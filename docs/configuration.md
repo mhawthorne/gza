@@ -1016,6 +1016,7 @@ When execution provenance is known, `gza show` also includes:
 For completed `review` tasks, `gza show` also includes:
 - `Verdict: <APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION|...>` when parseable from review output.
 - `Score: <N>/100` when a derived `review_score` is available.
+- Review-verify audit fields when autonomous review verification ran, including status, exit status, capture time, branch/head/base provenance, working directory, the persisted `## verify_command result` section, and the `.gza/logs/<slug>.review-verify.json` artifact path for the full captured output.
 
 ### run-inline
 

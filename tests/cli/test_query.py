@@ -3773,6 +3773,52 @@ class TestShowCommand:
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
+    def test_show_displays_review_verify_evidence(self, tmp_path: Path):
+        """Show should surface persisted review verify audit fields and stored markdown."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "gza/20260605-implement-feature"
+        store.update(impl)
+
+        task = store.add("Review feature", task_type="review", depends_on=impl.id)
+        task.slug = "20260605-review-feature"
+        task.status = "completed"
+        task.review_verify_status = "failed"
+        task.review_verify_exit_status = "7"
+        task.review_verify_branch = impl.branch
+        task.review_verify_head_sha = "deadbeef"
+        task.review_verify_base_sha = "cafebabe"
+        task.review_verify_cwd = "/tmp/worktrees/20260605-review-feature-review"
+        task.review_verify_artifact_file = "logs/20260605-review-feature.review-verify.json"
+        task.review_verify_markdown = (
+            "## verify_command result\n\n"
+            "- Command: `./bin/tests`\n"
+            "- Status: failed\n"
+            "- Exit status: 7\n"
+            "- Working directory: `/tmp/worktrees/20260605-review-feature-review`\n"
+            "- Failure: verify failed\n\n"
+            "Failing output (trimmed):\n"
+            "```text\nmypy failed\n```"
+        )
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Review Verify Status:" in result.stdout
+        assert "failed" in result.stdout
+        assert "Review Verify Exit:" in result.stdout
+        assert "Review Verify Branch:" in result.stdout
+        assert "Review Verify Head:" in result.stdout
+        assert "Review Verify Base:" in result.stdout
+        assert "Review Verify Cwd:" in result.stdout
+        assert "Review Verify Artifact:" in result.stdout
+        assert "Review Verify Result:" in result.stdout
+        assert "## verify_command result" in result.stdout
+        assert "mypy failed" in result.stdout
+
     def test_show_warns_and_reads_when_readonly_db_is_missing_task_comments(self, tmp_path: Path):
         """Show should warn instead of trying to repair task_comments on a frozen DB."""
         import sqlite3

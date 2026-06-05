@@ -423,6 +423,9 @@ class Task:
     review_verify_head_sha: str | None = None  # Reviewed implementation HEAD at verify time
     review_verify_base_sha: str | None = None  # Resolved default/base branch SHA at verify time
     review_verify_branch: str | None = None  # Implementation branch/ref the review verified
+    review_verify_markdown: str | None = None  # Exact rendered verify section injected into the review prompt
+    review_verify_cwd: str | None = None  # Working directory used for review-time verify execution
+    review_verify_artifact_file: str | None = None  # Full captured verify artifact for later audit/debugging
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
     execution_mode: str | None = None  # worker_background, worker_foreground, foreground_inline, foreground_attach_resume, manual, skill_inline
 
@@ -820,8 +823,15 @@ CREATE INDEX IF NOT EXISTS idx_watch_progress_subject
     ON watch_progress_observations(project_id, subject_kind, subject_id);
 """
 
+# Migration from v50 to v51: durable review verify audit payload metadata
+MIGRATION_V50_TO_V51 = """
+ALTER TABLE tasks ADD COLUMN review_verify_markdown TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT;
+ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 50
+SCHEMA_VERSION = 51
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1131,6 +1141,9 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 review_verify_head_sha TEXT,
                 review_verify_base_sha TEXT,
                 review_verify_branch TEXT,
+                review_verify_markdown TEXT,
+                review_verify_cwd TEXT,
+                review_verify_artifact_file TEXT,
                 log_schema_version INTEGER DEFAULT 1,
                 execution_mode TEXT,
                 base_branch TEXT,
@@ -1226,6 +1239,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "review_cleared_at", "review_score",
             "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
             "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
+            "review_verify_markdown", "review_verify_cwd", "review_verify_artifact_file",
             "log_schema_version", "execution_mode", "base_branch", "recovery_origin",
             "trigger_source",
         )
@@ -1272,6 +1286,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 changed_diff, review_cleared_at, review_score,
                 review_verify_command, review_verify_status, review_verify_exit_status, review_verify_failure,
                 review_verify_captured_at, review_verify_head_sha, review_verify_base_sha, review_verify_branch,
+                review_verify_markdown, review_verify_cwd, review_verify_artifact_file,
                 log_schema_version, execution_mode, base_branch, recovery_origin,
                 trigger_source
             )
@@ -1532,7 +1547,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51}
 )
 
 
@@ -1728,6 +1743,9 @@ def _ensure_required_auto_migration_artifacts(
         (47, "tasks", "review_scope", "ALTER TABLE tasks ADD COLUMN review_scope TEXT"),
         (48, "tasks", "model_is_explicit", "ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0"),
         (49, "merge_units", "merge_source", "ALTER TABLE merge_units ADD COLUMN merge_source TEXT"),
+        (51, "tasks", "review_verify_markdown", "ALTER TABLE tasks ADD COLUMN review_verify_markdown TEXT"),
+        (51, "tasks", "review_verify_cwd", "ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT"),
+        (51, "tasks", "review_verify_artifact_file", "ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1954,6 +1972,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_verify_head_sha TEXT,
     review_verify_base_sha TEXT,
     review_verify_branch TEXT,
+    review_verify_markdown TEXT,
+    review_verify_cwd TEXT,
+    review_verify_artifact_file TEXT,
     log_schema_version INTEGER DEFAULT 1,
     execution_mode TEXT,
     base_branch TEXT,
@@ -2378,6 +2399,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (48, MIGRATION_V47_TO_V48),
     (49, MIGRATION_V48_TO_V49),
     (50, MIGRATION_V49_TO_V50),
+    (51, MIGRATION_V50_TO_V51),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3124,6 +3146,11 @@ class SqliteTaskStore:
             review_verify_head_sha=row["review_verify_head_sha"] if "review_verify_head_sha" in keys else None,
             review_verify_base_sha=row["review_verify_base_sha"] if "review_verify_base_sha" in keys else None,
             review_verify_branch=row["review_verify_branch"] if "review_verify_branch" in keys else None,
+            review_verify_markdown=row["review_verify_markdown"] if "review_verify_markdown" in keys else None,
+            review_verify_cwd=row["review_verify_cwd"] if "review_verify_cwd" in keys else None,
+            review_verify_artifact_file=(
+                row["review_verify_artifact_file"] if "review_verify_artifact_file" in keys else None
+            ),
             log_schema_version=(
                 row["log_schema_version"]
                 if "log_schema_version" in keys and row["log_schema_version"] is not None
@@ -3491,6 +3518,9 @@ class SqliteTaskStore:
                     review_verify_head_sha = ?,
                     review_verify_base_sha = ?,
                     review_verify_branch = ?,
+                    review_verify_markdown = ?,
+                    review_verify_cwd = ?,
+                    review_verify_artifact_file = ?,
                     log_schema_version = ?,
                     execution_mode = ?
                 WHERE project_id = ? AND id = ?
@@ -3561,6 +3591,9 @@ class SqliteTaskStore:
                     task.review_verify_head_sha,
                     task.review_verify_base_sha,
                     task.review_verify_branch,
+                    task.review_verify_markdown,
+                    task.review_verify_cwd,
+                    task.review_verify_artifact_file,
                     task.log_schema_version,
                     task.execution_mode,
                     self._project_id,
@@ -6739,6 +6772,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score",
         "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
         "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
+        "review_verify_markdown", "review_verify_cwd", "review_verify_artifact_file",
         "log_schema_version", "execution_mode", "base_branch",
         "recovery_origin", "trigger_source",
     )
@@ -6762,6 +6796,9 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "review_verify_head_sha": "NULL",
         "review_verify_base_sha": "NULL",
         "review_verify_branch": "NULL",
+        "review_verify_markdown": "NULL",
+        "review_verify_cwd": "NULL",
+        "review_verify_artifact_file": "NULL",
         "review_scope": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
@@ -7352,6 +7389,9 @@ def _task_to_dict(task: "Task") -> dict:
         "review_verify_head_sha": task.review_verify_head_sha,
         "review_verify_base_sha": task.review_verify_base_sha,
         "review_verify_branch": task.review_verify_branch,
+        "review_verify_markdown": task.review_verify_markdown,
+        "review_verify_cwd": task.review_verify_cwd,
+        "review_verify_artifact_file": task.review_verify_artifact_file,
         "log_schema_version": task.log_schema_version,
         "execution_mode": task.execution_mode,
     }

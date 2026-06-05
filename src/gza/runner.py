@@ -1714,6 +1714,7 @@ REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
 REVIEW_VERIFY_TIMEOUT_SECONDS = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
+REVIEW_VERIFY_ARTIFACT_VERSION = 1
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -2136,6 +2137,7 @@ class ReviewVerifyResult:
     reviewed_branch: str | None = None
     reviewed_head_sha: str | None = None
     reviewed_base_sha: str | None = None
+    working_directory: str | None = None
     failure: str | None = None
     output: str | None = None
 
@@ -2178,6 +2180,7 @@ def _make_review_verify_result(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
+    working_directory: str | None = None,
     failure: str | None = None,
     output: str | bytes | None = None,
 ) -> ReviewVerifyResult:
@@ -2190,6 +2193,7 @@ def _make_review_verify_result(
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
+        working_directory=working_directory,
         failure=failure,
         output=_combine_review_verify_output(output),
     )
@@ -2204,6 +2208,7 @@ def _format_review_verify_failure(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
+    working_directory: str | None = None,
     captured_at: datetime | None = None,
 ) -> str:
     """Compatibility wrapper for tests and legacy callers that expect markdown."""
@@ -2216,13 +2221,105 @@ def _format_review_verify_failure(
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
+            working_directory=working_directory,
             failure=failure,
             output=output,
         )
     )
 
 
-def _persist_review_verify_result(task: Task, result: ReviewVerifyResult | None) -> None:
+def _extract_review_verify_phase_results(output: str | None) -> list[dict[str, Any]]:
+    """Parse structured per-phase verification lines from captured command output."""
+    if not output:
+        return []
+    matches = re.finditer(
+        r"^gza-verify phase=(?P<status>passed|failed) name=(?P<name>[A-Za-z0-9_.-]+) "
+        r"duration_seconds=(?P<duration>[0-9.]+)"
+        r"(?: tree_fingerprint=(?P<tree_fingerprint>[0-9a-f]{64}))?$",
+        output,
+        re.MULTILINE,
+    )
+    phases: list[dict[str, Any]] = []
+    for match in matches:
+        phase: dict[str, Any] = {
+            "name": match.group("name"),
+            "status": match.group("status"),
+            "duration_seconds": float(match.group("duration")),
+        }
+        tree_fingerprint = match.group("tree_fingerprint")
+        if tree_fingerprint:
+            phase["tree_fingerprint"] = tree_fingerprint
+        phases.append(phase)
+    return phases
+
+
+def _review_verify_result_payload(result: ReviewVerifyResult) -> dict[str, Any]:
+    """Convert a structured review verify result into a durable JSON payload."""
+    payload: dict[str, Any] = {
+        "command": result.command,
+        "status": result.status,
+        "exit_status": result.exit_status,
+        "captured_at": result.captured_at.isoformat(),
+        "reviewed_branch": result.reviewed_branch,
+        "reviewed_head_sha": result.reviewed_head_sha,
+        "reviewed_base_sha": result.reviewed_base_sha,
+        "working_directory": result.working_directory,
+        "failure": result.failure,
+        "output": result.output,
+        "phase_results": _extract_review_verify_phase_results(result.output),
+    }
+    return payload
+
+
+def _review_verify_artifact_path(config: Config, task: Task) -> Path:
+    """Return the durable artifact path for a review verify capture."""
+    if task.log_file:
+        log_path = config.project_dir / Path(task.log_file)
+    else:
+        assert task.slug is not None
+        log_path = config.log_path / f"{task.slug}.log"
+    return log_path.with_name(f"{log_path.stem}.review-verify.json")
+
+
+def _write_review_verify_artifact(
+    config: Config,
+    task: Task,
+    *,
+    markdown: str,
+    result: ReviewVerifyResult,
+    project_results: tuple[ProjectReviewVerifyResult, ...] = (),
+) -> str:
+    """Persist the full review verify capture to a durable artifact file."""
+    artifact_path = _review_verify_artifact_path(config, task)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": REVIEW_VERIFY_ARTIFACT_VERSION,
+        "task_id": task.id,
+        "task_slug": task.slug,
+        "task_type": task.task_type,
+        "markdown": markdown,
+        "aggregate_result": _review_verify_result_payload(result),
+        "project_results": [
+            {
+                "scope": entry.scope,
+                "working_directory": entry.working_directory,
+                "skip_reason": entry.skip_reason,
+                "result": _review_verify_result_payload(entry.result) if entry.result is not None else None,
+            }
+            for entry in project_results
+        ],
+    }
+    artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return task_log_storage_path(config, artifact_path)
+
+
+def _persist_review_verify_result(
+    task: Task,
+    result: ReviewVerifyResult | None,
+    *,
+    markdown: str | None = None,
+    artifact_file: str | None = None,
+) -> None:
     """Copy structured review verify provenance onto a persisted task row."""
     if result is None:
         task.review_verify_command = None
@@ -2233,6 +2330,9 @@ def _persist_review_verify_result(task: Task, result: ReviewVerifyResult | None)
         task.review_verify_head_sha = None
         task.review_verify_base_sha = None
         task.review_verify_branch = None
+        task.review_verify_markdown = None
+        task.review_verify_cwd = None
+        task.review_verify_artifact_file = None
         return
 
     task.review_verify_command = result.command
@@ -2243,6 +2343,9 @@ def _persist_review_verify_result(task: Task, result: ReviewVerifyResult | None)
     task.review_verify_head_sha = result.reviewed_head_sha
     task.review_verify_base_sha = result.reviewed_base_sha
     task.review_verify_branch = result.reviewed_branch
+    task.review_verify_markdown = markdown
+    task.review_verify_cwd = result.working_directory
+    task.review_verify_artifact_file = artifact_file
 
 
 def _format_review_verify_result(
@@ -2268,6 +2371,8 @@ def _format_review_verify_result(
         f"- Exit status: {result.exit_status}",
         f"- Captured at: {result.captured_at.isoformat()}",
     ]
+    if result.working_directory:
+        lines.append(f"- Working directory: `{result.working_directory}`")
     if result.reviewed_branch:
         lines.append(f"- Reviewed branch: `{result.reviewed_branch}`")
     if result.reviewed_head_sha:
@@ -2323,6 +2428,7 @@ def _run_review_verify_command(
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(cwd),
             failure=f"verify_command timed out after {timeout_seconds}s",
             output=_combine_review_verify_output(exc.stdout, exc.stderr),
         )
@@ -2335,6 +2441,7 @@ def _run_review_verify_command(
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(cwd),
             failure=f"failed to launch verify_command: {exc}",
         )
     elapsed = time.monotonic() - started_at
@@ -2353,18 +2460,19 @@ def _run_review_verify_command(
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
+        working_directory=str(cwd),
         output=_combine_review_verify_output(result.stdout, result.stderr),
     )
 
 
-def _format_review_verify_skip(project: RepoProjectConfig, reason: str) -> str:
+def _format_review_verify_skip(project: RepoProjectConfig, reason: str, *, working_directory: str) -> str:
     """Format an explicit skipped verification entry for a discovered project."""
     scope = _format_repo_project_scope(project.scope_root)
     return "\n".join(
         [
             f"### {scope}",
             "",
-            f"- Working directory: `{scope}`",
+            f"- Working directory: `{working_directory}`",
             "- Status: skipped",
             f"- Reason: {reason}",
         ]
@@ -2431,6 +2539,7 @@ def _aggregate_cross_project_review_verify_result(
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
+        working_directory="(per-project; see artifact)",
         failure=failure,
     )
 
@@ -2451,9 +2560,10 @@ def _run_review_verify_commands_for_projects(
         verify_command = config.verify_command if isinstance(config.verify_command, str) else ""
         if not verify_command.strip():
             return None
+        project_cwd = _worktree_project_root(worktree_path, _project_boundary(config))
         result = _run_review_verify_command(
             verify_command.strip(),
-            cwd=_worktree_project_root(worktree_path, _project_boundary(config)),
+            cwd=project_cwd,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
@@ -2467,7 +2577,7 @@ def _run_review_verify_commands_for_projects(
                 ProjectReviewVerifyResult(
                     project=None,
                     scope=scope,
-                    working_directory=scope,
+                    working_directory=str(project_cwd),
                     result=result,
                 ),
             )
@@ -2493,12 +2603,13 @@ def _run_review_verify_commands_for_projects(
     section_entries: list[str] = []
     for project in affected.projects:
         scope = _format_repo_project_scope(project.scope_root)
+        project_cwd = worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root
         if not project.verify_command:
             project_results.append(
                 ProjectReviewVerifyResult(
                     project=project,
                     scope=scope,
-                    working_directory=scope,
+                    working_directory=str(project_cwd),
                     skip_reason="no verify_command configured for this affected project",
                 )
             )
@@ -2507,6 +2618,7 @@ def _run_review_verify_commands_for_projects(
                     _format_review_verify_skip(
                         project,
                         "no verify_command configured for this affected project",
+                        working_directory=str(project_cwd),
                     ),
                     "",
                 ]
@@ -2515,7 +2627,7 @@ def _run_review_verify_commands_for_projects(
 
         result = _run_review_verify_command(
             project.verify_command,
-            cwd=worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root,
+            cwd=project_cwd,
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
@@ -2525,12 +2637,12 @@ def _run_review_verify_commands_for_projects(
             ProjectReviewVerifyResult(
                 project=project,
                 scope=scope,
-                working_directory=scope,
+                working_directory=str(project_cwd),
                 result=result,
             )
         )
         result_lines = _strip_review_verify_heading(_format_review_verify_result(result))
-        section_entries.extend([f"### {scope}", "", f"- Working directory: `{scope}`", *result_lines, ""])
+        section_entries.extend([f"### {scope}", "", *result_lines, ""])
 
     if affected.unknown_paths:
         project_results.append(
@@ -6748,10 +6860,12 @@ def _run_non_code_task(
                         reviewed_branch=reviewed_branch,
                         reviewed_head_sha=None,
                         reviewed_base_sha=reviewed_base_sha,
+                        working_directory=str(provider_cwd),
                         failure="unable to resolve review worktree HEAD before verify_command ran",
                     )
                     review_verify_markdown = _format_review_verify_result(review_verify_result)
                 else:
+                    persisted_project_results: tuple[ProjectReviewVerifyResult, ...] = ()
                     if _task_is_cross_project(task):
                         cross_project_verify = _run_review_verify_commands_for_projects(
                             config=config,
@@ -6766,6 +6880,7 @@ def _run_non_code_task(
                         if cross_project_verify is not None:
                             review_verify_markdown = cross_project_verify.markdown
                             review_verify_result = cross_project_verify.aggregate_result
+                            persisted_project_results = cross_project_verify.project_results
                     elif verify_command.strip():
                         review_verify_result = _run_review_verify_command(
                             verify_command.strip(),
@@ -6777,8 +6892,37 @@ def _run_non_code_task(
                         )
                         review_verify_markdown = _format_review_verify_result(review_verify_result)
                 if review_verify_result is not None:
-                    _persist_review_verify_result(task, review_verify_result)
+                    assert review_verify_markdown is not None
+                    artifact_file = _write_review_verify_artifact(
+                        config,
+                        task,
+                        markdown=review_verify_markdown,
+                        result=review_verify_result,
+                        project_results=persisted_project_results if reviewed_head_sha is not None else (),
+                    )
+                    _persist_review_verify_result(
+                        task,
+                        review_verify_result,
+                        markdown=review_verify_markdown,
+                        artifact_file=artifact_file,
+                    )
                     store.update(task)
+                    task_logger.phase(
+                        f"Captured review verify result: {review_verify_result.status} "
+                        f"({review_verify_result.exit_status})",
+                        extra={
+                            "event": "review_verify_result",
+                            "review_verify_status": review_verify_result.status,
+                            "review_verify_exit_status": review_verify_result.exit_status,
+                            "review_verify_command": review_verify_result.command,
+                            "review_verify_captured_at": review_verify_result.captured_at.isoformat(),
+                            "review_verify_branch": review_verify_result.reviewed_branch,
+                            "review_verify_head_sha": review_verify_result.reviewed_head_sha,
+                            "review_verify_base_sha": review_verify_result.reviewed_base_sha,
+                            "review_verify_cwd": review_verify_result.working_directory,
+                            "review_verify_artifact_file": artifact_file,
+                        },
+                    )
             prompt = build_prompt(
                 task,
                 config,

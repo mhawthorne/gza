@@ -3407,6 +3407,8 @@ def _cmd_show_output(
     console.print(f"[{c['heading']}]Task {task.id}[/{c['heading']}]")
     console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
     console.print(f"[{c['label']}]Status:[/{c['label']}] [{status_color}]{task.status}[/{status_color}]")
+    metadata_only = getattr(args, "metadata_only", False)
+    full_mode = getattr(args, "full", False)
     lifecycle_summary = _summarize_lifecycle(task, config=config, store=store)
     if lifecycle_summary is not None:
         lifecycle_color = c["value"]
@@ -3500,6 +3502,51 @@ def _cmd_show_output(
             score = get_review_score(config, task)
         if score is not None:
             console.print(f"[{c['label']}]Score:[/{c['label']}] [{c['value']}]{score}/100[/{c['value']}]")
+        if task.review_verify_status or task.review_verify_markdown or task.review_verify_artifact_file:
+            console.print(
+                f"[{c['label']}]Review Verify Status:[/{c['label']}] "
+                f"[{c['value']}]{task.review_verify_status or 'unknown'}[/{c['value']}]"
+            )
+            if task.review_verify_exit_status:
+                console.print(
+                    f"[{c['label']}]Review Verify Exit:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_exit_status}[/{c['value']}]"
+                )
+            if task.review_verify_captured_at:
+                console.print(
+                    f"[{c['label']}]Review Verify At:[/{c['label']}] "
+                    f"[{c['value']}]{_format_utc_timestamp(task.review_verify_captured_at)}[/{c['value']}]"
+                )
+            if task.review_verify_branch:
+                console.print(
+                    f"[{c['label']}]Review Verify Branch:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_branch}[/{c['value']}]"
+                )
+            if task.review_verify_head_sha:
+                console.print(
+                    f"[{c['label']}]Review Verify Head:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_head_sha}[/{c['value']}]"
+                )
+            if task.review_verify_base_sha:
+                console.print(
+                    f"[{c['label']}]Review Verify Base:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_base_sha}[/{c['value']}]"
+                )
+            if task.review_verify_cwd:
+                console.print(
+                    f"[{c['label']}]Review Verify Cwd:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_cwd}[/{c['value']}]"
+                )
+            if task.review_verify_artifact_file:
+                console.print(
+                    f"[{c['label']}]Review Verify Artifact:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_artifact_file}[/{c['value']}]"
+                )
+            if task.review_verify_failure:
+                console.print(
+                    f"[{c['label']}]Review Verify Failure:[/{c['label']}] "
+                    f"[{c['value']}]{task.review_verify_failure}[/{c['value']}]"
+                )
     if task.session_id:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 
@@ -3515,7 +3562,6 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Lineage:[/{c['label']}]")
         console.print(lineage_str)
 
-    metadata_only = getattr(args, "metadata_only", False)
     if not metadata_only:
         console.print()
         console.print(f"[{c['label']}]Prompt:[/{c['label']}]")
@@ -3523,6 +3569,21 @@ def _cmd_show_output(
         console.print(f"[{c['prompt']}]{task.prompt}[/{c['prompt']}]")
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
         console.print()
+        if task.task_type == "review" and task.review_verify_markdown:
+            console.print(f"[{c['label']}]Review Verify Result:[/{c['label']}]")
+            console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+            review_verify_lines = task.review_verify_markdown.splitlines()
+            if not full_mode and len(review_verify_lines) > 30:
+                truncated = "\n".join(review_verify_lines[:20])
+                remainder = len(review_verify_lines) - 20
+                console.print(truncated)
+                console.print(
+                    f"[{c['section']}](... truncated, {remainder} more lines — use `gza show {task.id} --full` to see all)[/{c['section']}]"
+                )
+            else:
+                console.print(task.review_verify_markdown)
+            console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+            console.print()
     if task.id is not None:
         comments = store.get_comments(task.id)
         if comments:
@@ -3609,7 +3670,6 @@ def _cmd_show_output(
         console.print()
         console.print(f"[{c['label']}]Output:[/{c['label']}]")
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
-        full_mode = getattr(args, "full", False)
         lines = output.splitlines()
         if not full_mode and len(lines) > 30:
             truncated = "\n".join(lines[:20])

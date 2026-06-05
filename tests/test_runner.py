@@ -13838,6 +13838,169 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_exit_status == "7"
         assert refreshed.review_verify_head_sha == "deadbeef"
         assert refreshed.review_verify_branch == impl.branch
+        assert refreshed.review_verify_markdown is not None
+        assert "- Working directory: `" in refreshed.review_verify_markdown
+        assert refreshed.review_verify_cwd is not None
+        assert refreshed.review_verify_cwd.endswith(f"{task.slug}-{task.task_type}")
+        assert refreshed.review_verify_artifact_file == f"logs/{task.slug}.review-verify.json"
+
+        artifact_path = tmp_path / refreshed.review_verify_artifact_file
+        artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert artifact_payload["task_id"] == task.id
+        assert artifact_payload["markdown"] == refreshed.review_verify_markdown
+        assert artifact_payload["aggregate_result"]["status"] == "failed"
+        assert artifact_payload["aggregate_result"]["exit_status"] == "7"
+        assert artifact_payload["aggregate_result"]["output"] == "lint failed"
+        assert artifact_payload["aggregate_result"]["working_directory"] == refreshed.review_verify_cwd
+
+        ops_entries = [
+            json.loads(line)
+            for line in (tmp_path / "logs" / f"{task.slug}.ops.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        verify_entry = next(entry for entry in ops_entries if entry.get("event") == "review_verify_result")
+        assert verify_entry["review_verify_status"] == "failed"
+        assert verify_entry["review_verify_artifact_file"] == refreshed.review_verify_artifact_file
+
+    def test_fresh_review_persists_passing_verify_artifact(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = "printf 'all good\\n'"
+        config.review_verify_timeout_seconds = 120
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: APPROVED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "passed"
+        assert refreshed.review_verify_markdown is not None
+        assert "- Status: passed" in refreshed.review_verify_markdown
+        assert refreshed.review_verify_artifact_file == f"logs/{task.slug}.review-verify.json"
+
+        artifact_payload = json.loads(
+            (tmp_path / refreshed.review_verify_artifact_file).read_text(encoding="utf-8")
+        )
+        assert artifact_payload["aggregate_result"]["status"] == "passed"
+        assert artifact_payload["aggregate_result"]["output"] == "all good"
+        assert artifact_payload["aggregate_result"]["working_directory"] == refreshed.review_verify_cwd
+
+    def test_fresh_review_truncates_inline_verify_output_and_keeps_full_artifact(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        large_output = ("x" * 4500) + " ENDMARK"
+        config.verify_command = f"printf '%s' '{large_output}' && exit 9"
+        config.review_verify_timeout_seconds = 120
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_markdown is not None
+        assert "Failing output (trimmed):" in refreshed.review_verify_markdown
+        assert "```text" in refreshed.review_verify_markdown
+        assert "..." in refreshed.review_verify_markdown
+        assert refreshed.review_verify_artifact_file == f"logs/{task.slug}.review-verify.json"
+
+        artifact_payload = json.loads(
+            (tmp_path / refreshed.review_verify_artifact_file).read_text(encoding="utf-8")
+        )
+        assert artifact_payload["aggregate_result"]["output"] == large_output
+        assert artifact_payload["aggregate_result"]["output"].endswith("ENDMARK")
 
     def test_cross_project_review_persists_failed_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
