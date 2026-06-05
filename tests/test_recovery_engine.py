@@ -80,15 +80,47 @@ def _attach_empty_merge_unit(store, task) -> None:
 
 
 class _StubMergeGit:
-    def __init__(self, *, merged_branches: set[str] | None = None, default_branch: str = "main") -> None:
-        self.merged_branches = merged_branches or set()
+    def __init__(
+        self,
+        *,
+        merged_side_branches: set[str] | None = None,
+        empty_merged_branches: set[str] | None = None,
+        default_branch: str = "main",
+    ) -> None:
+        self.merged_side_branches = merged_side_branches or set()
+        self.empty_merged_branches = empty_merged_branches or set()
+        self.merged_branches = self.merged_side_branches | self.empty_merged_branches
         self.default_branch = default_branch
+
+    def resolve_fresh_merge_source(self, branch: str):
+        from gza.git import ResolvedMergeSourceRef
+
+        return ResolvedMergeSourceRef(branch)
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref == self.default_branch:
+            return "target-tip"
+        if ref in self.merged_side_branches:
+            return f"{ref}-merged-tip"
+        if ref in self.empty_merged_branches:
+            return f"{ref}-empty-tip"
+        return f"{ref}-tip" if ref else None
 
     def branch_exists(self, branch: str) -> bool:
         return bool(branch)
 
     def is_merged(self, branch: str, into: str) -> bool:
         return into == self.default_branch and branch in self.merged_branches
+
+    def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+        if base != self.default_branch:
+            return None
+        if branch in self.merged_branches:
+            return 0
+        return 1
+
+    def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+        return target == self.default_branch and commit in self.empty_merged_branches
 
 
 class _StubEmptyBranchGit:
@@ -141,10 +173,15 @@ class _StubNonEmptyBranchGit:
 def _stub_merge_context(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    merged_branches: set[str] | None = None,
+    merged_side_branches: set[str] | None = None,
+    empty_merged_branches: set[str] | None = None,
     default_branch: str = "main",
 ) -> None:
-    git = _StubMergeGit(merged_branches=merged_branches, default_branch=default_branch)
+    git = _StubMergeGit(
+        merged_side_branches=merged_side_branches,
+        empty_merged_branches=empty_merged_branches,
+        default_branch=default_branch,
+    )
     monkeypatch.setattr(
         recovery_engine,
         "_load_merge_context",
@@ -239,13 +276,14 @@ def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch, merged_branches={"feature/landed-work"})
+    _stub_merge_context(monkeypatch, empty_merged_branches={"feature/landed-work"})
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
     failed.status = "failed"
     failed.failure_reason = "INFRASTRUCTURE_ERROR"
     failed.branch = "feature/landed-work"
+    failed.has_commits = True
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
 
@@ -258,6 +296,35 @@ def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_
 
     assert is_chain_resolved_by_recovery(store, failed) is False
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [unrelated.id]
+
+
+def test_list_failed_tasks_for_recovery_keeps_empty_failed_worker_died_branch_for_shared_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(
+        monkeypatch,
+        empty_merged_branches={"feature/empty-worker-died"},
+    )
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED"
+    failed.branch = "feature/empty-worker-died"
+    failed.session_id = "sess-empty-worker-died"
+    failed.num_steps_computed = 1
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.reason_code == "WORKER_DIED"
 
 
 def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage(
@@ -604,6 +671,46 @@ def test_list_failed_tasks_for_recovery_filters_failed_descendant_when_merged_an
     assert list_failed_tasks_for_recovery(store) == []
 
 
+def test_list_failed_tasks_for_recovery_filters_fast_forward_landed_descendant_via_merged_merge_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    merged_ancestor = store.add("Fast-forward landed implementation", task_type="implement")
+    assert merged_ancestor.id is not None
+    merged_ancestor.status = "completed"
+    merged_ancestor.branch = "feature/fast-forward-landed"
+    merged_ancestor.has_commits = True
+    merged_ancestor.completed_at = datetime.now(UTC)
+    store.update(merged_ancestor)
+    unit = store.create_merge_unit(
+        source_branch=merged_ancestor.branch,
+        target_branch="main",
+        owner_task_id=merged_ancestor.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_ancestor.id, unit.id, "owner")
+
+    failed_descendant = store.add("Failed retry", task_type="implement", based_on=merged_ancestor.id)
+    assert failed_descendant.id is not None
+    failed_descendant.status = "failed"
+    failed_descendant.failure_reason = "WORKER_DIED"
+    failed_descendant.session_id = "sess-fast-forward-descendant"
+    failed_descendant.branch = merged_ancestor.branch
+    failed_descendant.completed_at = datetime.now(UTC)
+    store.update(failed_descendant)
+
+    assert _is_resolved_by_landed_lineage(
+        store,
+        failed_descendant,
+        merge_context=recovery_engine._load_merge_context(tmp_path),
+    ) is True
+    assert list_failed_tasks_for_recovery(store) == []
+
+
 def test_list_failed_tasks_for_recovery_keeps_failed_descendant_under_merged_manual_follow_up_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -645,7 +752,7 @@ def test_recovery_engine_timeout_implement_with_stale_merged_metadata_still_choo
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch, merged_branches={"feature/stale-timeout"})
+    _stub_merge_context(monkeypatch, merged_side_branches={"feature/stale-timeout"})
 
     failed = store.add("Failed timeout implementation", task_type="implement")
     assert failed.id is not None
@@ -764,6 +871,17 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
         def __init__(self) -> None:
             self.branch_exists_calls = 0
             self.is_merged_calls = 0
+            self.count_commits_ahead_checked_calls = 0
+
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref == "main":
+                return "target-tip"
+            return f"{ref}-tip"
 
         def branch_exists(self, branch: str) -> bool:
             self.branch_exists_calls += 1
@@ -772,6 +890,13 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
         def is_merged(self, branch: str, into: str) -> bool:
             self.is_merged_calls += 1
             return True
+
+        def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+            self.count_commits_ahead_checked_calls += 1
+            return 0
+
+        def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+            return False
 
     git = _CachedBranchGit()
     merge_context = _MergeContext(
@@ -784,6 +909,102 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
     assert git.branch_exists_calls == 0
     assert git.is_merged_calls == 1
+    assert git.count_commits_ahead_checked_calls == 1
+
+
+def test_is_resolved_by_landed_lineage_treats_reachable_merged_branch_with_zero_ahead_commits_as_landed(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/merged-zero-ahead"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    git = _StubMergeGit(empty_merged_branches={failed.branch})
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+
+
+def test_is_resolved_by_landed_lineage_does_not_treat_reachable_empty_branch_as_landed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED"
+    failed.branch = "feature/reachable-empty"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    git = _StubMergeGit(empty_merged_branches={failed.branch})
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
+
+
+@pytest.mark.parametrize("landed_created_first", [True, False])
+def test_list_failed_tasks_for_recovery_recomputes_reachable_empty_branch_resolution_per_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    landed_created_first: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/reachable-empty-shared"
+    _stub_merge_context(monkeypatch, empty_merged_branches={branch})
+
+    def _landed_failed_task():
+        task = store.add("Failed landed work", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "INFRASTRUCTURE_ERROR"
+        task.branch = branch
+        task.has_commits = True
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return task
+
+    def _recoverable_empty_task():
+        task = store.add("Recoverable empty failed work", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "WORKER_DIED"
+        task.branch = branch
+        task.session_id = "sess-recoverable-empty"
+        task.num_steps_computed = 1
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return task
+
+    if landed_created_first:
+        landed = _landed_failed_task()
+        recoverable_empty = _recoverable_empty_task()
+    else:
+        recoverable_empty = _recoverable_empty_task()
+        landed = _landed_failed_task()
+
+    failed = list_failed_tasks_for_recovery(store)
+
+    assert [task.id for task in failed] == [recoverable_empty.id]
+    assert landed not in failed
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:

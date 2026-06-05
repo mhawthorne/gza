@@ -15,7 +15,7 @@ from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
 from .lifecycle_completion import task_is_complete_for_lifecycle
-from .merge_state import resolve_task_merge_state_for_target
+from .merge_state import classify_branch_merge_state_for_target, resolve_task_merge_state_for_target
 from .operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL
 from .recovery_read_context import RecoveryReadContext
 
@@ -125,7 +125,7 @@ class _MergeContext:
     default_branch: str | None
     existing_branches: frozenset[str] | None = None
     resolution_error: str | None = None
-    branch_resolution: dict[str, bool] = field(default_factory=dict)
+    branch_resolution: dict[str, str] = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
     _warning_keys: set[str] = field(default_factory=set)
 
@@ -784,19 +784,26 @@ def _is_resolved_by_landed_lineage(
 
     if merge_context.git is not None and target_branch is not None and task.branch:
         try:
-            branch_merged = merge_context.branch_resolution.get(task.branch)
-            if branch_merged is None:
+            branch_merge_state = merge_context.branch_resolution.get(task.branch)
+            if branch_merge_state is None:
                 if merge_context.existing_branches is not None:
-                    branch_merged = (
-                        task.branch in merge_context.existing_branches
-                        and merge_context.git.is_merged(task.branch, target_branch)
-                    )
+                    branch_exists = task.branch in merge_context.existing_branches
                 else:
-                    branch_merged = merge_context.git.branch_exists(task.branch) and merge_context.git.is_merged(
-                        task.branch,
-                        target_branch,
-                    )
-                merge_context.branch_resolution[task.branch] = branch_merged
+                    branch_exists = merge_context.git.branch_exists(task.branch)
+                branch_merge_state = "unmerged"
+                if branch_exists:
+                    merged_proof = merge_context.git.is_merged(task.branch, target_branch)
+                    if merged_proof:
+                        branch_merge_state = classify_branch_merge_state_for_target(
+                            git=merge_context.git,
+                            source_branch=task.branch,
+                            target_branch=target_branch,
+                            merged_proof=merged_proof,
+                        ).state
+                merge_context.branch_resolution[task.branch] = branch_merge_state
+            branch_merged = branch_merge_state == "merged" or (
+                branch_merge_state == "empty" and _task_has_recoverable_real_work(task)
+            )
             if branch_merged:
                 return True
         except GitError as exc:
@@ -990,8 +997,12 @@ def _task_has_provider_output(task: DbTask) -> bool:
     return bool(task.output_content or task.report_file)
 
 
-def _prerequisite_unmerged_has_recoverable_real_work(task: DbTask) -> bool:
+def _task_has_recoverable_real_work(task: DbTask) -> bool:
     return bool(task.has_commits or _task_has_provider_output(task))
+
+
+def _prerequisite_unmerged_has_recoverable_real_work(task: DbTask) -> bool:
+    return _task_has_recoverable_real_work(task)
 
 
 def _persist_prerequisite_unmerged_empty_reconciliation(store: SqliteTaskStore, task: DbTask) -> None:
