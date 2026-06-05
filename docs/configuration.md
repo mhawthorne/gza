@@ -998,6 +998,11 @@ gza show <task_id> [options]
 
 `--metadata-only` is incompatible with `--prompt`, `--output`, `--path`, and `--full`.
 
+The standard metadata block includes PR intent and cached PR details when known:
+- `Create PR: yes|no` showing whether the task is configured to auto-create or reuse a PR on successful completion.
+- `PR Number: <N>` when a cached PR number is present on the task.
+- `PR State: <open|closed|merged|...>` when a cached PR state is present on the task.
+
 When a task's lineage extends beyond the selected row, `gza show` also includes:
 - `Lifecycle: ...` directly under `Status:` summarizing the current unit-of-work state using the same shared recovery planning handoff and advance lifecycle classifier as `gza advance`, `gza watch`, and `gza iterate`. For completed plan lineages with implement descendants, `show` summarizes the newest implement descendant instead of the plan-level `implement task already exists` skip, so already-merged implementations render as terminal. Needs-attention lifecycle outcomes reuse the shared `reason=...` policy slug format, and git/default-branch resolution or later shared-classifier Git/context failures are surfaced as an explicit lifecycle-unavailable message instead of guessed fallback state.
 - A `Lineage:` tree where every node includes its current task status, failed-task reason when relevant, and merge state for completed code tasks.

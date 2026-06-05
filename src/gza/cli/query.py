@@ -3470,6 +3470,14 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Tags:[/{c['label']}] [{c['value']}]{', '.join(task.tags)}[/{c['value']}]")
     if task.spec:
         console.print(f"[{c['label']}]Spec:[/{c['label']}] [{c['value']}]{task.spec}[/{c['value']}]")
+    console.print(
+        f"[{c['label']}]Create PR:[/{c['label']}] "
+        f"[{c['value']}]{'yes' if task.create_pr else 'no'}[/{c['value']}]"
+    )
+    if task.pr_number is not None:
+        console.print(f"[{c['label']}]PR Number:[/{c['label']}] [{c['value']}]{task.pr_number}[/{c['value']}]")
+    if task.pr_state is not None:
+        console.print(f"[{c['label']}]PR State:[/{c['label']}] [{c['value']}]{task.pr_state}[/{c['value']}]")
     review_rebase_detail = _implementation_review_rebase_detail(task, config=config, store=store)
     if review_rebase_detail is not None:
         console.print(f"[{c['label']}]Review:[/{c['label']}] [{c['value']}]{review_rebase_detail}[/{c['value']}]")

@@ -4415,6 +4415,75 @@ class TestShowCommand:
         assert exit_code == 0
         assert "Auto Implement: no (hold for review; run uv run gza implement" in output
 
+    def test_show_displays_create_pr_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement with PR intent", task_type="implement", create_pr=True)
+        assert task.id is not None
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Create PR: yes" in output
+
+    def test_show_displays_cached_pr_details(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Implement with cached PR", task_type="implement")
+        assert task.id is not None
+        task.pr_number = 123
+        task.pr_state = "open"
+        store.update(task)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Create PR: no" in output
+        assert "PR Number: 123" in output
+        assert "PR State: open" in output
+
     @pytest.mark.parametrize(
         ("changed_diff", "expected"),
         [
