@@ -29,6 +29,7 @@ from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
+    ProjectReviewVerifyResult,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     SUMMARY_DIR,
     WIP_DIR,
@@ -14347,7 +14348,15 @@ class TestProviderPromptSanitization:
         config.model = None
         config.max_steps = 10
         config.timeout_minutes = 10
-        config.verify_command = "printf 'lint failed\\n' && exit 7"
+        passed_fingerprint = "a" * 64
+        failed_fingerprint = "b" * 64
+        config.verify_command = (
+            "printf 'gza-verify phase=passed name=ruff duration_seconds=1.25 "
+            f"tree_fingerprint={passed_fingerprint}\\n"
+            "gza-verify phase=failed name=pytest duration_seconds=3.5 "
+            f"tree_fingerprint={failed_fingerprint}\\n"
+            "lint failed\\n' && exit 7"
+        )
         config.review_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
@@ -14408,8 +14417,28 @@ class TestProviderPromptSanitization:
         assert artifact_payload["markdown"] == refreshed.review_verify_markdown
         assert artifact_payload["aggregate_result"]["status"] == "failed"
         assert artifact_payload["aggregate_result"]["exit_status"] == "7"
-        assert artifact_payload["aggregate_result"]["output"] == "lint failed"
+        assert artifact_payload["aggregate_result"]["output"] == (
+            "gza-verify phase=passed name=ruff duration_seconds=1.25 "
+            f"tree_fingerprint={passed_fingerprint}\n"
+            "gza-verify phase=failed name=pytest duration_seconds=3.5 "
+            f"tree_fingerprint={failed_fingerprint}\n"
+            "lint failed"
+        )
         assert artifact_payload["aggregate_result"]["working_directory"] == refreshed.review_verify_cwd
+        assert artifact_payload["aggregate_result"]["phase_results"] == [
+            {
+                "duration_seconds": 1.25,
+                "name": "ruff",
+                "status": "passed",
+                "tree_fingerprint": passed_fingerprint,
+            },
+            {
+                "duration_seconds": 3.5,
+                "name": "pytest",
+                "status": "failed",
+                "tree_fingerprint": failed_fingerprint,
+            },
+        ]
 
         ops_entries = [
             json.loads(line)
@@ -14672,6 +14701,208 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_head_sha == "deadbeef"
         assert refreshed.review_verify_base_sha == "cafebabe"
         assert refreshed.review_verify_branch == impl.branch
+
+    def test_cross_project_review_artifact_persists_per_project_verify_phase_results(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        impl.status = "completed"
+        impl.slug = "20260212-implement-feature-x"
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        task = store.add(prompt="Review feature X", task_type="review", depends_on=impl.id)
+        task.slug = "20260213-review-feature-x"
+        task.tags = ("cross-project",)
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.model = None
+        config.max_steps = 10
+        config.timeout_minutes = 10
+        config.verify_command = ""
+        config.review_verify_timeout_seconds = 120
+
+        def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
+            report_dir = work_dir / ".gza" / "reviews"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text("# Review\n\nVerdict: CHANGES_REQUESTED")
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=resume_session_id,
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        git = Mock()
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=0)
+        git.get_diff_numstat.return_value = ""
+        git.get_diff.return_value = ""
+        git.get_diff_stat.return_value = ""
+
+        passed_fingerprint = "c" * 64
+        failed_fingerprint = "d" * 64
+        project_results = (
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="services/foo",
+                working_directory="services/foo",
+                result=ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="deadbeef",
+                    reviewed_base_sha="cafebabe",
+                    working_directory="services/foo",
+                    output=(
+                        "gza-verify phase=passed name=ruff duration_seconds=0.5 "
+                        f"tree_fingerprint={passed_fingerprint}"
+                    ),
+                ),
+            ),
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="libs/bar",
+                working_directory="libs/bar",
+                result=ReviewVerifyResult(
+                    command="./bin/bar-verify",
+                    status="failed",
+                    exit_status="7",
+                    captured_at=datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="deadbeef",
+                    reviewed_base_sha="cafebabe",
+                    working_directory="libs/bar",
+                    failure="verify failed",
+                    output=(
+                        "gza-verify phase=failed name=pytest duration_seconds=2.75 "
+                        f"tree_fingerprint={failed_fingerprint}\n"
+                        "bar failed"
+                    ),
+                ),
+            ),
+        )
+        aggregate = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="failed",
+            exit_status="1 passed, 1 failed, 0 unavailable",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            working_directory="(per-project; see artifact)",
+            failure="one or more affected projects failed review verification",
+        )
+        cross_project_verify = CrossProjectReviewVerifyResult(
+            markdown=(
+                "## verify_command result\n\n"
+                "- Command: `(per-project verify_command)`\n"
+                "- Status: failed\n"
+                "- Exit status: 1 passed, 1 failed, 0 unavailable\n"
+                "- Captured at: 2026-01-01T00:00:00+00:00\n"
+                "- Working directory: `(per-project; see artifact)`\n"
+                "- Reviewed branch: `gza/20260212-implement-feature-x`\n"
+                "- Reviewed head: `deadbeef`\n"
+                "- Reviewed base/default SHA: `cafebabe`\n"
+                "- Failure: one or more affected projects failed review verification\n\n"
+                "Per affected project:\n\n"
+                "### services/foo\n\n"
+                "- Status: passed\n\n"
+                "### libs/bar\n\n"
+                "- Status: failed"
+            ),
+            aggregate_result=aggregate,
+            project_results=project_results,
+        )
+
+        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"), \
+             patch("gza.runner._run_review_verify_commands_for_projects", return_value=cross_project_verify), \
+             patch("gza.runner.post_review_to_pr"):
+            exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert exit_code == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        artifact_payload = json.loads(
+            (tmp_path / refreshed.review_verify_artifact_file).read_text(encoding="utf-8")
+        )
+        assert artifact_payload["aggregate_result"]["phase_results"] == []
+        assert artifact_payload["project_results"] == [
+            {
+                "scope": "services/foo",
+                "working_directory": "services/foo",
+                "skip_reason": None,
+                "result": {
+                    "command": "./bin/foo-verify",
+                    "status": "passed",
+                    "exit_status": "0",
+                    "captured_at": "2026-01-01T00:00:01+00:00",
+                    "reviewed_branch": impl.branch,
+                    "reviewed_head_sha": "deadbeef",
+                    "reviewed_base_sha": "cafebabe",
+                    "working_directory": "services/foo",
+                    "failure": None,
+                    "output": (
+                        "gza-verify phase=passed name=ruff duration_seconds=0.5 "
+                        f"tree_fingerprint={passed_fingerprint}"
+                    ),
+                    "phase_results": [
+                        {
+                            "duration_seconds": 0.5,
+                            "name": "ruff",
+                            "status": "passed",
+                            "tree_fingerprint": passed_fingerprint,
+                        }
+                    ],
+                },
+            },
+            {
+                "scope": "libs/bar",
+                "working_directory": "libs/bar",
+                "skip_reason": None,
+                "result": {
+                    "command": "./bin/bar-verify",
+                    "status": "failed",
+                    "exit_status": "7",
+                    "captured_at": "2026-01-01T00:00:02+00:00",
+                    "reviewed_branch": impl.branch,
+                    "reviewed_head_sha": "deadbeef",
+                    "reviewed_base_sha": "cafebabe",
+                    "working_directory": "libs/bar",
+                    "failure": "verify failed",
+                    "output": (
+                        "gza-verify phase=failed name=pytest duration_seconds=2.75 "
+                        f"tree_fingerprint={failed_fingerprint}\n"
+                        "bar failed"
+                    ),
+                    "phase_results": [
+                        {
+                            "duration_seconds": 2.75,
+                            "name": "pytest",
+                            "status": "failed",
+                            "tree_fingerprint": failed_fingerprint,
+                        }
+                    ],
+                },
+            },
+        ]
 
     def test_cross_project_review_persists_unavailable_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
