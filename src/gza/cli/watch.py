@@ -18,7 +18,11 @@ from typing import Any, Literal, TypeVar, cast
 from rich.text import Text
 
 from .. import colors as _colors, lineage
-from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
+from ..advance_engine import (
+    WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS,
+    _resolve_and_persist_post_merge_rebase_state,
+    _resolve_current_merge_source,
+)
 from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -112,7 +116,7 @@ _WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset(
-    {"retry-limit-reached", "retryable-provider-error", WATCH_NO_PROGRESS_BACKSTOP_REASON}
+    set(WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS) | {WATCH_NO_PROGRESS_BACKSTOP_REASON}
 )
 _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"

@@ -185,6 +185,7 @@ def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_p
             "description": "SKIP: manual intervention required",
             "needs_attention_reason": "retry-limit-reached",
             "subject_task_id": "gza-999999",
+            "noop_improve_kind": "verify_only",
         },
     )
 
@@ -197,6 +198,7 @@ def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_p
     )
 
     assert projected.values["next_action_owner_id"] == impl.id
+    assert projected.values["next_action_noop_improve_kind"] == "verify_only"
 
 
 def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_task_id(

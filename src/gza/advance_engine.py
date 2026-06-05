@@ -56,12 +56,60 @@ from gza.source_followup import (
 )
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
+PARK_REASON_AWAITING_HUMAN_REVIEW = "awaiting-human-review"
+PARK_REASON_EXPLORE_NEEDS_FOLLOW_UP_DECISION = "explore-needs-follow-up-decision"
+PARK_REASON_PROJECT_SCOPE_VIOLATION = "project-scope-violation"
+PARK_REASON_PROJECT_SCOPE_UNVERIFIED = "project-scope-unverified"
+PARK_REASON_MERGE_SOURCE_NEEDS_MANUAL_RESOLUTION = "merge-source-needs-manual-resolution"
+PARK_REASON_REBASE_FAILED_NEEDS_MANUAL_RESOLUTION = "rebase-failed-needs-manual-resolution"
+PARK_REASON_REBASE_DID_NOT_UNBLOCK_MERGE = "rebase-did-not-unblock-merge"
+PARK_REASON_REBASE_FAILURE_CIRCUIT_BREAKER = "rebase-failure-circuit-breaker"
+PARK_REASON_BRANCH_ALREADY_REBASED_LINEAGE_INCOMPLETE = "branch-already-rebased-lineage-incomplete"
+PARK_REASON_STALE_REVIEW_NEEDS_MANUAL_REFRESH = "stale-review-needs-manual-refresh"
+PARK_REASON_CLOSING_REVIEW_NEEDS_MANUAL_REFRESH = "closing-review-needs-manual-refresh"
+PARK_REASON_CLOSING_REVIEW_FAILED_MAX_RETRIES = "closing-review-failed-max-retries"
+PARK_REASON_REVIEW_NEEDS_MANUAL_CREATION = "review-needs-manual-creation"
+PARK_REASON_REVIEW_VERDICT_NEEDS_MANUAL_ATTENTION = "review-verdict-needs-manual-attention"
+PARK_REASON_IMPROVE_NO_OP = "improve-no-op"
+PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE = "verify-noop-improve-branch-tip-unavailable"
+PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE = "verify-noop-improve-diff-probe-unavailable"
+PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES = "verify-blocked-no-code-issues"
+PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS = "duplicate-blocker-no-progress"
+PARK_REASON_REVIEW_MAX_CYCLES_REACHED = "review-max-cycles-reached"
+PARK_REASON_RETRY_LIMIT_REACHED = "retry-limit-reached"
+PARK_REASON_RETRYABLE_PROVIDER_ERROR = "retryable-provider-error"
+WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
+    {
+        PARK_REASON_AWAITING_HUMAN_REVIEW,
+        PARK_REASON_EXPLORE_NEEDS_FOLLOW_UP_DECISION,
+        PARK_REASON_PROJECT_SCOPE_VIOLATION,
+        PARK_REASON_PROJECT_SCOPE_UNVERIFIED,
+        PARK_REASON_MERGE_SOURCE_NEEDS_MANUAL_RESOLUTION,
+        PARK_REASON_REBASE_FAILED_NEEDS_MANUAL_RESOLUTION,
+        PARK_REASON_REBASE_DID_NOT_UNBLOCK_MERGE,
+        PARK_REASON_REBASE_FAILURE_CIRCUIT_BREAKER,
+        PARK_REASON_BRANCH_ALREADY_REBASED_LINEAGE_INCOMPLETE,
+        PARK_REASON_STALE_REVIEW_NEEDS_MANUAL_REFRESH,
+        PARK_REASON_CLOSING_REVIEW_NEEDS_MANUAL_REFRESH,
+        PARK_REASON_CLOSING_REVIEW_FAILED_MAX_RETRIES,
+        PARK_REASON_REVIEW_NEEDS_MANUAL_CREATION,
+        PARK_REASON_REVIEW_VERDICT_NEEDS_MANUAL_ATTENTION,
+        PARK_REASON_IMPROVE_NO_OP,
+        PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
+        PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
+        PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
+        PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS,
+        PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
+        PARK_REASON_RETRY_LIMIT_REACHED,
+        PARK_REASON_RETRYABLE_PROVIDER_ERROR,
+    }
+)
 FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
     {
-        "review-max-cycles-reached",
+        PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
         "automatic-recovery-disabled",
-        "retry-limit-reached",
-        "retryable-provider-error",
+        PARK_REASON_RETRY_LIMIT_REACHED,
+        PARK_REASON_RETRYABLE_PROVIDER_ERROR,
     }
 )
 ALLOW_NOOP_IMPROVE_TAG = "allow-noop-improve"
@@ -632,6 +680,37 @@ def _latest_review_is_verify_blocked_only(ctx: AdvanceContext) -> bool:
     )
 
 
+def _noop_improve_kind(ctx: AdvanceContext) -> str:
+    return "verify_only" if _latest_review_is_verify_blocked_only(ctx) else "real_blocker"
+
+
+def _has_verify_only_noop_recovery_clearance(ctx: AdvanceContext) -> bool:
+    if not ctx.review_cleared:
+        return False
+    if ctx.review_verdict != "CHANGES_REQUESTED":
+        return False
+    if not _latest_review_is_verify_blocked_only(ctx):
+        return False
+    if ctx.latest_completed_review is None:
+        return False
+    if ctx.rebase_invalidates_review or ctx.closing_review_action is not None:
+        return False
+    if ctx.current_branch_head_sha is None or not ctx.task.branch:
+        return False
+    if ctx.task.review_verify_status != "passed":
+        return False
+    if ctx.task.review_verify_captured_at is None:
+        return False
+    review_completed_at = ctx.latest_completed_review.completed_at
+    if review_completed_at is None:
+        return False
+    if _normalize_time(ctx.task.review_verify_captured_at) < _normalize_time(review_completed_at):
+        return False
+    if ctx.task.review_verify_branch != ctx.task.branch:
+        return False
+    return ctx.task.review_verify_head_sha == ctx.current_branch_head_sha
+
+
 def _normalize_blocker_title(title: str) -> str:
     normalized = re.sub(r"`+", "", title).strip().lower()
     normalized = re.sub(r"^#+\s*", "", normalized)
@@ -833,8 +912,9 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
                 f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
                 f"(latest {latest_noop_id}); {source} no tracked diff change.{opt_out_note}"
             ),
+            "noop_improve_kind": _noop_improve_kind(ctx),
         },
-        reason="improve-no-op",
+        reason=PARK_REASON_IMPROVE_NO_OP,
         subject_task_id=ctx.task.id,
     )
 
@@ -854,8 +934,9 @@ def _noop_improve_branch_tip_unavailable_action(ctx: AdvanceContext) -> dict[str
                 f"(latest {latest_noop_id}); latest review is blocked only by verify_command, "
                 f"but lifecycle cannot prove the current branch tip. {detail}."
             ),
+            "noop_improve_kind": _noop_improve_kind(ctx),
         },
-        reason="verify-noop-improve-branch-tip-unavailable",
+        reason=PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
         subject_task_id=ctx.task.id,
     )
 
@@ -875,8 +956,9 @@ def _noop_improve_verify_probe_unavailable_action(ctx: AdvanceContext) -> dict[s
             ),
             "verify_command_availability_error": detail,
             "verify_command_availability_revision_range": revision_range,
+            "noop_improve_kind": _noop_improve_kind(ctx),
         },
-        reason="verify-noop-improve-diff-probe-unavailable",
+        reason=PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
         subject_task_id=ctx.task.id,
     )
 
@@ -926,6 +1008,7 @@ def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
         "implementation_task": ctx.task,
         "verify_provenance_state": latest_review_verify_provenance_state,
         "current_branch_head_sha": current_branch_head_sha,
+        "noop_improve_kind": _noop_improve_kind(ctx),
     }
     if ctx.latest_noop_improve is not None:
         action["latest_noop_improve"] = ctx.latest_noop_improve
@@ -942,6 +1025,7 @@ def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
                 f"SKIP: same review blocker repeated for {streak.cycles} consecutive review cycles; "
                 "needs manual intervention"
             ),
+            "noop_improve_kind": _noop_improve_kind(ctx),
             "duplicate_blocker": {
                 "cycles": streak.cycles,
                 "title": streak.title,
@@ -949,7 +1033,7 @@ def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
                 "review_task_ids": streak.review_task_ids,
             },
         },
-        reason="duplicate-blocker-no-progress",
+        reason=PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS,
         subject_task_id=ctx.task.id,
     )
 
@@ -1858,7 +1942,10 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     if ctx.latest_completed_review is None:
         return False
     if ctx.review_cleared:
-        return True
+        return (
+            ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+            or _has_verify_only_noop_recovery_clearance(ctx)
+        )
     return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
@@ -2704,8 +2791,9 @@ ADVANCE_RULES: list[AdvanceRule] = [
                     "Investigate test performance or verify_timeout config."
                 ),
                 "review_task": ctx.latest_completed_review,
+                "noop_improve_kind": _noop_improve_kind(ctx),
             },
-            reason="verify-blocked-no-code-issues",
+            reason=PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
             subject_task_id=ctx.task.id,
         ),
     ),
@@ -2727,8 +2815,9 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "description": (
                     f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
                 ),
+                "noop_improve_kind": _noop_improve_kind(ctx),
             },
-            reason="review-max-cycles-reached",
+            reason=PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
             subject_task_id=ctx.task.id,
         ),
     ),

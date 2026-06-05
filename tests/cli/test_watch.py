@@ -40,6 +40,7 @@ from gza.cli.watch import (
     _should_reexec_watch,
     _task_snapshot,
     _watch_needs_attention_message,
+    _watch_parked_lineage_action,
     _watch_reexec_argv,
     _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
@@ -1236,7 +1237,7 @@ def test_watch_cycle_default_mode_attempt_cap_skips_failed_resume_and_starts_pen
     assert spawn_worker.call_args.kwargs["task_id"] == pending.id
 
 
-def test_watch_cycle_skipped_failed_descendant_does_not_emit_attention_without_owner_plan_attention(
+def test_watch_cycle_skipped_failed_descendant_surfaces_owner_parked_attention_once(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -1265,12 +1266,13 @@ def test_watch_cycle_skipped_failed_descendant_does_not_emit_attention_without_o
             log=log,
             restart_failed=True,
             max_recovery_attempts=config.max_resume_attempts,
-        )
+    )
 
     assert result.work_done is False
     text = log_path.read_text()
-    assert "ATTENTION" not in text
-    assert failed_rebase.id not in text
+    assert "ATTENTION" in text
+    assert "reason=rebase-failed-needs-manual-resolution" in text
+    assert failed_rebase.id in text
 
 
 def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_descendant(
@@ -1312,7 +1314,7 @@ def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_de
     attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
     assert len(attention_lines) == 1
     assert impl.id in attention_lines[0]
-    assert failed_rebase.id not in attention_lines[0]
+    assert failed_rebase.id in attention_lines[0]
 
 
 def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(tmp_path: Path) -> None:
@@ -1381,16 +1383,16 @@ def test_watch_cycle_show_skipped_emits_skip_for_failed_descendant_without_atten
             restart_failed=True,
             max_recovery_attempts=config.max_resume_attempts,
             show_skipped=True,
-        )
+    )
 
     assert result.work_done is False
     text = log_path.read_text()
-    assert "ATTENTION" not in text
+    assert "ATTENTION" in text
     assert any(
         "SKIP" in line and f"{impl.id} failed rebase: manual_failure_reason" in line
         for line in text.splitlines()
     )
-    assert failed_rebase.id not in text
+    assert failed_rebase.id in text
 
 
 def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
@@ -2290,6 +2292,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         assert review_task.id is not None
         review_task.status = "completed"
         review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
         store.update(review_task)
 
     rebase_task = None
@@ -5127,6 +5130,7 @@ def test_watch_cycle_improve_action_routes_to_iterate_without_creating_local_chi
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -5178,6 +5182,7 @@ def test_watch_cycle_improve_action_routes_failed_chain_to_iterate(tmp_path: Pat
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(
@@ -5244,6 +5249,7 @@ def test_watch_cycle_improve_action_with_manual_review_failure_routes_to_iterate
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(
@@ -5310,6 +5316,7 @@ def test_watch_cycle_attempt_capped_improve_chain_stays_parked_without_iterate_r
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -5383,6 +5390,7 @@ def test_watch_cycle_runs_pending_improve_even_when_failed_chain_is_parked(tmp_p
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -6309,6 +6317,99 @@ def test_watch_cycle_skips_parked_retry_limit_lineage_without_recomputing_or_spa
     assert not any(line.split(maxsplit=2)[1] == "START" for line in log_text.splitlines())
 
 
+def test_watch_cycle_surfaces_and_skips_parked_improve_no_op_lineage(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/parked-improve-no-op"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._query_owner_rows",
+            return_value=[
+                LineageOwnerRow(
+                    owner_task=impl,
+                    members=(impl,),
+                    tree=None,
+                    lineage_status="actionable",
+                    next_action={
+                        "type": "needs_discussion",
+                        "description": "SKIP: 2 consecutive no-op improves reached",
+                        "needs_attention_reason": "improve-no-op",
+                        "noop_improve_kind": "verify_only",
+                    },
+                    next_action_reason="test",
+                    unresolved_tasks=(impl,),
+                    unresolved_leaf_summary=(),
+                    lifecycle_action_task=impl,
+                )
+            ],
+        ),
+        patch("gza.cli.watch.determine_next_action", side_effect=AssertionError("parked lineage should not be recomputed")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("parked lineage should not spawn iterate")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    log_text = log_path.read_text()
+    assert "ATTENTION" in log_text
+    assert "reason=improve-no-op" in log_text
+    assert "START" not in log_text
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "improve-no-op",
+        "verify-noop-improve-branch-tip-unavailable",
+        "verify-noop-improve-diff-probe-unavailable",
+        "retry-limit-reached",
+    ],
+)
+def test_watch_parked_lineage_action_uses_shared_reason_taxonomy(reason: str) -> None:
+    row = LineageOwnerRow(
+        owner_task=SimpleNamespace(id="gza-1"),
+        members=(),
+        tree=None,
+        lineage_status="actionable",
+        next_action={
+            "type": "needs_discussion",
+            "description": f"SKIP: parked for {reason}",
+            "needs_attention_reason": reason,
+        },
+        next_action_reason="test",
+        unresolved_tasks=(),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+    )
+
+    parked = _watch_parked_lineage_action(row)
+
+    assert parked is row.next_action
+
+
 def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spawning_rebase(
     tmp_path: Path,
 ) -> None:
@@ -7069,6 +7170,7 @@ def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -7126,6 +7228,7 @@ def test_watch_cycle_parks_repeated_identical_iterate_no_progress_across_restart
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -7185,6 +7288,7 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     candidate = build_watch_progress_candidate(
@@ -7446,6 +7550,7 @@ def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_pat
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -7489,6 +7594,7 @@ def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     action = {"type": "improve", "review_task": review}
@@ -10534,6 +10640,7 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     improve = store.add(
@@ -10600,6 +10707,7 @@ def test_watch_cycle_run_improve_routes_retry_chain_through_root_impl_iterate(tm
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(

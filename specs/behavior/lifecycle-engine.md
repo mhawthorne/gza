@@ -184,13 +184,23 @@ When a current review exists for the implementation lineage:
 
 - Review→improve cycles reach `max_review_cycles` → `max_cycles_reached`.
 - Consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
-  `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`).
+  `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`) when the
+  blocker is a real code or comment issue, or when fresh verify-only recovery
+  cannot be proved safely.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the
   compared reviews, any non-`CHANGES_REQUESTED` review, or a changed blocker.
 - Last reviews fail only on verify timeout (no code issues) → `needs_discussion` (reason
-  `verify-blocked-no-code-issues`); do not keep spawning improves that cannot help.
+  `verify-blocked-no-code-issues`) unless the no-op-improve bound is reached and the
+  engine can attempt a fresh SHA-bound verify-only recovery for the current unchanged tip.
+- If the latest review is blocked only by verify, the current implementation tip is
+  unchanged from the reviewed code, and fresh verify evidence for that same tip passes,
+  the implementation becomes mergeable directly; the engine MUST consume persisted,
+  SHA-bound verify clearance on the next evaluation rather than spawn another review.
+- If that fresh verify-only recovery fails, is unavailable, or the evaluated current tip
+  cannot be matched to the freshly verified tip, the lineage MUST park for a human
+  (`needs_discussion`) instead of re-deriving the same verify-only no-op action forever.
 
 **Improve chain invariant (load-bearing; source of past bugs).** An (implementation,
 review) pair can spawn a *chain* of improves (the original plus retries/resumes). To find
@@ -250,6 +260,14 @@ failure *and* actionable merge/review work remains eligible for the latter.
   mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
   MUST reject merge representatives whose execution status is not `completed` or
   `unmerged`.
+
+## Observability
+
+- No-op improve lifecycle actions and terminal parked outcomes MUST classify the branch as
+  `noop_improve_kind = "verify_only"` when the latest blocker is verify-only, otherwise
+  `noop_improve_kind = "real_blocker"`.
+- Operator surfaces that already project next-action metadata MAY expose this structured
+  field directly; merge or parking decisions MUST NOT rely on prompt text alone.
 
 ## Parked reason codes
 

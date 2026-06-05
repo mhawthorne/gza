@@ -29,6 +29,7 @@ from ..runner import (
 )
 from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
 from .advance_engine import (
+    PARK_REASON_IMPROVE_NO_OP,
     classify_advance_action,
     failed_recovery_decision_to_attention_action,
 )
@@ -108,6 +109,7 @@ class AdvanceActionExecutionResult:
     handled_task_id: str | None = None
     created_task: DbTask | None = None
     improve_mode: str | None = None
+    noop_improve_kind: str | None = None
     failed_improve: DbTask | None = None
     attention_type: str | None = None
     attention_reason: str | None = None
@@ -127,10 +129,13 @@ class AdvanceExecutionNeedsAttention:
 class NoopVerifyThenReviewOutcome:
     """Shared execution outcome for verify-then-rereview no-op recovery."""
 
-    status: Literal["create_review", "review_cleared", "needs_attention", "skip", "error"]
+    status: Literal["merge_ready", "needs_attention", "skip", "error"]
     message: str
     verify_markdown: str | None = None
     review_task: DbTask | None = None
+    reviewed_head_sha: str | None = None
+    verify_status: str | None = None
+    noop_improve_kind: str | None = None
 
 
 _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS = (GitError, OSError, RuntimeError, ValueError)
@@ -198,8 +203,9 @@ def run_noop_improve_verify_then_review(
     action: dict[str, Any],
     context: AdvanceActionExecutionContext,
 ) -> NoopVerifyThenReviewOutcome:
-    """Shared no-op improve escape hatch: fresh verify on tip, then create a new review."""
+    """Shared no-op improve escape hatch: fresh verify on tip, then mark merge-ready."""
     description = str(action.get("description", "Re-run verify_command before re-review"))
+    noop_improve_kind = str(action.get("noop_improve_kind", "verify_only"))
 
     review_task = action.get("review_task")
     if not isinstance(review_task, DbTask) or review_task.id is None or task.id is None:
@@ -225,7 +231,13 @@ def run_noop_improve_verify_then_review(
 
     worktree_label = task.slug or task.id or "review-verify"
     worktree_path = Path(context.config.worktree_path) / f"{worktree_label}-noop-review-verify"
-    timeout_seconds = getattr(context.config, "review_verify_timeout_seconds", 120)
+    timeout_seconds = getattr(context.config, "noop_improve_verify_timeout_seconds", None)
+    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        timeout_minutes = getattr(context.config, "timeout_minutes", None)
+        if isinstance(timeout_minutes, int) and timeout_minutes > 0:
+            timeout_seconds = timeout_minutes * 60
+        else:
+            timeout_seconds = getattr(context.config, "review_verify_timeout_seconds", 120)
     if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
         timeout_seconds = 120
 
@@ -314,6 +326,7 @@ def run_noop_improve_verify_then_review(
                 f"SKIP: {description}. unable to prepare or run fresh verify_command: {lifecycle_failure}.",
                 cleanup_failure,
             ),
+            noop_improve_kind=noop_improve_kind,
         )
     if reviewed_head_sha is None:
         return NoopVerifyThenReviewOutcome(
@@ -322,6 +335,7 @@ def run_noop_improve_verify_then_review(
                 f"SKIP: {description}. unable to resolve review worktree HEAD before verify_command ran.",
                 cleanup_failure,
             ),
+            noop_improve_kind=noop_improve_kind,
         )
     if verify_result is None or verify_markdown is None:
         return NoopVerifyThenReviewOutcome(
@@ -330,6 +344,7 @@ def run_noop_improve_verify_then_review(
                 f"SKIP: {description}. verify_command is unavailable.",
                 cleanup_failure,
             ),
+            noop_improve_kind=noop_improve_kind,
         )
     _capture_review_verify_result(
         context.config,
@@ -347,6 +362,9 @@ def run_noop_improve_verify_then_review(
                 f"{cleanup_failure}."
             ),
             verify_markdown=verify_markdown,
+            reviewed_head_sha=reviewed_head_sha,
+            verify_status=verify_result.status,
+            noop_improve_kind=noop_improve_kind,
         )
 
     if verify_result.status != "passed":
@@ -355,46 +373,55 @@ def run_noop_improve_verify_then_review(
             status="needs_attention",
             message=f"SKIP: {description}. Fresh verify_command {verify_result.status} ({detail}).",
             verify_markdown=verify_markdown,
+            reviewed_head_sha=reviewed_head_sha,
+            verify_status=verify_result.status,
+            noop_improve_kind=noop_improve_kind,
         )
 
     expected_head_sha = action.get("current_branch_head_sha")
     current_head_sha = expected_head_sha if isinstance(expected_head_sha, str) and expected_head_sha else None
+    if current_head_sha is None or current_head_sha != reviewed_head_sha:
+        return NoopVerifyThenReviewOutcome(
+            status="needs_attention",
+            message=(
+                f"SKIP: {description}. current branch tip changed since lifecycle selected reverify "
+                f"(expected {current_head_sha or 'unknown'}, verified {reviewed_head_sha}); rerun lifecycle."
+            ),
+            verify_markdown=verify_markdown,
+            reviewed_head_sha=reviewed_head_sha,
+            verify_status=verify_result.status,
+            noop_improve_kind=noop_improve_kind,
+        )
     persisted_task = context.store.get(task.id) if task.id is not None else None
     task_with_evidence = persisted_task if persisted_task is not None else task
     if _fresh_verify_resolves_verify_only_review(
         task=task_with_evidence,
         review_task=review_task,
         current_branch=task.branch,
-        current_head_sha=current_head_sha or reviewed_head_sha,
+        current_head_sha=current_head_sha,
         context=context,
     ):
         return NoopVerifyThenReviewOutcome(
-            status="review_cleared",
+            status="merge_ready",
             message=(
                 f"Fresh verify passed for {task.branch} at {verify_result.reviewed_head_sha}; "
-                f"cleared verify-only review block on {task.id}"
+                f"merge-ready via verify-only no-op recovery on {task.id}"
             ),
             verify_markdown=verify_markdown,
-        )
-
-    create_result = context.prepare_create_review(task)
-    if create_result.status == "skip":
-        return NoopVerifyThenReviewOutcome(status="skip", message=create_result.message, verify_markdown=verify_markdown)
-    new_review = create_result.review_task
-    if new_review is None or new_review.id is None:
-        return NoopVerifyThenReviewOutcome(
-            status="error",
-            message="review creation returned no task after fresh verify",
-            verify_markdown=verify_markdown,
+            reviewed_head_sha=reviewed_head_sha,
+            verify_status=verify_result.status,
+            noop_improve_kind=noop_improve_kind,
         )
     return NoopVerifyThenReviewOutcome(
-        status="create_review",
+        status="needs_attention",
         message=(
-            f"Fresh verify passed for {task.branch} at {verify_result.reviewed_head_sha}; "
-            f"created review {new_review.id} to re-grade current tip"
+            f"SKIP: {description}. fresh verify passed but the latest review is not eligible for "
+            "verify-only no-op recovery; rerun lifecycle."
         ),
         verify_markdown=verify_markdown,
-        review_task=new_review,
+        reviewed_head_sha=reviewed_head_sha,
+        verify_status=verify_result.status,
+        noop_improve_kind=noop_improve_kind,
     )
 
 
@@ -790,13 +817,14 @@ def execute_advance_action(
                 status="skip",
                 message=outcome.message,
                 attention_type="needs_discussion",
-                attention_reason="improve-no-op",
+                attention_reason=PARK_REASON_IMPROVE_NO_OP,
+                noop_improve_kind=outcome.noop_improve_kind,
             )
         if outcome.status == "skip":
             return AdvanceActionExecutionResult(action_type=action_type, status="skip", message=outcome.message)
         if outcome.status == "error":
             return AdvanceActionExecutionResult(action_type=action_type, status="error", message=outcome.message)
-        if outcome.status == "review_cleared":
+        if outcome.status == "merge_ready":
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="success",
@@ -804,33 +832,9 @@ def execute_advance_action(
                 success_message=outcome.message,
                 work_done=True,
                 handled_task_id=task.id,
+                noop_improve_kind=outcome.noop_improve_kind,
             )
-        new_review = outcome.review_task
-        assert new_review is not None and new_review.id is not None
-
-        prepared_review_task, prepare_error = _prepare_background_start(
-            context=context,
-            action_type=action_type,
-            task=new_review,
-            worker_label="review",
-            rollback_on_failure=True,
-        )
-        if prepared_review_task is None:
-            assert prepare_error is not None
-            return prepare_error
-        assert prepared_review_task.id is not None
-
-        rc = context.spawn_worker(prepared_review_task, "review")
-        result = _spawn_result(
-            action_type=action_type,
-            rc=rc,
-            handled_task_id=prepared_review_task.id,
-            worker_label="review",
-            created_task=prepared_review_task,
-        )
-        result.success_message = outcome.message
-        result.message = outcome.verify_markdown or outcome.message
-        return result
+        return AdvanceActionExecutionResult(action_type=action_type, status="error", message=outcome.message)
 
     if action_type == "improve":
         review_task = action.get("review_task")

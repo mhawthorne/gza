@@ -2020,9 +2020,19 @@ def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path
         changed_diff=False,
     )
     impl.review_cleared_at = improve.completed_at
+    impl.review_verify_status = "passed"
+    impl.review_verify_branch = impl.branch
+    impl.review_verify_head_sha = "current-sha"
+    impl.review_verify_captured_at = improve.completed_at + timedelta(seconds=1)
     store.update(impl)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
+    )
 
     assert action["type"] == "merge"
     assert "improve-no-op" not in action["description"]
@@ -2076,6 +2086,7 @@ def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tm
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "verify_noop_improve_then_review"
+    assert action["noop_improve_kind"] == "verify_only"
     assert action["type"] != "merge"
 
 
@@ -2120,6 +2131,7 @@ def test_substantive_noop_improves_still_park_without_auto_clear(tmp_path: Path)
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == "real_blocker"
 
 
 def test_verify_blocked_noop_improves_return_reverify_action_when_review_sha_is_stale(
@@ -2186,6 +2198,7 @@ def test_verify_blocked_noop_improves_return_reverify_action_when_review_sha_is_
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "verify_noop_improve_then_review"
+    assert action["noop_improve_kind"] == "verify_only"
     assert action["verify_provenance_state"] == "stale"
     assert action["current_branch_head_sha"] == "newsha"
 
@@ -4345,8 +4358,8 @@ def test_failed_rebase_is_superseded_by_later_review_clear_event(
         "main",
     )
 
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (previous review addressed)"
+    assert action["type"] == "create_review"
+    assert action["description"] == "Create review (required before merge)"
 
 
 def test_failed_rebase_with_older_review_clear_event_still_requires_manual_resolution(

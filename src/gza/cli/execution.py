@@ -4260,6 +4260,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     "type": "needs_discussion",
                     "description": outcome.message,
                     "needs_attention_reason": "improve-no-op",
+                    "noop_improve_kind": outcome.noop_improve_kind,
                     "subject_task_id": impl_task.id,
                 }
                 final_attention_task = impl_task
@@ -4270,19 +4271,20 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 final_stop_reason = "review_in_progress" if "already pending" in outcome.message else "needs_discussion"
                 print(f"  {outcome.message.removeprefix('SKIP: ')}")
                 break
-            if outcome.status == "review_cleared":
+            if outcome.status == "merge_ready":
                 final_status = "merge_ready"
-                final_stop_reason = "verify_only_review_cleared"
+                final_stop_reason = "verify_only_noop_merge_ready"
                 print(f"  {outcome.message}")
                 break
-            if outcome.status == "error" or outcome.review_task is None:
+            if outcome.status == "error":
                 final_status = "blocked"
                 final_stop_reason = "review_failed"
-                print(f"  Error creating fresh review after verify: {outcome.message}")
+                print(f"  Error finishing verify-only no-op recovery: {outcome.message}")
                 break
-            action_task = outcome.review_task
-            assert action_task.id is not None
-            print(f"  Fresh verify passed; running review {action_task.id}...")
+            final_status = "blocked"
+            final_stop_reason = "needs_discussion"
+            print(f"  {outcome.message.removeprefix('SKIP: ')}")
+            break
         elif action_type == "improve":
             if isinstance(prepared_action_task, DbTask):
                 action_task = prepared_action_task

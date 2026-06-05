@@ -52,7 +52,18 @@ def _make_noop_verify_fixture(tmp_path: Path) -> tuple[Any, Any, DbTask, DbTask]
     assert review.id is not None
     review.slug = "20260605-review-feature"
     _mark_completed(review)
-    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: mypy error\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
     store.update(review)
 
     config = SimpleNamespace(
@@ -597,8 +608,10 @@ def test_improve_executor_uses_context_trigger_source_for_followup_after_complet
     assert spawned == [(result.created_task.id, "improve")]
 
 
-def test_run_noop_improve_verify_then_review_creates_review_after_green_verify(tmp_path: Path) -> None:
+def test_run_noop_improve_verify_then_review_returns_merge_ready_after_green_verify(tmp_path: Path) -> None:
     store, config, impl, review = _make_noop_verify_fixture(tmp_path)
+    review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
+    store.update(review)
 
     context = AdvanceActionExecutionContext(
         store=store,
@@ -608,9 +621,7 @@ def test_run_noop_improve_verify_then_review_creates_review_after_green_verify(t
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
         prepare_task_for_background_start=lambda task, _rollback: task,
-        prepare_create_review=lambda parent: type(
-            "_R", (), {"status": "created", "review_task": store.add("Fresh review", task_type="review", depends_on=parent.id), "message": "Created review"}
-        )(),
+        prepare_create_review=lambda _parent: pytest.fail("fresh review should not run"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
@@ -641,14 +652,21 @@ def test_run_noop_improve_verify_then_review_creates_review_after_green_verify(t
          ):
         outcome = run_noop_improve_verify_then_review(
             task=impl,
-            action={"type": "verify_noop_improve_then_review", "review_task": review},
+            action={
+                "type": "verify_noop_improve_then_review",
+                "review_task": review,
+                "current_branch_head_sha": "deadbeef",
+                "noop_improve_kind": "verify_only",
+            },
             context=context,
         )
 
-    assert outcome.status == "create_review"
-    assert outcome.review_task is not None
-    assert outcome.review_task.depends_on == impl.id
-    assert "Fresh verify passed" in outcome.message
+    assert outcome.status == "merge_ready"
+    assert outcome.review_task is None
+    assert outcome.reviewed_head_sha == "deadbeef"
+    assert outcome.verify_status == "passed"
+    assert outcome.noop_improve_kind == "verify_only"
+    assert "merge-ready via verify-only no-op recovery" in outcome.message
 
 
 def test_run_noop_improve_verify_then_review_persists_verify_evidence_before_clearing_verify_only_review(
@@ -719,7 +737,7 @@ def test_run_noop_improve_verify_then_review_persists_verify_evidence_before_cle
             context=context,
         )
 
-    assert outcome.status == "review_cleared"
+    assert outcome.status == "merge_ready"
     refreshed_impl = store.get(impl.id)
     assert refreshed_impl is not None
     assert refreshed_impl.review_cleared_at is not None
@@ -737,6 +755,65 @@ def test_run_noop_improve_verify_then_review_persists_verify_evidence_before_cle
     assert artifact_payload["aggregate_result"]["status"] == "passed"
     assert artifact_payload["aggregate_result"]["reviewed_branch"] == impl.branch
     assert artifact_payload["aggregate_result"]["reviewed_head_sha"] == "deadbeef"
+
+
+def test_run_noop_improve_verify_then_review_fails_closed_when_verified_tip_mismatches_selected_tip(
+    tmp_path: Path,
+) -> None:
+    store, config, impl, review = _make_noop_verify_fixture(tmp_path)
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("fresh review should not run"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=SimpleNamespace(
+            default_branch=lambda: "main",
+            rev_parse_if_exists=lambda _ref: "cafebabe",
+            worktree_remove=lambda _path, force=True: None,
+        ),
+    )
+
+    with patch("gza.cli.advance_executor._create_detached_review_worktree"), patch(
+        "gza.cli.advance_executor.Git.rev_parse_if_exists",
+        return_value="deadbeef",
+    ), patch(
+        "gza.cli.advance_executor._run_review_verify_command",
+        return_value=ReviewVerifyResult(
+            command=config.verify_command,
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 1, 19, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+        ),
+    ):
+        outcome = run_noop_improve_verify_then_review(
+            task=impl,
+            action={
+                "type": "verify_noop_improve_then_review",
+                "review_task": review,
+                "current_branch_head_sha": "badc0de",
+            },
+            context=context,
+        )
+
+    assert outcome.status == "needs_attention"
+    assert "current branch tip changed since lifecycle selected reverify" in outcome.message
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    assert refreshed_impl.review_cleared_at is None
 
 
 def test_run_noop_improve_verify_then_review_parks_when_worktree_creation_fails(tmp_path: Path) -> None:
@@ -1152,6 +1229,8 @@ def test_run_noop_improve_verify_then_review_parks_when_cleanup_fails_after_gree
 
 def test_run_noop_improve_verify_then_review_uses_cross_project_review_verifier(tmp_path: Path) -> None:
     store, config, impl, review = _make_noop_verify_fixture(tmp_path)
+    review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
+    store.update(review)
     impl.tags = ("cross-project",)
     store.update(impl)
     config.verify_command = ""
@@ -1165,8 +1244,6 @@ def test_run_noop_improve_verify_then_review_uses_cross_project_review_verifier(
         ),
     )
 
-    fresh_review = store.add("Fresh review", task_type="review", depends_on=impl.id)
-    assert fresh_review.id is not None
     context = AdvanceActionExecutionContext(
         store=store,
         trigger_source="manual",
@@ -1175,11 +1252,7 @@ def test_run_noop_improve_verify_then_review_uses_cross_project_review_verifier(
         use_iterate_for_create_implement=False,
         use_iterate_for_needs_rebase=False,
         prepare_task_for_background_start=lambda task, _rollback: task,
-        prepare_create_review=lambda _task: type(
-            "_R",
-            (),
-            {"status": "created", "review_task": fresh_review, "message": "created"},
-        )(),
+        prepare_create_review=lambda _task: pytest.fail("fresh review should not run"),
         create_resume_task=lambda _task: pytest.fail("unused"),
         create_rebase_task=lambda _task: pytest.fail("unused"),
         create_implement_task=lambda _task: pytest.fail("unused"),
@@ -1219,14 +1292,19 @@ def test_run_noop_improve_verify_then_review_uses_cross_project_review_verifier(
     ):
         outcome = run_noop_improve_verify_then_review(
             task=impl,
-            action={"type": "verify_noop_improve_then_review", "review_task": review},
+            action={
+                "type": "verify_noop_improve_then_review",
+                "review_task": review,
+                "current_branch_head_sha": "deadbeef",
+                "noop_improve_kind": "verify_only",
+            },
             context=context,
         )
 
-    assert outcome.status == "create_review"
-    assert outcome.review_task is fresh_review
+    assert outcome.status == "merge_ready"
+    assert outcome.review_task is None
     assert cross_project_verify.call_count == 1
-    assert "Fresh verify passed" in outcome.message
+    assert "merge-ready via verify-only no-op recovery" in outcome.message
 
 
 @pytest.mark.parametrize(

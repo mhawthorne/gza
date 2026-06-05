@@ -179,6 +179,16 @@ When the installed `gza` package fingerprint changes while watch is running:
   shared needs-attention reason of `watch-no-progress-backstop` and MUST stop respawning
   that unchanged no-op automatically.
 
+### 8a. Human-needed parked lineages surface once, then stay parked
+
+- When the shared lifecycle engine returns a human-needed parked action for a lineage,
+  watch MUST emit an operator-visible `ATTENTION` event for that parked state once, then
+  treat that lineage as parked on later cycles until persisted lineage state changes.
+- Watch MUST consume the engine's shared parked-reason taxonomy rather than maintain a
+  separate hand-curated allowlist of parked slugs.
+- Watch MUST NOT start a new iterate worker for a lineage whose latest shared action is
+  already one of those parked human-needed states.
+
 ### 9. Tag scope is a hard boundary
 
 - `watch --tag ...` MUST only act on work that matches the requested scope.

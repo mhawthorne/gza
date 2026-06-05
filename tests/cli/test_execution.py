@@ -7,7 +7,7 @@ import os
 import re
 import signal as signal_mod
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -6518,6 +6518,10 @@ class TestIterateCommand:
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
             patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "merge", "description": "Merge (previous review addressed)"},
+            ),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -6593,7 +6597,7 @@ class TestIterateCommand:
         assert "Iteration 1/1: run_review" in output
         assert "Iterate complete: APPROVED" in output
 
-    def test_iterate_review_cleared_merge_reports_merge_ready_not_approved(
+    def test_iterate_verify_only_review_clearance_reports_merge_ready_not_approved(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -6605,15 +6609,29 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
-        prior_review = store.add("Review", task_type="review", depends_on=impl.id)
+        prior_review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
         prior_review.status = "completed"
-        prior_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        prior_review.output_content = (
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
         prior_review.completed_at = datetime.now(UTC)
         store.update(prior_review)
 
-        # Mark review as cleared and ensure no newer review/improve iteration exists,
-        # so shared engine returns the "reviews_all_cleared" merge path.
-        impl.review_cleared_at = datetime.now(UTC)
+        # Persist verify-only clearance for the current unchanged tip.
+        impl.review_cleared_at = prior_review.completed_at + timedelta(seconds=1)
+        impl.review_verify_status = "passed"
+        impl.review_verify_branch = impl.branch
+        impl.review_verify_head_sha = "current-sha"
+        impl.review_verify_captured_at = prior_review.completed_at + timedelta(seconds=2)
         store.update(impl)
 
         args = argparse.Namespace(
@@ -6630,12 +6648,19 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.resolve_fresh_merge_source.return_value = (f"origin/{impl.branch}", None)
+        mock_git.ref_exists.return_value = True
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: "current-sha" if ref == f"origin/{impl.branch}" else None
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
             patch("gza.db.Git", return_value=mock_git, create=True),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "merge", "description": "Merge (previous review addressed)"},
+            ),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -13295,10 +13320,11 @@ class TestIterateCommand:
             patch(
                 "gza.cli.run_noop_improve_verify_then_review",
                 return_value=SimpleNamespace(
-                    status="review_cleared",
-                    message=f"Fresh verify passed for {impl.branch} at deadbeef; cleared verify-only review block on {impl.id}",
+                    status="merge_ready",
+                    message=f"Fresh verify passed for {impl.branch} at deadbeef; merge-ready via verify-only no-op recovery on {impl.id}",
                     verify_markdown="## verify_command result\n\nPassed\n",
                     review_task=None,
+                    noop_improve_kind="verify_only",
                 ),
             ) as rerun_verify,
             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
@@ -13310,12 +13336,12 @@ class TestIterateCommand:
         rerun_verify.assert_called_once()
         run_fg.assert_not_called()
         assert "Iteration 1/1: verify_noop_improve_then_review" in output
-        assert "cleared verify-only review block" in output
-        assert "Iterate complete: MERGE_READY (verify_only_review_cleared)" in output
+        assert "merge-ready via verify-only no-op recovery" in output
+        assert "Iterate complete: MERGE_READY (verify_only_noop_merge_ready)" in output
         improves = [task for task in store.get_all() if task.task_type == "improve" and task.based_on == impl.id]
         assert improves == []
 
-    def test_iterate_verify_noop_improve_then_review_runs_fresh_review_for_substantive_blocker(
+    def test_iterate_verify_noop_improve_then_review_fails_closed_when_reverified_tip_is_stale(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -13345,8 +13371,6 @@ class TestIterateCommand:
         stale_review.completed_at = datetime.now(UTC)
         store.update(stale_review)
 
-        fresh_review = store.add("Fresh review", task_type="review", depends_on=impl.id, based_on=impl.id)
-
         args = argparse.Namespace(
             impl_task_id=impl.id,
             max_iterations=1,
@@ -13360,16 +13384,6 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            task = store.get(task_id)
-            assert task is not None
-            assert task.id == fresh_review.id
-            task.status = "completed"
-            task.output_content = "**Verdict: APPROVED**"
-            task.completed_at = datetime.now(UTC)
-            store.update(task)
-            return 0
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -13386,23 +13400,27 @@ class TestIterateCommand:
             patch(
                 "gza.cli.run_noop_improve_verify_then_review",
                 return_value=SimpleNamespace(
-                    status="create_review",
-                    message=f"Fresh verify passed for {impl.branch} at deadbeef; created review {fresh_review.id} to re-grade current tip",
+                    status="needs_attention",
+                    message=(
+                        "SKIP: Re-run verify_command before re-review. current branch tip changed since lifecycle "
+                        "selected reverify (expected badc0de, verified deadbeef); rerun lifecycle."
+                    ),
                     verify_markdown="## verify_command result\n\nPassed\n",
-                    review_task=fresh_review,
+                    review_task=None,
+                    noop_improve_kind="verify_only",
                 ),
             ) as rerun_verify,
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+            patch("gza.cli._run_foreground") as run_fg,
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        assert result == 0
+        assert result == 3
         rerun_verify.assert_called_once()
-        run_fg.assert_called_once()
-        assert run_fg.call_args.kwargs["task_id"] == fresh_review.id
+        run_fg.assert_not_called()
         assert "Iteration 1/1: verify_noop_improve_then_review" in output
-        assert f"Fresh verify passed; running review {fresh_review.id}" in output
+        assert "current branch tip changed since lifecycle selected reverify" in output
+        assert "Iterate complete: BLOCKED (needs_discussion)" in output
 
     def test_iterate_verify_noop_improve_then_review_parks_on_reverify_setup_failure(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -13456,6 +13474,7 @@ class TestIterateCommand:
                     message="SKIP: Re-run verify_command before re-review. unable to prepare or run fresh verify_command: cannot create detached worktree.",
                     verify_markdown=None,
                     review_task=None,
+                    noop_improve_kind="verify_only",
                 ),
             ) as rerun_verify,
             patch("gza.cli._run_foreground") as run_fg,
@@ -13527,6 +13546,7 @@ class TestIterateCommand:
                     ),
                     verify_markdown="## verify_command result\n\n### dre/web\n\n- Status: skipped\n",
                     review_task=None,
+                    noop_improve_kind="verify_only",
                 ),
             ) as rerun_verify,
             patch("gza.cli._run_foreground") as run_fg,

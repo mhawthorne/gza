@@ -2118,6 +2118,32 @@ def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
     return f"{candidate}..."
 
 
+def _truncate_verify_output_for_review(text: str, max_chars: int) -> str:
+    """Trim verify output for review prompts while preserving line structure and failure tails."""
+    normalized = text.strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    if max_chars <= 3:
+        return "." * max_chars
+
+    tail_budget = max_chars - 16
+    if tail_budget <= 0:
+        return normalized[-(max_chars - 3) :].lstrip() + "..."
+
+    head_budget = max(0, tail_budget // 3)
+    tail_budget = max_chars - head_budget - len("\n...\n")
+    if head_budget < 40:
+        head_budget = 0
+        tail_budget = max_chars - len("\n...\n")
+
+    if head_budget > 0:
+        head = normalized[:head_budget].rstrip()
+        tail = normalized[-tail_budget:].lstrip()
+        return f"{head}\n...\n{tail}"
+
+    return "...\n" + normalized[-(max_chars - 4) :].lstrip()
+
+
 def _decode_subprocess_output(output: str | bytes | None) -> str:
     """Normalize subprocess output payloads to text."""
     if output is None:
@@ -2427,7 +2453,7 @@ def _format_review_verify_result(
     if result.failure:
         lines.append(f"- Failure: {result.failure}")
     if result.status != "passed":
-        trimmed_output = _truncate_to_word_boundary(
+        trimmed_output = _truncate_verify_output_for_review(
             result.output or result.failure or "(no failing output captured)",
             REVIEW_VERIFY_OUTPUT_MAX_CHARS,
         )

@@ -1762,6 +1762,25 @@ class TestReviewContextFromChain:
         assert "Failing output (trimmed):" in rendered
         assert "lint failed" in rendered
 
+    def test_format_review_verify_result_preserves_failure_tail_summary(self):
+        """Long failing verify output should keep the tail where pytest reports failures."""
+        long_output = (
+            "setup noise\n" * 400
+            + "FAILED tests/test_sample.py::test_breaks - AssertionError: boom\n"
+            + "=========================== short test summary info ============================\n"
+            + "FAILED tests/test_sample.py::test_breaks - AssertionError: boom\n"
+        )
+        rendered = _format_review_verify_failure(
+            "uv run pytest tests/ -q",
+            exit_status="1",
+            failure="pytest failed",
+            output=long_output,
+        )
+
+        assert "Failing output (trimmed):" in rendered
+        assert "FAILED tests/test_sample.py::test_breaks" in rendered
+        assert "short test summary info" in rendered
+
     def test_format_review_verify_failure_labels_timeout(self):
         """Timeout formatter should preserve failure status and timeout evidence."""
         result = _format_review_verify_failure(
