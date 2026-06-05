@@ -86,6 +86,16 @@ Consequences:
 - Manual-only failures MUST park for a human and MUST NOT be auto-resumed or auto-retried.
 - A fresh retry MUST create a new execution attempt. A resume MUST preserve the provider
   session/thread being continued.
+- A failure meaning the completed work **could not be published to `origin`** (push
+  rejected / local branch diverged from `origin/<branch>`, reason `BRANCH_UNPUSHABLE`) is
+  **recoverable**, not manual. Its recovery action is neither session-resume nor fresh
+  retry: it MUST route to the `lifecycle-engine.md` §4 reconcile/rebase gate (reconcile or
+  mechanically rebase, then re-publish and continue to PR creation and the §8 merge gate).
+  Only a genuine host-side conflict surfaced by that gate parks for a human. This reason
+  MUST NOT be classified manual-only.
+- Conversely, failing to **open a PR after a successful push** is not a recoverable failure
+  because it is not a failure at all: the unit completes and the missing PR is recorded and
+  surfaced ([lifecycle-engine.md](lifecycle-engine.md) §9).
 
 ### 3. Recovery suppression after valid resolution
 

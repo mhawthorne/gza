@@ -257,6 +257,42 @@ failure *and* actionable merge/review work remains eligible for the latter.
   MUST reject merge representatives whose execution status is not `completed` or
   `unmerged`.
 
+### §9 — PR publication for completed code tasks
+
+When a code task completes with PR creation requested (`create_pr`), the work is published
+by pushing the unit's source branch to `origin` and opening a PR. Publication is a
+*completion-time* step, distinct from the §8 merge into the canonical local target; it MUST
+NOT be conflated with merge-ness. P4 forbids pushing the *target* branch — it does **not**
+forbid publishing the unit's own source branch to `origin`.
+
+Publication has two failure modes with different outcomes, decided by **whether the branch
+push succeeded**:
+
+- **Push succeeded, PR creation failed** (host unavailable, auth/token expired, API/rate
+  limit) → the unit is **completed**. The branch is already on `origin` and visible; only
+  the PR wrapper is missing. The engine MUST record the missing PR as a *non-fatal*,
+  surfaced note (watch log) and MUST NOT mark the unit `failed`. A unit completed this way
+  stays eligible for the normal merge path (§8); the absent PR never blocks merge.
+- **Push failed** (the branch could not be published — e.g. local diverged from
+  `origin/<branch>`) → the unit is **failed** with the recoverable reason
+  `BRANCH_UNPUSHABLE` ([recovery.md](recovery.md) §2). This is *not* a manual stop. Its
+  prescribed next action is to make the branch pushable via the §4 reconcile/rebase
+  machinery. The reason MUST be distinct and countable so publication-blocked frequency is
+  observable (P5: an invisible "completed" branch is a real hazard, not a silent success).
+
+**Recovery and continuation (P5 — no needless human stop).** A `BRANCH_UNPUSHABLE` unit
+routes into §4: benign/mechanical divergence (including superseded gza WIP savepoints) is
+reconciled automatically (publish the strictly-ahead or patch-equivalent local side;
+otherwise fetch and mechanically rebase, then publish); only a genuine host-side conflict
+parks for a human (the existing §4 reconcile / merge-source manual codes). Once reconcile
+or rebase makes the branch pushable, if `create_pr` is set and no PR yet exists, the engine
+MUST publish and create the PR, then proceed to the §8 merge gate — closing
+push → PR → merge end-to-end with no human step on the mechanical path.
+
+`PR_REQUIRED` is retired as a single terminal/manual outcome: a publication problem is now
+either non-terminal (push succeeded, §9 first bullet) or the recoverable `BRANCH_UNPUSHABLE`
+(push failed).
+
 ## Parked reason codes
 
 Every stop-for-human action MUST carry one machine-readable **reason code** from this
