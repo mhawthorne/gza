@@ -10,12 +10,13 @@ from typing import Literal
 
 from .config import Config, ConfigError
 from .db import MergeTargetResolutionError, SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from .dependency_preconditions import get_unmerged_dependency_precondition, task_is_merged
+from .dependency_preconditions import dependency_readiness, get_unmerged_dependency_precondition, task_is_merged
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .merge_state import resolve_task_merge_state_for_target
+from .recovery_read_context import RecoveryReadContext
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,7 @@ class _RecoveryChainSnapshot:
 class _MergeContext:
     git: Git | None
     default_branch: str | None
+    existing_branches: frozenset[str] | None = None
     resolution_error: str | None = None
     branch_resolution: dict[str, bool] = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
@@ -260,10 +262,19 @@ def _descendant_sort_key(descendant: DbTask) -> tuple[datetime, int]:
     return (when, task_id_numeric_key(descendant.id))
 
 
-def _task_merge_state_for_recovery(store: SqliteTaskStore, task: DbTask) -> str | None:
+def _task_merge_state_for_recovery(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> str | None:
     if task.id is None:
         return task.merge_status
-    unit = store.resolve_merge_unit_for_task(task.id)
+    unit = (
+        read_context.resolve_merge_unit_for_task(task.id)
+        if read_context is not None
+        else store.resolve_merge_unit_for_task(task.id)
+    )
     return unit.state if unit is not None else task.merge_status
 
 
@@ -289,21 +300,24 @@ def _classify_empty_task_recovery_state(
     *,
     merge_state: str | None = None,
     merge_context: _MergeContext | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> EmptyTaskRecoveryState:
     """Classify whether an empty failed task is moot, resolved, or still recoverable."""
     if task.status != "failed":
         return "moot"
-    resolved_merge_state = merge_state if merge_state is not None else _task_merge_state_for_recovery(store, task)
+    resolved_merge_state = (
+        merge_state if merge_state is not None else _task_merge_state_for_recovery(store, task, read_context=read_context)
+    )
     if resolved_merge_state != "empty":
         return "moot"
     if not _task_has_executed_resumable_session(task):
         return "moot"
-    if get_completed_recovery_descendant(store, task) is not None:
+    if get_completed_recovery_descendant(store, task, read_context=read_context) is not None:
         return "resolved"
-    if get_completed_sibling_recovery(store, task) is not None:
+    if get_completed_sibling_recovery(store, task, read_context=read_context) is not None:
         return "resolved"
     resolved_merge_context = merge_context or _load_merge_context(_project_dir_for_store(store))
-    if _is_resolved_by_landed_lineage(store, task, merge_context=resolved_merge_context):
+    if _is_resolved_by_landed_lineage(store, task, merge_context=resolved_merge_context, read_context=read_context):
         return "resolved"
     return "requires_recovery"
 
@@ -314,6 +328,7 @@ def empty_task_requires_recovery(
     *,
     merge_state: str | None = None,
     merge_context: _MergeContext | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> bool:
     """Return whether an empty merge unit still represents recoverable failed work."""
     return (
@@ -322,6 +337,7 @@ def empty_task_requires_recovery(
             task,
             merge_state=merge_state,
             merge_context=merge_context,
+            read_context=read_context,
         )
         == "requires_recovery"
     )
@@ -338,8 +354,16 @@ def resolve_pending_recovery_execution_mode(task: DbTask) -> PendingRecoveryExec
     return None
 
 
-def _task_is_complete_recovery_outcome(store: SqliteTaskStore, task: DbTask) -> bool:
-    return task_is_complete_for_lifecycle(task, merge_state=_task_merge_state_for_recovery(store, task))
+def _task_is_complete_recovery_outcome(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
+    return task_is_complete_for_lifecycle(
+        task,
+        merge_state=_task_merge_state_for_recovery(store, task, read_context=read_context),
+    )
 
 
 def _is_resumable_timeout_implementation(task: DbTask) -> bool:
@@ -351,7 +375,16 @@ def _is_resumable_timeout_implementation(task: DbTask) -> bool:
     )
 
 
-def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _RecoveryChainSnapshot:
+def _build_recovery_chain_snapshot(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> _RecoveryChainSnapshot:
+    if read_context is not None and task.id is not None:
+        cached = read_context.recovery_snapshots.get(task.id)
+        if isinstance(cached, _RecoveryChainSnapshot):
+            return cached
     steps_reversed: list[RecoveryRole] = []
     ancestor_ids_reversed: list[str] = []
     current = task
@@ -362,7 +395,7 @@ def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _Rec
         ancestor_ids_reversed.append(current.id)
         if not current.based_on:
             break
-        parent = store.get(current.based_on)
+        parent = read_context.get_task(current.based_on) if read_context is not None else store.get(current.based_on)
         if parent is None or parent.id is None:
             break
         edge = _classify_recovery_edge(parent, current)
@@ -380,7 +413,12 @@ def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _Rec
         parent = queue.pop(0)
         if parent.id is None:
             continue
-        for child in store.get_based_on_children_by_type(parent.id, task.task_type):
+        children = (
+            read_context.get_based_on_children_by_type(parent.id, task.task_type)
+            if read_context is not None
+            else store.get_based_on_children_by_type(parent.id, task.task_type)
+        )
+        for child in children:
             child_id = child.id
             if child_id is None or child_id in seen_descendants:
                 continue
@@ -408,10 +446,13 @@ def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _Rec
     if terminal_descendants and all(descendant.status == "completed" for descendant in terminal_descendants):
         latest_completed_terminal_descendant = max(terminal_descendants, key=_descendant_sort_key)
     completed_terminal_descendant: DbTask | None = None
-    if terminal_descendants and all(_task_is_complete_recovery_outcome(store, descendant) for descendant in terminal_descendants):
+    if terminal_descendants and all(
+        _task_is_complete_recovery_outcome(store, descendant, read_context=read_context)
+        for descendant in terminal_descendants
+    ):
         completed_terminal_descendant = max(terminal_descendants, key=_descendant_sort_key)
 
-    return _RecoveryChainSnapshot(
+    snapshot = _RecoveryChainSnapshot(
         root_task=current,
         ancestor_ids=tuple(reversed(ancestor_ids_reversed)),
         steps=tuple(reversed(steps_reversed)),
@@ -424,10 +465,18 @@ def _build_recovery_chain_snapshot(store: SqliteTaskStore, task: DbTask) -> _Rec
         latest_completed_terminal_descendant=latest_completed_terminal_descendant,
         completed_terminal_descendant=completed_terminal_descendant,
     )
+    if read_context is not None and task.id is not None:
+        read_context.recovery_snapshots[task.id] = snapshot
+    return snapshot
 
 
-def get_recovery_chain_state(store: SqliteTaskStore, task: DbTask) -> RecoveryChainState:
-    snapshot = _build_recovery_chain_snapshot(store, task)
+def get_recovery_chain_state(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> RecoveryChainState:
+    snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
     steps = snapshot.steps
     if not steps:
         return RecoveryChainState(
@@ -444,34 +493,55 @@ def get_recovery_chain_state(store: SqliteTaskStore, task: DbTask) -> RecoveryCh
     )
 
 
-def get_recovery_chain_root_task_id(store: SqliteTaskStore, task: DbTask) -> str | None:
+def get_recovery_chain_root_task_id(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> str | None:
     """Return the recovery-only lineage root for a task."""
-    return _build_recovery_chain_snapshot(store, task).root_task.id
+    return _build_recovery_chain_snapshot(store, task, read_context=read_context).root_task.id
 
 
 def has_recovery_chain_ancestor_in_ids(
     store: SqliteTaskStore,
     task: DbTask,
     ancestor_ids: set[str],
+    *,
+    read_context: RecoveryReadContext | None = None,
 ) -> bool:
     """Return whether this failed task is owned by a completed task already in the plan."""
-    snapshot = _build_recovery_chain_snapshot(store, task)
+    snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
     if any(task_id in ancestor_ids for task_id in snapshot.ancestor_ids[:-1]):
         return True
-    parent = store.get(snapshot.root_task.based_on) if snapshot.root_task.based_on else None
+    parent = (
+        read_context.get_task(snapshot.root_task.based_on)
+        if read_context is not None and snapshot.root_task.based_on
+        else store.get(snapshot.root_task.based_on) if snapshot.root_task.based_on else None
+    )
     if parent and parent.id and snapshot.root_task.task_type in {"improve", "rebase"} and parent.task_type == "implement":
         return parent.id in ancestor_ids
     return False
 
 
-def get_completed_recovery_descendant(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+def get_completed_recovery_descendant(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
     """Return the terminal completed recovery descendant when a failed chain is fully resolved."""
     if task.id is None or task.status != "failed":
         return None
-    return _build_recovery_chain_snapshot(store, task).completed_terminal_descendant
+    return _build_recovery_chain_snapshot(store, task, read_context=read_context).completed_terminal_descendant
 
 
-def get_completed_sibling_recovery(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+def get_completed_sibling_recovery(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
     """Return the newest completed automatic sibling recovery that resolves this failed task's parent."""
     if (
         task.id is None
@@ -481,20 +551,29 @@ def get_completed_sibling_recovery(store: SqliteTaskStore, task: DbTask) -> DbTa
     ):
         return None
 
-    parent = store.get(task.based_on)
+    parent = read_context.get_task(task.based_on) if read_context is not None else store.get(task.based_on)
     if parent is None or parent.id is None:
         return None
 
     candidates: list[DbTask] = []
-    for sibling in store.get_based_on_children_by_type(parent.id, task.task_type):
+    siblings = (
+        read_context.get_based_on_children_by_type(parent.id, task.task_type)
+        if read_context is not None
+        else store.get_based_on_children_by_type(parent.id, task.task_type)
+    )
+    for sibling in siblings:
         if sibling.id is None or sibling.id == task.id:
             continue
         if _classify_recovery_edge(parent, sibling) is None:
             continue
-        if _task_is_complete_recovery_outcome(store, sibling):
+        if _task_is_complete_recovery_outcome(store, sibling, read_context=read_context):
             candidates.append(sibling)
             continue
-        completed_descendant = _build_recovery_chain_snapshot(store, sibling).completed_terminal_descendant
+        completed_descendant = _build_recovery_chain_snapshot(
+            store,
+            sibling,
+            read_context=read_context,
+        ).completed_terminal_descendant
         if completed_descendant is not None:
             candidates.append(completed_descendant)
 
@@ -503,7 +582,12 @@ def get_completed_sibling_recovery(store: SqliteTaskStore, task: DbTask) -> DbTa
     return max(candidates, key=_descendant_sort_key)
 
 
-def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+def _resolve_impl_ancestor_by_based_on(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
     """Resolve the implementation ancestor by walking structured based_on edges."""
     visited: set[str] = set()
     current: DbTask | None = task
@@ -516,11 +600,16 @@ def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> 
             return current
         if current.based_on is None:
             return None
-        current = store.get(current.based_on)
+        current = read_context.get_task(current.based_on) if read_context is not None else store.get(current.based_on)
     return None
 
 
-def _resolve_review_target_implement(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+def _resolve_review_target_implement(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
     """Resolve the implementation task a review was created to evaluate."""
     candidate_ids = tuple(target_id for target_id in (task.depends_on, task.based_on) if target_id is not None)
     if not candidate_ids:
@@ -532,7 +621,7 @@ def _resolve_review_target_implement(store: SqliteTaskStore, task: DbTask) -> Db
         if candidate_id in seen_ids:
             continue
         seen_ids.add(candidate_id)
-        candidate = store.get(candidate_id)
+        candidate = read_context.get_task(candidate_id) if read_context is not None else store.get(candidate_id)
         if candidate is None or candidate.task_type != "implement":
             continue
         candidates.append(candidate)
@@ -545,12 +634,17 @@ def _resolve_review_target_implement(store: SqliteTaskStore, task: DbTask) -> Db
     return candidates[0]
 
 
-def _resolve_merged_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+def _resolve_merged_target_task(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
     """Return the structured implementation target for review/improve/rebase tasks."""
     if task.task_type == "review":
-        return _resolve_review_target_implement(store, task)
+        return _resolve_review_target_implement(store, task, read_context=read_context)
     if task.task_type in {"improve", "rebase"}:
-        return _resolve_impl_ancestor_by_based_on(store, task)
+        return _resolve_impl_ancestor_by_based_on(store, task, read_context=read_context)
     return None
 
 
@@ -563,14 +657,19 @@ def _effective_merge_target_branch(
     return _resolve_merge_context_target_branch(store, merge_context)
 
 
-def is_resolved_by_merged_target(store: SqliteTaskStore, task: DbTask) -> bool:
+def is_resolved_by_merged_target(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
     """Return whether a failed side-quest task is obsolete because its target impl merged."""
     if task.id is None or task.status != "failed" or task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
         return False
     if task.task_type == "improve" and task.same_branch:
         # Same-branch improve tasks can represent real post-merge follow-up work.
         return False
-    target_task = _resolve_merged_target_task(store, task)
+    target_task = _resolve_merged_target_task(store, task, read_context=read_context)
     if target_task is None:
         return False
     return task_is_merged(store, target_task)
@@ -580,7 +679,23 @@ def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
     try:
         config = Config.load(project_dir or Path.cwd(), discover=True)
         git = Git(config.project_dir)
-        return _MergeContext(git=git, default_branch=git.default_branch())
+        merge_context = _MergeContext(
+            git=git,
+            default_branch=git.default_branch(),
+        )
+        try:
+            merge_context.existing_branches = frozenset(git.local_branch_names())
+        except (GitError, OSError, ValueError) as exc:
+            _record_repository_inspection_warning(
+                merge_context,
+                key="local-branch-list",
+                message=_branch_reachability_warning(
+                    "failed to list local branches for recovery-lane batch inspection: "
+                    f"{exc}"
+                ),
+            )
+            merge_context.existing_branches = None
+        return merge_context
     except (ConfigError, GitError, OSError, ValueError) as exc:
         merge_context = _MergeContext(git=None, default_branch=None, resolution_error=str(exc))
         _record_repository_inspection_warning(
@@ -618,21 +733,31 @@ def _project_dir_for_store(store: SqliteTaskStore) -> Path | None:
     return None
 
 
-def _task_lineage_branch_keys(store: SqliteTaskStore, task: DbTask) -> set[str]:
+def _task_lineage_branch_keys(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> set[str]:
     keys: set[str] = set()
     if task.branch:
         keys.add(task.branch)
-    target_task = _resolve_merged_target_task(store, task)
+    target_task = _resolve_merged_target_task(store, task, read_context=read_context)
     if target_task is not None and target_task.branch:
         keys.add(target_task.branch)
     return keys
 
 
-def _is_independent_follow_up_root(store: SqliteTaskStore, task: DbTask) -> bool:
+def _is_independent_follow_up_root(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
     """Return whether the task roots a recovery chain under a non-recovery follow-up."""
     if not task.based_on or task.id is None:
         return False
-    parent = store.get(task.based_on)
+    parent = read_context.get_task(task.based_on) if read_context is not None else store.get(task.based_on)
     if parent is None:
         return False
     if parent.task_type == task.task_type:
@@ -645,6 +770,7 @@ def _is_resolved_by_landed_lineage(
     task: DbTask,
     *,
     merge_context: _MergeContext,
+    read_context: RecoveryReadContext | None = None,
 ) -> bool:
     # This helper only suppresses failed rows during failed-task recovery.
     if task.id is None or task.status != "failed":
@@ -659,10 +785,16 @@ def _is_resolved_by_landed_lineage(
         try:
             branch_merged = merge_context.branch_resolution.get(task.branch)
             if branch_merged is None:
-                branch_merged = merge_context.git.branch_exists(task.branch) and merge_context.git.is_merged(
-                    task.branch,
-                    target_branch,
-                )
+                if merge_context.existing_branches is not None:
+                    branch_merged = (
+                        task.branch in merge_context.existing_branches
+                        and merge_context.git.is_merged(task.branch, target_branch)
+                    )
+                else:
+                    branch_merged = merge_context.git.branch_exists(task.branch) and merge_context.git.is_merged(
+                        task.branch,
+                        target_branch,
+                    )
                 merge_context.branch_resolution[task.branch] = branch_merged
             if branch_merged:
                 return True
@@ -677,24 +809,33 @@ def _is_resolved_by_landed_lineage(
             )
             pass
 
-    branch_keys = _task_lineage_branch_keys(store, task)
+    branch_keys = _task_lineage_branch_keys(store, task, read_context=read_context)
     if not branch_keys:
         return False
 
-    from .query import build_lineage, resolve_lineage_root
-
-    recovery_snapshot = _build_recovery_chain_snapshot(store, task)
+    recovery_snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
     independent_follow_up_root_id = (
-        recovery_snapshot.root_task.id if _is_independent_follow_up_root(store, recovery_snapshot.root_task) else None
+        recovery_snapshot.root_task.id
+        if _is_independent_follow_up_root(store, recovery_snapshot.root_task, read_context=read_context)
+        else None
     )
 
-    lineage = build_lineage(store, resolve_lineage_root(store, task))
+    if read_context is not None:
+        lineage = read_context.build_lineage(read_context.resolve_lineage_root(task))
+    else:
+        from .query import build_lineage, resolve_lineage_root
+
+        lineage = tuple(build_lineage(store, resolve_lineage_root(store, task)))
     for lineage_task in lineage:
         if lineage_task.id == task.id:
             continue
         merge_state = lineage_task.merge_status
         if lineage_task.id is not None:
-            unit = store.resolve_merge_unit_for_task(lineage_task.id)
+            unit = (
+                read_context.resolve_merge_unit_for_task(lineage_task.id)
+                if read_context is not None
+                else store.resolve_merge_unit_for_task(lineage_task.id)
+            )
             if unit is not None:
                 merge_state = unit.state
         if merge_state != "merged":
@@ -703,7 +844,7 @@ def _is_resolved_by_landed_lineage(
             continue
         if lineage_task.status not in _MERGEABLE_EXECUTION_STATUSES:
             continue
-        if branch_keys & _task_lineage_branch_keys(store, lineage_task):
+        if branch_keys & _task_lineage_branch_keys(store, lineage_task, read_context=read_context):
             return True
     return False
 
@@ -717,11 +858,16 @@ def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTa
     return snapshot.latest_completed_terminal_descendant or task
 
 
-def is_chain_resolved_by_recovery(store: SqliteTaskStore, task: DbTask) -> bool:
+def is_chain_resolved_by_recovery(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
     """Return whether a failed task's recovery-only chain ends in a completed task."""
     if task.id is None or task.status != "failed":
         return False
-    return _build_recovery_chain_snapshot(store, task).completed_terminal_descendant is not None
+    return _build_recovery_chain_snapshot(store, task, read_context=read_context).completed_terminal_descendant is not None
 
 
 def list_failed_tasks_for_recovery(
@@ -730,9 +876,16 @@ def list_failed_tasks_for_recovery(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
     warnings: list[str] | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> list[DbTask]:
-    merge_context = _load_merge_context(_project_dir_for_store(store))
-    failed = [task for task in store.get_all() if task.status == "failed"]
+    merge_context = (
+        read_context.merge_context
+        if read_context is not None and isinstance(read_context.merge_context, _MergeContext)
+        else _load_merge_context(_project_dir_for_store(store))
+    )
+    if read_context is not None and read_context.merge_context is None:
+        read_context.merge_context = merge_context
+    failed = list(read_context.failed_tasks()) if read_context is not None else [task for task in store.get_all() if task.status == "failed"]
     if tags:
         from .task_query import normalize_tag_filters, task_matches_tag_filters
 
@@ -742,10 +895,28 @@ def list_failed_tasks_for_recovery(
             for task in failed
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
         ]
-    failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task)]
-    failed = [task for task in failed if not is_resolved_by_merged_target(store, task)]
-    failed = [task for task in failed if not _is_resolved_by_landed_lineage(store, task, merge_context=merge_context)]
-    failed = [task for task in failed if _failed_task_requires_operator_recovery(store, task, merge_context=merge_context)]
+    failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task, read_context=read_context)]
+    failed = [task for task in failed if not is_resolved_by_merged_target(store, task, read_context=read_context)]
+    failed = [
+        task
+        for task in failed
+        if not _is_resolved_by_landed_lineage(
+            store,
+            task,
+            merge_context=merge_context,
+            read_context=read_context,
+        )
+    ]
+    failed = [
+        task
+        for task in failed
+        if _failed_task_requires_operator_recovery(
+            store,
+            task,
+            merge_context=merge_context,
+            read_context=read_context,
+        )
+    ]
     if warnings is not None:
         warnings.extend(merge_context.repository_inspection_warnings)
     return sort_failed_tasks(failed)
@@ -822,11 +993,35 @@ def _prerequisite_unmerged_has_recoverable_real_work(task: DbTask) -> bool:
     return bool(task.has_commits or _task_has_provider_output(task))
 
 
+def _persist_prerequisite_unmerged_empty_reconciliation(store: SqliteTaskStore, task: DbTask) -> None:
+    if task.id is None:
+        return
+    unit = store.resolve_merge_unit_for_task(task.id)
+    if unit is None:
+        unit = store.get_or_create_merge_unit_for_task(task)
+    if unit is not None and unit.state != "empty":
+        store.set_merge_unit_state(unit.id, "empty")
+
+
+def apply_pending_recovery_reconciliations(
+    store: SqliteTaskStore,
+    *,
+    read_context: RecoveryReadContext | None,
+) -> None:
+    if read_context is None:
+        return
+    pending = tuple(read_context.pending_empty_prerequisite_reconciliations.values())
+    read_context.pending_empty_prerequisite_reconciliations.clear()
+    for task in pending:
+        _persist_prerequisite_unmerged_empty_reconciliation(store, task)
+
+
 def _reconcile_historical_prerequisite_unmerged_failure(
     store: SqliteTaskStore,
     task: DbTask,
     *,
     merge_context: _MergeContext | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> PrerequisiteUnmergedReconciliation:
     """Reconcile historical pre-provider dependency failures into moot empty work when proven.
 
@@ -839,9 +1034,14 @@ def _reconcile_historical_prerequisite_unmerged_failure(
     if task.depends_on is None:
         return "parked_unknown"
 
-    if task.depends_on and store.resolve_dependency_completion(task) is None:
+    resolved_dependency = (
+        read_context.resolve_dependency_completion(task)
+        if read_context is not None
+        else store.resolve_dependency_completion(task)
+    )
+    if task.depends_on and resolved_dependency is None:
         return "dependency_not_ready"
-    if get_unmerged_dependency_precondition(store, task) is not None:
+    if get_unmerged_dependency_precondition(store, task, read_context=read_context) is not None:
         return "dependency_not_ready"
     if _prerequisite_unmerged_has_recoverable_real_work(task):
         return "recoverable_real_work"
@@ -849,7 +1049,11 @@ def _reconcile_historical_prerequisite_unmerged_failure(
     if task.id is None:
         return "moot_empty"
 
-    unit = store.resolve_merge_unit_for_task(task.id)
+    unit = (
+        read_context.resolve_merge_unit_for_task(task.id)
+        if read_context is not None
+        else store.resolve_merge_unit_for_task(task.id)
+    )
     if unit is not None and unit.state == "empty":
         return "moot_empty"
 
@@ -872,9 +1076,10 @@ def _reconcile_historical_prerequisite_unmerged_failure(
         except MergeTargetResolutionError:
             return "parked_unknown"
 
-        unit = unit or store.get_or_create_merge_unit_for_task(task)
-        if unit is not None:
-            store.set_merge_unit_state(unit.id, "empty")
+        if read_context is not None and not read_context.allow_reconcile_mutation:
+            read_context.record_empty_prerequisite_reconciliation(task)
+            return "moot_empty"
+        _persist_prerequisite_unmerged_empty_reconciliation(store, task)
 
     return "moot_empty"
 
@@ -884,6 +1089,7 @@ def _failed_task_requires_operator_recovery(
     task: DbTask,
     *,
     merge_context: _MergeContext,
+    read_context: RecoveryReadContext | None = None,
 ) -> bool:
     reason = task.failure_reason or "UNKNOWN"
     if reason == "PREREQUISITE_UNMERGED":
@@ -891,17 +1097,34 @@ def _failed_task_requires_operator_recovery(
             store,
             task,
             merge_context=merge_context,
+            read_context=read_context,
         )
         if reconciliation == "dependency_not_ready":
             return False
         if reconciliation == "moot_empty":
-            return empty_task_requires_recovery(store, task, merge_state="empty", merge_context=merge_context)
+            return empty_task_requires_recovery(
+                store,
+                task,
+                merge_state="empty",
+                merge_context=merge_context,
+                read_context=read_context,
+            )
         if reconciliation == "recoverable_real_work":
             return True
-        merge_state = _task_merge_state_for_recovery(store, task)
-        return merge_state != "empty" or empty_task_requires_recovery(store, task, merge_context=merge_context)
-    merge_state = _task_merge_state_for_recovery(store, task)
-    return merge_state != "empty" or empty_task_requires_recovery(store, task, merge_context=merge_context)
+        merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+        return merge_state != "empty" or empty_task_requires_recovery(
+            store,
+            task,
+            merge_context=merge_context,
+            read_context=read_context,
+        )
+    merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+    return merge_state != "empty" or empty_task_requires_recovery(
+        store,
+        task,
+        merge_context=merge_context,
+        read_context=read_context,
+    )
 
 
 def _skip_decision(
@@ -928,12 +1151,13 @@ def decide_failed_task_recovery(
     task: DbTask,
     *,
     max_recovery_attempts: int,
+    read_context: RecoveryReadContext | None = None,
 ) -> FailedRecoveryDecision:
     assert task.id is not None
     task_id = str(task.id)
     launch_mode: Literal["iterate", "worker", "none"] = "iterate" if task.task_type == "implement" else "worker"
-    chain = get_recovery_chain_state(store, task)
-    snapshot = _build_recovery_chain_snapshot(store, task)
+    chain = get_recovery_chain_state(store, task, read_context=read_context)
+    snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
     attempt_index, attempt_limit = _policy_attempt_counters(
         chain,
         max_recovery_attempts=max_recovery_attempts,
@@ -961,7 +1185,11 @@ def decide_failed_task_recovery(
     prerequisite_reconciliation: PrerequisiteUnmergedReconciliation | None = None
     expected_action: RecoveryAction | None
     if reason == "PREREQUISITE_UNMERGED":
-        prerequisite_reconciliation = _reconcile_historical_prerequisite_unmerged_failure(store, task)
+        prerequisite_reconciliation = _reconcile_historical_prerequisite_unmerged_failure(
+            store,
+            task,
+            read_context=read_context,
+        )
         expected_action = _expected_recovery_action(
             task,
             chain=chain,
@@ -970,7 +1198,11 @@ def decide_failed_task_recovery(
     else:
         expected_action = _expected_recovery_action(task, chain=chain)
 
-    if not _is_resumable_timeout_implementation(task) and is_resolved_by_merged_target(store, task):
+    if not _is_resumable_timeout_implementation(task) and is_resolved_by_merged_target(
+        store,
+        task,
+        read_context=read_context,
+    ):
         return _skip_decision(
             task_id=task_id,
             reason_code="resolved_by_merged_target",
@@ -990,7 +1222,7 @@ def decide_failed_task_recovery(
                 attempt_limit=attempt_limit,
             )
         if reconciliation == "moot_empty":
-            if empty_task_requires_recovery(store, task, merge_state="empty"):
+            if empty_task_requires_recovery(store, task, merge_state="empty", read_context=read_context):
                 return _skip_decision(
                     task_id=task_id,
                     reason_code="legacy_prerequisite_unmerged_parked",
@@ -1016,9 +1248,14 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
-    merge_state = _task_merge_state_for_recovery(store, task)
+    merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
     if merge_state == "empty":
-        empty_recovery_state = _classify_empty_task_recovery_state(store, task, merge_state=merge_state)
+        empty_recovery_state = _classify_empty_task_recovery_state(
+            store,
+            task,
+            merge_state=merge_state,
+            read_context=read_context,
+        )
         if empty_recovery_state == "resolved":
             return _skip_decision(
                 task_id=task_id,
@@ -1053,8 +1290,7 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    blocked, _blocking_id, _blocking_status = store.is_task_blocked(task)
-    if blocked:
+    if not dependency_readiness(store, task, read_context=read_context).ready:
         return _skip_decision(
             task_id=task_id,
             reason_code="dependency_not_ready",
@@ -1080,7 +1316,11 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    children = store.get_based_on_children_by_type(task_id, task.task_type)
+    children = (
+        list(read_context.get_based_on_children_by_type(task_id, task.task_type))
+        if read_context is not None
+        else store.get_based_on_children_by_type(task_id, task.task_type)
+    )
     recovery_children = [
         child for child in children
         if _classify_recovery_edge(task, child) is not None
@@ -1092,7 +1332,7 @@ def decide_failed_task_recovery(
     deeper_descendants = list(snapshot.deeper_descendants)
     pending_children = [child for child in matching_children if child.status == "pending" and child.id is not None]
     all_pending_children = [child for child in recovery_children if child.status == "pending" and child.id is not None]
-    if any(store.is_task_blocked(child)[0] for child in all_pending_children):
+    if any(not dependency_readiness(store, child, read_context=read_context).ready for child in all_pending_children):
         return _skip_decision(
             task_id=task_id,
             reason_code="dependency_not_ready",
@@ -1180,6 +1420,7 @@ def get_failed_recovery_needs_attention_reason(
     *,
     decision: FailedRecoveryDecision | None = None,
     max_recovery_attempts: int,
+    read_context: RecoveryReadContext | None = None,
 ) -> str | None:
     """Return a shared needs-attention reason slug for failed-task skip decisions."""
     if task.id is None:
@@ -1188,6 +1429,7 @@ def get_failed_recovery_needs_attention_reason(
         store,
         task,
         max_recovery_attempts=max_recovery_attempts,
+        read_context=read_context,
     )
     return _get_failed_recovery_needs_attention_reason(
         store,
@@ -1195,6 +1437,7 @@ def get_failed_recovery_needs_attention_reason(
         decision=resolved_decision,
         max_recovery_attempts=max_recovery_attempts,
         seen_task_ids=set(),
+        read_context=read_context,
     )
 
 
@@ -1204,6 +1447,7 @@ def get_manual_resume_override_descendant(
     *,
     decision: FailedRecoveryDecision | None = None,
     max_recovery_attempts: int,
+    read_context: RecoveryReadContext | None = None,
 ) -> DbTask | None:
     """Return the newest failed recovery descendant eligible for manual override."""
     if task.id is None:
@@ -1212,12 +1456,15 @@ def get_manual_resume_override_descendant(
         store,
         task,
         max_recovery_attempts=max_recovery_attempts,
+        read_context=read_context,
     )
     if resolved_decision.reason_code != "recovery_has_newer_unresolved_descendant":
         return None
 
     unresolved_descendants = sort_failed_tasks(
-        _list_unresolved_recovery_terminal_descendants(_build_recovery_chain_snapshot(store, task))
+        _list_unresolved_recovery_terminal_descendants(
+            _build_recovery_chain_snapshot(store, task, read_context=read_context)
+        )
     )
     failed_descendants = [
         descendant
@@ -1236,6 +1483,7 @@ def _get_failed_recovery_needs_attention_reason(
     decision: FailedRecoveryDecision,
     max_recovery_attempts: int,
     seen_task_ids: set[str],
+    read_context: RecoveryReadContext | None = None,
 ) -> str | None:
     if task.id is None or decision.action != "skip":
         return None
@@ -1259,7 +1507,9 @@ def _get_failed_recovery_needs_attention_reason(
         return None
 
     unresolved_descendants = sort_failed_tasks(
-        _list_unresolved_recovery_terminal_descendants(_build_recovery_chain_snapshot(store, task))
+        _list_unresolved_recovery_terminal_descendants(
+            _build_recovery_chain_snapshot(store, task, read_context=read_context)
+        )
     )
     for descendant in unresolved_descendants:
         if descendant.status == "dropped":
@@ -1268,6 +1518,7 @@ def _get_failed_recovery_needs_attention_reason(
             store,
             descendant,
             max_recovery_attempts=max_recovery_attempts,
+            read_context=read_context,
         )
         descendant_reason = _get_failed_recovery_needs_attention_reason(
             store,
@@ -1275,6 +1526,7 @@ def _get_failed_recovery_needs_attention_reason(
             decision=descendant_decision,
             max_recovery_attempts=max_recovery_attempts,
             seen_task_ids=seen_task_ids,
+            read_context=read_context,
         )
         if descendant_reason is not None:
             return _UNRESOLVED_RECOVERY_ATTENTION_REASON

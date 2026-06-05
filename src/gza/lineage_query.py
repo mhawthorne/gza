@@ -14,6 +14,7 @@ from .lifecycle_completion import (
     task_is_complete_for_lifecycle,
 )
 from .operator_state import blocked_by_empty_prereq_label
+from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
@@ -120,6 +121,10 @@ def _normalize_dt(value: datetime | None) -> datetime:
 
 def _task_event_time(task: DbTask) -> datetime:
     return _normalize_dt(task.completed_at or task.created_at)
+
+
+def _indexed_child_created_order_key(task: DbTask) -> tuple[datetime, int]:
+    return (_normalize_dt(task.created_at), task_id_numeric_key(task.id))
 
 
 def _actionable_lifecycle_tasks(
@@ -316,13 +321,25 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
             based_on_children[task.based_on].append(task)
         if task.depends_on is not None:
             depends_on_children[task.depends_on].append(task)
+    for children in based_on_children.values():
+        children.sort(key=_indexed_child_created_order_key)
+    for children in depends_on_children.values():
+        children.sort(key=_indexed_child_created_order_key)
 
     merge_units_by_task_id: dict[str, MergeUnit] = {}
     if store.supports_merge_units():
         for unit in store.list_active_merge_units():
             for member in store.list_tasks_for_merge_unit(unit.id):
                 if member.id is not None:
-                    merge_units_by_task_id[member.id] = unit
+                    existing = merge_units_by_task_id.get(member.id)
+                    unit_key = (_normalize_dt(unit.updated_at), unit.id)
+                    existing_key = (
+                        (_normalize_dt(existing.updated_at), existing.id)
+                        if existing is not None
+                        else None
+                    )
+                    if existing_key is None or unit_key > existing_key:
+                        merge_units_by_task_id[member.id] = unit
 
     def resolve_root(task: DbTask, seen: set[str] | None = None) -> DbTask:
         if task.id is None:
@@ -687,9 +704,28 @@ def query_lineage_owner_rows(
     git: Git | None = None,
     target_branch: str | None = None,
 ) -> tuple[LineageOwnerRow, ...]:
+    rows, _read_context = _query_lineage_owner_rows_with_context(
+        store,
+        query,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+    )
+    return rows
+
+
+def _query_lineage_owner_rows_with_context(
+    store: SqliteTaskStore,
+    query: LineageOwnerQuery,
+    *,
+    config: Config | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
+) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .cli.advance_engine import determine_next_action, failed_recovery_decision_to_attention_action
     from .query import is_lineage_complete
     from .recovery_engine import (
+        apply_pending_recovery_reconciliations,
         decide_failed_task_recovery,
         get_completed_recovery_descendant,
         get_completed_sibling_recovery,
@@ -698,9 +734,20 @@ def query_lineage_owner_rows(
     from .task_query import task_matches_tag_filters
 
     indexes = _load_indexes(store)
+    read_context = RecoveryReadContext(
+        tasks=indexes.tasks,
+        task_by_id=indexes.task_by_id,
+        based_on_children=indexes.based_on_children,
+        depends_on_children=indexes.depends_on_children,
+        root_by_task_id=indexes.root_by_task_id,
+        merge_units_by_task_id=indexes.merge_units_by_task_id,
+        allow_reconcile_mutation=store._read_session_depth == 0,
+    )
     owner_ids_filter = set(query.owner_task_ids) if query.owner_task_ids is not None else None
     task_ids_filter = set(query.task_ids) if query.task_ids is not None else None
-    visible_failed_tasks = [task for task in list_failed_tasks_for_recovery(store) if task.id is not None]
+    visible_failed_tasks = [
+        task for task in list_failed_tasks_for_recovery(store, read_context=read_context) if task.id is not None
+    ]
     visible_failed_ids = {task.id for task in visible_failed_tasks if task.id is not None}
     visible_failed_order = {
         task.id: index
@@ -742,7 +789,7 @@ def query_lineage_owner_rows(
         for task in sorted(owner_members, key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id))):
             if task.id is None:
                 continue
-            empty_prereq_block = blocked_by_empty_prereq_label(store, task)
+            empty_prereq_block = blocked_by_empty_prereq_label(store, task, read_context=read_context)
             if task.status not in {"failed", "completed", "unmerged", "dropped"} and empty_prereq_block is None:
                 continue
             if query.exclude_dropped_from_planning and task.status == "dropped":
@@ -774,11 +821,11 @@ def query_lineage_owner_rows(
                     continue
                 if _has_merged_descendant(indexes, task, merge_units_by_member=merge_units_by_member):
                     continue
-                completed_recovery = get_completed_recovery_descendant(store, task)
+                completed_recovery = get_completed_recovery_descendant(store, task, read_context=read_context)
                 if completed_recovery is not None:
                     recovery_completed_by_failed_id[task.id] = completed_recovery
                     continue
-                completed_sibling_recovery = get_completed_sibling_recovery(store, task)
+                completed_sibling_recovery = get_completed_sibling_recovery(store, task, read_context=read_context)
                 if completed_sibling_recovery is not None:
                     recovery_completed_by_failed_id[task.id] = completed_sibling_recovery
                     continue
@@ -831,7 +878,7 @@ def query_lineage_owner_rows(
         )
         owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
         has_empty_prereq_blocked_pending = any(
-            blocked_by_empty_prereq_label(store, task) is not None for task in unresolved_tasks
+            blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None for task in unresolved_tasks
         )
         if (
             owner_merge_unit is not None
@@ -901,12 +948,14 @@ def query_lineage_owner_rows(
                 store,
                 failed_task,
                 max_recovery_attempts=max_recovery_attempts,
+                read_context=read_context,
             )
             attention_action = failed_recovery_decision_to_attention_action(
                 store,
                 failed_task,
                 decision,
                 max_recovery_attempts=max_recovery_attempts,
+                read_context=read_context,
             )
             if decision.reason_code == "recovery_has_newer_unresolved_descendant":
                 continue
@@ -949,13 +998,13 @@ def query_lineage_owner_rows(
             action = get_active_watch_no_progress_attention(store, candidate=candidate)
         if planning_task is None:
             blocked_pending = next(
-                (task for task in unresolved_tasks if blocked_by_empty_prereq_label(store, task) is not None),
+                (task for task in unresolved_tasks if blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None),
                 None,
             )
             if blocked_pending is not None:
                 action = {
                     "type": "awaiting_human",
-                    "description": blocked_by_empty_prereq_label(store, blocked_pending),
+                    "description": blocked_by_empty_prereq_label(store, blocked_pending, read_context=read_context),
                     "needs_attention_reason": "awaiting-human-review",
                     "subject_task_id": blocked_pending.id,
                 }
@@ -1045,7 +1094,9 @@ def query_lineage_owner_rows(
     )
     if query.limit is not None:
         rows = rows[: query.limit]
-    return tuple(rows)
+    if read_context.allow_reconcile_mutation:
+        apply_pending_recovery_reconciliations(store, read_context=read_context)
+    return (tuple(rows), read_context)
 
 
 __all__ = [
@@ -1054,6 +1105,7 @@ __all__ = [
     "LineageOwnerSnapshot",
     "LineageResolution",
     "UnresolvedLeafSummary",
+    "_query_lineage_owner_rows_with_context",
     "filter_display_unresolved_tasks_for_incomplete",
     "is_lineage_resolved",
     "query_lineage_owner_rows",

@@ -7,8 +7,16 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
-from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from ..lineage_query import (
+    LineageOwnerQuery,
+    LineageOwnerRow,
+    _query_lineage_owner_rows_with_context,
+)
+from ..recovery_engine import (
+    FailedRecoveryDecision,
+    apply_pending_recovery_reconciliations,
+    decide_failed_task_recovery,
+)
 from ..task_query import normalize_tag_filters
 from .advance_engine import failed_recovery_decision_to_attention_action
 
@@ -31,8 +39,8 @@ def collect_recovery_lane_entries(
     max_recovery_attempts: int,
 ) -> list[RecoveryLaneEntry]:
     """Return visible recovery-lane entries in deterministic watch order."""
-    owner_rows = list(
-        query_lineage_owner_rows(
+    with store.read_session():
+        owner_rows, read_context = _query_lineage_owner_rows_with_context(
             store,
             LineageOwnerQuery(
                 limit=None,
@@ -43,7 +51,7 @@ def collect_recovery_lane_entries(
                 max_recovery_attempts=max_recovery_attempts,
             ),
         )
-    )
+    apply_pending_recovery_reconciliations(store, read_context=read_context)
     failed_rows = [
         row
         for row in owner_rows

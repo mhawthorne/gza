@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from .db import SqliteTaskStore, Task as DbTask
 from .dependency_preconditions import resolved_dependency_satisfies_task_readiness
+from .recovery_read_context import RecoveryReadContext
 
 EMPTY_PREREQ_RELEASE_VALVE_DETAIL = (
     "empty prerequisite; manual release tracked by "
@@ -23,33 +24,51 @@ class EmptyMergeUnitLookup:
     warning: str | None = None
 
 
-def blocked_by_empty_prereq_label(store: SqliteTaskStore, task: DbTask) -> str | None:
+def blocked_by_empty_prereq_label(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> str | None:
     """Return specialized blocked wording for dependents held on an empty prerequisite."""
     if task.depends_on is None:
         return None
-    dep = _resolve_empty_prereq_candidate(store, task)
+    dep = _resolve_empty_prereq_candidate(store, task, read_context=read_context)
     if dep is None or dep.id is None:
         return None
-    if resolved_dependency_satisfies_task_readiness(store, dep, task):
+    if resolved_dependency_satisfies_task_readiness(store, dep, task, read_context=read_context):
         return None
     return f"blocked by {dep.id} ({EMPTY_PREREQ_RELEASE_VALVE_DETAIL})"
 
 
-def _resolve_empty_prereq_candidate(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+def _resolve_empty_prereq_candidate(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
     """Resolve an empty prerequisite, preferring the direct dependency over retry descendants."""
     if task.depends_on is None:
         return None
 
-    dep = store.get(task.depends_on)
+    dep = read_context.get_task(task.depends_on) if read_context is not None else store.get(task.depends_on)
     if dep is not None and dep.id is not None:
-        unit = store.resolve_merge_unit_for_task(dep.id)
+        unit = (
+            read_context.resolve_merge_unit_for_task(dep.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(dep.id)
+        )
         if unit is not None and unit.state == "empty":
             return dep
 
-    dep = store.resolve_dependency_completion(task)
+    dep = read_context.resolve_dependency_completion(task) if read_context is not None else store.resolve_dependency_completion(task)
     if dep is None or dep.id is None:
         return None
-    unit = store.resolve_merge_unit_for_task(dep.id)
+    unit = (
+        read_context.resolve_merge_unit_for_task(dep.id)
+        if read_context is not None
+        else store.resolve_merge_unit_for_task(dep.id)
+    )
     if unit is None or unit.state != "empty":
         return None
     return dep

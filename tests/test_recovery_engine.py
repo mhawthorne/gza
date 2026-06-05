@@ -7,10 +7,11 @@ import gza.recovery_engine as recovery_engine
 from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
 from gza.git import GitError
-from gza.db import MergeTargetResolutionError
-from gza.git import GitError
+from gza.lineage_query import _load_indexes
+from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import (
     _MergeContext,
+    _build_recovery_chain_snapshot,
     _is_resolved_by_landed_lineage,
     FailedRecoveryDecision,
     classify_failure_reason,
@@ -28,6 +29,19 @@ from gza.recovery_engine import (
     resolve_recovery_planning_task,
 )
 from tests.cli.conftest import make_store, setup_config
+
+
+def _read_context_for_store(store) -> RecoveryReadContext:
+    indexes = _load_indexes(store)
+    return RecoveryReadContext(
+        tasks=indexes.tasks,
+        task_by_id=indexes.task_by_id,
+        based_on_children=indexes.based_on_children,
+        depends_on_children=indexes.depends_on_children,
+        root_by_task_id=indexes.root_by_task_id,
+        merge_units_by_task_id=indexes.merge_units_by_task_id,
+        allow_reconcile_mutation=False,
+    )
 
 
 def _failed_task(tmp_path: Path, *, task_type: str = "implement", reason: str = "MAX_TURNS", session_id: str | None = "sess-1"):
@@ -460,6 +474,59 @@ def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachabili
     assert "reached default branch 'main': simulated reachability failure" in warnings[0]
 
 
+def test_list_failed_tasks_for_recovery_warns_once_when_local_branch_batch_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class _BranchListFailureGit:
+        def __init__(self, project_dir: Path) -> None:
+            self.project_dir = project_dir
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def local_branch_names(self) -> frozenset[str]:
+            raise GitError("simulated branch list failure")
+
+        def branch_exists(self, branch: str) -> bool:
+            return False
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            raise AssertionError("is_merged should not run when branch_exists returns False")
+
+    monkeypatch.setattr(recovery_engine, "Git", _BranchListFailureGit)
+
+    first = store.add("Failed implementation A", task_type="implement")
+    assert first.id is not None
+    first.status = "failed"
+    first.failure_reason = "INFRASTRUCTURE_ERROR"
+    first.branch = "feature/a"
+    first.completed_at = datetime.now(UTC)
+    store.update(first)
+
+    second = store.add("Failed implementation B", task_type="implement")
+    assert second.id is not None
+    second.status = "failed"
+    second.failure_reason = "INFRASTRUCTURE_ERROR"
+    second.branch = "feature/b"
+    second.completed_at = datetime.now(UTC)
+    store.update(second)
+
+    warnings: list[str] = []
+    failed = list_failed_tasks_for_recovery(store, warnings=warnings)
+
+    assert [task.id for task in failed] == [first.id, second.id]
+    assert warnings == [
+        "Failed-task recovery could not inspect repository branch reachability; "
+        "git branch reachability suppression is unavailable for this run, but "
+        "metadata-based same-lineage merged-task suppression may still apply: "
+        "failed to list local branches for recovery-lane batch inspection: simulated branch list failure"
+    ]
+
+
 def test_load_merge_context_warning_says_metadata_based_lineage_suppression_may_still_apply(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -679,6 +746,44 @@ def test_list_failed_tasks_for_recovery_filters_same_branch_failed_improve_under
     merge_context = recovery_engine._load_merge_context(tmp_path)
     assert _is_resolved_by_landed_lineage(store, failed_improve, merge_context=merge_context) is True
     assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resolution_cache(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/cached-landed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    class _CachedBranchGit:
+        def __init__(self) -> None:
+            self.branch_exists_calls = 0
+            self.is_merged_calls = 0
+
+        def branch_exists(self, branch: str) -> bool:
+            self.branch_exists_calls += 1
+            return True
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            self.is_merged_calls += 1
+            return True
+
+    git = _CachedBranchGit()
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+    assert git.branch_exists_calls == 0
+    assert git.is_merged_calls == 1
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:
@@ -1052,6 +1157,60 @@ def test_get_completed_sibling_recovery_returns_completed_descendant_of_failed_s
     store.update(completed_grandchild)
 
     assert get_completed_sibling_recovery(store, failed_resume).id == completed_grandchild.id
+
+
+def test_recovery_snapshot_helpers_match_indexed_context_for_descendants_and_siblings(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "NO_ACTIVITY"
+    root.session_id = "sess-root"
+    root.branch = "feature/root"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime.now(UTC)
+    store.update(failed_resume)
+
+    sibling_resume = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="resume")
+    assert sibling_resume.id is not None
+    sibling_resume.status = "failed"
+    sibling_resume.failure_reason = "INFRASTRUCTURE_ERROR"
+    sibling_resume.session_id = root.session_id
+    sibling_resume.branch = root.branch
+    sibling_resume.completed_at = datetime.now(UTC)
+    store.update(sibling_resume)
+
+    completed_grandchild = store.add(
+        sibling_resume.prompt,
+        task_type="plan",
+        based_on=sibling_resume.id,
+        recovery_origin="resume",
+    )
+    assert completed_grandchild.id is not None
+    completed_grandchild.status = "completed"
+    completed_grandchild.session_id = sibling_resume.session_id
+    completed_grandchild.branch = sibling_resume.branch
+    completed_grandchild.completed_at = datetime.now(UTC)
+    store.update(completed_grandchild)
+
+    read_context = _read_context_for_store(store)
+    assert get_recovery_chain_state(store, root) == get_recovery_chain_state(store, root, read_context=read_context)
+    assert get_completed_recovery_descendant(store, root, read_context=read_context) is None
+    assert get_completed_sibling_recovery(store, failed_resume) == get_completed_sibling_recovery(
+        store,
+        failed_resume,
+        read_context=read_context,
+    )
 
 
 def test_completed_recovery_descendant_requires_merged_code_outcome(tmp_path: Path) -> None:
@@ -2257,3 +2416,111 @@ def test_list_failed_tasks_for_recovery_sorts_oldest_created_first(
 
     failed = list_failed_tasks_for_recovery(store)
     assert [task.id for task in failed] == [legacy.id, current.id]
+
+
+def test_recovery_engine_reuses_same_pending_child_with_indexed_context(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "RETRYABLE_PROVIDER_ERROR"
+    failed.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    pending_retry = store.add(failed.prompt, task_type="implement", based_on=failed.id, recovery_origin="retry")
+    assert pending_retry.id is not None
+    pending_retry.status = "pending"
+    store.update(pending_retry)
+
+    manual_follow_up = store.add(failed.prompt, task_type="implement", based_on=failed.id, recovery_origin="manual")
+    assert manual_follow_up.id is not None
+    manual_follow_up.status = "pending"
+    store.update(manual_follow_up)
+
+    read_context = _read_context_for_store(store)
+    store_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    indexed_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, read_context=read_context)
+
+    assert store_decision.reuse_existing is True
+    assert indexed_decision.reuse_existing is True
+    assert store_decision.recovery_task_id == pending_retry.id
+    assert indexed_decision.recovery_task_id == store_decision.recovery_task_id
+
+
+def test_recovery_snapshot_descendant_order_matches_indexed_context(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed plan root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "INFRASTRUCTURE_ERROR"
+    root.completed_at = datetime(2026, 5, 16, 8, 30, tzinfo=UTC)
+    store.update(root)
+
+    older_child = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="retry")
+    assert older_child.id is not None
+    older_child.status = "pending"
+    store.update(older_child)
+
+    newer_child = store.add(root.prompt, task_type="plan", based_on=root.id, recovery_origin="retry")
+    assert newer_child.id is not None
+    newer_child.status = "pending"
+    store.update(newer_child)
+
+    grandchild = store.add(older_child.prompt, task_type="plan", based_on=older_child.id, recovery_origin="retry")
+    assert grandchild.id is not None
+    grandchild.status = "pending"
+    store.update(grandchild)
+
+    read_context = _read_context_for_store(store)
+    store_snapshot = _build_recovery_chain_snapshot(store, root)
+    indexed_snapshot = _build_recovery_chain_snapshot(store, root, read_context=read_context)
+
+    assert [task.id for task in store_snapshot.direct_children] == [older_child.id, newer_child.id]
+    assert [task.id for task in indexed_snapshot.direct_children] == [task.id for task in store_snapshot.direct_children]
+    assert [task.id for task in indexed_snapshot.descendants] == [task.id for task in store_snapshot.descendants]
+
+
+def test_list_failed_tasks_for_recovery_uses_indexed_lineage_without_store_walks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/landed-lineage"
+    failed.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    landed_follow_up = store.add(
+        "Merged same-branch follow-up",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="manual",
+    )
+    assert landed_follow_up.id is not None
+    landed_follow_up.status = "completed"
+    landed_follow_up.branch = failed.branch
+    landed_follow_up.has_commits = True
+    landed_follow_up.merge_status = "merged"
+    landed_follow_up.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(landed_follow_up)
+
+    assert list_failed_tasks_for_recovery(store) == []
+
+    read_context = _read_context_for_store(store)
+
+    def _unexpected_store_lineage_read(*_args, **_kwargs):
+        raise AssertionError("store lineage read should not run when RecoveryReadContext is available")
+
+    monkeypatch.setattr(store, "get", _unexpected_store_lineage_read)
+    monkeypatch.setattr(store, "get_lineage_children", _unexpected_store_lineage_read)
+
+    assert list_failed_tasks_for_recovery(store, read_context=read_context) == []

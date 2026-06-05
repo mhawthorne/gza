@@ -7,10 +7,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from gza import dependency_preconditions as dependency_preconditions_module
+import gza.recovery_engine as recovery_engine
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows
+from gza.operator_state import blocked_by_empty_prereq_label
+from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import list_failed_tasks_for_recovery
 from tests.cli.conftest import make_store, setup_config
 
@@ -27,6 +30,19 @@ def _set_dropped(task, *, when: datetime, branch: str | None, has_commits: bool)
     task.completed_at = when
     task.branch = branch
     task.has_commits = has_commits
+
+
+def _read_context_for_store(store: SqliteTaskStore) -> RecoveryReadContext:
+    indexes = _load_indexes(store)
+    return RecoveryReadContext(
+        tasks=indexes.tasks,
+        task_by_id=indexes.task_by_id,
+        based_on_children=indexes.based_on_children,
+        depends_on_children=indexes.depends_on_children,
+        root_by_task_id=indexes.root_by_task_id,
+        merge_units_by_task_id=indexes.merge_units_by_task_id,
+        allow_reconcile_mutation=False,
+    )
 
 
 def _build_tag_filtered_merge_unit_case(tmp_path: Path) -> tuple[SqliteTaskStore, str, str, str]:
@@ -1447,6 +1463,368 @@ def test_query_lineage_owner_rows_keeps_empty_failed_owner_visible_for_recovery_
     assert entries[0].owner_task.id == failed.id
     assert entries[0].task.id == failed.id
     assert entries[0].decision.action == "resume"
+
+
+def test_collect_recovery_lane_entries_uses_one_read_session_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement owner", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-reuse"
+    failed.branch = "feature/reuse"
+    failed.num_steps_computed = 3
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    opened_connections: list[tuple[bool, object]] = []
+    original_open_connection = store._open_connection
+
+    def _tracking_open_connection(*, close_on_exit: bool):
+        conn = original_open_connection(close_on_exit=close_on_exit)
+        opened_connections.append((close_on_exit, conn))
+        return conn
+
+    monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+    )
+
+    assert [entry.task.id for entry in entries] == [failed.id]
+    assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
+
+
+def test_collect_recovery_lane_entries_performs_prerequisite_reconciliation_writes_only_after_read_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-empty-lane"
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    class _EmptyBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in {"main", failed.branch}:
+                return "same-sha"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: recovery_engine._MergeContext(
+            git=_EmptyBranchGit(),
+            default_branch="main",
+            existing_branches=frozenset({failed.branch}),
+        ),
+    )
+
+    depths: list[tuple[str, int]] = []
+    original_get_or_create = store.get_or_create_merge_unit_for_task
+    original_set_state = store.set_merge_unit_state
+
+    def _record_get_or_create(task):
+        depths.append(("get_or_create", store._read_session_depth))
+        return original_get_or_create(task)
+
+    def _record_set_state(unit_id: str, state: str) -> None:
+        depths.append(("set_merge_unit_state", store._read_session_depth))
+        original_set_state(unit_id, state)
+
+    monkeypatch.setattr(store, "get_or_create_merge_unit_for_task", _record_get_or_create)
+    monkeypatch.setattr(store, "set_merge_unit_state", _record_set_state)
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+    )
+
+    assert [entry.task.id for entry in entries] == []
+    assert depths
+    assert all(depth == 0 for _name, depth in depths)
+    merge_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert merge_unit is not None
+    assert merge_unit.state == "empty"
+
+
+def test_query_lineage_owner_rows_reconciles_historical_prerequisite_unmerged_empty_branch_outside_read_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-empty-watch"
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    class _EmptyBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in {"main", failed.branch}:
+                return "same-sha"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: recovery_engine._MergeContext(
+            git=_EmptyBranchGit(),
+            default_branch="main",
+            existing_branches=frozenset({failed.branch}),
+        ),
+    )
+
+    depths: list[tuple[str, int]] = []
+    original_get_or_create = store.get_or_create_merge_unit_for_task
+    original_set_state = store.set_merge_unit_state
+
+    def _record_get_or_create(task):
+        depths.append(("get_or_create", store._read_session_depth))
+        return original_get_or_create(task)
+
+    def _record_set_state(unit_id: str, state: str) -> None:
+        depths.append(("set_merge_unit_state", store._read_session_depth))
+        original_set_state(unit_id, state)
+
+    monkeypatch.setattr(store, "get_or_create_merge_unit_for_task", _record_get_or_create)
+    monkeypatch.setattr(store, "set_merge_unit_state", _record_set_state)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+    )
+
+    assert rows == ()
+    assert depths
+    assert all(depth == 0 for _name, depth in depths)
+    merge_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert merge_unit is not None
+    assert merge_unit.state == "empty"
+
+
+def test_blocked_by_empty_prereq_label_matches_indexed_context_for_direct_empty_dependency(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Empty dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.branch = "feature/direct-empty"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    unit = store.create_merge_unit(
+        source_branch=dependency.branch,
+        target_branch="main",
+        owner_task_id=dependency.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dependency.id, unit.id, "owner")
+
+    dependent = store.add("Dependent task", task_type="implement", depends_on=dependency.id)
+    assert dependent.id is not None
+
+    read_context = _read_context_for_store(store)
+    assert blocked_by_empty_prereq_label(store, dependent) == blocked_by_empty_prereq_label(
+        store,
+        dependent,
+        read_context=read_context,
+    )
+
+
+def test_blocked_by_empty_prereq_label_matches_indexed_context_for_completed_retry_descendant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Failed dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "failed"
+    dependency.failure_reason = "INFRASTRUCTURE_ERROR"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    completed_retry = store.add("Completed retry", task_type="implement", based_on=dependency.id)
+    assert completed_retry.id is not None
+    completed_retry.status = "completed"
+    completed_retry.branch = "feature/retry-empty"
+    completed_retry.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(completed_retry)
+
+    unit = store.create_merge_unit(
+        source_branch=completed_retry.branch,
+        target_branch="main",
+        owner_task_id=completed_retry.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(completed_retry.id, unit.id, "owner")
+
+    dependent = store.add("Dependent task", task_type="implement", depends_on=dependency.id)
+    assert dependent.id is not None
+
+    read_context = _read_context_for_store(store)
+    assert blocked_by_empty_prereq_label(store, dependent) == blocked_by_empty_prereq_label(
+        store,
+        dependent,
+        read_context=read_context,
+    )
+
+
+def test_read_context_preserves_store_based_on_child_order(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Failed implementation", task_type="implement")
+    assert parent.id is not None
+    parent.status = "failed"
+    parent.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(parent)
+
+    older = store.add(parent.prompt, task_type="implement", based_on=parent.id, recovery_origin="retry")
+    assert older.id is not None
+    older.status = "pending"
+    store.update(older)
+
+    newer = store.add(parent.prompt, task_type="implement", based_on=parent.id, recovery_origin="retry")
+    assert newer.id is not None
+    newer.status = "pending"
+    store.update(newer)
+
+    read_context = _read_context_for_store(store)
+    assert [task.id for task in store.get_based_on_children(parent.id)] == [task.id for task in read_context.get_based_on_children(parent.id)]
+    assert [task.id for task in store.get_based_on_children_by_type(parent.id, "implement")] == [
+        task.id for task in read_context.get_based_on_children_by_type(parent.id, "implement")
+    ]
+
+
+def test_read_context_dependency_completion_matches_store_oldest_completed_retry_descendant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Failed dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "failed"
+    dependency.failure_reason = "INFRASTRUCTURE_ERROR"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 30, tzinfo=UTC)
+    store.update(dependency)
+
+    older_retry = store.add("Completed retry older", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    assert older_retry.id is not None
+    older_retry.status = "completed"
+    older_retry.completed_at = datetime(2026, 5, 16, 9, 30, tzinfo=UTC)
+    store.update(older_retry)
+
+    newer_retry = store.add("Completed retry newer", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    assert newer_retry.id is not None
+    newer_retry.status = "completed"
+    newer_retry.completed_at = datetime(2026, 5, 16, 10, 30, tzinfo=UTC)
+    store.update(newer_retry)
+
+    dependent = store.add("Dependent task", task_type="implement", depends_on=dependency.id)
+    assert dependent.id is not None
+
+    read_context = _read_context_for_store(store)
+    store_resolved = store.resolve_dependency_completion(dependent)
+    indexed_resolved = read_context.resolve_dependency_completion(dependent)
+
+    assert store_resolved is not None
+    assert indexed_resolved is not None
+    assert store_resolved.id == older_retry.id
+    assert indexed_resolved.id == store_resolved.id
+
+
+def test_load_indexes_prefers_latest_active_merge_unit_per_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.branch = "feature/tie-break"
+    task.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(task)
+
+    older = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    newer = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(task.id, older.id, "owner")
+    store.attach_task_to_merge_unit(task.id, newer.id, "owner")
+
+    indexes = _load_indexes(store)
+    assert indexes.merge_units_by_task_id[task.id].id == newer.id
 
 
 def test_query_lineage_owner_rows_hides_branchless_moot_prerequisite_unmerged_failed_owner_from_recovery_lane(

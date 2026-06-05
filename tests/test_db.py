@@ -709,6 +709,69 @@ class TestConnectionLifecycle:
 
         assert seen_pragmas == ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"]
 
+    def test_read_session_reuses_one_underlying_connection_for_many_reads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add("Task 1", group="release")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        opened_connections: list[sqlite3.Connection] = []
+        original_open_connection = store._open_connection
+
+        def _tracking_open_connection(*, close_on_exit: bool) -> sqlite3.Connection:
+            conn = original_open_connection(close_on_exit=close_on_exit)
+            opened_connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+
+        with store.read_session():
+            assert [row.id for row in store.get_all()] == [task.id]
+            assert store.get(task.id) is not None
+            assert store.get_by_tag("release")[0].id == task.id
+            assert store.get_tag_status_counts()["release"]["completed"] == 1
+
+        assert len(opened_connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened_connections[0].execute("SELECT 1")
+
+    def test_nested_read_session_inner_exit_keeps_connection_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        store.add("Task 1")
+
+        opened_connections: list[sqlite3.Connection] = []
+        original_open_connection = store._open_connection
+
+        def _tracking_open_connection(*, close_on_exit: bool) -> sqlite3.Connection:
+            conn = original_open_connection(close_on_exit=close_on_exit)
+            opened_connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+
+        with store.read_session():
+            outer_conn = store._read_session_conn
+            assert outer_conn is not None
+            with store.read_session():
+                assert store._read_session_conn is outer_conn
+                assert store.get_all()
+            outer_conn.execute("SELECT 1")
+
+        assert len(opened_connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened_connections[0].execute("SELECT 1")
+
     def test_get_by_tag(self, tmp_path: Path):
         """Tag lookups should return tasks in creation order."""
         db_path = tmp_path / "test.db"

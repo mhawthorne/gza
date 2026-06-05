@@ -32,6 +32,7 @@ from gza.recovery_engine import (
     decide_failed_task_recovery,
     get_failed_recovery_needs_attention_reason,
 )
+from gza.recovery_read_context import RecoveryReadContext
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
 from gza.review_verdict import (
     ParsedReviewReport,
@@ -1318,6 +1319,7 @@ def failed_recovery_decision_to_attention_action(
     decision: FailedRecoveryDecision,
     *,
     max_recovery_attempts: int,
+    read_context: RecoveryReadContext | None = None,
 ) -> dict[str, Any] | None:
     """Convert a terminal failed-task recovery stop into the shared attention action."""
     attention_reason = get_failed_recovery_needs_attention_reason(
@@ -1325,6 +1327,7 @@ def failed_recovery_decision_to_attention_action(
         task,
         decision=decision,
         max_recovery_attempts=max_recovery_attempts,
+        read_context=read_context,
     )
     action = failed_recovery_decision_to_action(
         task,

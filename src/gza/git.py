@@ -328,6 +328,11 @@ class Git:
         result = self._run("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
         return result.returncode == 0
 
+    def local_branch_names(self) -> frozenset[str]:
+        """Return all local branch names in one call."""
+        result = self._run("for-each-ref", "--format=%(refname:strip=2)", "refs/heads/")
+        return frozenset(line.strip() for line in result.stdout.splitlines() if line.strip())
+
     def worktree_add(self, path: Path, branch: str, base_branch: str | None = None) -> Path:
         """Create a new worktree with a new branch.
 

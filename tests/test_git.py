@@ -455,6 +455,17 @@ class TestBranchOperations:
 
             assert result is False
 
+    def test_local_branch_names_returns_all_local_heads(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="main\nfeature/demo\n", stderr="")
+
+            assert git.local_branch_names() == frozenset({"main", "feature/demo"})
+            mock_run.assert_called_once_with("for-each-ref", "--format=%(refname:strip=2)", "refs/heads/")
+
     def test_delete_branch_without_force(self, tmp_path: Path):
         """Test deleting a branch without force."""
         repo_dir = tmp_path / "repo"

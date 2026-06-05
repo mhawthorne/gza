@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import tempfile
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -119,6 +120,25 @@ class _ClosingSqliteConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc, tb)
         finally:
             self.close()
+
+
+class _SessionSqliteConnectionProxy:
+    """Context-manager wrapper that never closes a shared read-session connection."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn
+
+    def __exit__(self, exc_type, exc, tb) -> Literal[False]:
+        return False
+
+    def close(self) -> None:
+        """Intentionally do nothing; the outer read session owns connection lifetime."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
 
 
 def _encode_v25_base36(n: int) -> str:
@@ -2542,6 +2562,8 @@ class SqliteTaskStore:
         self._write_pragmas_applied = False
         self._supports_merge_units_cache: bool | None = None
         self._default_merge_target_cache: str | None = None
+        self._read_session_conn: sqlite3.Connection | None = None
+        self._read_session_depth = 0
         if self._open_mode == "query_only":
             self._ensure_db_query_only()
         else:
@@ -3026,14 +3048,34 @@ class SqliteTaskStore:
                 if "readonly" not in str(exc).lower():
                     raise
 
-    def _connect(self) -> sqlite3.Connection:
-        """Create a database connection with auto-commit."""
+    @contextmanager
+    def read_session(self):
+        """Reuse one connection for nested read-heavy operations.
+
+        This is read-only only: callers must not route writes through an active session.
+        """
+        if self._read_session_conn is None:
+            self._read_session_conn = self._open_connection(close_on_exit=False)
+        self._read_session_depth += 1
+        try:
+            yield
+        finally:
+            self._read_session_depth -= 1
+            if self._read_session_depth == 0:
+                conn = self._read_session_conn
+                self._read_session_conn = None
+                if conn is not None:
+                    conn.close()
+
+    def _open_connection(self, *, close_on_exit: bool) -> sqlite3.Connection:
+        """Create a database connection with the store's standard pragmas and mode."""
+        factory: type[sqlite3.Connection] = _ClosingSqliteConnection if close_on_exit else sqlite3.Connection
         if self._query_only_empty_db:
             conn = sqlite3.connect(
                 ":memory:",
                 isolation_level=None,
                 timeout=15,
-                factory=_ClosingSqliteConnection,
+                factory=factory,
             )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=15000")
@@ -3045,7 +3087,7 @@ class SqliteTaskStore:
             self.db_path,
             isolation_level=None,
             timeout=15,
-            factory=_ClosingSqliteConnection,
+            factory=factory,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
@@ -3064,6 +3106,12 @@ class SqliteTaskStore:
                         raise
             self._write_pragmas_applied = True
         return conn
+
+    def _connect(self) -> sqlite3.Connection | _SessionSqliteConnectionProxy:
+        """Create a database connection with auto-commit."""
+        if self._read_session_conn is not None:
+            return _SessionSqliteConnectionProxy(self._read_session_conn)
+        return self._open_connection(close_on_exit=True)
 
     def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
         """Convert a database row to a Task."""
