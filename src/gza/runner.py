@@ -78,6 +78,10 @@ from .improve_diff import (
     compute_improve_changed_diff,
 )
 from .learnings import maybe_auto_regenerate_learnings
+from .lifecycle_completion import (
+    auto_review_skip_message_for_completed_code_task,
+    should_auto_create_review_for_completed_code_task,
+)
 from .lineage import get_plan_for_task
 from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
@@ -3346,6 +3350,42 @@ def _noop_improve_warning_text(
     return warning
 
 
+def _resolved_merge_state_for_task(store: SqliteTaskStore, task: Task) -> str | None:
+    """Resolve persisted merge state for a task without live git classification."""
+    if task.id is None:
+        return task.merge_status
+    unit = store.resolve_merge_unit_for_task(task.id)
+    if unit is not None:
+        return unit.state
+    return task.merge_status
+
+
+def _emit_auto_review_suppressed(
+    *,
+    task: Task,
+    config: Config,
+    message: str,
+    task_logger: TaskExecutionLogger | None,
+) -> None:
+    """Emit and persist an operator-visible auto-review suppression event."""
+    if task_logger is not None:
+        task_logger.info(message, extra={"task_id": task.id, "auto_review": "skipped"})
+        return
+    print(message)
+    if not task.log_file:
+        return
+    write_log_entry(
+        config.project_dir / Path(task.log_file),
+        {
+            "type": "gza",
+            "subtype": "info",
+            "message": message,
+            "task_id": task.id,
+            "auto_review": "skipped",
+        },
+    )
+
+
 def _task_has_current_passing_review_verify_evidence(
     *,
     task: Task,
@@ -6185,6 +6225,21 @@ def _post_complete_code_task(
 
     # Auto-create and run review task if requested
     if task.create_review:
+        if task.task_type == "implement":
+            refreshed_task = store.get(task.id) if task.id is not None else None
+            if refreshed_task is not None:
+                task = refreshed_task
+            merge_state = _resolved_merge_state_for_task(store, task)
+            if not should_auto_create_review_for_completed_code_task(task, merge_state=merge_state):
+                message = auto_review_skip_message_for_completed_code_task(task, merge_state=merge_state)
+                if message is not None:
+                    _emit_auto_review_suppressed(
+                        task=task,
+                        config=config,
+                        message=message,
+                        task_logger=task_logger,
+                    )
+                return 0
         if task.task_type == "improve" and improve_changed_diff is False:
             return 0
         if task.task_type == "improve" and not improve_follow_up_ready:

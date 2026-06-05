@@ -17,7 +17,7 @@ EMPTY_PREREQ_RELEASE_VALVE_DETAIL = (
     "empty prerequisite; manual release tracked by "
     "gza-4072 / `gza edit --clear-depends-on`"
 )
-MOOT_EMPTY_LIFECYCLE_DETAIL = "moot (no task commits)"
+MOOT_EMPTY_LIFECYCLE_DETAIL = "moot (no unique commits vs target)"
 
 
 @dataclass(frozen=True)

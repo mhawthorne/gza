@@ -9833,6 +9833,139 @@ class TestExtractedRunInnerHelpers:
         assert rc == 7
         assert call_order == ["pr", "review"]
 
+    def test_post_complete_implement_without_task_commits_skips_auto_review_and_logs_reason(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement no-op", task_type="implement", create_review=True)
+        task.status = "completed"
+        task.has_commits = False
+        task.branch = "feature/no-task-commits"
+        task.slug = "20260605-no-task-commits"
+        task.log_file = "logs/20260605-no-task-commits.log"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        log_file = tmp_path / task.log_file
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                task.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        run_review.assert_not_called()
+        reviews = [row for row in store.get_all() if row.task_type == "review"]
+        assert reviews == []
+        output = capsys.readouterr().out
+        assert "nothing to review" in output
+        assert "no task commits" in output
+
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines()]
+        assert any(
+            entry["message"]
+            == "Skipping auto-review for "
+            f"{task.id}: completed with no task commits; nothing to review."
+            for entry in ops_entries
+        )
+
+    def test_post_complete_implement_with_empty_merge_unit_skips_auto_review_without_no_task_commits_wording(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement already landed", task_type="implement", create_review=True)
+        store.mark_completed(task, has_commits=True, branch="feature/empty-review")
+        assert task.id is not None
+        task.slug = "20260605-empty-review"
+        task.log_file = "logs/20260605-empty-review.log"
+        store.update(task)
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "empty")
+
+        config = self._make_config(tmp_path)
+        log_file = tmp_path / task.log_file
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                task.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        run_review.assert_not_called()
+        reviews = [row for row in store.get_all() if row.task_type == "review"]
+        assert reviews == []
+        output = capsys.readouterr().out
+        assert "no unique commits vs target" in output
+        assert "no task commits" not in output
+
+        ops_entries = [json.loads(line) for line in ops_log_path_for(log_file).read_text().splitlines()]
+        assert any(
+            entry["message"]
+            == "Skipping auto-review for "
+            f"{task.id}: no unique commits vs target (nothing to review)."
+            for entry in ops_entries
+        )
+
+    def test_post_complete_implement_with_commits_still_runs_auto_review(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement with commits", task_type="implement", create_review=True)
+        store.mark_completed(task, has_commits=True, branch="feature/with-commits")
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner._create_and_run_review_task", return_value=17) as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                task.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 17
+        run_review.assert_called_once()
+
     def test_post_complete_improve_syncs_live_pr_before_auto_review(self, tmp_path: Path):
         """Successful improve completion should sync a live PR before follow-up review work."""
         db_path = tmp_path / "test.db"

@@ -387,6 +387,28 @@ def test_lifecycle_incomplete_prefers_merged_unit_state_over_stale_task_row(tmp_
     assert result.rows == ()
 
 
+def test_lifecycle_incomplete_excludes_completed_empty_implementation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    task = store.add("completed empty implementation", task_type="implement")
+    store.mark_completed(task, has_commits=True, branch="feature/completed-empty-implementation")
+    assert task.id is not None
+
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            statuses=("completed",),
+            lifecycle_state=("incomplete",),
+            limit=None,
+        )
+    )
+
+    assert result.rows == ()
+
+
 def test_lifecycle_complete_excludes_pending_review_attached_to_merged_unit(tmp_path: Path) -> None:
     store = _store(tmp_path)
     root = store.add("merged implement", task_type="implement")

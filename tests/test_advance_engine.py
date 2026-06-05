@@ -3396,7 +3396,7 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (no task commits)"
+    assert action["description"] == "SKIP: moot (no unique commits vs target)"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
     assert refreshed_unit.state == "empty"
@@ -3472,7 +3472,7 @@ def test_empty_branch_persists_empty_and_skips_merge_actions(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (no task commits)"
+    assert action["description"] == "SKIP: moot (no unique commits vs target)"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
     assert refreshed_unit.state == "empty"
@@ -4152,7 +4152,7 @@ def test_empty_branch_skips_with_moot_no_work_text(tmp_path: Path) -> None:
     )
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (no task commits)"
+    assert action["description"] == "SKIP: moot (no unique commits vs target)"
 
 
 def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(

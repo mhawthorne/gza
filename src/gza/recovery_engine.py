@@ -16,6 +16,7 @@ from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .merge_state import resolve_task_merge_state_for_target
+from .operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL
 from .recovery_read_context import RecoveryReadContext
 
 logger = logging.getLogger(__name__)
@@ -1236,7 +1237,7 @@ def decide_failed_task_recovery(
             return _skip_decision(
                 task_id=task_id,
                 reason_code="merge_unit_empty",
-                reason_text="moot (no task commits)",
+                reason_text=MOOT_EMPTY_LIFECYCLE_DETAIL,
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )

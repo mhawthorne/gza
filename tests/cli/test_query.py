@@ -1037,7 +1037,7 @@ class TestHistoryCommand:
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
         assert "Historical empty row [implement] [empty]" in normalized
-        assert "lifecycle: moot (no task commits)" in result.stdout
+        assert "lifecycle: moot (no unique commits vs target)" in result.stdout
 
     def test_history_shows_orphaned_tasks_at_top(self, tmp_path: Path):
         """History command includes orphaned in-progress tasks at the top."""

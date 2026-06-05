@@ -240,6 +240,9 @@ failure *and* actionable merge/review work remains eligible for the latter.
 
 ### §8 — Merge
 
+- A completed `implement` task with no task commits, or with merge-unit state `empty`,
+  is terminal moot: it MUST NOT create, run, wait on, or require a review, and it MUST
+  remain absent from actionable `unmerged` and lifecycle-`incomplete` surfaces.
 - Reviews all cleared/addressed, with no newer rebase or closing-review requirement
   invalidating that state → `merge`.
 - A non-implementation unit, or a unit that does not require review → `merge`.
@@ -256,6 +259,10 @@ failure *and* actionable merge/review work remains eligible for the latter.
   mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
   MUST reject merge representatives whose execution status is not `completed` or
   `unmerged`.
+
+Note: the "implementation unit with no review" rule above applies only when the
+implementation still has reviewable commits or diff against the target. Terminal empty
+implementations are covered by the moot rule and do not require review creation.
 
 ### §9 — PR publication for completed code tasks
 

@@ -1792,7 +1792,7 @@ def test_recovery_engine_prerequisite_unmerged_branchless_no_output_row_is_moot_
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_empty"
-    assert decision.reason_text == "moot (no task commits)"
+    assert decision.reason_text == "moot (no unique commits vs target)"
     assert store.resolve_merge_unit_for_task(failed.id) is None
     assert list_failed_tasks_for_recovery(store) == []
 

@@ -1262,6 +1262,38 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     assert rows_by_owner[failed_impl.id].next_action["type"] == "resume"
 
 
+def test_query_lineage_owner_rows_excludes_completed_empty_implementation(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Completed empty implement", task_type="implement")
+    assert task.id is not None
+    store.mark_completed(task, has_commits=True, branch="feature/completed-empty-owner")
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    owner_ids = {row.owner_task.id for row in rows if row.owner_task.id is not None}
+    assert task.id not in owner_ids
+
+
 def test_query_lineage_owner_rows_failed_timeout_no_review_prefers_resume_over_merge(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
