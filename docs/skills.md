@@ -243,6 +243,14 @@ Use `/gza-docs-review` to audit documentation before a release or after adding n
 
 ---
 
+## gza-spec-coherence
+
+**Check the behavior-spec set for ownership overlap, cross-reference discipline, and plain-language RFC-2119 usage.**
+
+Use `/gza-spec-coherence` when you want an author-side gate on `specs/behavior/**`. It reviews the behavior specs against each other, not against the code, and reports duplicate ownership, repeated vocabulary or invariants that should cross-reference `00-overview.md`, broken or missing cross-references, and normative clauses that can be rewritten more plainly. Writes findings to `reviews/<timestamp>-spec-coherence.md`.
+
+---
+
 ## Authoring Skills
 
 ### Where Skills Live

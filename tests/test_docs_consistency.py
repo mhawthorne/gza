@@ -784,6 +784,18 @@ def test_skill_install_docs_and_internal_task_model_match_importer_cleanup() -> 
     assert "importer/config flows" not in task_model_content
 
 
+def test_skills_docs_describe_spec_coherence_as_behavior_spec_set_gate() -> None:
+    """Operator docs should describe the new behavior-spec coherence gate accurately."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skills_content = (repo_root / "docs" / "skills.md").read_text()
+
+    assert "## gza-spec-coherence" in skills_content
+    assert "author-side gate on `specs/behavior/**`" in skills_content
+    assert "not against the code" in skills_content
+    assert "repeated vocabulary or invariants that should cross-reference `00-overview.md`" in skills_content
+    assert "reviews/<timestamp>-spec-coherence.md" in skills_content
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

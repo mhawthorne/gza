@@ -180,6 +180,7 @@ class TestSkillsInstallClaudeTarget:
 
         assert result.returncode == 0
         assert "Available skills:" in result.stdout
+        assert "gza-spec-coherence" in result.stdout
         assert "gza-task-add" in result.stdout
         assert "gza-task-info" in result.stdout
         assert "gza-plan-review" in result.stdout
@@ -196,6 +197,7 @@ class TestSkillsInstallClaudeTarget:
         # Verify skills were created
         skills_dir = tmp_path / ".claude" / "skills"
         assert skills_dir.exists()
+        assert (skills_dir / "gza-spec-coherence" / "SKILL.md").exists()
         assert (skills_dir / "gza-task-add" / "SKILL.md").exists()
         assert (skills_dir / "gza-task-info" / "SKILL.md").exists()
         assert (skills_dir / "gza-plan-review" / "SKILL.md").exists()
@@ -637,6 +639,7 @@ class TestSkillsInstallCommand:
 
         assert result.returncode == 0
         assert "Available skills:" in result.stdout
+        assert "gza-spec-coherence" in result.stdout
         assert "gza-task-add" in result.stdout
         assert "gza-plan-review" in result.stdout
 
@@ -769,6 +772,27 @@ class TestSkillContentValidation:
         assert "full prefixed explore task ID" in content
         assert "supports `42` or `#42`" not in content
         assert "strip the leading `#`" not in content
+
+    def test_gza_spec_coherence_defines_required_behavior_spec_checks(self):
+        """gza-spec-coherence should enforce overlap, cross-reference, and plain-language review."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-spec-coherence" / "SKILL.md"
+        content = skill_file.read_text()
+        normalized = " ".join(content.split())
+
+        assert "This skill is blind to authorship." in content
+        assert "never who wrote it" in content
+        assert "Bash(git log:*)" not in content
+        assert "Bash(git blame:*)" not in content
+        assert "00-overview.md" in content
+        assert "lifecycle-engine.md" in content
+        assert "restated shared vocabulary or invariants" in normalized
+        assert "Broken or missing cross-references" in content
+        assert "RFC-2119 keyword misuse" in content
+        assert "quote the clause, then propose a tighter rewrite" in normalized
+        assert "MUST NOT edit the spec or the code" in content
+        assert "reviews/<timestamp>-spec-coherence.md" in content
 
     def test_gza_task_run_routes_to_first_class_run_inline_command(self):
         """gza-task-run should delegate execution to `gza run-inline` instead of synthetic lifecycle steps."""
