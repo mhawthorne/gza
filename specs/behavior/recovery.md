@@ -37,7 +37,11 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
   park for a human; it MUST NOT loop forever.
 - **R5 — Already-landed work is not recoverable.** Once a failed task has a valid landed
   or completed representative, recovery MUST suppress the older failed row instead of
-  re-queueing it.
+  re-queueing it. **Branch reachability from the target is not, by itself, a valid landed
+  representative**: a branch counts as landed only if it contributed at least one commit now
+  contained in the target. An `empty` branch (no commits ahead of the target) never satisfies R5 —
+  it is governed by the empty-recovery predicate (§1), not by landed suppression. This rule and
+  `lifecycle-engine.md` §7 ("already landed") MUST stay in lockstep.
 - **R6 — A recovery row carries its action.** A task created to carry recovery
   (`recovery_origin = resume` or `recovery_origin = retry`) MUST be executed with that
   action whenever it runs, by **any** launch path (pending-queue worker pickup, `iterate`,
@@ -48,8 +52,12 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
 
 ### 1. Empty merge units split into moot vs recoverable
 
-When a failed task's active merge unit state is `empty`, the policy MUST evaluate a
-single shared predicate:
+The operative condition is **"the branch has no commits ahead of the merge target"**. This surfaces
+either as an active merge-unit state of `empty`, **or** as a failed task with no merge unit at all
+(`merge_status` absent / `None`) whose branch is reachable-but-empty vs the target. In **both** cases
+the policy MUST evaluate the single shared predicate below — it MUST NOT gate solely on the literal
+`empty` merge-unit enum, since a task that died before its first commit may never have acquired a
+merge unit:
 
 - `empty_task_requires_recovery(task)` is **true** iff all of the following hold:
   - the task status is `failed`
@@ -88,7 +96,10 @@ resolved by a valid representative, including:
 - a completed automatic sibling recovery that already resolved the replaced attempt
 - another valid landed representative for the same code by an independent path
 
-The same failed task being `empty` on its own MUST NOT count as proof of resolution.
+The same failed task being `empty` on its own MUST NOT count as proof of resolution. A branch that
+is merely reachable from the target but contributed **no unique commits** is `empty`, not a landed
+representative, and MUST NOT count as proof of resolution either (see R5 and `lifecycle-engine.md`
+§7).
 
 ### 4. Executing a pending recovery row
 
