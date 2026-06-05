@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from gza.db import Task
 from gza.query import (
     _lineage_child_sort_key,
+    build_ancestor_forest,
     build_lineage,
     build_lineage_tree,
     filter_lineage_tree,
@@ -413,6 +414,23 @@ class TestBuildLineage:
         tree = build_lineage_tree(store, root)
         assert [child.task.id for child in tree.children] == [2]
         assert [child.task.id for child in tree.children[0].children] == [3]
+
+    def test_ancestor_forest_deduplicates_shared_parent_edge(self):
+        store = MagicMock()
+        parent = _make_task(id=1, task_type="implement", created_at=datetime(2026, 1, 1))
+        child = _make_task(
+            id=2,
+            task_type="implement",
+            based_on=1,
+            depends_on=1,
+            created_at=datetime(2026, 1, 2),
+        )
+
+        with patch("gza.query.walk_ancestors", return_value=[parent]):
+            forest = build_ancestor_forest(store, child)
+
+        assert [node.task.id for node in forest] == [1]
+        assert [node.task.id for node in forest[0].children] == [2]
 
 
 # ---------------------------------------------------------------------------

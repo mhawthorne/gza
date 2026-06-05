@@ -2337,12 +2337,29 @@ def main() -> int:
 
     # lineage command
     lineage_parser = subparsers.add_parser(
-        "lineage", help="Show the full lineage tree for a given task"
+        "lineage",
+        help="Show a task's lineage tree (children by default; parents optional)",
     )
     lineage_parser.add_argument(
         "task_id",
         type=str,
         help="Full prefixed task ID to show lineage for",
+    )
+    lineage_mode = lineage_parser.add_mutually_exclusive_group()
+    lineage_mode.add_argument(
+        "--full",
+        action="store_true",
+        help="Show both ancestor and descendant lineage for the selected task",
+    )
+    lineage_mode.add_argument(
+        "--parents-only",
+        action="store_true",
+        help="Show only the ancestor chain for the selected task",
+    )
+    lineage_mode.add_argument(
+        "--children-only",
+        action="store_true",
+        help="Show only the selected task and its descendants",
     )
     add_common_args(lineage_parser)
 

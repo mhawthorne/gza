@@ -11613,6 +11613,283 @@ class TestLineageCommand:
         assert "Implement auth per plan" in normalized
         assert "review" in normalized
 
+    def test_lineage_default_notes_immediate_resume_parent(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        parent = store.add("Recover original attempt", task_type="implement")
+        assert parent.id is not None
+        parent.status = "failed"
+        parent.session_id = "sess-1"
+        parent.branch = "feature/recover"
+        parent.completed_at = datetime.now(UTC)
+        store.update(parent)
+
+        child = store.add(
+            "Recover original attempt",
+            task_type="implement",
+            based_on=parent.id,
+            recovery_origin="resume",
+        )
+        assert child.id is not None
+        child.status = "completed"
+        child.session_id = parent.session_id
+        child.branch = parent.branch
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert f"Parents: {parent.id} [resume]. Use --full or --parents-only to inspect ancestors." in normalized
+        assert child.id in normalized
+
+    def test_lineage_default_uses_persisted_resume_parent_label_without_matching_session(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        parent = store.add("Recover original attempt", task_type="implement")
+        assert parent.id is not None
+        parent.status = "failed"
+        parent.session_id = "sess-parent"
+        parent.branch = "feature/recover"
+        parent.completed_at = datetime.now(UTC)
+        store.update(parent)
+
+        child = store.add(
+            "Recover original attempt",
+            task_type="implement",
+            based_on=parent.id,
+            recovery_origin="resume",
+        )
+        assert child.id is not None
+        child.status = "completed"
+        child.session_id = "sess-child"
+        child.branch = parent.branch
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert f"Parents: {parent.id} [resume]. Use --full or --parents-only to inspect ancestors." in normalized
+        assert f"Parents: {parent.id} [retry]." not in normalized
+
+    def test_lineage_default_uses_persisted_retry_parent_label_even_with_matching_session(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        parent = store.add("Retry original attempt", task_type="implement")
+        assert parent.id is not None
+        parent.status = "failed"
+        parent.session_id = "sess-parent"
+        parent.branch = "feature/retry"
+        parent.completed_at = datetime.now(UTC)
+        store.update(parent)
+
+        child = store.add(
+            "Retry original attempt",
+            task_type="implement",
+            based_on=parent.id,
+            recovery_origin="retry",
+        )
+        assert child.id is not None
+        child.status = "completed"
+        child.session_id = parent.session_id
+        child.branch = "feature/retry-2"
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert f"Parents: {parent.id} [retry]. Use --full or --parents-only to inspect ancestors." in normalized
+        assert f"Parents: {parent.id} [resume]." not in normalized
+
+    def test_lineage_children_only_omits_parent_hint(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        parent = store.add("Initial attempt", task_type="implement")
+        assert parent.id is not None
+        parent.status = "failed"
+        parent.completed_at = datetime.now(UTC)
+        store.update(parent)
+
+        parent.session_id = "sess-2"
+        parent.branch = "feature/retry"
+        store.update(parent)
+
+        child = store.add(
+            "Retry attempt",
+            task_type="implement",
+            based_on=parent.id,
+            recovery_origin="resume",
+        )
+        assert child.id is not None
+        child.status = "completed"
+        child.session_id = parent.session_id
+        child.branch = parent.branch
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        review = store.add("Review retry", task_type="review", depends_on=child.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        result = run_gza("lineage", str(child.id), "--children-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Parents:" not in normalized
+        assert child.id in normalized
+        assert review.id in normalized
+        assert parent.id not in normalized
+
+    def test_lineage_parents_only_shows_ancestor_chain_without_children(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Design auth flow", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        impl = store.add("Implement auth flow", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        review = store.add("Review auth flow", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        result = run_gza("lineage", str(review.id), "--parents-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Parents:" not in normalized
+        assert plan.id in normalized
+        assert impl.id in normalized
+        assert review.id in normalized
+        assert "children" not in normalized.lower()
+
+    def test_lineage_parent_modes_deduplicate_shared_parent_edge(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        parent = store.add("Shared parent", task_type="implement")
+        assert parent.id is not None
+        parent.status = "completed"
+        parent.completed_at = datetime.now(UTC)
+        store.update(parent)
+
+        child = store.add(
+            "Shared-edge child",
+            task_type="implement",
+            based_on=parent.id,
+            depends_on=parent.id,
+        )
+        assert child.id is not None
+        child.status = "completed"
+        child.completed_at = datetime.now(UTC)
+        store.update(child)
+
+        parents_only = run_gza("lineage", str(child.id), "--parents-only", "--project", str(tmp_path))
+
+        assert parents_only.returncode == 0
+        assert parents_only.stdout.count(child.id) == 1
+
+        full = run_gza("lineage", str(child.id), "--full", "--project", str(tmp_path))
+
+        assert full.returncode == 0
+        parents_section = full.stdout.split("Children:", 1)[0]
+        assert parents_section.count(child.id) == 1
+
+    def test_lineage_full_shows_parents_and_children_sections(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        impl = store.add("Implement rollout", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        review = store.add("Review rollout", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        result = run_gza("lineage", str(impl.id), "--full", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Parents:" in normalized
+        assert "Children:" in normalized
+        assert plan.id in normalized
+        assert impl.id in normalized
+        assert review.id in normalized
+
+    def test_lineage_default_without_parents_keeps_descendant_view(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root = store.add("Standalone implementation", task_type="implement")
+        assert root.id is not None
+        root.status = "completed"
+        root.completed_at = datetime.now(UTC)
+        store.update(root)
+
+        review = store.add("Review standalone implementation", task_type="review", depends_on=root.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Parents:" not in normalized
+        assert root.id in normalized
+        assert review.id in normalized
+
+    def test_lineage_mode_flags_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Exclusive modes", task_type="implement")
+        assert task.id is not None
+
+        result = run_gza(
+            "lineage",
+            str(task.id),
+            "--full",
+            "--parents-only",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode != 0
+        assert "not allowed with argument" in result.stderr
+
     def test_lineage_omits_runtime_steps_cost_trailer(self, tmp_path: Path):
         """Lineage command omits runtime/steps/cost stats trailers."""
         from datetime import datetime

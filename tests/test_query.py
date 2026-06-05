@@ -42,6 +42,42 @@ class TestClassifyChildRelationship:
 
         assert _classify_child_relationship(parent, child) == "rebase"
 
+    def test_explicit_resume_recovery_origin_wins_over_session_heuristic(self):
+        parent = _make_task(id="gza-1", task_type="implement", session_id=None)
+        child = _make_task(
+            id="gza-2",
+            task_type="implement",
+            based_on="gza-1",
+            recovery_origin="resume",
+            session_id="sess-child",
+        )
+
+        assert _classify_child_relationship(parent, child) == "resume"
+
+    def test_explicit_retry_recovery_origin_wins_over_session_heuristic(self):
+        parent = _make_task(id="gza-1", task_type="implement", session_id="sess-parent")
+        child = _make_task(
+            id="gza-2",
+            task_type="implement",
+            based_on="gza-1",
+            recovery_origin="retry",
+            session_id="sess-parent",
+        )
+
+        assert _classify_child_relationship(parent, child) == "retry"
+
+    def test_manual_same_type_follow_up_is_not_mislabeled_as_recovery(self):
+        parent = _make_task(id="gza-1", task_type="implement", session_id="sess-parent")
+        child = _make_task(
+            id="gza-2",
+            task_type="implement",
+            based_on="gza-1",
+            recovery_origin="manual",
+            session_id="sess-parent",
+        )
+
+        assert _classify_child_relationship(parent, child) == "implement"
+
 
 class TestIsLineageComplete:
     """Unit tests for the is_lineage_complete pure function."""

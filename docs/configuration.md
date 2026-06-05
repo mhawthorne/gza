@@ -1137,6 +1137,23 @@ uv run gza merged [options]
 
 `uv run gza merged` is the audit surface for persisted merge provenance. It reads canonical merge-unit state and renders merged units newest-first, with default columns for unit ID, owner task, source, merge timestamp, and source branch. Use it to answer questions like `uv run gza merged --source manual --last-days 7`.
 
+### lineage
+
+Show a task's lineage from the selected task outward.
+
+```bash
+uv run gza lineage <task_id> [--full | --parents-only | --children-only]
+```
+
+By default, `uv run gza lineage <task_id>` keeps the existing children-focused view: it renders the selected task and its descendants. When the selected task has immediate parents, the default output also prints a short parent hint so resume/retry or dependency ancestry is visible without switching modes.
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID to inspect (for example `gza-1234`) |
+| `--full` | Show both ancestor lineage and descendant lineage |
+| `--parents-only` | Show only the ancestor chain for the selected task |
+| `--children-only` | Show only the selected task and its descendants |
+
 ### unmerged
 
 List tasks with merge units that have not been merged to the default branch.

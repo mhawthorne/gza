@@ -596,6 +596,15 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
         and child.task_type == parent.task_type
         and child.depends_on != parent_id
     ):
+        # Persisted recovery provenance is authoritative when present. Fall
+        # back to legacy session heuristics only for historical rows that
+        # predate recovery_origin.
+        if child.recovery_origin == "manual":
+            return child.task_type
+        if child.recovery_origin == "resume":
+            return "resume"
+        if child.recovery_origin == "retry":
+            return "retry"
         if child.session_id and child.session_id == parent.session_id:
             return "resume"
         return "retry"
@@ -687,6 +696,75 @@ def build_lineage_tree(
 
     _populate(root)
     return root
+
+
+def build_ancestor_forest(store: SqliteTaskStore, current_task: Task) -> list[TaskLineageNode]:
+    """Build ancestor trees for a task, deduplicating shared parent edges per node."""
+
+    if current_task.id is None:
+        return [TaskLineageNode(task=current_task, depth=0, relationship="root")]
+
+    tasks_by_id: dict[str, Task] = {current_task.id: current_task}
+    for ancestor in walk_ancestors(store, current_task, follow_based_on=True, follow_depends_on=True):
+        if ancestor.id is not None:
+            tasks_by_id[ancestor.id] = ancestor
+
+    if len(tasks_by_id) == 1:
+        return [TaskLineageNode(task=current_task, depth=0, relationship="root")]
+
+    child_ids_by_parent_id: dict[str, list[str]] = {}
+    for candidate in tasks_by_id.values():
+        if candidate.id is None:
+            continue
+        attached_parent_ids: set[str] = set()
+        for parent_id in (candidate.based_on, candidate.depends_on):
+            if (
+                parent_id is None
+                or parent_id not in tasks_by_id
+                or parent_id in attached_parent_ids
+            ):
+                continue
+            attached_parent_ids.add(parent_id)
+            child_ids_by_parent_id.setdefault(parent_id, []).append(candidate.id)
+
+    root_ids = [
+        candidate_id
+        for candidate_id, candidate in tasks_by_id.items()
+        if candidate.based_on not in tasks_by_id and candidate.depends_on not in tasks_by_id
+    ]
+
+    def _sort_time(candidate_id: str) -> tuple[datetime, int]:
+        candidate = tasks_by_id[candidate_id]
+        id_str = candidate.id if isinstance(candidate.id, str) else None
+        return (
+            _normalize_lineage_time(task_time_for_lineage(candidate)),
+            task_id_numeric_key(id_str),
+        )
+
+    root_ids.sort(key=_sort_time)
+
+    def _build_node(
+        current_id: str,
+        *,
+        parent_task: Task | None,
+        depth: int,
+    ) -> TaskLineageNode:
+        current = tasks_by_id[current_id]
+        relationship = (
+            "root"
+            if parent_task is None
+            else _classify_child_relationship(parent_task, current)
+        )
+        node = TaskLineageNode(task=current, depth=depth, relationship=relationship)
+        child_ids = child_ids_by_parent_id.get(current_id, [])
+        child_tasks = [tasks_by_id[child_id] for child_id in child_ids]
+        child_tasks.sort(key=lambda child: _lineage_child_sort_key(current, child))
+        for child in child_tasks:
+            assert child.id is not None
+            node.children.append(_build_node(child.id, parent_task=current, depth=depth + 1))
+        return node
+
+    return [_build_node(root_id, parent_task=None, depth=0) for root_id in root_ids]
 
 
 def filter_lineage_tree(

@@ -54,6 +54,7 @@ from ..query import (
     TaskLineageNode,
     _classify_child_relationship as _classify_lineage_child_relationship,
     _lineage_child_sort_key as _lineage_child_sort_key,
+    build_ancestor_forest as _build_ancestor_forest_for_task,
     build_lineage_tree as _build_lineage_tree_for_root,
     flatten_lineage_tree as _flatten_query_lineage_tree,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
@@ -3144,7 +3145,7 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_lineage(args: argparse.Namespace) -> int:
-    """Show the full lineage tree for a given task."""
+    """Show lineage for a given task."""
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
@@ -3193,13 +3194,12 @@ def cmd_lineage(args: argparse.Namespace) -> int:
             value = t.prompt.split("\n")[0].strip()
         return value[:60] + "…" if len(value) > 60 else value
 
-    rows: list[tuple[TaskLineageNode, str]] = []
-
     def _collect_rows(
         node: TaskLineageNode,
         *,
         ancestors_last: tuple[bool, ...] = (),
-    ) -> None:
+    ) -> list[tuple[TaskLineageNode, str]]:
+        rows: list[tuple[TaskLineageNode, str]] = []
         if ancestors_last:
             prefix = "".join(" " if flag else "│" for flag in ancestors_last[:-1])
             prefix += "└── " if ancestors_last[-1] else "├── "
@@ -3208,90 +3208,142 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         rows.append((node, prefix))
 
         for idx, child in enumerate(node.children):
-            _collect_rows(
-                child,
-                ancestors_last=(*ancestors_last, idx == len(node.children) - 1),
+            rows.extend(
+                _collect_rows(
+                    child,
+                    ancestors_last=(*ancestors_last, idx == len(node.children) - 1),
+                )
             )
+        return rows
 
-    _collect_rows(lineage_tree)
+    def _render_lineage_tree(tree: TaskLineageNode) -> None:
+        rows = _collect_rows(tree)
 
-    id_width = 1
-    when_width = 1
-    type_width = 1
-    status_width = 1
-    merge_width = 0
-    prefix_width = 0
+        id_width = 1
+        when_width = 1
+        type_width = 1
+        status_width = 1
+        merge_width = 0
+        prefix_width = 0
 
-    for node, prefix in rows:
-        t = node.task
-        when = t.completed_at or t.started_at or t.created_at
-        type_str = t.task_type or "implement"
-        rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
-        status_text = format_task_status_text(t)
-        merge_label = format_task_merge_label(t)
-        merge_text = f"[{merge_label}]" if merge_label else ""
+        for node, prefix in rows:
+            t = node.task
+            when = t.completed_at or t.started_at or t.created_at
+            type_str = t.task_type or "implement"
+            rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
+            type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
+            status_text = format_task_status_text(t)
+            merge_label = format_task_merge_label(t)
+            merge_text = f"[{merge_label}]" if merge_label else ""
 
-        id_width = max(id_width, len(t.id or "-"))
-        when_width = max(when_width, len(_format_utc_timestamp(when)) if when else 1)
-        type_width = max(type_width, len(type_display))
-        status_width = max(status_width, len(status_text))
-        merge_width = max(merge_width, len(merge_text))
-        prefix_width = max(prefix_width, len(prefix))
+            id_width = max(id_width, len(t.id or "-"))
+            when_width = max(when_width, len(_format_utc_timestamp(when)) if when else 1)
+            type_width = max(type_width, len(type_display))
+            status_width = max(status_width, len(status_text))
+            merge_width = max(merge_width, len(merge_text))
+            prefix_width = max(prefix_width, len(prefix))
 
-    lc = _colors.LINEAGE_COLORS
-    merged_color = _colors.STATUS_COLORS.completed
-    unmerged_color = _colors.STATUS_COLORS.unmerged
+        lc = _colors.LINEAGE_COLORS
+        merged_color = _colors.STATUS_COLORS.completed
+        unmerged_color = _colors.STATUS_COLORS.unmerged
 
-    for node, prefix in rows:
-        t = node.task
-        is_target = t.id == task_id
-        when = t.completed_at or t.started_at or t.created_at
+        for node, prefix in rows:
+            t = node.task
+            is_target = t.id == task_id
+            when = t.completed_at or t.started_at or t.created_at
 
-        task_id_text = t.id or "-"
-        timestamp_text = _format_utc_timestamp(when) if when else "-"
-        type_str = t.task_type or "implement"
-        rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
-        type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
-        status_text = format_task_status_text(t)
-        merge_label = format_task_merge_label(t)
-        merge_text = f"[{merge_label}]" if merge_label else ""
-        prompt_text = _prompt_text(t)
+            task_id_text = t.id or "-"
+            timestamp_text = _format_utc_timestamp(when) if when else "-"
+            type_str = t.task_type or "implement"
+            rel = _LINEAGE_REL_LABELS.get(node.relationship, "")
+            type_display = f"{type_str} [{rel}]" if rel and rel != type_str else type_str
+            status_text = format_task_status_text(t)
+            merge_label = format_task_merge_label(t)
+            merge_text = f"[{merge_label}]" if merge_label else ""
+            prompt_text = _prompt_text(t)
 
-        status_color = get_task_status_color(t)
-        if merge_text == "[merged]":
-            merge_color = merged_color
-        elif merge_text == "[unmerged]":
-            merge_color = unmerged_color
-        else:
-            merge_color = lc.annotation
+            status_color = get_task_status_color(t)
+            if merge_text == "[merged]":
+                merge_color = merged_color
+            elif merge_text == "[unmerged]":
+                merge_color = unmerged_color
+            else:
+                merge_color = lc.annotation
 
-        prefix_part = f"[{lc.connector}]{rich_escape(prefix.ljust(prefix_width))}[/{lc.connector}]"
-        arrow_char = "→" if is_target else " "
-        arrow_part = f"[{lc.target_highlight}]{arrow_char}[/{lc.target_highlight}]"
-        task_id_part = f"[{lc.task_id}]{rich_escape(task_id_text.ljust(id_width))}[/{lc.task_id}]"
-        timestamp_part = f"[{lc.stats}]{rich_escape(timestamp_text.ljust(when_width))}[/{lc.stats}]"
-        type_part = f"[{lc.type_label}]{rich_escape(type_display.ljust(type_width))}[/{lc.type_label}]"
-        status_part = f"[{status_color}]{rich_escape(status_text.ljust(status_width))}[/{status_color}]"
-        if merge_width > 0:
-            merge_cell = merge_text.ljust(merge_width)
-            merge_part = f"[{merge_color}]{rich_escape(merge_cell)}[/{merge_color}]"
-        else:
-            merge_part = ""
-        prompt_part = f"[{lc.prompt}]{rich_escape(prompt_text)}[/{lc.prompt}]"
+            prefix_part = f"[{lc.connector}]{rich_escape(prefix.ljust(prefix_width))}[/{lc.connector}]"
+            arrow_char = "→" if is_target else " "
+            arrow_part = f"[{lc.target_highlight}]{arrow_char}[/{lc.target_highlight}]"
+            task_id_part = f"[{lc.task_id}]{rich_escape(task_id_text.ljust(id_width))}[/{lc.task_id}]"
+            timestamp_part = f"[{lc.stats}]{rich_escape(timestamp_text.ljust(when_width))}[/{lc.stats}]"
+            type_part = f"[{lc.type_label}]{rich_escape(type_display.ljust(type_width))}[/{lc.type_label}]"
+            status_part = f"[{status_color}]{rich_escape(status_text.ljust(status_width))}[/{status_color}]"
+            if merge_width > 0:
+                merge_cell = merge_text.ljust(merge_width)
+                merge_part = f"[{merge_color}]{rich_escape(merge_cell)}[/{merge_color}]"
+            else:
+                merge_part = ""
+            prompt_part = f"[{lc.prompt}]{rich_escape(prompt_text)}[/{lc.prompt}]"
 
-        pieces = [
-            prefix_part,
-            arrow_part,
-            task_id_part,
-            timestamp_part,
-            type_part,
-            status_part,
-        ]
-        if merge_width > 0:
-            pieces.append(merge_part)
-        pieces.append(prompt_part)
-        console.print(" ".join(pieces).rstrip())
+            pieces = [
+                prefix_part,
+                arrow_part,
+                task_id_part,
+                timestamp_part,
+                type_part,
+                status_part,
+            ]
+            if merge_width > 0:
+                pieces.append(merge_part)
+            pieces.append(prompt_part)
+            console.print(" ".join(pieces).rstrip())
+
+    def _immediate_parent_entries(current_task: DbTask) -> list[tuple[DbTask, str]]:
+        entries: list[tuple[DbTask, str]] = []
+        seen: set[str] = set()
+        for edge_name, parent_id in (("based_on", current_task.based_on), ("depends_on", current_task.depends_on)):
+            if parent_id is None or parent_id in seen:
+                continue
+            parent = store.get(parent_id)
+            if parent is None or parent.id is None:
+                continue
+            seen.add(parent.id)
+            relationship = _classify_lineage_child_relationship(parent, current_task)
+            label = relationship if relationship in {"resume", "retry"} else edge_name
+            entries.append((parent, label))
+        return entries
+
+    show_full = bool(getattr(args, "full", False))
+    show_parents_only = bool(getattr(args, "parents_only", False))
+    show_children_only = bool(getattr(args, "children_only", False))
+    parent_entries = _immediate_parent_entries(task)
+
+    if show_parents_only:
+        for index, tree in enumerate(_build_ancestor_forest_for_task(store, task)):
+            if index > 0:
+                console.print()
+            _render_lineage_tree(tree)
+        return 0
+
+    if show_full:
+        console.print("Parents:")
+        for index, tree in enumerate(_build_ancestor_forest_for_task(store, task)):
+            if index > 0:
+                console.print()
+            _render_lineage_tree(tree)
+        console.print()
+        console.print("Children:")
+        _render_lineage_tree(lineage_tree)
+        return 0
+
+    _render_lineage_tree(lineage_tree)
+
+    if not show_children_only and parent_entries:
+        parent_summary = ", ".join(
+            f"{parent.id} [{label}]"
+            for parent, label in parent_entries
+            if parent.id is not None
+        )
+        console.print(rich_escape(f"Parents: {parent_summary}. Use --full or --parents-only to inspect ancestors."))
 
     return 0
 
