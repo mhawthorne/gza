@@ -14756,6 +14756,7 @@ class TestProviderPromptSanitization:
 
         passed_fingerprint = "c" * 64
         failed_fingerprint = "d" * 64
+        setup_fingerprint = "e" * 64
         project_results = (
             ProjectReviewVerifyResult(
                 project=None,
@@ -14771,8 +14772,12 @@ class TestProviderPromptSanitization:
                     reviewed_base_sha="cafebabe",
                     working_directory="services/foo",
                     output=(
+                        "gza-verify phase=passed name=setup duration_seconds=0.25 "
+                        f"tree_fingerprint={setup_fingerprint}\n"
                         "gza-verify phase=passed name=ruff duration_seconds=0.5 "
-                        f"tree_fingerprint={passed_fingerprint}"
+                        f"tree_fingerprint={passed_fingerprint}\n"
+                        "gza-verify phase=failed name=pytest duration_seconds=2.75\n"
+                        "bar failed"
                     ),
                 ),
             ),
@@ -14860,15 +14865,30 @@ class TestProviderPromptSanitization:
                     "working_directory": "services/foo",
                     "failure": None,
                     "output": (
+                        "gza-verify phase=passed name=setup duration_seconds=0.25 "
+                        f"tree_fingerprint={setup_fingerprint}\n"
                         "gza-verify phase=passed name=ruff duration_seconds=0.5 "
-                        f"tree_fingerprint={passed_fingerprint}"
+                        f"tree_fingerprint={passed_fingerprint}\n"
+                        "gza-verify phase=failed name=pytest duration_seconds=2.75\n"
+                        "bar failed"
                     ),
                     "phase_results": [
+                        {
+                            "duration_seconds": 0.25,
+                            "name": "setup",
+                            "status": "passed",
+                            "tree_fingerprint": setup_fingerprint,
+                        },
                         {
                             "duration_seconds": 0.5,
                             "name": "ruff",
                             "status": "passed",
                             "tree_fingerprint": passed_fingerprint,
+                        },
+                        {
+                            "duration_seconds": 2.75,
+                            "name": "pytest",
+                            "status": "failed",
                         }
                     ],
                 },
