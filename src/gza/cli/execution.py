@@ -2583,12 +2583,30 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             f"Task {impl_task.id} is {impl_task.status}. Can only iterate completed, pending, or failed tasks.",
         )
 
+    effective_max_resume_attempts = _int_config(
+        getattr(config, "max_resume_attempts", None),
+        DEFAULT_MAX_RESUME_ATTEMPTS,
+    )
     resolved_unit = store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
+    failed_start_decision = (
+        decide_failed_task_recovery(
+            store,
+            impl_task,
+            max_recovery_attempts=max(1, effective_max_resume_attempts),
+        )
+        if impl_task.status == "failed"
+        else None
+    )
     failed_task_is_lifecycle_moot = bool(
         impl_task.status == "failed"
         and resolved_unit is not None
         and merge_state_is_terminal_for_lifecycle(resolved_unit.state)
         and not empty_task_requires_recovery(store, impl_task, merge_state=resolved_unit.state)
+    )
+    failed_task_is_lifecycle_moot = failed_task_is_lifecycle_moot or bool(
+        failed_start_decision is not None
+        and failed_start_decision.action == "skip"
+        and failed_start_decision.reason_code == "merge_unit_empty"
     )
 
     if impl_task.status == "failed" and not use_resume and not use_retry and not failed_task_is_lifecycle_moot:
@@ -2610,15 +2628,31 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 f"{flag} is only valid for failed tasks (task {impl_task.id} is {impl_task.status}).",
             )
 
+    if (
+        impl_task.status == "failed"
+        and not use_resume
+        and not use_retry
+        and failed_start_decision is not None
+        and failed_start_decision.action == "skip"
+        and failed_start_decision.reason_code == "merge_unit_empty"
+    ):
+        terminal_message = _format_iterate_terminal_merge_state_message(
+            store=store,
+            requested_impl_task=requested_impl_task,
+            iterate_task=impl_task,
+            resolved_from_failed_ancestor=resolved_from_failed_ancestor,
+            merge_state="empty",
+        )
+        if terminal_message is not None:
+            print(terminal_message)
+            return 0
+
     assert impl_task.id is not None
+    active_impl_task_id = impl_task.id
 
     if impl_task.status == "failed" and use_resume and not impl_task.session_id:
         return phase1_error(args, f"Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
 
-    effective_max_resume_attempts = _int_config(
-        getattr(config, "max_resume_attempts", None),
-        DEFAULT_MAX_RESUME_ATTEMPTS,
-    )
     manual_iterate = not bool(getattr(args, "auto_iterate", False))
 
     def _decision_hits_max_auto_resume_cap(
@@ -2694,6 +2728,8 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         return target_task, target_decision
 
     def _decide_failed_iterate_resume_start(failed_task: DbTask) -> FailedRecoveryDecision:
+        if failed_task.id is not None and failed_task.id == active_impl_task_id and failed_start_decision is not None:
+            return failed_start_decision
         return decide_failed_task_recovery(
             store,
             failed_task,

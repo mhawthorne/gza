@@ -8188,6 +8188,207 @@ def test_watch_restart_failed_skips_historical_prerequisite_unmerged_row_after_e
     assert store.get_based_on_children(failed.id) == []
 
 
+def test_watch_restart_failed_skips_historical_prerequisite_unmerged_row_when_dependency_is_empty(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Empty dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.branch = "feature/dependency-empty-watch"
+    dependency.has_commits = True
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+    unit = store.create_merge_unit(
+        source_branch=dependency.branch,
+        target_branch="main",
+        owner_task_id=dependency.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dependency.id, unit.id, "owner")
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/downstream-watch-blocked"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("watch should not retry dependency-blocked prerequisite failures"),
+        ) as spawn_worker,
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("watch should not iterate dependency-blocked prerequisite failures"),
+        ) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is False
+    spawn_worker.assert_not_called()
+    spawn_iterate.assert_not_called()
+    assert store.get_based_on_children(failed.id) == []
+
+
+def test_watch_restart_failed_resumes_historical_prerequisite_unmerged_row_with_recorded_real_work(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.session_id = "sess-prereq-real-work"
+    failed.output_content = "provider emitted output before the legacy prerequisite failure was stored"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("implement recovery should iterate")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_args.resume is True
+    assert spawned_args.retry is False
+    assert spawned_task.id == failed.id
+
+
+def test_watch_restart_failed_retries_historical_prerequisite_unmerged_row_with_live_non_empty_branch(
+    tmp_path: Path,
+) -> None:
+    from gza.recovery_engine import _MergeContext
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-live-work-watch"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    class _NonEmptyBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref == "main":
+                return "target123"
+            if ref == "feature/prereq-live-work-watch":
+                return "source456"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+        def count_commits_ahead(self, source_ref: str, base_ref: str) -> int:
+            return 1
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: _MergeContext(git=_NonEmptyBranchGit(), default_branch="main"),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("implement recovery should iterate")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    spawned_args = spawn_iterate.call_args.args[0]
+    spawned_task = spawn_iterate.call_args.args[2]
+    prepared_task_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert spawned_args.resume is False
+    assert spawned_task.id == failed.id
+    assert spawned_args.retry is False
+    retry_children = store.get_based_on_children(failed.id)
+    assert len(retry_children) == 1
+    retry_child = retry_children[0]
+    assert retry_child.id == prepared_task_id
+    assert retry_child.recovery_origin == "retry"
+
+
 def test_cmd_watch_reexecs_on_next_pass_even_when_work_is_still_running(tmp_path: Path) -> None:
     """Detached workers should not block watch from restarting to pick up drifted code."""
     setup_config(tmp_path)

@@ -98,6 +98,32 @@ class _StubEmptyBranchGit:
         return False
 
 
+class _StubNonEmptyBranchGit:
+    def __init__(self, *, target_branch: str = "main") -> None:
+        self.target_branch = target_branch
+
+    def resolve_fresh_merge_source(self, branch: str):
+        from gza.git import ResolvedMergeSourceRef
+
+        return ResolvedMergeSourceRef(branch)
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref == self.target_branch:
+            return "target123"
+        if ref in {"feature/prereq-live-work", "feature/prereq-live-work-watch"}:
+            return "source456"
+        return None
+
+    def branch_exists(self, branch: str) -> bool:
+        return bool(branch)
+
+    def is_merged(self, branch: str, into: str) -> bool:
+        return False
+
+    def count_commits_ahead(self, source_ref: str, base_ref: str) -> int:
+        return 1
+
+
 def _stub_merge_context(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1583,6 +1609,72 @@ def test_recovery_engine_prerequisite_unmerged_reconciles_no_output_row_to_empty
     assert unit.state == "empty"
 
 
+def test_recovery_engine_prerequisite_unmerged_branchless_no_output_row_is_moot_after_dependency_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_empty"
+    assert decision.reason_text == "moot (no task commits)"
+    assert store.resolve_merge_unit_for_task(failed.id) is None
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_recovery_engine_prerequisite_unmerged_stays_dependency_not_ready_when_dependency_is_empty(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.branch = "feature/dependency-empty"
+    dependency.has_commits = True
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+    unit = store.create_merge_unit(
+        source_branch=dependency.branch,
+        target_branch="main",
+        owner_task_id=dependency.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dependency.id, unit.id, "owner")
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/blocked-downstream"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "dependency_not_ready"
+    assert decision.reason_text == "dependency precondition not satisfied"
+    assert list_failed_tasks_for_recovery(store) == []
+
+
 def test_recovery_engine_prerequisite_unmerged_empty_session_backed_failure_stays_visible_after_dependency_merge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1627,7 +1719,7 @@ def test_recovery_engine_prerequisite_unmerged_empty_session_backed_failure_stay
     assert unit.state == "empty"
 
 
-def test_recovery_engine_prerequisite_unmerged_with_commits_stays_parked_after_dependency_merge(
+def test_recovery_engine_prerequisite_unmerged_with_commits_retries_after_dependency_merge(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -1652,8 +1744,78 @@ def test_recovery_engine_prerequisite_unmerged_with_commits_stays_parked_after_d
     store.set_merge_status(dependency.id, "merged")
 
     ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
-    assert ready_decision.action == "skip"
-    assert ready_decision.reason_code == "legacy_prerequisite_unmerged_parked"
+    assert ready_decision.action == "retry"
+    assert ready_decision.reason_code == "PREREQUISITE_UNMERGED"
+    assert ready_decision.reason_text == "dependency merge prerequisite now satisfied"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_recovery_engine_prerequisite_unmerged_with_live_non_empty_branch_retries_after_dependency_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-live-work"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_StubNonEmptyBranchGit(), default_branch="main"),
+    )
+
+    ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+
+    assert ready_decision.action == "retry"
+    assert ready_decision.reason_code == "PREREQUISITE_UNMERGED"
+    assert ready_decision.reason_text == "dependency merge prerequisite now satisfied"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is None or unit.state != "empty"
+
+
+def test_recovery_engine_prerequisite_unmerged_with_provider_output_and_session_resumes_after_dependency_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.session_id = "sess-prereq-real-work"
+    failed.output_content = "provider produced output before the legacy failure was recorded"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    ready_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert ready_decision.action == "resume"
+    assert ready_decision.reason_code == "PREREQUISITE_UNMERGED"
+    assert ready_decision.reason_text == "dependency merge prerequisite now satisfied"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
 def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:

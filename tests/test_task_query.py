@@ -1062,7 +1062,9 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     assert blocked_resolved.id not in ids
 
 
-def test_dependency_state_completed_empty_prereq_is_unblocked_by_default(tmp_path: Path) -> None:
+def test_dependency_state_completed_empty_prereq_is_unblocked_when_policy_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty dependency", task_type="implement")
@@ -1074,6 +1076,12 @@ def test_dependency_state_completed_empty_prereq_is_unblocked_by_default(tmp_pat
 
     blocked = store.add("Blocked downstream", task_type="implement", depends_on=dep.id)
     ready = store.add("Ready task", task_type="task")
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
 
     service = TaskQueryService(store)
     blocked_result = service.run(
@@ -1091,9 +1099,7 @@ def test_dependency_state_completed_empty_prereq_is_unblocked_by_default(tmp_pat
     assert ready.id in unblocked_ids
 
 
-def test_dependency_state_completed_empty_prereq_blocks_when_policy_disabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dependency_state_completed_empty_prereq_blocks_by_default(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty dependency", task_type="implement")
@@ -1104,12 +1110,6 @@ def test_dependency_state_completed_empty_prereq_blocks_when_policy_disabled(
     store.set_merge_unit_state(unit.id, "empty")
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
-
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: False,
-    )
 
     service = TaskQueryService(store)
     blocked_result = service.run(
@@ -1126,7 +1126,7 @@ def test_dependency_state_completed_empty_prereq_blocks_when_policy_disabled(
     assert downstream.id not in unblocked_ids
 
 
-def test_incomplete_preset_empty_prereq_does_not_set_awaiting_human_by_default(tmp_path: Path) -> None:
+def test_incomplete_preset_empty_prereq_sets_awaiting_human_by_default(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty prerequisite", task_type="implement")
@@ -1152,7 +1152,10 @@ def test_incomplete_preset_empty_prereq_does_not_set_awaiting_human_by_default(t
         target_branch="main",
     )
 
-    assert len(result.rows) == 0
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.owner_task.id == downstream.id
+    assert row.values["next_action"] == "awaiting_human"
 
 
 def test_search_negative_scalar_filters_apply_after_positive_filters(tmp_path: Path) -> None:

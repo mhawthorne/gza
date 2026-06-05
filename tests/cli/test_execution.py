@@ -9544,6 +9544,36 @@ class TestIterateCommand:
         run_foreground.assert_not_called()
         assert f"No remaining iterate action: implementation {failed.id} has no remaining commits to land." in output
 
+    def test_iterate_suppresses_branchless_historical_prerequisite_unmerged_failure_once_shared_recovery_marks_it_moot(
+        self, tmp_path: Path
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dependency = store.add("Merged dependency", task_type="implement")
+        assert dependency.id is not None
+        dependency.status = "completed"
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+        store.set_merge_status(dependency.id, "merged")
+
+        failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "PREREQUISITE_UNMERGED"
+        failed.has_commits = False
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        result = run_gza("iterate", str(failed.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        output = result.stdout + (result.stderr or "")
+        assert "No remaining iterate action" in output
+        assert "no remaining commits to land" in output
+        assert "--resume" not in output
+        assert "--retry" not in output
+
     def test_iterate_resume_on_empty_failed_branch_with_recorded_session_work(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

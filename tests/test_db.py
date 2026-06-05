@@ -5141,27 +5141,25 @@ class TestRetryChainDependencyResolution:
         assert next_task is not None
         assert next_task.id == downstream.id
 
-    def test_completed_empty_implement_dependency_is_runnable_by_default(self, tmp_path: Path):
-        """Completed empty implement prerequisites satisfy pickup by default."""
+    def test_completed_empty_implement_dependency_blocks_by_default(self, tmp_path: Path):
+        """Completed empty implement prerequisites stay blocked by default."""
         store = self._make_store(tmp_path)
         dep = store.add("Dep", task_type="implement")
         self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-default")
         downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
 
         assert store.resolve_dependency_completion(downstream) is not None
-        next_task = store.get_next_pending()
-        assert next_task is not None
-        assert next_task.id == downstream.id
-        assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
+        assert store.get_next_pending() is None
+        assert store.get_pending_pickup() == []
 
         is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
-        assert is_blocked is False
-        assert blocking_id is None
-        assert blocking_status is None
+        assert is_blocked is True
+        assert blocking_id == dep.id
+        assert blocking_status == "completed"
 
-        assert store.count_blocked_tasks() == 0
+        assert store.count_blocked_tasks() == 1
 
-    def test_completed_empty_implement_dependency_blocks_when_policy_disabled(
+    def test_completed_empty_implement_dependency_is_runnable_when_policy_enabled(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Toggling the empty-prereq policy must flip pickup and blocked semantics together."""
@@ -5173,18 +5171,20 @@ class TestRetryChainDependencyResolution:
         monkeypatch.setattr(
             dependency_preconditions_module,
             "empty_prereq_satisfies_dependency",
-            lambda _store, _prereq, _dependent: False,
+            lambda _store, _prereq, _dependent: True,
         )
 
-        assert store.get_next_pending() is None
-        assert store.get_pending_pickup() == []
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == downstream.id
+        assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
 
         is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
-        assert is_blocked is True
-        assert blocking_id == dep.id
-        assert blocking_status == "completed"
+        assert is_blocked is False
+        assert blocking_id is None
+        assert blocking_status is None
 
-        assert store.count_blocked_tasks() == 1
+        assert store.count_blocked_tasks() == 0
 
     # --- count_blocked_tasks ---
 

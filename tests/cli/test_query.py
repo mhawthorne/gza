@@ -3237,7 +3237,7 @@ class TestQueueCommand:
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
-    def test_queue_empty_prerequisite_is_runnable(self, tmp_path: Path):
+    def test_queue_empty_prerequisite_surfaces_release_valve_by_default(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3264,9 +3264,10 @@ class TestQueueCommand:
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
         assert "Held downstream" in normalized
-        assert "empty prerequisite" not in normalized
+        assert "empty prerequisite" in normalized
+        assert "gza-4072" in normalized
 
-    def test_queue_failed_empty_prerequisite_is_runnable(self, tmp_path: Path):
+    def test_queue_failed_empty_prerequisite_surfaces_release_valve_by_default(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3294,7 +3295,8 @@ class TestQueueCommand:
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
         assert "Held downstream" in normalized
-        assert "empty prerequisite" not in normalized
+        assert "empty prerequisite" in normalized
+        assert "gza-4072" in normalized
 
     def test_queue_layout_keeps_first_line_columns_stable_and_second_line_aligned(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -12699,7 +12701,7 @@ class TestIncompleteCommand:
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
 
-    def test_incomplete_empty_prereq_is_not_unresolved_by_default(
+    def test_incomplete_empty_prereq_is_unresolved_by_default(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -12722,7 +12724,11 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        assert "No unresolved task lineages" in captured.out
+        one_line_output = captured.out
+        assert self._one_line_row_id(one_line_output) == downstream.id
+        assert "empty prerequisite" in one_line_output
+        assert "gza-4072" in one_line_output
+        assert "gza edit --clear-depends-on" in one_line_output
 
     def test_incomplete_warns_when_mergeable_rows_are_blocked_by_dirty_default_checkout(
         self,
@@ -12756,7 +12762,7 @@ class TestIncompleteCommand:
         assert result == 0
         assert "merges blocked: main checkout has uncommitted changes - commit or stash them first" in captured.out
 
-    def test_incomplete_empty_prereq_policy_toggle_surfaces_release_valve_guidance(
+    def test_incomplete_empty_prereq_policy_toggle_hides_release_valve_guidance(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -12778,7 +12784,7 @@ class TestIncompleteCommand:
         monkeypatch.setattr(
             dependency_preconditions_module,
             "empty_prereq_satisfies_dependency",
-            lambda _store, _prereq, _dependent: False,
+            lambda _store, _prereq, _dependent: True,
         )
 
         with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
@@ -12786,11 +12792,7 @@ class TestIncompleteCommand:
         captured = capsys.readouterr()
 
         assert result == 0
-        one_line_output = captured.out
-        assert self._one_line_row_id(one_line_output) == downstream.id
-        assert "empty prerequisite" in one_line_output
-        assert "gza-4072" in one_line_output
-        assert "gza edit --clear-depends-on" in one_line_output
+        assert "No unresolved task lineages" in captured.out
 
     def test_incomplete_surfaces_strict_scope_unverified_needs_attention(
         self,

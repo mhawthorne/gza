@@ -119,6 +119,9 @@ def _render_tree(result: TaskQueryResult) -> str:
 
 def _render_one_line(result: TaskQueryResult) -> str:
     lines: list[str] = []
+    incomplete_view = bool(
+        result.query.lifecycle_state and "incomplete" in result.query.lifecycle_state
+    )
     for row in result.rows:
         if isinstance(row, LineageRow):
             lineage_row: LineageRow = row
@@ -129,7 +132,15 @@ def _render_one_line(result: TaskQueryResult) -> str:
             unresolved_text = _render_unresolved_summary(lineage_row.unresolved_tasks)
 
             if isinstance(reason, str) and reason:
-                lines.append(f"{owner_id}: {reason} — {owner_prompt}{unresolved_text}")
+                if incomplete_view:
+                    parked_prereq_reason = (
+                        "SKIP: legacy dependency-merge failure is parked; "
+                        "wait for dependency merge state to reconcile"
+                    )
+                    if reason == parked_prereq_reason:
+                        reason = "SKIP: legacy prereq parked"
+                prefix = f"{owner_id}: {reason} — "
+                lines.append(f"{prefix}{owner_prompt}{unresolved_text}")
                 continue
 
             unresolved_count = len(lineage_row.unresolved_tasks)

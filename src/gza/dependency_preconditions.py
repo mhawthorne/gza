@@ -32,9 +32,14 @@ def empty_prereq_satisfies_dependency(
     prereq: DbTask,
     dependent: DbTask,
 ) -> bool:
-    """Policy hook for whether an empty prerequisite satisfies a dependency."""
+    """Policy hook for whether an empty prerequisite satisfies a dependency.
+
+    Conservative default: an empty prerequisite is not merged work, so
+    downstream merge-required tasks stay blocked unless this one policy point is
+    deliberately flipped.
+    """
     del store, prereq, dependent
-    return True
+    return False
 
 
 def task_is_merged(store: SqliteTaskStore, task: DbTask) -> bool:

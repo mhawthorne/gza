@@ -525,7 +525,7 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     assert f"uv run gza implement {plan.id}" in row.next_action["description"]
 
 
-def test_query_lineage_owner_rows_empty_prereq_is_suppressed_by_default(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_empty_prereq_surfaces_release_valve_by_default(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -551,10 +551,16 @@ def test_query_lineage_owner_rows_empty_prereq_is_suppressed_by_default(tmp_path
         target_branch="main",
     )
 
-    assert not rows
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == downstream.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "awaiting_human"
+    assert "empty prerequisite" in row.next_action["description"]
+    assert "gza-4072" in row.next_action["description"]
 
 
-def test_query_lineage_owner_rows_failed_empty_prereq_is_suppressed_by_default(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_release_valve_by_default(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -590,10 +596,16 @@ def test_query_lineage_owner_rows_failed_empty_prereq_is_suppressed_by_default(t
         target_branch="main",
     )
 
-    assert not rows
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == downstream.id
+    assert row.next_action is not None
+    assert row.next_action["type"] == "awaiting_human"
+    assert "empty prerequisite" in row.next_action["description"]
+    assert "gza-4072" in row.next_action["description"]
 
 
-def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_surfaces_release_valve(
+def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_release_valve(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     setup_config(tmp_path)
@@ -623,7 +635,7 @@ def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_surfaces_rel
     monkeypatch.setattr(
         dependency_preconditions_module,
         "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: False,
+        lambda _store, _prereq, _dependent: True,
     )
 
     git = MagicMock()
@@ -637,13 +649,7 @@ def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_surfaces_rel
         target_branch="main",
     )
 
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.owner_task.id == downstream.id
-    assert row.next_action is not None
-    assert row.next_action["type"] == "awaiting_human"
-    assert "empty prerequisite" in row.next_action["description"]
-    assert "gza-4072" in row.next_action["description"]
+    assert not rows
 
 
 def test_query_lineage_owner_rows_surfaces_manual_review_creation_attention(tmp_path: Path) -> None:
@@ -1441,6 +1447,55 @@ def test_query_lineage_owner_rows_keeps_empty_failed_owner_visible_for_recovery_
     assert entries[0].owner_task.id == failed.id
     assert entries[0].task.id == failed.id
     assert entries[0].decision.action == "resume"
+
+
+def test_query_lineage_owner_rows_hides_branchless_moot_prerequisite_unmerged_failed_owner_from_recovery_lane(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.has_commits = False
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    assert list_failed_tasks_for_recovery(store) == []
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed.id not in failed_leaf_ids
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+    )
+
+    assert [entry.task.id for entry in entries] == []
 
 
 def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_sibling(
