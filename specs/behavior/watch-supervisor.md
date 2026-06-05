@@ -152,16 +152,29 @@ When the installed `gza` package fingerprint changes while watch is running:
 
 - Watch MUST persist a no-progress observation for each repeated worker-launch or
   recovery-launch candidate, keyed by the subject merge unit when one exists or otherwise
-  by the subject lineage, plus the selected action type and reason.
+  by the subject lineage, plus the selected action type and reason. This MUST cover **every**
+  path that launches work for a subject, including the **pending-queue worker dispatch** —
+  not only `advance`-derived actions and failed-task recovery launches.
 - The persisted observation MUST include enough evidence to distinguish durable progress
   from a true no-op repeat: merge-unit identity/state/head, selected action type/reason,
   action task ID, relevant failed/recovery task ID, and current task status.
 - Watch MUST increment the no-progress streak only when the next cycle selects the same
   subject/action with unchanged evidence. Restarting watch MUST NOT reset that streak.
-- Watch MUST reset the streak whenever durable progress occurs, including a new task,
-  worker start, task status transition, recovery edge creation, review/improve/rebase
-  completion, branch-head change, merge-unit state change, or a different selected
-  action/reason.
+- Progress MUST be measured by **outcome**, not by the act of launching. Starting (or
+  re-starting) a worker for a subject is NOT, by itself, durable progress. A worker launch
+  that leaves the subject in the same state — no task status transition, no branch-head
+  change, no merge-unit state change, no recovery-edge creation — is a no-op repeat and MUST
+  advance the streak, not reset it.
+- Watch MUST reset the streak only when durable progress actually occurs: a newly created
+  task, a task status transition, a recovery edge creation, a review/improve/rebase
+  completion, a branch-head change, a merge-unit state change, or a different selected
+  action/reason. Merely launching a worker for the same task in the same state MUST NOT reset
+  it.
+- Re-invoking the **same command on the same task is permitted when the task's state has
+  changed** since the prior cycle — e.g. a prior `iterate` worker was killed, leaving the
+  task reclaimable, so the next cycle legitimately re-invokes `iterate` (possibly with resume
+  or retry). The backstop suppresses only repeats where the task is in the **exact same
+  state** as the prior observed cycle.
 - When the streak reaches `watch.no_progress_cycles`, watch MUST park the subject with a
   shared needs-attention reason of `watch-no-progress-backstop` and MUST stop respawning
   that unchanged no-op automatically.
