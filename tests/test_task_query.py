@@ -140,6 +140,42 @@ def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_ava
     assert f"uv run gza implement {plan.id}" in str(row.values["next_action_reason"])
 
 
+def test_incomplete_preset_keeps_held_plan_visible_when_pending_dependent_awaits_review(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add("completed held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    dependent = store.add("blocked dependent", task_type="implement", depends_on=plan.id)
+    assert dependent.id is not None
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=SimpleNamespace(
+            max_resume_attempts=1,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+        ),
+        git=SimpleNamespace(),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "owner_task")
+    assert row.owner_task.id == plan.id
+    assert row.values["next_action"] == "skip"
+    assert row.values["next_action_owner_id"] == plan.id
+    assert row.values["next_action_reason"] == "SKIP: implement task already exists for this plan"
+    assert row.values["unresolved_ids"] == [plan.id]
+
+
 def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_path: Path) -> None:
     store = _store(tmp_path)
     config = SimpleNamespace(

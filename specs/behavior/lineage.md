@@ -82,7 +82,9 @@ A task `T` with `depends_on = D` MUST NOT run until `D`'s work is **satisfied**.
   `empty`. For a merge-required dependency, `status == "completed"` alone is **not**
   sufficient — the dependency's branch MUST actually be merged into the work unit's
   canonical local target (lifecycle P4), or be provably `empty` (no unique commits — a
-  no-op contributes nothing to merge and so cannot block).
+  no-op contributes nothing to merge and so cannot block). A completed held plan
+  (`task_type == "plan"` with `auto_implement == false`) is a distinct exception:
+  direct dependents MUST stay blocked until the hold is explicitly released.
 - **Retry-chain satisfaction.** If `D` itself is `failed` or `dropped`, satisfaction MUST
   follow the `based_on` recovery chain rooted at `D`: the **first `status == "completed"`
   descendant** (whose merge unit is then `merged`/`empty`) satisfies the dependency.

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .db import SqliteTaskStore, Task as DbTask
 from .dependency_preconditions import resolved_dependency_satisfies_task_readiness
 from .recovery_read_context import RecoveryReadContext
+
+if TYPE_CHECKING:
+    from .dependency_preconditions import DependencyReadiness
 
 EMPTY_PREREQ_RELEASE_VALVE_DETAIL = (
     "empty prerequisite; manual release tracked by "
@@ -39,6 +43,48 @@ def blocked_by_empty_prereq_label(
     if resolved_dependency_satisfies_task_readiness(store, dep, task, read_context=read_context):
         return None
     return f"blocked by {dep.id} ({EMPTY_PREREQ_RELEASE_VALVE_DETAIL})"
+
+
+def blocked_by_awaiting_plan_review_label(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+    readiness: DependencyReadiness | None = None,
+) -> str | None:
+    """Return specialized blocked wording for dependents awaiting held-plan release."""
+    if task.depends_on is None:
+        return None
+    if readiness is None:
+        from .dependency_preconditions import dependency_readiness
+
+        readiness = dependency_readiness(store, task, read_context=read_context)
+    if readiness.reason != "plan_awaiting_review":
+        return None
+    plan_id = readiness.blocking_task_id or task.depends_on
+    if plan_id is None:
+        return "blocked: awaiting plan review"
+    return (
+        f"blocked: awaiting plan review for {plan_id}; "
+        f"release with uv run gza implement {plan_id} "
+        f"or uv run gza edit {plan_id} --no-hold-for-review"
+    )
+
+
+def blocked_dependency_label(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+    readiness: DependencyReadiness | None = None,
+) -> str | None:
+    """Return specialized operator wording for blocked dependencies."""
+    return blocked_by_empty_prereq_label(store, task, read_context=read_context) or blocked_by_awaiting_plan_review_label(
+        store,
+        task,
+        read_context=read_context,
+        readiness=readiness,
+    )
 
 
 def _resolve_empty_prereq_candidate(

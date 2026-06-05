@@ -132,3 +132,40 @@ def test_dependency_precondition_uses_canonical_dependency_lineage_merge_unit(tm
 
     store.set_merge_unit_state(unit.id, "merged")
     assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
+def test_failed_held_plan_dependency_stays_blocked_after_completed_retry_descendant(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    store.mark_failed(plan, failure_reason="UNKNOWN")
+
+    retry = store.add("Completed retry", task_type="plan", based_on=plan.id)
+    assert retry.id is not None
+    store.mark_completed(retry, has_commits=False)
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=plan.id)
+    assert downstream.id is not None
+
+    readiness = store.get_dependency_readiness(downstream)
+    assert readiness.ready is False
+    assert readiness.reason == "plan_awaiting_review"
+    assert readiness.direct_dependency is not None
+    assert readiness.direct_dependency.id == plan.id
+    assert readiness.resolved_dependency is not None
+    assert readiness.resolved_dependency.id == retry.id
+    assert readiness.blocking_task_id == plan.id
+    assert readiness.blocking_task_status == "failed"
+    assert store.get_pending_pickup() == []
+
+    refreshed_plan = store.get(plan.id)
+    assert refreshed_plan is not None
+    refreshed_plan.auto_implement = True
+    store.update(refreshed_plan)
+
+    released_readiness = store.get_dependency_readiness(downstream)
+    assert released_readiness.ready is True
+    assert [task.id for task in store.get_pending_pickup()] == [downstream.id]

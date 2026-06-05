@@ -18,6 +18,7 @@ from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
+    held_plan_has_blocked_awaiting_review_dependents,
     resolve_source_followup_state,
     source_task_needs_implementation_followup,
 )
@@ -818,13 +819,19 @@ def _query_lineage_owner_rows_with_context(
             )
             if task.task_type in {"plan", "explore"} and task.status == "completed":
                 followup_state = _source_followup_state(indexes, task, source_followup_cache)
-                if not source_task_needs_implementation_followup(
+                needs_followup = source_task_needs_implementation_followup(
                     task,
                     followup_state,
                     non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
-                ):
+                )
+                has_blocked_review_dependents = held_plan_has_blocked_awaiting_review_dependents(
+                    task,
+                    get_dependents=lambda task_id: indexes.depends_on_children.get(task_id, ()),
+                    get_dependency_readiness=lambda dependent: store.get_dependency_readiness(dependent),
+                )
+                if not needs_followup and not has_blocked_review_dependents:
                     continue
-                if matches:
+                if matches or has_blocked_review_dependents:
                     unresolved_tasks.append(task)
                 continue
             if empty_prereq_block is not None:
@@ -919,10 +926,17 @@ def _query_lineage_owner_rows_with_context(
             owner.id is not None
             and owner.task_type in {"plan", "explore"}
             and owner.status == "completed"
-            and source_task_needs_implementation_followup(
-                owner,
-                _source_followup_state(indexes, owner, source_followup_cache),
-                non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
+            and (
+                source_task_needs_implementation_followup(
+                    owner,
+                    _source_followup_state(indexes, owner, source_followup_cache),
+                    non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
+                )
+                or held_plan_has_blocked_awaiting_review_dependents(
+                    owner,
+                    get_dependents=lambda task_id: indexes.depends_on_children.get(task_id, ()),
+                    get_dependency_readiness=lambda dependent: store.get_dependency_readiness(dependent),
+                )
             )
         )
         resolved_in_query = any(

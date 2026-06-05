@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from .db import Task as DbTask, task_id_numeric_key
 
@@ -146,3 +147,27 @@ def source_task_has_implementation_followup(
         and task.id in non_dropped_implement_source_ids
     )
     return has_direct_implement_followup or followup_state.has_non_dropped_implement_descendant
+
+
+def held_plan_has_blocked_awaiting_review_dependents(
+    task: DbTask,
+    *,
+    get_dependents: Callable[[str], Sequence[DbTask]],
+    get_dependency_readiness: Callable[[DbTask], Any],
+) -> bool:
+    """Return whether a completed held plan still blocks pending dependents awaiting review."""
+
+    if task.id is None or task.task_type != "plan" or task.status != "completed" or task.auto_implement is not False:
+        return False
+
+    for dependent in get_dependents(task.id):
+        if dependent.status != "pending":
+            continue
+        readiness = get_dependency_readiness(dependent)
+        if (
+            getattr(readiness, "ready", False) is False
+            and getattr(readiness, "reason", None) == "plan_awaiting_review"
+            and (getattr(readiness, "blocking_task_id", None) == task.id or dependent.depends_on == task.id)
+        ):
+            return True
+    return False

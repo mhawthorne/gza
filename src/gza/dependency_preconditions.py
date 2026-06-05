@@ -43,6 +43,39 @@ def empty_prereq_satisfies_dependency(
     return False
 
 
+def plan_dependency_awaits_review(task: DbTask) -> bool:
+    """Return whether ``task`` is a held plan awaiting explicit release."""
+    return task.task_type == "plan" and task.auto_implement is False
+
+
+def _held_plan_dependency_blocked_readiness(
+    direct_dep: DbTask,
+    *,
+    resolved_dep: DbTask | None,
+) -> DependencyReadiness | None:
+    """Return the held-plan blocked readiness result for a direct dependency."""
+    if not plan_dependency_awaits_review(direct_dep):
+        return None
+    if direct_dep.status == "dropped":
+        return DependencyReadiness(
+            ready=False,
+            reason="dropped",
+            direct_dependency=direct_dep,
+            blocking_task_id=direct_dep.id,
+            blocking_task_status=direct_dep.status,
+        )
+    if direct_dep.status == "completed" or resolved_dep is not None:
+        return DependencyReadiness(
+            ready=False,
+            reason="plan_awaiting_review",
+            direct_dependency=direct_dep,
+            resolved_dependency=resolved_dep or direct_dep,
+            blocking_task_id=direct_dep.id,
+            blocking_task_status=direct_dep.status,
+        )
+    return None
+
+
 def task_is_merged(
     store: SqliteTaskStore,
     task: DbTask,
@@ -157,7 +190,15 @@ def dependency_readiness(
             blocking_task_status="missing",
         )
 
+    held_plan_block = _held_plan_dependency_blocked_readiness(direct_dep, resolved_dep=None)
+    if held_plan_block is not None:
+        return held_plan_block
+
     resolved_dep = read_context.resolve_dependency_completion(task) if read_context is not None else store.resolve_dependency_completion(task)
+    held_plan_block = _held_plan_dependency_blocked_readiness(direct_dep, resolved_dep=resolved_dep)
+    if held_plan_block is not None:
+        return held_plan_block
+
     if resolved_dep is None:
         if _resolved_merge_state(store, direct_dep, read_context=read_context) == "empty" and resolved_dependency_satisfies_task_readiness(
             store,

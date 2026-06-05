@@ -13076,6 +13076,68 @@ class TestIncompleteCommand:
         assert "gza-4072" in one_line_output
         assert "gza edit --clear-depends-on" in one_line_output
 
+    def test_queue_blocked_dependent_surfaces_awaiting_plan_review_release_guidance(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        dependent = store.add("Blocked downstream", task_type="implement", depends_on=plan.id)
+        assert dependent.id is not None
+
+        result = run_gza("queue", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert dependent.id in normalized
+        assert f"blocked: awaiting plan review for {plan.id}" in normalized
+        assert f"release with uv run gza implement {plan.id}" in normalized
+        assert f"or uv run gza edit {plan.id} --no-hold-for-review" in normalized
+
+    def test_incomplete_surfaces_blocked_dependent_for_completed_held_plan_until_release(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        dependent = store.add("Blocked downstream", task_type="implement", depends_on=plan.id)
+        assert dependent.id is not None
+
+        blocked_result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert blocked_result.returncode == 0
+        blocked_output = " ".join(blocked_result.stdout.split())
+        assert f"Blocked dependents:" in blocked_result.stdout
+        assert dependent.id in blocked_output
+        assert f"blocked: awaiting plan review for {plan.id}" in blocked_output
+        assert f"release with uv run gza implement {plan.id}" in blocked_output
+        assert f"or uv run gza edit {plan.id} --no-hold-for-review" in blocked_output
+
+        plan = store.get(plan.id)
+        assert plan is not None
+        plan.auto_implement = True
+        store.update(plan)
+
+        released_result = run_gza("incomplete", "--project", str(tmp_path))
+
+        assert released_result.returncode == 0
+        assert "No unresolved task lineages" in released_result.stdout
+        assert dependent.id not in released_result.stdout
+
     def test_incomplete_warns_when_mergeable_rows_are_blocked_by_dirty_default_checkout(
         self,
         tmp_path: Path,

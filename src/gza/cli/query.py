@@ -47,7 +47,7 @@ from ..github import GitHub
 from ..lifecycle_completion import TERMINAL_MERGE_STATES
 from ..lineage import walk_based_on_descendants
 from ..lineage_query import filter_display_unresolved_tasks_for_incomplete
-from ..operator_state import blocked_by_empty_prereq_label, moot_empty_lifecycle_detail
+from ..operator_state import blocked_by_empty_prereq_label, blocked_dependency_label, moot_empty_lifecycle_detail
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -673,7 +673,7 @@ def cmd_next(args: argparse.Namespace) -> int:
                 position_text="-",
                 blocked=True,
                 blocked_by_text=(
-                    blocked_by_empty_prereq_label(store, row.task)
+                    blocked_dependency_label(store, row.task)
                     or _format_blocked_dependency_label(
                         cast(str | None, row.values.get("blocking_id")),
                         cast(str | None, row.values.get("blocking_status")),
@@ -1400,20 +1400,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         console.print("Blocked dependents:")
         for task, readiness in blocked_dependents:
             assert task.id is not None
-            detail = (
-                f"  {task.id} pending {task.task_type} blocked by "
-                f"{readiness.blocking_merge_state or 'unmerged'} dependency "
-                f"{readiness.blocking_task_id or task.depends_on or 'unknown'}"
-            )
-            owner_id = readiness.blocking_merge_unit_owner_task_id
-            if owner_id and owner_id != readiness.blocking_task_id:
-                detail += f" (merge unit owned by {owner_id}"
-                if readiness.blocking_source_branch:
-                    detail += f", branch {readiness.blocking_source_branch}"
-                detail += ")"
-            elif readiness.blocking_source_branch:
-                detail += f" (branch {readiness.blocking_source_branch})"
-            console.print(detail)
+            console.print(_blocked_dependent_detail(store, task, readiness))
 
     if getattr(args, "verbose", False) and mode != "tree":
         c = TASK_COLORS
@@ -1459,13 +1446,38 @@ def _collect_incomplete_blocked_dependents(
         if readiness.ready:
             continue
         if (
-            readiness.blocking_merge_unit_owner_task_id not in owner_ids
+            readiness.blocking_task_id not in owner_ids
+            and readiness.blocking_merge_unit_owner_task_id not in owner_ids
             and readiness.blocking_merge_unit_id not in owner_unit_ids
         ):
             continue
         blocked.append((task, readiness))
     blocked.sort(key=lambda item: _normalize_task_timestamp(item[0].created_at))
     return blocked
+
+
+def _blocked_dependent_detail(
+    store: SqliteTaskStore,
+    task: DbTask,
+    readiness: DependencyReadiness,
+) -> str:
+    operator_label = blocked_dependency_label(store, task, readiness=readiness)
+    if operator_label is not None:
+        return f"  {task.id} pending {task.task_type} {operator_label}"
+    detail = (
+        f"  {task.id} pending {task.task_type} blocked by "
+        f"{readiness.blocking_merge_state or 'unmerged'} dependency "
+        f"{readiness.blocking_task_id or task.depends_on or 'unknown'}"
+    )
+    owner_id = readiness.blocking_merge_unit_owner_task_id
+    if owner_id and owner_id != readiness.blocking_task_id:
+        detail += f" (merge unit owned by {owner_id}"
+        if readiness.blocking_source_branch:
+            detail += f", branch {readiness.blocking_source_branch}"
+        detail += ")"
+    elif readiness.blocking_source_branch:
+        detail += f" (branch {readiness.blocking_source_branch})"
+    return detail
 
 
 def _incomplete_dirty_checkout_warning(
@@ -1524,7 +1536,17 @@ def _normalize_incomplete_result_rows(
             merge_units_by_task_id=merge_units_by_task_id,
             exclude_dropped=True,
         )
-        if owner_task.status == "dropped" or not unresolved_tasks:
+        if owner_task.status == "dropped":
+            changed = True
+            continue
+        if (
+            not unresolved_tasks
+            and owner_task.task_type == "plan"
+            and action is not None
+            and classify_advance_action(action) == "needs_attention"
+        ):
+            unresolved_tasks = (owner_task,)
+        if not unresolved_tasks:
             changed = True
             continue
 

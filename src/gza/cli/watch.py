@@ -25,7 +25,7 @@ from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_nu
 from ..git import Git, GitError
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from ..merge_state import resolve_task_merge_state_for_target
-from ..operator_state import blocked_by_empty_prereq_label
+from ..operator_state import blocked_dependency_label
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -2780,9 +2780,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     def _blocked_by_text(row: TaskRow) -> str:
         task = row.task
-        empty_label = blocked_by_empty_prereq_label(store, task)
-        if empty_label is not None:
-            return empty_label
+        operator_label = blocked_dependency_label(store, task)
+        if operator_label is not None:
+            return operator_label
         blocking_id = row.values.get("blocking_id")
         merge_state = row.values.get("blocking_merge_state")
         merge_owner = row.values.get("blocking_merge_owner_id")

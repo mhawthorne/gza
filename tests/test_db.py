@@ -5204,6 +5204,47 @@ class TestRetryChainDependencyResolution:
         assert next_task is not None
         assert next_task.id == downstream.id
 
+    def test_completed_held_plan_dependency_blocks_until_released(self, tmp_path: Path) -> None:
+        """Completed held plans keep dependents out of readiness and pickup until released."""
+        store = self._make_store(tmp_path)
+        plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        self._complete(store, plan)
+        downstream = store.add("Downstream", task_type="implement", depends_on=plan.id)
+
+        readiness = store.get_dependency_readiness(downstream)
+        assert readiness.ready is False
+        assert readiness.reason == "plan_awaiting_review"
+        assert readiness.blocking_task_id == plan.id
+        assert store.get_pending_pickup() == []
+
+        refreshed_plan = store.get(plan.id)
+        assert refreshed_plan is not None
+        refreshed_plan.auto_implement = True
+        store.update(refreshed_plan)
+
+        readiness = store.get_dependency_readiness(downstream)
+        assert readiness.ready is True
+        assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
+
+    def test_dropped_held_plan_dependency_stays_blocked_even_with_completed_retry(self, tmp_path: Path) -> None:
+        """Retry-chain completion must not bypass a directly held plan that was dropped."""
+        store = self._make_store(tmp_path)
+        plan = store.add("Dropped held plan", task_type="plan", auto_implement=False)
+        assert plan.id is not None
+        plan.status = "dropped"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        retry = store.add("Completed retry", task_type="plan", based_on=plan.id)
+        self._complete(store, retry)
+
+        downstream = store.add("Blocked downstream", task_type="implement", depends_on=plan.id)
+        readiness = store.get_dependency_readiness(downstream)
+        assert readiness.ready is False
+        assert readiness.reason == "dropped"
+        assert readiness.blocking_task_id == plan.id
+        assert store.get_pending_pickup() == []
+
     def test_completed_empty_implement_dependency_blocks_by_default(self, tmp_path: Path):
         """Completed empty implement prerequisites stay blocked by default."""
         store = self._make_store(tmp_path)
