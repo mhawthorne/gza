@@ -2484,6 +2484,76 @@ def test_recovery_snapshot_descendant_order_matches_indexed_context(tmp_path: Pa
     assert [task.id for task in indexed_snapshot.descendants] == [task.id for task in store_snapshot.descendants]
 
 
+def test_recovery_snapshot_and_sibling_resolution_match_indexed_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed implementation", task_type="implement")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.session_id = "sess-root"
+    root.branch = "feature/recovery-root"
+    root.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(root)
+
+    failed_resume = store.add(root.prompt, task_type="implement", based_on=root.id, recovery_origin="resume")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "MAX_TURNS"
+    failed_resume.session_id = root.session_id
+    failed_resume.branch = root.branch
+    failed_resume.completed_at = datetime(2026, 5, 16, 8, 30, tzinfo=UTC)
+    store.update(failed_resume)
+
+    retry_child = store.add(root.prompt, task_type="implement", based_on=root.id, recovery_origin="retry")
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "MAX_TURNS"
+    retry_child.session_id = "sess-retry"
+    retry_child.branch = "feature/recovery-retry"
+    retry_child.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(retry_child)
+
+    resumed_retry = store.add(retry_child.prompt, task_type="implement", based_on=retry_child.id, recovery_origin="resume")
+    assert resumed_retry.id is not None
+    resumed_retry.status = "completed"
+    resumed_retry.session_id = retry_child.session_id
+    resumed_retry.branch = retry_child.branch
+    resumed_retry.has_commits = False
+    resumed_retry.completed_at = datetime(2026, 5, 16, 9, 30, tzinfo=UTC)
+    store.update(resumed_retry)
+
+    read_context = _read_context_for_store(store)
+    store_snapshot = _build_recovery_chain_snapshot(store, retry_child)
+    store_sibling = get_completed_sibling_recovery(store, failed_resume)
+
+    def _unexpected_store_lookup(*_args, **_kwargs):
+        raise AssertionError("indexed recovery traversal should not hit the store")
+
+    monkeypatch.setattr(store, "get", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "get_based_on_children_by_type", _unexpected_store_lookup)
+
+    indexed_snapshot = _build_recovery_chain_snapshot(store, retry_child, read_context=read_context)
+    indexed_sibling = get_completed_sibling_recovery(store, failed_resume, read_context=read_context)
+
+    assert indexed_snapshot.root_task.id == store_snapshot.root_task.id
+    assert indexed_snapshot.ancestor_ids == store_snapshot.ancestor_ids
+    assert indexed_snapshot.steps == store_snapshot.steps
+    assert [task.id for task in indexed_snapshot.descendants] == [task.id for task in store_snapshot.descendants]
+    assert [task.id for task in indexed_snapshot.direct_children] == [task.id for task in store_snapshot.direct_children]
+    assert [task.id for task in indexed_snapshot.terminal_descendants] == [task.id for task in store_snapshot.terminal_descendants]
+    assert indexed_snapshot.completed_terminal_descendant is not None
+    assert store_snapshot.completed_terminal_descendant is not None
+    assert indexed_snapshot.completed_terminal_descendant.id == store_snapshot.completed_terminal_descendant.id
+    assert store_sibling is not None
+    assert indexed_sibling is not None
+    assert indexed_sibling.id == store_sibling.id == resumed_retry.id
+
+
 def test_list_failed_tasks_for_recovery_uses_indexed_lineage_without_store_walks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

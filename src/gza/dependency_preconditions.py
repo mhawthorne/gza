@@ -43,14 +43,23 @@ def empty_prereq_satisfies_dependency(
     return False
 
 
-def task_is_merged(store: SqliteTaskStore, task: DbTask) -> bool:
+def task_is_merged(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
     """Return whether the task no longer requires merge work.
 
     Merge units are authoritative when present; legacy task-row merge status is
     only a compatibility fallback while a task has no merge unit.
     """
     if task.id is not None:
-        unit = store.resolve_merge_unit_for_task(task.id)
+        unit = (
+            read_context.resolve_merge_unit_for_task(task.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(task.id)
+        )
         if unit is not None:
             return merge_state_is_terminal_for_lifecycle(unit.state)
     return merge_state_is_terminal_for_lifecycle(task.merge_status)

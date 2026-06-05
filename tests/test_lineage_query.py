@@ -576,6 +576,36 @@ def test_query_lineage_owner_rows_empty_prereq_surfaces_release_valve_by_default
     assert "gza-4072" in row.next_action["description"]
 
 
+def test_blocked_by_empty_prereq_label_uses_direct_empty_dependency_from_read_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dep = store.add("Empty prerequisite", task_type="implement")
+    store.mark_completed(dep, has_commits=True, branch="feature/direct-empty-prereq")
+    assert dep.id is not None
+    unit = store.resolve_merge_unit_for_task(dep.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
+    assert downstream.id is not None
+
+    read_context = _read_context_for_store(store)
+    store_label = blocked_by_empty_prereq_label(store, downstream)
+
+    def _unexpected_store_lookup(*_args, **_kwargs):
+        raise AssertionError("indexed empty-prerequisite resolution should not hit the store")
+
+    monkeypatch.setattr(store, "get", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_merge_unit_for_task", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_dependency_completion", _unexpected_store_lookup)
+
+    assert blocked_by_empty_prereq_label(store, downstream, read_context=read_context) == store_label
+
+
 def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_release_valve_by_default(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -619,6 +649,53 @@ def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_release_valve_by_
     assert row.next_action["type"] == "awaiting_human"
     assert "empty prerequisite" in row.next_action["description"]
     assert "gza-4072" in row.next_action["description"]
+
+
+def test_blocked_by_empty_prereq_label_uses_completed_retry_descendant_from_read_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Failed dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "failed"
+    dependency.failure_reason = "PREREQUISITE_UNMERGED"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    retry = store.add("Completed retry", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    assert retry.id is not None
+    retry.status = "completed"
+    retry.branch = "feature/retry-empty-prereq"
+    retry.has_commits = True
+    retry.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(retry)
+
+    retry_unit = store.create_merge_unit(
+        source_branch=retry.branch,
+        target_branch="main",
+        owner_task_id=retry.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(retry.id, retry_unit.id, "owner")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dependency.id)
+    assert downstream.id is not None
+
+    read_context = _read_context_for_store(store)
+    store_label = blocked_by_empty_prereq_label(store, downstream)
+    assert store_label == f"blocked by {retry.id} (empty prerequisite; manual release tracked by gza-4072 / `gza edit --clear-depends-on`)"
+
+    def _unexpected_store_lookup(*_args, **_kwargs):
+        raise AssertionError("indexed retry-descendant prerequisite resolution should not hit the store")
+
+    monkeypatch.setattr(store, "get", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_merge_unit_for_task", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_dependency_completion", _unexpected_store_lookup)
+
+    assert blocked_by_empty_prereq_label(store, downstream, read_context=read_context) == store_label
 
 
 def test_query_lineage_owner_rows_failed_empty_prereq_policy_toggle_suppresses_release_valve(
@@ -1825,6 +1902,46 @@ def test_load_indexes_prefers_latest_active_merge_unit_per_task(tmp_path: Path) 
 
     indexes = _load_indexes(store)
     assert indexes.merge_units_by_task_id[task.id].id == newer.id
+
+
+def test_load_indexes_matches_merge_unit_updated_at_then_id_tie_break(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.branch = "feature/merge-unit-tie-break"
+    task.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(task)
+
+    first = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    second = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(task.id, first.id, "owner")
+    store.attach_task_to_merge_unit(task.id, second.id, "owner")
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE merge_units SET updated_at = ? WHERE id IN (?, ?)",
+            ("2026-05-16 09:00:00", first.id, second.id),
+        )
+
+    resolved = store.resolve_merge_unit_for_task(task.id)
+    indexes = _load_indexes(store)
+
+    assert resolved is not None
+    assert indexes.merge_units_by_task_id[task.id].id == resolved.id
+    assert resolved.id == max(first.id, second.id)
 
 
 def test_query_lineage_owner_rows_hides_branchless_moot_prerequisite_unmerged_failed_owner_from_recovery_lane(

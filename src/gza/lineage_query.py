@@ -341,6 +341,15 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
                     if existing_key is None or unit_key > existing_key:
                         merge_units_by_task_id[member.id] = unit
 
+    recovery_read_context = RecoveryReadContext(
+        tasks=tasks,
+        task_by_id=task_by_id,
+        based_on_children=based_on_children,
+        depends_on_children=depends_on_children,
+        merge_units_by_task_id=merge_units_by_task_id,
+        allow_reconcile_mutation=False,
+    )
+
     def resolve_root(task: DbTask, seen: set[str] | None = None) -> DbTask:
         if task.id is None:
             return task
@@ -409,7 +418,13 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
             owner = root
         elif (
             task.status == "failed"
-            and (recovery_root_id := get_recovery_chain_root_task_id(store, task)) is not None
+            and (
+                recovery_root_id := get_recovery_chain_root_task_id(
+                    store,
+                    task,
+                    read_context=recovery_read_context,
+                )
+            )
             and recovery_root_id != task.id
             and recovery_root_id in task_by_id
         ):

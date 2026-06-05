@@ -672,7 +672,7 @@ def is_resolved_by_merged_target(
     target_task = _resolve_merged_target_task(store, task, read_context=read_context)
     if target_task is None:
         return False
-    return task_is_merged(store, target_task)
+    return task_is_merged(store, target_task, read_context=read_context)
 
 
 def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
