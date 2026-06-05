@@ -1,39 +1,12 @@
 # Behavior specs
 
-This directory holds gza's **behavior specs** — the prescriptive, normative description of
-*how we want the system to behave*, not how any particular piece of code currently happens
-to behave. They function as a **contract**: when the code disagrees with a behavior spec,
-that disagreement is a finding to resolve, not a doc to silently update.
+This file is the index for `specs/behavior/`. It lists what each file owns and the writing
+convention for the set. It does not define behavior.
 
-**Behavior specs vs. feature specs.** `specs/features/` holds *feature specs* — proposals
-for features, codified in a file before becoming tasks. Those are *wishes*. Behavior specs
-here (`specs/behavior/`) are *requirements*: the binding behavior the running system must
-satisfy. Same root (`specs/`), qualified by type, so the two never get confused.
+## Reading order
 
-It exists to do three jobs:
-
-1. **Shared understanding.** One place to learn how the system is *supposed* to work,
-   in domain terms, without reading the implementation.
-2. **A baseline to evaluate against.** Point an agent (or a human) at this contract
-   plus the code and ask: *where does the system diverge from the intended behavior?*
-   A divergence is either a bug in the code or a gap in this spec — and naming which
-   is the point. The planned **`gza-behavior-check`** skill automates exactly this.
-3. **A basis to re-implement.** Precise enough that the system could be rebuilt in
-   another language from this document alone.
-
-## How this is different from `specs/features/` and `docs/internal/`
-
-| Location | Kind | Authority |
-|----------|------|-----------|
-| `specs/behavior/` (here) | **Prescriptive** — intent, "should" | The contract. When code and this doc disagree, that disagreement is a finding to resolve, not a doc to silently update. |
-| `docs/internal/` | **Descriptive** — design notes, "how it works today," implementation-coupled | Useful background. Mirrors the code; cannot be used to *find* code bugs because it was written *from* the code. |
-| `specs/features/` | **Mixed** — feature specs, some implemented, some aspirational | Historical / forward-looking. No status guarantee. |
-
-The critical distinction: `docs/internal/advance-workflow.md` is an excellent
-*description* of the engine, but it was reverse-engineered from the code and carries a
-"Status: Implemented" banner. It therefore documents the behavior *including any
-bug-shaped behavior*. The documents here are written **from intent**, so they can be
-held up against the code to find where the code is wrong.
+Read [00-overview.md](00-overview.md) first. Then read the subsystem file that owns the
+question you are answering.
 
 ## Writing convention
 
@@ -63,17 +36,11 @@ Additional rules for authors:
 
 ## Contents
 
-| Doc | Scope | Status |
-|-----|-------|--------|
-| [00-overview.md](00-overview.md) | The lifecycle state machine: states, transition diagram, and the consolidated human-escalation table. | Draft — invariants + 5 decisions ratified 2026-06-01 |
-| [lifecycle-engine.md](lifecycle-engine.md) | The prescriptive transition rules the engine evaluates each pass (plan → implement → review → improve → rebase → merge). | Draft — 5 decisions ratified 2026-06-01 |
-| [recovery.md](recovery.md) | The prescriptive failed-task recovery policy: moot-empty vs recoverable-empty, resume vs retry vs manual escalation, and shared operator semantics. | Draft — initial shared recovery contract |
-| [watch-supervisor.md](watch-supervisor.md) | The prescriptive runtime/supervisor contract for `gza watch`: cycle order, slot accounting, detached-worker adoption, drift re-exec, scope, and stop/backoff rules. | Draft — north-star runtime contract pending conformance pass |
-| [worktree-reclaim.md](worktree-reclaim.md) | The prescriptive contract for how a code work unit acquires its isolated worktree at task start, and when an existing worktree may be reclaimed vs. must fail for a human. | Draft — core model settled (clean→reclaim, dirty→fail), governed by `worktree_auto_reclaim_clean` |
-| [lineage.md](lineage.md) | The task graph (`based_on`/`depends_on`) and its canonical operations — dependency satisfaction across retry chains, owner/merge-unit resolution, latest-node resolution, recovery-target attachment — plus the merge-unit ownership model. The substrate the other behavior specs query. | Draft — initial, pending conformance pass; 4 open questions |
-
-### Planned (not yet written)
-
-These follow the same template once the lifecycle engine above is settled:
-
-- CLI interface contract (the observable command surface and its guarantees)
+| File | Owns |
+|------|------|
+| [00-overview.md](00-overview.md) | Shared model for the whole set: vocabulary, system-wide invariants, lifecycle diagram, and the consolidated human-escalation table. |
+| [lifecycle-engine.md](lifecycle-engine.md) | Engine-only decision rules: ordered rule set, policy knobs, parked reason codes, and ratified decisions. |
+| [lineage.md](lineage.md) | Task-graph operations: dependency satisfaction, owner/merge-unit resolution, latest-node resolution, and recovery-target attachment. |
+| [recovery.md](recovery.md) | Failed-task recovery policy: moot vs recoverable empty work, resume vs retry vs manual stop. |
+| [watch-supervisor.md](watch-supervisor.md) | Runtime loop contract for `gza watch`: cycle order, slot accounting, adoption, restart, and stop/backoff behavior. |
+| [worktree-reclaim.md](worktree-reclaim.md) | Worktree acquisition and reclaim rules at task start. |

@@ -37,26 +37,11 @@ The engine MUST distinguish *task created/selected* from *worker failed to start
 output: a creation success followed by a launch failure MUST NOT be reported as a plain
 failure to create.
 
-## Principles these rules must satisfy
+## Shared model
 
-These restate the core invariants for this layer; no rule below may contradict them.
-
-- **P1 — Idempotent.** A `pending`/`in_progress` child for the needed step MUST cause a
-  *wait*, never a duplicate spawn. Already-merged units MUST be invisible to the engine.
-- **P2 — Terminate.** Every loop is bounded (§5, §6, §7). Hitting a bound MUST escalate to
-  a human, never loop and never silently abandon.
-- **P3 — Fail closed.** When a required fact cannot be established safely (scope,
-  merge-ness, verdict, ref state), the engine MUST stop for a human rather than guess in
-  a way that could merge wrong or unreviewed code.
-- **P4 — Canonical local target.** Merge-ness and conflict checks MUST resolve against the
-  work unit's canonical local target branch. The engine MUST NOT prove merge-ness against
-  `origin/<target>` and MUST NOT push the target branch.
-- **P5 — Minimize human stops.** Every stop-for-human MUST be a deliberate, named choice
-  with a clearing path (overview escalation table), not an accident of missing logic.
-- **P6 — Merge requires successful execution evidence.** A work unit MUST NOT be selected
-  for merge, or marked merged by any merge execution path, unless the task that currently
-  represents the code being landed has execution status `completed` or legacy-compatible
-  `unmerged`.
+Shared vocabulary and system-wide invariants are defined in
+[00-overview.md](00-overview.md). The rules below MUST apply that model and MUST NOT
+contradict it.
 
 ## Policy knobs
 
@@ -77,8 +62,9 @@ as confidence grows.
 | `merge_squash_threshold` | off | Auto-squash branches at/above N commits on merge (§8). |
 
 The *values* above are non-normative defaults. Only the **existence and enforcement** of
-each corresponding bound/gate is contract (P2); an operator changing a value is
-configuration, not a spec violation.
+each corresponding bound/gate is contract (see
+[00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2); an
+operator changing a value is configuration, not a spec violation.
 
 ## The rules, in order
 
@@ -87,12 +73,13 @@ configuration, not a spec violation.
 - `auto_implement` defaults **on**. A completed `plan` with no implement child MUST create
   and run its `implement` unless holding was explicitly chosen at plan-creation time. This
   keeps `awaiting_human` rare: the plan stage is not a routine human checkpoint — the
-  review-before-merge gate is (P-overview-3).
+  review-before-merge gate is (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 3).
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
   `awaiting_human` with parked reason `awaiting-human-review`.
 - A completed `explore` with no plan/implement follow-up MUST go to `needs_discussion`
-  (decide: drop or spawn follow-up). The engine MUST NOT silently leave it pending (P5,
-  no-orphans).
+  (decide: drop or spawn follow-up). The engine MUST NOT silently leave it pending (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 6).
 
 > **Planned (aspirational — not yet contract):** an *automatic* plan-review / plan-refine
 > step will run on every plan before its implement — an agent gate analogous to code
@@ -114,13 +101,16 @@ MUST verify the branch diff stays within the work unit's declared project scope.
   the engine MUST `needs_discussion` (ScopeParked): list the offending paths; instruct to
   tag `cross-project` and re-advance, or fix the branch.
 - If the diff cannot be inspected reliably, the engine MUST `needs_discussion` and stop
-  all automation for the unit until the ref/diff problem is fixed (P3, fail closed).
+  all automation for the unit until the ref/diff problem is fixed (fail closed; see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 
 ### §4 — Conflict & rebase gate
 
-Conflict is decided against the canonical local target (P4).
+Conflict is decided against the canonical local target (see
+[00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 
-- Branch cannot merge AND a rebase child is `pending`/`in_progress` → `skip` (P1).
+- Branch cannot merge AND a rebase child is `pending`/`in_progress` → `skip` (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1).
 - Branch cannot merge AND no rebase child AND the branch does not already contain the
   target tip → create a `rebase` task (`needs_rebase`).
 - Local branch and `origin/<branch>` have diverged → reconcile the source ref directly
@@ -134,7 +124,7 @@ Conflict is decided against the canonical local target (P4).
   already contains the target tip.
 - Branch cannot merge AND a same-branch rebase already `completed` → `needs_discussion`
   (reason `rebase-did-not-unblock-merge`). The engine MUST NOT re-queue an identical
-  rebase (P2).
+  rebase (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2).
 - Repeated rebase failures reach the **circuit-breaker bound** with no intervening success,
   review, or code change → `needs_discussion` (reason `rebase-failure-circuit-breaker`).
 - Branch already contains the target tip but the lineage is still unresolved →
@@ -165,22 +155,25 @@ changed.
 When a current review exists for the implementation lineage:
 
 - Latest review `pending` → `run_review`. Latest review `in_progress` → `wait_review`.
-  (P1.)
+  (See [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
 - Verdict `APPROVED` and still valid for the current mergeable diff → `merge`.
 - Verdict `APPROVED_WITH_FOLLOWUPS` with ≥1 parsed follow-up, review still valid →
   `merge_with_followups` (create/reuse follow-up implement tasks, then merge). The
   follow-up tasks MUST be durably recorded *before* the merge completes (overview
   invariant 3); the merge MUST NOT proceed if its follow-ups could not be persisted.
 - Verdict `APPROVED_WITH_FOLLOWUPS` with **zero** parsed follow-ups → `needs_discussion`
-  (P3: self-contradictory output; do not guess).
+  (self-contradictory output; do not guess. See
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4.)
 - Verdict `CHANGES_REQUESTED`:
-  - An improve is `in_progress` → `wait_improve`; `pending` → `run_improve`. (P1.)
+  - An improve is `in_progress` → `wait_improve`; `pending` → `run_improve`. (See
+    [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
   - No improve yet, and no bound is tripped → create an `improve` task.
 - Unresolved review comments newer than the latest completed review MUST be addressed via
   the improve flow **before** any merge, even on an approved verdict.
-- Verdict is unknown / unclassifiable → `needs_discussion` (P3).
+- Verdict is unknown / unclassifiable → `needs_discussion` (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 
-**Bounds (P2), each a policy knob:**
+**Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
 - Review→improve cycles reach `max_review_cycles` → `max_cycles_reached`.
 - Consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
@@ -212,7 +205,8 @@ Failed tasks are evaluated by the same ordered engine, through one shared recove
 - Recovery is disabled (attempt budget = 0) → stop; surface that automatic recovery is
   off.
 - Recovery limit reached, ambiguous, or a terminal manual situation (e.g. failed resume
-  descendants, dropped recovery terminal) → `needs_discussion` / manual review (P2, P5).
+  descendants, dropped recovery terminal) → `needs_discussion` / manual review (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariants 2 and 6).
 - Before treating merge-unit state `empty` as a terminal "nothing left to do" outcome,
   the engine MUST apply the shared empty-recovery predicate from
   [recovery.md](recovery.md). A failed task with an `empty` merge unit but recoverable
@@ -254,7 +248,8 @@ failure *and* actionable merge/review work remains eligible for the latter.
   with a resumable `session_id` MUST stay in recovery until that recovery resolves to a
   valid completed representative, exhausts its bounded policy, or is parked for manual
   intervention.
-- Merge executes against the canonical local target (P4), respects
+- Merge executes against the canonical local target (see
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4), respects
   `merge_squash_threshold`, and MUST NOT push the target branch as a side effect. Direct
   mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
   MUST reject merge representatives whose execution status is not `completed` or
@@ -269,7 +264,7 @@ implementations are covered by the moot rule and do not require review creation.
 When a code task completes with PR creation requested (`create_pr`), the work is published
 by pushing the unit's source branch to `origin` and opening a PR. Publication is a
 *completion-time* step, distinct from the §8 merge into the canonical local target; it MUST
-NOT be conflated with merge-ness. P4 forbids pushing the *target* branch — it does **not**
+NOT be conflated with merge-ness. Overview invariant 4 forbids pushing the *target* branch — it does **not**
 forbid publishing the unit's own source branch to `origin`.
 
 Publication has two failure modes with different outcomes, decided by **whether the branch
@@ -285,9 +280,9 @@ push succeeded**:
   `BRANCH_UNPUSHABLE` ([recovery.md](recovery.md) §2). This is *not* a manual stop. Its
   prescribed next action is to make the branch pushable via the §4 reconcile/rebase
   machinery. The reason MUST be distinct and countable so publication-blocked frequency is
-  observable (P5: an invisible "completed" branch is a real hazard, not a silent success).
+  observable (an invisible "completed" branch is a real hazard, not a silent success).
 
-**Recovery and continuation (P5 — no needless human stop).** A `BRANCH_UNPUSHABLE` unit
+**Recovery and continuation.** A `BRANCH_UNPUSHABLE` unit
 routes into §4: benign/mechanical divergence (including superseded gza WIP savepoints) is
 reconciled automatically (publish the strictly-ahead or patch-equivalent local side;
 otherwise fetch and mechanically rebase, then publish); only a genuine host-side conflict
@@ -369,7 +364,8 @@ kept for future readers.
 3. **Reason codes are a stable enumerated contract; messages are free text** (§ Parked
    reason codes; overview escalation table). Legitimizes `watch` branching on codes such
    as recovery stops.
-4. **Bound existence is contract; bound values are tunable knobs** (§ Policy knobs, P2).
+4. **Bound existence is contract; bound values are tunable knobs** (§ Policy knobs; see
+   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2).
    Conformance verifies a loop cannot run unbounded, not the specific number.
 5. **One batch slot per `iterate` chain is intended** (to be detailed in the future
    concurrency doc). The batch limit bounds concurrent worker *processes*; `iterate`

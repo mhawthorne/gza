@@ -1,10 +1,10 @@
 # Lifecycle state machine — overview
 
-> **Status: Draft.** Core invariants and the five lifecycle decisions were ratified
-> 2026-06-01 (see *Ratified decisions* in [lifecycle-engine.md](lifecycle-engine.md));
-> the detailed transition rules remain draft pending a conformance pass against the code.
-> This is the centerpiece of the behavioral contract: the states a unit of work moves
-> through, what moves it, and every point where a human is required.
+> **Status: Draft.** This file owns the shared model for `specs/behavior/`: vocabulary,
+> system-wide invariants, the lifecycle diagram, and the consolidated human-escalation
+> table. Core invariants and the five lifecycle decisions were ratified 2026-06-01 (see
+> *Ratified decisions* in [lifecycle-engine.md](lifecycle-engine.md)); detailed transition
+> rules remain draft pending a conformance pass against the code.
 
 ## What this models
 
