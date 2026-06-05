@@ -38,6 +38,11 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
 - **R5 — Already-landed work is not recoverable.** Once a failed task has a valid landed
   or completed representative, recovery MUST suppress the older failed row instead of
   re-queueing it.
+- **R6 — A recovery row carries its action.** A task created to carry recovery
+  (`recovery_origin = resume` or `recovery_origin = retry`) MUST be executed with that
+  action whenever it runs, by **any** launch path (pending-queue worker pickup, `iterate`,
+  `advance`, recovery lane) — not only by the recovery lane. Its `pending` status MUST NOT
+  cause it to be dispatched as ordinary fresh work that ignores the stored action.
 
 ## Decision model
 
@@ -85,12 +90,33 @@ resolved by a valid representative, including:
 
 The same failed task being `empty` on its own MUST NOT count as proof of resolution.
 
-## Operator-visible behavior
+### 4. Executing a pending recovery row
+
+Sections 1–3 decide whether to **create** a resume/retry for a failed task. This section
+governs what happens when the resulting recovery row (a `pending` task with
+`recovery_origin` set) is later **executed**. These are distinct: creation policy may
+legitimately decline to auto-create recovery (e.g. a manual-only failure), but once a
+recovery row exists — whether auto-created or operator-created — executing it MUST honor
+its stored action.
+
+- A `pending` task with `recovery_origin = resume` and a stored `session_id` MUST, when
+  run, **continue that provider session**, including when its branch currently has **no
+  commits**. An empty branch MUST NOT downgrade a resume row to a no-op.
+- Such a row MUST NOT be dispatched as a fresh `iterate` that terminates with an `empty` /
+  "no remaining commits to land" message. That terminal applies only to work that has no
+  remaining action — a resume row with a continuable session always has a remaining action.
+- A `pending` task with `recovery_origin = resume` but **no** stored `session_id` is not
+  resumable; it MUST be treated as a retry (fresh attempt) or, if nothing is left to do,
+  parked — never silently no-op'd.
+- A `pending` task with `recovery_origin = retry` MUST start a fresh execution attempt.
+- The empty-recovery mootness logic in section 1 (which governs *failed* tasks) MUST NOT be
+  used to suppress an explicit pending resume/retry row to a no-op.
 
 - Operator wording MUST distinguish **moot empty work** from **empty but resumable
   failed work**.
 - `iterate` MUST check the shared empty-recovery predicate before printing an `empty` /
-  "no remaining commits to land" terminal message.
+  "no remaining commits to land" terminal message, and MUST NOT print that terminal for a
+  pending resume row with a continuable session (see §4).
 - Failed-task recovery queues and dry-run reports MUST omit moot empty tasks and retain
   recoverable empty tasks.
 - `watch`, `advance`, `iterate`, and query/recovery-lane surfaces MUST agree on the same
