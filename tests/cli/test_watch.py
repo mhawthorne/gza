@@ -7223,40 +7223,24 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
     ) == []
 
 
-def test_watch_cycle_successful_iterate_start_resets_no_progress_streak(tmp_path: Path) -> None:
+def test_watch_cycle_pending_dispatch_parks_repeated_identical_no_progress_across_restart(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
-    impl.status = "completed"
-    impl.completed_at = datetime.now(UTC)
-    impl.branch = "feature/no-progress-iterate-reset"
-    impl.has_commits = True
-    store.update(impl)
-    store.set_merge_status(impl.id, "unmerged")
-    unit = store.get_or_create_merge_unit_for_task(impl)
-    assert unit is not None
-
-    review = store.add("Review feature", task_type="review", depends_on=impl.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime.now(UTC)
-    store.update(review)
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
-    git = _make_watch_git()
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=[0, 1]) as spawn_iterate,
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=1) as spawn_iterate,
     ):
         _run_cycle(
             config=config,
@@ -7266,10 +7250,88 @@ def test_watch_cycle_successful_iterate_start_resets_no_progress_streak(tmp_path
             dry_run=False,
             log=_WatchLog(log_path, quiet=True),
         )
-        assert store.list_watch_progress_observations(
-            subject_kind="merge_unit",
-            subject_id=unit.id,
-        ) == []
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+    )
+
+    assert spawn_iterate.call_count == 1
+    text = log_path.read_text()
+    assert "ATTENTION" in text
+    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert any("START_FAILED" in line and str(impl.id) in line for line in text.splitlines())
+    assert not any("START" in line and f"{impl.id} iterate" in line for line in text.splitlines())
+
+
+def test_watch_cycle_pending_dispatch_status_transition_resets_no_progress_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    spawn_attempts = 0
+
+    def spawn_with_initial_claim(*_args, **_kwargs) -> int:
+        nonlocal spawn_attempts
+        spawn_attempts += 1
+        if spawn_attempts == 1:
+            claimed = store.get(impl.id)
+            assert claimed is not None
+            claimed.status = "in_progress"
+            claimed.started_at = datetime.now(UTC)
+            store.update(claimed)
+            return 0
+        return 1
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=spawn_with_initial_claim) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+        observations = store.list_watch_progress_observations(
+            subject_kind="lineage",
+            subject_id=str(impl.id),
+        )
+        assert len(observations) == 1
+        assert observations[0].action_task_status == "in_progress"
+        assert observations[0].parked_reason is None
+
+        reset = store.get(impl.id)
+        assert reset is not None
+        reset.status = "pending"
+        reset.started_at = None
+        reset.running_pid = None
+        store.update(reset)
+
         _run_cycle(
             config=Config.load(tmp_path),
             store=make_store(tmp_path),
@@ -7292,7 +7354,7 @@ def test_watch_cycle_successful_iterate_start_resets_no_progress_streak(tmp_path
     assert text.count("ATTENTION") == 1
     assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
     assert any("START_FAILED" in line and str(impl.id) in line for line in text.splitlines())
-    assert any("START" in line and f"{impl.id} iterate" in line for line in text.splitlines())
+    assert any("START" in line and f"{impl.id} implement" in line for line in text.splitlines())
 
 
 def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_path: Path) -> None:
@@ -7327,10 +7389,13 @@ def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_pa
             restart_failed=True,
             max_recovery_attempts=config.max_resume_attempts,
         )
-        assert store.list_watch_progress_observations(
+        observations = store.list_watch_progress_observations(
             subject_kind="lineage",
             subject_id=str(failed.id),
-        ) == []
+        )
+        assert len(observations) == 1
+        assert observations[0].action_task_id in {child.id for child in store.get_based_on_children(failed.id)}
+        assert observations[0].parked_reason is None
         _run_cycle(
             config=Config.load(tmp_path),
             store=make_store(tmp_path),

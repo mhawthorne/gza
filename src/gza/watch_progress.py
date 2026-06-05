@@ -283,3 +283,41 @@ def observe_watch_progress_and_maybe_park(
         action_type=candidate.action_type,
         streak=streak,
     )
+
+
+def refresh_watch_progress_after_state_change(
+    store: SqliteTaskStore,
+    *,
+    candidate: WatchProgressCandidate,
+) -> None:
+    """Refresh persisted evidence after durable progress without counting another watch pass."""
+    existing = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    if existing is None:
+        return
+    if existing.evidence_fingerprint == candidate.evidence_fingerprint:
+        return
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=1,
+            parked_reason=None,
+            observed_at=datetime.now(UTC),
+        )
+    )

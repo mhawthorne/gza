@@ -45,9 +45,9 @@ from ..task_query import (
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     build_watch_progress_candidate,
-    clear_watch_progress_subject,
     get_active_watch_no_progress_attention,
     observe_watch_progress_and_maybe_park,
+    refresh_watch_progress_after_state_change,
 )
 from ..workers import WorkerRegistry
 from ._common import (
@@ -533,6 +533,40 @@ def _maybe_park_watch_no_progress(
         candidate=candidate,
         no_progress_cycles=no_progress_cycles,
     )
+
+
+def _refresh_watch_no_progress_after_state_change(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task: DbTask | None,
+    failed_task: DbTask | None,
+) -> None:
+    """Refresh persisted no-progress evidence only when the subject actually changed state."""
+    if subject_task.id is None:
+        return
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+        failed_task=failed_task,
+    )
+    refresh_watch_progress_after_state_change(store, candidate=candidate)
+
+
+def _pending_queue_dispatch_action(task: DbTask) -> dict[str, Any]:
+    """Build the stable watch action used for pending-queue no-progress tracking."""
+    if task.task_type == "implement":
+        pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+        if pending_recovery_mode == "resume":
+            return {"type": "iterate", "description": "pending queue iterate resume"}
+        if pending_recovery_mode == "retry":
+            return {"type": "iterate", "description": "pending queue iterate retry"}
+        return {"type": "iterate", "description": "pending queue iterate"}
+    task_kind = task.task_type or "task"
+    return {"type": "worker", "description": f"pending queue {task_kind} worker"}
 
 
 @dataclass(frozen=True)
@@ -1872,7 +1906,14 @@ def _run_cycle(
                     log.emit("START", f"{child_id} implement")
                 elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
                     log.emit("START", f"{child_id} rebase")
-                clear_watch_progress_subject(store, subject_task=display_task)
+                refreshed_action_task = store.get(child_id) if child_id is not None else None
+                _refresh_watch_no_progress_after_state_change(
+                    store=store,
+                    subject_task=display_task,
+                    action=action,
+                    action_task=refreshed_action_task,
+                    failed_task=None,
+                )
                 started_task_ids.add(str(child_id))
                 if exec_result.worker_consuming:
                     slots -= 1
@@ -2120,7 +2161,14 @@ def _run_cycle(
 
         if rc != 0:
             continue
-        clear_watch_progress_subject(store, subject_task=failed)
+        refreshed_recovered_task = store.get(recovered_task_id)
+        _refresh_watch_no_progress_after_state_change(
+            store=store,
+            subject_task=failed,
+            action=recovery_action,
+            action_task=refreshed_recovered_task,
+            failed_task=failed,
+        )
         started_task_ids.add(recovered_task_id)
         started_recovery_task_ids.add(recovered_task_id)
         slots -= 1
@@ -2161,6 +2209,7 @@ def _run_cycle(
             if str(task.id) in step1_handled_child_task_ids:
                 continue
             task_type = task.task_type or "implement"
+            pending_action = _pending_queue_dispatch_action(task)
             if task_type == "implement":
                 if dry_run:
                     dry_run_prompt = _format_prompt_for_width(
@@ -2172,6 +2221,20 @@ def _run_cycle(
                     started_task_ids.add(str(task.id))
                     slots -= 1
                     work_done = True
+                    continue
+                no_progress_attention = _maybe_park_watch_no_progress(
+                    store=store,
+                    subject_task=task,
+                    action=pending_action,
+                    action_task=task,
+                    failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                )
+                if no_progress_attention is not None:
+                    log.emit_attention(
+                        attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                        message=_watch_needs_attention_message(task, no_progress_attention),
+                    )
                     continue
                 iterate_args = argparse.Namespace(
                     max_iterations=max_iterations,
@@ -2210,6 +2273,14 @@ def _run_cycle(
                 )
                 if rc != 0:
                     continue
+                refreshed_pending_task = store.get(str(task.id))
+                _refresh_watch_no_progress_after_state_change(
+                    store=store,
+                    subject_task=task,
+                    action=pending_action,
+                    action_task=refreshed_pending_task,
+                    failed_task=None,
+                )
                 slots -= 1
                 work_done = True
                 started_task_ids.add(str(task.id))
@@ -2232,6 +2303,20 @@ def _run_cycle(
                 slots -= 1
                 work_done = True
                 continue
+            no_progress_attention = _maybe_park_watch_no_progress(
+                store=store,
+                subject_task=task,
+                action=pending_action,
+                action_task=task,
+                failed_task=None,
+                no_progress_cycles=config.watch.no_progress_cycles,
+            )
+            if no_progress_attention is not None:
+                log.emit_attention(
+                    attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                    message=_watch_needs_attention_message(task, no_progress_attention),
+                )
+                continue
             worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
             rc = _spawn_worker_with_failure_log(
                 quiet=quiet,
@@ -2248,6 +2333,14 @@ def _run_cycle(
             )
             if rc != 0:
                 continue
+            refreshed_pending_task = store.get(str(task.id))
+            _refresh_watch_no_progress_after_state_change(
+                store=store,
+                subject_task=task,
+                action=pending_action,
+                action_task=refreshed_pending_task,
+                failed_task=None,
+            )
             slots -= 1
             work_done = True
             started_task_ids.add(str(task.id))
