@@ -429,7 +429,7 @@ class TestPromptBuilderBuild:
         assert "exploration/research task" not in result.lower()
 
     def test_build_plan_type_with_report_path(self, tmp_path: Path):
-        """Test that plan type includes planning instructions."""
+        """Test that plan type includes planning and persistence instructions."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Design feature", task_type="plan")
@@ -445,6 +445,10 @@ class TestPromptBuilderBuild:
         assert "Overview of the approach" in result
         assert "Key design decisions" in result
         assert "Implementation steps" in result
+        assert "ephemeral worktree with no git branch and no commits" in result
+        assert f"Only the plan report at `{report_path}` is persisted" in result
+        assert "Do NOT edit specs, source files, tests, or other files" in result
+        assert "Describe any intended spec or code changes inside the written plan" in result
 
     def test_build_review_type_with_report_path(self, tmp_path: Path):
         """Test that review type includes review instructions."""

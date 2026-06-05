@@ -1,6 +1,12 @@
 This is a planning task. Write your design/architecture plan to:
   {report_path}
 
+Planning environment constraints:
+- Plan tasks run in an ephemeral worktree with no git branch and no commits.
+- Only the plan report at `{report_path}` is persisted after the task completes.
+- Do NOT edit specs, source files, tests, or other files for this task; those edits are discarded when the task ends.
+- Describe any intended spec or code changes inside the written plan instead of editing files.
+
 Structure the plan with clear sections covering:
 - Overview of the approach
 - Key design decisions
