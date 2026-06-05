@@ -13233,7 +13233,7 @@ class TestIterateCommand:
         children = store.get_based_on_children(review.id)
         assert len(children) == 1
 
-    def test_iterate_verify_noop_improve_then_review_runs_fresh_review_instead_of_improve(
+    def test_iterate_verify_noop_improve_then_review_clears_verify_only_block_without_new_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -13248,7 +13248,100 @@ class TestIterateCommand:
 
         stale_review = store.add("Stale review", task_type="review", depends_on=impl.id, based_on=impl.id)
         stale_review.status = "completed"
-        stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        stale_review.output_content = (
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        stale_review.completed_at = datetime.now(UTC)
+        store.update(stale_review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        def fake_run_foreground(config, task_id, **kwargs):
+            raise AssertionError("fresh review should not run for a verify-only blocker")
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={
+                    "type": "verify_noop_improve_then_review",
+                    "description": "Re-run verify_command before re-review",
+                    "review_task": stale_review,
+                },
+            ),
+            patch(
+                "gza.cli.run_noop_improve_verify_then_review",
+                return_value=SimpleNamespace(
+                    status="review_cleared",
+                    message=f"Fresh verify passed for {impl.branch} at deadbeef; cleared verify-only review block on {impl.id}",
+                    verify_markdown="## verify_command result\n\nPassed\n",
+                    review_task=None,
+                ),
+            ) as rerun_verify,
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        rerun_verify.assert_called_once()
+        run_fg.assert_not_called()
+        assert "Iteration 1/1: verify_noop_improve_then_review" in output
+        assert "cleared verify-only review block" in output
+        assert "Iterate complete: MERGE_READY (verify_only_review_cleared)" in output
+        improves = [task for task in store.get_all() if task.task_type == "improve" and task.based_on == impl.id]
+        assert improves == []
+
+    def test_iterate_verify_noop_improve_then_review_runs_fresh_review_for_substantive_blocker(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        import argparse
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        stale_review = store.add("Stale review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = (
+            "## Summary\n\n- Verify failed because the guard is missing.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing empty-input guard\n"
+            "Evidence: src/gza/foo.py:10-12 indexes the first item before validating input.\n"
+            "Impact: empty selections still raise IndexError.\n"
+            "Required fix: return early when the selection is empty, then rerun verify_command.\n"
+            "Required tests: add an empty-selection regression and rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
         stale_review.completed_at = datetime.now(UTC)
         store.update(stale_review)
 
@@ -13310,8 +13403,6 @@ class TestIterateCommand:
         assert run_fg.call_args.kwargs["task_id"] == fresh_review.id
         assert "Iteration 1/1: verify_noop_improve_then_review" in output
         assert f"Fresh verify passed; running review {fresh_review.id}" in output
-        improves = [task for task in store.get_all() if task.task_type == "improve" and task.based_on == impl.id]
-        assert improves == []
 
     def test_iterate_verify_noop_improve_then_review_parks_on_reverify_setup_failure(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

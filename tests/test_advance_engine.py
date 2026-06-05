@@ -1984,6 +1984,144 @@ def test_two_consecutive_noop_improves_return_needs_discussion(tmp_path: Path, m
     assert "2 consecutive no-op improves" in action["description"]
 
 
+def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-mergeable",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: mypy error\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "merge"
+    assert "improve-no-op" not in action["description"]
+
+
+def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-not-cleared",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: mypy error\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = _add_completed_improve_for_review(
+            store,
+            impl,
+            review,
+            when=datetime(2026, 5, 14, hour, 0, tzinfo=UTC),
+            changed_diff=False,
+        )
+        assert improve.id is not None
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_noop_improve_then_review"
+    assert action["type"] != "merge"
+
+
+def test_substantive_noop_improves_still_park_without_auto_clear(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-substantive-still-parked",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Verify failed because the guard is missing.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing empty-input guard\n"
+        "Evidence: src/gza/foo.py:10-12 indexes the first item before validating input.\n"
+        "Impact: empty selections still raise IndexError.\n"
+        "Required fix: return early when the selection is empty, then rerun verify_command.\n"
+        "Required tests: add an empty-selection regression and rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    for hour in (11, 12):
+        _add_completed_improve_for_review(
+            store,
+            impl,
+            review,
+            when=datetime(2026, 5, 14, hour, 0, tzinfo=UTC),
+            changed_diff=False,
+        )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+
+
 def test_verify_blocked_noop_improves_return_reverify_action_when_review_sha_is_stale(
     tmp_path: Path,
     monkeypatch,

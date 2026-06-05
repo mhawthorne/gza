@@ -102,6 +102,7 @@ from .review_scope import resolve_review_scope_for_impl
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
+    is_verify_blocked_only_review,
     is_verify_timeout_only_review,
     parse_review_report,
     parse_review_template,
@@ -2348,6 +2349,50 @@ def _persist_review_verify_result(
     task.review_verify_artifact_file = artifact_file
 
 
+def _capture_review_verify_result(
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    result: ReviewVerifyResult,
+    *,
+    markdown: str,
+    project_results: tuple[ProjectReviewVerifyResult, ...] = (),
+    task_logger: TaskExecutionLogger | None = None,
+) -> str:
+    """Persist review verify provenance, artifact, and optional ops-log evidence."""
+    artifact_file = _write_review_verify_artifact(
+        config,
+        task,
+        markdown=markdown,
+        result=result,
+        project_results=project_results,
+    )
+    _persist_review_verify_result(
+        task,
+        result,
+        markdown=markdown,
+        artifact_file=artifact_file,
+    )
+    store.update(task)
+    if task_logger is not None:
+        task_logger.phase(
+            f"Captured review verify result: {result.status} ({result.exit_status})",
+            extra={
+                "event": "review_verify_result",
+                "review_verify_status": result.status,
+                "review_verify_exit_status": result.exit_status,
+                "review_verify_command": result.command,
+                "review_verify_captured_at": result.captured_at.isoformat(),
+                "review_verify_branch": result.reviewed_branch,
+                "review_verify_head_sha": result.reviewed_head_sha,
+                "review_verify_base_sha": result.reviewed_base_sha,
+                "review_verify_cwd": result.working_directory,
+                "review_verify_artifact_file": artifact_file,
+            },
+        )
+    return artifact_file
+
+
 def _format_review_verify_result(
     result: ReviewVerifyResult | str,
     completed: subprocess.CompletedProcess[str] | None = None,
@@ -3299,6 +3344,168 @@ def _noop_improve_warning_text(
     if opt_out:
         warning += " Tag `allow-noop-improve` is present, so continuation is explicitly allowed."
     return warning
+
+
+def _task_has_current_passing_review_verify_evidence(
+    *,
+    task: Task,
+    review_task: Task,
+    current_branch: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    """Require durable green verify evidence for the current improve tip."""
+    if task.review_verify_status != "passed":
+        return False
+    if task.review_verify_captured_at is None:
+        return False
+    if review_task.completed_at is not None and task.review_verify_captured_at < review_task.completed_at:
+        return False
+    if not current_branch or not task.review_verify_branch:
+        return False
+    if task.review_verify_branch != current_branch:
+        return False
+    if not current_head_sha or not task.review_verify_head_sha:
+        return False
+    return task.review_verify_head_sha == current_head_sha
+
+
+def _noop_improve_resolves_verify_only_review(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    impl_ancestor: Task | None,
+    current_branch: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    """Return whether this no-op improve should clear a verify-only review block."""
+    if task.task_type != "improve" or task.depends_on is None:
+        return False
+    if impl_ancestor is None or impl_ancestor.id is None:
+        return False
+
+    review_task = store.get(task.depends_on)
+    if review_task is None or review_task.task_type != "review" or review_task.status != "completed":
+        return False
+
+    review_content = _get_task_output(review_task, Path(config.project_dir))
+    if not is_verify_blocked_only_review(review_content):
+        return False
+
+    if not _task_has_current_passing_review_verify_evidence(
+        task=task,
+        review_task=review_task,
+        current_branch=current_branch,
+        current_head_sha=current_head_sha,
+    ):
+        return False
+
+    store.clear_review_state(impl_ancestor.id)
+    return True
+
+
+def _capture_noop_improve_review_verify_result(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    worktree_git: Git,
+    branch_name: str,
+    task_logger: TaskExecutionLogger | None = None,
+) -> ReviewVerifyResult | None:
+    """Persist fresh verify evidence for a no-op improve blocked only by review verify."""
+    if task.task_type != "improve" or task.depends_on is None:
+        return None
+
+    review_task = store.get(task.depends_on)
+    if review_task is None or review_task.task_type != "review" or review_task.status != "completed":
+        return None
+
+    review_content = _get_task_output(review_task, Path(config.project_dir))
+    if not is_verify_blocked_only_review(review_content):
+        return None
+
+    verify_command = config.verify_command if isinstance(config.verify_command, str) else ""
+    if not _task_is_cross_project(task) and not verify_command.strip():
+        return None
+
+    timeout_seconds = getattr(config, "review_verify_timeout_seconds", REVIEW_VERIFY_TIMEOUT_SECONDS)
+    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
+
+    provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(config))
+    reviewed_base_sha: str | None = None
+    reviewed_head_sha: str | None = None
+    project_results: tuple[ProjectReviewVerifyResult, ...] = ()
+    command_label = verify_command.strip() or "(review verify unavailable)"
+
+    try:
+        default_branch = worktree_git.default_branch()
+        reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, default_branch)
+        reviewed_head_sha = worktree_git.rev_parse_if_exists(branch_name)
+        if reviewed_head_sha is None:
+            result = _make_review_verify_result(
+                command_label,
+                status="unavailable",
+                exit_status="unresolved head",
+                captured_at=datetime.now(UTC),
+                reviewed_branch=branch_name,
+                reviewed_head_sha=None,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(provider_cwd),
+                failure="unable to resolve review worktree HEAD before verify_command ran",
+            )
+            markdown = _format_review_verify_result(result)
+        elif _task_is_cross_project(task):
+            cross_project_verify = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_git.repo_dir,
+                timeout_seconds=timeout_seconds,
+                reviewed_branch=branch_name,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+            )
+            if cross_project_verify is None:
+                return None
+            result = cross_project_verify.aggregate_result
+            markdown = cross_project_verify.markdown
+            project_results = cross_project_verify.project_results
+        else:
+            result = _run_review_verify_command(
+                verify_command.strip(),
+                cwd=provider_cwd,
+                reviewed_branch=branch_name,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                timeout_seconds=timeout_seconds,
+            )
+            markdown = _format_review_verify_result(result)
+    except (GitError, OSError, RuntimeError, ValueError) as exc:
+        result = _make_review_verify_result(
+            command_label,
+            status="unavailable",
+            exit_status="launch failed",
+            captured_at=datetime.now(UTC),
+            reviewed_branch=branch_name,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(provider_cwd),
+            failure=f"unable to prepare or run verify_command for no-op improve: {exc}",
+        )
+        markdown = _format_review_verify_result(result)
+
+    _capture_review_verify_result(
+        config,
+        store,
+        task,
+        result,
+        markdown=markdown,
+        project_results=project_results,
+        task_logger=task_logger,
+    )
+    return result
 
 
 def _is_recovered_rebase_lineage(task: Task, *, resume: bool) -> bool:
@@ -5855,6 +6062,37 @@ def _post_complete_code_task(
                     impl_ancestor.id,
                     created_on_or_before=task.created_at,
                 )
+        else:
+            current_noop_head_sha = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
+            cleared_verify_only_blocker = _noop_improve_resolves_verify_only_review(
+                config=config,
+                store=store,
+                task=task,
+                impl_ancestor=impl_ancestor,
+                current_branch=branch_name,
+                current_head_sha=current_noop_head_sha,
+            )
+            if not cleared_verify_only_blocker:
+                _capture_noop_improve_review_verify_result(
+                    config=config,
+                    store=store,
+                    task=task,
+                    worktree_git=worktree_git,
+                    branch_name=branch_name,
+                    task_logger=task_logger,
+                )
+                cleared_verify_only_blocker = _noop_improve_resolves_verify_only_review(
+                    config=config,
+                    store=store,
+                    task=task,
+                    impl_ancestor=impl_ancestor,
+                    current_branch=branch_name,
+                    current_head_sha=current_noop_head_sha,
+                )
+            if cleared_verify_only_blocker:
+                console.print(
+                    "[blue]Review State: cleared verify-only blocker from persisted passing no-op improve verify evidence.[/blue]"
+                )
 
     # Rebase tasks run provider-side conflict resolution in the worktree.
     # Force-push from the host runner so SSH/auth follows host environment.
@@ -6893,35 +7131,14 @@ def _run_non_code_task(
                         review_verify_markdown = _format_review_verify_result(review_verify_result)
                 if review_verify_result is not None:
                     assert review_verify_markdown is not None
-                    artifact_file = _write_review_verify_artifact(
+                    _capture_review_verify_result(
                         config,
-                        task,
-                        markdown=review_verify_markdown,
-                        result=review_verify_result,
-                        project_results=persisted_project_results if reviewed_head_sha is not None else (),
-                    )
-                    _persist_review_verify_result(
+                        store,
                         task,
                         review_verify_result,
                         markdown=review_verify_markdown,
-                        artifact_file=artifact_file,
-                    )
-                    store.update(task)
-                    task_logger.phase(
-                        f"Captured review verify result: {review_verify_result.status} "
-                        f"({review_verify_result.exit_status})",
-                        extra={
-                            "event": "review_verify_result",
-                            "review_verify_status": review_verify_result.status,
-                            "review_verify_exit_status": review_verify_result.exit_status,
-                            "review_verify_command": review_verify_result.command,
-                            "review_verify_captured_at": review_verify_result.captured_at.isoformat(),
-                            "review_verify_branch": review_verify_result.reviewed_branch,
-                            "review_verify_head_sha": review_verify_result.reviewed_head_sha,
-                            "review_verify_base_sha": review_verify_result.reviewed_base_sha,
-                            "review_verify_cwd": review_verify_result.working_directory,
-                            "review_verify_artifact_file": artifact_file,
-                        },
+                        project_results=persisted_project_results if reviewed_head_sha is not None else (),
+                        task_logger=task_logger,
                     )
             prompt = build_prompt(
                 task,

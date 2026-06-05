@@ -12,13 +12,18 @@ from typing import Any, Literal, Protocol
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
+from ..review_verdict import is_verify_blocked_only_review
 from ..runner import (
+    ProjectReviewVerifyResult,
+    _capture_review_verify_result,
     _create_detached_review_worktree,
     _format_review_verify_result,
+    _get_task_output,
     _project_boundary,
     _resolve_review_verify_base_sha,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
+    _task_has_current_passing_review_verify_evidence,
     _task_is_cross_project,
     _worktree_execution_dir,
 )
@@ -122,13 +127,37 @@ class AdvanceExecutionNeedsAttention:
 class NoopVerifyThenReviewOutcome:
     """Shared execution outcome for verify-then-rereview no-op recovery."""
 
-    status: Literal["create_review", "needs_attention", "skip", "error"]
+    status: Literal["create_review", "review_cleared", "needs_attention", "skip", "error"]
     message: str
     verify_markdown: str | None = None
     review_task: DbTask | None = None
 
 
 _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS = (GitError, OSError, RuntimeError, ValueError)
+
+
+def _fresh_verify_resolves_verify_only_review(
+    *,
+    task: DbTask,
+    review_task: DbTask,
+    current_branch: str | None,
+    current_head_sha: str | None,
+    context: AdvanceActionExecutionContext,
+) -> bool:
+    if context.config is None or task.id is None:
+        return False
+    review_content = _get_task_output(review_task, Path(context.config.project_dir))
+    if not is_verify_blocked_only_review(review_content):
+        return False
+    if not _task_has_current_passing_review_verify_evidence(
+        task=task,
+        review_task=review_task,
+        current_branch=current_branch,
+        current_head_sha=current_head_sha,
+    ):
+        return False
+    context.store.clear_review_state(task.id)
+    return True
 
 
 _WORKER_ACTIONS = frozenset(
@@ -236,6 +265,7 @@ def run_noop_improve_verify_then_review(
     verify_markdown = None
     reviewed_head_sha: str | None = None
     reviewed_base_sha: str | None = None
+    project_results: tuple[ProjectReviewVerifyResult, ...] = ()
     lifecycle_failure: Exception | None = None
     try:
         default_branch = verify_git.default_branch()
@@ -258,6 +288,7 @@ def run_noop_improve_verify_then_review(
                 if cross_project_verify is not None:
                     verify_result = cross_project_verify.aggregate_result
                     verify_markdown = cross_project_verify.markdown
+                    project_results = cross_project_verify.project_results
             elif isinstance(verify_command, str) and verify_command.strip():
                 provider_cwd = _worktree_execution_dir(
                     worktree_path,
@@ -300,6 +331,14 @@ def run_noop_improve_verify_then_review(
                 cleanup_failure,
             ),
         )
+    _capture_review_verify_result(
+        context.config,
+        context.store,
+        task,
+        verify_result,
+        markdown=verify_markdown,
+        project_results=project_results,
+    )
     if cleanup_failure is not None:
         return NoopVerifyThenReviewOutcome(
             status="needs_attention",
@@ -315,6 +354,26 @@ def run_noop_improve_verify_then_review(
         return NoopVerifyThenReviewOutcome(
             status="needs_attention",
             message=f"SKIP: {description}. Fresh verify_command {verify_result.status} ({detail}).",
+            verify_markdown=verify_markdown,
+        )
+
+    expected_head_sha = action.get("current_branch_head_sha")
+    current_head_sha = expected_head_sha if isinstance(expected_head_sha, str) and expected_head_sha else None
+    persisted_task = context.store.get(task.id) if task.id is not None else None
+    task_with_evidence = persisted_task if persisted_task is not None else task
+    if _fresh_verify_resolves_verify_only_review(
+        task=task_with_evidence,
+        review_task=review_task,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha or reviewed_head_sha,
+        context=context,
+    ):
+        return NoopVerifyThenReviewOutcome(
+            status="review_cleared",
+            message=(
+                f"Fresh verify passed for {task.branch} at {verify_result.reviewed_head_sha}; "
+                f"cleared verify-only review block on {task.id}"
+            ),
             verify_markdown=verify_markdown,
         )
 
@@ -737,6 +796,15 @@ def execute_advance_action(
             return AdvanceActionExecutionResult(action_type=action_type, status="skip", message=outcome.message)
         if outcome.status == "error":
             return AdvanceActionExecutionResult(action_type=action_type, status="error", message=outcome.message)
+        if outcome.status == "review_cleared":
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="success",
+                message=outcome.verify_markdown or outcome.message,
+                success_message=outcome.message,
+                work_done=True,
+                handled_task_id=task.id,
+            )
         new_review = outcome.review_task
         assert new_review is not None and new_review.id is not None
 

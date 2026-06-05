@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,24 +43,28 @@ def _make_noop_verify_fixture(tmp_path: Path) -> tuple[Any, Any, DbTask, DbTask]
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
+    impl.slug = "20260605-implement-feature"
     _mark_completed(impl, branch="feature/noop-reverify")
     store.update(impl)
     store.set_merge_status(impl.id, "unmerged")
 
     review = store.add("Review feature", task_type="review", depends_on=impl.id)
     assert review.id is not None
+    review.slug = "20260605-review-feature"
     _mark_completed(review)
     review.output_content = "**Verdict: CHANGES_REQUESTED**"
     store.update(review)
 
     config = SimpleNamespace(
         worktree_path=tmp_path / "worktrees",
+        log_path=tmp_path / "logs",
         project_dir=tmp_path,
         verify_command="uv run pytest tests/ -q",
         review_verify_timeout_seconds=120,
         project_dir_raw=tmp_path,
     )
     config.worktree_path.mkdir(parents=True, exist_ok=True)
+    config.log_path.mkdir(parents=True, exist_ok=True)
     return store, config, impl, review
 
 
@@ -644,6 +649,94 @@ def test_run_noop_improve_verify_then_review_creates_review_after_green_verify(t
     assert outcome.review_task is not None
     assert outcome.review_task.depends_on == impl.id
     assert "Fresh verify passed" in outcome.message
+
+
+def test_run_noop_improve_verify_then_review_persists_verify_evidence_before_clearing_verify_only_review(
+    tmp_path: Path,
+) -> None:
+    store, config, impl, review = _make_noop_verify_fixture(tmp_path)
+    review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: mypy error\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("fresh review should not run"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=SimpleNamespace(
+            default_branch=lambda: "main",
+            rev_parse_if_exists=lambda _ref: "cafebabe",
+            worktree_remove=lambda _path, force=True: None,
+        ),
+    )
+
+    captured_at = datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
+    with patch("gza.cli.advance_executor._create_detached_review_worktree"), patch(
+        "gza.cli.advance_executor.Git.rev_parse_if_exists",
+        return_value="deadbeef",
+    ), patch(
+        "gza.cli.advance_executor._run_review_verify_command",
+        return_value=ReviewVerifyResult(
+            command=config.verify_command,
+            status="passed",
+            exit_status="0",
+            captured_at=captured_at,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+        ),
+    ):
+        outcome = run_noop_improve_verify_then_review(
+            task=impl,
+            action={
+                "type": "verify_noop_improve_then_review",
+                "review_task": review,
+                "current_branch_head_sha": "deadbeef",
+            },
+            context=context,
+        )
+
+    assert outcome.status == "review_cleared"
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    assert refreshed_impl.review_cleared_at is not None
+    assert refreshed_impl.review_verify_status == "passed"
+    assert refreshed_impl.review_verify_branch == impl.branch
+    assert refreshed_impl.review_verify_head_sha == "deadbeef"
+    assert refreshed_impl.review_verify_captured_at == captured_at
+    assert refreshed_impl.review_verify_captured_at > review.completed_at
+    assert refreshed_impl.review_verify_artifact_file == f"logs/{impl.slug}.review-verify.json"
+
+    artifact_payload = json.loads(
+        (tmp_path / refreshed_impl.review_verify_artifact_file).read_text(encoding="utf-8")
+    )
+    assert artifact_payload["task_id"] == impl.id
+    assert artifact_payload["aggregate_result"]["status"] == "passed"
+    assert artifact_payload["aggregate_result"]["reviewed_branch"] == impl.branch
+    assert artifact_payload["aggregate_result"]["reviewed_head_sha"] == "deadbeef"
 
 
 def test_run_noop_improve_verify_then_review_parks_when_worktree_creation_fails(tmp_path: Path) -> None:

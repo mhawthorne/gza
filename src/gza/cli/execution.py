@@ -4270,6 +4270,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 final_stop_reason = "review_in_progress" if "already pending" in outcome.message else "needs_discussion"
                 print(f"  {outcome.message.removeprefix('SKIP: ')}")
                 break
+            if outcome.status == "review_cleared":
+                final_status = "merge_ready"
+                final_stop_reason = "verify_only_review_cleared"
+                print(f"  {outcome.message}")
+                break
             if outcome.status == "error" or outcome.review_task is None:
                 final_status = "blocked"
                 final_stop_reason = "review_failed"
