@@ -9701,6 +9701,155 @@ class TestIterateCommand:
         ) in output
         assert "Resuming failed implementation" not in output
 
+    def test_iterate_pending_resume_on_empty_branch_runs_provider_resume(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        pending = store.add("Pending resumed implementation", task_type="implement", recovery_origin="resume")
+        assert pending.id is not None
+        pending.status = "pending"
+        pending.session_id = "sess-pending-empty"
+        pending.branch = "test-project/20260605-pending-empty-resume"
+        store.update(pending)
+
+        unit = store.create_merge_unit(
+            source_branch=pending.branch,
+            target_branch="main",
+            owner_task_id=pending.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(pending.id, unit.id, "owner")
+
+        args = argparse.Namespace(
+            impl_task_id=pending.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.id == pending.id
+            assert resume is True
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "has no remaining commits to land" not in output
+        assert f"Running pending implementation {pending.id}..." in output
+        assert run_foreground.call_count >= 1
+        assert run_foreground.call_args_list[0].kwargs.get("resume") is True
+
+    def test_iterate_pending_resume_without_session_on_empty_branch_runs_fresh_attempt(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        pending = store.add("Pending resume without session", task_type="implement", recovery_origin="resume")
+        assert pending.id is not None
+        pending.status = "pending"
+        pending.branch = "test-project/20260605-pending-empty-retry"
+        store.update(pending)
+
+        unit = store.create_merge_unit(
+            source_branch=pending.branch,
+            target_branch="main",
+            owner_task_id=pending.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(pending.id, unit.id, "owner")
+
+        args = argparse.Namespace(
+            impl_task_id=pending.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            workers_path=tmp_path / ".gza" / "workers",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.id == pending.id
+            assert resume is False
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "has no remaining commits to land" not in output
+        assert f"Running pending implementation {pending.id}..." in output
+        assert run_foreground.call_count >= 1
+        assert "resume" not in run_foreground.call_args_list[0].kwargs
+
     def test_latest_review_needs_discussion_blocks(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch

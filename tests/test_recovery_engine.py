@@ -24,6 +24,7 @@ from gza.recovery_engine import (
     is_chain_resolved_by_recovery,
     is_resolved_by_merged_target,
     list_failed_tasks_for_recovery,
+    resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
 from tests.cli.conftest import make_store, setup_config
@@ -287,6 +288,33 @@ def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missi
 
     assert empty_task_requires_recovery(store, failed) is True
     assert decide_failed_task_recovery(store, failed, max_recovery_attempts=1).action == "resume"
+
+
+@pytest.mark.parametrize(
+    ("recovery_origin", "session_id", "expected"),
+    [
+        ("resume", "sess-pending", "resume"),
+        ("resume", None, "retry"),
+        ("retry", None, "retry"),
+        (None, "sess-pending", None),
+    ],
+)
+def test_resolve_pending_recovery_execution_mode(
+    tmp_path: Path,
+    recovery_origin: str | None,
+    session_id: str | None,
+    expected: str | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Pending recovery row", task_type="implement", recovery_origin=recovery_origin)
+    assert task.id is not None
+    task.status = "pending"
+    task.session_id = session_id
+    store.update(task)
+
+    assert resolve_pending_recovery_execution_mode(task) == expected
 
 
 def test_empty_task_requires_recovery_false_when_landed_representative_exists(tmp_path: Path) -> None:

@@ -312,6 +312,51 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
     assert spawn_worker.call_args.kwargs["startup_quiet"] is True
 
 
+def test_watch_cycle_pending_resume_row_on_empty_branch_preserves_resume_startup(tmp_path: Path) -> None:
+    """Pending resume rows in the general queue must launch iterate in resume mode even when empty."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending resumed implement", task_type="implement", recovery_origin="resume")
+    assert pending.id is not None
+    pending.status = "pending"
+    pending.session_id = "sess-watch-pending"
+    pending.branch = "feature/watch-pending-empty-resume"
+    store.update(pending)
+
+    unit = store.create_merge_unit(
+        source_branch=pending.branch,
+        target_branch="main",
+        owner_task_id=pending.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(pending.id, unit.id, "owner")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_args.args[2].id == pending.id
+    assert spawn_iterate.call_args.kwargs["prepared_task_id"] == pending.id
+    assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
+    assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
+
+
 def test_watch_cycle_pending_implement_startup_failure_surfaces_without_spawning_iterate(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

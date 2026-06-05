@@ -65,6 +65,7 @@ from ..recovery_engine import (
     empty_task_requires_recovery,
     get_failed_recovery_needs_attention_reason,
     get_manual_resume_override_descendant,
+    resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
 from ..review_verdict import get_review_report
@@ -203,6 +204,8 @@ def _format_iterate_terminal_merge_state_message(
         return None
 
     if merge_state == "empty":
+        if resolve_pending_recovery_execution_mode(iterate_task) is not None:
+            return None
         empty_recovery_state = _classify_empty_task_recovery_state(store, iterate_task, merge_state=merge_state)
         if empty_recovery_state == "requires_recovery":
             return None
@@ -3036,6 +3039,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if dry_run:
             return None, None
         if iterate_task.status == "pending":
+            pending_recovery_mode = resolve_pending_recovery_execution_mode(iterate_task)
             prepared_task = _prepare_task_for_immediate_execution(
                 config,
                 iterate_task,
@@ -3046,7 +3050,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return (
                 _PreparedIterateStart(
                     task=prepared_task,
-                    initial_resume=False,
+                    initial_resume=pending_recovery_mode == "resume",
                     phase="preloop",
                 ),
                 None,
@@ -3485,7 +3489,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return 0
 
         print(f"Running pending implementation {impl_task.id}...")
-        impl_task, rc, terminal_skip_decision = _run_task_with_recovery(impl_task)
+        pending_recovery_mode = resolve_pending_recovery_execution_mode(impl_task)
+        impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
+            impl_task,
+            initial_resume=pending_recovery_mode == "resume",
+        )
         if rc != 0:
             if terminal_skip_decision is not None:
                 exit_code = _print_failed_recovery_attention_and_return(

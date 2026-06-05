@@ -30,6 +30,7 @@ from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_act
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
+    resolve_pending_recovery_execution_mode,
     should_hide_failed_recovery_decision,
 )
 from ..source_followup import collect_non_dropped_implement_source_ids
@@ -2179,6 +2180,7 @@ def _run_cycle(
                     retry=False,
                     auto_iterate=True,
                 )
+                pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
                 prepared_pending_task = _prepare_task_for_immediate_execution(
                     config,
                     task,
@@ -2201,6 +2203,7 @@ def _run_cycle(
                         config,
                         task,
                         prepared_task_id=str(prepared_pending_task.id),
+                        prepared_resume=pending_recovery_mode == "resume",
                         prepared_phase="preloop",
                         startup_quiet=True,
                     ),

@@ -54,7 +54,11 @@ from ..pickup import (
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
 from ..rebase_publish import publish_rebased_branch
-from ..recovery_engine import list_failed_tasks_for_recovery, resolve_recovery_planning_task
+from ..recovery_engine import (
+    list_failed_tasks_for_recovery,
+    resolve_pending_recovery_execution_mode,
+    resolve_recovery_planning_task,
+)
 from ..review_verdict import get_review_report
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
@@ -800,6 +804,7 @@ def _spawn_prepared_background_iterate(
     auto_iterate: bool = False,
     quiet: bool = False,
 ) -> int:
+    pending_recovery_mode = resolve_pending_recovery_execution_mode(impl_task)
     prepared_task = _prepare_task_for_immediate_execution(
         config,
         impl_task,
@@ -815,6 +820,7 @@ def _spawn_prepared_background_iterate(
         auto_iterate=auto_iterate,
         quiet=quiet,
         prepared_task_id=prepared_task.id,
+        prepared_resume=pending_recovery_mode == "resume",
         prepared_phase="preloop",
     )
 

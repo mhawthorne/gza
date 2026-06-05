@@ -697,6 +697,7 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
                 "auto_iterate": kwargs.get("auto_iterate"),
                 "max_iterations": kwargs.get("max_iterations"),
                 "prepared_task_id": kwargs.get("prepared_task_id"),
+                "prepared_resume": kwargs.get("prepared_resume"),
                 "prepared_phase": kwargs.get("prepared_phase"),
             }
         )
@@ -717,6 +718,57 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
             "auto_iterate": True,
             "max_iterations": 3,
             "prepared_task_id": pending_impl.id,
+            "prepared_resume": False,
+            "prepared_phase": "preloop",
+        }
+    ]
+
+
+def test_advance_new_pending_resume_row_on_empty_branch_preserves_resume_startup(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending_impl = store.add("Implement queued resume task", task_type="implement", recovery_origin="resume")
+    assert pending_impl.id is not None
+    pending_impl.status = "pending"
+    pending_impl.session_id = "sess-advance-pending"
+    pending_impl.branch = "feature/advance-pending-empty-resume"
+    store.update(pending_impl)
+
+    unit = store.create_merge_unit(
+        source_branch=pending_impl.branch,
+        target_branch="main",
+        owner_task_id=pending_impl.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(pending_impl.id, unit.id, "owner")
+
+    iterate_calls: list[dict[str, object]] = []
+
+    def fake_spawn_iterate(_args, _config, impl_task, **kwargs):
+        iterate_calls.append(
+            {
+                "task_id": impl_task.id,
+                "prepared_task_id": kwargs.get("prepared_task_id"),
+                "prepared_resume": kwargs.get("prepared_resume"),
+                "prepared_phase": kwargs.get("prepared_phase"),
+            }
+        )
+        return 0
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.git_ops._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, batch=1, new=True))
+
+    assert rc == 0
+    assert iterate_calls == [
+        {
+            "task_id": pending_impl.id,
+            "prepared_task_id": pending_impl.id,
+            "prepared_resume": True,
             "prepared_phase": "preloop",
         }
     ]

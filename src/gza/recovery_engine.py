@@ -54,6 +54,7 @@ _DIRECT_CHILD_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
 )
 
 RecoveryAction = Literal["resume", "retry", "skip"]
+PendingRecoveryExecutionMode = Literal["resume", "retry"]
 RecoveryRole = Literal["original", "resume", "retry"]
 FailureCategory = Literal["timeout", "retryable", "manual"]
 PrerequisiteUnmergedReconciliation = Literal["dependency_not_ready", "moot_empty", "ordinary_failed"]
@@ -319,6 +320,17 @@ def empty_task_requires_recovery(
         )
         == "requires_recovery"
     )
+
+
+def resolve_pending_recovery_execution_mode(task: DbTask) -> PendingRecoveryExecutionMode | None:
+    """Return how an explicit pending recovery row must execute."""
+    if task.status != "pending":
+        return None
+    if task.recovery_origin == "resume":
+        return "resume" if task.session_id else "retry"
+    if task.recovery_origin == "retry":
+        return "retry"
+    return None
 
 
 def _task_is_complete_recovery_outcome(store: SqliteTaskStore, task: DbTask) -> bool:
