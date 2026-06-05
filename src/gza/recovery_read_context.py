@@ -40,6 +40,14 @@ class RecoveryReadContext:
             return None
         return self.merge_units_by_task_id.get(task_id)
 
+    def resolve_merge_unit_owner_task(self, merge_unit: MergeUnit | None) -> DbTask | None:
+        if merge_unit is None:
+            return None
+        owner = self.get_task(merge_unit.owner_task_id)
+        if owner is not None:
+            return owner
+        return None
+
     def get_based_on_children(self, task_id: str) -> tuple[DbTask, ...]:
         return tuple(self.based_on_children.get(task_id, ()))
 

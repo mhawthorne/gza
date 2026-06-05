@@ -241,9 +241,9 @@ def dependency_readiness(
     )
     merge_unit = merge_resolution.merge_unit
     merge_unit_owner = (
-        store.resolve_merge_unit_owner_task(merge_unit)
-        if merge_unit is not None
-        else None
+        read_context.resolve_merge_unit_owner_task(merge_unit)
+        if read_context is not None
+        else store.resolve_merge_unit_owner_task(merge_unit) if merge_unit is not None else None
     )
     blocking_merge_state = merge_unit.state if merge_unit is not None else resolved_dep.merge_status
     blocking_target_branch = merge_unit.target_branch if merge_unit is not None else store.default_merge_target()
