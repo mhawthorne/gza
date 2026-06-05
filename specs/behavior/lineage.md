@@ -159,7 +159,11 @@ It is the object L1/L2 ultimately resolve against.
 - Its **state** is `merged`, `unmerged`, or `empty`. `empty` means branch inspection
   proved **no unique commits** — a moot/no-op unit. `empty` MUST satisfy a dependency
   exactly as `merged` does (there is nothing to merge, so nothing to wait for), and MUST
-  NOT be re-reported as `unmerged`/blocking.
+  NOT be re-reported as `unmerged`/blocking. `empty` and `merged` are **distinct**: a branch that
+  is merely reachable from the target with no unique commits is `empty`, **never** `merged`/landed,
+  and MUST NOT be treated as a landed representative for failed-task recovery suppression (see
+  `recovery.md` R5 / `lifecycle-engine.md` §7). "Reachable from target" alone does not prove work
+  landed — only contributed commits do.
 - A unit MAY be **superseded** (e.g. on re-sync); resolution MUST consider only the active
   (non-superseded) unit.
 - Tasks attach many-to-one to a merge unit. The unit, not any single task, is the "needs

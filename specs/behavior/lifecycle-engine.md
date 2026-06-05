@@ -218,16 +218,22 @@ Failed tasks are evaluated by the same ordered engine, through one shared recove
   [recovery.md](recovery.md). A failed task with an `empty` merge unit but recoverable
   session-backed execution evidence MUST continue through recovery instead of being
   suppressed as moot.
-- A failed task whose work has *already landed* by another path (merged sibling in the
-  same lineage, branch reachable from target) MUST be omitted silently — there is nothing
-  to recover.
+- A failed task whose work has *already landed* by an independent valid path — a completed
+  recovery descendant, or a merged sibling/lineage member that actually contributed the commits —
+  MUST be omitted silently; there is nothing to recover. **Branch reachability from the target is
+  not, by itself, proof of landing.** A branch is a landed representative only if it contributed
+  **at least one commit that is now contained in the target**. A branch whose tip is merely an
+  ancestor of the target with **no unique commits is `empty`, not landed** — it represents the
+  absence of work, and MUST be routed through the shared empty-recovery predicate
+  ([recovery.md](recovery.md) §1), never silently omitted by this clause.
 
-For a failed `implement` with timeout-style failure and a resumable `session_id`, the
-engine MUST prefer the shared recovery decision (`resume`, bounded retry, or manual stop)
-before any merge-style suppression. The "already landed" exception only applies when the
-work landed by an independent valid path, such as a completed recovery descendant or a
-different merged lineage member. The same failed implementation task being marked merged
-must never satisfy that exception on its own.
+For any failed task with a recoverable failure — timeout-style resumable failures *and* retryable
+failures (e.g. `WORKER_DIED`) alike — the engine MUST prefer the shared recovery decision
+(`resume`, `retry`, bounded retry, or manual stop) **before any reachability- or merge-style
+suppression**. The "already landed" exception only applies when the work landed by an independent
+valid path, such as a completed recovery descendant or a different merged lineage member that
+contributed commits. The same failed task being reachable-from-target, marked merged, or `empty`
+on its own MUST never satisfy that exception.
 
 Recovery and lifecycle progress are independent: a unit that carries both a recovered
 failure *and* actionable merge/review work remains eligible for the latter.
