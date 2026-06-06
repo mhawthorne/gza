@@ -1727,21 +1727,6 @@ gza learnings update
 | `show` | Display the current learnings file |
 | `update` | Regenerate learnings from recent completed tasks |
 
-### refresh
-
-Refresh cached diff stats for unmerged tasks.
-
-```bash
-gza refresh [task_id] [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `task_id` | Full prefixed task ID to refresh (e.g. `gza-1234`; omit to refresh all unmerged tasks) |
-| `--include-failed` | Also refresh failed tasks that have branches |
-
-`gza refresh` only updates cached diff stats. It does not reconcile PR metadata or perform any GitHub cleanup.
-
 ### sync
 
 Explicitly reconcile branch-scoped task state across local git, fetched remote default-branch git state, and GitHub PR metadata.

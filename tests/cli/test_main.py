@@ -1009,6 +1009,16 @@ class TestCommandAliases:
         assert "invalid choice: 'import'" in result.stderr
         assert "add" in result.stderr
 
+    def test_refresh_command_is_rejected(self, tmp_path):
+        """Removed `refresh` command should now fail at parser validation."""
+        setup_config(tmp_path)
+
+        result = run_gza("refresh", "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "invalid choice: 'refresh'" in result.stderr
+        assert "sync" in result.stderr
+
     def test_iterate_dispatches_to_cmd_iterate(self, tmp_path):
         """`iterate` command should parse args and dispatch to cmd_iterate."""
         from gza.cli.main import main

@@ -1,4 +1,4 @@
-"""Git-related CLI commands: merge, rebase, checkout, diff, PR, refresh, advance."""
+"""Git-related CLI commands: merge, rebase, checkout, diff, PR, advance."""
 
 import argparse
 import logging
@@ -80,7 +80,6 @@ from ..sync_ops import (
     build_branch_cohorts_for_task_ids,
     build_default_branch_cohorts,
     reconcile_task_branch_merge_truth,
-    refresh_branch_diff_stats,
     sync_branch_cohorts,
 )
 from ..worktree_roots import managed_worktree_root_paths
@@ -882,55 +881,6 @@ def _collect_advance_completed_tasks(
         tasks = [t for t in tasks if t.task_type == 'implement']
 
     return tasks, impl_based_on_ids
-
-
-def cmd_refresh(args: argparse.Namespace) -> int:
-    """Refresh cached diff stats for one or all unmerged tasks."""
-    config = Config.load(args.project_dir)
-    store = get_store(config)
-    git = Git(config.project_dir)
-
-    if args.task_id is not None:
-        # Single task by ID
-        task_id = resolve_id(config, args.task_id)
-        task = store.get(task_id)
-        if task is None:
-            console.print(f"[red]Error: Task {task_id} not found[/red]")
-            return 1
-        tasks_to_refresh = [task]
-    else:
-        # All unmerged tasks (optionally including failed tasks with branches)
-        all_unmerged = store.get_unmerged()
-        tasks_to_refresh = [t for t in all_unmerged if t.status == "completed"]
-        if getattr(args, 'include_failed', False):
-            all_tasks = store.get_history(limit=None, status='failed')
-            for t in all_tasks:
-                if t.branch and t not in tasks_to_refresh:
-                    tasks_to_refresh.append(t)
-
-    results, skipped = refresh_branch_diff_stats(store, git, tasks_to_refresh)
-    refreshed = 0
-    for result in results:
-        if result.skipped_reason is not None:
-            task_id = result.task_ids[0] if result.task_ids else "<unknown>"
-            if result.skipped_reason == "no branch":
-                console.print(f"[dim]{task_id}: no branch, skipping[/dim]")
-            elif result.skipped_reason == "branch no longer exists":
-                console.print(f"[dim]{task_id} {result.branch}: branch no longer exists, skipping[/dim]")
-            else:
-                console.print(f"[dim]{task_id}: {result.skipped_reason}, skipping[/dim]")
-            continue
-        refreshed += 1
-        task_label = ",".join(result.task_ids) if result.task_ids else result.branch
-        console.print(
-            f"{task_label} {result.branch}: +{result.diff_lines_added} -{result.diff_lines_removed} "
-            f"in {result.diff_files_changed} files"
-        )
-        if result.warnings:
-            console.print(f"[yellow]Warning:[/yellow] {'; '.join(result.warnings)}")
-
-    print(f"\nRefreshed {refreshed} task(s), skipped {skipped}.")
-    return 0
 
 
 def _require_default_branch(

@@ -153,7 +153,6 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `plan_task_id` | Full prefixed completed plan task ID to implement",
         "| `task_id` | Specific full prefixed task ID to advance",
         "| `impl_task_id` | Full prefixed implementation task ID to iterate",
-        "| `task_id` | Full prefixed task ID to refresh",
         "| `task_id` | Full prefixed task ID(s) whose branch cohorts should be synced",
         "`task_id` must be a full prefixed task ID (for example `gza-1234`).",
     ]

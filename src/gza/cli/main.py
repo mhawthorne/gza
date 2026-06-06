@@ -73,7 +73,6 @@ from .git_ops import (
     cmd_merge,
     cmd_pr,
     cmd_rebase,
-    cmd_refresh,
     cmd_sync,
 )
 from .log import cmd_log
@@ -958,24 +957,6 @@ def main() -> int:
     queue_clear.add_argument("task_id", type=str, help="Full prefixed task ID to clear")
     add_common_args(queue_clear)
     _add_queue_tag_scope_args(queue_clear, action="clearing queue order")
-
-    # refresh command
-    refresh_parser = subparsers.add_parser("refresh", help="Refresh cached diff stats for unmerged tasks")
-    add_common_args(refresh_parser)
-    refresh_group = refresh_parser.add_mutually_exclusive_group()
-    refresh_group.add_argument(
-        "task_id",
-        type=str,
-        nargs="?",
-        metavar="task_id",
-        help="Full prefixed task ID to refresh (omit to refresh all unmerged tasks)",
-    )
-    refresh_group.add_argument(
-        "--include-failed",
-        action="store_true",
-        dest="include_failed",
-        help="Also refresh failed tasks that have branches (cannot be used with task_id)",
-    )
 
     # sync command
     sync_parser = subparsers.add_parser(
@@ -2663,8 +2644,6 @@ def main() -> int:
             return cmd_watch(args)
         elif args.command == "queue":
             return cmd_queue(args)
-        elif args.command == "refresh":
-            return cmd_refresh(args)
         elif args.command == "sync":
             return cmd_sync(args)
         elif args.command == "merge":
