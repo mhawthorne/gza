@@ -661,8 +661,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
         assert not line.lstrip().startswith("$ gza ")
 
 
-def test_watch_attention_docs_describe_sticky_manual_attention_behavior() -> None:
-    """Watch docs should describe sticky ATTENTION reminders for manual advance outcomes."""
+def test_watch_attention_docs_describe_changed_only_inline_attention_behavior() -> None:
+    """Watch docs should describe changed-only inline ATTENTION plus full roundups."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"
     config_content = (docs_root / "configuration.md").read_text()
     internal_content = (docs_root / "internal" / "advance-workflow.md").read_text()
@@ -670,11 +670,16 @@ def test_watch_attention_docs_describe_sticky_manual_attention_behavior() -> Non
     watch_section = config_content.split("### watch", 1)[1].split("### learnings", 1)[0]
 
     assert "surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines" in watch_section
+    assert "Inline `ATTENTION` is emitted only when an attention row is newly visible" in watch_section
+    assert "Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set" in watch_section
+    assert "Guarded pending routing skips use the same centralized attention path on the first observed guarded skip" in watch_section
     assert "watch does not re-select them for a fresh iterate worker in the meantime" in watch_section
     assert "Ordinary wait/skip states keep the existing `SKIP` dedupe behavior." in watch_section
-    assert "sticky `ATTENTION` log lines instead of deduped `SKIP` lines" in internal_content
+    assert "Inline `ATTENTION` appears only when an attention key is newly visible" in internal_content
+    assert "Each watch pass that emits visible attention also prints a counted `Needs attention (...)` section with the same formatted task rows for the full current visible set" in internal_content
+    assert "Guarded-pending routing skips are promoted through the same centralized attention path on the first observed guarded skip" in internal_content
     assert "watch reuses that parked action instead of recomputing a fresh lifecycle step" in internal_content
-    assert "Ordinary watch skip/wait lines remain deduped across cycles." in internal_content
+    assert "Ordinary watch skip/wait lines remain deduped across passes." in internal_content
 
 
 def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy() -> None:

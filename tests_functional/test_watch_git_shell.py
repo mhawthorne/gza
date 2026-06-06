@@ -1,9 +1,16 @@
 """Functional tests for watch flows that require a real git repo."""
 
+from datetime import UTC, datetime
+from unittest.mock import patch
+
+import pytest
+
+from gza.cli.watch import _run_cycle, _WatchLog
 from gza.cli.git_ops import _execute_merge_action
 from gza.config import Config
+from tests.cli.conftest import make_store, setup_config
 
-from tests_functional.git_helpers import setup_git_repo_with_task_branch
+from tests_functional.git_helpers import init_basic_repo, setup_git_repo_with_task_branch
 
 
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) -> None:
@@ -34,3 +41,86 @@ def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) 
     refreshed_task = store.get(task.id)
     assert refreshed_task is not None
     assert refreshed_task.merge_status == "merged"
+
+
+@pytest.mark.functional
+def test_watch_cycle_real_git_dedupes_attention_and_emits_single_task_scoped_repair(tmp_path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "advance_create_reviews: false\n")
+    store = make_store(tmp_path)
+    git = init_basic_repo(tmp_path)
+
+    diverged = store.add("Diverged implementation", task_type="implement")
+    assert diverged.id is not None
+    diverged.status = "completed"
+    diverged.completed_at = datetime.now(UTC)
+    diverged.branch = "feature/diverged-watch"
+    diverged.has_commits = True
+    diverged.merge_status = "unmerged"
+    store.update(diverged)
+
+    attention = store.add("Awaiting review creation", task_type="implement")
+    assert attention.id is not None
+    attention.status = "completed"
+    attention.completed_at = datetime.now(UTC)
+    attention.branch = "feature/manual-review-watch"
+    attention.has_commits = True
+    attention.merge_status = "unmerged"
+    store.update(attention)
+
+    git._run("checkout", "-b", attention.branch)
+    (tmp_path / "manual-review.txt").write_text("manual review branch\n")
+    git._run("add", "manual-review.txt")
+    git._run("commit", "-m", "Manual review branch")
+    git._run("checkout", "main")
+
+    git._run("checkout", "-b", diverged.branch)
+    base_sha = git._run("rev-parse", "HEAD").stdout.strip()
+    (tmp_path / "local-diverged.txt").write_text("local only\n")
+    git._run("add", "local-diverged.txt")
+    git._run("commit", "-m", "Local diverged commit")
+    git._run("checkout", "-B", "tmp-diverged-remote", base_sha)
+    (tmp_path / "remote-diverged.txt").write_text("remote only\n")
+    git._run("add", "remote-diverged.txt")
+    git._run("commit", "-m", "Remote diverged commit")
+    remote_sha = git._run("rev-parse", "HEAD").stdout.strip()
+    git._run("update-ref", f"refs/remotes/origin/{diverged.branch}", remote_sha)
+    git._run("checkout", "main")
+    git._run("branch", "-D", "tmp-diverged-remote")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    text = log_path.read_text()
+    manual_attention_lines = [
+        line
+        for line in text.splitlines()
+        if attention.id in line and "reason=review-needs-manual-creation" in line
+    ]
+    assert len(manual_attention_lines) == 2
+    assert sum(" ATTENTION " in line for line in manual_attention_lines) == 1
+    assert "Needs attention (1 task):" in text
+    assert "Could not resolve freshest merge source" not in text
+    repair_lines = [
+        line
+        for line in text.splitlines()
+        if " REPAIR " in line and diverged.id in line and diverged.branch in line
+    ]
+    assert len(repair_lines) == 1

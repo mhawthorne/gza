@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -102,6 +102,7 @@ class PostMergeRebaseState:
     reason: str | None
     warning: str | None = None
     rebase_target_missing_merge_unit: bool = False
+    resolved_merge_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -506,6 +507,7 @@ def _resolve_and_persist_post_merge_rebase_state(
         git=git,
         target_branch=target_branch,
     )
+    state = replace(state, resolved_merge_state=resolved_merge_state)
     if (
         (
             (state.reason == "branch-tip-equals-target-tip" and state.already_merged)
@@ -2104,11 +2106,15 @@ def resolve_advance_context(
             target_branch,
             merge_source=merge_source,
         )
-    merge_state = resolve_task_merge_state_for_target(
-        store=store,
-        task=task,
-        git=git,
-        target_branch=target_branch,
+    merge_state = (
+        post_merge_rebase_state.resolved_merge_state
+        if persist_post_merge_rebase_state
+        else resolve_task_merge_state_for_target(
+            store=store,
+            task=task,
+            git=git,
+            target_branch=target_branch,
+        )
     )
     branch_tip_resolution = (
         BranchTipResolution(None)

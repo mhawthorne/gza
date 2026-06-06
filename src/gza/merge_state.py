@@ -351,13 +351,6 @@ def resolve_task_merge_state_for_target(
     resolved_merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
     merge_source = resolve_task_merge_source(git, task.branch) if task.branch else ResolvedMergeSourceRef(None)
     source_merge_ref = merge_source.ref
-    if merge_source.warning:
-        logger.warning(
-            "Could not resolve freshest merge source for branch %r against %r: %s",
-            task.branch,
-            target_branch,
-            merge_source.warning,
-        )
 
     merged_proof = False
     is_merged = getattr(git, "is_merged", None)

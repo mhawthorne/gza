@@ -16,12 +16,14 @@ class _FakeGit:
         self,
         *,
         source_ref: str | None = None,
+        merge_source_warning: str | None = None,
         ref_shas: dict[str, str | None] | None = None,
         ahead_count: int | None = None,
         merged: bool = False,
         on_first_parent: bool = True,
     ) -> None:
         self._source_ref = source_ref
+        self._merge_source_warning = merge_source_warning
         self._ref_shas = ref_shas or {}
         self._ahead_count = ahead_count
         self._merged = merged
@@ -30,7 +32,7 @@ class _FakeGit:
     def resolve_fresh_merge_source(self, _branch: str):
         from gza.git import ResolvedMergeSourceRef
 
-        return ResolvedMergeSourceRef(self._source_ref)
+        return ResolvedMergeSourceRef(self._source_ref, self._merge_source_warning)
 
     def rev_parse_if_exists(self, ref: str) -> str | None:
         return self._ref_shas.get(ref)
@@ -238,6 +240,39 @@ def test_resolve_task_merge_state_falls_back_to_persisted_empty_when_source_ref_
     )
 
     assert state == "empty"
+
+
+def test_resolve_task_merge_state_does_not_log_merge_source_warning_side_effect(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Diverged branch", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.has_commits = True
+    task.branch = "feature/diverged"
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    warning = "Could not resolve freshest merge source for branch 'feature/diverged' against 'main': local/origin diverged"
+
+    with caplog.at_level("WARNING"):
+        state = resolve_task_merge_state_for_target(
+            store=store,
+            task=task,
+            git=_FakeGit(
+                source_ref="origin/feature/diverged",
+                merge_source_warning=warning,
+                ref_shas={"origin/feature/diverged": "branch-sha", "main": "target-sha"},
+                ahead_count=1,
+                merged=False,
+            ),
+            target_branch="main",
+        )
+
+    assert state == "unmerged"
+    assert warning not in caplog.text
 
 
 def test_classify_branch_merge_state_returns_unknown_without_persisted_state_for_missing_ref() -> None:

@@ -29,6 +29,7 @@ from gza.cli.watch import (
     _compute_failure_backoff_seconds,
     _count_live_workers,
     _CycleResult,
+    _emit_cycle_attention_summary,
     _emit_transition_events,
     _format_elapsed,
     _format_wake_message,
@@ -6159,7 +6160,8 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
         )
 
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 2
+    assert text.count("ATTENTION") == 1
+    assert text.count("Needs attention (1 task):") == 2
     assert str(impl.id) in text
     assert "SKIP" not in text
 
@@ -7656,11 +7658,11 @@ def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> N
     assert text.count("ATTENTION") == 0
 
 
-def test_watch_cycle_escalates_recurring_guarded_pending_skip_to_attention(
+def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_only(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A repeated guarded pending skip should surface as attention on the second pass."""
+    """Guarded pending attention should emit inline once, then stay in the roundup until it changes."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -7698,8 +7700,8 @@ def test_watch_cycle_escalates_recurring_guarded_pending_skip_to_attention(
     ):
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
         first_pass = log_path.read_text()
-        assert "ATTENTION" not in first_pass
-        assert "Needs attention (1 task):" not in first_pass
+        assert "ATTENTION" in first_pass
+        assert "Needs attention (1 task):" in first_pass
         assert "SKIP" in first_pass
 
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
@@ -7712,16 +7714,16 @@ def test_watch_cycle_escalates_recurring_guarded_pending_skip_to_attention(
         f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
         f'{exec_result.message}; will not run automatically'
     ) in attention_lines[0]
-    assert "Needs attention (1 task):" in text
+    assert text.count("Needs attention (1 task):") == 2
     assert "Summary:" not in text
     assert (
         text.count(
             f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
             f'{exec_result.message}; will not run automatically'
         )
-        == 2
+        == 3
     )
-    assert "Needs attention (1 task):" in stdout
+    assert stdout.count("Needs attention (1 task):") == 2
     assert text.count("SKIP") == 1
 
 
@@ -7749,6 +7751,47 @@ def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pyt
         "\n"
         "18:13:47 WAKE      checking... (1 running, 0 pending, 0 slots)\n"
     )
+
+
+def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps_roundups(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with patch(
+        "gza.cli.watch._format_hms",
+        side_effect=[
+            "18:08:47",
+            "18:08:48",
+            "18:13:47",
+            "18:18:47",
+            "18:18:48",
+        ],
+    ):
+        log.begin_cycle()
+        log.emit_attention(attention_key="task-1", message="gza-1 review needs manual attention")
+        _emit_cycle_attention_summary(log)
+        log.end_cycle()
+
+        log.begin_cycle()
+        log.emit_attention(attention_key="task-1", message="gza-1 review needs manual attention")
+        _emit_cycle_attention_summary(log)
+        log.end_cycle()
+
+        log.begin_cycle()
+        log.emit_attention(attention_key="task-1", message="gza-1 review still needs manual attention")
+        _emit_cycle_attention_summary(log)
+        log.end_cycle()
+
+    text = log_path.read_text()
+    attention_lines = [line for line in text.splitlines() if " ATTENTION " in line]
+    assert len(attention_lines) == 2
+    assert attention_lines[0].startswith("18:08:47 ATTENTION")
+    assert attention_lines[1].startswith("18:18:47 ATTENTION")
+    assert text.count("INFO      Needs attention (1 task):") == 3
+    assert text.count("  gza-1 review needs manual attention") == 2
+    assert text.count("  gza-1 review still needs manual attention") == 1
 
 
 def test_installed_gza_package_fingerprint_changes_only_when_python_source_changes(tmp_path: Path) -> None:

@@ -222,11 +222,10 @@ def _maybe_emit_recurring_guarded_pending_skip_attention(
         guard_message=guard_message,
     )
     attention_key = f"guarded-pending-skip:{pending_task.id}"
-    attention_message = _watch_needs_attention_message(pending_task, attention)
-    if log._sticky_attention_prev_cycle.get(attention_key) == attention_message:
-        log.emit_attention(attention_key=attention_key, message=attention_message)
-        return
-    log._sticky_attention_this_cycle[attention_key] = attention_message
+    log.emit_attention(
+        attention_key=attention_key,
+        message=_watch_needs_attention_message(pending_task, attention),
+    )
 
 
 def _watch_parked_lineage_action(row: LineageOwnerRow) -> dict[str, Any] | None:
@@ -839,11 +838,13 @@ class _WatchLog:
         self._sticky_attention_prev_cycle = dict(self._sticky_attention_this_cycle)
 
     def emit_attention(self, *, attention_key: str, message: str) -> None:
+        self._visible_attention_this_cycle[attention_key] = message
         previous_message = self._sticky_attention_this_cycle.get(attention_key)
         if previous_message == message:
             return
         self._sticky_attention_this_cycle[attention_key] = message
-        self._visible_attention_this_cycle[attention_key] = message
+        if self._sticky_attention_prev_cycle.get(attention_key) == message:
+            return
         self.emit("ATTENTION", message)
 
     def visible_attention_messages(self) -> tuple[str, ...]:
@@ -1833,8 +1834,9 @@ def _run_cycle(
                 if guarded_pending_task_id is not None:
                     step1_handled_child_task_ids.add(str(guarded_pending_task_id))
                 if not exec_result.attempted_spawn and display_task.id is not None:
+                    event = "REPAIR" if action_type == "reconcile_branch_divergence" else "ERROR"
                     log.emit(
-                        "ERROR",
+                        event,
                         f"{display_task.id}: {exec_result.message}",
                         dedupe_key=f"advance-worker-error:{action_type}:{display_task.id}:{exec_result.message}",
                     )

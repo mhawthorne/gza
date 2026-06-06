@@ -4961,6 +4961,50 @@ def test_resolve_subject_task_warns_before_falling_back_for_missing_or_unusable_
     assert expected_warning in caplog.text
 
 
+def test_resolve_advance_context_reuses_persisted_merge_state_resolution(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.merge_state import resolve_task_merge_state_for_target as original_resolve_merge_state
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/reuse-merge-state",
+        when=datetime(2026, 5, 18, 9, 0, tzinfo=UTC),
+    )
+
+    warning = (
+        "Could not resolve freshest merge source for branch 'feature/reuse-merge-state' "
+        "against 'main': local/origin diverged"
+    )
+    git = _FakeGit(
+        can_merge=False,
+        existing_branches={impl.branch},
+        existing_refs={f"origin/{impl.branch}"},
+        ref_shas={f"origin/{impl.branch}": "branch-tip", "main": "target-tip"},
+        merge_source_result=(f"origin/{impl.branch}", warning),
+        ahead_count=1,
+    )
+    calls: list[str] = []
+
+    def spy_resolve_merge_state(*args, **kwargs):
+        task = kwargs.get("task") if "task" in kwargs else args[1]
+        calls.append(task.id)
+        return original_resolve_merge_state(*args, **kwargs)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_task_merge_state_for_target",
+        spy_resolve_merge_state,
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+
+    assert calls == [impl.id]
+    assert ctx.merge_state == "unmerged"
+    assert ctx.merge_source_warning == warning
+
+
 def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     impl = store.add("Implement feature", task_type="implement")
