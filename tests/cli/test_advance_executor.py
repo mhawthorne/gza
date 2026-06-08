@@ -728,15 +728,18 @@ def test_run_noop_improve_verify_then_review_persists_verify_evidence_before_cle
     assert refreshed_impl.review_verify_head_sha == "deadbeef"
     assert refreshed_impl.review_verify_captured_at == captured_at
     assert refreshed_impl.review_verify_captured_at > review.completed_at
-    assert refreshed_impl.review_verify_artifact_file == f"logs/{impl.slug}.review-verify.json"
-
-    artifact_payload = json.loads(
-        (tmp_path / refreshed_impl.review_verify_artifact_file).read_text(encoding="utf-8")
-    )
-    assert artifact_payload["task_id"] == impl.id
-    assert artifact_payload["aggregate_result"]["status"] == "passed"
-    assert artifact_payload["aggregate_result"]["reviewed_branch"] == impl.branch
-    assert artifact_payload["aggregate_result"]["reviewed_head_sha"] == "deadbeef"
+    assert refreshed_impl.review_verify_artifact_file is None
+    artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
+    assert len(artifacts) == 1
+    assert artifacts[0].producer == "noop_review_verify"
+    assert artifacts[0].status == "passed"
+    assert artifacts[0].metadata == {
+        "reviewed_base_sha": "cafebabe",
+        "reviewed_branch": impl.branch,
+        "reviewed_head_sha": "deadbeef",
+        "triggering_review_task_id": review.id,
+        "working_directory": None,
+    }
 
 
 def test_run_noop_improve_verify_then_review_parks_when_worktree_creation_fails(tmp_path: Path) -> None:

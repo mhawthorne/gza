@@ -10,6 +10,7 @@ gza.local.yaml
 
 # Gza runtime data
 .gza
+.gza/artifacts/
 
 # Claude Code local skills (removed from git, kept locally)
 .claude

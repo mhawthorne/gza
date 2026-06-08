@@ -22,6 +22,7 @@ from rich.markup import escape as rich_escape
 
 import gza.colors as _colors
 
+from ..artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from ..colors import PS_STATUS_COLORS, SHOW_COLORS_DICT
 from ..config import Config
 from ..console import (
@@ -36,6 +37,7 @@ from ..db import (
     MergeUnit,
     SqliteTaskStore,
     Task as DbTask,
+    TaskArtifact,
     _is_readonly_snapshot_operational_error,
     task_id_numeric_key as _task_id_numeric_key,
     task_owns_merge_status,
@@ -195,6 +197,81 @@ _SHOW_STATUS_COLOR_KEYS: dict[str, str] = {
     "unmerged": "status_pending",
     "dropped": "status_failed",
 }
+
+
+@dataclass(frozen=True)
+class _ResolvedTaskArtifact:
+    """Resolved latest-artifact metadata for read-only operator surfaces."""
+
+    artifact: TaskArtifact
+    path: Path | None
+    invalid_path_error: str | None = None
+
+    def retrieval_error(self, *, task_id: str) -> str | None:
+        if self.invalid_path_error is not None:
+            return (
+                f"Artifact {self.artifact.id} for task {task_id} has an invalid stored path: "
+                f"{self.invalid_path_error}"
+            )
+        if self.artifact.byte_size == 0:
+            return f"Latest artifact {self.artifact.id} for task {task_id} has no content file"
+        if self.path is None or not self.path.exists():
+            return (
+                f"Artifact {self.artifact.id} for task {task_id} is missing on disk: "
+                f"{self.artifact.path}"
+            )
+        return None
+
+
+def _format_task_artifact_summary(artifact: TaskArtifact, *, config: Config) -> str:
+    """Render one compact artifact metadata line for operator surfaces."""
+    created_text = artifact.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    detail_parts = [artifact.kind]
+    if artifact.status:
+        detail_parts.append(artifact.status)
+    if artifact.exit_status:
+        detail_parts.append(f"exit={artifact.exit_status}")
+    detail_parts.append(f"created={created_text}")
+    detail_parts.append(f"path={artifact.path}")
+    try:
+        resolved_path = resolve_artifact_path(config.project_dir, artifact.path)
+    except InvalidArtifactPathError:
+        detail_parts.append("invalid-path")
+    else:
+        if not resolved_path.exists():
+            detail_parts.append("missing")
+    return " ".join(detail_parts)
+
+
+def _latest_task_artifact(
+    store: SqliteTaskStore,
+    task_id: str,
+    *,
+    kind: str | None = None,
+) -> TaskArtifact | None:
+    """Return the newest matching artifact row for one task."""
+    artifacts = store.list_artifacts(task_id, kind=kind)
+    if not artifacts:
+        return None
+    return artifacts[0]
+
+
+def _resolve_latest_task_artifact(
+    store: SqliteTaskStore,
+    config: Config,
+    task_id: str,
+    *,
+    kind: str | None = None,
+) -> _ResolvedTaskArtifact | None:
+    """Resolve the newest matching artifact row and any managed on-disk path."""
+    artifact = _latest_task_artifact(store, task_id, kind=kind)
+    if artifact is None:
+        return None
+    try:
+        artifact_path = resolve_artifact_path(config.project_dir, artifact.path)
+    except InvalidArtifactPathError as exc:
+        return _ResolvedTaskArtifact(artifact=artifact, path=None, invalid_path_error=str(exc))
+    return _ResolvedTaskArtifact(artifact=artifact, path=artifact_path)
 
 
 def _show_status_color(task: DbTask, colors: dict[str, str]) -> str:
@@ -3433,6 +3510,43 @@ def cmd_show(args: argparse.Namespace) -> int:
         return _cmd_show_output(task, args, config, store)
 
 
+def cmd_artifact(args: argparse.Namespace) -> int:
+    """Print the latest matching task artifact content or path."""
+    config = Config.load(args.project_dir)
+    store = get_store(config, open_mode="query_only")
+
+    task_id = resolve_id(config, args.task_id)
+    task = store.get(task_id)
+    if task is None:
+        console.print(f"[red]Error: Task {task_id} not found[/red]")
+        return 1
+
+    resolved = _resolve_latest_task_artifact(store, config, task_id, kind=getattr(args, "kind", None))
+    if resolved is None:
+        kind_note = f" of kind {args.kind}" if getattr(args, "kind", None) else ""
+        console.print(f"[red]Error: Task {task_id} has no artifacts{kind_note}[/red]")
+        return 1
+
+    retrieval_error = resolved.retrieval_error(task_id=task_id)
+    if retrieval_error is not None:
+        console.print(f"[red]Error: {retrieval_error}[/red]")
+        return 1
+
+    if getattr(args, "path", False):
+        print(resolved.path)
+        return 0
+
+    if resolved.path is None:
+        return 1
+
+    try:
+        print(resolved.path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        console.print(f"[red]Error: Failed to read artifact {resolved.artifact.id}: {exc}[/red]")
+        return 1
+    return 0
+
+
 def _show_incompatible_flags(args: argparse.Namespace) -> list[str]:
     """Return incompatible flags when --metadata-only is combined with other show modes."""
     if not getattr(args, "metadata_only", False):
@@ -3575,6 +3689,11 @@ def _cmd_show_output(
                 file_mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=UTC)
                 if file_mtime > task.completed_at:
                     console.print("[yellow]Warning: Report on disk has been modified since task completion[/yellow]")
+    task_artifacts = store.list_artifacts(task.id) if task.id is not None else []
+    if task_artifacts:
+        console.print(f"[{c['label']}]Artifacts:[/{c['label']}]")
+        for artifact in task_artifacts:
+            console.print(f"  - [{c['value']}]{_format_task_artifact_summary(artifact, config=config)}[/{c['value']}]")
     if task.task_type == "review":
         verdict = get_review_verdict(config, task)
         if verdict:
@@ -3584,7 +3703,12 @@ def _cmd_show_output(
             score = get_review_score(config, task)
         if score is not None:
             console.print(f"[{c['label']}]Score:[/{c['label']}] [{c['value']}]{score}/100[/{c['value']}]")
-        if task.review_verify_status or task.review_verify_markdown or task.review_verify_artifact_file:
+        latest_verify_artifact = (
+            _resolve_latest_task_artifact(store, config, task.id, kind="verify_command_output")
+            if task.id is not None
+            else None
+        )
+        if task.review_verify_status or task.review_verify_markdown or task.review_verify_artifact_file or latest_verify_artifact:
             console.print(
                 f"[{c['label']}]Review Verify Status:[/{c['label']}] "
                 f"[{c['value']}]{task.review_verify_status or 'unknown'}[/{c['value']}]"
@@ -3619,10 +3743,24 @@ def _cmd_show_output(
                     f"[{c['label']}]Review Verify Cwd:[/{c['label']}] "
                     f"[{c['value']}]{task.review_verify_cwd}[/{c['value']}]"
                 )
-            if task.review_verify_artifact_file:
+            verify_artifact_path = (
+                latest_verify_artifact.artifact.path if latest_verify_artifact is not None else task.review_verify_artifact_file
+            )
+            if verify_artifact_path:
+                verify_artifact_text = verify_artifact_path
+                if latest_verify_artifact is not None and latest_verify_artifact.invalid_path_error is not None:
+                    verify_artifact_text = f"{verify_artifact_text} (invalid path)"
+                else:
+                    try:
+                        resolved_verify_artifact = resolve_artifact_path(config.project_dir, verify_artifact_path)
+                    except InvalidArtifactPathError:
+                        verify_artifact_text = f"{verify_artifact_text} (invalid path)"
+                    else:
+                        if not resolved_verify_artifact.exists():
+                            verify_artifact_text = f"{verify_artifact_text} (missing)"
                 console.print(
                     f"[{c['label']}]Review Verify Artifact:[/{c['label']}] "
-                    f"[{c['value']}]{task.review_verify_artifact_file}[/{c['value']}]"
+                    f"[{c['value']}]{verify_artifact_text}[/{c['value']}]"
                 )
             if task.review_verify_failure:
                 console.print(

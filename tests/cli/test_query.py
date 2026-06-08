@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.text import Text
 
 import gza.colors as colors
+from gza.artifacts import store_command_output_artifact
 from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
@@ -3793,7 +3794,6 @@ class TestShowCommand:
         task.review_verify_head_sha = "deadbeef"
         task.review_verify_base_sha = "cafebabe"
         task.review_verify_cwd = "/tmp/worktrees/20260605-review-feature-review"
-        task.review_verify_artifact_file = "logs/20260605-review-feature.review-verify.json"
         task.review_verify_markdown = (
             "## verify_command result\n\n"
             "- Command: `./bin/tests`\n"
@@ -3804,6 +3804,27 @@ class TestShowCommand:
             "Failing output (trimmed):\n"
             "```text\nmypy failed\n```"
         )
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="mypy failed\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            head_sha="deadbeef",
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": task.review_verify_cwd,
+            },
+        )
+        task.review_verify_artifact_file = stored.path
         store.update(task)
 
         result = run_gza("show", str(task.id), "--project", str(tmp_path))
@@ -3817,9 +3838,209 @@ class TestShowCommand:
         assert "Review Verify Base:" in result.stdout
         assert "Review Verify Cwd:" in result.stdout
         assert "Review Verify Artifact:" in result.stdout
+        assert "Artifacts:" in result.stdout
+        assert stored.path in result.stdout
         assert "Review Verify Result:" in result.stdout
         assert "## verify_command result" in result.stdout
         assert "mypy failed" in result.stdout
+
+    def test_show_metadata_only_marks_missing_artifacts(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with missing artifact", task_type="review")
+        task.status = "completed"
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="full output\n",
+            status="failed",
+            exit_status="1",
+        )
+        (tmp_path / stored.path).unlink()
+
+        result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Artifacts:" in result.stdout
+        assert stored.path in result.stdout
+        assert "missing" in result.stdout
+
+    def test_artifact_command_prints_latest_content_and_path(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with artifacts", task_type="review")
+        store.update(task)
+        config = Config.load(tmp_path)
+        older = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="older output\n",
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        newer = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="newer output\n",
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+
+        content_result = run_gza("artifact", str(task.id), "--project", str(tmp_path))
+        path_result = run_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
+
+        assert content_result.returncode == 0
+        assert content_result.stdout == "newer output\n\n"
+        assert path_result.returncode == 0
+        assert path_result.stdout.strip() == str(tmp_path / newer.path)
+
+    def test_artifact_command_does_not_fall_back_to_older_content_when_latest_row_is_metadata_only(
+        self, tmp_path: Path
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with mixed verify artifacts", task_type="review")
+        task.status = "completed"
+        store.update(task)
+        config = Config.load(tmp_path)
+        older = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="older output\n",
+            status="failed",
+            exit_status="1",
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        newer = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output=None,
+            status="unavailable",
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        task.review_verify_artifact_file = newer.path
+        store.update(task)
+
+        content_result = run_gza("artifact", str(task.id), "--project", str(tmp_path))
+        path_result = run_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
+        show_result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+
+        assert content_result.returncode == 1
+        assert "has no content file" in content_result.stdout
+        assert "older output" not in content_result.stdout
+
+        assert path_result.returncode == 1
+        assert "has no content file" in path_result.stdout
+        assert str(tmp_path / newer.path) not in path_result.stdout
+
+        assert show_result.returncode == 0
+        assert f"Review Verify Artifact:" in show_result.stdout
+        assert newer.path in show_result.stdout
+        assert older.path in show_result.stdout
+
+    def test_artifact_command_path_fails_when_latest_content_file_is_missing(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with missing latest artifact file", task_type="review")
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="verify output\n",
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        (tmp_path / stored.path).unlink()
+
+        content_result = run_gza("artifact", str(task.id), "--project", str(tmp_path))
+        path_result = run_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
+
+        assert content_result.returncode == 1
+        assert f"missing on disk: {stored.path}" in content_result.stdout
+
+        assert path_result.returncode == 1
+        assert f"missing on disk: {stored.path}" in path_result.stdout
+
+    def test_show_metadata_only_lists_skipped_cross_project_metadata_only_artifact(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Cross-project review with skipped verify artifact", task_type="review")
+        task.status = "completed"
+        store.update(task)
+        config = Config.load(tmp_path)
+        older = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="services/foo passed\n",
+            status="passed",
+            exit_status="0",
+            scope="services/foo",
+            metadata={
+                "scope": "services/foo",
+                "working_directory": "services/foo",
+                "skip_reason": None,
+            },
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        newer = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output=None,
+            status="skipped",
+            exit_status="skipped",
+            scope="unknown paths",
+            metadata={
+                "scope": "unknown paths",
+                "working_directory": "unknown paths",
+                "skip_reason": "affected paths fell outside all discovered project roots",
+            },
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        task.review_verify_artifact_file = older.path
+        store.update(task)
+
+        result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Artifacts:" in result.stdout
+        assert older.path in result.stdout
+        assert newer.path in result.stdout
+        assert "skipped" in result.stdout
+        assert "missing" in result.stdout
+        assert "Review Verify Artifact:" in result.stdout
+        assert newer.path in result.stdout
 
     def test_show_warns_and_reads_when_readonly_db_is_missing_task_comments(self, tmp_path: Path):
         """Show should warn instead of trying to repair task_comments on a frozen DB."""

@@ -1021,7 +1021,24 @@ When execution provenance is known, `gza show` also includes:
 For completed `review` tasks, `gza show` also includes:
 - `Verdict: <APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION|...>` when parseable from review output.
 - `Score: <N>/100` when a derived `review_score` is available.
-- Review-verify audit fields when autonomous review verification ran, including status, exit status, capture time, branch/head/base provenance, working directory, the persisted `## verify_command result` section, and the `.gza/logs/<slug>.review-verify.json` artifact path for the full captured output.
+- Review-verify audit fields when autonomous review verification ran, including status, exit status, capture time, branch/head/base provenance, working directory, the persisted `## verify_command result` section, the latest `verify_command_output` artifact path, and an `Artifacts:` list covering every stored task artifact with missing-file visibility.
+
+### artifact
+
+Print the latest matching stored task artifact content or path.
+
+```bash
+gza artifact <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID to inspect (e.g. `gza-1234`) |
+| `--kind KIND` | Filter artifacts by kind (for example `verify_command_output`) |
+| `--latest` | Select the latest matching artifact (default behavior) |
+| `--path` | Print only the resolved absolute artifact path when the latest row has a content file |
+
+By default, `gza artifact` selects the newest matching artifact row. If that latest row is metadata-only (for example a no-output verify result), or if its stored file is missing, both default content retrieval and `--path` fail clearly instead of silently falling back to an older content-bearing artifact.
 
 ### run-inline
 
@@ -1352,7 +1369,7 @@ uv run gza skills-install --target codex gza-rebase --project /path/to/project
 
 ### clean
 
-Clean up stale worktrees, old logs, worker metadata, and archives.
+Clean up stale worktrees, old logs, task artifacts, worker metadata, and archives.
 
 ```bash
 gza clean [options]
@@ -1362,12 +1379,12 @@ gza clean [options]
 |--------|-------------|
 | `--worktrees` | Only clean up stale worktrees |
 | `--workers` | Only clean up stale worker metadata and startup logs |
-| `--logs` | Only clean up old log files (conversation `.log` and paired `.ops.jsonl` siblings together) |
+| `--logs` | Only clean up old log files (conversation `.log` and paired `.ops.jsonl` siblings together) and live task artifact files; archived artifacts are left for `--purge` |
 | `--backups` | Only clean up old backup files |
 | `--days N` | Remove items older than N days (default: from config cleanup_days, or 30) |
-| `--keep-unmerged` | Keep logs for tasks that are still unmerged |
-| `--archive` | Archive old log and worker files instead of deleting |
-| `--purge` | Delete previously archived files (default: older than 365 days) |
+| `--keep-unmerged` | Keep logs and task artifacts for tasks that are still unmerged |
+| `--archive` | Archive old log, live task artifact, and worker files instead of deleting; already archived artifacts are skipped |
+| `--purge` | Delete previously archived log, artifact, and worker files (default: older than 365 days) |
 | `--force` | Skip confirmation prompt before removing worktrees |
 | `--dry-run` | Show what would be cleaned without doing it |
 

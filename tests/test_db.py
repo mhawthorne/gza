@@ -6820,6 +6820,35 @@ def _drop_run_steps_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_task_artifacts_column(db_path: Path, column_name: str) -> None:
+    """Rebuild task_artifacts without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE task_artifacts RENAME TO task_artifacts_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(task_artifacts_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    for row in conn.execute("PRAGMA table_info(task_artifacts_old)"):
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    conn.execute(f"CREATE TABLE task_artifacts ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO task_artifacts ({cols_str}) SELECT {cols_str} FROM task_artifacts_old")
+    conn.execute("DROP TABLE task_artifacts_old")
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -8699,6 +8728,179 @@ class TestSharedDbIsolationAndImportGating:
         assert stored_merge_source == "manual"
         assert [merged.id for merged in merged_units] == [unit.id]
         assert merged_units[0].merge_source == "manual"
+
+    def test_auto_migration_v49_to_v50_adds_task_artifacts_and_store_accessors(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before v50 artifacts")
+        assert task.id is not None
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP TABLE task_artifacts")
+            conn.execute("UPDATE schema_version SET version = 49")
+            conn.commit()
+
+        migrated_store = SqliteTaskStore(db_path, prefix="gza")
+        stored = migrated_store.add_artifact(
+            task.id,
+            kind="verify_command_output",
+            label="verify",
+            path=".gza/artifacts/gza-1/verify.txt",
+            byte_size=7,
+            sha256="abc123",
+            created_at=datetime(2026, 1, 5, 12, 30, 0),
+            producer="review_verify",
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            head_sha="deadbeef",
+            metadata={"scope": "pkg"},
+        )
+
+        listed = migrated_store.list_artifacts(task.id)
+        fetched = migrated_store.get_artifact(stored.id, task_id=task.id)
+
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(task_artifacts)").fetchall()}
+            index_names = {row[1] for row in conn.execute("PRAGMA index_list(task_artifacts)").fetchall()}
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            stored_created_at = conn.execute(
+                "SELECT created_at FROM task_artifacts WHERE project_id = ? AND id = ?",
+                ("default", stored.id),
+            ).fetchone()[0]
+
+        assert "created_at" in columns
+        assert "idx_task_artifacts_project_task_created" in index_names
+        assert "idx_task_artifacts_project_task_kind_created" in index_names
+        assert version == SCHEMA_VERSION
+        assert stored.created_at == datetime(2026, 1, 5, 12, 30, 0, tzinfo=UTC)
+        assert stored_created_at == "2026-01-05T12:30:00+00:00"
+        assert [artifact.id for artifact in listed] == [stored.id]
+        assert fetched == stored
+        assert stored.metadata == {"scope": "pkg"}
+
+    def test_current_v50_db_missing_task_artifact_column_and_indexes_repairs_in_place(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task on current v50 artifact store")
+        assert task.id is not None
+        artifact = store.add_artifact(
+            task.id,
+            kind="verify_command_output",
+            label="verify",
+            path=".gza/artifacts/gza-1/verify.txt",
+            byte_size=12,
+            sha256="feedface",
+            created_at=datetime(2026, 2, 1, 9, 0, tzinfo=UTC),
+            producer="review_verify",
+        )
+
+        _drop_task_artifacts_column(db_path, "metadata_json")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_task_artifacts_project_task_created")
+            conn.execute("DROP INDEX IF EXISTS idx_task_artifacts_project_task_kind_created")
+            conn.execute("UPDATE schema_version SET version = 50")
+            conn.commit()
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        repaired = repaired_store.get_artifact(artifact.id, task_id=task.id)
+
+        with sqlite3.connect(db_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(task_artifacts)").fetchall()}
+            index_names = {row[1] for row in conn.execute("PRAGMA index_list(task_artifacts)").fetchall()}
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+
+        assert repaired is not None
+        assert repaired.id == artifact.id
+        assert repaired.path == artifact.path
+        assert repaired.kind == artifact.kind
+        assert repaired.byte_size == artifact.byte_size
+        assert repaired.sha256 == artifact.sha256
+        assert "metadata_json" in columns
+        assert "idx_task_artifacts_project_task_created" in index_names
+        assert "idx_task_artifacts_project_task_kind_created" in index_names
+        assert version == SCHEMA_VERSION
+
+    def test_list_artifacts_filters_by_kind_and_orders_newest_first(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with multiple artifacts")
+        assert task.id is not None
+
+        older = store.add_artifact(
+            task.id,
+            kind="verify_command_output",
+            label="verify",
+            path=".gza/artifacts/gza-1/verify-old.txt",
+            byte_size=3,
+            sha256="111",
+            created_at=datetime(2026, 3, 1, 8, 0, 0),
+        )
+        different_kind = store.add_artifact(
+            task.id,
+            kind="build_output",
+            label="build",
+            path=".gza/artifacts/gza-1/build.txt",
+            byte_size=4,
+            sha256="222",
+            created_at=datetime(2026, 3, 1, 9, 0, 0),
+        )
+        newer = store.add_artifact(
+            task.id,
+            kind="verify_command_output",
+            label="verify",
+            path=".gza/artifacts/gza-1/verify-new.txt",
+            byte_size=5,
+            sha256="333",
+            created_at=datetime(2026, 3, 1, 10, 0, 0),
+        )
+
+        all_artifacts = store.list_artifacts(task.id)
+        verify_only = store.list_artifacts(task.id, kind="verify_command_output")
+
+        assert [artifact.id for artifact in all_artifacts] == [newer.id, different_kind.id, older.id]
+        assert [artifact.id for artifact in verify_only] == [newer.id, older.id]
+        assert older.created_at == datetime(2026, 3, 1, 8, 0, 0, tzinfo=UTC)
+
+    def test_add_artifact_accepts_live_and_archive_paths_and_rejects_escaped_paths(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with validated artifact paths")
+        assert task.id is not None
+
+        live = store.add_artifact(
+            task.id,
+            kind="verify_command_output",
+            label="verify",
+            path=".gza/artifacts/gza-1/verify.txt",
+            byte_size=3,
+            sha256="111",
+        )
+        archived = store.add_artifact(
+            task.id,
+            kind="verify_command_output",
+            label="verify",
+            path=".gza/archives/artifacts/gza-1/verify.txt",
+            byte_size=4,
+            sha256="222",
+        )
+
+        assert live.path == ".gza/artifacts/gza-1/verify.txt"
+        assert archived.path == ".gza/archives/artifacts/gza-1/verify.txt"
+
+        with pytest.raises(ValueError, match="artifact path"):
+            store.add_artifact(
+                task.id,
+                kind="verify_command_output",
+                label="verify",
+                path="../outside.txt",
+                byte_size=5,
+                sha256="333",
+            )
 
     def test_query_only_open_pre_v49_db_missing_merge_source_warns_and_degrades_source_filter(
         self, tmp_path: Path

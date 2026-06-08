@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from gza.artifacts import store_command_output_artifact
 from gza.cli.config_cmds import (
     CheckTarget,
     _extract_preflight_failure_detail,
@@ -2192,6 +2193,186 @@ class TestCleanCommand:
         config = Config.load(tmp_path)
         assert config.cleanup_days == 7
 
+    def test_clean_logs_also_removes_old_task_artifacts(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact cleanup", task_type="review")
+        task.status = "completed"
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="artifact output\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+
+        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Artifacts cleaned: 1" in result.stdout
+        assert artifact_path.exists() is False
+
+    def test_clean_keep_unmerged_preserves_task_artifacts(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact keep-unmerged", task_type="implement")
+        task.status = "completed"
+        task.branch = "gza/feature"
+        task.has_commits = True
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="keep me\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+
+        with patch("gza.cli.config_cmds._collect_unmerged_cleanup_sets", return_value=({str(task.id)}, set())):
+            result = run_gza("clean", "--logs", "--keep-unmerged", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Artifacts: nothing to clean" in result.stdout
+        assert artifact_path.exists()
+
+    def test_clean_keep_unmerged_preserves_old_unmerged_artifact_outside_history_window(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        target = store.add("artifact keep-unmerged old", task_type="implement")
+        target.status = "completed"
+        target.branch = "gza/unmerged-target"
+        target.has_commits = True
+        store.update(target)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            target,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="keep me old\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+
+        filler = store.add("filler completed task", task_type="implement")
+        filler.status = "completed"
+        filler.branch = "gza/merged-filler"
+        filler.has_commits = True
+        store.update(filler)
+
+        def fake_merge_state(*args, **kwargs):
+            task = kwargs["task"]
+            return "unmerged" if task.id == target.id else "merged"
+
+        with (
+            patch("gza.cli.config_cmds.SqliteTaskStore.get_history", return_value=[filler] * 200),
+            patch("gza.cli.config_cmds.SqliteTaskStore.get_all", return_value=[filler] * 205 + [target]),
+            patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=fake_merge_state),
+            patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
+            patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
+        ):
+            result = run_gza(
+                "clean",
+                "--logs",
+                "--keep-unmerged",
+                "--days",
+                "30",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Artifacts: nothing to clean" in result.stdout
+        assert artifact_path.exists()
+
+    def test_clean_keep_unmerged_preserves_logs_and_artifacts_when_merge_state_lookup_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact keep-unmerged merge-state failure", task_type="implement")
+        task.status = "completed"
+        task.branch = "gza/merge-state-failure"
+        task.has_commits = True
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="preserve on merge-state failure\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        conversation_log = logs_dir / f"{task.id}.log"
+        ops_log = logs_dir / f"{task.id}.ops.jsonl"
+        conversation_log.write_text("conversation\n", encoding="utf-8")
+        ops_log.write_text("{\"type\":\"event\"}\n", encoding="utf-8")
+
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+        os.utime(conversation_log, (old_time, old_time))
+        os.utime(ops_log, (old_time, old_time))
+
+        def raise_merge_state(*args, **kwargs):
+            checked_task = kwargs["task"]
+            if checked_task.id == task.id:
+                raise RuntimeError("merge inspection blew up")
+            return "merged"
+
+        with (
+            patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=raise_merge_state),
+            patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
+        ):
+            result = run_gza(
+                "clean",
+                "--logs",
+                "--keep-unmerged",
+                "--days",
+                "30",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Warning: Preserving task" in result.stderr
+        assert "merge-state inspection failed" in result.stderr
+        assert "Logs: nothing to clean" in result.stdout
+        assert "Artifacts: nothing to clean" in result.stdout
+        assert artifact_path.exists()
+        assert conversation_log.exists()
+        assert ops_log.exists()
+
 
 class TestCleanArchiveCommand:
     """Tests for 'gza clean --archive' command."""
@@ -2281,6 +2462,445 @@ class TestCleanArchiveCommand:
         # Verify file was archived
         archives_dir = tmp_path / ".gza" / "archives"
         assert (archives_dir / "logs" / "log.txt").exists()
+
+    def test_clean_archive_moves_artifacts_and_updates_db_path(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact archive", task_type="review")
+        task.status = "completed"
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="archive me\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+
+        result = run_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Artifacts: 1 files" in result.stdout
+        archived_path = tmp_path / ".gza" / "archives" / "artifacts" / str(task.id) / artifact_path.name
+        assert archived_path.exists()
+        refreshed = make_store(tmp_path).list_artifacts(task.id, kind="verify_command_output")[0]
+        assert refreshed.path == archived_path.relative_to(tmp_path).as_posix()
+
+    def test_clean_logs_preserves_archived_artifact_until_purge(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("archived artifact retention", task_type="review")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC) - timedelta(days=60)
+        store.update(task)
+
+        archives_dir = tmp_path / ".gza" / "archives" / "artifacts" / str(task.id)
+        archives_dir.mkdir(parents=True, exist_ok=True)
+        archived_artifact = archives_dir / "verify.txt"
+        archived_artifact.write_text("keep until purge\n", encoding="utf-8")
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(archived_artifact, (old_time, old_time))
+
+        with sqlite3.connect(tmp_path / ".gza" / "gza.db") as conn:
+            project_id = conn.execute("SELECT project_id FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO task_artifacts(
+                    project_id, task_id, kind, label, path, content_type, byte_size, sha256,
+                    created_at, producer, command, status, exit_status, head_sha, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    task.id,
+                    "verify_command_output",
+                    "verify",
+                    archived_artifact.relative_to(tmp_path).as_posix(),
+                    "text/plain; charset=utf-8",
+                    len("keep until purge\n"),
+                    "archived123",
+                    (datetime.now(UTC) - timedelta(days=60)).isoformat(),
+                    "review_verify",
+                    "./bin/tests",
+                    "failed",
+                    "1",
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+
+        cleanup = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert cleanup.returncode == 0
+        assert "Artifacts: nothing to clean" in cleanup.stdout
+        assert archived_artifact.exists()
+
+        purge = run_gza("clean", "--purge", "--days", "30", "--project", str(tmp_path))
+
+        assert purge.returncode == 0
+        assert "Archived artifacts: 1 files" in purge.stdout
+        assert archived_artifact.exists() is False
+
+    def test_clean_logs_skips_invalid_artifact_path_without_deleting_outside_file(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact cleanup invalid path", task_type="review")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC) - timedelta(days=60)
+        store.update(task)
+
+        outside_file = tmp_path / "outside.txt"
+        outside_file.write_text("keep me\n", encoding="utf-8")
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(outside_file, (old_time, old_time))
+
+        with sqlite3.connect(tmp_path / ".gza" / "gza.db") as conn:
+            project_id = conn.execute("SELECT project_id FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO task_artifacts(
+                    project_id, task_id, kind, label, path, content_type, byte_size, sha256,
+                    created_at, producer, command, status, exit_status, head_sha, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    task.id,
+                    "verify_command_output",
+                    "verify",
+                    str(outside_file),
+                    "text/plain; charset=utf-8",
+                    len("keep me\n"),
+                    "abc123",
+                    (datetime.now(UTC) - timedelta(days=60)).isoformat(),
+                    "review_verify",
+                    "./bin/tests",
+                    "failed",
+                    "1",
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+
+        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: Skipping artifact" in result.stdout
+        assert outside_file.exists()
+        assert outside_file.read_text(encoding="utf-8") == "keep me\n"
+
+    def test_clean_archive_skips_invalid_artifact_path_without_moving_or_rewriting_row(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact archive invalid path", task_type="review")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC) - timedelta(days=60)
+        store.update(task)
+
+        outside_file = tmp_path / "outside-archive.txt"
+        outside_file.write_text("archive should not move me\n", encoding="utf-8")
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(outside_file, (old_time, old_time))
+
+        with sqlite3.connect(tmp_path / ".gza" / "gza.db") as conn:
+            project_id = conn.execute("SELECT project_id FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO task_artifacts(
+                    project_id, task_id, kind, label, path, content_type, byte_size, sha256,
+                    created_at, producer, command, status, exit_status, head_sha, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    task.id,
+                    "verify_command_output",
+                    "verify",
+                    str(outside_file),
+                    "text/plain; charset=utf-8",
+                    len("archive should not move me\n"),
+                    "def456",
+                    (datetime.now(UTC) - timedelta(days=60)).isoformat(),
+                    "review_verify",
+                    "./bin/tests",
+                    "failed",
+                    "1",
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+
+        result = run_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Warning: Skipping artifact" in result.stdout
+        assert outside_file.exists()
+        assert outside_file.read_text(encoding="utf-8") == "archive should not move me\n"
+        assert not (tmp_path / ".gza" / "archives" / "artifacts" / str(task.id) / outside_file.name).exists()
+        with sqlite3.connect(tmp_path / ".gza" / "gza.db") as conn:
+            stored_path = conn.execute(
+                "SELECT path FROM task_artifacts WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()[0]
+        assert stored_path == str(outside_file)
+
+    def test_clean_archive_skips_already_archived_artifact_rows(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("artifact archive already archived", task_type="review")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC) - timedelta(days=60)
+        store.update(task)
+
+        archives_dir = tmp_path / ".gza" / "archives" / "artifacts" / str(task.id)
+        archives_dir.mkdir(parents=True, exist_ok=True)
+        archived_artifact = archives_dir / "verify.txt"
+        archived_artifact.write_text("already archived\n", encoding="utf-8")
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(archived_artifact, (old_time, old_time))
+        stored_path = archived_artifact.relative_to(tmp_path).as_posix()
+
+        with sqlite3.connect(tmp_path / ".gza" / "gza.db") as conn:
+            project_id = conn.execute("SELECT project_id FROM tasks WHERE id = ?", (task.id,)).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO task_artifacts(
+                    project_id, task_id, kind, label, path, content_type, byte_size, sha256,
+                    created_at, producer, command, status, exit_status, head_sha, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    task.id,
+                    "verify_command_output",
+                    "verify",
+                    stored_path,
+                    "text/plain; charset=utf-8",
+                    len("already archived\n"),
+                    "archived456",
+                    (datetime.now(UTC) - timedelta(days=60)).isoformat(),
+                    "review_verify",
+                    "./bin/tests",
+                    "failed",
+                    "1",
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+
+        result = run_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Artifacts: 0 files" in result.stdout
+        assert archived_artifact.exists()
+        refreshed = make_store(tmp_path).list_artifacts(task.id, kind="verify_command_output")[0]
+        assert refreshed.path == stored_path
+
+    def test_clean_archive_keep_unmerged_preserves_old_artifact_and_db_path(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        target = store.add("artifact archive keep-unmerged", task_type="implement")
+        target.status = "completed"
+        target.branch = "gza/unmerged-target"
+        target.has_commits = True
+        store.update(target)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            target,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="keep archived artifact live\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+
+        filler = store.add("archive filler task", task_type="implement")
+        filler.status = "completed"
+        filler.branch = "gza/merged-filler"
+        filler.has_commits = True
+        store.update(filler)
+
+        def fake_merge_state(*args, **kwargs):
+            task = kwargs["task"]
+            return "unmerged" if task.id == target.id else "merged"
+
+        with (
+            patch("gza.cli.config_cmds.SqliteTaskStore.get_history", return_value=[filler] * 200),
+            patch("gza.cli.config_cmds.SqliteTaskStore.get_all", return_value=[filler] * 205 + [target]),
+            patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=fake_merge_state),
+            patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
+            patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
+        ):
+            result = run_gza(
+                "clean",
+                "--archive",
+                "--logs",
+                "--keep-unmerged",
+                "--days",
+                "30",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Artifacts: 0 files" in result.stdout
+        assert artifact_path.exists()
+        archived_path = tmp_path / ".gza" / "archives" / "artifacts" / str(target.id) / artifact_path.name
+        assert archived_path.exists() is False
+        refreshed = make_store(tmp_path).list_artifacts(target.id, kind="verify_command_output")[0]
+        assert refreshed.path == stored.path
+
+    def test_clean_archive_keep_unmerged_preserves_log_group_for_unmerged_slug(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("archive keep-unmerged logs", task_type="implement")
+        task.status = "completed"
+        task.branch = "gza/unmerged-log-target"
+        task.has_commits = True
+        task.slug = "keep-unmerged-log"
+        store.update(task)
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        conversation_log = logs_dir / f"{task.id}.log"
+        ops_log = logs_dir / f"{task.id}.ops.jsonl"
+        conversation_log.write_text("conversation\n")
+        ops_log.write_text("{\"type\":\"event\"}\n")
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(conversation_log, (old_time, old_time))
+        os.utime(ops_log, (old_time, old_time))
+
+        def fake_merge_state(*args, **kwargs):
+            resolved_task = kwargs["task"]
+            return "unmerged" if resolved_task.id == task.id else "merged"
+
+        with (
+            patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=fake_merge_state),
+            patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
+            patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
+        ):
+            result = run_gza(
+                "clean",
+                "--archive",
+                "--logs",
+                "--keep-unmerged",
+                "--days",
+                "30",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Logs: 0 files" in result.stdout
+        assert conversation_log.exists()
+        assert ops_log.exists()
+        archives_logs_dir = tmp_path / ".gza" / "archives" / "logs"
+        assert (archives_logs_dir / conversation_log.name).exists() is False
+        assert (archives_logs_dir / ops_log.name).exists() is False
+
+    def test_clean_archive_keep_unmerged_preserves_logs_and_artifact_when_merge_state_lookup_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("archive keep-unmerged merge-state failure", task_type="implement")
+        task.status = "completed"
+        task.branch = "gza/archive-merge-state-failure"
+        task.has_commits = True
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="keep archive live on merge-state failure\n",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        artifact_path = tmp_path / stored.path
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        conversation_log = logs_dir / f"{task.id}.log"
+        ops_log = logs_dir / f"{task.id}.ops.jsonl"
+        conversation_log.write_text("conversation\n", encoding="utf-8")
+        ops_log.write_text("{\"type\":\"event\"}\n", encoding="utf-8")
+
+        old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
+        os.utime(artifact_path, (old_time, old_time))
+        os.utime(conversation_log, (old_time, old_time))
+        os.utime(ops_log, (old_time, old_time))
+
+        def raise_merge_state(*args, **kwargs):
+            checked_task = kwargs["task"]
+            if checked_task.id == task.id:
+                raise RuntimeError("archive merge inspection blew up")
+            return "merged"
+
+        with (
+            patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=raise_merge_state),
+            patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
+        ):
+            result = run_gza(
+                "clean",
+                "--archive",
+                "--logs",
+                "--keep-unmerged",
+                "--days",
+                "30",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Warning: Preserving task" in result.stderr
+        assert "merge-state inspection failed" in result.stderr
+        assert "Artifacts: 0 files" in result.stdout
+        assert artifact_path.exists()
+        assert conversation_log.exists()
+        assert ops_log.exists()
+        archived_artifact = tmp_path / ".gza" / "archives" / "artifacts" / str(task.id) / artifact_path.name
+        archived_logs_dir = tmp_path / ".gza" / "archives" / "logs"
+        assert archived_artifact.exists() is False
+        assert (archived_logs_dir / conversation_log.name).exists() is False
+        assert (archived_logs_dir / ops_log.name).exists() is False
+        refreshed = make_store(tmp_path).list_artifacts(task.id, kind="verify_command_output")[0]
+        assert refreshed.path == stored.path
+
+    def test_clean_purge_removes_archived_artifacts(self, tmp_path: Path):
+        setup_config(tmp_path)
+        archives_dir = tmp_path / ".gza" / "archives" / "artifacts" / "gza-1"
+        archives_dir.mkdir(parents=True, exist_ok=True)
+        archived_artifact = archives_dir / "verify.txt"
+        archived_artifact.write_text("old artifact")
+        old_time = (datetime.now(UTC) - timedelta(days=400)).timestamp()
+        os.utime(archived_artifact, (old_time, old_time))
+
+        result = run_gza("clean", "--purge", "--days", "365", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Archived artifacts: 1 files" in result.stdout
+        assert archived_artifact.exists() is False
 
     def test_clean_dry_run_mode(self, tmp_path: Path):
         """Clean command with --dry-run shows what would be archived without archiving."""

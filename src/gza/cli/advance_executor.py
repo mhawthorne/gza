@@ -338,6 +338,8 @@ def run_noop_improve_verify_then_review(
         verify_result,
         markdown=verify_markdown,
         project_results=project_results,
+        producer="noop_review_verify",
+        metadata={"triggering_review_task_id": review_task.id},
     )
     if cleanup_failure is not None:
         return NoopVerifyThenReviewOutcome(

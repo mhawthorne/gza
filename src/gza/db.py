@@ -15,6 +15,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
+from gza.artifact_paths import normalize_artifact_path
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ __all__ = [
     "MergeTargetResolutionError",
     "SchemaIntegrityError",
     "Task",
+    "TaskArtifact",
     "MergeUnit",
     "WatchProgressObservation",
     "TaskComment",
@@ -522,6 +524,27 @@ class TaskComment:
 
 
 @dataclass(frozen=True)
+class TaskArtifact:
+    """Persisted metadata for one task artifact stored under the project .gza dir."""
+
+    id: int
+    task_id: str
+    kind: str
+    label: str | None
+    path: str
+    content_type: str
+    byte_size: int
+    sha256: str
+    created_at: datetime
+    producer: str | None = None
+    command: str | None = None
+    status: str | None = None
+    exit_status: str | None = None
+    head_sha: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TaskClaimResult:
     """Outcome of attempting to claim a pending task for execution."""
 
@@ -585,6 +608,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
         "sync_last_synced_at",
     ),
     "merge_unit_tasks": ("attached_at",),
+    "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
@@ -817,8 +841,35 @@ CREATE INDEX IF NOT EXISTS idx_merge_units_project_state_source
     ON merge_units(project_id, state, merge_source);
 """
 
-# Migration from v49 to v50: restart-safe watch no-progress observations
+# Migration from v49 to v50: durable per-task artifact store foundation
 MIGRATION_V49_TO_V50 = """
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    project_id TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    label TEXT,
+    path TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'text/plain; charset=utf-8',
+    byte_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    producer TEXT,
+    command TEXT,
+    status TEXT,
+    exit_status TEXT,
+    head_sha TEXT,
+    metadata_json TEXT,
+    FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_created
+    ON task_artifacts(project_id, task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_kind_created
+    ON task_artifacts(project_id, task_id, kind, created_at DESC, id DESC);
+"""
+
+# Migration from v50 to v51: restart-safe watch no-progress observations
+MIGRATION_V50_TO_V51 = """
 CREATE TABLE IF NOT EXISTS watch_progress_observations (
     project_id TEXT NOT NULL,
     subject_kind TEXT NOT NULL,
@@ -843,15 +894,15 @@ CREATE INDEX IF NOT EXISTS idx_watch_progress_subject
     ON watch_progress_observations(project_id, subject_kind, subject_id);
 """
 
-# Migration from v50 to v51: durable review verify audit payload metadata
-MIGRATION_V50_TO_V51 = """
+# Migration from v51 to v52: durable review verify audit payload metadata
+MIGRATION_V51_TO_V52 = """
 ALTER TABLE tasks ADD COLUMN review_verify_markdown TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT;
 """
 
 # Schema version for migrations
-SCHEMA_VERSION = 51
+SCHEMA_VERSION = 52
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -910,6 +961,22 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     """Return the set of column names for an existing table."""
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _split_sql_statements(script: str) -> list[str]:
+    """Split a SQL script into complete sqlite statements without breaking string literals."""
+    statements: list[str] = []
+    buffer: list[str] = []
+    for line in script.splitlines():
+        buffer.append(line)
+        candidate = "\n".join(buffer).strip()
+        if candidate and sqlite3.complete_statement(candidate):
+            statements.append(candidate)
+            buffer = []
+    tail = "\n".join(buffer).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 def _rewrite_persisted_timestamps_to_canonical_utc(conn: sqlite3.Connection) -> int:
@@ -1567,7 +1634,26 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52}
+)
+
+_TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "id",
+    "task_id",
+    "kind",
+    "label",
+    "path",
+    "content_type",
+    "byte_size",
+    "sha256",
+    "created_at",
+    "producer",
+    "command",
+    "status",
+    "exit_status",
+    "head_sha",
+    "metadata_json",
 )
 
 
@@ -1623,6 +1709,110 @@ def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at)")
 
 
+def _rebuild_task_artifacts_table(conn: sqlite3.Connection) -> None:
+    """Rebuild task_artifacts with the required schema, preserving existing rows."""
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_artifacts)")}
+    now_text = _format_db_timestamp(datetime.now(UTC))
+    assert now_text is not None
+    conn.execute("ALTER TABLE task_artifacts RENAME TO task_artifacts_damaged")
+    conn.execute(
+        """
+        CREATE TABLE task_artifacts (
+            project_id TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            label TEXT,
+            path TEXT NOT NULL,
+            content_type TEXT NOT NULL DEFAULT 'text/plain; charset=utf-8',
+            byte_size INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            producer TEXT,
+            command TEXT,
+            status TEXT,
+            exit_status TEXT,
+            head_sha TEXT,
+            metadata_json TEXT,
+            FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+        )
+        """
+    )
+    select_exprs = {
+        "project_id": "project_id" if "project_id" in existing_columns else "'default'",
+        "id": "id" if "id" in existing_columns else "NULL",
+        "task_id": "task_id" if "task_id" in existing_columns else "''",
+        "kind": "kind" if "kind" in existing_columns else "'unknown'",
+        "label": "label" if "label" in existing_columns else "NULL",
+        "path": "path" if "path" in existing_columns else "''",
+        "content_type": (
+            "content_type" if "content_type" in existing_columns else "'text/plain; charset=utf-8'"
+        ),
+        "byte_size": "byte_size" if "byte_size" in existing_columns else "0",
+        "sha256": "sha256" if "sha256" in existing_columns else "''",
+        "created_at": "created_at" if "created_at" in existing_columns else f"'{now_text}'",
+        "producer": "producer" if "producer" in existing_columns else "NULL",
+        "command": "command" if "command" in existing_columns else "NULL",
+        "status": "status" if "status" in existing_columns else "NULL",
+        "exit_status": "exit_status" if "exit_status" in existing_columns else "NULL",
+        "head_sha": "head_sha" if "head_sha" in existing_columns else "NULL",
+        "metadata_json": "metadata_json" if "metadata_json" in existing_columns else "NULL",
+    }
+    conn.execute(
+        """
+        INSERT INTO task_artifacts (
+            project_id,
+            id,
+            task_id,
+            kind,
+            label,
+            path,
+            content_type,
+            byte_size,
+            sha256,
+            created_at,
+            producer,
+            command,
+            status,
+            exit_status,
+            head_sha,
+            metadata_json
+        )
+        SELECT
+            {project_id},
+            {id},
+            {task_id},
+            {kind},
+            {label},
+            {path},
+            {content_type},
+            {byte_size},
+            {sha256},
+            {created_at},
+            {producer},
+            {command},
+            {status},
+            {exit_status},
+            {head_sha},
+            {metadata_json}
+        FROM task_artifacts_damaged
+        """.format(**select_exprs)
+    )
+    conn.execute("DROP TABLE task_artifacts_damaged")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_created
+            ON task_artifacts(project_id, task_id, created_at DESC, id DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_kind_created
+            ON task_artifacts(project_id, task_id, kind, created_at DESC, id DESC)
+        """
+    )
+
+
 def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: int) -> None:
     """Validate required schema artifacts for selected automatic migration targets."""
     if target_version == 32:
@@ -1659,7 +1849,9 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         47: ("tasks", "review_scope"),
         48: ("tasks", "model_is_explicit"),
         49: ("merge_units", "merge_source"),
-        50: ("watch_progress_observations", "observed_at"),
+        50: ("task_artifacts", "created_at"),
+        51: ("watch_progress_observations", "observed_at"),
+        52: ("tasks", "review_verify_artifact_file"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1680,14 +1872,29 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             "idx_merge_units_project_state_source"
         )
     if target_version >= 50:
-        for table in ("watch_progress_observations",):
+        for table in ("task_artifacts",):
             if not _table_exists(conn, table):
                 raise RuntimeError(
                     f"Auto-migration to v50 incomplete: missing required table {table}"
                 )
+        for index_name in (
+            "idx_task_artifacts_project_task_created",
+            "idx_task_artifacts_project_task_kind_created",
+        ):
+            if not _index_exists(conn, index_name):
+                raise RuntimeError(
+                    "Auto-migration to v50 incomplete: missing required index "
+                    f"{index_name}"
+                )
+    if target_version >= 51:
+        for table in ("watch_progress_observations",):
+            if not _table_exists(conn, table):
+                raise RuntimeError(
+                    f"Auto-migration to v51 incomplete: missing required table {table}"
+                )
         if not _index_exists(conn, "idx_watch_progress_subject"):
             raise RuntimeError(
-                "Auto-migration to v50 incomplete: missing required index "
+                "Auto-migration to v51 incomplete: missing required index "
                 "idx_watch_progress_subject"
             )
 
@@ -1733,6 +1940,27 @@ def _ensure_required_auto_migration_artifacts(
                 f"task_comments.{remaining_missing[0]}: use a writable database."
             )
 
+    missing_artifact_columns = (
+        _missing_required_columns(conn, "task_artifacts", _TASK_ARTIFACTS_REQUIRED_COLUMNS)
+        if target_version >= 50 and _table_exists(conn, "task_artifacts")
+        else []
+    )
+    if target_version >= 50 and missing_artifact_columns:
+        missing_column = missing_artifact_columns[0]
+        try:
+            _rebuild_task_artifacts_table(conn)
+        except sqlite3.OperationalError as exc:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required column "
+                f"task_artifacts.{missing_column}: use a writable database."
+            ) from exc
+        remaining_missing = _missing_required_columns(conn, "task_artifacts", _TASK_ARTIFACTS_REQUIRED_COLUMNS)
+        if remaining_missing:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required column "
+                f"task_artifacts.{remaining_missing[0]}: use a writable database."
+            )
+
     required_columns: tuple[tuple[int, str, str, str], ...] = (
         (30, "tasks", "urgent_bumped_at", "ALTER TABLE tasks ADD COLUMN urgent_bumped_at TEXT"),
         (31, "tasks", "execution_mode", "ALTER TABLE tasks ADD COLUMN execution_mode TEXT"),
@@ -1763,9 +1991,9 @@ def _ensure_required_auto_migration_artifacts(
         (47, "tasks", "review_scope", "ALTER TABLE tasks ADD COLUMN review_scope TEXT"),
         (48, "tasks", "model_is_explicit", "ALTER TABLE tasks ADD COLUMN model_is_explicit INTEGER DEFAULT 0"),
         (49, "merge_units", "merge_source", "ALTER TABLE merge_units ADD COLUMN merge_source TEXT"),
-        (51, "tasks", "review_verify_markdown", "ALTER TABLE tasks ADD COLUMN review_verify_markdown TEXT"),
-        (51, "tasks", "review_verify_cwd", "ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT"),
-        (51, "tasks", "review_verify_artifact_file", "ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT"),
+        (52, "tasks", "review_verify_markdown", "ALTER TABLE tasks ADD COLUMN review_verify_markdown TEXT"),
+        (52, "tasks", "review_verify_cwd", "ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT"),
+        (52, "tasks", "review_verify_artifact_file", "ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -1844,6 +2072,72 @@ def _ensure_required_auto_migration_artifacts(
                     "idx_merge_units_project_state_source: use a writable database."
                 ) from exc
     if target_version >= 50:
+        if not _table_exists(conn, "task_artifacts"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_artifacts (
+                        project_id TEXT NOT NULL,
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        label TEXT,
+                        path TEXT NOT NULL,
+                        content_type TEXT NOT NULL DEFAULT 'text/plain; charset=utf-8',
+                        byte_size INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        producer TEXT,
+                        command TEXT,
+                        status TEXT,
+                        exit_status TEXT,
+                        head_sha TEXT,
+                        metadata_json TEXT,
+                        FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table task_artifacts; "
+                        "use a writable database to complete migration to v50, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "task_artifacts: use a writable database."
+                ) from exc
+        for index_name, create_sql in (
+            (
+                "idx_task_artifacts_project_task_created",
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_created
+                    ON task_artifacts(project_id, task_id, created_at DESC, id DESC)
+                """,
+            ),
+            (
+                "idx_task_artifacts_project_task_kind_created",
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_kind_created
+                    ON task_artifacts(project_id, task_id, kind, created_at DESC, id DESC)
+                """,
+            ),
+        ):
+            if _index_exists(conn, index_name):
+                continue
+            try:
+                conn.execute(create_sql)
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        f"Query-only DB open detected missing required index {index_name}; "
+                        "use a writable database to complete migration to v50, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    f"{index_name}: use a writable database."
+                ) from exc
+    if target_version >= 51:
         if not _table_exists(conn, "watch_progress_observations"):
             try:
                 conn.execute(
@@ -1874,7 +2168,7 @@ def _ensure_required_auto_migration_artifacts(
                 if _is_readonly_snapshot_operational_error(exc):
                     raise SchemaIntegrityError(
                         "Query-only DB open detected missing required table watch_progress_observations; "
-                        "use a writable database to complete migration to v50, then retry."
+                        "use a writable database to complete migration to v51, then retry."
                     ) from exc
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required table "
@@ -1892,7 +2186,7 @@ def _ensure_required_auto_migration_artifacts(
                 if _is_readonly_snapshot_operational_error(exc):
                     raise SchemaIntegrityError(
                         "Query-only DB open detected missing required index idx_watch_progress_subject; "
-                        "use a writable database to complete migration to v50, then retry."
+                        "use a writable database to complete migration to v51, then retry."
                     ) from exc
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required index "
@@ -2017,6 +2311,30 @@ CREATE TABLE IF NOT EXISTS task_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_task_tags_project_tag ON task_tags(project_id, tag);
 CREATE INDEX IF NOT EXISTS idx_task_tags_project_task_id ON task_tags(project_id, task_id);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    project_id TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    label TEXT,
+    path TEXT NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'text/plain; charset=utf-8',
+    byte_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    producer TEXT,
+    command TEXT,
+    status TEXT,
+    exit_status TEXT,
+    head_sha TEXT,
+    metadata_json TEXT,
+    FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_created
+    ON task_artifacts(project_id, task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_project_task_kind_created
+    ON task_artifacts(project_id, task_id, kind, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS run_steps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2420,6 +2738,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (49, MIGRATION_V48_TO_V49),
     (50, MIGRATION_V49_TO_V50),
     (51, MIGRATION_V50_TO_V51),
+    (52, MIGRATION_V51_TO_V52),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -2654,6 +2973,13 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "watch_progress_observations")
 
+    def supports_task_artifacts(self) -> bool:
+        """Return whether task artifact storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("task_artifacts", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "task_artifacts")
+
     def default_merge_target(self, *, strict: bool = False) -> str:
         """Resolve the default merge target branch for stored merge units.
 
@@ -2729,7 +3055,7 @@ class SqliteTaskStore:
                         elif target_version == 44:
                             _run_v43_to_v44_migration(conn)
                         elif migration_sql is not None:
-                            for stmt in migration_sql.strip().split(";"):
+                            for stmt in _split_sql_statements(migration_sql):
                                 stmt = stmt.strip()
                                 if stmt:
                                     try:
@@ -2834,6 +3160,7 @@ class SqliteTaskStore:
             "projects",
             "merge_units",
             "merge_unit_tasks",
+            "task_artifacts",
             "watch_progress_observations",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
@@ -4322,6 +4649,204 @@ class SqliteTaskStore:
             parked_reason=str(row["parked_reason"]) if row["parked_reason"] is not None else None,
             observed_at=_parse_db_timestamp(row["observed_at"]),
         )
+
+    def _row_to_task_artifact(self, row: sqlite3.Row | None) -> TaskArtifact | None:
+        if row is None:
+            return None
+        metadata: dict[str, Any] | None = None
+        raw_metadata = row["metadata_json"] if "metadata_json" in row.keys() else None
+        if raw_metadata:
+            parsed = json.loads(str(raw_metadata))
+            metadata = parsed if isinstance(parsed, dict) else {"value": parsed}
+        created_at = _parse_db_timestamp(cast("str | None", row["created_at"]))
+        assert created_at is not None
+        return TaskArtifact(
+            id=int(row["id"]),
+            task_id=str(row["task_id"]),
+            kind=str(row["kind"]),
+            label=str(row["label"]) if row["label"] is not None else None,
+            path=str(row["path"]),
+            content_type=str(row["content_type"]),
+            byte_size=int(row["byte_size"]),
+            sha256=str(row["sha256"]),
+            created_at=created_at,
+            producer=str(row["producer"]) if row["producer"] is not None else None,
+            command=str(row["command"]) if row["command"] is not None else None,
+            status=str(row["status"]) if row["status"] is not None else None,
+            exit_status=str(row["exit_status"]) if row["exit_status"] is not None else None,
+            head_sha=str(row["head_sha"]) if row["head_sha"] is not None else None,
+            metadata=metadata,
+        )
+
+    def add_artifact(
+        self,
+        task_id: str,
+        *,
+        kind: str,
+        label: str | None = None,
+        path: str,
+        content_type: str = "text/plain; charset=utf-8",
+        byte_size: int,
+        sha256: str,
+        created_at: datetime | None = None,
+        producer: str | None = None,
+        command: str | None = None,
+        status: str | None = None,
+        exit_status: str | None = None,
+        head_sha: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        artifact_id: int | None = None,
+    ) -> TaskArtifact:
+        """Insert or update one task artifact row and return the canonical stored record."""
+        created_at_text = _format_db_timestamp(created_at or datetime.now(UTC))
+        assert created_at_text is not None
+        normalized_path = normalize_artifact_path(path)
+        metadata_json = json.dumps(metadata, sort_keys=True) if metadata is not None else None
+        with self._connect() as conn:
+            if artifact_id is None:
+                cur = conn.execute(
+                    """
+                    INSERT INTO task_artifacts(
+                        project_id,
+                        task_id,
+                        kind,
+                        label,
+                        path,
+                        content_type,
+                        byte_size,
+                        sha256,
+                        created_at,
+                        producer,
+                        command,
+                        status,
+                        exit_status,
+                        head_sha,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._project_id,
+                        task_id,
+                        kind,
+                        label,
+                        normalized_path,
+                        content_type,
+                        byte_size,
+                        sha256,
+                        created_at_text,
+                        producer,
+                        command,
+                        status,
+                        exit_status,
+                        head_sha,
+                        metadata_json,
+                    ),
+                )
+                assert cur.lastrowid is not None
+                resolved_id = int(cur.lastrowid)
+            else:
+                conn.execute(
+                    """
+                    UPDATE task_artifacts
+                    SET kind = ?,
+                        label = ?,
+                        path = ?,
+                        content_type = ?,
+                        byte_size = ?,
+                        sha256 = ?,
+                        created_at = ?,
+                        producer = ?,
+                        command = ?,
+                        status = ?,
+                        exit_status = ?,
+                        head_sha = ?,
+                        metadata_json = ?
+                    WHERE project_id = ? AND task_id = ? AND id = ?
+                    """,
+                    (
+                        kind,
+                        label,
+                        normalized_path,
+                        content_type,
+                        byte_size,
+                        sha256,
+                        created_at_text,
+                        producer,
+                        command,
+                        status,
+                        exit_status,
+                        head_sha,
+                        metadata_json,
+                        self._project_id,
+                        task_id,
+                        artifact_id,
+                    ),
+                )
+                resolved_id = artifact_id
+            row = conn.execute(
+                """
+                SELECT *
+                FROM task_artifacts
+                WHERE project_id = ? AND task_id = ? AND id = ?
+                """,
+                (self._project_id, task_id, resolved_id),
+            ).fetchone()
+        artifact = self._row_to_task_artifact(row)
+        assert artifact is not None
+        return artifact
+
+    def list_artifacts(self, task_id: str, kind: str | None = None) -> list[TaskArtifact]:
+        """Return artifacts for one task, newest first."""
+        if not self.supports_task_artifacts():
+            return []
+        with self._connect() as conn:
+            if kind is None:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM task_artifacts
+                    WHERE project_id = ? AND task_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (self._project_id, task_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM task_artifacts
+                    WHERE project_id = ? AND task_id = ? AND kind = ?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (self._project_id, task_id, kind),
+                ).fetchall()
+        return [artifact for row in rows if (artifact := self._row_to_task_artifact(row)) is not None]
+
+    def get_artifact(self, artifact_id: int, *, task_id: str | None = None) -> TaskArtifact | None:
+        """Return one artifact by id, optionally scoped to a task."""
+        if not self.supports_task_artifacts():
+            return None
+        with self._connect() as conn:
+            if task_id is None:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM task_artifacts
+                    WHERE project_id = ? AND id = ?
+                    """,
+                    (self._project_id, artifact_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM task_artifacts
+                    WHERE project_id = ? AND task_id = ? AND id = ?
+                    """,
+                    (self._project_id, task_id, artifact_id),
+                ).fetchone()
+        return self._row_to_task_artifact(row)
 
     def list_watch_progress_observations(
         self,

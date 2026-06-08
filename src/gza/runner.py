@@ -20,6 +20,7 @@ from typing import Any, cast
 
 import gza.colors as _colors
 
+from .artifacts import store_command_output_artifact
 from .branch_naming import generate_branch_name
 from .branch_resolution import resolve_rebase_target_branch
 from .commit_messages import build_task_commit_message
@@ -1719,7 +1720,6 @@ REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
 REVIEW_VERIFY_TIMEOUT_SECONDS = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
-REVIEW_VERIFY_ARTIFACT_VERSION = 1
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -2258,64 +2258,86 @@ def _extract_review_verify_phase_results(output: str | None) -> list[dict[str, A
     return phases
 
 
-def _review_verify_result_payload(result: ReviewVerifyResult) -> dict[str, Any]:
-    """Convert a structured review verify result into a durable JSON payload."""
-    payload: dict[str, Any] = {
-        "command": result.command,
-        "status": result.status,
-        "exit_status": result.exit_status,
-        "captured_at": result.captured_at.isoformat(),
+def _store_review_verify_artifact_records(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    result: ReviewVerifyResult,
+    project_results: tuple[ProjectReviewVerifyResult, ...] = (),
+    *,
+    producer: str,
+    metadata: dict[str, Any] | None = None,
+) -> str | None:
+    """Persist durable verify artifacts and return the latest content-bearing path."""
+    stored_paths: list[tuple[datetime, str]] = []
+    shared_metadata = {
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
         "reviewed_base_sha": result.reviewed_base_sha,
-        "working_directory": result.working_directory,
-        "failure": result.failure,
-        "output": result.output,
-        "phase_results": _extract_review_verify_phase_results(result.output),
+        **(metadata or {}),
     }
-    return payload
-
-
-def _review_verify_artifact_path(config: Config, task: Task) -> Path:
-    """Return the durable artifact path for a review verify capture."""
-    if task.log_file:
-        log_path = config.project_dir / Path(task.log_file)
+    if project_results:
+        for entry in project_results:
+            entry_result = entry.result
+            entry_status = entry_result.status if entry_result is not None else "skipped"
+            entry_exit_status = entry_result.exit_status if entry_result is not None else "skipped"
+            entry_command = entry_result.command if entry_result is not None else None
+            entry_head_sha = entry_result.reviewed_head_sha if entry_result is not None else result.reviewed_head_sha
+            entry_branch = entry_result.reviewed_branch if entry_result is not None else result.reviewed_branch
+            entry_base_sha = entry_result.reviewed_base_sha if entry_result is not None else result.reviewed_base_sha
+            entry_created_at = entry_result.captured_at if entry_result is not None else result.captured_at
+            entry_output = entry_result.output if entry_result is not None else None
+            stored = store_command_output_artifact(
+                store,
+                task,
+                config,
+                kind="verify_command_output",
+                producer=producer,
+                label="verify_command",
+                output=entry_output,
+                command=entry_command,
+                status=entry_status,
+                exit_status=entry_exit_status,
+                head_sha=entry_head_sha,
+                scope=entry.scope,
+                metadata={
+                    "scope": entry.scope,
+                    "working_directory": entry.working_directory,
+                    "skip_reason": entry.skip_reason,
+                    "reviewed_branch": entry_branch,
+                    "reviewed_head_sha": entry_head_sha,
+                    "reviewed_base_sha": entry_base_sha,
+                    **(metadata or {}),
+                },
+                created_at=entry_created_at,
+            )
+            if entry_output:
+                stored_paths.append((entry_created_at, stored.path))
     else:
-        assert task.slug is not None
-        log_path = config.log_path / f"{task.slug}.log"
-    return log_path.with_name(f"{log_path.stem}.review-verify.json")
-
-
-def _write_review_verify_artifact(
-    config: Config,
-    task: Task,
-    *,
-    markdown: str,
-    result: ReviewVerifyResult,
-    project_results: tuple[ProjectReviewVerifyResult, ...] = (),
-) -> str:
-    """Persist the full review verify capture to a durable artifact file."""
-    artifact_path = _review_verify_artifact_path(config, task)
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "version": REVIEW_VERIFY_ARTIFACT_VERSION,
-        "task_id": task.id,
-        "task_slug": task.slug,
-        "task_type": task.task_type,
-        "markdown": markdown,
-        "aggregate_result": _review_verify_result_payload(result),
-        "project_results": [
-            {
-                "scope": entry.scope,
-                "working_directory": entry.working_directory,
-                "skip_reason": entry.skip_reason,
-                "result": _review_verify_result_payload(entry.result) if entry.result is not None else None,
-            }
-            for entry in project_results
-        ],
-    }
-    artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return task_log_storage_path(config, artifact_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer=producer,
+            label="verify_command",
+            output=result.output,
+            command=result.command,
+            status=result.status,
+            exit_status=result.exit_status,
+            head_sha=result.reviewed_head_sha,
+            metadata={
+                "working_directory": result.working_directory,
+                **shared_metadata,
+            },
+            created_at=result.captured_at,
+        )
+        if result.output:
+            stored_paths.append((result.captured_at, stored.path))
+    if not stored_paths:
+        return None
+    stored_paths.sort(key=lambda item: item[0], reverse=True)
+    return stored_paths[0][1]
 
 
 def _persist_review_verify_result(
@@ -2362,14 +2384,18 @@ def _capture_review_verify_result(
     markdown: str,
     project_results: tuple[ProjectReviewVerifyResult, ...] = (),
     task_logger: TaskExecutionLogger | None = None,
+    producer: str = "review_verify",
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Persist review verify provenance, artifact, and optional ops-log evidence."""
-    artifact_file = _write_review_verify_artifact(
-        config,
+    artifact_file = _store_review_verify_artifact_records(
         task,
-        markdown=markdown,
+        config,
+        store,
         result=result,
         project_results=project_results,
+        producer=producer,
+        metadata=metadata,
     )
     _persist_review_verify_result(
         task,
@@ -2394,7 +2420,7 @@ def _capture_review_verify_result(
                 "review_verify_artifact_file": artifact_file,
             },
         )
-    return artifact_file
+    return artifact_file or ""
 
 
 def _format_review_verify_result(

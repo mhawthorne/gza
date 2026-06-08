@@ -18,6 +18,12 @@ from typing import Any, cast
 from rich.table import Table
 
 from .. import colors as _colors
+from ..artifact_paths import (
+    InvalidArtifactPathError,
+    is_archived_artifact_path,
+    is_live_artifact_path,
+    resolve_artifact_path,
+)
 from ..config import Config, ConfigError, _generate_project_id
 from ..config_examples import (
     BranchStrategyRender,
@@ -27,7 +33,7 @@ from ..config_examples import (
 )
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
-from ..db import SqliteTaskStore, Task, task_id_numeric_key
+from ..db import SqliteTaskStore, Task, TaskArtifact, task_id_numeric_key
 from ..git import Git
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
@@ -41,6 +47,122 @@ logger = logging.getLogger(__name__)
 _INIT_SHARED_DB_PATH = "~/.gza/gza.db"
 _PREFLIGHT_ERROR_PATTERN = re.compile(r"(error|model|invalid|unknown|not found)", re.IGNORECASE)
 _PREFLIGHT_DETAIL_MAX_LEN = 120
+
+
+@dataclass(frozen=True)
+class _UnmergedCleanupSets:
+    task_ids: set[str]
+    task_slugs: set[str]
+    warnings: tuple[str, ...] = ()
+
+
+class _UnmergedCleanupCollectionError(RuntimeError):
+    """Raised when keep-unmerged preservation evidence cannot be collected safely."""
+
+
+def _normalize_unmerged_cleanup_sets(
+    collected: _UnmergedCleanupSets | tuple[set[str], set[str]],
+) -> _UnmergedCleanupSets:
+    """Accept legacy tuple stubs and normalize them to the shared result shape."""
+    if isinstance(collected, _UnmergedCleanupSets):
+        return collected
+    task_ids, task_slugs = collected
+    return _UnmergedCleanupSets(task_ids=task_ids, task_slugs=task_slugs)
+
+
+def _collect_unmerged_cleanup_sets(store: SqliteTaskStore, git: Git) -> _UnmergedCleanupSets:
+    """Return task IDs and slugs that should be preserved by keep-unmerged cleanup."""
+    unmerged_task_ids: set[str] = set()
+    unmerged_task_slugs: set[str] = set()
+    warnings: list[str] = []
+    try:
+        default_branch = git.default_branch()
+        for task in store.get_all():
+            if not task.branch or not task.has_commits:
+                continue
+            try:
+                if (
+                    resolve_task_merge_state_for_target(
+                        store=store,
+                        task=task,
+                        git=git,
+                        target_branch=default_branch,
+                    )
+                    != "merged"
+                    and not git.is_merged(task.branch, default_branch)
+                ):
+                    if task.id is not None:
+                        unmerged_task_ids.add(task.id)
+                    if task.slug:
+                        unmerged_task_slugs.add(task.slug)
+            except Exception as exc:
+                if task.id is not None:
+                    unmerged_task_ids.add(task.id)
+                if task.slug:
+                    unmerged_task_slugs.add(task.slug)
+                warning = (
+                    "Warning: Preserving task "
+                    f"{task.id} during --keep-unmerged because merge-state inspection failed: {exc}"
+                )
+                warnings.append(warning)
+                logger.warning(
+                    "Failed to check merge state for task %s branch=%s during cleanup",
+                    task.id,
+                    task.branch,
+                    exc_info=True,
+                )
+    except Exception as exc:
+        logger.warning("Could not collect unmerged tasks during cleanup", exc_info=True)
+        raise _UnmergedCleanupCollectionError(
+            f"Could not collect unmerged tasks during cleanup: {exc}"
+        ) from exc
+    return _UnmergedCleanupSets(
+        task_ids=unmerged_task_ids,
+        task_slugs=unmerged_task_slugs,
+        warnings=tuple(warnings),
+    )
+
+
+def _preserve_log_group_for_unmerged_task(
+    path: Path,
+    *,
+    unmerged_task_ids: set[str],
+    unmerged_task_slugs: set[str],
+) -> bool:
+    """Return whether a log group belongs to an unmerged task that should be kept."""
+    task_stem = slug_from_log_path(path)
+    return task_stem in unmerged_task_ids or task_stem in unmerged_task_slugs
+
+
+def _iter_task_artifacts(store: SqliteTaskStore) -> list[TaskArtifact]:
+    """Return all task artifacts visible in the current project store."""
+    artifacts: list[TaskArtifact] = []
+    for task in store.get_all():
+        if task.id is None:
+            continue
+        artifacts.extend(store.list_artifacts(task.id))
+    return artifacts
+
+
+def _update_task_artifact_path(store: SqliteTaskStore, artifact: TaskArtifact, *, path: str) -> None:
+    """Persist a new relative path for an existing task artifact row."""
+    store.add_artifact(
+        artifact.task_id,
+        kind=artifact.kind,
+        label=artifact.label,
+        path=path,
+        content_type=artifact.content_type,
+        byte_size=artifact.byte_size,
+        sha256=artifact.sha256,
+        created_at=artifact.created_at,
+        producer=artifact.producer,
+        command=artifact.command,
+        status=artifact.status,
+        exit_status=artifact.exit_status,
+        head_sha=artifact.head_sha,
+        metadata=artifact.metadata,
+        artifact_id=artifact.id,
+    )
 
 
 def _percentile(sorted_vals: list[int], p: float) -> int:
@@ -2000,7 +2122,7 @@ def _find_removable_workers(registry: WorkerRegistry, store: "SqliteTaskStore") 
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    """Clean up stale worktrees, old logs, worker metadata, and archives."""
+    """Clean up stale worktrees, logs, task artifacts, worker metadata, and archives."""
     import shutil
     from datetime import timedelta
 
@@ -2029,6 +2151,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # Track what was cleaned
     cleaned_worktrees: list[tuple[str, str]] = []
     cleaned_logs: list[str] = []
+    cleaned_artifacts: list[str] = []
     cleaned_workers = 0
     deleted_backups: list[str] = []
     errors: list[tuple[str, Exception]] = []
@@ -2110,40 +2233,21 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # 2. Clean up old log files
     if args.logs or no_scope:
         print("Scanning logs...")
+        unmerged_task_ids: set[str] = set()
+        unmerged_task_slugs: set[str] = set()
+        if args.keep_unmerged:
+            try:
+                unmerged_sets = _normalize_unmerged_cleanup_sets(
+                    _collect_unmerged_cleanup_sets(store, git)
+                )
+            except _UnmergedCleanupCollectionError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            unmerged_task_ids = unmerged_sets.task_ids
+            unmerged_task_slugs = unmerged_sets.task_slugs
+            for warning in unmerged_sets.warnings:
+                print(warning, file=sys.stderr)
         if config.log_path.exists():
-            # Get list of unmerged tasks if --keep-unmerged is set
-            unmerged_task_ids = set()
-            if args.keep_unmerged:
-                try:
-                    # Check completed tasks with branches for unmerged work
-                    default_branch = git.default_branch()
-                    history = store.get_history(limit=200)
-                    for task in history:
-                        if task.status == "completed" and task.branch and task.has_commits:
-                            try:
-                                if (
-                                    resolve_task_merge_state_for_target(
-                                        store=store,
-                                        task=task,
-                                        git=git,
-                                        target_branch=default_branch,
-                                    )
-                                    != "merged"
-                                    and not git.is_merged(task.branch, default_branch)
-                                ):
-                                    if task.slug:
-                                        unmerged_task_ids.add(task.slug)
-                            except Exception:
-                                logger.warning(
-                                    "Failed to check merge state for task %s branch=%s during cleanup",
-                                    task.id,
-                                    task.branch,
-                                    exc_info=True,
-                                )
-                except Exception as e:
-                    logger.warning("Could not collect unmerged tasks during cleanup", exc_info=True)
-                    print(f"Warning: Could not fetch unmerged tasks: {e}", file=sys.stderr)
-
             processed_logs: set[Path] = set()
             for log_file in config.log_path.iterdir():
                 if not log_file.is_file():
@@ -2155,8 +2259,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
                 # Check if this log is for an unmerged task
                 if args.keep_unmerged:
-                    task_id = slug_from_log_path(log_file)
-                    if task_id in unmerged_task_ids:
+                    if _preserve_log_group_for_unmerged_task(
+                        log_file,
+                        unmerged_task_ids=unmerged_task_ids,
+                        unmerged_task_slugs=unmerged_task_slugs,
+                    ):
                         continue
 
                 # Check age
@@ -2171,6 +2278,47 @@ def cmd_clean(args: argparse.Namespace) -> int:
                                 cleaned_logs.append(path.name)
                             except OSError as e:
                                 errors.append((path.name, e))
+
+        terminal_statuses = {"completed", "failed", "dropped"}
+        task_by_id = {task.id: task for task in store.get_all() if task.id is not None}
+        for artifact in _iter_task_artifacts(store):
+            owner = task_by_id.get(artifact.task_id)
+            if owner is None or owner.status not in terminal_statuses:
+                continue
+            if args.keep_unmerged and artifact.task_id in unmerged_task_ids:
+                continue
+            try:
+                if not is_live_artifact_path(artifact.path):
+                    continue
+                artifact_path = resolve_artifact_path(config.project_dir, artifact.path)
+            except InvalidArtifactPathError as exc:
+                print(
+                    f"Warning: Skipping artifact {artifact.id} for task {artifact.task_id}: {exc}"
+                )
+                continue
+            age_source = (
+                artifact_path.stat().st_mtime
+                if artifact_path.exists()
+                else artifact.created_at.timestamp()
+            )
+            if age_source >= cutoff_timestamp:
+                continue
+            if args.dry_run:
+                cleaned_artifacts.append(artifact.path)
+                continue
+            if artifact_path.exists():
+                try:
+                    artifact_path.unlink()
+                    cleaned_artifacts.append(artifact.path)
+                except OSError as e:
+                    errors.append((artifact.path, e))
+            parent = artifact_path.parent
+            while parent != config.project_dir and parent.exists() and parent.is_dir():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
 
     # 3. Clean up worker metadata for finished/stale/zombie workers
     if args.workers or no_scope:
@@ -2226,6 +2374,13 @@ def cmd_clean(args: argparse.Namespace) -> int:
         else:
             print("Logs: nothing to clean")
         print()
+        if cleaned_artifacts:
+            print(f"Artifacts cleaned: {len(cleaned_artifacts)}")
+            if args.keep_unmerged:
+                print("  (kept artifacts for unmerged tasks)")
+        else:
+            print("Artifacts: nothing to clean")
+        print()
 
     if args.workers or no_scope:
         print(f"Worker files cleaned: {cleaned_workers}")
@@ -2259,6 +2414,7 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
     archives_dir = config.project_dir / ".gza" / "archives"
 
     deleted_logs = []
+    deleted_artifacts = []
     deleted_workers = []
     errors = []
 
@@ -2292,6 +2448,20 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
                         except OSError as e:
                             errors.append((worker_file, e))
 
+    # Delete from archives/artifacts
+    archives_artifacts_dir = archives_dir / "artifacts"
+    if archives_artifacts_dir.exists():
+        for artifact_file in archives_artifacts_dir.rglob("*"):
+            if artifact_file.is_file() and artifact_file.stat().st_mtime < cutoff_timestamp:
+                if args.dry_run:
+                    deleted_artifacts.append(artifact_file)
+                else:
+                    try:
+                        artifact_file.unlink()
+                        deleted_artifacts.append(artifact_file)
+                    except OSError as e:
+                        errors.append((artifact_file, e))
+
     # Report results
     if args.dry_run:
         print(f"Dry run: would purge archived files older than {days} days")
@@ -2310,10 +2480,18 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
                 print(f"  - {worker_file.name}")
         else:
             print("Archived workers: no files to purge")
+        print()
+        if deleted_artifacts:
+            print(f"Archived artifacts ({len(deleted_artifacts)} files):")
+            for artifact_file in deleted_artifacts:
+                print(f"  - {artifact_file.relative_to(archives_artifacts_dir)}")
+        else:
+            print("Archived artifacts: no files to purge")
     else:
         print(f"Purged archived files older than {days} days:")
         print(f"  - Archived logs: {len(deleted_logs)} files")
         print(f"  - Archived workers: {len(deleted_workers)} files")
+        print(f"  - Archived artifacts: {len(deleted_artifacts)} files")
 
         if errors:
             print()
@@ -2336,6 +2514,7 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
     archives_dir = config.project_dir / ".gza" / "archives"
 
     archived_logs = []
+    archived_artifacts = []
     archived_workers = []
     deleted_backups = []
     errors = []
@@ -2350,6 +2529,24 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
 
     # Archive logs
     if args.logs or no_scope:
+        unmerged_task_ids: set[str] = set()
+        unmerged_task_slugs: set[str] = set()
+        if args.keep_unmerged:
+            try:
+                unmerged_sets = _normalize_unmerged_cleanup_sets(
+                    _collect_unmerged_cleanup_sets(
+                        get_store(config),
+                        Git(config.project_dir),
+                    )
+                )
+            except _UnmergedCleanupCollectionError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            unmerged_task_ids = unmerged_sets.task_ids
+            unmerged_task_slugs = unmerged_sets.task_slugs
+            for warning in unmerged_sets.warnings:
+                print(warning, file=sys.stderr)
+        store = get_store(config)
         if config.log_path.exists():
             archives_logs_dir = archives_dir / "logs"
             processed_logs: set[Path] = set()
@@ -2359,6 +2556,12 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
                         continue
                     conversation_log, ops_log = paired_log_paths(log_file)
                     processed_logs.update({conversation_log, ops_log})
+                    if args.keep_unmerged and _preserve_log_group_for_unmerged_task(
+                        log_file,
+                        unmerged_task_ids=unmerged_task_ids,
+                        unmerged_task_slugs=unmerged_task_slugs,
+                    ):
+                        continue
                     existing_group = [path for path in (conversation_log, ops_log) if path.exists()]
                     if existing_group and max(path.stat().st_mtime for path in existing_group) < cutoff_timestamp:
                         if args.dry_run:
@@ -2372,6 +2575,49 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
                                     archived_logs.append(path)
                                 except OSError as e:
                                     errors.append((path, e))
+
+        archives_artifacts_dir = archives_dir / "artifacts"
+        task_by_id = {task.id: task for task in store.get_all() if task.id is not None}
+        for artifact in _iter_task_artifacts(store):
+            owner = task_by_id.get(artifact.task_id)
+            if owner is None or owner.status not in {"completed", "failed", "dropped"}:
+                continue
+            if args.keep_unmerged and artifact.task_id in unmerged_task_ids:
+                continue
+            try:
+                if is_archived_artifact_path(artifact.path):
+                    continue
+                artifact_path = resolve_artifact_path(config.project_dir, artifact.path)
+            except InvalidArtifactPathError as exc:
+                print(
+                    f"Warning: Skipping artifact {artifact.id} for task {artifact.task_id}: {exc}"
+                )
+                continue
+            age_source = (
+                artifact_path.stat().st_mtime
+                if artifact_path.exists()
+                else artifact.created_at.timestamp()
+            )
+            if age_source >= cutoff_timestamp:
+                continue
+            if args.dry_run:
+                archived_artifacts.append(artifact_path)
+                continue
+            if not artifact_path.exists():
+                continue
+            try:
+                destination_dir = archives_artifacts_dir / artifact.task_id
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                dest = destination_dir / artifact_path.name
+                shutil.move(str(artifact_path), str(dest))
+                archived_artifacts.append(artifact_path)
+                _update_task_artifact_path(
+                    store,
+                    artifact,
+                    path=str(dest.relative_to(config.project_dir).as_posix()),
+                )
+            except OSError as e:
+                errors.append((artifact_path, e))
 
     # Archive workers
     if args.workers or no_scope:
@@ -2427,6 +2673,14 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
             print("Workers: no files to archive")
 
         print()
+        if archived_artifacts:
+            print(f"Artifacts ({len(archived_artifacts)} files):")
+            for artifact_file in archived_artifacts:
+                print(f"  - {artifact_file.name}")
+        else:
+            print("Artifacts: no files to archive")
+
+        print()
         if deleted_backups:
             print(f"Backups ({len(deleted_backups)} files):")
             for backup_file in deleted_backups:
@@ -2437,6 +2691,7 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
         print(f"Archived files older than {days} days:")
         print(f"  - Logs: {len(archived_logs)} files")
         print(f"  - Workers: {len(archived_workers)} files")
+        print(f"  - Artifacts: {len(archived_artifacts)} files")
         print(f"  - Backups deleted: {len(deleted_backups)} files")
 
         if errors:

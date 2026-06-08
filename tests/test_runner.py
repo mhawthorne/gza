@@ -10680,15 +10680,18 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_improve.review_verify_branch == impl.branch
         assert refreshed_improve.review_verify_head_sha == "abc1234"
         assert refreshed_improve.review_verify_captured_at == captured_at
-        assert refreshed_improve.review_verify_artifact_file == f"logs/{improve.slug}.review-verify.json"
-
-        artifact_payload = json.loads(
-            (tmp_path / refreshed_improve.review_verify_artifact_file).read_text(encoding="utf-8")
-        )
-        assert artifact_payload["task_id"] == improve.id
-        assert artifact_payload["aggregate_result"]["status"] == "passed"
-        assert artifact_payload["aggregate_result"]["reviewed_branch"] == impl.branch
-        assert artifact_payload["aggregate_result"]["reviewed_head_sha"] == "abc1234"
+        assert refreshed_improve.review_verify_artifact_file is None
+        artifacts = store.list_artifacts(improve.id, kind="verify_command_output")
+        assert len(artifacts) == 1
+        assert artifacts[0].producer == "review_verify"
+        assert artifacts[0].status == "passed"
+        assert artifacts[0].metadata == {
+            "reviewed_base_sha": "cafebabe",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "abc1234",
+            "working_directory": None,
+        }
+        assert (tmp_path / artifacts[0].path).exists() is False
 
         output = capsys.readouterr().out
         assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" in output
@@ -14542,36 +14545,27 @@ class TestProviderPromptSanitization:
         assert "- Working directory: `" in refreshed.review_verify_markdown
         assert refreshed.review_verify_cwd is not None
         assert refreshed.review_verify_cwd.endswith(f"{task.slug}-{task.task_type}")
-        assert refreshed.review_verify_artifact_file == f"logs/{task.slug}.review-verify.json"
+        assert refreshed.review_verify_artifact_file is not None
 
-        artifact_path = tmp_path / refreshed.review_verify_artifact_file
-        artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-        assert artifact_payload["task_id"] == task.id
-        assert artifact_payload["markdown"] == refreshed.review_verify_markdown
-        assert artifact_payload["aggregate_result"]["status"] == "failed"
-        assert artifact_payload["aggregate_result"]["exit_status"] == "7"
-        assert artifact_payload["aggregate_result"]["output"] == (
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 1
+        artifact = artifacts[0]
+        assert artifact.status == "failed"
+        assert artifact.exit_status == "7"
+        assert artifact.path == refreshed.review_verify_artifact_file
+        assert artifact.metadata == {
+            "reviewed_base_sha": None,
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "working_directory": refreshed.review_verify_cwd,
+        }
+        assert (tmp_path / artifact.path).read_text(encoding="utf-8") == (
             "gza-verify phase=passed name=ruff duration_seconds=1.25 "
             f"tree_fingerprint={passed_fingerprint}\n"
             "gza-verify phase=failed name=pytest duration_seconds=3.5 "
             f"tree_fingerprint={failed_fingerprint}\n"
             "lint failed"
         )
-        assert artifact_payload["aggregate_result"]["working_directory"] == refreshed.review_verify_cwd
-        assert artifact_payload["aggregate_result"]["phase_results"] == [
-            {
-                "duration_seconds": 1.25,
-                "name": "ruff",
-                "status": "passed",
-                "tree_fingerprint": passed_fingerprint,
-            },
-            {
-                "duration_seconds": 3.5,
-                "name": "pytest",
-                "status": "failed",
-                "tree_fingerprint": failed_fingerprint,
-            },
-        ]
 
         ops_entries = [
             json.loads(line)
@@ -14642,14 +14636,17 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_status == "passed"
         assert refreshed.review_verify_markdown is not None
         assert "- Status: passed" in refreshed.review_verify_markdown
-        assert refreshed.review_verify_artifact_file == f"logs/{task.slug}.review-verify.json"
-
-        artifact_payload = json.loads(
-            (tmp_path / refreshed.review_verify_artifact_file).read_text(encoding="utf-8")
-        )
-        assert artifact_payload["aggregate_result"]["status"] == "passed"
-        assert artifact_payload["aggregate_result"]["output"] == "all good"
-        assert artifact_payload["aggregate_result"]["working_directory"] == refreshed.review_verify_cwd
+        assert refreshed.review_verify_artifact_file is not None
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 1
+        assert artifacts[0].status == "passed"
+        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == "all good"
+        assert artifacts[0].metadata == {
+            "reviewed_base_sha": None,
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "working_directory": refreshed.review_verify_cwd,
+        }
 
     def test_fresh_review_truncates_inline_verify_output_and_keeps_full_artifact(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -14714,13 +14711,11 @@ class TestProviderPromptSanitization:
         assert "Failing output (trimmed):" in refreshed.review_verify_markdown
         assert "```text" in refreshed.review_verify_markdown
         assert "..." in refreshed.review_verify_markdown
-        assert refreshed.review_verify_artifact_file == f"logs/{task.slug}.review-verify.json"
-
-        artifact_payload = json.loads(
-            (tmp_path / refreshed.review_verify_artifact_file).read_text(encoding="utf-8")
-        )
-        assert artifact_payload["aggregate_result"]["output"] == large_output
-        assert artifact_payload["aggregate_result"]["output"].endswith("ENDMARK")
+        assert refreshed.review_verify_artifact_file is not None
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 1
+        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == large_output
+        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8").endswith("ENDMARK")
 
     def test_cross_project_review_persists_failed_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -14978,84 +14973,41 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         refreshed = store.get(task.id)
         assert refreshed is not None
-        artifact_payload = json.loads(
-            (tmp_path / refreshed.review_verify_artifact_file).read_text(encoding="utf-8")
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 2
+        artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
+        assert set(artifacts_by_scope) == {"services/foo", "libs/bar"}
+        assert artifacts_by_scope["services/foo"].status == "passed"
+        assert artifacts_by_scope["services/foo"].metadata == {
+            "reviewed_base_sha": "cafebabe",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "scope": "services/foo",
+            "skip_reason": None,
+            "working_directory": "services/foo",
+        }
+        assert (tmp_path / artifacts_by_scope["services/foo"].path).read_text(encoding="utf-8") == (
+            "gza-verify phase=passed name=setup duration_seconds=0.25 "
+            f"tree_fingerprint={setup_fingerprint}\n"
+            "gza-verify phase=passed name=ruff duration_seconds=0.5 "
+            f"tree_fingerprint={passed_fingerprint}\n"
+            "gza-verify phase=failed name=pytest duration_seconds=2.75\n"
+            "bar failed"
         )
-        assert artifact_payload["aggregate_result"]["phase_results"] == []
-        assert artifact_payload["project_results"] == [
-            {
-                "scope": "services/foo",
-                "working_directory": "services/foo",
-                "skip_reason": None,
-                "result": {
-                    "command": "./bin/foo-verify",
-                    "status": "passed",
-                    "exit_status": "0",
-                    "captured_at": "2026-01-01T00:00:01+00:00",
-                    "reviewed_branch": impl.branch,
-                    "reviewed_head_sha": "deadbeef",
-                    "reviewed_base_sha": "cafebabe",
-                    "working_directory": "services/foo",
-                    "failure": None,
-                    "output": (
-                        "gza-verify phase=passed name=setup duration_seconds=0.25 "
-                        f"tree_fingerprint={setup_fingerprint}\n"
-                        "gza-verify phase=passed name=ruff duration_seconds=0.5 "
-                        f"tree_fingerprint={passed_fingerprint}\n"
-                        "gza-verify phase=failed name=pytest duration_seconds=2.75\n"
-                        "bar failed"
-                    ),
-                    "phase_results": [
-                        {
-                            "duration_seconds": 0.25,
-                            "name": "setup",
-                            "status": "passed",
-                            "tree_fingerprint": setup_fingerprint,
-                        },
-                        {
-                            "duration_seconds": 0.5,
-                            "name": "ruff",
-                            "status": "passed",
-                            "tree_fingerprint": passed_fingerprint,
-                        },
-                        {
-                            "duration_seconds": 2.75,
-                            "name": "pytest",
-                            "status": "failed",
-                        }
-                    ],
-                },
-            },
-            {
-                "scope": "libs/bar",
-                "working_directory": "libs/bar",
-                "skip_reason": None,
-                "result": {
-                    "command": "./bin/bar-verify",
-                    "status": "failed",
-                    "exit_status": "7",
-                    "captured_at": "2026-01-01T00:00:02+00:00",
-                    "reviewed_branch": impl.branch,
-                    "reviewed_head_sha": "deadbeef",
-                    "reviewed_base_sha": "cafebabe",
-                    "working_directory": "libs/bar",
-                    "failure": "verify failed",
-                    "output": (
-                        "gza-verify phase=failed name=pytest duration_seconds=2.75 "
-                        f"tree_fingerprint={failed_fingerprint}\n"
-                        "bar failed"
-                    ),
-                    "phase_results": [
-                        {
-                            "duration_seconds": 2.75,
-                            "name": "pytest",
-                            "status": "failed",
-                            "tree_fingerprint": failed_fingerprint,
-                        }
-                    ],
-                },
-            },
-        ]
+        assert artifacts_by_scope["libs/bar"].status == "failed"
+        assert artifacts_by_scope["libs/bar"].metadata == {
+            "reviewed_base_sha": "cafebabe",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "scope": "libs/bar",
+            "skip_reason": None,
+            "working_directory": "libs/bar",
+        }
+        assert (tmp_path / artifacts_by_scope["libs/bar"].path).read_text(encoding="utf-8") == (
+            "gza-verify phase=failed name=pytest duration_seconds=2.75 "
+            f"tree_fingerprint={failed_fingerprint}\n"
+            "bar failed"
+        )
 
     def test_cross_project_review_persists_unavailable_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -15368,7 +15320,30 @@ class TestProviderPromptSanitization:
                 "- Reason: no verify_command configured for this affected project"
             ),
             aggregate_result=aggregate,
-            project_results=(),
+            project_results=(
+                ProjectReviewVerifyResult(
+                    project=None,
+                    scope="services/foo",
+                    working_directory="services/foo",
+                    result=ReviewVerifyResult(
+                        command="./bin/foo-verify",
+                        status="passed",
+                        exit_status="0",
+                        captured_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+                        reviewed_branch=impl.branch,
+                        reviewed_head_sha="deadbeef",
+                        reviewed_base_sha="cafebabe",
+                        working_directory="services/foo",
+                        output="foo passed\n",
+                    ),
+                ),
+                ProjectReviewVerifyResult(
+                    project=None,
+                    scope="apps/baz",
+                    working_directory="apps/baz",
+                    skip_reason="no verify_command configured for this affected project",
+                ),
+            ),
         )
 
         with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
@@ -15387,6 +15362,22 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_status == "unavailable"
         assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
         assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 2
+        artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
+        assert set(artifacts_by_scope) == {"services/foo", "apps/baz"}
+        assert artifacts_by_scope["services/foo"].status == "passed"
+        assert artifacts_by_scope["apps/baz"].status == "skipped"
+        assert artifacts_by_scope["apps/baz"].byte_size == 0
+        assert artifacts_by_scope["apps/baz"].metadata == {
+            "reviewed_base_sha": "cafebabe",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "scope": "apps/baz",
+            "skip_reason": "no verify_command configured for this affected project",
+            "working_directory": "apps/baz",
+        }
+        assert (tmp_path / artifacts_by_scope["apps/baz"].path).exists() is False
 
     def test_cross_project_review_persists_unavailable_aggregate_when_unknown_paths_are_skipped(
         self, tmp_path: Path
@@ -15469,7 +15460,30 @@ class TestProviderPromptSanitization:
                 "- Paths: misc/tool.py"
             ),
             aggregate_result=aggregate,
-            project_results=(),
+            project_results=(
+                ProjectReviewVerifyResult(
+                    project=None,
+                    scope="services/foo",
+                    working_directory="services/foo",
+                    result=ReviewVerifyResult(
+                        command="./bin/foo-verify",
+                        status="passed",
+                        exit_status="0",
+                        captured_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC),
+                        reviewed_branch=impl.branch,
+                        reviewed_head_sha="deadbeef",
+                        reviewed_base_sha="cafebabe",
+                        working_directory="services/foo",
+                        output="foo passed\n",
+                    ),
+                ),
+                ProjectReviewVerifyResult(
+                    project=None,
+                    scope="unknown paths",
+                    working_directory="unknown paths",
+                    skip_reason="affected paths fell outside all discovered project roots",
+                ),
+            ),
         )
 
         with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
@@ -15488,6 +15502,21 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_status == "unavailable"
         assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
         assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 2
+        artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
+        assert set(artifacts_by_scope) == {"services/foo", "unknown paths"}
+        assert artifacts_by_scope["unknown paths"].status == "skipped"
+        assert artifacts_by_scope["unknown paths"].byte_size == 0
+        assert artifacts_by_scope["unknown paths"].metadata == {
+            "reviewed_base_sha": "cafebabe",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "scope": "unknown paths",
+            "skip_reason": "affected paths fell outside all discovered project roots",
+            "working_directory": "unknown paths",
+        }
+        assert (tmp_path / artifacts_by_scope["unknown paths"].path).exists() is False
 
     def test_fresh_review_prompt_still_runs_provider_after_verify_timeout(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

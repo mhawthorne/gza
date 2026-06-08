@@ -800,6 +800,46 @@ class TestHelpOutput:
         assert "as JSON" not in help_text
         assert "| `--prompt` | Print only the fully built prompt text for this task and exit |" in docs_text
 
+    def test_artifact_and_clean_help_docs_stay_aligned_on_artifact_operator_surfaces(self, tmp_path: Path) -> None:
+        """Artifact retrieval and cleanup docs should match parser help for artifact-aware behavior."""
+        setup_config(tmp_path)
+
+        artifact_help = run_gza("artifact", "--help", "--project", str(tmp_path))
+        clean_help = run_gza("clean", "--help", "--project", str(tmp_path))
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert artifact_help.returncode == 0
+        assert "Print the latest stored task artifact content or path" in artifact_help.stdout
+        assert "--kind KIND" in artifact_help.stdout
+        assert "--latest" in artifact_help.stdout
+        assert "--path" in artifact_help.stdout
+        assert "### artifact" in docs_text
+        assert "gza artifact <task_id> [options]" in docs_text
+        assert "| `--kind KIND` | Filter artifacts by kind (for example `verify_command_output`) |" in docs_text
+        assert "| `--latest` | Select the latest matching artifact (default behavior) |" in docs_text
+        assert "Print only the resolved absolute artifact path when the latest row has a content file" in artifact_help.stdout
+        assert (
+            "| `--path` | Print only the resolved absolute artifact path when the latest row has a content file |"
+            in docs_text
+        )
+        assert "both default content retrieval and `--path` fail clearly" in docs_text
+
+        assert clean_help.returncode == 0
+        assert "task artifacts" in clean_help.stdout
+        assert "archived log, artifact, and worker files" in clean_help.stdout
+        assert "Only clean up old log files and live task artifacts" in clean_help.stdout
+        assert (
+            "| `--logs` | Only clean up old log files (conversation `.log` and paired `.ops.jsonl` siblings together) and live task artifact files; archived artifacts are left for `--purge` |"
+            in docs_text
+        )
+        assert "| `--keep-unmerged` | Keep logs and task artifacts for tasks that are still unmerged |" in docs_text
+        assert "Archive old log, live task artifact, and worker files instead of deleting" in clean_help.stdout
+        assert (
+            "| `--archive` | Archive old log, live task artifact, and worker files instead of deleting; already archived artifacts are skipped |"
+            in docs_text
+        )
+        assert "| `--purge` | Delete previously archived log, artifact, and worker files (default: older than 365 days) |" in docs_text
+
     def test_removed_group_commands_are_absent_from_docs_and_rejected(self, tmp_path):
         """Retired group command spellings should be undocumented and fail in argparse."""
         setup_config(tmp_path)

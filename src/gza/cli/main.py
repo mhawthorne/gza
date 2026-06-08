@@ -77,6 +77,7 @@ from .git_ops import (
 )
 from .log import cmd_log
 from .query import (
+    cmd_artifact,
     cmd_attach,
     cmd_delete,
     cmd_history,
@@ -1294,7 +1295,10 @@ def main() -> int:
     add_common_args(config_parser)
 
     # clean command
-    clean_parser = subparsers.add_parser("clean", help="Clean up stale worktrees, old logs, worker metadata, and archives")
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Clean up stale worktrees, logs, task artifacts, worker metadata, and archives",
+    )
     clean_parser.add_argument(
         "--worktrees",
         action="store_true",
@@ -1308,7 +1312,7 @@ def main() -> int:
     clean_parser.add_argument(
         "--logs",
         action="store_true",
-        help="Only clean up old log files",
+        help="Only clean up old log files and live task artifacts",
     )
     clean_parser.add_argument(
         "--backups",
@@ -1325,17 +1329,17 @@ def main() -> int:
     clean_parser.add_argument(
         "--keep-unmerged",
         action="store_true",
-        help="Keep logs for tasks that are still unmerged",
+        help="Keep logs and task artifacts for tasks that are still unmerged",
     )
     clean_parser.add_argument(
         "--archive",
         action="store_true",
-        help="Archive old log and worker files instead of deleting",
+        help="Archive old log, live task artifact, and worker files instead of deleting",
     )
     clean_parser.add_argument(
         "--purge",
         action="store_true",
-        help="Delete previously archived files (default: older than 365 days)",
+        help="Delete previously archived log, artifact, and worker files (default: older than 365 days)",
     )
     clean_parser.add_argument(
         "--force",
@@ -2389,6 +2393,36 @@ def main() -> int:
     )
     add_common_args(show_parser)
 
+    # artifact command
+    artifact_parser = subparsers.add_parser(
+        "artifact",
+        help="Print the latest stored task artifact content or path",
+        description="Print the latest stored task artifact content or path",
+    )
+    artifact_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID to inspect",
+    )
+    artifact_parser.add_argument(
+        "--kind",
+        default=None,
+        help="Filter artifacts by kind (for example verify_command_output)",
+    )
+    artifact_parser.add_argument(
+        "--latest",
+        action="store_true",
+        default=False,
+        help="Select the latest matching artifact (default behavior)",
+    )
+    artifact_parser.add_argument(
+        "--path",
+        action="store_true",
+        default=False,
+        help="Print only the resolved absolute artifact path when the latest row has a content file",
+    )
+    add_common_args(artifact_parser)
+
     # sync-report command
     sync_report_parser = subparsers.add_parser(
         "sync-report", help="Sync report file content from disk into DB output_content"
@@ -2704,6 +2738,8 @@ def main() -> int:
             return cmd_lineage(args)
         elif args.command == "show":
             return cmd_show(args)
+        elif args.command == "artifact":
+            return cmd_artifact(args)
         elif args.command == "sync-report":
             return cmd_sync_report(args)
         elif args.command == "ps":
