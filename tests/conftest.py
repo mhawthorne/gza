@@ -1,5 +1,7 @@
 """Shared test fixtures."""
 
+import contextlib
+import fcntl
 import os
 from pathlib import Path
 
@@ -70,3 +72,41 @@ def _isolate_rich_console(monkeypatch):
         monkeypatch.setattr(rich_console, "_color_system", None, raising=False)
         monkeypatch.setattr(rich_console, "_width", 200, raising=False)
         monkeypatch.setitem(console_module._REGISTERED_COLOR_SYSTEMS, rich_console, None)
+
+
+def _clear_process_local_launch_state() -> None:
+    from gza.concurrency import (
+        _PROCESS_LOCKS,
+        _PROCESS_LOCKS_GUARD,
+        _RESERVED_LAUNCH_PERMITS,
+        _RESERVED_LAUNCH_PERMITS_GUARD,
+    )
+
+    with _RESERVED_LAUNCH_PERMITS_GUARD:
+        reserved_permits = list(_RESERVED_LAUNCH_PERMITS.values())
+        _RESERVED_LAUNCH_PERMITS.clear()
+    for permit in reserved_permits:
+        with contextlib.suppress(Exception):
+            permit.release()
+
+    with _PROCESS_LOCKS_GUARD:
+        held_lock_files = [
+            state.lock_file
+            for state in _PROCESS_LOCKS.values()
+            if state.lock_file is not None
+        ]
+        _PROCESS_LOCKS.clear()
+    for lock_file in held_lock_files:
+        with contextlib.suppress(Exception):
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(Exception):
+            lock_file.close()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_launch_permit_state():
+    _clear_process_local_launch_state()
+    try:
+        yield
+    finally:
+        _clear_process_local_launch_state()

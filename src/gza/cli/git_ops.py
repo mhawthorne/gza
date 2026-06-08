@@ -17,6 +17,13 @@ from gza.query import get_base_task_slug as _get_base_task_slug
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..colors import pink
 from ..commit_messages import build_task_commit_message
+from ..concurrency import (
+    MaxConcurrentTasksError,
+    format_max_concurrent_message,
+    get_concurrency_snapshot,
+    launch_permit,
+    reserve_task_launch_permit,
+)
 from ..config import Config
 from ..console import (
     console,
@@ -804,13 +811,21 @@ def _spawn_prepared_background_iterate(
     quiet: bool = False,
 ) -> int:
     pending_recovery_mode = resolve_pending_recovery_execution_mode(impl_task)
+    try:
+        permit = launch_permit(config, get_store(config))
+    except MaxConcurrentTasksError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     prepared_task = _prepare_task_for_immediate_execution(
         config,
         impl_task,
         rollback_on_failure=False,
     )
     if prepared_task is None:
+        permit.release()
         return 1
+    if prepared_task.id is not None:
+        reserve_task_launch_permit(str(prepared_task.id), permit)
     return _spawn_background_iterate_worker(
         args,
         config,
@@ -1860,6 +1875,10 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         target = getattr(args, 'onto', None) or git.default_branch()
         if getattr(args, 'remote', False):
             target = f"origin/{target}"
+        try:
+            permit = launch_permit(config, store)
+        except MaxConcurrentTasksError as exc:
+            return phase1_error(args, str(exc))
         rebase_task = _create_rebase_task(
             store,
             task_id,
@@ -1873,7 +1892,10 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             rollback_on_failure=True,
         )
         if prepared_rebase_task is None:
+            permit.release()
             return 1
+        if prepared_rebase_task.id is not None:
+            reserve_task_launch_permit(str(prepared_rebase_task.id), permit)
         assert prepared_rebase_task.id is not None
         worker_args = argparse.Namespace(
             no_docker=getattr(args, "no_docker", False),
@@ -2742,6 +2764,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     if batch_limit is not None and batch_limit < 1:
         return phase1_error(args, "--batch must be a positive integer")
+    concurrency_snapshot = get_concurrency_snapshot(config, store)
+    concurrency_budget = concurrency_snapshot.available
+    effective_start_budget = concurrency_budget if batch_limit is None else min(batch_limit, concurrency_budget)
+    capacity_message = format_max_concurrent_message(
+        running=concurrency_snapshot.running,
+        limit=concurrency_snapshot.limit,
+    )
 
     # --unimplemented mode: list completed plans/explores without implementations
     # Legacy --plans is supported as an alias scoped to plans only.
@@ -2936,11 +2965,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             max_resume_attempts=max_resume_attempts,
             use_iterate_for_create_implement=use_iterate_mode,
             use_iterate_for_needs_rebase=use_iterate_mode,
-            can_spawn_worker=lambda _kind: batch_limit is None or workers_started < batch_limit,
+            can_spawn_worker=lambda _kind: workers_started < effective_start_budget,
             no_worker_capacity_message=lambda worker_label: (
                 f"SKIP: batch limit reached ({workers_started}/{batch_limit}), cannot start {worker_label} worker"
-                if batch_limit is not None
-                else f"SKIP: no worker capacity available for {worker_label}"
+                if batch_limit is not None and workers_started >= batch_limit
+                else f"SKIP: {capacity_message}"
             ),
             prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
                 config,
@@ -3146,7 +3175,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print()
         if new_mode and batch_limit is not None:
             planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
-            remaining = max(0, batch_limit - planned_workers)
+            remaining = max(0, effective_start_budget - planned_workers)
             if remaining > 0:
                 pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
                 if pending_tasks:
@@ -3180,7 +3209,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     new_pending_tasks: list = []
     if new_mode and batch_limit is not None:
         planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
-        remaining = max(0, batch_limit - planned_workers)
+        remaining = max(0, effective_start_budget - planned_workers)
         if remaining > 0:
             new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
             if new_pending_tasks:
@@ -3259,9 +3288,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         # Worker-spawning actions: check batch limit before proceeding
         if is_worker_consuming_advance_action(action_type):
-            if batch_limit is not None and workers_started >= batch_limit:
+            if workers_started >= effective_start_budget:
                 console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                console.print(f"      [{_c_warn}]— batch limit reached ({workers_started}/{batch_limit}), skipping[/{_c_warn}]")
+                message = (
+                    f"batch limit reached ({workers_started}/{batch_limit}), skipping"
+                    if batch_limit is not None and workers_started >= batch_limit
+                    else f"{capacity_message}, skipping"
+                )
+                console.print(f"      [{_c_warn}]— {message}[/{_c_warn}]")
                 print()
                 skip_count += 1
                 continue
@@ -3338,15 +3372,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     # --new: start pending tasks to fill remaining batch slots
     new_started = 0
-    if new_mode and batch_limit is not None and workers_started < batch_limit:
+    if new_mode and batch_limit is not None and workers_started < effective_start_budget:
         # Use the pre-fetched new_pending_tasks list so each worker gets a
         # distinct task.  If we didn't pre-fetch (e.g. no confirmation prompt
         # was shown), fetch now.
         if not new_pending_tasks:
-            remaining = batch_limit - workers_started
+            remaining = effective_start_budget - workers_started
             new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
         for pt in new_pending_tasks:
-            if workers_started >= batch_limit:
+            if workers_started >= effective_start_budget:
                 break
             if _advance_uses_iterate(config) and pt.task_type == "implement":
                 iterate_args = argparse.Namespace(

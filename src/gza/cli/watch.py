@@ -19,6 +19,14 @@ from rich.text import Text
 
 from .. import colors as _colors, lineage
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
+from ..concurrency import (
+    LaunchPermit,
+    MaxConcurrentTasksError,
+    get_concurrency_snapshot,
+    launch_permit,
+    release_task_launch_permit,
+    reserve_task_launch_permit,
+)
 from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -1285,7 +1293,9 @@ def _run_cycle(
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
 
-    live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=not dry_run)
+    running_task_ids = list(snapshot.running_task_ids)
+    anonymous_worker_count = snapshot.anonymous_worker_count
     running_task_id_set = set(running_task_ids)
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     blocked_pending_count = sum(
@@ -1295,8 +1305,9 @@ def _run_cycle(
         and task_matches_tag_filters(task_tags=pending_task.tags, tag_filters=tags, any_tag=any_tag)
         and store.is_task_blocked(pending_task)[0]
     )
-    running = len(live_pids)
-    slots = max(0, batch - running)
+    running = snapshot.running
+    effective_batch = min(batch, snapshot.limit)
+    slots = max(0, effective_batch - running)
     work_done = False
     started_task_ids: set[str] = set()
     step1_handled_child_task_ids: set[str] = set()
@@ -1315,6 +1326,38 @@ def _run_cycle(
     scope_message = _format_scope_message(tags, any_tag=any_tag)
     if scope_message is not None:
         log.emit("INFO", scope_message)
+
+    def _reserve_watch_launch(worker_label: str, subject_task_id: str) -> LaunchPermit | None:
+        try:
+            return launch_permit(config, store)
+        except MaxConcurrentTasksError as exc:
+            log.emit(
+                "SKIP",
+                f"{subject_task_id}: {exc}",
+                dedupe_key=f"watch-max-concurrent:{worker_label}:{subject_task_id}",
+            )
+            return None
+
+    def _prepare_watch_reserved_task(
+        task: DbTask,
+        *,
+        permit: LaunchPermit,
+        rollback_on_failure: bool,
+    ) -> DbTask | None:
+        prepared_task = _prepare_task_for_immediate_execution(
+            config,
+            task,
+            rollback_on_failure=rollback_on_failure,
+        )
+        if prepared_task is None:
+            permit.release()
+            return None
+        if prepared_task.id is not None:
+            reserve_task_launch_permit(str(prepared_task.id), permit)
+        return prepared_task
+
+    def _release_watch_reserved_task(task_id: str | None) -> None:
+        release_task_launch_permit(task_id)
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
@@ -1683,14 +1726,19 @@ def _run_cycle(
                                 )
                                 _rebuild_isolated_checkout()
                             try:
+                                reserved_launch = _reserve_watch_launch("rebase", str(display_task.id))
+                                if reserved_launch is None:
+                                    continue
                                 rebase_task = _create_rebase_from_task(task)
                             except Exception as rebase_error:
+                                if reserved_launch is not None:
+                                    reserved_launch.release()
                                 log.emit("ERROR", f"{display_task.id}: failed to create rebase task ({rebase_error})")
                                 continue
                             assert rebase_task.id is not None
-                            prepared_rebase_task = _prepare_task_for_immediate_execution(
-                                config,
+                            prepared_rebase_task = _prepare_watch_reserved_task(
                                 rebase_task,
+                                permit=reserved_launch,
                                 rollback_on_failure=True,
                             )
                             if prepared_rebase_task is None:
@@ -1703,6 +1751,7 @@ def _run_cycle(
                             work_done = True
                             if slots > 0:
                                 rebase_rc = _watch_spawn_worker(prepared_rebase_task, "rebase")
+                                _release_watch_reserved_task(str(prepared_rebase_task.id))
                                 if rebase_rc == 0:
                                     log.emit("START", f"{prepared_rebase_task.id} rebase")
                                     started_task_ids.add(str(prepared_rebase_task.id))
@@ -1714,6 +1763,7 @@ def _run_cycle(
                                         dedupe_key=f"merge-conflict-rebase-spawn-failed:{display_task.id}",
                                     )
                             else:
+                                _release_watch_reserved_task(str(prepared_rebase_task.id))
                                 log.emit(
                                     "SKIP",
                                     f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
@@ -2014,18 +2064,25 @@ def _run_cycle(
                 launched_recovery_count += 1
                 continue
             if decision.launch_mode == "worker":
+                reserved_launch = _reserve_watch_launch("resume", str(failed.id))
+                if reserved_launch is None:
+                    continue
                 if decision.reuse_existing:
                     assert decision.recovery_task_id is not None
                     recovered_task_id = decision.recovery_task_id
                     recovered_task = store.get(recovered_task_id)
                     assert recovered_task is not None
                 else:
-                    recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                    try:
+                        recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                    except Exception:
+                        reserved_launch.release()
+                        raise
                     assert recovered_task.id is not None
                     recovered_task_id = str(recovered_task.id)
-                prepared_recovered_task = _prepare_task_for_immediate_execution(
-                    config,
+                prepared_recovered_task = _prepare_watch_reserved_task(
                     recovered_task,
+                    permit=reserved_launch,
                     rollback_on_failure=not decision.reuse_existing,
                 )
                 if prepared_recovered_task is None:
@@ -2045,16 +2102,24 @@ def _run_cycle(
                         startup_quiet=True,
                     ),
                 )
+                _release_watch_reserved_task(recovered_task_id)
             else:
+                reserved_launch = _reserve_watch_launch("iterate", str(failed.id))
+                if reserved_launch is None:
+                    continue
                 if decision.reuse_existing:
                     assert decision.recovery_task_id is not None
                     recovered_task = store.get(decision.recovery_task_id)
                     assert recovered_task is not None
                 else:
-                    recovered_task = _create_resume_task(store, failed, trigger_source="watch")
-                prepared_recovered_task = _prepare_task_for_immediate_execution(
-                    config,
+                    try:
+                        recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                    except Exception:
+                        reserved_launch.release()
+                        raise
+                prepared_recovered_task = _prepare_watch_reserved_task(
                     recovered_task,
+                    permit=reserved_launch,
                     rollback_on_failure=not decision.reuse_existing,
                 )
                 if prepared_recovered_task is None:
@@ -2082,6 +2147,7 @@ def _run_cycle(
                         startup_quiet=True,
                     ),
                 )
+                _release_watch_reserved_task(recovered_task_id)
         else:
             if dry_run:
                 destination = decision.recovery_task_id or "(new task)"
@@ -2098,6 +2164,12 @@ def _run_cycle(
                 work_done = True
                 launched_recovery_count += 1
                 continue
+            reserved_launch = _reserve_watch_launch(
+                "iterate" if decision.launch_mode != "worker" else "retry",
+                str(failed.id),
+            )
+            if reserved_launch is None:
+                continue
             if decision.reuse_existing:
                 assert decision.recovery_task_id is not None
                 recovered_task_id = decision.recovery_task_id
@@ -2105,17 +2177,21 @@ def _run_cycle(
                 assert existing_recovered_task is not None
                 recovered_task = existing_recovered_task
             else:
-                recovered_task = _create_retry_task(
-                    store,
-                    failed,
-                    trigger_source="watch",
-                    automatic_recovery=True,
-                )
+                try:
+                    recovered_task = _create_retry_task(
+                        store,
+                        failed,
+                        trigger_source="watch",
+                        automatic_recovery=True,
+                    )
+                except Exception:
+                    reserved_launch.release()
+                    raise
                 assert recovered_task.id is not None
                 recovered_task_id = str(recovered_task.id)
-            prepared_recovered_task = _prepare_task_for_immediate_execution(
-                config,
+            prepared_recovered_task = _prepare_watch_reserved_task(
                 recovered_task,
+                permit=reserved_launch,
                 rollback_on_failure=not decision.reuse_existing,
             )
             if prepared_recovered_task is None:
@@ -2160,6 +2236,7 @@ def _run_cycle(
                     ),
                 )
             )
+            _release_watch_reserved_task(recovered_task_id)
 
         if rc != 0:
             continue
@@ -2246,9 +2323,12 @@ def _run_cycle(
                     auto_iterate=True,
                 )
                 pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
-                prepared_pending_task = _prepare_task_for_immediate_execution(
-                    config,
+                reserved_launch = _reserve_watch_launch("iterate", str(task.id))
+                if reserved_launch is None:
+                    continue
+                prepared_pending_task = _prepare_watch_reserved_task(
                     task,
+                    permit=reserved_launch,
                     rollback_on_failure=False,
                 )
                 if prepared_pending_task is None:
@@ -2273,6 +2353,7 @@ def _run_cycle(
                         startup_quiet=True,
                     ),
                 )
+                _release_watch_reserved_task(str(prepared_pending_task.id))
                 if rc != 0:
                     continue
                 refreshed_pending_task = store.get(str(task.id))

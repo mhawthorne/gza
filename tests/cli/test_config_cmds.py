@@ -1496,8 +1496,10 @@ class TestLocalConfigOverrides:
         assert result.returncode == 0
         assert "watch.restart_failed_batch" in result.stdout
         assert "watch.no_activity_timeout" in result.stdout
+        assert "max_concurrent" in result.stdout
         assert "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active." in result.stdout
         assert "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`." in result.stdout
+        assert "Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`." in result.stdout
         assert (
             "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
             in result.stdout
@@ -1532,6 +1534,7 @@ class TestLocalConfigOverrides:
         keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
         assert keyed_entries["watch.restart_failed_batch"]["default"] == 1
         assert keyed_entries["watch.no_activity_timeout"]["default"] == 60
+        assert keyed_entries["max_concurrent"]["default"] == "watch.batch or 5"
         assert (
             keyed_entries["watch.restart_failed_batch"]["description"]
             == "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active."
@@ -1539,6 +1542,10 @@ class TestLocalConfigOverrides:
         assert (
             keyed_entries["watch.no_activity_timeout"]["description"]
             == "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`."
+        )
+        assert (
+            keyed_entries["max_concurrent"]["description"]
+            == "Hard global ceiling on concurrently running task-executing processes across all commands. Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`."
         )
         assert (
             keyed_entries["max_resume_attempts"]["description"]
@@ -1558,6 +1565,42 @@ class TestLocalConfigOverrides:
 
         assert result.returncode == 0
         assert result.stdout == Path("src/gza/gza.local.yaml.example").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        ("local", "artifact_name", "config_name"),
+        [
+            (False, "gza.yaml.example", "gza.yaml"),
+            (True, "gza.local.yaml.example", "gza.local.yaml"),
+        ],
+    )
+    def test_config_example_max_concurrent_sample_renders_valid_int_and_loads(
+        self,
+        tmp_path: Path,
+        local: bool,
+        artifact_name: str,
+        config_name: str,
+    ) -> None:
+        """Generated config examples should document dynamic defaults without emitting an invalid sample value."""
+        setup_config(tmp_path)
+
+        rendered = run_gza(
+            "config",
+            "example",
+            *(["--local"] if local else []),
+            "--project",
+            str(tmp_path),
+        )
+
+        assert rendered.returncode == 0
+        assert '"watch.batch or 5"' not in rendered.stdout
+        assert "# max_concurrent: 5" in rendered.stdout
+        assert rendered.stdout == Path(f"src/gza/{artifact_name}").read_text(encoding="utf-8")
+
+        uncommented = rendered.stdout.replace("# max_concurrent: 5", "max_concurrent: 5", 1)
+        (tmp_path / config_name).write_text(uncommented, encoding="utf-8")
+
+        config = Config.load(tmp_path)
+        assert config.max_concurrent == 5
 
     def test_config_example_output_and_check_round_trip(self, tmp_path: Path):
         """`config example` should support explicit write targets and drift checks."""
@@ -4346,6 +4389,49 @@ class TestWatchConfigValidation:
         assert config.watch.poll == 45
         assert config.watch.max_idle == 180
         assert config.watch.max_iterations == 9
+
+    def test_config_max_concurrent_defaults_to_watch_batch_when_unset(self, tmp_path: Path) -> None:
+        """Absent max_concurrent should inherit the effective watch.batch value."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "watch:\n  batch: 7\n")
+        config = Config.load(tmp_path)
+        assert config.watch.batch == 7
+        assert config.max_concurrent == 7
+
+    def test_config_max_concurrent_defaults_to_five_when_both_fields_are_unset(self, tmp_path: Path) -> None:
+        """Absent max_concurrent and watch.batch should preserve the legacy default of 5."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+        config = Config.load(tmp_path)
+        assert config.watch.batch == 5
+        assert config.max_concurrent == 5
+
+    def test_config_explicit_max_concurrent_overrides_watch_batch(self, tmp_path: Path) -> None:
+        """Explicit max_concurrent should win over watch.batch."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "max_concurrent: 3\nwatch:\n  batch: 7\n")
+        config = Config.load(tmp_path)
+        assert config.watch.batch == 7
+        assert config.max_concurrent == 3
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("bad", "'max_concurrent' must be an integer"),
+            ("0", "'max_concurrent' must be positive"),
+        ],
+    )
+    def test_config_invalid_explicit_max_concurrent_still_fails(self, tmp_path: Path, value: str, message: str) -> None:
+        """Explicit max_concurrent validation should remain unchanged."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"max_concurrent: {value}\n")
+
+        with pytest.raises(ConfigError, match=re.escape(message)):
+            Config.load(tmp_path)
 
     def test_config_watch_defaults_include_no_activity_timeout(self, tmp_path: Path) -> None:
         """Config.load preserves the default watch no-activity timeout when unset."""

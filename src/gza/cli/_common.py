@@ -25,6 +25,12 @@ from rich.pager import Pager
 from rich.panel import Panel
 
 from ..branch_resolution import resolve_rebase_target_branch, resolve_rebase_target_task
+from ..concurrency import (
+    LaunchPermit,
+    launch_permit,
+    reserve_task_launch_permit,
+    take_task_launch_permit,
+)
 from ..config import Config
 from ..console import (
     MAX_PROMPT_DISPLAY,
@@ -74,6 +80,8 @@ from ..workers import WorkerMetadata, WorkerRegistry
 
 _REUSE_WORKER_OWNER_ENV = "GZA_REUSE_WORKER_OWNER"
 _REUSE_WORKER_OWNER_OUTER = "outer"
+_REUSE_WORKER_REENTRY_ENV = "GZA_REUSE_WORKER_REENTRY"
+_REUSE_WORKER_SESSION_ENV = "GZA_REUSE_WORKER_SESSION"
 
 
 def format_task_status_text(task: DbTask) -> str:
@@ -710,13 +718,96 @@ def _prepare_task_for_immediate_execution(
     return prepared
 
 
+def _reserve_task_launch_after_prepare(
+    task: DbTask | None,
+    permit: LaunchPermit | None,
+) -> DbTask | None:
+    if task is None or permit is None or task.id is None:
+        return task
+    reserve_task_launch_permit(str(task.id), permit)
+    return task
+
+
+def _prepare_task_for_reserved_launch(
+    config: Config,
+    task: DbTask,
+    *,
+    permit: LaunchPermit,
+    rollback_on_failure: bool,
+    rollback_cleanup: Callable[[], None] | None = None,
+) -> DbTask | None:
+    prepared = _prepare_task_for_immediate_execution(
+        config,
+        task,
+        rollback_on_failure=rollback_on_failure,
+        rollback_cleanup=rollback_cleanup,
+    )
+    if prepared is None:
+        permit.release()
+        return None
+    return _reserve_task_launch_after_prepare(prepared, permit)
+
+
+def _prepare_task_for_launch(
+    config: Config,
+    task: DbTask,
+    *,
+    rollback_on_failure: bool,
+    rollback_cleanup: Callable[[], None] | None = None,
+    allow_same_pid_reentry: bool = False,
+    permit: LaunchPermit | None = None,
+) -> tuple[DbTask, LaunchPermit] | None:
+    store = get_store(config)
+    original_slug = task.slug
+    original_log_file = task.log_file
+    acquired_permit = permit
+    try:
+        if acquired_permit is None:
+            acquired_permit = launch_permit(
+                config,
+                store,
+                current_pid=os.getpid() if allow_same_pid_reentry else None,
+            )
+        prepared = prepare_task_startup_phase(config, store, task)
+    except Exception as exc:
+        if acquired_permit is not None:
+            acquired_permit.release()
+        if rollback_on_failure and task.id is not None:
+            remove_task_startup_artifacts(config, task)
+            if rollback_cleanup is not None:
+                rollback_cleanup()
+            store.delete(task.id)
+        elif task.id is not None:
+            remove_task_startup_artifacts(config, task)
+            restored_task = store.get(task.id) or task
+            restored_task.slug = original_slug
+            restored_task.log_file = original_log_file
+            store.update(restored_task)
+        print(f"Error: {exc}", file=sys.stderr)
+        return None
+    assert acquired_permit is not None
+    return prepared, acquired_permit
+
+
+def _acquire_background_launch_permit(config: Config, store: SqliteTaskStore) -> LaunchPermit | None:
+    """Acquire a launch permit while preserving detached phase-1 error handling."""
+    try:
+        return launch_permit(config, store)
+    except Exception as exc:
+        _print_background_phase1_error(str(exc))
+        return None
+
+
 def _run_foreground(
     config: Config,
     task_id: str | None,
     resume: bool = False,
     open_after: bool = False,
     force: bool = False,
+    create_pr: bool = False,
+    phase1_args: argparse.Namespace | None = None,
     invocation: RunInvocationContext | None = None,
+    prepared_task: DbTask | None = None,
 ) -> int:
     """Run a task in the foreground with worker registration.
 
@@ -732,26 +823,41 @@ def _run_foreground(
         invocation: Optional runner invocation context.
     """
     registry = WorkerRegistry(config.workers_path)
+    store = get_store(config)
     worker_id = os.environ.get("GZA_WORKER_ID")
     worker_mode = os.environ.get("GZA_WORKER_MODE")
     worker = None
     reuse_existing_worker = False
-    reused_registered_worker = False
+    worker_registered = False
     if worker_id and worker_mode == "1":
-        reused_registered_worker = registry.get(worker_id) is not None
-        worker = registry.ensure_running(
-            WorkerMetadata(
-                worker_id=worker_id,
-                task_id=task_id,
-                pid=os.getpid(),
-                is_background=False,
-            )
-        )
         reuse_existing_worker = True
-    outer_worker_owns_completion = reused_registered_worker and (
-        os.environ.get(_REUSE_WORKER_OWNER_ENV) == _REUSE_WORKER_OWNER_OUTER
+        existing_worker = registry.get(worker_id)
+        if existing_worker is not None:
+            worker = registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=task_id,
+                    pid=os.getpid(),
+                    is_background=False,
+                )
+            )
+            worker_registered = True
+    allow_registered_worker_reentry = worker_registered and os.environ.get(_REUSE_WORKER_REENTRY_ENV, "1") == "1"
+    outer_worker_owns_completion = (
+        os.environ.get(_REUSE_WORKER_SESSION_ENV) == "1"
+        and os.environ.get(_REUSE_WORKER_OWNER_ENV) == _REUSE_WORKER_OWNER_OUTER
     )
-    if worker is None:
+    allow_registered_worker_reentry = allow_registered_worker_reentry or (
+        outer_worker_owns_completion and os.environ.get(_REUSE_WORKER_REENTRY_ENV, "1") == "1"
+    )
+    if worker is None and worker_id and worker_mode == "1":
+        worker = WorkerMetadata(
+            worker_id=worker_id,
+            task_id=task_id,
+            pid=os.getpid(),
+            is_background=False,
+        )
+    elif worker is None:
         worker_id = registry.generate_worker_id()
         worker = WorkerMetadata(
             worker_id=worker_id,
@@ -759,7 +865,6 @@ def _run_foreground(
             pid=os.getpid(),
             is_background=False,
         )
-        registry.register(worker)
 
     # Save original signal handlers so we can restore them in the finally block
     original_sigint = signal.getsignal(signal.SIGINT)
@@ -779,13 +884,67 @@ def _run_foreground(
     signal.signal(signal.SIGINT, _cleanup)
     signal.signal(signal.SIGTERM, _cleanup)
 
+    permit: LaunchPermit | None = None
     try:
         if resume and task_id is not None:
             rebase_exit_code = _auto_rebase_before_resume(config, task_id)
             if rebase_exit_code != 0:
-                if not reuse_existing_worker or not outer_worker_owns_completion:
+                if not worker_registered and not reuse_existing_worker:
+                    registry.register(worker)
+                    worker_registered = True
+                if worker_registered and (not reuse_existing_worker or not outer_worker_owns_completion):
                     registry.mark_completed(worker.worker_id, exit_code=rebase_exit_code, status="failed")
                 return rebase_exit_code
+        if prepared_task is not None and prepared_task.id is not None:
+            permit = take_task_launch_permit(str(prepared_task.id))
+            task_id = str(prepared_task.id)
+        elif task_id is not None:
+            permit = take_task_launch_permit(task_id)
+            if permit is not None:
+                task = store.get(task_id)
+                if task is None:
+                    if phase1_args is not None:
+                        return phase1_error(phase1_args, f"Task {task_id} not found")
+                    print(f"Error: Task {task_id} not found", file=sys.stderr)
+                    permit.release()
+                    return 1
+            else:
+                task = store.get(task_id)
+                if task is None:
+                    if phase1_args is not None:
+                        return phase1_error(phase1_args, f"Task {task_id} not found")
+                    print(f"Error: Task {task_id} not found", file=sys.stderr)
+                    return 1
+                prepared_launch = _prepare_task_for_launch(
+                    config,
+                    task,
+                    rollback_on_failure=False,
+                    allow_same_pid_reentry=allow_registered_worker_reentry,
+                )
+                if prepared_launch is None:
+                    return 1
+                _prepared_task, permit = prepared_launch
+        else:
+            try:
+                permit = launch_permit(
+                    config,
+                    store,
+                    current_pid=os.getpid() if allow_registered_worker_reentry else None,
+                )
+            except Exception as exc:
+                if phase1_args is not None:
+                    return phase1_error(phase1_args, str(exc))
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        if not worker_registered:
+            registry.register(worker)
+            worker_registered = True
+
+        def _on_task_claimed(_claimed_task: DbTask) -> None:
+            if permit is not None:
+                permit.release()
+
         if invocation is None:
             exit_code = run(
                 config,
@@ -793,6 +952,8 @@ def _run_foreground(
                 resume=resume,
                 open_after=open_after,
                 skip_precondition_check=force,
+                create_pr=create_pr,
+                on_task_claimed=_on_task_claimed,
             )
         else:
             exit_code = run(
@@ -801,14 +962,20 @@ def _run_foreground(
                 resume=resume,
                 open_after=open_after,
                 skip_precondition_check=force,
+                create_pr=create_pr,
+                on_task_claimed=_on_task_claimed,
                 invocation=invocation,
             )
+        if permit is not None:
+            permit.release()
         status = "completed" if exit_code == 0 else "failed"
         if not reuse_existing_worker or not outer_worker_owns_completion:
             registry.mark_completed(worker.worker_id, exit_code=exit_code, status=status)
         return exit_code
     except KeyboardInterrupt:
-        if not reuse_existing_worker or not outer_worker_owns_completion:
+        if permit is not None:
+            permit.release()
+        if worker_registered and (not reuse_existing_worker or not outer_worker_owns_completion):
             registry.mark_completed(worker.worker_id, exit_code=130, status="failed")
         return 130
     finally:
@@ -905,13 +1072,27 @@ def _spawn_background_worker(
 
     assert selected_task is not None
 
+    permit: LaunchPermit | None = None
     if prepared_task is None:
-        prepared_task = _prepare_task_for_immediate_execution(
+        reserved_task_id = str(explicit_task_id) if explicit_task_id is not None else (
+            str(selected_task.id) if selected_task.id is not None else None
+        )
+        permit = take_task_launch_permit(reserved_task_id)
+        prepared_launch = _prepare_task_for_launch(
             config,
             selected_task,
             rollback_on_failure=False,
+            permit=permit,
         )
-        if prepared_task is None:
+        if prepared_launch is None:
+            return 1
+        prepared_task, permit = prepared_launch
+    else:
+        reserved_task_id = str(prepared_task.id) if prepared_task.id is not None else explicit_task_id
+        permit = take_task_launch_permit(reserved_task_id)
+        if permit is None:
+            permit = _acquire_background_launch_permit(config, store)
+        if permit is None:
             return 1
     selected_task = prepared_task
     task_id_for_child = explicit_task_id or selected_task.id
@@ -1057,6 +1238,8 @@ def _spawn_background_worker(
             tmux_session=tmux_session,
         )
         registry.ensure_running(worker_metadata)
+        if permit is not None:
+            permit.release()
 
         _print_background_worker_started(
             selected_task,
@@ -1069,6 +1252,8 @@ def _spawn_background_worker(
         return 0
 
     except Exception as e:
+        if permit is not None:
+            permit.release()
         _rollback_background_worker_launch(
             registry=registry,
             worker_id=worker_id,
@@ -1259,13 +1444,21 @@ def _spawn_background_resume_worker(
     if not task:
         _print_background_phase1_error(f"Task {new_task_id} not found")
         return 1
+    permit: LaunchPermit | None = None
     if prepared_task is None:
-        task = _prepare_task_for_immediate_execution(
+        prepared_launch = _prepare_task_for_launch(
             config,
             task,
             rollback_on_failure=False,
         )
-        if task is None:
+        if prepared_launch is None:
+            return 1
+        task, permit = prepared_launch
+    else:
+        permit = take_task_launch_permit(str(prepared_task.id) if prepared_task.id is not None else new_task_id)
+        if permit is None:
+            permit = _acquire_background_launch_permit(config, store)
+        if permit is None:
             return 1
 
     # Build command for worker subprocess
@@ -1303,6 +1496,8 @@ def _spawn_background_resume_worker(
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
+        if permit is not None:
+            permit.release()
 
         _print_background_worker_started(
             task,
@@ -1315,6 +1510,8 @@ def _spawn_background_resume_worker(
         return 0
 
     except Exception as e:
+        if permit is not None:
+            permit.release()
         _rollback_background_worker_launch(
             registry=registry,
             worker_id=worker_id,
@@ -1384,6 +1581,12 @@ def _spawn_background_iterate_worker(
         print(f"[dry-run] Would spawn background iterate worker: {shlex.join(inner_cmd)}")
         return 0
 
+    permit = take_task_launch_permit(prepared_task_id)
+    if permit is None:
+        permit = _acquire_background_launch_permit(config, get_store(config))
+    if permit is None:
+        return 1
+
     worker_id = registry.generate_worker_id()
     inner_cmd.extend(["--worker-id", worker_id])
     proc: subprocess.Popen | None = None
@@ -1396,6 +1599,7 @@ def _spawn_background_iterate_worker(
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
+        permit.release()
         _print_background_worker_started(
             display_task,
             pid=proc.pid,
@@ -1404,6 +1608,7 @@ def _spawn_background_iterate_worker(
         )
         return 0
     except Exception as e:
+        permit.release()
         _rollback_background_worker_launch(
             registry=registry,
             worker_id=worker_id,

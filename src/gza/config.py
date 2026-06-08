@@ -75,6 +75,7 @@ DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 2
 DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
+DEFAULT_MAX_CONCURRENT = 5
 DEFAULT_WATCH_BATCH = 5
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT = 60
@@ -111,7 +112,7 @@ VALID_CONFIG_FIELDS = {
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
     "verify_command", "inner_verify_command",
     "advance_create_reviews", "require_review_before_merge", "pr_integration", "advance_mode", "max_resume_attempts",
-    "max_review_cycles", "max_noop_improve_cycles", "max_failed_closing_review_retries",
+    "max_review_cycles", "max_noop_improve_cycles", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
@@ -187,6 +188,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "require_review_before_merge": None,
     "pr_integration": None,
     "max_resume_attempts": None,
+    "max_concurrent": None,
     "max_review_cycles": None,
     "max_noop_improve_cycles": None,
     "max_failed_closing_review_retries": None,
@@ -301,6 +303,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     },
     "iterate_max_iterations": None,
     "max_resume_attempts": None,
+    "max_concurrent": None,
     "max_review_cycles": None,
     "max_noop_improve_cycles": None,
     "max_failed_closing_review_retries": None,
@@ -907,6 +910,7 @@ class Config:
     pr_integration: bool = DEFAULT_PR_INTEGRATION
     advance_mode: str = DEFAULT_ADVANCE_MODE
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
@@ -1821,6 +1825,12 @@ class Config:
             raise ConfigError("watch.batch must be a positive integer")
         if watch_batch < 1:
             raise ConfigError("watch.batch must be a positive integer")
+        if "max_concurrent" in data:
+            max_concurrent = _load_strict_int_field(data, "max_concurrent", DEFAULT_MAX_CONCURRENT)
+            if max_concurrent <= 0:
+                raise ConfigError("'max_concurrent' must be positive")
+        else:
+            max_concurrent = watch_batch
         try:
             watch_poll = int(watch_data.get("poll", DEFAULT_WATCH_POLL))
         except (TypeError, ValueError):
@@ -2127,6 +2137,7 @@ class Config:
             pr_integration=pr_integration,
             advance_mode=advance_mode,
             max_resume_attempts=max_resume_attempts,
+            max_concurrent=max_concurrent,
             max_review_cycles=max_review_cycles,
             max_noop_improve_cycles=max_noop_improve_cycles,
             max_failed_closing_review_retries=max_failed_closing_review_retries,
@@ -2553,6 +2564,11 @@ class Config:
                 errors.append("'max_resume_attempts' must be an integer")
             elif data["max_resume_attempts"] < 0:
                 errors.append("'max_resume_attempts' must be non-negative")
+        if "max_concurrent" in data:
+            if not _is_strict_int(data["max_concurrent"]):
+                errors.append("'max_concurrent' must be an integer")
+            elif data["max_concurrent"] <= 0:
+                errors.append("'max_concurrent' must be positive")
         if "max_review_cycles" in data:
             if not _is_strict_int(data["max_review_cycles"]):
                 errors.append("'max_review_cycles' must be an integer")

@@ -292,11 +292,11 @@ def _render_node(
 
 def _render_generic_node(key: str, node: _Node, full_path: str, indent: int) -> list[str]:
     if node.spec and not node.children:
-        return _render_simple_setting(node.spec, key, indent, enabled=False, value=node.spec.default)
+        return _render_simple_setting(node.spec, key, indent, enabled=False, value=_example_value(node.spec))
 
     lines: list[str] = []
     if node.spec:
-        lines.extend(_render_simple_setting(node.spec, key, indent, enabled=False, value=node.spec.default))
+        lines.extend(_render_simple_setting(node.spec, key, indent, enabled=False, value=_example_value(node.spec)))
         lines.append("")
 
     lines.extend(_render_container(key, indent, enabled=False))
@@ -322,7 +322,7 @@ def _render_branch_strategy(node: _Node, indent: int, branch_strategy: BranchStr
                     child_key,
                     indent + 2,
                     enabled=False,
-                    value=child.spec.default if child.spec else None,
+                    value=_example_value(child.spec),
                 )
             )
         return lines
@@ -360,6 +360,15 @@ def _render_simple_setting(
     return lines
 
 
+def _example_value(spec: ConfigKeySpec | None) -> object | None:
+    """Return the sample value to render in generated example YAML."""
+    if spec is None:
+        return None
+    if spec.example_value is not None:
+        return spec.example_value
+    return spec.default
+
+
 def _render_container(key: str, indent: int, *, enabled: bool) -> list[str]:
     prefix = "" if enabled else "# "
     return [f"{prefix}{' ' * indent}{key}:"]
@@ -374,7 +383,12 @@ def _render_spec_comments(
     lines: list[str] = []
     if spec is not None:
         lines.extend(_wrap_comment(spec.description, indent=indent))
-        default_text = "(required)" if spec.required else _format_inline_scalar(spec.default)
+        if spec.required:
+            default_text = "(required)"
+        elif spec.example_value is not None and isinstance(spec.default, str):
+            default_text = spec.default
+        else:
+            default_text = _format_inline_scalar(spec.default)
         lines.append(f"# {' ' * indent}Default: {default_text}")
     if extra_comments:
         for extra in extra_comments:

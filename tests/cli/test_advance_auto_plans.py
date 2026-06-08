@@ -848,7 +848,8 @@ def test_advance_creates_exactly_one_closing_review_after_completed_improve(
                 message=f"Created review task {closing_review.id}",
             ),
         ) as create_review,
-        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.git_ops.launch_permit"),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         rc = cmd_advance(_advance_args(tmp_path))

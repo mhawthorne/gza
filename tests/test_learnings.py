@@ -1,17 +1,20 @@
 """Tests for learnings generation."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.concurrency import _PROCESS_LOCKS
 from gza.learnings import (
     LearningsResult,
     _build_summarization_prompt,
     _extract_learnings_from_output,
     _flatten_categorized,
+    _run_learnings_task,
     maybe_auto_regenerate_learnings,
     regenerate_learnings,
 )
@@ -376,6 +379,70 @@ def test_internal_task_kept_after_failure(tmp_path: Path):
 
     assert len(captured_internal_task_id) == 1
     assert store.get(captured_internal_task_id[0]) is not None
+
+
+def test_run_learnings_task_refuses_at_capacity_without_creating_internal_task(tmp_path: Path):
+    """Capacity refusal must happen before persisting the internal learnings task row."""
+    store = _new_store(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text("project_name: test\nmax_concurrent: 1\n")
+    config = Config.load(tmp_path)
+
+    completed = store.add("Completed task", task_type="implement")
+    store.mark_completed(completed, output_content="- Learn pattern\n", has_commits=False)
+
+    running = store.add("Running task", task_type="implement")
+    running.status = "in_progress"
+    running.running_pid = 424242
+    store.update(running)
+
+    with (
+        patch("gza.concurrency._best_effort_stale_cleanup", return_value=None),
+        patch("gza.concurrency._pid_alive", side_effect=lambda pid: pid == 424242),
+        patch("gza.runner.run", side_effect=AssertionError("runner should not start at capacity")),
+        patch("gza.learnings.console.print") as mock_print,
+    ):
+        result = _run_learnings_task(store, config, [completed])
+
+    assert result is None
+    assert [task for task in store.get_all() if task.task_type == "internal"] == []
+    assert _PROCESS_LOCKS == {}
+    assert any(
+        "already at max concurrent tasks: 1 running, limit is 1" in str(call.args[0])
+        for call in mock_print.call_args_list
+    )
+
+
+def test_run_learnings_task_allows_same_pid_reentry_at_max_concurrent_one(tmp_path: Path):
+    """Nested learnings generation should reuse the current worker slot."""
+    store = _new_store(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text("project_name: test\nmax_concurrent: 1\n")
+    config = Config.load(tmp_path)
+
+    completed = store.add("Completed task", task_type="implement")
+    store.mark_completed(completed, output_content="- Learn pattern\n", has_commits=False)
+
+    running = store.add("Outer running task", task_type="implement")
+    running.status = "in_progress"
+    running.running_pid = os.getpid()
+    store.update(running)
+
+    def _complete_internal_task(_config, task_id=None, **kwargs):
+        internal_task = store.get(task_id)
+        assert internal_task is not None
+        internal_task.status = "completed"
+        internal_task.output_content = "## Testing Patterns\n- Keep targeted launch-capacity regressions\n"
+        store.update(internal_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=_complete_internal_task):
+        result = _run_learnings_task(store, config, [completed])
+
+    assert result is not None
+    assert result["Testing Patterns"] == ["Keep targeted launch-capacity regressions"]
+    internal_tasks = [task for task in store.get_all() if task.task_type == "internal"]
+    assert len(internal_tasks) == 1
 
 
 def test_internal_task_not_in_get_recent_completed(tmp_path: Path):

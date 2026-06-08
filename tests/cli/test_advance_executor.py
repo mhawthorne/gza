@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,8 @@ from gza.cli.advance_executor import (
     resolve_execution_needs_attention,
     run_noop_improve_verify_then_review,
 )
+from gza.config import Config
+from gza.concurrency import launch_permit
 from gza.db import Task as DbTask
 from gza.git import GitError
 from gza.recovery_engine import decide_failed_task_recovery
@@ -1442,6 +1445,126 @@ def test_verify_noop_improve_then_review_can_route_through_iterate_before_runnin
     assert spawned == [(impl.id, "iterate")]
 
 
+def test_verify_noop_improve_then_review_skips_at_max_concurrent_without_creating_review(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    running = store.add("Running task", task_type="implement")
+    running.status = "in_progress"
+    running.running_pid = os.getpid()
+    store.update(running)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/noop-capacity")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    before_ids = {task.id for task in store.get_all()}
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("review creation should not run at max concurrent"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("spawn should not run"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=SimpleNamespace(),
+    )
+
+    def _fake_reverify(*, task: DbTask, action: dict[str, Any], context: AdvanceActionExecutionContext):
+        del action
+        create_result = context.prepare_create_review(task)
+        if create_result.status != "created":
+            return SimpleNamespace(
+                status="error",
+                message=create_result.message,
+                verify_markdown="## verify_command result\n\nPassed\n",
+                review_task=None,
+            )
+        return SimpleNamespace(
+            status="create_review",
+            message=create_result.message,
+            verify_markdown="## verify_command result\n\nPassed\n",
+            review_task=create_result.review_task,
+        )
+
+    with patch("gza.cli.advance_executor.run_noop_improve_verify_then_review", side_effect=_fake_reverify):
+        result = execute_advance_action(
+            task=impl,
+            action={"type": "verify_noop_improve_then_review", "review_task": review},
+            context=context,
+        )
+
+    assert result.status == "error"
+    assert result.message == "SKIP: already at max concurrent tasks: 1 running, limit is 1"
+    assert {task.id for task in store.get_all()} == before_ids
+
+
+def test_retry_iterate_missing_launcher_releases_reserved_launch_permit(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_retry_task=lambda task: _create_retry_task(store, task, trigger_source="manual"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_recovery=None,
+        config=config,
+    )
+
+    result = execute_advance_action(
+        task=failed,
+        action={"type": "retry", "launch_mode": "iterate"},
+        context=context,
+    )
+
+    assert result.status == "error"
+    assert result.message == "missing iterate recovery launcher"
+
+    permit = launch_permit(config, store)
+    permit.release()
+
+
 def test_run_improve_can_return_fail_closed_iterate_skip_result(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1785,6 +1908,61 @@ def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> N
     assert len(store.get_all()) == before_count
     rebase_rows = [t for t in store.get_all() if t.task_type == "rebase"]
     assert rebase_rows == []
+
+
+def test_needs_rebase_skips_at_max_concurrent_without_creating_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    running = store.add("Running task", task_type="implement")
+    running.status = "in_progress"
+    running.running_pid = os.getpid()
+    store.update(running)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/needs-rebase-cap")
+    store.update(impl)
+
+    before_count = len(store.get_all())
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        assert parent.branch is not None
+        return store.add(
+            prompt=f"Rebase {parent.branch}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("spawn must not run at max concurrent"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *_args, **_kwargs: pytest.fail("unused"),
+        config=config,
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    assert result.status == "skip"
+    assert result.message == "SKIP: already at max concurrent tasks: 1 running, limit is 1"
+    assert len(store.get_all()) == before_count
+    assert [task for task in store.get_all() if task.task_type == "rebase"] == []
 
 
 def test_needs_rebase_iterate_hands_prepared_metadata_to_spawn(tmp_path: Path) -> None:

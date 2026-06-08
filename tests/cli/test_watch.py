@@ -9,11 +9,12 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 from rich.console import Console
 
+from gza.concurrency import MaxConcurrentTasksError
 from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
@@ -287,6 +288,7 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.launch_permit"),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=prepare_pending_impl) as prepare_task,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
@@ -5474,7 +5476,8 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch.launch_permit"),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -5590,7 +5593,8 @@ def test_watch_cycle_reconcile_conflict_spawns_rebase_and_logs_start(tmp_path: P
                 rebase_target="origin/feature/watch-reconcile-conflict",
             ),
         ),
-        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch.launch_permit"),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -5778,6 +5782,7 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
         ),
         patch("gza.cli.watch._create_rebase_task", return_value=created_rebase),
+        patch("gza.cli.watch.launch_permit"),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", return_value=prepared_rebase) as prepare_task,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -5800,6 +5805,79 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
     assert spawn_worker.call_args.kwargs["task_id"] == prepared_rebase.id
     assert spawn_worker.call_args.kwargs["prepared_task"] is prepared_rebase
     assert f"START     {prepared_rebase.id} rebase" in log_path.read_text()
+
+
+def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creating_task(tmp_path: Path) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-rebase-cap"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.return_value = False
+
+    before_count = len(store.get_all())
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch(
+            "gza.cli.watch.get_concurrency_snapshot",
+            return_value=SimpleNamespace(
+                limit=1,
+                running=0,
+                available=1,
+                running_task_ids=(),
+                live_pids=frozenset(),
+                anonymous_worker_count=0,
+                current_pid_counted=False,
+            ),
+        ),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch(
+            "gza.cli.watch.launch_permit",
+            side_effect=MaxConcurrentTasksError("already at max concurrent tasks: 1 running, limit is 1"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert len(store.get_all()) == before_count
+    assert [row for row in store.get_all() if row.task_type == "rebase"] == []
+    assert "already at max concurrent tasks: 1 running, limit is 1" in log_path.read_text()
 
 
 def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_path: Path) -> None:
@@ -5828,7 +5906,8 @@ def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_pat
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase"}),
-        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch.launch_permit"),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):

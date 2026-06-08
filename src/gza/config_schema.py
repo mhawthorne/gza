@@ -12,6 +12,7 @@ class ConfigKeySpec:
     default: object | None
     description: str
     required: bool = False
+    example_value: object | None = None
 
 
 # Runtime-only Config dataclass fields; not user-configurable keys.
@@ -94,6 +95,13 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_noop_improve_cycles", "int", 2, "Cap for consecutive no-op improves before lifecycle automation stops for discussion."),
     ConfigKeySpec("max_failed_closing_review_retries", "int", 3, "Max consecutive failed closing-review attempts before the lineage is parked as needs_attention; 0 escalates on first failure."),
+    ConfigKeySpec(
+        "max_concurrent",
+        "int",
+        "watch.batch or 5",
+        "Hard global ceiling on concurrently running task-executing processes across all commands. Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`.",
+        example_value=5,
+    ),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),
     ConfigKeySpec("max_turns", "int", 50, "Deprecated global alias for `max_steps`."),
     ConfigKeySpec("main_checkout_isolate", "bool", False, "Stage watch-time merges in a detached integration checkout before advancing the real default branch on success."),

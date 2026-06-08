@@ -1,11 +1,14 @@
 """Tests for shared PR ensure/create behavior."""
 
+import os
 from unittest.mock import Mock, patch
 
+from gza.config import Config
+from gza.concurrency import _PROCESS_LOCKS
 from gza.db import SqliteTaskStore
 from gza.git import GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
-from gza.pr_ops import ensure_task_pr, lookup_task_pr, sync_task_branch_if_live_pr
+from gza.pr_ops import _generate_pr_content, ensure_task_pr, lookup_task_pr, sync_task_branch_if_live_pr
 
 
 class TestEnsureTaskPr:
@@ -302,6 +305,86 @@ class TestEnsureTaskPr:
         assert refreshed.pr_state == "open"
         assert refreshed.pr_last_synced_at == original_synced_at
         gh.create_pr.assert_not_called()
+
+
+def test_generate_pr_content_refuses_at_capacity_without_creating_internal_task(
+    tmp_path,
+    capsys,
+):
+    """Capacity refusal must fall back before persisting an internal PR task row."""
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text("project_name: test\nproject_prefix: test\nmax_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+
+    source_task = store.add("Add auth and metrics", task_type="implement")
+    source_task.slug = "20260318-test-add-auth-and-metrics"
+    source_task.branch = "feature/auth-metrics"
+    store.update(source_task)
+
+    running = store.add("Running task", task_type="implement")
+    running.status = "in_progress"
+    running.running_pid = 424242
+    store.update(running)
+
+    with (
+        patch("gza.concurrency._best_effort_stale_cleanup", return_value=None),
+        patch("gza.concurrency._pid_alive", side_effect=lambda pid: pid == 424242),
+        patch("gza.runner.run", side_effect=AssertionError("runner should not start at capacity")),
+    ):
+        title, body = _generate_pr_content(
+            source_task,
+            commit_log="abc123 Add auth",
+            diff_stat="1 file changed",
+            config=config,
+            store=store,
+        )
+
+    assert title == "Add auth and metrics"
+    assert "## Task Prompt" in body
+    assert [task for task in store.get_all() if task.task_type == "internal"] == []
+    assert _PROCESS_LOCKS == {}
+    assert "already at max concurrent tasks: 1 running, limit is 1" in capsys.readouterr().err
+
+
+def test_generate_pr_content_allows_same_pid_reentry_at_max_concurrent_one(tmp_path):
+    """Nested PR generation should reuse the current worker slot instead of falling back."""
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text("project_name: test\nproject_prefix: test\nmax_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
+
+    source_task = store.add("Add auth and metrics", task_type="implement")
+    source_task.slug = "20260318-test-add-auth-and-metrics"
+    source_task.branch = "feature/auth-metrics"
+    store.update(source_task)
+
+    running = store.add("Outer running task", task_type="implement")
+    running.status = "in_progress"
+    running.running_pid = os.getpid()
+    store.update(running)
+
+    def _complete_internal_task(_config, task_id=None, **kwargs):
+        internal_task = store.get(task_id)
+        assert internal_task is not None
+        internal_task.status = "completed"
+        internal_task.output_content = "TITLE: Better title\nBODY:\nGenerated body\n"
+        store.update(internal_task)
+        return 0
+
+    with patch("gza.runner.run", side_effect=_complete_internal_task):
+        title, body = _generate_pr_content(
+            source_task,
+            commit_log="abc123 Add auth",
+            diff_stat="1 file changed",
+            config=config,
+            store=store,
+        )
+
+    assert title == "Better title"
+    assert body == "Generated body"
+    internal_tasks = [task for task in store.get_all() if task.task_type == "internal"]
+    assert len(internal_tasks) == 1
 
 
 class TestLookupTaskPr:

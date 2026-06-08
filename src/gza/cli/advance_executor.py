@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from ..concurrency import (
+    LaunchPermit,
+    MaxConcurrentTasksError,
+    launch_permit,
+    release_task_launch_permit,
+    reserve_task_launch_permit,
+)
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
@@ -27,7 +34,7 @@ from ..runner import (
     _task_is_cross_project,
     _worktree_execution_dir,
 )
-from ._common import _create_improve_task, _create_retry_task, resolve_improve_action
+from ._common import _create_improve_task, _create_retry_task, _prepare_task_for_reserved_launch, resolve_improve_action
 from .advance_engine import (
     classify_advance_action,
     failed_recovery_decision_to_attention_action,
@@ -38,6 +45,15 @@ logger = logging.getLogger(__name__)
 
 class CreateReviewActionResult(Protocol):
     """Duck type returned by create-review preparation helpers."""
+
+    status: str
+    review_task: DbTask | None
+    message: str
+
+
+@dataclass
+class PreparedCreateReviewActionResult:
+    """Concrete create-review preparation result for typed wrappers."""
 
     status: str
     review_task: DbTask | None
@@ -382,6 +398,12 @@ def run_noop_improve_verify_then_review(
     create_result = context.prepare_create_review(task)
     if create_result.status == "skip":
         return NoopVerifyThenReviewOutcome(status="skip", message=create_result.message, verify_markdown=verify_markdown)
+    if create_result.status != "created":
+        return NoopVerifyThenReviewOutcome(
+            status="error",
+            message=create_result.message,
+            verify_markdown=verify_markdown,
+        )
     new_review = create_result.review_task
     if new_review is None or new_review.id is None:
         return NoopVerifyThenReviewOutcome(
@@ -573,8 +595,21 @@ def _prepare_background_start(
     task: DbTask,
     worker_label: str,
     rollback_on_failure: bool,
+    permit: LaunchPermit | None = None,
 ) -> tuple[DbTask | None, AdvanceActionExecutionResult | None]:
-    prepared_task = context.prepare_task_for_background_start(task, rollback_on_failure)
+    if permit is not None and context.config is not None:
+        prepared_task = _prepare_task_for_reserved_launch(
+            context.config,
+            task,
+            permit=permit,
+            rollback_on_failure=rollback_on_failure,
+        )
+        if prepared_task is not None and prepared_task.id is not None:
+            reserve_task_launch_permit(str(prepared_task.id), permit)
+    else:
+        prepared_task = context.prepare_task_for_background_start(task, rollback_on_failure)
+        if prepared_task is None and permit is not None:
+            permit.release()
     if prepared_task is None:
         return None, _startup_preparation_failed_result(
             action_type=action_type,
@@ -582,6 +617,37 @@ def _prepare_background_start(
             worker_label=worker_label,
         )
     return prepared_task, None
+
+
+def _reserve_background_launch(
+    *,
+    action_type: str,
+    context: AdvanceActionExecutionContext,
+    worker_label: str,
+) -> tuple[LaunchPermit | None, AdvanceActionExecutionResult | None]:
+    blocked = _worker_capacity_blocked_result(
+        action_type=action_type,
+        context=context,
+        worker_label=worker_label,
+    )
+    if blocked is not None:
+        return None, blocked
+    if context.config is None:
+        return None, None
+    try:
+        return launch_permit(context.config, context.store), None
+    except MaxConcurrentTasksError as exc:
+        return None, AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=f"SKIP: {exc}",
+            worker_label=worker_label,
+        )
+
+
+def _release_reserved_launch_if_left(task: DbTask | None) -> None:
+    if task is not None and task.id is not None:
+        release_task_launch_permit(str(task.id))
 
 
 def _worker_capacity_blocked_result(
@@ -700,8 +766,17 @@ def execute_advance_action(
                 work_done=True,
             )
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="review",
+        )
+        if blocked is not None:
+            return blocked
         create_result = context.prepare_create_review(task)
         if create_result.status == "skip":
+            if permit is not None:
+                permit.release()
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="skip",
@@ -710,6 +785,8 @@ def execute_advance_action(
 
         review_task = create_result.review_task
         if review_task is None or review_task.id is None:
+            if permit is not None:
+                permit.release()
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="error",
@@ -722,6 +799,7 @@ def execute_advance_action(
             task=review_task,
             worker_label="review",
             rollback_on_failure=True,
+            permit=permit,
         )
         if prepared_review_task is None:
             assert prepare_error is not None
@@ -729,6 +807,7 @@ def execute_advance_action(
         assert prepared_review_task.id is not None
 
         rc = context.spawn_worker(prepared_review_task, "review")
+        _release_reserved_launch_if_left(prepared_review_task)
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
@@ -755,12 +834,20 @@ def execute_advance_action(
                 created_task=review_task,
             )
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="review",
+        )
+        if blocked is not None:
+            return blocked
         prepared_review_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
             task=review_task,
             worker_label="review",
             rollback_on_failure=False,
+            permit=permit,
         )
         if prepared_review_task is None:
             assert prepare_error is not None
@@ -768,6 +855,7 @@ def execute_advance_action(
         assert prepared_review_task.id is not None
 
         rc = context.spawn_worker(prepared_review_task, "review")
+        _release_reserved_launch_if_left(prepared_review_task)
         return _spawn_result(
             action_type=action_type,
             rc=rc,
@@ -785,7 +873,87 @@ def execute_advance_action(
                 worker_consuming=True,
                 work_done=True,
             )
-        outcome = run_noop_improve_verify_then_review(task=task, action=action, context=context)
+        reserved_verify_permit: LaunchPermit | None = None
+
+        def _prepare_review_after_verify(parent_task: DbTask) -> CreateReviewActionResult:
+            nonlocal reserved_verify_permit
+            permit, blocked = _reserve_background_launch(
+                action_type=action_type,
+                context=context,
+                worker_label="review",
+            )
+            if blocked is not None:
+                return PreparedCreateReviewActionResult(
+                    status="error",
+                    review_task=None,
+                    message=blocked.message,
+                )
+            reserved_verify_permit = permit
+            create_result = context.prepare_create_review(parent_task)
+            if create_result.status != "created":
+                if reserved_verify_permit is not None:
+                    reserved_verify_permit.release()
+                    reserved_verify_permit = None
+                return create_result
+            review_task = create_result.review_task
+            if review_task is None or review_task.id is None:
+                if reserved_verify_permit is not None:
+                    reserved_verify_permit.release()
+                    reserved_verify_permit = None
+                return PreparedCreateReviewActionResult(
+                    status="error",
+                    review_task=None,
+                    message="review creation returned no task",
+                )
+            prepared_review_task, prepare_error = _prepare_background_start(
+                context=context,
+                action_type=action_type,
+                task=review_task,
+                worker_label="review",
+                rollback_on_failure=True,
+                permit=reserved_verify_permit,
+            )
+            reserved_verify_permit = None
+            if prepared_review_task is None:
+                assert prepare_error is not None
+                return PreparedCreateReviewActionResult(
+                    status="error",
+                    review_task=None,
+                    message=prepare_error.message or "startup preparation failed for review",
+                )
+            return PreparedCreateReviewActionResult(
+                status="created",
+                review_task=prepared_review_task,
+                message=create_result.message,
+            )
+
+        verify_context = AdvanceActionExecutionContext(
+            store=context.store,
+            trigger_source=context.trigger_source,
+            dry_run=context.dry_run,
+            max_resume_attempts=context.max_resume_attempts,
+            use_iterate_for_create_implement=context.use_iterate_for_create_implement,
+            use_iterate_for_needs_rebase=context.use_iterate_for_needs_rebase,
+            prepare_task_for_background_start=context.prepare_task_for_background_start,
+            prepare_create_review=_prepare_review_after_verify,
+            create_resume_task=context.create_resume_task,
+            create_rebase_task=context.create_rebase_task,
+            create_implement_task=context.create_implement_task,
+            spawn_worker=context.spawn_worker,
+            spawn_resume_worker=context.spawn_resume_worker,
+            spawn_iterate_worker=context.spawn_iterate_worker,
+            can_spawn_worker=context.can_spawn_worker,
+            no_worker_capacity_message=context.no_worker_capacity_message,
+            is_rebase_target_already_merged=context.is_rebase_target_already_merged,
+            prefer_iterate_for_action=context.prefer_iterate_for_action,
+            spawn_iterate_recovery=context.spawn_iterate_recovery,
+            create_retry_task=context.create_retry_task,
+            create_targeted_rebase_task=context.create_targeted_rebase_task,
+            reconcile_diverged_branch=context.reconcile_diverged_branch,
+            config=context.config,
+            git=context.git,
+        )
+        outcome = run_noop_improve_verify_then_review(task=task, action=action, context=verify_context)
         if outcome.status == "needs_attention":
             return AdvanceActionExecutionResult(
                 action_type=action_type,
@@ -809,26 +977,14 @@ def execute_advance_action(
             )
         new_review = outcome.review_task
         assert new_review is not None and new_review.id is not None
-
-        prepared_review_task, prepare_error = _prepare_background_start(
-            context=context,
-            action_type=action_type,
-            task=new_review,
-            worker_label="review",
-            rollback_on_failure=True,
-        )
-        if prepared_review_task is None:
-            assert prepare_error is not None
-            return prepare_error
-        assert prepared_review_task.id is not None
-
-        rc = context.spawn_worker(prepared_review_task, "review")
+        rc = context.spawn_worker(new_review, "review")
+        _release_reserved_launch_if_left(new_review)
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
-            handled_task_id=prepared_review_task.id,
+            handled_task_id=new_review.id,
             worker_label="review",
-            created_task=prepared_review_task,
+            created_task=new_review,
         )
         result.success_message = outcome.message
         result.message = outcome.verify_markdown or outcome.message
@@ -879,6 +1035,13 @@ def execute_advance_action(
                 failed_improve=failed_improve,
             )
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="improve",
+        )
+        if blocked is not None:
+            return blocked
         if improve_mode == "resume" and failed_improve is not None:
             assert failed_improve.id is not None
             improve_task = context.create_resume_task(failed_improve)
@@ -901,6 +1064,8 @@ def execute_advance_action(
                     trigger_source=context.trigger_source,
                 )
             except ValueError as exc:
+                if permit is not None:
+                    permit.release()
                 return AdvanceActionExecutionResult(
                     action_type=action_type,
                     status="error",
@@ -915,6 +1080,7 @@ def execute_advance_action(
             task=improve_task,
             worker_label="improve",
             rollback_on_failure=True,
+            permit=permit,
         )
         if prepared_improve_task is None:
             assert prepare_error is not None
@@ -924,6 +1090,7 @@ def execute_advance_action(
             rc = context.spawn_resume_worker(prepared_improve_task, "improve")
         else:
             rc = context.spawn_worker(prepared_improve_task, "improve")
+        _release_reserved_launch_if_left(prepared_improve_task)
 
         return _spawn_result(
             action_type=action_type,
@@ -951,12 +1118,20 @@ def execute_advance_action(
                 created_task=run_improve_task,
             )
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="improve",
+        )
+        if blocked is not None:
+            return blocked
         prepared_improve_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
             task=run_improve_task,
             worker_label="improve",
             rollback_on_failure=False,
+            permit=permit,
         )
         if prepared_improve_task is None:
             assert prepare_error is not None
@@ -964,6 +1139,7 @@ def execute_advance_action(
         assert prepared_improve_task.id is not None
 
         rc = context.spawn_worker(prepared_improve_task, "improve")
+        _release_reserved_launch_if_left(prepared_improve_task)
         return _spawn_result(
             action_type=action_type,
             rc=rc,
@@ -988,7 +1164,16 @@ def execute_advance_action(
         resume_task_id = action.get("recovery_task_id")
         reuse_existing = bool(action.get("reuse_existing", False))
         if launch_mode == "iterate":
+            permit, blocked = _reserve_background_launch(
+                action_type=action_type,
+                context=context,
+                worker_label="iterate",
+            )
+            if blocked is not None:
+                return blocked
             if context.spawn_iterate_recovery is None:
+                if permit is not None:
+                    permit.release()
                 return AdvanceActionExecutionResult(
                     action_type=action_type,
                     status="error",
@@ -997,6 +1182,8 @@ def execute_advance_action(
             if reuse_existing and isinstance(resume_task_id, str):
                 resume_task = context.store.get(resume_task_id)
                 if resume_task is None:
+                    if permit is not None:
+                        permit.release()
                     return AdvanceActionExecutionResult(
                         action_type=action_type,
                         status="error",
@@ -1010,6 +1197,7 @@ def execute_advance_action(
                 task=resume_task,
                 worker_label="iterate",
                 rollback_on_failure=not reuse_existing,
+                permit=permit,
             )
             if prepared_resume_task is None:
                 assert prepare_error is not None
@@ -1017,6 +1205,7 @@ def execute_advance_action(
             assert prepared_resume_task.id is not None
 
             rc = context.spawn_iterate_recovery(task, "resume", prepared_resume_task)
+            _release_reserved_launch_if_left(prepared_resume_task)
             result = _spawn_result(
                 action_type=action_type,
                 rc=rc,
@@ -1030,9 +1219,18 @@ def execute_advance_action(
                 result.success_message = f"Created resume task {prepared_resume_task.id}"
             return result
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="resume",
+        )
+        if blocked is not None:
+            return blocked
         if reuse_existing and isinstance(resume_task_id, str):
             resume_task = context.store.get(resume_task_id)
             if resume_task is None:
+                if permit is not None:
+                    permit.release()
                 return AdvanceActionExecutionResult(
                     action_type=action_type,
                     status="error",
@@ -1046,6 +1244,7 @@ def execute_advance_action(
             task=resume_task,
             worker_label="resume",
             rollback_on_failure=not reuse_existing,
+            permit=permit,
         )
         if prepared_resume_task is None:
             assert prepare_error is not None
@@ -1053,6 +1252,7 @@ def execute_advance_action(
 
         assert prepared_resume_task.id is not None
         rc = context.spawn_resume_worker(prepared_resume_task, task.task_type or "task")
+        _release_reserved_launch_if_left(prepared_resume_task)
         result = _spawn_result(
             action_type=action_type,
             rc=rc,
@@ -1081,9 +1281,18 @@ def execute_advance_action(
         launch_mode = str(action.get("launch_mode") or ("iterate" if task.task_type == "implement" else "worker"))
         retry_task_id = action.get("recovery_task_id")
         reuse_existing = bool(action.get("reuse_existing", False))
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="iterate" if launch_mode == "iterate" else "retry",
+        )
+        if blocked is not None:
+            return blocked
         if reuse_existing and isinstance(retry_task_id, str):
             retry_task = context.store.get(retry_task_id)
             if retry_task is None:
+                if permit is not None:
+                    permit.release()
                 return AdvanceActionExecutionResult(
                     action_type=action_type,
                     status="error",
@@ -1091,6 +1300,8 @@ def execute_advance_action(
                 )
         else:
             if context.create_retry_task is None:
+                if permit is not None:
+                    permit.release()
                 return AdvanceActionExecutionResult(
                     action_type=action_type,
                     status="error",
@@ -1099,6 +1310,8 @@ def execute_advance_action(
             retry_task = context.create_retry_task(task)
         if launch_mode == "iterate":
             if context.spawn_iterate_recovery is None:
+                if permit is not None:
+                    permit.release()
                 return AdvanceActionExecutionResult(
                     action_type=action_type,
                     status="error",
@@ -1110,6 +1323,7 @@ def execute_advance_action(
                 task=retry_task,
                 worker_label="iterate",
                 rollback_on_failure=not reuse_existing,
+                permit=permit,
             )
             if prepared_retry_task is None:
                 assert prepare_error is not None
@@ -1125,6 +1339,7 @@ def execute_advance_action(
                 task=retry_task,
                 worker_label="retry",
                 rollback_on_failure=not reuse_existing,
+                permit=permit,
             )
             if prepared_retry_task is None:
                 assert prepare_error is not None
@@ -1133,6 +1348,7 @@ def execute_advance_action(
             rc = context.spawn_worker(prepared_retry_task, task.task_type or "task")
             worker_label = "retry"
             handled_task = prepared_retry_task
+        _release_reserved_launch_if_left(handled_task)
         assert handled_task.id is not None
         result = _spawn_result(
             action_type=action_type,
@@ -1159,6 +1375,13 @@ def execute_advance_action(
                 work_done=True,
             )
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="iterate" if context.use_iterate_for_create_implement else "implement",
+        )
+        if blocked is not None:
+            return blocked
         impl_task = context.create_implement_task(task)
         prepared_impl_task, prepare_error = _prepare_background_start(
             context=context,
@@ -1166,6 +1389,7 @@ def execute_advance_action(
             task=impl_task,
             worker_label="implement" if not context.use_iterate_for_create_implement else "iterate",
             rollback_on_failure=True,
+            permit=permit,
         )
         if prepared_impl_task is None:
             assert prepare_error is not None
@@ -1178,6 +1402,7 @@ def execute_advance_action(
         else:
             rc = context.spawn_worker(prepared_impl_task, "implement")
             worker_label = "implement"
+        _release_reserved_launch_if_left(prepared_impl_task)
 
         result = _spawn_result(
             action_type=action_type,
@@ -1216,6 +1441,13 @@ def execute_advance_action(
                 work_done=True,
             )
 
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="iterate" if context.use_iterate_for_needs_rebase else "rebase",
+        )
+        if blocked is not None:
+            return blocked
         rebase_task = context.create_rebase_task(task)
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,
@@ -1223,6 +1455,7 @@ def execute_advance_action(
             task=rebase_task,
             worker_label="rebase",
             rollback_on_failure=True,
+            permit=permit,
         )
         if prepared_rebase_task is None:
             assert prepare_error is not None
@@ -1241,6 +1474,7 @@ def execute_advance_action(
         else:
             rc = context.spawn_worker(prepared_rebase_task, "rebase")
             worker_label = "rebase"
+        _release_reserved_launch_if_left(prepared_rebase_task)
 
         result = _spawn_result(
             action_type=action_type,
@@ -1305,6 +1539,13 @@ def execute_advance_action(
         )
         if capacity_blocked is not None:
             return capacity_blocked
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="rebase",
+        )
+        if blocked is not None:
+            return blocked
         create_rebase_task = context.create_targeted_rebase_task
         rebase_task = (
             create_rebase_task(task, rebase_target)
@@ -1317,6 +1558,7 @@ def execute_advance_action(
             task=rebase_task,
             worker_label="rebase",
             rollback_on_failure=True,
+            permit=permit,
         )
         if prepared_rebase_task is None:
             assert prepare_error is not None
@@ -1324,6 +1566,7 @@ def execute_advance_action(
 
         assert prepared_rebase_task.id is not None
         rc = context.spawn_worker(prepared_rebase_task, "rebase")
+        _release_reserved_launch_if_left(prepared_rebase_task)
         result = _spawn_result(
             action_type=action_type,
             rc=rc,

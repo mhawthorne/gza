@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from collections import OrderedDict
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .concurrency import launch_permit
 from .config import DEFAULT_LEARNINGS_INTERVAL, DEFAULT_LEARNINGS_MAX_ITEMS, DEFAULT_LEARNINGS_WINDOW
 from .console import console
 from .db import SqliteTaskStore, Task
@@ -288,19 +290,31 @@ def _run_learnings_task(
     from . import runner as _runner_mod
 
     prompt = _build_summarization_prompt(recent_tasks, existing_learnings, max_items=max_items)
-    learn_task = store.add(
-        prompt=prompt,
-        task_type="internal",
-        skip_learnings=True,
-        trigger_source="manual",
-    )
-
-    learn_task_id = learn_task.id
-    if learn_task_id is None:
-        return None
 
     try:
-        exit_code = _runner_mod.run(config, task_id=learn_task_id)
+        permit = launch_permit(config, store, current_pid=os.getpid())
+        try:
+            learn_task = store.add(
+                prompt=prompt,
+                task_type="internal",
+                skip_learnings=True,
+                trigger_source="manual",
+            )
+            learn_task_id = learn_task.id
+            if learn_task_id is None:
+                permit.release()
+                return None
+
+            def _on_task_claimed(_task: Task) -> None:
+                permit.release()
+
+            try:
+                exit_code = _runner_mod.run(config, task_id=learn_task_id, on_task_claimed=_on_task_claimed)
+            finally:
+                permit.release()
+        except Exception:
+            permit.release()
+            raise
     except Exception as exc:
         console.print(f"[yellow]LLM learnings summarization failed: {exc}; falling back to regex extraction.[/yellow]")
         return None

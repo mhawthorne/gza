@@ -39,6 +39,7 @@ def _clear_foreground_worker_env():
             "GZA_WORKER_ID": "",
             "GZA_WORKER_MODE": "",
             "GZA_REUSE_WORKER_OWNER": "",
+            "GZA_REUSE_WORKER_SESSION": "",
         },
         clear=False,
     ):
@@ -155,6 +156,18 @@ def _background_iterate_restart_error(tmp_path: Path) -> tuple[list[str], str]:
         ["iterate", str(impl.id), "--background", "--no-docker", "--project", str(tmp_path)],
         f"Error: Task {impl.id} is failed. Use --resume or --retry to specify how to restart it.",
     )
+
+
+def _assert_immediate_launch_lock_released(config: Config, store: SqliteTaskStore) -> None:
+    from gza.concurrency import _PROCESS_LOCKS, launch_permit
+
+    assert _PROCESS_LOCKS == {}
+    permit = launch_permit(config, store)
+    try:
+        assert _PROCESS_LOCKS
+    finally:
+        permit.release()
+    assert _PROCESS_LOCKS == {}
 
 
 def _advance_new_batch_error(tmp_path: Path) -> tuple[list[str], str]:
@@ -1759,15 +1772,30 @@ class TestRetryCommand:
             any_tag=False,
         )
 
+        registry = WorkerRegistry(config.workers_path)
+
+        def _fake_run_foreground(*_args, **kwargs) -> int:
+            worker_id = os.environ.get("GZA_WORKER_ID")
+            assert worker_id is not None
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=retry_task.id,
+                    pid=os.getpid(),
+                    is_background=False,
+                )
+            )
+            return 0
+
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", return_value=0),
+            patch("gza.cli.execution._run_foreground", side_effect=_fake_run_foreground),
         ):
             rc = cmd_run(args)
 
         assert rc == 0
-        workers = WorkerRegistry(config.workers_path).list_all(include_completed=True)
+        workers = registry.list_all(include_completed=True)
         assert workers
         assert workers[-1].task_id == retry_task.id
 
@@ -2024,17 +2052,317 @@ class TestResumeCommand:
             any_tag=False,
         )
 
+        registry = WorkerRegistry(config.workers_path)
+
+        def _fake_run_foreground(*_args, **kwargs) -> int:
+            worker_id = os.environ.get("GZA_WORKER_ID")
+            assert worker_id is not None
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=resume_task.id,
+                    pid=os.getpid(),
+                    is_background=False,
+                )
+            )
+            return 0
+
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", return_value=0),
+            patch("gza.cli.execution._run_foreground", side_effect=_fake_run_foreground),
         ):
             rc = cmd_run(args)
 
         assert rc == 0
-        workers = WorkerRegistry(config.workers_path).list_all(include_completed=True)
+        workers = registry.list_all(include_completed=True)
         assert workers
         assert workers[-1].task_id == resume_task.id
+
+    def test_work_rejects_at_max_concurrent_without_registering_new_worker(self, tmp_path: Path, capsys) -> None:
+        """Direct foreground work should fail cleanly at the global cap before publishing itself."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = 999999
+        store.update(running)
+
+        pending = store.add("Pending task", task_type="implement")
+        assert pending.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+            tags=[],
+            group=None,
+            any_tag=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.concurrency._best_effort_stale_cleanup"),
+            patch("gza.concurrency._pid_alive", side_effect=lambda pid: pid == 999999),
+            patch("gza.cli.run") as mock_run,
+        ):
+            rc = cmd_run(args)
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Error: already at max concurrent tasks: 1 running, limit is 1" in captured.out
+        assert captured.err.strip() == ""
+        mock_run.assert_not_called()
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_work_runs_single_foreground_task_at_max_concurrent_one_without_self_counting(self, tmp_path: Path) -> None:
+        """The outer work session must not consume the only slot before the first task launch."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        pending = store.add("Pending task", task_type="implement")
+        assert pending.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+            tags=[],
+            group=None,
+            any_tag=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.run", return_value=0) as mock_run,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["task_id"] is None
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_work_serial_explicit_tasks_reuse_one_foreground_slot_at_max_concurrent_one(self, tmp_path: Path) -> None:
+        """Serial foreground sessions should reuse one worker/slot across multiple explicit tasks."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("Pending task 1", task_type="implement")
+        second = store.add("Pending task 2", task_type="implement")
+        assert first.id is not None
+        assert second.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[first.id, second.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+            tags=[],
+            group=None,
+            any_tag=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.run", return_value=0) as mock_run,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        assert [call.kwargs["task_id"] for call in mock_run.call_args_list] == [first.id, second.id]
+        workers = WorkerRegistry(config.workers_path).list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].status == "completed"
+        assert workers[0].task_id == second.id
+
+    def test_work_explicit_task_ids_use_shared_run_foreground_path(self, tmp_path: Path) -> None:
+        """Explicit work selections should delegate foreground launches through the shared helper."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task1 = store.add("Pending task 1")
+        task2 = store.add("Pending task 2")
+        assert task1.id is not None
+        assert task2.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[task1.id, task2.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=True,
+            tags=[],
+            group=None,
+            any_tag=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.run", side_effect=AssertionError("cmd_run should not call runner.run directly")),
+            patch("gza.cli.execution._run_foreground", side_effect=[0, 0]) as run_foreground,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        assert [call.kwargs["task_id"] for call in run_foreground.call_args_list] == [task1.id, task2.id]
+        for call in run_foreground.call_args_list:
+            assert call.kwargs["force"] is False
+            assert call.kwargs["create_pr"] is True
+            assert call.kwargs["phase1_args"] is args
+
+    def test_work_count_mode_uses_shared_run_foreground_path(self, tmp_path: Path) -> None:
+        """Count-based work runs should stay on the shared foreground helper path."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Pending task 1", tags=("release",))
+        store.add("Pending task 2", tags=("release",))
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[],
+            count=2,
+            force=True,
+            resume=False,
+            create_pr=False,
+            tags=["release"],
+            group=None,
+            any_tag=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.run", side_effect=AssertionError("cmd_run should not call runner.run directly")),
+            patch("gza.cli.execution._run_foreground", side_effect=[0, 0]) as run_foreground,
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        assert len(run_foreground.call_args_list) == 2
+        for call in run_foreground.call_args_list:
+            assert call.kwargs["task_id"] is not None
+            assert call.kwargs["force"] is True
+            assert call.kwargs["create_pr"] is False
+            assert call.kwargs["phase1_args"] is args
+
+    def test_work_multi_task_reuses_same_registered_worker_across_shared_foreground_calls(self, tmp_path: Path) -> None:
+        """Multi-task work sessions should keep the same outer worker registration across helper calls."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task1 = store.add("Pending task 1")
+        task2 = store.add("Pending task 2")
+        assert task1.id is not None
+        assert task2.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[task1.id, task2.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=False,
+            tags=[],
+            group=None,
+            any_tag=False,
+        )
+
+        seen_worker_ids: list[str | None] = []
+        seen_owner_markers: list[str | None] = []
+        registry = WorkerRegistry(config.workers_path)
+
+        def _fake_run_foreground(*_args, **_kwargs) -> int:
+            worker_id = os.environ.get("GZA_WORKER_ID")
+            seen_worker_ids.append(worker_id)
+            seen_owner_markers.append(os.environ.get("GZA_REUSE_WORKER_OWNER"))
+            assert worker_id is not None
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=_kwargs["task_id"],
+                    pid=os.getpid(),
+                    is_background=False,
+                )
+            )
+            return 0
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution._run_foreground", side_effect=_fake_run_foreground),
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 0
+        assert len(seen_worker_ids) == 2
+        assert seen_worker_ids[0] is not None
+        assert seen_worker_ids[0] == seen_worker_ids[1]
+        assert seen_owner_markers == ["outer", "outer"]
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].worker_id == seen_worker_ids[0]
+        assert workers[0].status == "completed"
 
     def test_resume_creates_new_task_preserves_original(self, tmp_path: Path):
         """Resume creates a new pending task, leaving original task as failed."""
@@ -2169,8 +2497,8 @@ class TestWorkCommandMultiTask:
     @pytest.fixture(autouse=True)
     def _mock_work_runner(self):
         """Keep work command tests focused on selection/CLI behavior, not task execution."""
-        with patch("gza.cli.execution.run", return_value=0) as run_mock:
-            yield run_mock
+        with patch("gza.cli.execution._run_foreground", return_value=0) as run_foreground:
+            yield run_foreground
 
     def test_work_with_single_task_id(self, tmp_path: Path):
         """Work command accepts a single task ID."""
@@ -2310,7 +2638,7 @@ class TestWorkCommandMultiTask:
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", return_value=0),
+            patch("gza.cli.execution._run_foreground", return_value=0),
         ):
             rc = cmd_run(args)
 
@@ -2424,10 +2752,28 @@ class TestWorkCommandMultiTask:
             resume=False,
         )
 
+        registry = WorkerRegistry(config.workers_path)
+        seen_calls = 0
+
+        def _fake_run_foreground(*_args, **_kwargs) -> int:
+            nonlocal seen_calls
+            seen_calls += 1
+            worker_id = os.environ.get("GZA_WORKER_ID")
+            assert worker_id is not None
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=f"simulated-task-{seen_calls}",
+                    pid=os.getpid(),
+                    is_background=False,
+                )
+            )
+            return 0 if seen_calls == 1 else 1
+
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", side_effect=[0, 1]),
+            patch("gza.cli.execution._run_foreground", side_effect=_fake_run_foreground),
         ):
             rc = cmd_run(args)
 
@@ -2436,7 +2782,6 @@ class TestWorkCommandMultiTask:
         assert "Completed 1 task(s) before a task failed" in output
         assert "Completed 2 task(s)" not in output
 
-        registry = WorkerRegistry(config.workers_path)
         workers = registry.list_all(include_completed=True)
         assert len(workers) == 1
         assert workers[0].status == "failed"
@@ -2473,7 +2818,7 @@ class TestWorkCommandMultiTask:
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", side_effect=_fake_run),
+            patch("gza.cli.execution._run_foreground", side_effect=_fake_run),
         ):
             rc = cmd_run(args)
 
@@ -2515,7 +2860,7 @@ class TestWorkCommandMultiTask:
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", side_effect=_fake_run),
+            patch("gza.cli.execution._run_foreground", side_effect=_fake_run),
         ):
             rc = cmd_run(args)
 
@@ -2645,7 +2990,7 @@ class TestWorkCommandMultiTask:
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", return_value=0) as run_mock,
+            patch("gza.cli.execution._run_foreground", return_value=0) as run_mock,
         ):
             rc = cmd_run(args)
 
@@ -2680,7 +3025,7 @@ class TestWorkCommandMultiTask:
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
             patch("gza.cli.execution.get_store", return_value=store),
-            patch("gza.cli.execution.run", return_value=0) as run_mock,
+            patch("gza.cli.execution._run_foreground", return_value=0) as run_mock,
         ):
             rc = cmd_run(args)
 
@@ -7655,6 +8000,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
+            max_concurrent=5,
             max_resume_attempts=1,
             max_review_cycles=3,
             require_review_before_merge=True,
@@ -7777,6 +8123,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
+            max_concurrent=5,
             max_resume_attempts=1,
             max_review_cycles=3,
             require_review_before_merge=True,
@@ -8088,6 +8435,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
+            max_concurrent=5,
             max_resume_attempts=1,
             max_review_cycles=3,
             require_review_before_merge=True,
@@ -13729,6 +14077,282 @@ class TestIterateCommand:
         assert retry_task.provider == "codex"
         assert retry_task.provider_is_explicit is True
 
+    def test_iterate_create_review_rejects_at_limit_without_creating_child(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        impl = self._make_completed_impl(store)
+        before_ids = {task.id for task in store.get_all()}
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.resolve_closing_review_action", return_value=None),
+            patch("gza.cli.determine_next_action", return_value={"type": "create_review", "description": "Create review"}),
+            patch("gza.cli._create_review_task", side_effect=AssertionError("review should not be created at max concurrent")),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "already at max concurrent tasks: 1 running, limit is 1" in output
+        assert {task.id for task in store.get_all()} == before_ids
+
+    @pytest.mark.parametrize("recovery_mode", ["new", "resume", "retry"])
+    def test_iterate_improve_recovery_rejects_at_limit_without_creating_child(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        recovery_mode: str,
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        impl = self._make_completed_impl(store)
+        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        if recovery_mode != "new":
+            failed_improve = store.add(
+                "Improve",
+                task_type="improve",
+                depends_on=review.id,
+                based_on=impl.id,
+                same_branch=True,
+            )
+            failed_improve.status = "failed"
+            failed_improve.failure_reason = "MAX_STEPS" if recovery_mode == "resume" else "INFRASTRUCTURE_ERROR"
+            failed_improve.session_id = "improve-session" if recovery_mode == "resume" else None
+            failed_improve.completed_at = datetime.now(UTC)
+            store.update(failed_improve)
+
+        before_ids = {task.id for task in store.get_all()}
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=3,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        improve_action = {"type": "improve", "description": "Create improve", "review_task": review}
+        engine_actions = [improve_action, improve_action]
+
+        create_resume_patch = "gza.cli._create_resume_task"
+        create_retry_patch = "gza.cli._create_retry_task"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.determine_next_action", side_effect=engine_actions),
+            patch(create_resume_patch, side_effect=AssertionError("resume child should not be created at max concurrent")),
+            patch(create_retry_patch, side_effect=AssertionError("retry child should not be created at max concurrent")),
+            patch("gza.cli._create_improve_task", side_effect=AssertionError("new improve child should not be created at max concurrent")),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "already at max concurrent tasks: 1 running, limit is 1" in output
+        assert {task.id for task in store.get_all()} == before_ids
+
+    def test_iterate_verify_noop_rejects_at_limit_without_creating_child(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        impl = self._make_completed_impl(store)
+        stale_review = store.add("Stale review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        stale_review.completed_at = datetime.now(UTC)
+        store.update(stale_review)
+        before_ids = {task.id for task in store.get_all()}
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        def _fake_rerun_verify(*_args, **kwargs):
+            result = kwargs["context"].prepare_create_review(kwargs["task"])
+            return SimpleNamespace(
+                status="error",
+                message=result.message,
+                verify_markdown="## verify_command result\n\nPassed\n",
+                review_task=None,
+            )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={
+                    "type": "verify_noop_improve_then_review",
+                    "description": "Re-run verify_command before re-review",
+                    "review_task": stale_review,
+                },
+            ),
+            patch("gza.cli._create_review_task", side_effect=AssertionError("review should not be created at max concurrent")),
+            patch("gza.cli.run_noop_improve_verify_then_review", side_effect=_fake_rerun_verify),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "already at max concurrent tasks" in output
+        assert {task.id for task in store.get_all()} == before_ids
+
+    def test_iterate_needs_rebase_rejects_at_limit_without_creating_child(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        impl = self._make_completed_impl(store)
+        before_ids = {task.id for task in store.get_all()}
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.resolve_closing_review_action", return_value=None),
+            patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase", "description": "Create rebase"}),
+            patch("gza.cli._create_rebase_task", side_effect=AssertionError("rebase should not be created at max concurrent")),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert "already at max concurrent tasks: 1 running, limit is 1" in output
+        assert {task.id for task in store.get_all()} == before_ids
+
     def test_iterate_default_resume_budget_is_one(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
@@ -15047,13 +15671,12 @@ class TestRunForeground:
             rc = _run_foreground(config, task_id=task.id)
 
         assert rc == 0
-        mock_run.assert_called_once_with(
-            config,
-            task_id=task.id,
-            resume=False,
-            open_after=False,
-            skip_precondition_check=False,
-        )
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["task_id"] == task.id
+        assert mock_run.call_args.kwargs["resume"] is False
+        assert mock_run.call_args.kwargs["open_after"] is False
+        assert mock_run.call_args.kwargs["skip_precondition_check"] is False
+        assert callable(mock_run.call_args.kwargs["on_task_claimed"])
 
         # Worker should now be marked completed
         registry = WorkerRegistry(workers_path)
@@ -15130,13 +15753,12 @@ class TestRunForeground:
             rc = _run_foreground(config, task_id=task.id, resume=True, open_after=True)
 
         assert rc == 0
-        mock_run.assert_called_once_with(
-            config,
-            task_id=task.id,
-            resume=True,
-            open_after=True,
-            skip_precondition_check=False,
-        )
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["task_id"] == task.id
+        assert mock_run.call_args.kwargs["resume"] is True
+        assert mock_run.call_args.kwargs["open_after"] is True
+        assert mock_run.call_args.kwargs["skip_precondition_check"] is False
+        assert callable(mock_run.call_args.kwargs["on_task_claimed"])
 
     def test_run_foreground_resume_auto_rebases_before_run(self, tmp_path: Path):
         """Resume runs an automatic rebase step before resuming the provider session."""
@@ -15157,13 +15779,12 @@ class TestRunForeground:
 
         assert rc == 0
         mock_rebase.assert_called_once_with(config, task.id)
-        mock_run.assert_called_once_with(
-            config,
-            task_id=task.id,
-            resume=True,
-            open_after=False,
-            skip_precondition_check=False,
-        )
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["task_id"] == task.id
+        assert mock_run.call_args.kwargs["resume"] is True
+        assert mock_run.call_args.kwargs["open_after"] is False
+        assert mock_run.call_args.kwargs["skip_precondition_check"] is False
+        assert callable(mock_run.call_args.kwargs["on_task_claimed"])
 
     def test_run_foreground_resume_rebase_failure_skips_run(self, tmp_path: Path):
         """Resume aborts before run() when the automatic rebase fails."""
@@ -15315,13 +15936,12 @@ class TestRunForeground:
                 run_command=run_command,
             ) == 0
 
-        mock_run.assert_called_once_with(
-            config,
-            task_id=task.id,
-            resume=False,
-            open_after=False,
-            skip_precondition_check=False,
-        )
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["task_id"] == task.id
+        assert mock_run.call_args.kwargs["resume"] is False
+        assert mock_run.call_args.kwargs["open_after"] is False
+        assert mock_run.call_args.kwargs["skip_precondition_check"] is False
+        assert callable(mock_run.call_args.kwargs["on_task_claimed"])
         workers = registry.list_all(include_completed=True)
         assert len(workers) == 1
         worker = workers[0]
@@ -15360,6 +15980,40 @@ class TestRunForeground:
         assert worker.status == "completed"
         assert worker.task_id == task.id
         assert worker.exit_code == 0
+
+    def test_run_foreground_rejects_at_max_concurrent_before_registering_worker(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Standalone foreground launches should fail cleanly at the cap without self-counting."""
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        task = store.add("Blocked launch", task_type="implement")
+        assert task.id is not None
+
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run") as mock_run,
+        ):
+            rc = _run_foreground(config, task_id=task.id)
+
+        assert rc == 1
+        assert (
+            capsys.readouterr().err.strip()
+            == "Error: already at max concurrent tasks: 1 running, limit is 1"
+        )
+        mock_run.assert_not_called()
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
     def test_run_foreground_signal_calls_mark_completed_once(self, tmp_path: Path):
         """Signal delivery via _cleanup raises KeyboardInterrupt; mark_completed is called exactly once."""
@@ -15400,6 +16054,140 @@ class TestRunForeground:
         assert mock_mark.call_count == 1
         assert mock_mark.call_args.kwargs.get("status") == "failed"
         assert mock_mark.call_args.kwargs.get("exit_code") == 130
+
+
+class TestBackgroundLaunchConcurrency:
+    """Targeted max-concurrent regressions for prepared/background launch helpers."""
+
+    def test_prepared_background_worker_rejects_at_limit_without_spawning(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli._common import _spawn_background_worker
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        prepared = store.add("Prepared task", task_type="implement")
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            force=False,
+            create_pr=False,
+            resume=False,
+            tags=[],
+            group=None,
+            any_tag=False,
+        )
+
+        with patch(
+            "gza.cli._common._spawn_detached_worker_process",
+            side_effect=AssertionError("background worker should not spawn"),
+        ):
+            rc = _spawn_background_worker(args, config, task_id=prepared.id, prepared_task=prepared)
+
+        assert rc == 1
+        assert (
+            capsys.readouterr().err.strip()
+            == "Error: already at max concurrent tasks: 1 running, limit is 1"
+        )
+
+    def test_prepared_background_resume_worker_rejects_at_limit_without_spawning(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli._common import _spawn_background_resume_worker
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        prepared = store.add("Prepared resume task", task_type="implement")
+        prepared.session_id = "resume-session"
+        store.update(prepared)
+        args = argparse.Namespace(no_docker=True, max_turns=None, force=False)
+
+        with patch(
+            "gza.cli._common._spawn_detached_worker_process",
+            side_effect=AssertionError("background resume worker should not spawn"),
+        ):
+            rc = _spawn_background_resume_worker(args, config, str(prepared.id), prepared_task=prepared)
+
+        assert rc == 1
+        assert (
+            capsys.readouterr().err.strip()
+            == "Error: already at max concurrent tasks: 1 running, limit is 1"
+        )
+
+    def test_background_iterate_worker_rejects_at_limit_without_spawning(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli._common import _spawn_background_iterate_worker
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        impl = store.add("Implementation task", task_type="implement")
+        args = argparse.Namespace(no_docker=True, force=False)
+
+        with patch(
+            "gza.cli._common._spawn_detached_worker_process",
+            side_effect=AssertionError("background iterate worker should not spawn"),
+        ):
+            rc = _spawn_background_iterate_worker(args, config, impl, max_iterations=1)
+
+        assert rc == 1
+        assert (
+            capsys.readouterr().err.strip()
+            == "Error: already at max concurrent tasks: 1 running, limit is 1"
+        )
+
+    def test_background_iterate_dry_run_does_not_leak_launch_lock(self, tmp_path: Path) -> None:
+        from gza.cli._common import _spawn_background_iterate_worker
+        from gza.concurrency import _PROCESS_LOCKS, launch_permit
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implementation task", task_type="implement")
+        args = argparse.Namespace(no_docker=True, force=False)
+
+        assert _spawn_background_iterate_worker(args, config, impl, max_iterations=1, dry_run=True) == 0
+        assert _PROCESS_LOCKS == {}
+
+        permit = launch_permit(config, store)
+        try:
+            assert _PROCESS_LOCKS
+        finally:
+            permit.release()
+        assert _PROCESS_LOCKS == {}
 
 
 class TestRunInlineCommand:
@@ -15671,6 +16459,166 @@ class TestForegroundInvocationContextWiring:
         assert invocation.command == "improve"
         assert invocation.execution_mode == "foreground_worker"
 
+    @pytest.mark.parametrize(
+        ("comments_action", "failure_reason"),
+        [
+            ("wait_in_progress", None),
+            ("give_up", None),
+            ("manual_review", "requires human review"),
+        ],
+    )
+    def test_cmd_improve_releases_reserved_launch_on_comments_only_phase1_return(
+        self,
+        tmp_path: Path,
+        comments_action: str,
+        failure_reason: str | None,
+    ) -> None:
+        from gza.cli.execution import cmd_improve
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement api", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+        assert impl.id is not None
+
+        store.add_comment(impl.id, "Address the failure path.")
+        existing_improve = store.add("Existing improve", task_type="improve", based_on=impl.id)
+        existing_improve.status = "in_progress" if comments_action == "wait_in_progress" else "failed"
+        store.update(existing_improve)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            max_turns=None,
+            review=False,
+            review_id=None,
+            model=None,
+            provider=None,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        comments_decision = None
+        if comments_action == "manual_review":
+            comments_decision = MagicMock(reason_text=failure_reason)
+
+        with patch(
+            "gza.cli.resolve_comments_improve_action",
+            return_value=(comments_action, existing_improve, comments_decision),
+        ):
+            assert cmd_improve(args) == 1
+
+        _assert_immediate_launch_lock_released(config, store)
+
+    def test_cmd_improve_releases_reserved_launch_on_create_value_error(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_improve
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement api", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        review = store.add("Review api", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            max_turns=None,
+            review=False,
+            review_id=None,
+            model=None,
+            provider=None,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with patch("gza.cli._create_improve_task", side_effect=ValueError("improve task already exists")):
+            assert cmd_improve(args) == 1
+
+        _assert_immediate_launch_lock_released(config, store)
+
+    def test_cmd_review_releases_reserved_launch_on_duplicate_review(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_review
+        from gza.review_tasks import DuplicateReviewError
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement api", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        existing_review = store.add("Existing review", task_type="review", depends_on=impl.id)
+        existing_review.status = "pending"
+        store.update(existing_review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            queue=False,
+            background=False,
+            model=None,
+            provider=None,
+        )
+
+        with patch("gza.cli._create_review_task", side_effect=DuplicateReviewError(existing_review)):
+            assert cmd_review(args) == 1
+
+        _assert_immediate_launch_lock_released(config, store)
+
+    def test_cmd_review_releases_reserved_launch_on_create_value_error(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_review
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement api", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            queue=False,
+            background=False,
+            model=None,
+            provider=None,
+        )
+
+        with patch("gza.cli._create_review_task", side_effect=ValueError("review task already exists")):
+            assert cmd_review(args) == 1
+
+        _assert_immediate_launch_lock_released(config, store)
+
     def test_cmd_fix_passes_fix_invocation(self, tmp_path: Path):
         from gza.cli.execution import cmd_fix
 
@@ -15761,6 +16709,42 @@ class TestForegroundInvocationContextWiring:
         assert "create a new retry attempt with a fresh conversation" in output
         assert "implement retries may fork fresh" in output
         assert "same-branch follow-ups stay on the shared branch" in output
+
+    def test_cmd_resume_rejects_at_limit_without_creating_child(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        from gza.cli.execution import cmd_resume
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        failed = store.add("Failed implement", task_type="implement")
+        failed.status = "failed"
+        failed.session_id = "resume-session-123"
+        store.update(failed)
+
+        before_ids = {task.id for task in store.get_all()}
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        rc = cmd_resume(args)
+
+        assert rc == 1
+        assert capsys.readouterr().out.strip() == "Error: already at max concurrent tasks: 1 running, limit is 1"
+        after_ids = {task.id for task in store.get_all()}
+        assert after_ids == before_ids
 
     def test_cmd_iterate_passes_iterate_invocation_to_run_foreground(self, tmp_path: Path):
         from unittest.mock import MagicMock

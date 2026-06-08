@@ -1,11 +1,13 @@
 """Shared pull-request ensure/create flow for task branches."""
 
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+from .concurrency import launch_permit
 from .config import Config
 from .console import MAX_PR_BODY_LENGTH, MAX_PR_TITLE_LENGTH, truncate
 from .db import SqliteTaskStore, Task
@@ -108,19 +110,11 @@ def _generate_pr_content(
         commit_log=commit_log,
         diff_stat=diff_stat,
     )
-
-    internal_task = store.add(
-        prompt=prompt,
-        task_type="internal",
-        skip_learnings=True,
-        trigger_source="manual",
-    )
-
-    if internal_task.id is None:
-        return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
-    internal_task_id = internal_task.id
+    internal_task_id: str | None = None
 
     def _mark_internal_task_failed_if_nonterminal() -> None:
+        if internal_task_id is None:
+            return
         refreshed = store.get(internal_task_id)
         if refreshed is None:
             return
@@ -136,11 +130,33 @@ def _generate_pr_content(
     try:
         from . import runner as runner_mod
 
-        exit_code = runner_mod.run(config, task_id=internal_task_id)
+        permit = launch_permit(config, store, current_pid=os.getpid())
+        try:
+            internal_task = store.add(
+                prompt=prompt,
+                task_type="internal",
+                skip_learnings=True,
+                trigger_source="manual",
+            )
+            if internal_task.id is None:
+                permit.release()
+                return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)
+            internal_task_id = internal_task.id
+
+            def _on_task_claimed(_task: Task) -> None:
+                permit.release()
+
+            try:
+                exit_code = runner_mod.run(config, task_id=internal_task_id, on_task_claimed=_on_task_claimed)
+            finally:
+                permit.release()
+        except Exception:
+            permit.release()
+            raise
     except Exception as exc:
         _mark_internal_task_failed_if_nonterminal()
         print(
-            f"Warning: PR description internal task {internal_task_id} failed: {exc}",
+            f"Warning: PR description internal task {internal_task_id or '<not-created>'} failed: {exc}",
             file=sys.stderr,
         )
         return _fallback_pr_content(task, commit_log, project_prefix=config.project_prefix or None)

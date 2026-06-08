@@ -327,3 +327,10 @@
 # Built-in color theme name.
 # Default: minimal
 # theme: minimal
+
+# --- Other ---
+
+# Hard global ceiling on concurrently running task-executing processes across all commands.
+# Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`.
+# Default: watch.batch or 5
+# max_concurrent: 5
