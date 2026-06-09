@@ -464,6 +464,70 @@ class TestEditCommand:
         assert updated is not None
         assert updated.tags == ()
 
+    def test_edit_clear_depends_on_persists_none_for_pending_task(self, tmp_path: Path):
+        """Pending tasks can explicitly clear their execution dependency."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Dependency task")
+        task = store.add("Blocked task", depends_on=blocker.id)
+        assert task.depends_on == blocker.id
+
+        result = run_gza("edit", str(task.id), "--clear-depends-on", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Cleared execution dependency" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.depends_on is None
+
+    def test_edit_clear_depends_on_without_existing_dependency_is_noop(self, tmp_path: Path):
+        """Clearing when no execution dependency exists should be a defined no-op."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Independent task")
+        assert task.depends_on is None
+
+        result = run_gza("edit", str(task.id), "--clear-depends-on", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "already has no execution dependency" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.depends_on is None
+
+    def test_edit_rejects_setting_and_clearing_depends_on_together(self, tmp_path: Path):
+        """`--depends-on` and `--clear-depends-on` cannot be combined."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original_dep = store.add("Original dependency")
+        replacement_dep = store.add("Replacement dependency")
+        task = store.add("Blocked task", depends_on=original_dep.id)
+
+        result = run_gza(
+            "edit",
+            str(task.id),
+            "--depends-on",
+            str(replacement_dep.id),
+            "--clear-depends-on",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Cannot use both --depends-on and --clear-depends-on" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.depends_on == original_dep.id
+
     def test_edit_rejects_combined_tag_mutation_flags(self, tmp_path: Path):
         """Tag mutation flags are mutually exclusive to prevent silent partial updates."""
 
@@ -592,6 +656,28 @@ class TestEditCommand:
         assert updated.status == "in_progress"
         assert updated.create_review is False
         assert updated.tags == ("backend",)
+
+    def test_edit_clear_depends_on_is_rejected_for_non_pending_task(self, tmp_path: Path):
+        """Clearing dependencies must still respect the non-pending tag-only rule."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Dependency task")
+        task = store.add("Blocked task", depends_on=blocker.id)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = run_gza("edit", str(task.id), "--clear-depends-on", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "non-pending tasks only allow tag edits" in result.stdout
+        assert "Pending-only edit flags requested: --clear-depends-on" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.depends_on == blocker.id
 
     def test_edit_auto_implement_allowed_for_completed_plan(self, tmp_path: Path):
         """Completed held plans may release the hold via --auto-implement."""

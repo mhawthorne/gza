@@ -681,6 +681,7 @@ gza edit <task_id> [options]
 | `--set-tags CSV` | Replace all tags with comma-separated tags (mutually exclusive with other tag mutation flags) |
 | `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID (branch inheritance and context; e.g. `gza-1234`) |
 | `--depends-on ID` | Set execution dependency using a full prefixed task ID (blocks task until dependency completes; e.g. `gza-1234`) |
+| `--clear-depends-on` | Remove the execution dependency (mutually exclusive with `--depends-on`) |
 | `--explore` | Convert to explore task |
 | `--task` | Convert to regular task |
 | `--review` | Enable automatic review task creation on completion |
@@ -695,7 +696,7 @@ gza edit <task_id> [options]
 
 Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`).
 Pending plan tasks may use `--hold-for-review` or `--no-hold-for-review`. Completed plan tasks may also use `--no-hold-for-review` (preferred) or `--auto-implement` (compatibility alias) to release a hold-for-review plan without rerunning it.
-All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, `--no-learnings`, and completed-plan `--hold-for-review`) remain pending-only.
+All other edit flags (`--based-on`, `--depends-on`, `--clear-depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, `--no-learnings`, and completed-plan `--hold-for-review`) remain pending-only.
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 

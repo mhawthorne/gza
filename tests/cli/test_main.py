@@ -509,6 +509,7 @@ class TestHelpOutput:
         for flag in (
             "--based-on",
             "--depends-on",
+            "--clear-depends-on",
             "--review",
             "--pr",
             "--prompt-file",

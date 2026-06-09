@@ -1625,7 +1625,7 @@ def main() -> int:
             "Pending plan tasks may use `--hold-for-review` or `--no-hold-for-review`. "
             "Completed plan tasks may also use `--no-hold-for-review` "
             "(preferred) or `--auto-implement` (compatibility alias) to release a hold-for-review plan. "
-            "All other edit flags (`--based-on`, `--depends-on`, `--explore`, `--task`, "
+            "All other edit flags (`--based-on`, `--depends-on`, `--clear-depends-on`, `--explore`, `--task`, "
             "`--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, "
             "and `--no-learnings`) remain pending-only."
         ),
@@ -1674,6 +1674,12 @@ def main() -> int:
         type=str,
         metavar="ID",
         help="Set execution dependency (depends_on field, blocks task until dependency completes)",
+    )
+    edit_parser.add_argument(
+        "--clear-depends-on",
+        action="store_true",
+        dest="clear_depends_on",
+        help="Clear the execution dependency (mutually exclusive with --depends-on)",
     )
     edit_parser.add_argument(
         "--explore",

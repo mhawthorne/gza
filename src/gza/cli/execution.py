@@ -2188,6 +2188,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
         pending_only_flags.append("--based-on")
     if getattr(args, "depends_on_flag", None) is not None:
         pending_only_flags.append("--depends-on")
+    if getattr(args, "clear_depends_on", False):
+        pending_only_flags.append("--clear-depends-on")
     if getattr(args, "explore", False):
         pending_only_flags.append("--explore")
     if getattr(args, "task", False):
@@ -2257,6 +2259,10 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     if prompt_file_arg is not None and prompt_arg is not None:
         print("Error: Cannot use both --prompt-file and --prompt")
+        return 1
+
+    if getattr(args, "clear_depends_on", False) and getattr(args, "depends_on_flag", None) is not None:
+        print("Error: Cannot use both --depends-on and --clear-depends-on")
         return 1
 
     based_on_id: str | None = None
@@ -2335,6 +2341,16 @@ def cmd_edit(args: argparse.Namespace) -> int:
         task.depends_on = depends_on_id
         update_messages.append(f"✓ Set task {task.id} to depend on task {depends_on_id}")
         changed = True
+    elif getattr(args, "clear_depends_on", False):
+        if task.depends_on is None:
+            info_messages.append(f"Task {task.id} already has no execution dependency")
+        else:
+            previous_depends_on = task.depends_on
+            task.depends_on = None
+            update_messages.append(
+                f"✓ Cleared execution dependency for task {task.id} (was {previous_depends_on})"
+            )
+            changed = True
 
     # Handle --review flag
     if hasattr(args, "review") and args.review:
