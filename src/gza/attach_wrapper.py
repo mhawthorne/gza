@@ -359,14 +359,14 @@ def main() -> int:
                                 no_docker=args.no_docker,
                                 force=args.force,
                                 max_iterations=config.iterate_max_iterations,
-                                resume=handoff_resume_mode,
+                                resume=False,
                                 retry=False,
                                 auto_iterate=True,
                             )
                             spawn_rc = _spawn_background_iterate(
                                 iterate_args,
                                 config,
-                                iterate_task,
+                                prepared_recovery,
                                 prepared_task_id=str(prepared_recovery.id),
                                 prepared_resume=handoff_resume_mode,
                                 prepared_phase="preloop",

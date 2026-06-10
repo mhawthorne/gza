@@ -165,6 +165,12 @@ When the installed `gza` package fingerprint changes while watch is running:
   that leaves the subject in the same state — no task status transition, no branch-head
   change, no merge-unit state change, no recovery-edge creation — is a no-op repeat and MUST
   advance the streak, not reset it.
+- Dead prepared recovery workers are a distinct primary failure signal, not merely
+  "no-progress" evidence. When watch can prove a detached worker for a pending recovery row
+  died before claiming it, reconciliation MUST terminalize that row as a failed recovery
+  descendant before the next recovery decision is computed. Watch MUST NOT keep reusing the
+  same dead pending recovery row forever and rely on the no-progress backstop as the
+  primary stop condition.
 - Watch MUST reset the streak only when durable progress actually occurs: a newly created
   task, a task status transition, a recovery edge creation, a review/improve/rebase
   completion, a branch-head change, a merge-unit state change, or a different selected

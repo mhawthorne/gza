@@ -123,6 +123,10 @@ its stored action.
 - A `pending` task with `recovery_origin = resume` and a stored `session_id` MUST, when
   run, **continue that provider session**, including when its branch currently has **no
   commits**. An empty branch MUST NOT downgrade a resume row to a no-op.
+- Any launch path that executes a prepared pending recovery row in detached `iterate`
+  mode MUST target that recovery row itself as the concrete iterate task. Passing the
+  failed parent only as display context while relying on `prepared_task_id` to bypass
+  failed-task validation is not authoritative and MUST NOT be required for correctness.
 - Such a row MUST NOT be dispatched as a fresh `iterate` that terminates with an `empty` /
   "no remaining commits to land" message. That terminal applies only to work that has no
   remaining action — a resume row with a continuable session always has a remaining action.
@@ -132,6 +136,14 @@ its stored action.
 - A `pending` task with `recovery_origin = retry` MUST start a fresh execution attempt.
 - The empty-recovery mootness logic in section 1 (which governs *failed* tasks) MUST NOT be
   used to suppress an explicit pending resume/retry row to a no-op.
+- If a detached worker for a prepared pending recovery row dies before claiming the task,
+  reconciliation MUST terminalize that recovery row as a failed recovery descendant rather
+  than leaving it `pending` forever. That startup abort MUST consume the same bounded
+  automatic recovery budget as any other failed recovery attempt.
+- A same-action failed recovery descendant that merely consumed one bounded automatic
+  attempt MUST count toward that budget first. Automation MAY spend the remaining bounded
+  attempt(s) before escalating to shared needs-attention; it MUST NOT park immediately on
+  the first same-action startup-abort descendant alone.
 
 - Operator wording MUST distinguish **moot empty work** from **empty but resumable
   failed work**.

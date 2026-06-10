@@ -5269,6 +5269,15 @@ class TestShowCommand:
         failed_resume.completed_at = datetime(2026, 5, 4, 12, 10, 0, tzinfo=UTC)
         store.update(failed_resume)
 
+        failed_resume_retry_limit = store.add(failed_root.prompt, task_type="implement", based_on=failed_root.id)
+        assert failed_resume_retry_limit.id is not None
+        failed_resume_retry_limit.status = "failed"
+        failed_resume_retry_limit.failure_reason = "TIMEOUT"
+        failed_resume_retry_limit.session_id = failed_root.session_id
+        failed_resume_retry_limit.branch = failed_root.branch
+        failed_resume_retry_limit.completed_at = datetime(2026, 5, 4, 12, 20, 0, tzinfo=UTC)
+        store.update(failed_resume_retry_limit)
+
         git = MagicMock()
         git.default_branch.return_value = "main"
         git.can_merge.return_value = True
@@ -5293,13 +5302,14 @@ class TestShowCommand:
         expected = format_needs_attention_lifecycle(
             {
                 "type": "skip",
-                "needs_attention_reason": "newer-recovery-descendant-needs-attention",
-                "description": "SKIP: a newer recovery descendant requires manual attention first",
+                "needs_attention_reason": "retry-limit-reached",
+                "description": "SKIP: automatic recovery stops here; retry limit reached",
             }
         )
         assert f"Lifecycle: {expected}" in output
         assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
         assert f"{failed_resume.id}[implement] [resume] failed (TIMEOUT)" in output
+        assert f"{failed_resume_retry_limit.id}[implement] [resume] failed (TIMEOUT)" in output
 
     def test_show_recovered_needs_attention_lifecycle_uses_failed_color(
         self, tmp_path: Path

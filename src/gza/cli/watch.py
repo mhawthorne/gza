@@ -1279,7 +1279,11 @@ def _run_cycle(
     auto_restart_on_drift: bool = True,
     installed_package_drift: _InstalledPackageDriftState | None = None,
 ) -> _CycleResult:
-    from ._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
+    from ._common import (
+        prune_terminal_dead_workers,
+        reconcile_dead_pending_recovery_tasks,
+        reconcile_in_progress_tasks,
+    )
 
     tags = normalize_tag_filters(tags)
 
@@ -1292,8 +1296,9 @@ def _run_cycle(
     if not dry_run:
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
+        reconcile_dead_pending_recovery_tasks(config)
 
-    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=not dry_run)
+    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
     running_task_ids = list(snapshot.running_task_ids)
     anonymous_worker_count = snapshot.anonymous_worker_count
     running_task_id_set = set(running_task_ids)
@@ -1609,12 +1614,12 @@ def _run_cycle(
                     argparse.Namespace(
                         max_iterations=max_iterations,
                         no_docker=False,
-                        resume=mode == "resume",
-                        retry=mode == "retry",
+                        resume=False,
+                        retry=False,
                         auto_iterate=True,
                     ),
                     config,
-                    task_obj,
+                    prepared_task,
                     prepared_task_id=str(prepared_task.id),
                     prepared_resume=mode == "resume",
                     prepared_phase="preloop",
@@ -2124,6 +2129,7 @@ def _run_cycle(
                 )
                 if prepared_recovered_task is None:
                     continue
+                resume_recovered_task = prepared_recovered_task
                 recovered_task_id = str(prepared_recovered_task.id)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
@@ -2135,12 +2141,12 @@ def _run_cycle(
                         argparse.Namespace(
                             max_iterations=max_iterations,
                             no_docker=False,
-                            resume=True,
+                            resume=False,
                             retry=False,
                             auto_iterate=True,
                         ),
                         config,
-                        failed,
+                        resume_recovered_task,
                         prepared_task_id=recovered_task_id,
                         prepared_resume=True,
                         prepared_phase="preloop",
@@ -2196,6 +2202,7 @@ def _run_cycle(
             )
             if prepared_recovered_task is None:
                 continue
+            retry_recovered_task = prepared_recovered_task
             recovered_task_id = str(prepared_recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
@@ -2228,7 +2235,7 @@ def _run_cycle(
                             auto_iterate=True,
                         ),
                         config,
-                        failed,
+                        retry_recovered_task,
                         prepared_task_id=recovered_task_id,
                         prepared_resume=False,
                         prepared_phase="preloop",

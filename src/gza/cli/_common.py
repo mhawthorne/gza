@@ -53,7 +53,7 @@ from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..operator_state import inspect_empty_merge_unit
 from ..prompts import PromptBuilder
-from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from ..recovery_engine import FailedRecoveryDecision, classify_recovery_row, decide_failed_task_recovery
 from ..review_scope import extract_review_scope_from_prompt
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
@@ -464,6 +464,68 @@ def reconcile_in_progress_tasks(config: Config) -> None:
             print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
         except Exception as exc:
             print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
+
+
+def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
+    """Fail prepared recovery rows whose detached worker died before the row was claimed."""
+    try:
+        store = get_store(config)
+        registry = WorkerRegistry(config.workers_path)
+    except ManualMigrationRequired:
+        return
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        print(f"Warning: Skipping pending recovery reconciliation due to setup error: {exc}", file=sys.stderr)
+        return
+    except Exception as exc:
+        print(f"Warning: Skipping pending recovery reconciliation due to unexpected error: {exc}", file=sys.stderr)
+        return
+
+    for worker in registry.list_all(include_completed=True):
+        if worker.task_id is None:
+            continue
+        worker_dead = worker.status == "running" and not registry.is_running(worker.worker_id)
+        worker_failed = worker.status == "failed"
+        if not worker_dead and not worker_failed:
+            continue
+
+        task_label = worker.task_id
+        try:
+            task = store.get(worker.task_id)
+            if task is None or task.status != "pending":
+                continue
+            if classify_recovery_row(store, task) not in {"resume", "retry"}:
+                continue
+            if not (worker_dead or worker_failed or worker.startup_log_file):
+                continue
+
+            has_commits = _branch_has_commits(config, task.branch)
+            mark_task_failed_from_cause(
+                task=task,
+                config=config,
+                store=store,
+                log_file=task.log_file or worker.startup_log_file,
+                branch=task.branch,
+                explicit_reason="WORKER_DIED",
+                has_commits=has_commits,
+                error_type=None,
+                exit_code=worker.exit_code,
+            )
+            registry.mark_completed(
+                worker.worker_id,
+                exit_code=worker.exit_code if worker.exit_code is not None else 1,
+                status="failed",
+                completion_reason="startup failure before task claim",
+            )
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(
+                f"Warning: Failed to reconcile pending recovery task {task_label}: {exc}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: Unexpected pending recovery reconciliation error for task {task_label}: {exc}",
+                file=sys.stderr,
+            )
 
 
 def prune_terminal_dead_workers(config: Config) -> None:

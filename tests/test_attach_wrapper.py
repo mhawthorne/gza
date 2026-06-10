@@ -265,14 +265,14 @@ def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume
     mock_spawn_iterate.assert_called_once()
     spawned_args = mock_spawn_iterate.call_args.args[0]
     spawned_task = mock_spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is True
+    assert spawned_args.resume is False
     assert spawned_args.retry is False
-    # Iterate target stays the failed impl task; the prepared recovery row is the
-    # resume child created by the parent.
-    assert spawned_task.id == task_id
+    # Iterate targets the prepared recovery child directly; the parent only
+    # contributes the recovery decision and prepared metadata.
     resume_children = store.get_based_on_children(task_id)
     assert len(resume_children) == 1
     resume_child = resume_children[0]
+    assert spawned_task.id == resume_child.id
     assert resume_child.based_on == task_id
     assert resume_child.recovery_origin == "resume"
     spawned_kwargs = mock_spawn_iterate.call_args.kwargs
@@ -932,6 +932,7 @@ def test_attach_wrapper_retry_iterate_success_passes_prepared_metadata(tmp_path:
     ]
     assert len(retry_children) == 1
     retry_child = retry_children[0]
+    assert mock_spawn_iterate.call_args.args[2].id == retry_child.id
     kwargs = mock_spawn_iterate.call_args.kwargs
     assert kwargs.get("prepared_task_id") == retry_child.id
     assert kwargs.get("prepared_resume") is False

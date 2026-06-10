@@ -736,9 +736,12 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is True
+    assert spawned_args.resume is False
     assert spawned_args.retry is False
-    assert spawned_task.id == failed.id
+    prepared_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert isinstance(prepared_child_id, str)
+    assert spawned_task.id == prepared_child_id
+    assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
 
 
 def test_watch_cycle_restart_failed_prioritizes_oldest_created_failed_task(tmp_path: Path) -> None:
@@ -833,8 +836,10 @@ def test_watch_cycle_default_auto_resume_prioritizes_oldest_created_failed_task(
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is True
-    assert spawned_task.id == older.id
+    prepared_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert isinstance(prepared_child_id, str)
+    assert spawned_args.resume is False
+    assert spawned_task.id == prepared_child_id
 
 
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
@@ -928,8 +933,9 @@ def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path:
     children = store.get_based_on_children(failed.id)
     assert result.work_done is True
     assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == failed.id
-    assert spawn_iterate.call_args.args[0].resume is True
+    assert spawn_iterate.call_args.args[2].id == resume_child.id
+    assert spawn_iterate.call_args.args[0].resume is False
+    assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
     assert len(children) == 1
     assert children[0].id == resume_child.id
 
@@ -1120,10 +1126,11 @@ def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_
 
     assert result.work_done is True
     assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == failed.id
-    assert spawn_iterate.call_args.args[0].resume is True
     prepared_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
     assert isinstance(prepared_child_id, str)
+    assert spawn_iterate.call_args.args[2].id == prepared_child_id
+    assert spawn_iterate.call_args.args[0].resume is False
+    prepared_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
     assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
     assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
     assert spawn_iterate.call_args.kwargs["startup_quiet"] is True
@@ -1434,15 +1441,88 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     spawned_task = spawn_iterate.call_args.args[2]
     assert spawned_args.resume is False
     assert spawned_args.retry is False
-    assert spawned_task.id == failed.id
+    spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert isinstance(spawned_child_id, str)
+    assert spawned_task.id == spawned_child_id
     assert spawn_iterate.call_args.kwargs["prepared_resume"] is False
     assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
     assert spawn_iterate.call_args.kwargs["startup_quiet"] is True
-    spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
-    assert isinstance(spawned_child_id, str)
     log_text = log_path.read_text()
     assert any("RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
     assert not any("RECOVR" in line and f"{failed.id} resume via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
+
+
+def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before_next_bounded_attempt(
+    tmp_path: Path,
+) -> None:
+    """Restart-failed should fail a dead pending retry row and launch the remaining bounded retry."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    retry_child = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert retry_child.id is not None
+    retry_child.status = "pending"
+    store.update(retry_child)
+
+    config = Config.load(tmp_path)
+    registry = WorkerRegistry(config.workers_path)
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-dead-watch-retry",
+            task_id=retry_child.id,
+            pid=999999,
+            startup_log_file=".gza/workers/dead-watch-retry.startup.log",
+        )
+    )
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    refreshed_retry_child = store.get(retry_child.id)
+    assert refreshed_retry_child is not None
+    assert refreshed_retry_child.status == "failed"
+    assert refreshed_retry_child.failure_reason == "WORKER_DIED"
+
+    assert spawn_iterate.call_count == 1
+    spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert isinstance(spawned_child_id, str)
+    assert spawned_child_id != retry_child.id
+    spawned_task = spawn_iterate.call_args.args[2]
+    assert spawned_task.id == spawned_child_id
+
+    pending_retry_children = [
+        child
+        for child in store.get_based_on_children_by_type(failed.id, failed.task_type)
+        if child.status == "pending"
+    ]
+    assert [child.id for child in pending_retry_children] == [spawned_child_id]
 
 
 def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
@@ -1683,11 +1763,11 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
     second_args = spawn_iterate.call_args_list[1].args[0]
     second_task = spawn_iterate.call_args_list[1].args[2]
     assert first_task.id == second_task.id
-    assert first_task.id == failed.id
+    assert first_task.id != failed.id
     first_prepared_child = spawn_iterate.call_args_list[0].kwargs["prepared_task_id"]
     second_prepared_child = spawn_iterate.call_args_list[1].kwargs["prepared_task_id"]
     assert first_prepared_child == second_prepared_child
-    assert second_args.resume is True
+    assert second_args.resume is False
     assert second_args.retry is False
     assert [task.id for task in children] == [first_prepared_child]
 
@@ -1734,8 +1814,8 @@ def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semanti
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_task.id == failed.id
-    assert spawned_args.resume is True
+    assert spawned_task.id == resume_child.id
+    assert spawned_args.resume is False
     assert spawned_args.retry is False
     assert [task.id for task in store.get_based_on_children(failed.id)] == [resume_child.id]
 
@@ -1811,8 +1891,8 @@ def test_watch_cycle_blocked_pending_recovery_child_waits_for_dependency_then_re
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_task.id == failed.id
-    assert spawned_args.resume is True
+    assert spawned_task.id == resume_child.id
+    assert spawned_args.resume is False
     assert spawned_args.retry is False
     assert len(store.get_based_on_children(failed.id)) == 1
 
@@ -2003,8 +2083,10 @@ def test_watch_cycle_plain_mode_starts_manually_queued_pending_recovery_child(tm
     assert spawn_worker.call_args.kwargs["task_id"] == manual_child.id
 
 
-def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_exhaustion(tmp_path: Path) -> None:
-    """--restart-failed should start manual pending children after actionable recovery work is drained."""
+def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_budget_exhaustion(
+    tmp_path: Path,
+) -> None:
+    """--restart-failed should drain both bounded retries before starting manual pending children."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2061,10 +2143,26 @@ def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_
             restart_failed_batch=1,
             max_recovery_attempts=config.max_resume_attempts,
         )
+        final_actionable_child = sorted(store.get_based_on_children(actionable.id), key=lambda task: str(task.id))[-1]
+        final_actionable_child.status = "failed"
+        final_actionable_child.failure_reason = "TEST_FAILURE"
+        store.update(final_actionable_child)
+        third_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
 
     assert first_result.work_done is True
     assert second_result.work_done is True
-    assert spawn_worker.call_count == 2
+    assert third_result.work_done is True
+    assert spawn_worker.call_count == 3
     assert spawn_worker.call_args_list[-1].kwargs["task_id"] == manual_child.id
 
 
@@ -8420,9 +8518,11 @@ def test_watch_restart_failed_resumes_historical_prerequisite_unmerged_row_with_
     assert spawn_iterate.call_count == 1
     spawned_args = spawn_iterate.call_args.args[0]
     spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is True
+    prepared_task_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+    assert spawned_args.resume is False
     assert spawned_args.retry is False
-    assert spawned_task.id == failed.id
+    assert isinstance(prepared_task_id, str)
+    assert spawned_task.id == prepared_task_id
 
 
 def test_watch_restart_failed_retries_historical_prerequisite_unmerged_row_with_live_non_empty_branch(
@@ -8502,7 +8602,7 @@ def test_watch_restart_failed_retries_historical_prerequisite_unmerged_row_with_
     spawned_task = spawn_iterate.call_args.args[2]
     prepared_task_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
     assert spawned_args.resume is False
-    assert spawned_task.id == failed.id
+    assert spawned_task.id == prepared_task_id
     assert spawned_args.retry is False
     retry_children = store.get_based_on_children(failed.id)
     assert len(retry_children) == 1
@@ -8770,6 +8870,15 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     exhausted_child.completed_at = datetime(2026, 4, 28, 10, 50, 0, tzinfo=UTC)
     store.update(exhausted_child)
 
+    exhausted_child_retry_limit = store.add("Failed resume attempt 2", task_type="implement", based_on=exhausted_root.id)
+    assert exhausted_child_retry_limit.id is not None
+    exhausted_child_retry_limit.status = "failed"
+    exhausted_child_retry_limit.failure_reason = "MAX_TURNS"
+    exhausted_child_retry_limit.session_id = exhausted_root.session_id
+    exhausted_child_retry_limit.branch = exhausted_root.branch
+    exhausted_child_retry_limit.completed_at = datetime(2026, 4, 28, 10, 52, 0, tzinfo=UTC)
+    store.update(exhausted_child_retry_limit)
+
     hidden_skip = store.add("Pending retry already queued", task_type="implement")
     assert hidden_skip.id is not None
     hidden_skip.status = "failed"
@@ -8820,9 +8929,10 @@ def test_cmd_watch_restart_failed_dry_run_hides_skipped_by_default_and_sorts_old
     assert hidden_skip.id not in stdout
     assert f'{manual.id} implement "Manual failed implement" reason=manual-failure-reason' in normalized
     assert "TEST_FAILURE requires manual intervention" in normalized
-    assert f'{exhausted_child.id} implement "Failed resume attempt" reason=retry-limit-reached' in normalized
+    assert f'{exhausted_root.id} implement "Failed resume root" reason=retry-limit-reached' in normalized
     assert "automatic recovery stops here; retry limit reached" in normalized
-    assert f'{exhausted_root.id} implement "Failed resume root"' not in normalized
+    assert f'{exhausted_child.id} implement "Failed resume attempt"' not in normalized
+    assert f'{exhausted_child_retry_limit.id} implement "Failed resume attempt 2"' not in normalized
     assert "reason=newer-recovery-descendant-needs-attention" not in normalized
     assert "2 actionable (0 resume, 2 retry), 2 needs attention, 1 skipped hidden" in normalized
 
@@ -9517,6 +9627,14 @@ def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display
     resumed_retry.completed_at = datetime(2026, 4, 28, 12, 0, 0, tzinfo=UTC)
     store.update(resumed_retry)
 
+    resumed_retry_retry_limit = store.add(retry_child.prompt, task_type="plan", based_on=retry_child.id)
+    assert resumed_retry_retry_limit.id is not None
+    resumed_retry_retry_limit.status = "failed"
+    resumed_retry_retry_limit.failure_reason = "TIMEOUT"
+    resumed_retry_retry_limit.session_id = retry_child.session_id
+    resumed_retry_retry_limit.completed_at = datetime(2026, 4, 28, 12, 5, 0, tzinfo=UTC)
+    store.update(resumed_retry_retry_limit)
+
     args = argparse.Namespace(
         project_dir=tmp_path,
         batch=1,
@@ -9540,7 +9658,7 @@ def test_cmd_watch_restart_failed_dry_run_saturates_retry_resume_attempt_display
     stdout = capsys.readouterr().out
     assert "attempt=3/2" not in stdout
     normalized = " ".join(stdout.split())
-    assert f'{resumed_retry.id} plan "Root failed plan" reason=retry-limit-reached' in normalized
+    assert f'{retry_child.id} plan "Root failed plan" reason=retry-limit-reached' in normalized
     assert "automatic recovery stops here; retry limit reached" in normalized
 
 

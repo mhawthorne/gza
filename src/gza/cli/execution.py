@@ -2825,6 +2825,29 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,
     )
+
+    def _resolve_prepared_iterate_seed() -> tuple[DbTask | None, str | None, int | None]:
+        prepared_task_id = getattr(args, "prepared_task_id", None)
+        if not prepared_task_id:
+            return None, None, None
+        prepared_phase = getattr(args, "prepared_phase", None) or "preloop"
+        if prepared_phase not in {"preloop", "iteration"}:
+            print(f"Error: unsupported iterate prepared startup phase {prepared_phase!r}.")
+            return None, None, 1
+        prepared_action_type = getattr(args, "prepared_action_type", None)
+        if prepared_phase == "iteration" and not isinstance(prepared_action_type, str):
+            print("Error: prepared iterate iteration start is missing an action type.")
+            return None, None, 1
+        prepared_task = store.get(prepared_task_id)
+        if prepared_task is None:
+            print(f"Error: prepared iterate task {prepared_task_id} not found.")
+            return None, None, 1
+        return prepared_task, prepared_phase, None
+
+    prepared_validation_task, prepared_validation_phase, prepared_validation_rc = _resolve_prepared_iterate_seed()
+    if prepared_validation_rc is not None:
+        return prepared_validation_rc
+    prepared_preloop_task = prepared_validation_task if prepared_validation_phase == "preloop" else None
     resolved_unit = store.resolve_merge_unit_for_task(impl_task.id) if impl_task.id is not None else None
     failed_start_decision = (
         decide_failed_task_recovery(
@@ -2847,13 +2870,23 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         and failed_start_decision.reason_code == "merge_unit_empty"
     )
 
-    if impl_task.status == "failed" and not use_resume and not use_retry and not failed_task_is_lifecycle_moot:
+    if (
+        prepared_preloop_task is None
+        and impl_task.status == "failed"
+        and not use_resume
+        and not use_retry
+        and not failed_task_is_lifecycle_moot
+    ):
         return phase1_error(
             args,
             f"Task {impl_task.id} is failed. Use --resume or --retry to specify how to restart it.",
         )
 
-    if (use_resume or use_retry) and (impl_task.status != "failed" or failed_task_is_lifecycle_moot):
+    if (
+        prepared_preloop_task is None
+        and (use_resume or use_retry)
+        and (impl_task.status != "failed" or failed_task_is_lifecycle_moot)
+    ):
         if (resolved_from_failed_ancestor and requested_impl_task.status == "failed") or (
             impl_task.status == "failed" and failed_task_is_lifecycle_moot
         ):
@@ -2888,7 +2921,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     assert impl_task.id is not None
     active_impl_task_id = impl_task.id
 
-    if impl_task.status == "failed" and use_resume and not impl_task.session_id:
+    if prepared_preloop_task is None and impl_task.status == "failed" and use_resume and not impl_task.session_id:
         return phase1_error(args, f"Task {impl_task.id} has no session ID (cannot resume). Use --retry instead.")
 
     manual_iterate = not bool(getattr(args, "auto_iterate", False))
@@ -2913,23 +2946,16 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     ) -> tuple[DbTask, FailedRecoveryDecision, list[str]] | None:
         if not manual_iterate or decision.action == "resume":
             return None
-        if _decision_hits_max_auto_resume_cap(failed_task, decision):
-            assert failed_task.id is not None
-            return (
-                failed_task,
-                decision,
-                [
-                    "warning: task "
-                    f"{failed_task.id} has hit max auto-resume attempts; proceeding because this resume is manual"
-                ],
-            )
         attention_reason = get_failed_recovery_needs_attention_reason(
             store,
             failed_task,
             decision=decision,
             max_recovery_attempts=max(1, effective_max_resume_attempts),
         )
-        if attention_reason != "newer-recovery-descendant-needs-attention":
+        if (
+            attention_reason != "newer-recovery-descendant-needs-attention"
+            and decision.reason_code != "retry_limit_reached"
+        ):
             return None
         descendant = get_manual_resume_override_descendant(
             store,
@@ -2938,6 +2964,16 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             max_recovery_attempts=max(1, effective_max_resume_attempts),
         )
         if descendant is None or descendant.id is None or descendant.id == failed_task.id:
+            if _decision_hits_max_auto_resume_cap(failed_task, decision):
+                assert failed_task.id is not None
+                return (
+                    failed_task,
+                    decision,
+                    [
+                        "warning: task "
+                        f"{failed_task.id} has hit max auto-resume attempts; proceeding because this resume is manual"
+                    ],
+                )
             return None
         descendant_decision = _decide_failed_iterate_resume_start(descendant)
         nested_override = _resolve_manual_resume_override(descendant, descendant_decision)
@@ -3279,22 +3315,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         return 3
 
     def _resolve_prepared_iterate_start() -> tuple[_PreparedIterateStart | None, int | None]:
-        prepared_task_id = getattr(args, "prepared_task_id", None)
-        if not prepared_task_id:
+        prepared_task, prepared_phase, prepared_seed_rc = _resolve_prepared_iterate_seed()
+        if prepared_seed_rc is not None:
+            return None, prepared_seed_rc
+        if prepared_task is None:
             return None, None
-        prepared_phase = getattr(args, "prepared_phase", None) or "preloop"
-        if prepared_phase not in {"preloop", "iteration"}:
-            print(f"Error: unsupported iterate prepared startup phase {prepared_phase!r}.")
-            return None, 1
+        assert prepared_phase is not None
         prepared_action_type = getattr(args, "prepared_action_type", None)
         prepared_review_task_id = getattr(args, "prepared_review_task_id", None)
-        if prepared_phase == "iteration" and not isinstance(prepared_action_type, str):
-            print("Error: prepared iterate iteration start is missing an action type.")
-            return None, 1
-        prepared_task = store.get(prepared_task_id)
-        if prepared_task is None:
-            print(f"Error: prepared iterate task {prepared_task_id} not found.")
-            return None, 1
         return (
             _PreparedIterateStart(
                 task=prepared_task,

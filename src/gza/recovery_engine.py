@@ -355,6 +355,21 @@ def resolve_pending_recovery_execution_mode(task: DbTask) -> PendingRecoveryExec
     return None
 
 
+def classify_recovery_row(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> RecoveryRole | None:
+    """Return the recovery role carried by this task's based_on edge, if any."""
+    if task.id is None or task.based_on is None:
+        return None
+    parent = read_context.get_task(task.based_on) if read_context is not None else store.get(task.based_on)
+    if parent is None:
+        return None
+    return _classify_recovery_edge(parent, task)
+
+
 def _task_is_complete_recovery_outcome(
     store: SqliteTaskStore,
     task: DbTask,
@@ -934,13 +949,14 @@ def _policy_attempt_counters(
     chain: RecoveryChainState,
     *,
     max_recovery_attempts: int,
+    consumed_attempts: int = 0,
 ) -> tuple[int, int]:
     if max_recovery_attempts <= 0:
         return (0, 0)
     attempt_limit = 2
     # Display counters should reflect the bounded shared policy budget, not raw
     # based_on depth, so exhausted chains saturate at N/N instead of N+1/N.
-    attempt_index = min(len(chain.steps) + 1, attempt_limit)
+    attempt_index = min(max(len(chain.steps) + 1, consumed_attempts + 1), attempt_limit)
     return (attempt_index, attempt_limit)
 
 
@@ -950,6 +966,23 @@ def _list_unresolved_recovery_terminal_descendants(snapshot: _RecoveryChainSnaps
         descendant
         for descendant in snapshot.terminal_descendants
         if descendant.status in _UNRESOLVED_RECOVERY_TERMINAL_STATUSES and descendant.id is not None
+    ]
+
+
+def _matching_failed_terminal_descendants(
+    store: SqliteTaskStore,
+    snapshot: _RecoveryChainSnapshot,
+    *,
+    expected_action: RecoveryAction | None,
+    read_context: RecoveryReadContext | None = None,
+) -> list[DbTask]:
+    if expected_action is None:
+        return []
+    return [
+        descendant
+        for descendant in snapshot.terminal_descendants
+        if descendant.status == "failed"
+        and classify_recovery_row(store, descendant, read_context=read_context) == expected_action
     ]
 
 
@@ -1170,10 +1203,7 @@ def decide_failed_task_recovery(
     launch_mode: Literal["iterate", "worker", "none"] = "iterate" if task.task_type == "implement" else "worker"
     chain = get_recovery_chain_state(store, task, read_context=read_context)
     snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
-    attempt_index, attempt_limit = _policy_attempt_counters(
-        chain,
-        max_recovery_attempts=max_recovery_attempts,
-    )
+    attempt_index, attempt_limit = _policy_attempt_counters(chain, max_recovery_attempts=max_recovery_attempts)
 
     if task.status != "failed":
         return _skip_decision(
@@ -1209,6 +1239,19 @@ def decide_failed_task_recovery(
         )
     else:
         expected_action = _expected_recovery_action(task, chain=chain)
+    consumed_attempts = len(
+        _matching_failed_terminal_descendants(
+            store,
+            snapshot,
+            expected_action=expected_action,
+            read_context=read_context,
+        )
+    )
+    attempt_index, attempt_limit = _policy_attempt_counters(
+        chain,
+        max_recovery_attempts=max_recovery_attempts,
+        consumed_attempts=consumed_attempts,
+    )
 
     if not _is_resumable_timeout_implementation(task) and is_resolved_by_merged_target(
         store,
@@ -1371,11 +1414,34 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
-    if _list_unresolved_recovery_terminal_descendants(snapshot):
+    unresolved_terminals = _list_unresolved_recovery_terminal_descendants(snapshot)
+    matching_failed_terminals = _matching_failed_terminal_descendants(
+        store,
+        snapshot,
+        expected_action=expected_action,
+        read_context=read_context,
+    )
+    if any(descendant.status == "dropped" for descendant in unresolved_terminals):
         return _skip_decision(
             task_id=task_id,
             reason_code="recovery_has_newer_unresolved_descendant",
             reason_text="a newer recovery descendant requires manual attention first",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+    if unresolved_terminals and len(matching_failed_terminals) != len(unresolved_terminals):
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="recovery_has_newer_unresolved_descendant",
+            reason_text="a newer recovery descendant requires manual attention first",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+    if unresolved_terminals and consumed_attempts >= attempt_limit:
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="retry_limit_reached",
+            reason_text="automatic recovery stops here; retry limit reached",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )
@@ -1470,7 +1536,7 @@ def get_manual_resume_override_descendant(
         max_recovery_attempts=max_recovery_attempts,
         read_context=read_context,
     )
-    if resolved_decision.reason_code != "recovery_has_newer_unresolved_descendant":
+    if resolved_decision.reason_code not in {"recovery_has_newer_unresolved_descendant", "retry_limit_reached"}:
         return None
 
     unresolved_descendants = sort_failed_tasks(

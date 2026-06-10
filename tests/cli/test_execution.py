@@ -4127,6 +4127,56 @@ class TestReconciliation:
         assert refreshed is not None
         assert refreshed.status == "in_progress"
 
+    def test_reconciliation_terminalizes_dead_pending_recovery_task(self, tmp_path: Path):
+        """Dead detached workers for pending recovery rows should consume a bounded recovery attempt."""
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.status = "pending"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-recovery",
+                task_id=retry_child.id,
+                pid=999999,
+                startup_log_file=".gza/workers/retry-child.startup.log",
+            )
+        )
+
+        reconcile_dead_pending_recovery_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/workers/retry-child.startup.log"
+
+        worker = registry.get("w-dead-recovery")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "startup failure before task claim"
+
     def test_prune_terminal_dead_workers_removes_completed_task_worker(self, tmp_path: Path):
         """Terminal task workers with dead PIDs should be pruned from the registry."""
         import subprocess
@@ -9229,7 +9279,7 @@ class TestIterateCommand:
         assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
         assert output.count("Needs attention:") == 1
-        assert "reason=newer-recovery-descendant-needs-attention" in output
+        assert "reason=retry-limit-reached" in output
         assert "Cannot resume failed implementation" not in output
         assert "proceeding with manual resume from" not in output
 
@@ -12064,7 +12114,7 @@ class TestIterateCommand:
             in captured.err
         )
 
-    def test_failed_root_manual_resume_with_existing_failed_resume_child_reroutes_to_descendant(
+    def test_failed_root_manual_resume_with_existing_failed_resume_child_uses_final_bounded_attempt(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -12137,29 +12187,16 @@ class TestIterateCommand:
         output = captured.out
 
         root_children = store.get_based_on_children(root.id)
-        assert [task.id for task in root_children] == [failed_resume_child.id]
-        rerouted_children = store.get_based_on_children(failed_resume_child.id)
-        assert len(rerouted_children) == 1
-        manual_resume = rerouted_children[0]
+        assert len(root_children) == 2
+        assert root_children[0].id == failed_resume_child.id
+        final_resume = root_children[-1]
 
         assert result == 3
         assert run_foreground.call_count == 1
         assert run_foreground.call_args.kwargs.get("resume") is True
-        assert run_foreground.call_args.kwargs.get("task_id") == manual_resume.id
-        assert (
-            f"Resuming failed implementation {root.id} via newer recovery descendant "
-            f"{failed_resume_child.id} as {manual_resume.id}..."
-            in output
-        )
-        assert (
-            f"warning: task {root.id} is blocked by newer failed recovery descendant {failed_resume_child.id}; "
-            f"proceeding with manual resume from {failed_resume_child.id}"
-            in captured.err
-        )
-        assert (
-            f"warning: task {failed_resume_child.id} has hit max auto-resume attempts; proceeding because this resume is manual"
-            in captured.err
-        )
+        assert run_foreground.call_args.kwargs.get("task_id") == final_resume.id
+        assert f"Resuming failed implementation {root.id} as {final_resume.id}..." in output
+        assert captured.err == ""
         assert "reason=newer-recovery-descendant-needs-attention" not in output
 
     def test_failed_root_background_manual_resume_with_existing_failed_resume_child_warns_before_spawn(
@@ -12223,20 +12260,12 @@ class TestIterateCommand:
 
         assert result == 0
         assert spawn_background.call_count == 1
-        prepared_child_ids = [task.id for task in store.get_based_on_children(failed_resume_child.id)]
+        prepared_child_ids = [task.id for task in store.get_based_on_children(root.id) if task.id != failed_resume_child.id]
         assert len(prepared_child_ids) == 1
         assert spawn_background.call_args.kwargs["prepared_task_id"] == prepared_child_ids[0]
         assert spawn_background.call_args.kwargs["prepared_resume"] is True
         assert spawn_background.call_args.kwargs["prepared_phase"] == "preloop"
-        assert (
-            f"warning: task {root.id} is blocked by newer failed recovery descendant {failed_resume_child.id}; "
-            f"proceeding with manual resume from {failed_resume_child.id}"
-            in captured.err
-        )
-        assert (
-            f"warning: task {failed_resume_child.id} has hit max auto-resume attempts; proceeding because this resume is manual"
-            in captured.err
-        )
+        assert captured.err == ""
 
     @pytest.mark.parametrize(
         ("failure_reason", "seed_chain"),

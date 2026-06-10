@@ -1686,7 +1686,9 @@ def test_list_failed_tasks_for_recovery_hides_fully_recovered_ancestors(tmp_path
     assert [task.id for task in failed] == [unrelated.id]
 
 
-def test_recovery_engine_pending_match_stays_suppressed_by_newer_failed_descendant(tmp_path: Path) -> None:
+def test_recovery_engine_pending_match_reuses_retry_child_after_one_consumed_same_action_attempt(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1723,10 +1725,12 @@ def test_recovery_engine_pending_match_stays_suppressed_by_newer_failed_descenda
     store.update(failed_grandchild)
 
     decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
-    assert decision.action == "skip"
-    assert decision.reason_code == "recovery_has_newer_unresolved_descendant"
-    assert decision.recovery_task_id is None
-    assert decision.reuse_existing is False
+    assert decision.action == "retry"
+    assert decision.reason_code == "INFRASTRUCTURE_ERROR"
+    assert decision.reason_text == f"reusing pending retry child {reusable_pending.id}"
+    assert decision.recovery_task_id == reusable_pending.id
+    assert decision.reuse_existing is True
+    assert (decision.attempt_index, decision.attempt_limit) == (2, 2)
 
 
 @pytest.mark.parametrize(
@@ -1781,7 +1785,9 @@ def test_recovery_engine_skips_failed_ancestor_when_deeper_descendant_supersedes
     assert decision.reuse_existing is False
 
 
-def test_recovery_engine_only_terminal_failed_node_remains_actionable(tmp_path: Path) -> None:
+def test_recovery_engine_single_same_action_failed_recovery_descendant_gets_final_bounded_attempt(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1800,12 +1806,47 @@ def test_recovery_engine_only_terminal_failed_node_remains_actionable(tmp_path: 
     store.update(retry_child)
 
     root_decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
-    assert root_decision.action == "skip"
-    assert root_decision.reason_code == "recovery_has_newer_unresolved_descendant"
+    assert root_decision.action == "retry"
+    assert root_decision.reason_code == "INFRASTRUCTURE_ERROR"
+    assert root_decision.reason_text == "INFRASTRUCTURE_ERROR restart with fresh attempt"
+    assert (root_decision.attempt_index, root_decision.attempt_limit) == (2, 2)
+    assert root_decision.recovery_task_id is None
+    assert root_decision.reuse_existing is False
 
     child_decision = decide_failed_task_recovery(store, retry_child, max_recovery_attempts=3)
     assert child_decision.action == "skip"
     assert child_decision.reason_code == "retry_limit_reached"
+
+
+def test_recovery_engine_two_same_action_failed_recovery_descendants_exhaust_budget(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    root = store.add("Failed root", task_type="plan")
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "INFRASTRUCTURE_ERROR"
+    root.completed_at = datetime.now(UTC)
+    store.update(root)
+
+    first_retry_child = store.add(root.prompt, task_type="plan", based_on=root.id, depends_on=root.depends_on)
+    assert first_retry_child.id is not None
+    first_retry_child.status = "failed"
+    first_retry_child.failure_reason = "INFRASTRUCTURE_ERROR"
+    first_retry_child.completed_at = datetime.now(UTC)
+    store.update(first_retry_child)
+
+    second_retry_child = store.add(root.prompt, task_type="plan", based_on=root.id, depends_on=root.depends_on)
+    assert second_retry_child.id is not None
+    second_retry_child.status = "failed"
+    second_retry_child.failure_reason = "INFRASTRUCTURE_ERROR"
+    second_retry_child.completed_at = datetime.now(UTC)
+    store.update(second_retry_child)
+
+    root_decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
+    assert root_decision.action == "skip"
+    assert root_decision.reason_code == "retry_limit_reached"
+    assert (root_decision.attempt_index, root_decision.attempt_limit) == (2, 2)
 
 
 def test_recovery_engine_dropped_recovery_child_requires_shared_attention(tmp_path: Path) -> None:
