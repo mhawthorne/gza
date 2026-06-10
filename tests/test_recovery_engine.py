@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 import gza.recovery_engine as recovery_engine
+from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
+from gza.config import Config
 from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
 from gza.git import GitError
@@ -1019,6 +1021,92 @@ def test_recovery_engine_infra_failure_chooses_retry(tmp_path: Path) -> None:
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "retry"
     assert decision.launch_mode == "worker"
+
+
+def test_classify_failure_reason_branch_unpushable_is_reconcile() -> None:
+    assert classify_failure_reason("BRANCH_UNPUSHABLE") == "reconcile"
+
+
+def test_classify_failure_reason_pr_required_is_reconcile_compatibility() -> None:
+    assert classify_failure_reason("PR_REQUIRED") == "reconcile"
+
+
+def test_recovery_engine_branch_unpushable_chooses_reconcile(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+    task.branch = "feature/branch-unpushable"
+    store.update(task)
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "reconcile"
+    assert decision.launch_mode == "none"
+    assert decision.reason_code == "BRANCH_UNPUSHABLE"
+
+
+def test_recovery_engine_branch_unpushable_direct_reconcile_attempt_reaches_retry_limit(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+    task.branch = "feature/branch-unpushable"
+    store.update(task)
+    persist_branch_publication_state(
+        store=store,
+        task=task,
+        config=Config.load(tmp_path),
+        state=BranchPublicationState(reconcile_attempts_consumed=1),
+        status="BRANCH_UNPUSHABLE",
+        exit_status="reconcile_retry_failed",
+    )
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "retry_limit_reached"
+    assert (decision.attempt_index, decision.attempt_limit) == (2, 2)
+
+
+def test_recovery_engine_legacy_pr_required_chooses_reconcile(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="PR_REQUIRED", session_id=None)
+    task.branch = "feature/legacy-pr-required"
+    store.update(task)
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "reconcile"
+    assert decision.launch_mode == "none"
+    assert decision.reason_code == "PR_REQUIRED"
+
+
+def test_recovery_engine_branchless_branch_unpushable_parks_for_manual_repair(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "reconcile_branch_missing"
+    assert "no branch to reconcile" in decision.reason_text
+    assert (
+        get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=decision,
+            max_recovery_attempts=1,
+        )
+        == "branch-publication-needs-manual-repair"
+    )
+
+
+def test_recovery_engine_branchless_pr_required_parks_for_manual_repair(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="PR_REQUIRED", session_id=None)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "reconcile_branch_missing"
+    assert "no branch to reconcile" in decision.reason_text
+    assert (
+        get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=decision,
+            max_recovery_attempts=1,
+        )
+        == "branch-publication-needs-manual-repair"
+    )
 
 
 def test_classify_failure_reason_config_error_is_manual() -> None:

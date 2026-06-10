@@ -1814,6 +1814,7 @@ def _allow_pr_required_retry(args: argparse.Namespace, task: DbTask) -> bool:
         (getattr(args, "create_pr", False) or task.create_pr)
         and task.status == "failed"
         and task.failure_reason == "PR_REQUIRED"
+        and bool(task.branch)
     )
 
 
@@ -2547,6 +2548,31 @@ def run_with_recovery(
             current_task = resume_task
             resume_mode = True
             continue
+        if decision.action == "reconcile":
+            if not refreshed.branch:
+                if on_terminal_skip is not None:
+                    on_terminal_skip(refreshed, decision, _failure_exit_code(rc))
+                return refreshed, _failure_exit_code(rc)
+            from ..git import Git
+            from .git_ops import _reconcile_diverged_branch_with_origin, complete_branch_unpushable_after_reconcile
+
+            git = Git(config.project_dir)
+            reconcile_outcome = _reconcile_diverged_branch_with_origin(config, git, refreshed)
+            if reconcile_outcome.status != "reconciled":
+                if on_terminal_skip is not None:
+                    on_terminal_skip(refreshed, decision, _failure_exit_code(rc))
+                return refreshed, _failure_exit_code(rc)
+            completion_rc = complete_branch_unpushable_after_reconcile(
+                config=config,
+                store=store,
+                git=git,
+                task=refreshed,
+            )
+            if refreshed.id is not None:
+                refreshed = store.get(refreshed.id) or refreshed
+            if completion_rc != 0 or refreshed.status == "failed":
+                return refreshed, _failure_exit_code(completion_rc)
+            return refreshed, 0
 
         if decision.reuse_existing and decision.recovery_task_id is not None:
             retry_task = store.get(decision.recovery_task_id)

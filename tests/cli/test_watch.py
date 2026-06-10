@@ -48,8 +48,9 @@ from gza.cli.watch import (
     _WatchLog,
     cmd_watch,
 )
-from gza.cli.advance_executor import AdvanceActionExecutionResult
+from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
 import gza.colors as colors
+from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.config import Config
 from gza.db import WatchProgressObservation
 from gza.git import GitError
@@ -2223,6 +2224,252 @@ def test_watch_cycle_pending_manual_recovery_child_not_suppressed_for_stop_reaso
     assert result.work_done is True
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == manual_child.id
+
+
+def test_watch_cycle_executes_branch_unpushable_reconcile_without_worker_slots(tmp_path: Path) -> None:
+    """Failed BRANCH_UNPUSHABLE tasks should reconcile directly without spawning resume/retry workers."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/reconcile-publish"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="reconcile_branch_divergence",
+                status="success",
+                message="Reconciled branch publication",
+                success_message="Reconciled branch publication",
+                work_done=True,
+                worker_consuming=False,
+            ),
+        ) as execute_action,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker should not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is True
+    execute_action.assert_called_once()
+    action = execute_action.call_args.kwargs["action"]
+    assert action["type"] == "reconcile_branch_divergence"
+    assert action["decision"].action == "reconcile"
+    text = log_path.read_text()
+    assert "RECOVR" in text
+    assert "reconcile branch publication" in text
+    assert "REPAIR" in text
+
+
+def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_consumed(tmp_path: Path) -> None:
+    """A failed direct reconcile attempt should consume the shared recovery budget."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/reconcile-budget"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def _execute_and_fail_once(*, task, action, context):
+        persist_branch_publication_state(
+            store=store,
+            task=task,
+            config=config,
+            state=BranchPublicationState(reconcile_attempts_consumed=1),
+            status="BRANCH_UNPUSHABLE",
+            exit_status="reconcile_retry_failed",
+        )
+        return AdvanceActionExecutionResult(
+            action_type="reconcile_branch_divergence",
+            status="error",
+            message="Reconciled branch publication; completion retry ended in BRANCH_UNPUSHABLE",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_execute_and_fail_once) as execute_action,
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+
+    assert first.work_done is False
+    assert second.work_done is False
+    assert execute_action.call_count == 1
+    refreshed = store.get(failed.id)
+    assert refreshed is not None
+    decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+    assert decision.reason_code == "retry_limit_reached"
+
+
+def test_watch_cycle_branchless_pr_required_parks_without_reconcile_attempt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Branchless legacy publication failures should surface as attention, not attempted reconcile work."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Legacy failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PR_REQUIRED"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=5,
+        max_iterations=10,
+        dry_run=True,
+        show_skipped=False,
+        quiet=True,
+        yes=True,
+        group=None,
+        restart_failed=True,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+    )
+
+    with (
+        patch("gza.cli.watch.execute_advance_action", side_effect=AssertionError("reconcile should not execute")),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    normalized = " ".join(stdout.split())
+    assert "Needs attention" in stdout
+    assert "reason=branch-publication-needs-manual-repair" in normalized
+    assert "no branch to reconcile" in normalized
+    assert "reconcile branch publication" not in stdout
+    assert "REPAIR" not in stdout
+
+
+def test_watch_cycle_reconcile_completes_failed_branch_unpushable_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/watch-reconcile-complete"
+    failed.has_commits = True
+    failed.log_file = "logs/watch-reconcile.log"
+    failed.output_content = "summary"
+    failed.diff_files_changed = 1
+    failed.diff_lines_added = 3
+    failed.diff_lines_removed = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    ensure_result = SimpleNamespace(ok=True, status="created", error=None, pr_url="https://example.test/pr/2")
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        count_commits_ahead=lambda *_args: 1,
+        rev_parse_if_exists=lambda ref: {"feature/watch-reconcile-complete": "head123", "main": "base456"}.get(ref),
+        can_merge=lambda *_args: True,
+        get_diff_name_status=lambda *_args: "",
+    )
+
+    def _execute_with_mocked_git(*, task, action, context):
+        context.git = git
+        return real_execute_advance_action(task=task, action=action, context=context)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(
+                status="reconciled",
+                message="Reconciled branch publication",
+            ),
+        ),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_execute_with_mocked_git),
+        patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr,
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        patch("gza.runner.task_footer"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker should not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is True
+    ensure_pr.assert_called_once()
+    refreshed = store.get(failed.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+    text = log_path.read_text()
+    assert "reconcile branch publication" in text
 
 
 def test_watch_cycle_restart_failed_hides_skipped_logs_by_default(tmp_path: Path) -> None:

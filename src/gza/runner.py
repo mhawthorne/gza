@@ -22,6 +22,11 @@ import gza.colors as _colors
 
 from .artifacts import store_command_output_artifact
 from .branch_naming import generate_branch_name
+from .branch_publication import (
+    BranchPublicationState,
+    load_branch_publication_state,
+    persist_branch_publication_state,
+)
 from .branch_resolution import resolve_rebase_target_branch
 from .commit_messages import build_task_commit_message
 from .config import (
@@ -132,6 +137,7 @@ EXTRACTION_PRECHECK_FAILURE_REASON = "EXTRACTION_PRECHECK_FAILED"
 EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
+BRANCH_UNPUSHABLE_FAILURE_REASON = "BRANCH_UNPUSHABLE"
 PROJECT_SCOPE_VIOLATION_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
 CROSS_PROJECT_TAG = "cross-project"
 DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE = 3
@@ -153,6 +159,16 @@ class ExtractionSeedResult:
 
     seeded_paths: frozenset[str] = frozenset()
     completion_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CompletedCodeTaskPrPublicationOutcome:
+    """Runner-owned classification of post-completion PR publication results."""
+
+    kind: str
+    status: str
+    message: str
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -745,6 +761,134 @@ def _finalize_completed_code_task(
     )
 
 
+def _record_pr_publication_note(
+    *,
+    task: Task,
+    log_file: Path | None,
+    branch_name: str,
+    status: str,
+    error: str | None,
+) -> str:
+    """Surface a non-fatal completed-task PR publication note."""
+    message = (
+        f"Warning: Task {task.id} completed and branch '{branch_name}' is published to origin, "
+        f"but PR was not created ({status})"
+    )
+    if error:
+        message = f"{message}: {error}"
+    print(message)
+    if log_file is not None:
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "pr_publication_note",
+                "message": message,
+                "status": status,
+                "error": error,
+                "branch": branch_name,
+                "task_id": task.id,
+            },
+        )
+    return message
+
+
+def _ensure_completed_task_branch_is_published(
+    *,
+    task: Task,
+    git: Git,
+) -> str | None:
+    """Ensure the completed task branch is published to origin before non-fatal PR notes."""
+    assert task.branch is not None
+    try:
+        if git.needs_push(task.branch):
+            print(f"Pushing branch '{task.branch}' to origin...")
+            git.push_branch(task.branch)
+    except GitError as exc:
+        return str(exc)
+    return None
+
+
+def _persist_branch_unpushable_failure(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    log_file: Path | str | None,
+    stats: TaskStats,
+    branch_name: str,
+    output_content: str | None,
+    diff_files: int,
+    diff_added: int,
+    diff_removed: int,
+    head_sha: str | None,
+    base_sha: str | None,
+    message: str,
+    fix_commits_ahead_before_run: int | None = None,
+    fix_default_branch: str | None = None,
+    fix_was_merged_before_run: bool = False,
+    record_reconcile_attempt: bool = False,
+) -> int:
+    """Persist a completion-time branch publication failure."""
+    print(message)
+    task.output_content = output_content
+    task.diff_files_changed = diff_files
+    task.diff_lines_added = diff_added
+    task.diff_lines_removed = diff_removed
+    prior_state = load_branch_publication_state(store, task.id)
+    persist_branch_publication_state(
+        store=store,
+        task=task,
+        config=config,
+        state=BranchPublicationState(
+            reconcile_attempts_consumed=(
+                prior_state.reconcile_attempts_consumed + 1
+                if record_reconcile_attempt
+                else prior_state.reconcile_attempts_consumed
+            ),
+            fix_commits_ahead_before_run=(
+                fix_commits_ahead_before_run
+                if fix_commits_ahead_before_run is not None
+                else prior_state.fix_commits_ahead_before_run
+            ),
+            fix_default_branch=fix_default_branch or prior_state.fix_default_branch,
+            fix_was_merged_before_run=(
+                fix_was_merged_before_run or prior_state.fix_was_merged_before_run
+            ),
+        ),
+        status=BRANCH_UNPUSHABLE_FAILURE_REASON,
+        exit_status="reconcile_retry_failed" if record_reconcile_attempt else "initial_failure",
+        head_sha=head_sha,
+    )
+    _mark_task_failed(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        has_commits=True,
+        stats=stats,
+        branch=branch_name,
+        explicit_reason=BRANCH_UNPUSHABLE_FAILURE_REASON,
+        error_type=None,
+        exit_code=1,
+        head_sha=head_sha,
+        base_sha=base_sha,
+    )
+    if isinstance(log_file, Path):
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "outcome",
+                "message": f"Outcome: failed ({BRANCH_UNPUSHABLE_FAILURE_REASON})",
+                "exit_code": 1,
+                "failure_reason": BRANCH_UNPUSHABLE_FAILURE_REASON,
+            },
+        )
+        _write_stats_entry(log_file, stats)
+    return 1
+
+
 def _finalize_rebase_completion(
     *,
     task: Task,
@@ -788,38 +932,31 @@ def _finalize_rebase_completion(
     if post_complete_rc != 0:
         return post_complete_rc
     if create_pr:
-        pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
-        if not pr_ready:
-            print("Error: Task requested PR creation/reuse, aborting before rebase completion")
-            task.output_content = output_content
-            task.diff_files_changed = diff_files
-            task.diff_lines_added = diff_added
-            task.diff_lines_removed = diff_removed
-            _mark_task_failed(
+        pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+        if pr_outcome.kind == "nonfatal_missing_pr":
+            _record_pr_publication_note(
+                task=task,
+                log_file=log_file,
+                branch_name=branch_name,
+                status=pr_outcome.status,
+                error=pr_outcome.error,
+            )
+        elif pr_outcome.kind == "branch_unpushable":
+            return _persist_branch_unpushable_failure(
                 task=task,
                 config=config,
                 store=store,
                 log_file=log_file,
-                has_commits=True,
                 stats=stats,
-                branch=branch_name,
-                explicit_reason=PR_REQUIRED_FAILURE_REASON,
-                error_type=None,
-                exit_code=1,
+                branch_name=branch_name,
+                output_content=output_content,
+                diff_files=diff_files,
+                diff_added=diff_added,
+                diff_removed=diff_removed,
                 head_sha=head_sha,
                 base_sha=base_sha,
+                message=pr_outcome.message,
             )
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "outcome",
-                    "message": "Outcome: failed (PR_REQUIRED)",
-                    "exit_code": 1,
-                },
-            )
-            _write_stats_entry(log_file, stats)
-            return 1
     _finalize_completed_code_task(
         task=task,
         config=config,
@@ -869,38 +1006,31 @@ def _finalize_already_published_rebase_pr_retry(
         baseline=None,
         logger=task_logger,
     )
-    pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
-    if not pr_ready:
-        print("Error: Task requested PR creation/reuse, aborting before rebase completion")
-        task.output_content = output_content
-        task.diff_files_changed = diff_files
-        task.diff_lines_added = diff_added
-        task.diff_lines_removed = diff_removed
-        _mark_task_failed(
+    pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+    if pr_outcome.kind == "nonfatal_missing_pr":
+        _record_pr_publication_note(
+            task=task,
+            log_file=log_file,
+            branch_name=branch_name,
+            status=pr_outcome.status,
+            error=pr_outcome.error,
+        )
+    elif pr_outcome.kind == "branch_unpushable":
+        return _persist_branch_unpushable_failure(
             task=task,
             config=config,
             store=store,
             log_file=log_file,
-            has_commits=True,
             stats=stats,
-            branch=branch_name,
-            explicit_reason=PR_REQUIRED_FAILURE_REASON,
-            error_type=None,
-            exit_code=1,
+            branch_name=branch_name,
+            output_content=output_content,
+            diff_files=diff_files,
+            diff_added=diff_added,
+            diff_removed=diff_removed,
             head_sha=head_sha,
             base_sha=base_sha,
+            message=pr_outcome.message,
         )
-        write_log_entry(
-            log_file,
-            {
-                "type": "gza",
-                "subtype": "outcome",
-                "message": "Outcome: failed (PR_REQUIRED)",
-                "exit_code": 1,
-            },
-        )
-        _write_stats_entry(log_file, stats)
-        return 1
     _finalize_completed_code_task(
         task=task,
         config=config,
@@ -916,6 +1046,105 @@ def _finalize_already_published_rebase_pr_retry(
         base_sha=base_sha,
     )
     return 0
+
+
+def _complete_failed_code_task_after_pr_publication(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    branch_name: str,
+    stats: TaskStats,
+    log_file: Path | None,
+    output_content: str | None,
+    diff_files: int,
+    diff_added: int,
+    diff_removed: int,
+    head_sha: str | None,
+    base_sha: str | None,
+    task_logger: Any = None,
+    target_branch: str | None = None,
+    fix_commits_ahead_before_run: int | None = None,
+    fix_default_branch: str | None = None,
+    fix_was_merged_before_run: bool = False,
+    record_reconcile_attempt: bool = False,
+) -> int:
+    """Retry PR publication for a previously failed completed code task."""
+    pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+    if pr_outcome.kind == "nonfatal_missing_pr":
+        _record_pr_publication_note(
+            task=task,
+            log_file=log_file,
+            branch_name=branch_name,
+            status=pr_outcome.status,
+            error=pr_outcome.error,
+        )
+    elif pr_outcome.kind == "branch_unpushable":
+        return _persist_branch_unpushable_failure(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file if log_file is not None else task.log_file,
+            stats=stats,
+            branch_name=branch_name,
+            output_content=output_content,
+            diff_files=diff_files,
+            diff_added=diff_added,
+            diff_removed=diff_removed,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            message=pr_outcome.message,
+            fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+            fix_default_branch=fix_default_branch,
+            fix_was_merged_before_run=fix_was_merged_before_run,
+            record_reconcile_attempt=record_reconcile_attempt,
+        )
+
+    if log_file is not None:
+        _finalize_completed_code_task(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            branch_name=branch_name,
+            output_content=output_content,
+            stats=stats,
+            diff_files=diff_files,
+            diff_added=diff_added,
+            diff_removed=diff_removed,
+            head_sha=head_sha,
+            base_sha=base_sha,
+        )
+    else:
+        store.mark_completed(
+            task,
+            branch=branch_name,
+            log_file=task.log_file,
+            output_content=output_content,
+            has_commits=True,
+            stats=stats,
+            diff_files_changed=diff_files,
+            diff_lines_added=diff_added,
+            diff_lines_removed=diff_removed,
+            head_sha=head_sha,
+            base_sha=base_sha,
+        )
+    if task.task_type == "rebase":
+        return 0
+    return _post_complete_code_task(
+        task,
+        config,
+        store,
+        git,
+        branch_name,
+        stats,
+        task_logger=task_logger,
+        target_branch=target_branch,
+        fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+        fix_default_branch=fix_default_branch,
+        fix_was_merged_before_run=fix_was_merged_before_run,
+    )
 
 
 def _record_run_failure(
@@ -4606,20 +4835,28 @@ def _ensure_work_pr_for_completed_code_task(
     config: Config,
     store: SqliteTaskStore,
     git: Git,
-) -> bool:
+) -> CompletedCodeTaskPrPublicationOutcome:
     """Ensure a PR exists for a completed code task branch when `gza work --pr` is set.
 
-    Returns:
-        True when PR requirements are satisfied or PR creation is not applicable.
-        False when explicit PR creation was requested but could not be fulfilled.
+    Returns a runner-owned publication outcome that distinguishes non-fatal
+    missing-PR states from branch publication failures.
     """
     if not task.branch:
-        return True
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status="no_branch",
+            message=f"Info: Task {task.id} has no branch, skipping PR creation",
+        )
 
     default_branch = git.default_branch()
     if git.count_commits_ahead(task.branch, default_branch) <= 0:
-        print(f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation")
-        return True
+        message = f"Info: Task {task.id} has no commits on branch '{task.branch}', skipping PR creation"
+        print(message)
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status="no_commits",
+            message=message,
+        )
 
     result = ensure_task_pr(
         task,
@@ -4632,33 +4869,92 @@ def _ensure_work_pr_for_completed_code_task(
     )
     if result.ok and result.status == "disabled":
         print("Info: PR requested but skipped: PR integration disabled by project config")
-        return True
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status=result.status,
+            message="Info: PR requested but skipped: PR integration disabled by project config",
+            error=result.error,
+        )
     if result.ok and result.status == "unsupported":
         print("Info: PR requested but skipped: project has no GitHub-capable remote")
-        return True
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status=result.status,
+            message="Info: PR requested but skipped: project has no GitHub-capable remote",
+            error=result.error,
+        )
     if result.ok and result.status == "cached" and result.pr_number:
-        print(f"Info: Reusing cached PR #{result.pr_number} for task {task.id}: {result.pr_url}")
-        return True
+        message = f"Info: Reusing cached PR #{result.pr_number} for task {task.id}: {result.pr_url}"
+        print(message)
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status=result.status,
+            message=message,
+            error=result.error,
+        )
     if result.ok and result.status == "existing":
-        print(f"Info: Reusing existing PR for branch {task.branch}: {result.pr_url}")
-        return True
+        message = f"Info: Reusing existing PR for branch {task.branch}: {result.pr_url}"
+        print(message)
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status=result.status,
+            message=message,
+            error=result.error,
+        )
     if result.ok and result.status == "merged":
-        print(f"Info: Branch '{task.branch}' is already merged into {default_branch}, skipping PR creation")
-        return True
+        message = f"Info: Branch '{task.branch}' is already merged into {default_branch}, skipping PR creation"
+        print(message)
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status=result.status,
+            message=message,
+            error=result.error,
+        )
     if result.ok and result.status == "created":
-        print(f"✓ Created PR: {result.pr_url}")
-        return True
-    if result.status == "gh_unavailable":
-        print("Error: GitHub CLI (gh) not available, cannot create PR")
-    elif result.status == "push_failed":
-        print(f"Error: Failed to push branch '{task.branch}' before PR creation: {result.error}")
-    elif result.status == "lookup_failed":
-        print(f"Error: Failed to look up PR for task {task.id}: {result.error}")
-    elif result.status == "create_failed":
-        print(f"Error: Failed to create PR for task {task.id}: {result.error}")
-    else:
-        print(f"Error: Failed to ensure PR for task {task.id}")
-    return False
+        message = f"✓ Created PR: {result.pr_url}"
+        print(message)
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="ready",
+            status=result.status,
+            message=message,
+            error=result.error,
+        )
+    if result.status in {"gh_unavailable", "lookup_failed"}:
+        push_error = _ensure_completed_task_branch_is_published(task=task, git=git)
+        if push_error is not None:
+            return CompletedCodeTaskPrPublicationOutcome(
+                kind="branch_unpushable",
+                status="push_failed",
+                message=(
+                    f"Error: Task {task.id} completed locally, but branch '{task.branch}' "
+                    "could not be pushed after PR publication setup failed"
+                    f" ({result.status})"
+                    f": {push_error}"
+                ),
+                error=push_error,
+            )
+    if result.status == "push_failed":
+        return CompletedCodeTaskPrPublicationOutcome(
+            kind="branch_unpushable",
+            status=result.status,
+            message=(
+                f"Error: Task {task.id} completed locally, but branch '{task.branch}' "
+                f"could not be pushed ({result.status})"
+                f"{f': {result.error}' if result.error else ''}"
+            ),
+            error=result.error,
+        )
+
+    return CompletedCodeTaskPrPublicationOutcome(
+        kind="nonfatal_missing_pr",
+        status=result.status,
+        message=(
+            f"Warning: Task {task.id} completed and branch '{task.branch}' is published to origin, "
+            f"but PR was not created ({result.status})"
+            f"{f': {result.error}' if result.error else ''}"
+        ),
+        error=result.error,
+    )
 
 
 def _copy_learnings_to_worktree(config: Config, worktree_path: Path) -> None:
@@ -5271,6 +5567,7 @@ def run(
                 requested_create_pr
                 and task.status == "failed"
                 and task.failure_reason == PR_REQUIRED_FAILURE_REASON
+                and bool(task.branch)
             )
             if task.status == "in_progress":
                 task.running_pid = os.getpid()
@@ -5954,40 +6251,6 @@ def _complete_code_task(
     # Keep branch context on the in-memory task so PR ensure can run before
     # the final completed-state DB transition.
     task.branch = branch_name
-    if create_pr and task.task_type != "rebase":
-        pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
-        if not pr_ready:
-            print("Error: Task requested PR creation/reuse, aborting before auto-review")
-            task.output_content = output_content
-            task.diff_files_changed = diff_files
-            task.diff_lines_added = diff_added
-            task.diff_lines_removed = diff_removed
-            _mark_task_failed(
-                task=task,
-                config=config,
-                store=store,
-                log_file=log_file,
-                has_commits=True,
-                stats=stats,
-                branch=branch_name,
-                explicit_reason=PR_REQUIRED_FAILURE_REASON,
-                error_type=None,
-                exit_code=1,
-                head_sha=head_sha,
-                base_sha=base_sha,
-            )
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "outcome",
-                    "message": "Outcome: failed (PR_REQUIRED)",
-                    "exit_code": 1,
-                },
-            )
-            _write_stats_entry(log_file, stats)
-            return 1
-
     fix_was_merged_before_run = False
     if task.task_type == "fix":
         root_impl = _resolve_root_implementation_for_fix(task, store)
@@ -5995,6 +6258,35 @@ def _complete_code_task(
             root_impl_unit = store.resolve_merge_unit_for_task(root_impl.id)
             fix_was_merged_before_run = (
                 (root_impl_unit.state if root_impl_unit is not None else root_impl.merge_status) == "merged"
+            )
+    if create_pr and task.task_type != "rebase":
+        pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
+        if pr_outcome.kind == "nonfatal_missing_pr":
+            _record_pr_publication_note(
+                task=task,
+                log_file=log_file,
+                branch_name=branch_name,
+                status=pr_outcome.status,
+                error=pr_outcome.error,
+            )
+        elif pr_outcome.kind == "branch_unpushable":
+            return _persist_branch_unpushable_failure(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                stats=stats,
+                branch_name=branch_name,
+                output_content=output_content,
+                diff_files=diff_files,
+                diff_added=diff_added,
+                diff_removed=diff_removed,
+                head_sha=head_sha,
+                base_sha=base_sha,
+                message=pr_outcome.message,
+                fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+                fix_default_branch=fix_default_branch,
+                fix_was_merged_before_run=fix_was_merged_before_run,
             )
 
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
@@ -6404,7 +6696,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
             store=store,
             log_file=task.log_file,
             has_commits=bool(task.has_commits),
-            explicit_reason=PR_REQUIRED_FAILURE_REASON,
+            explicit_reason="GIT_ERROR",
             error_type=None,
             exit_code=1,
         )
@@ -6485,44 +6777,26 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
             )
             return 1
 
-    pr_ready = _ensure_work_pr_for_completed_code_task(task, config, store, git)
-    if not pr_ready:
-        print("Error: PR-required retry still could not create/reuse PR")
-        _mark_task_failed(
-            task=task,
-            config=config,
-            store=store,
-            log_file=task.log_file,
-            branch=task.branch,
-            has_commits=bool(task.has_commits),
-            explicit_reason=PR_REQUIRED_FAILURE_REASON,
-            error_type=None,
-            exit_code=1,
-        )
-        return 1
-
-    store.mark_completed(
-        task,
-        branch=task.branch,
-        log_file=task.log_file,
-        output_content=task.output_content,
-        has_commits=bool(task.has_commits),
+    publication_state = load_branch_publication_state(store, task.id)
+    return _complete_failed_code_task_after_pr_publication(
+        task=task,
+        config=config,
+        store=store,
+        git=git,
+        branch_name=task.branch,
         stats=stats,
-        diff_files_changed=task.diff_files_changed,
-        diff_lines_added=task.diff_lines_added,
-        diff_lines_removed=task.diff_lines_removed,
+        log_file=retry_log_path,
+        output_content=task.output_content,
+        diff_files=task.diff_files_changed or 0,
+        diff_added=task.diff_lines_added or 0,
+        diff_removed=task.diff_lines_removed or 0,
         head_sha=head_sha,
         base_sha=base_sha,
-    )
-    return _post_complete_code_task(
-        task,
-        config,
-        store,
-        git,
-        task.branch,
-        stats,
         task_logger=retry_logger,
         target_branch=target_branch,
+        fix_commits_ahead_before_run=publication_state.fix_commits_ahead_before_run,
+        fix_default_branch=publication_state.fix_default_branch,
+        fix_was_merged_before_run=publication_state.fix_was_merged_before_run,
     )
 
 

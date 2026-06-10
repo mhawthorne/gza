@@ -1247,6 +1247,49 @@ def test_actionable_failed_recovery_actions_are_not_needs_attention(tmp_path: Pa
     assert classify_advance_action(action) == "actionable"
 
 
+def test_branch_unpushable_failed_recovery_lowers_to_reconcile_action(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/advance-reconcile"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(failed, decision)
+
+    assert decision.action == "reconcile"
+    assert action["type"] == "reconcile_branch_divergence"
+    assert classify_advance_action(action) == "actionable"
+
+
+def test_branchless_branch_unpushable_failed_recovery_lowers_to_needs_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(
+        failed,
+        decision,
+        needs_attention_reason="branch-publication-needs-manual-repair",
+        subject_task_id=failed.id,
+    )
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "reconcile_branch_missing"
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == failed.id
+
+
 def test_retry_limit_reached_failed_recovery_action_is_needs_attention(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
 

@@ -9,6 +9,7 @@ import signal as signal_mod
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -208,6 +209,56 @@ def test_background_phase1_validation_errors_write_to_stderr_only(
     assert expected in result.stderr
     assert expected not in result.stdout
     assert "Error:" not in result.stdout
+
+
+def test_run_with_recovery_executes_reconcile_instead_of_terminal_skip(tmp_path: Path) -> None:
+    from gza.cli._common import run_with_recovery
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Failed publish", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/run-with-recovery-reconcile"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    terminal_skip_calls: list[str] = []
+
+    def _run_task(current_task, _resume):
+        refreshed = store.get(current_task.id)
+        assert refreshed is not None
+        return 1
+
+    def _complete_after_reconcile(*, config, store, git, task):
+        store.mark_completed(task, branch=task.branch, has_commits=True)
+        return 0
+
+    with (
+        patch(
+            "gza.cli.git_ops._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(status="reconciled", message="reconciled"),
+        ),
+        patch(
+            "gza.cli.git_ops.complete_branch_unpushable_after_reconcile",
+            side_effect=_complete_after_reconcile,
+        ) as complete_after_reconcile,
+    ):
+        final_task, rc = run_with_recovery(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=1,
+            on_terminal_skip=lambda failed_task, _decision, _rc: terminal_skip_calls.append(failed_task.id or ""),
+        )
+
+    assert rc == 0
+    complete_after_reconcile.assert_called_once()
+    assert terminal_skip_calls == []
+    assert final_task.status == "completed"
 
 
 class TestAddCommand:
@@ -2972,6 +3023,7 @@ class TestWorkCommandMultiTask:
         task = store.add("Retry PR-required task")
         task.status = "failed"
         task.failure_reason = "PR_REQUIRED"
+        task.branch = "task-branch"
         store.update(task)
 
         args = argparse.Namespace(
@@ -2997,6 +3049,47 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         run_mock.assert_called_once()
 
+    def test_work_rejects_branchless_failed_pr_required_task_with_pr_flag(self, tmp_path: Path):
+        """work <task> --pr should fail closed for branchless legacy PR_REQUIRED rows."""
+        from gza.cli.execution import cmd_run
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Branchless PR-required task")
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            background=False,
+            worker_mode=False,
+            task_ids=[task.id],
+            count=1,
+            force=False,
+            resume=False,
+            create_pr=True,
+        )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution._run_foreground", return_value=0) as run_mock,
+            patch("sys.stdout", stdout),
+            patch("sys.stderr", stderr),
+        ):
+            rc = cmd_run(args)
+
+        assert rc == 1
+        run_mock.assert_not_called()
+        output = stdout.getvalue() + stderr.getvalue()
+        assert f"Error: Task {task.id} is not pending (status: failed)" in output
+
     def test_work_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
         """work <task> should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
         from gza.cli.execution import cmd_run
@@ -3007,6 +3100,7 @@ class TestWorkCommandMultiTask:
         task = store.add("Retry PR-required task", create_pr=True)
         task.status = "failed"
         task.failure_reason = "PR_REQUIRED"
+        task.branch = "task-branch"
         store.update(task)
 
         args = argparse.Namespace(
@@ -3825,6 +3919,7 @@ class TestBackgroundWorkerCommand:
         task = store.add("Retry PR-required task in background")
         task.status = "failed"
         task.failure_reason = "PR_REQUIRED"
+        task.branch = "task-branch"
         store.update(task)
 
         workers_path = tmp_path / ".gza" / "workers"
@@ -3855,6 +3950,52 @@ class TestBackgroundWorkerCommand:
         assert rc == 0
         mock_spawn.assert_called_once()
 
+    def test_background_worker_rejects_branchless_failed_pr_required_task_with_pr_flag(
+        self, tmp_path: Path
+    ):
+        """Background explicit work should fail closed for branchless legacy PR_REQUIRED rows."""
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli import _spawn_background_worker
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Branchless PR-required task in background")
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        store.update(task)
+
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=True,
+            resume=False,
+            force=False,
+        )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch("gza.cli._spawn_detached_worker_process") as mock_spawn,
+            patch("sys.stdout", stdout),
+            patch("sys.stderr", stderr),
+        ):
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 1
+        mock_spawn.assert_not_called()
+        assert f"Error: Task {task.id} is not pending (status: failed)" in stderr.getvalue()
+
     def test_background_worker_allows_failed_pr_required_task_with_persisted_create_pr(self, tmp_path: Path):
         """Background explicit work should allow retrying failed PR_REQUIRED tasks via stored create_pr intent."""
         import argparse
@@ -3868,6 +4009,7 @@ class TestBackgroundWorkerCommand:
         task = store.add("Retry PR-required task in background", create_pr=True)
         task.status = "failed"
         task.failure_reason = "PR_REQUIRED"
+        task.branch = "task-branch"
         store.update(task)
 
         workers_path = tmp_path / ".gza" / "workers"

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from .branch_publication import load_branch_publication_state
 from .config import Config, ConfigError
 from .db import MergeTargetResolutionError, SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from .dependency_preconditions import dependency_readiness, get_unmerged_dependency_precondition, task_is_merged
@@ -26,7 +27,6 @@ _MANUAL_ONLY_REASONS = {
     "CONFIG_ERROR",
     "TEST_FAILURE",
     "GIT_ERROR",
-    "PR_REQUIRED",
     "MISSING_REPORT_ARTIFACT",
     "KILLED",
     "INTERRUPTED",
@@ -40,6 +40,7 @@ _RETRY_REASONS = {
     "WORKER_DIED",
     "NO_ACTIVITY",
 }
+_RECONCILE_REASONS = frozenset({"BRANCH_UNPUSHABLE", "PR_REQUIRED"})
 _TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED"})
 _UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
 _UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
@@ -55,10 +56,10 @@ _DIRECT_CHILD_SUPERSEDED_REASONS: tuple[tuple[str, str, str], ...] = (
     ("in_progress", "recovery_already_running", "recovery child already in progress"),
 )
 
-RecoveryAction = Literal["resume", "retry", "skip"]
+RecoveryAction = Literal["resume", "retry", "reconcile", "skip"]
 PendingRecoveryExecutionMode = Literal["resume", "retry"]
 RecoveryRole = Literal["original", "resume", "retry"]
-FailureCategory = Literal["timeout", "retryable", "manual"]
+FailureCategory = Literal["timeout", "retryable", "reconcile", "manual"]
 PrerequisiteUnmergedReconciliation = Literal[
     "dependency_not_ready",
     "moot_empty",
@@ -189,6 +190,8 @@ def classify_failure_reason(reason: str | None) -> FailureCategory:
         return "manual"
     if reason in _RETRY_REASONS:
         return "retryable"
+    if reason in _RECONCILE_REASONS:
+        return "reconcile"
     if reason in _TIMEOUT_STYLE_REASONS or is_resumable_failure_reason(reason):
         return "timeout"
     return "manual"
@@ -1022,6 +1025,10 @@ def _expected_recovery_action(
         if chain.role == "original":
             return "retry"
         return None
+    if category == "reconcile":
+        if chain.role == "original":
+            return "reconcile"
+        return None
 
     return None
 
@@ -1036,6 +1043,11 @@ def _task_has_recoverable_real_work(task: DbTask) -> bool:
 
 def _prerequisite_unmerged_has_recoverable_real_work(task: DbTask) -> bool:
     return _task_has_recoverable_real_work(task)
+
+
+def _reconcile_recovery_has_branch(task: DbTask) -> bool:
+    """Return whether a reconcile recovery has a concrete branch to operate on."""
+    return isinstance(task.branch, str) and bool(task.branch.strip())
 
 
 def _persist_prerequisite_unmerged_empty_reconciliation(store: SqliteTaskStore, task: DbTask) -> None:
@@ -1239,6 +1251,11 @@ def decide_failed_task_recovery(
         )
     else:
         expected_action = _expected_recovery_action(task, chain=chain)
+    direct_reconcile_attempts = (
+        load_branch_publication_state(store, task.id).reconcile_attempts_consumed
+        if expected_action == "reconcile"
+        else 0
+    )
     consumed_attempts = len(
         _matching_failed_terminal_descendants(
             store,
@@ -1246,7 +1263,7 @@ def decide_failed_task_recovery(
             expected_action=expected_action,
             read_context=read_context,
         )
-    )
+    ) + direct_reconcile_attempts
     attempt_index, attempt_limit = _policy_attempt_counters(
         chain,
         max_recovery_attempts=max_recovery_attempts,
@@ -1370,6 +1387,24 @@ def decide_failed_task_recovery(
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )
+    if expected_action == "reconcile" and direct_reconcile_attempts >= max_recovery_attempts:
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="retry_limit_reached",
+            reason_text="automatic recovery stops here; retry limit reached",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+    if expected_action == "reconcile" and not _reconcile_recovery_has_branch(task):
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="reconcile_branch_missing",
+            reason_text="branch publication failed but the task has no branch to reconcile; manual repair required",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+    if expected_action == "reconcile":
+        launch_mode = "none"
 
     children = (
         list(read_context.get_based_on_children_by_type(task_id, task.task_type))
@@ -1476,11 +1511,12 @@ def decide_failed_task_recovery(
         )
     reason_text = "dependency merge prerequisite now satisfied"
     if reason != "PREREQUISITE_UNMERGED":
-        reason_text = (
-            f"{reason} with preserved session"
-            if expected_action == "resume"
-            else f"{reason} restart with fresh attempt"
-        )
+        if expected_action == "resume":
+            reason_text = f"{reason} with preserved session"
+        elif expected_action == "retry":
+            reason_text = f"{reason} restart with fresh attempt"
+        elif expected_action == "reconcile":
+            reason_text = "branch publication failed; reconcile local/origin refs"
     return FailedRecoveryDecision(
         task_id=task_id,
         action=expected_action,
@@ -1575,6 +1611,8 @@ def _get_failed_recovery_needs_attention_reason(
         return "automatic-recovery-disabled"
     if decision.reason_code == "manual_failure_reason":
         return "manual-failure-reason"
+    if decision.reason_code == "reconcile_branch_missing":
+        return "branch-publication-needs-manual-repair"
     if decision.reason_code == "retryable_provider_error":
         return "retryable-provider-error"
     if decision.reason_code in {"retry_limit_reached", "manual_review_required"}:

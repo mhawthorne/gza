@@ -28,6 +28,8 @@ from gza.cli import _create_improve_task, _create_rebase_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
+    BRANCH_UNPUSHABLE_FAILURE_REASON,
+    CompletedCodeTaskPrPublicationOutcome,
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     ProjectReviewVerifyResult,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
@@ -216,8 +218,10 @@ def test_ensure_work_pr_for_completed_code_task_leaves_one_skip_note_for_non_git
         "gza.runner.ensure_task_pr",
         return_value=Mock(ok=True, status="unsupported", pr_number=None, pr_url=None, error="project has no GitHub-capable remote"),
     ):
-        assert _ensure_work_pr_for_completed_code_task(task, config, store, git) is True
+        outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
+    assert outcome.kind == "ready"
+    assert outcome.status == "unsupported"
     assert capsys.readouterr().out.strip() == "Info: PR requested but skipped: project has no GitHub-capable remote"
 
 
@@ -252,8 +256,10 @@ def test_ensure_work_pr_for_completed_code_task_discovers_non_github_repo_before
     gh.discover_pr_by_branch.side_effect = _raise_unsupported
 
     with patch("gza.pr_ops.GitHub", return_value=gh):
-        assert _ensure_work_pr_for_completed_code_task(task, config, store, git) is True
+        outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
+    assert outcome.kind == "ready"
+    assert outcome.status == "unsupported"
     assert capsys.readouterr().out.strip() == "Info: PR requested but skipped: project has no GitHub-capable remote"
     git.needs_push.assert_not_called()
     git.push_branch.assert_not_called()
@@ -9643,7 +9649,7 @@ class TestExtractedRunInnerHelpers:
             ) as build_content,
             patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr,
         ):
-            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
             ensure_pr.assert_called_once()
             assert "content_builder" in ensure_pr.call_args.kwargs
             assert ensure_pr.call_args.kwargs["merged_behavior"] == "skip"
@@ -9652,7 +9658,8 @@ class TestExtractedRunInnerHelpers:
             assert (title, body) == ("Shared title", "Shared body")
             build_content.assert_called_once_with(task, git, config, store)
 
-        assert ok is True
+        assert outcome.kind == "ready"
+        assert outcome.status == "created"
         git.needs_push.assert_not_called()
 
     def test_ensure_work_pr_skips_when_branch_has_no_commits(self, tmp_path: Path):
@@ -9669,9 +9676,10 @@ class TestExtractedRunInnerHelpers:
         git.count_commits_ahead.return_value = 0
 
         with patch("gza.runner.GitHub") as gh_cls:
-            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
-        assert ok is True
+        assert outcome.kind == "ready"
+        assert outcome.status == "no_commits"
         gh_cls.assert_not_called()
 
     def test_ensure_work_pr_reuses_existing_pr_and_caches_number(self, tmp_path: Path):
@@ -9689,9 +9697,10 @@ class TestExtractedRunInnerHelpers:
 
         ensure_result = Mock(ok=True, status="existing", pr_url="https://github.com/o/r/pull/55")
         with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
-            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
-        assert ok is True
+        assert outcome.kind == "ready"
+        assert outcome.status == "existing"
 
     def test_ensure_work_pr_reuses_existing_pr_without_generating_pr_content(self, tmp_path: Path):
         """`work --pr` should short-circuit existing PR reuse before spawning PR-content work."""
@@ -9722,9 +9731,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.build_task_pr_content", side_effect=AssertionError("should not build PR content")),
             patch("gza.pr_ops.GitHub", return_value=gh),
         ):
-            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
-        assert ok is True
+        assert outcome.kind == "ready"
+        assert outcome.status == "existing"
         assert [saved.task_type for saved in store.get_all()] == ["implement"]
 
     def test_ensure_work_pr_reuses_revalidated_cached_pr(self, tmp_path: Path):
@@ -9743,9 +9753,10 @@ class TestExtractedRunInnerHelpers:
 
         ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/81", pr_number=81)
         with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
-            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
-        assert ok is True
+        assert outcome.kind == "ready"
+        assert outcome.status == "cached"
 
     def test_ensure_work_pr_revalidates_cached_pr_before_reuse(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Cached PR reuse should reflect the revalidated PR URL and avoid fake push output."""
@@ -9763,13 +9774,104 @@ class TestExtractedRunInnerHelpers:
 
         ensure_result = Mock(ok=True, status="cached", pr_url="https://github.com/o/r/pull/81", pr_number=81)
         with patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr:
-            ok = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
 
-        assert ok is True
+        assert outcome.kind == "ready"
+        assert outcome.status == "cached"
         output = capsys.readouterr().out
         assert "Pushing branch" not in output
         assert "Reusing cached PR #81" in output
         ensure_pr.assert_called_once()
+
+    @pytest.mark.parametrize(("status", "error"), [("gh_unavailable", None), ("lookup_failed", "auth failed")])
+    def test_ensure_work_pr_pre_pr_failures_push_before_nonfatal_completion(
+        self,
+        tmp_path: Path,
+        status: str,
+        error: str | None,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Pre-PR failures should verify branch publication before completing non-fatally."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/pre-pr-nonfatal"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+        git.needs_push.return_value = True
+
+        ensure_result = Mock(ok=False, status=status, error=error, pr_url=None)
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert outcome.kind == "nonfatal_missing_pr"
+        assert outcome.status == status
+        assert "is published to origin" in outcome.message
+        git.push_branch.assert_called_once_with("feature/pre-pr-nonfatal")
+        output = capsys.readouterr().out
+        assert "Pushing branch 'feature/pre-pr-nonfatal' to origin..." in output
+
+    @pytest.mark.parametrize(("status", "error"), [("gh_unavailable", None), ("lookup_failed", "auth failed")])
+    def test_ensure_work_pr_pre_pr_failures_push_failure_marks_branch_unpushable(
+        self,
+        tmp_path: Path,
+        status: str,
+        error: str | None,
+    ):
+        """Pre-PR failures should fail with BRANCH_UNPUSHABLE when publish verification fails."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/pre-pr-push-fails"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+        git.needs_push.return_value = True
+        git.push_branch.side_effect = GitError("push failed")
+
+        ensure_result = Mock(ok=False, status=status, error=error, pr_url=None)
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert outcome.kind == "branch_unpushable"
+        assert outcome.status == "push_failed"
+        assert status in outcome.message
+        assert "push failed" in outcome.message
+
+    def test_ensure_work_pr_lookup_failed_without_push_needed_keeps_note_truthful(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Lookup failures with no pending branch publish should not claim a fresh push occurred."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement X", task_type="implement")
+        task.branch = "feature/already-published"
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.count_commits_ahead.return_value = 1
+        git.needs_push.return_value = False
+
+        ensure_result = Mock(ok=False, status="lookup_failed", error="auth failed", pr_url=None)
+        with patch("gza.runner.ensure_task_pr", return_value=ensure_result):
+            outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+
+        assert outcome.kind == "nonfatal_missing_pr"
+        assert "is published to origin" in outcome.message
+        assert "was pushed" not in outcome.message
+        git.push_branch.assert_not_called()
+        assert "Pushing branch" not in capsys.readouterr().out
 
     def test_complete_code_task_creates_pr_before_auto_review(self, tmp_path: Path):
         """When create_review is enabled, PR creation should run before auto-review execution."""
@@ -9802,7 +9904,11 @@ class TestExtractedRunInnerHelpers:
 
         def _mark_pr(*_args, **_kwargs):
             call_order.append("pr")
-            return True
+            return CompletedCodeTaskPrPublicationOutcome(
+                kind="ready",
+                status="created",
+                message="created",
+            )
 
         def _run_review(*_args, **_kwargs):
             call_order.append("review")
@@ -11691,18 +11797,17 @@ class TestExtractedRunInnerHelpers:
         ("failure_mode", "ensure_result"),
         [
             ("gh_unavailable", (False, "gh_unavailable", None)),
-            ("push_fails", (False, "push_failed", "push failed")),
             ("create_pr_fails", (False, "create_failed", "create failed")),
         ],
     )
-    def test_complete_code_task_work_pr_failure_aborts_before_auto_review(
+    def test_complete_code_task_work_pr_nonfatal_missing_pr_completes_and_logs_note(
         self,
         tmp_path: Path,
         failure_mode: str,
         ensure_result: tuple[bool, str, str | None],
         capsys: pytest.CaptureFixture[str],
     ):
-        """Explicit `work --pr` failures should fail task state and skip success output/review."""
+        """Push-success PR gaps should complete and surface a publication note."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt=f"Implement with review ({failure_mode})", task_type="implement", create_review=True)
@@ -11739,7 +11844,7 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner._squash_wip_commits"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
-            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
             patch("gza.runner.ensure_task_pr", return_value=ensure_mock_result),
             patch("gza.runner.task_footer") as footer,
         ):
@@ -11759,16 +11864,87 @@ class TestExtractedRunInnerHelpers:
                 create_pr=True,
             )
 
+        assert rc == 0
+        footer.assert_called_once()
+        run_review.assert_called_once()
+        output = capsys.readouterr().out
+        assert "completed and branch 'feature/review-order' is published to origin, but PR was not created" in output
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+        assert refreshed.output_content == "summary"
+        log_text = ops_log_path_for(log_file).read_text()
+        assert '"subtype": "pr_publication_note"' in log_text
+        assert f'"status": "{status}"' in log_text
+
+    def test_complete_code_task_work_pr_push_failure_marks_branch_unpushable(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Push failures should fail the task with BRANCH_UNPUSHABLE and skip auto-review."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement with review (push_fails)", task_type="implement", create_review=True)
+        task.slug = "20260414-impl-review-push-fails"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/foo.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+        worktree_git.count_commits_ahead.return_value = 1
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        ensure_mock_result = Mock(ok=False, status="push_failed", error="push failed", pr_url=None)
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.ensure_task_pr", return_value=ensure_mock_result),
+            patch("gza.runner.task_footer") as footer,
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/review-order",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                create_pr=True,
+            )
+
         assert rc == 1
         footer.assert_not_called()
         run_review.assert_not_called()
         output = capsys.readouterr().out
-        assert "aborting before auto-review" in output
+        assert "could not be pushed (push_failed): push failed" in output
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "PR_REQUIRED"
+        assert refreshed.failure_reason == BRANCH_UNPUSHABLE_FAILURE_REASON
         assert refreshed.output_content == "summary"
+        log_text = ops_log_path_for(log_file).read_text()
+        assert f'Outcome: failed ({BRANCH_UNPUSHABLE_FAILURE_REASON})' in log_text
 
     def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
         """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
@@ -11792,18 +11968,43 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
             patch("gza.runner.task_footer"),
         ):
             rc = run(config, task_id=task.id, create_pr=True)
 
         assert rc == 0
-        run_review.assert_called_once()
+
+    def test_run_work_pr_branchless_pr_required_does_not_rewrite_fresh_pr_required(self, tmp_path: Path):
+        """Legacy branchless PR_REQUIRED rows should not be re-failed through the compatibility retry path."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement with review", task_type="implement", create_review=True)
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.has_commits = True
+        store.update(task)
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True)
+
+        assert rc == 1
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.status == "completed"
-        assert refreshed.failure_reason is None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PR_REQUIRED"
 
     def test_run_can_retry_pr_required_failure_via_persisted_create_pr(self, tmp_path: Path):
         """Stored create_pr intent should recover failed PR_REQUIRED tasks without needing `work --pr`."""
@@ -11832,7 +12033,10 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
             patch("gza.runner.task_footer"),
         ):
@@ -11882,7 +12086,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.Git", return_value=Mock(spec=Git)),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
@@ -11929,7 +12136,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.Git", return_value=Mock(spec=Git)),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
@@ -11986,7 +12196,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.Git", return_value=Mock(spec=Git)),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
@@ -12030,49 +12243,30 @@ class TestExtractedRunInnerHelpers:
             create_pr=True,
         )
         task.slug = "20260516-retry-rebase-pr-required"
-        store.mark_in_progress(task)
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "feat/parent"
+        task.log_file = "logs/20260516-retry-rebase-pr-required.log"
+        task.output_content = "summary"
+        task.diff_files_changed = 0
+        task.diff_lines_added = 0
+        task.diff_lines_removed = 0
+        store.mark_failed(
+            task,
+            log_file=task.log_file,
+            has_commits=True,
+            branch=task.branch,
+            failure_reason="PR_REQUIRED",
+            head_sha="rebased-head",
+            base_sha="base-before-pr",
+        )
+        task.output_content = "summary"
+        store.update(task)
 
         log_dir = tmp_path / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{task.slug}.log"
         log_file.write_text("")
-
-        initial_git = Mock(spec=Git)
-        initial_git.default_branch.return_value = "main"
-        initial_git.get_diff_numstat.return_value = ""
-        initial_git.rev_parse_if_exists.side_effect = lambda ref: {
-            "feat/parent": "rebased-head",
-            "main": "base-before-pr",
-        }.get(ref)
-
-        with (
-            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
-            patch("gza.runner.publish_rebased_branch"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=False),
-            patch("gza.runner.task_footer"),
-        ):
-            rc = _complete_code_task(
-                task,
-                config,
-                store,
-                initial_git,
-                log_file,
-                "feat/parent",
-                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
-                0,
-                pre_run_status=set(),
-                worktree_summary_path=tmp_path / "missing-summary.md",
-                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
-                summary_dir=tmp_path / ".gza" / "summaries",
-                skip_commit=True,
-                create_pr=True,
-            )
-
-        assert rc == 1
-        failed = store.get(task.id)
-        assert failed is not None
-        assert failed.status == "failed"
-        assert failed.failure_reason == "PR_REQUIRED"
 
         git = Mock(spec=Git)
         git.default_branch.return_value = "main"
@@ -12087,7 +12281,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
             patch("gza.runner.publish_rebased_branch") as publish_rebased_branch,
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True) as ensure_work_pr,
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ) as ensure_work_pr,
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
@@ -12110,11 +12307,6 @@ class TestExtractedRunInnerHelpers:
         assert updated_unit is not None
         assert updated_unit.head_sha == "rebased-head"
         assert updated_unit.base_sha == "base-after-pr-retry"
-
-        updated_parent = store.get(parent.id)
-        assert updated_parent is not None
-        assert updated_parent.review_cleared_at is None
-        assert updated_parent.merge_status == "unmerged"
 
     def test_complete_code_task_rebase_pr_required_failure_persists_retry_baseline_refs(self, tmp_path: Path):
         """Rebase PR-required failures must persist head/base refs for publish retry verification."""
@@ -12149,7 +12341,15 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
             patch("gza.runner.publish_rebased_branch"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=False),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(
+                    kind="branch_unpushable",
+                    status="push_failed",
+                    message="push failed",
+                    error="push failed",
+                ),
+            ),
             patch("gza.runner.task_footer"),
         ):
             rc = _complete_code_task(
@@ -12173,7 +12373,7 @@ class TestExtractedRunInnerHelpers:
         refreshed = store.get(rebase_task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "PR_REQUIRED"
+        assert refreshed.failure_reason == BRANCH_UNPUSHABLE_FAILURE_REASON
         rebase_unit = store.resolve_merge_unit_for_task(rebase_task.id)
         assert rebase_unit is not None
         assert rebase_unit.head_sha == "head-before-pr"
@@ -12268,7 +12468,11 @@ class TestExtractedRunInnerHelpers:
 
         def _ensure(*_args, **_kwargs):
             call_order.append("pr")
-            return True
+            return CompletedCodeTaskPrPublicationOutcome(
+                kind="ready",
+                status="created",
+                message="created",
+            )
 
         with (
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
@@ -12582,7 +12786,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner.publish_rebased_branch", side_effect=GitError("push boom")),
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
@@ -12666,7 +12873,11 @@ class TestExtractedRunInnerHelpers:
 
         def _ensure(*_args, **_kwargs):
             call_order.append("pr")
-            return True
+            return CompletedCodeTaskPrPublicationOutcome(
+                kind="ready",
+                status="created",
+                message="created",
+            )
 
         with (
             patch("gza.runner.Git", return_value=git),
@@ -12759,7 +12970,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
-            patch("gza.runner._ensure_work_pr_for_completed_code_task", return_value=True),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):

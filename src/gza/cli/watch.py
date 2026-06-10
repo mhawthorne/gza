@@ -88,6 +88,7 @@ from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
     determine_next_action,
+    failed_recovery_decision_to_action,
     failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
     get_needs_attention_reason,
@@ -1197,6 +1198,7 @@ def _emit_recovery_dry_run_report(
         )
     )
     visible_entry_by_task_id = {entry.task.id: entry for entry in entries if entry.task.id is not None}
+    reconcile = 0
     for row in failed_rows:
         task = row.recovery_leaf_task
         assert task is not None
@@ -1210,7 +1212,7 @@ def _emit_recovery_dry_run_report(
                 continue
         else:
             decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
-        if decision.action in {"resume", "retry"}:
+        if decision.action in {"resume", "retry", "reconcile"}:
             launch = decision.launch_mode
             print(
                 f"{decision.action:<6} {_format_recovery_report_subject(row, task)} {task.task_type:<9} via {launch:<7} reason={decision.reason_code} "
@@ -1221,6 +1223,8 @@ def _emit_recovery_dry_run_report(
                 resume += 1
             if decision.action == "retry":
                 retry += 1
+            if decision.action == "reconcile":
+                reconcile += 1
             continue
         if task.id in visible_task_ids:
             continue
@@ -1242,7 +1246,7 @@ def _emit_recovery_dry_run_report(
     skipped_summary = skipped if show_skipped else hidden_skipped
     if show_skipped:
         print(
-            f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
+            f"Summary: {actionable} actionable ({resume} resume, {retry} retry, {reconcile} reconcile), "
             f"{len(attention_rows)} needs attention, {skipped_summary} skipped"
         )
     else:
@@ -1402,6 +1406,161 @@ def _run_cycle(
             task_id_numeric_key(row.owner_task.id),
         )
     )
+    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+
+    def _watch_spawn_worker(task_obj: DbTask, task_kind: str) -> int:
+        assert task_obj.id is not None
+        task_id = str(task_obj.id)
+        return _spawn_worker_with_failure_log(
+            quiet=quiet,
+            log=log,
+            failure_message=f"{task_id} {task_kind}: worker spawn failed",
+            dedupe_key=f"spawn-worker-failed:{task_id}",
+            spawn_fn=lambda: _spawn_background_worker(
+                worker_args,
+                config,
+                task_id=task_id,
+                quiet=quiet,
+                prepared_task=task_obj,
+                startup_quiet=True,
+            ),
+        )
+
+    def _watch_spawn_resume_worker(task_obj: DbTask, task_kind: str) -> int:
+        assert task_obj.id is not None
+        task_id = str(task_obj.id)
+        return _spawn_worker_with_failure_log(
+            quiet=quiet,
+            log=log,
+            failure_message=f"{task_id} {task_kind}: resume worker spawn failed",
+            dedupe_key=f"spawn-resume-failed:{task_id}",
+            spawn_fn=lambda: _spawn_background_resume_worker(
+                worker_args,
+                config,
+                new_task_id=task_id,
+                quiet=quiet,
+                prepared_task=task_obj,
+                startup_quiet=True,
+            ),
+        )
+
+    def _watch_spawn_iterate(task_obj: DbTask, task_kind: str) -> int:
+        iterate_args = argparse.Namespace(
+            max_iterations=max_iterations,
+            no_docker=False,
+            resume=False,
+            retry=False,
+            auto_iterate=True,
+        )
+        return _spawn_worker_with_failure_log(
+            quiet=quiet,
+            log=log,
+            failure_message=f"{task_obj.id} {task_kind}: iterate worker spawn failed",
+            dedupe_key=f"spawn-iterate-failed:{task_obj.id}",
+            spawn_fn=lambda: _spawn_background_iterate(
+                iterate_args,
+                config,
+                task_obj,
+                startup_quiet=True,
+            ),
+        )
+
+    def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
+        assert parent_task.id is not None
+        assert parent_task.branch is not None
+        return _create_rebase_task(
+            store,
+            parent_task.id,
+            parent_task.branch,
+            target_branch,
+            trigger_source="watch",
+        )
+
+    def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
+        assert parent_task.id is not None
+        assert parent_task.branch is not None
+        return _create_rebase_task(
+            store,
+            parent_task.id,
+            parent_task.branch,
+            rebase_target,
+            trigger_source="watch",
+        )
+
+    def _create_implement_from_task(parent_task: DbTask) -> DbTask:
+        return _create_implementation_task_from_source(
+            store,
+            parent_task,
+            prompt=_unimplemented_implement_prompt(parent_task),
+            trigger_source="watch",
+        )
+
+    executor_context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="watch",
+        dry_run=dry_run,
+        max_resume_attempts=max_recovery_attempts,
+        use_iterate_for_create_implement=True,
+        use_iterate_for_needs_rebase=False,
+        can_spawn_worker=lambda _kind: slots > 0,
+        no_worker_capacity_message=lambda worker_label: (
+            f"SKIP: no watch worker slots available for {worker_label}"
+        ),
+        prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+            config,
+            task,
+            rollback_on_failure=rollback_on_failure,
+        ),
+        prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="watch"),
+        create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="watch"),
+        create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="watch"),
+        create_rebase_task=_create_rebase_from_task,
+        create_implement_task=_create_implement_from_task,
+        create_targeted_rebase_task=_create_targeted_rebase_from_task,
+        spawn_worker=_watch_spawn_worker,
+        spawn_resume_worker=_watch_spawn_resume_worker,
+        spawn_iterate_worker=_watch_spawn_iterate,
+        is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
+            store,
+            git,
+            t,
+            target_branch,
+            merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+        ).already_merged,
+        config=config,
+        git=git,
+        spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
+            quiet=quiet,
+            log=log,
+            failure_message=f"{task_obj.id} {mode}: iterate worker spawn failed",
+            dedupe_key=f"spawn-iterate-failed:{task_obj.id}:{mode}",
+            spawn_fn=lambda: _spawn_background_iterate(
+                argparse.Namespace(
+                    max_iterations=max_iterations,
+                    no_docker=False,
+                    resume=False,
+                    retry=False,
+                    auto_iterate=True,
+                ),
+                config,
+                prepared_task,
+                prepared_task_id=str(prepared_task.id),
+                prepared_resume=mode == "resume",
+                prepared_phase="preloop",
+                startup_quiet=True,
+            ),
+        ),
+        prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
+            store=store,
+            git=git,
+            task=task,
+            action=action,
+            running_task_ids=running_task_id_set,
+            target_branch=target_branch,
+            max_recovery_attempts=max_recovery_attempts,
+        ),
+        reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
+    )
     if lifecycle_rows:
         current_branch = git.current_branch()
         merge_git: Git | None = None
@@ -1481,162 +1640,6 @@ def _run_cycle(
                     quiet,
                     lambda: _require_default_branch(git, current_branch, "merge"),
                 )
-
-        worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-
-        def _watch_spawn_worker(task_obj: DbTask, task_kind: str) -> int:
-            assert task_obj.id is not None
-            task_id = str(task_obj.id)
-            return _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=log,
-                failure_message=f"{task_id} {task_kind}: worker spawn failed",
-                dedupe_key=f"spawn-worker-failed:{task_id}",
-                spawn_fn=lambda: _spawn_background_worker(
-                    worker_args,
-                    config,
-                    task_id=task_id,
-                    quiet=quiet,
-                    prepared_task=task_obj,
-                    startup_quiet=True,
-                ),
-            )
-
-        def _watch_spawn_resume_worker(task_obj: DbTask, task_kind: str) -> int:
-            assert task_obj.id is not None
-            task_id = str(task_obj.id)
-            return _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=log,
-                failure_message=f"{task_id} {task_kind}: resume worker spawn failed",
-                dedupe_key=f"spawn-resume-failed:{task_id}",
-                spawn_fn=lambda: _spawn_background_resume_worker(
-                    worker_args,
-                    config,
-                    new_task_id=task_id,
-                    quiet=quiet,
-                    prepared_task=task_obj,
-                    startup_quiet=True,
-                ),
-            )
-
-        def _watch_spawn_iterate(task_obj: DbTask, task_kind: str) -> int:
-            iterate_args = argparse.Namespace(
-                max_iterations=max_iterations,
-                no_docker=False,
-                resume=False,
-                retry=False,
-                auto_iterate=True,
-            )
-            return _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=log,
-                failure_message=f"{task_obj.id} {task_kind}: iterate worker spawn failed",
-                dedupe_key=f"spawn-iterate-failed:{task_obj.id}",
-                spawn_fn=lambda: _spawn_background_iterate(
-                    iterate_args,
-                    config,
-                    task_obj,
-                    startup_quiet=True,
-                ),
-            )
-
-        def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
-            assert parent_task.id is not None
-            assert parent_task.branch is not None
-            return _create_rebase_task(
-                store,
-                parent_task.id,
-                parent_task.branch,
-                target_branch,
-                trigger_source="watch",
-            )
-
-        def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
-            assert parent_task.id is not None
-            assert parent_task.branch is not None
-            return _create_rebase_task(
-                store,
-                parent_task.id,
-                parent_task.branch,
-                rebase_target,
-                trigger_source="watch",
-            )
-
-        def _create_implement_from_task(parent_task: DbTask) -> DbTask:
-            return _create_implementation_task_from_source(
-                store,
-                parent_task,
-                prompt=_unimplemented_implement_prompt(parent_task),
-                trigger_source="watch",
-            )
-
-        executor_context = AdvanceActionExecutionContext(
-            store=store,
-            trigger_source="watch",
-            dry_run=dry_run,
-            max_resume_attempts=max_recovery_attempts,
-            use_iterate_for_create_implement=True,
-            use_iterate_for_needs_rebase=False,
-            can_spawn_worker=lambda _kind: slots > 0,
-            no_worker_capacity_message=lambda worker_label: (
-                f"SKIP: no watch worker slots available for {worker_label}"
-            ),
-            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
-                config,
-                task,
-                rollback_on_failure=rollback_on_failure,
-            ),
-            prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="watch"),
-            create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="watch"),
-            create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="watch"),
-            create_rebase_task=_create_rebase_from_task,
-            create_implement_task=_create_implement_from_task,
-            create_targeted_rebase_task=_create_targeted_rebase_from_task,
-            spawn_worker=_watch_spawn_worker,
-            spawn_resume_worker=_watch_spawn_resume_worker,
-            spawn_iterate_worker=_watch_spawn_iterate,
-            is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
-                store,
-                git,
-                t,
-                target_branch,
-                merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
-            ).already_merged,
-            config=config,
-            git=git,
-            spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=log,
-                failure_message=f"{task_obj.id} {mode}: iterate worker spawn failed",
-                dedupe_key=f"spawn-iterate-failed:{task_obj.id}:{mode}",
-                spawn_fn=lambda: _spawn_background_iterate(
-                    argparse.Namespace(
-                        max_iterations=max_iterations,
-                        no_docker=False,
-                        resume=False,
-                        retry=False,
-                        auto_iterate=True,
-                    ),
-                    config,
-                    prepared_task,
-                    prepared_task_id=str(prepared_task.id),
-                    prepared_resume=mode == "resume",
-                    prepared_phase="preloop",
-                    startup_quiet=True,
-                ),
-            ),
-            prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
-                store=store,
-                git=git,
-                task=task,
-                action=action,
-                running_task_ids=running_task_id_set,
-                target_branch=target_branch,
-                max_recovery_attempts=max_recovery_attempts,
-            ),
-            reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
-        )
 
         for row, task, action in action_plan:
             display_task = row.owner_task
@@ -2028,15 +2031,11 @@ def _run_cycle(
     started_recovery_task_ids: set[str] = set()
     launched_recovery_count = 0
     for row, failed, decision in actionable_failed:
-        if recovery_slots <= 0:
+        if decision.action != "reconcile" and recovery_slots <= 0:
             break
         if failed.id is None:
             continue
-        recovery_action = {
-            "type": decision.action,
-            "description": decision.reason_text,
-            "recovery_task_id": decision.recovery_task_id,
-        }
+        recovery_action = failed_recovery_decision_to_action(failed, decision)
         if not dry_run:
             no_progress_attention = _maybe_park_watch_no_progress(
                 store=store,
@@ -2052,6 +2051,65 @@ def _run_cycle(
                     message=_watch_needs_attention_message(failed, no_progress_attention),
                 )
                 continue
+        if decision.action == "reconcile":
+            if dry_run:
+                log.emit(
+                    "RECOVR",
+                    (
+                        f"{failed.id} reconcile branch publication "
+                        f"[owner={row.owner_task.id}] "
+                        f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
+                    ),
+                )
+                work_done = True
+                launched_recovery_count += 1
+                continue
+            exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
+            if exec_result.status == "skip":
+                attention = resolve_execution_needs_attention(failed, exec_result)
+                if attention is not None:
+                    log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:reconcile",
+                        message=_watch_needs_attention_message(attention.task, attention.action),
+                    )
+                else:
+                    log.emit(
+                        "SKIP",
+                        f"{failed.id}: {exec_result.message}",
+                        dedupe_key=f"recovery-reconcile-skip:{failed.id}:{exec_result.message}",
+                    )
+                continue
+            if exec_result.status == "error":
+                log.emit(
+                    "REPAIR",
+                    f"{failed.id}: {exec_result.message}",
+                    dedupe_key=f"recovery-reconcile-error:{failed.id}:{exec_result.message}",
+                )
+                continue
+            if exec_result.status == "success":
+                _refresh_watch_no_progress_after_state_change(
+                    store=store,
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task=failed,
+                    failed_task=failed,
+                )
+                log.emit(
+                    "RECOVR",
+                    (
+                        f"{failed.id} reconcile branch publication "
+                        f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
+                    ),
+                )
+                log.emit(
+                    "REPAIR",
+                    f"{failed.id}: {exec_result.success_message or exec_result.message}",
+                    dedupe_key=f"recovery-reconcile-success:{failed.id}",
+                )
+                work_done = True
+                launched_recovery_count += 1
+                continue
+            continue
         if decision.action == "resume":
             if dry_run:
                 destination = decision.recovery_task_id or "(new task)"

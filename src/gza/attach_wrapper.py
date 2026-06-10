@@ -189,6 +189,8 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
             resume_mode=True,
             launch_mode="worker",
         )
+    if decision.action == "reconcile":
+        return None
 
     if decision.launch_mode == "iterate":
         if decision.reuse_existing and decision.recovery_task_id is not None:

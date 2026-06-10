@@ -1298,8 +1298,11 @@ def failed_recovery_decision_to_action(
         description = f"Resume failed task ({failure_reason})"
     elif decision.action == "retry":
         description = f"Retry failed task ({failure_reason})"
+    elif decision.action == "reconcile":
+        description = f"Reconcile branch publication ({failure_reason})"
+    action_type = "reconcile_branch_divergence" if decision.action == "reconcile" else decision.action
     action: dict[str, Any] = {
-        "type": decision.action,
+        "type": action_type,
         "description": description,
         "recovery_task_id": decision.recovery_task_id,
         "reuse_existing": decision.reuse_existing,
@@ -2297,6 +2300,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="failed_task_resume",
         matches=lambda ctx: ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "resume",
+        action=_failed_task_resume_or_retry_action,
+    ),
+    AdvanceRule(
+        name="failed_task_reconcile",
+        matches=lambda ctx: (
+            ctx.failed_recovery_decision is not None and ctx.failed_recovery_decision.action == "reconcile"
+        ),
         action=_failed_task_resume_or_retry_action,
     ),
     AdvanceRule(

@@ -192,6 +192,20 @@ _WORKER_ACTIONS = frozenset(
 )
 
 
+def _should_continue_branch_publication_after_reconcile(
+    *,
+    task: DbTask,
+    action: dict[str, Any],
+) -> bool:
+    """Return whether a successful reconcile should resume failed PR publication."""
+    decision = action.get("decision")
+    if not isinstance(decision, FailedRecoveryDecision):
+        return False
+    if decision.action != "reconcile":
+        return False
+    return task.status == "failed" and task.failure_reason in {"BRANCH_UNPUSHABLE", "PR_REQUIRED"}
+
+
 def _build_noop_verify_attention_result(
     *,
     action_type: str,
@@ -1510,6 +1524,33 @@ def execute_advance_action(
 
         reconcile_outcome = context.reconcile_diverged_branch(task)
         if reconcile_outcome.status == "reconciled":
+            if _should_continue_branch_publication_after_reconcile(task=task, action=action):
+                if context.config is None or context.git is None:
+                    return AdvanceActionExecutionResult(
+                        action_type=action_type,
+                        status="error",
+                        message="missing config/git context for branch publication continuation",
+                    )
+                from .git_ops import complete_branch_unpushable_after_reconcile
+
+                completion_rc = complete_branch_unpushable_after_reconcile(
+                    config=context.config,
+                    store=context.store,
+                    git=context.git,
+                    task=task,
+                )
+                if completion_rc != 0:
+                    refreshed = context.store.get(task.id) if task.id is not None else None
+                    failure_reason = refreshed.failure_reason if refreshed is not None else task.failure_reason
+                    return AdvanceActionExecutionResult(
+                        action_type=action_type,
+                        status="error",
+                        message=(
+                            reconcile_outcome.message
+                            if failure_reason is None
+                            else f"{reconcile_outcome.message}; completion retry ended in {failure_reason}"
+                        ),
+                    )
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="success",

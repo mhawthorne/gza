@@ -15,6 +15,7 @@ import gza.colors as _colors
 from gza.query import get_base_task_slug as _get_base_task_slug
 
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
+from ..branch_publication import load_branch_publication_state
 from ..colors import pink
 from ..commit_messages import build_task_commit_message
 from ..concurrency import (
@@ -37,6 +38,7 @@ from ..db import (
     MergeTargetResolutionError,
     SqliteTaskStore,
     Task as DbTask,
+    TaskStats,
     task_id_numeric_key,
 )
 from ..dependency_preconditions import task_is_merged
@@ -70,6 +72,7 @@ from ..review_verdict import get_review_report
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
+    _complete_failed_code_task_after_pr_publication,
     ensure_task_log_path,
     get_effective_config_for_task,
     load_dotenv,
@@ -189,6 +192,58 @@ class SquashBranchReconcileResult:
     reason: str | None = None
     manual_source_ref: str | None = None
     expected_remote_oid: str | None = None
+
+
+def complete_branch_unpushable_after_reconcile(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    task: DbTask,
+) -> int:
+    """Re-publish PR state and complete a failed branch-publication task after reconcile."""
+    if task.id is None or not task.branch:
+        return 1
+    if task.status != "failed" or task.failure_reason not in {"BRANCH_UNPUSHABLE", "PR_REQUIRED"}:
+        return 1
+
+    log_path = None
+    if task.log_file:
+        log_path = config.project_dir / Path(task.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_path), echo=True) if log_path is not None else None
+    default_branch = git.default_branch()
+    publication_state = load_branch_publication_state(store, task.id)
+    return _complete_failed_code_task_after_pr_publication(
+        task=task,
+        config=config,
+        store=store,
+        git=git,
+        branch_name=task.branch,
+        stats=TaskStats(
+            duration_seconds=task.duration_seconds,
+            num_steps_reported=task.num_steps_reported,
+            num_steps_computed=task.num_steps_computed,
+            num_turns_reported=task.num_turns_reported,
+            num_turns_computed=task.num_turns_computed,
+            cost_usd=task.cost_usd,
+            input_tokens=task.input_tokens,
+            output_tokens=task.output_tokens,
+        ),
+        log_file=log_path,
+        output_content=task.output_content,
+        diff_files=task.diff_files_changed or 0,
+        diff_added=task.diff_lines_added or 0,
+        diff_removed=task.diff_lines_removed or 0,
+        head_sha=git.rev_parse_if_exists(task.branch) if task.has_commits else None,
+        base_sha=git.rev_parse_if_exists(default_branch) if task.has_commits else None,
+        task_logger=task_logger,
+        target_branch=default_branch,
+        fix_commits_ahead_before_run=publication_state.fix_commits_ahead_before_run,
+        fix_default_branch=publication_state.fix_default_branch,
+        fix_was_merged_before_run=publication_state.fix_was_merged_before_run,
+        record_reconcile_attempt=True,
+    )
 
 
 def _reconcile_diverged_branch_with_origin(

@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from gza.cli._common import _create_retry_task, resolve_improve_action
+from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
@@ -26,7 +27,7 @@ from gza.config import Config
 from gza.concurrency import launch_permit
 from gza.db import Task as DbTask
 from gza.git import GitError
-from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.runner import ReviewVerifyResult
 from gza.runner import CrossProjectReviewVerifyResult, ProjectBoundary
 
@@ -2098,6 +2099,8 @@ def test_reconcile_branch_divergence_reports_direct_success(tmp_path: Path) -> N
     assert task.id is not None
     _mark_completed(task, branch="feature/reconcile-direct")
     store.update(task)
+    config = Config.load(tmp_path)
+    git = SimpleNamespace()
 
     context = AdvanceActionExecutionContext(
         store=store,
@@ -2118,17 +2121,344 @@ def test_reconcile_branch_divergence_reports_direct_success(tmp_path: Path) -> N
             status="reconciled",
             message="Reconciled 'feature/reconcile-direct' with --force-with-lease",
         ),
+        config=config,
+        git=git,
     )
 
-    result = execute_advance_action(
-        task=task,
-        action={"type": "reconcile_branch_divergence"},
-        context=context,
-    )
+    with (
+        patch(
+            "gza.cli.git_ops.complete_branch_unpushable_after_reconcile",
+            side_effect=AssertionError("ordinary reconcile should not continue PR publication"),
+        ) as complete_after_reconcile,
+        patch(
+            "gza.runner.ensure_task_pr",
+            side_effect=AssertionError("ordinary reconcile should not touch PR publication"),
+        ) as ensure_pr,
+    ):
+        result = execute_advance_action(
+            task=task,
+            action={"type": "reconcile_branch_divergence"},
+            context=context,
+        )
 
     assert result.status == "success"
     assert result.work_done is True
     assert "force-with-lease" in result.message
+    complete_after_reconcile.assert_not_called()
+    ensure_pr.assert_not_called()
+
+
+def test_reconcile_branch_divergence_completes_failed_branch_unpushable_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/reconcile-complete"
+    task.has_commits = True
+    task.log_file = "logs/reconcile.log"
+    task.output_content = "summary"
+    task.diff_files_changed = 2
+    task.diff_lines_added = 5
+    task.diff_lines_removed = 1
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    config = Config.load(tmp_path)
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        count_commits_ahead=lambda *_args: 1,
+        rev_parse_if_exists=lambda ref: {"feature/reconcile-complete": "head123", "main": "base456"}.get(ref),
+    )
+    ensure_result = SimpleNamespace(ok=True, status="created", error=None, pr_url="https://example.test/pr/1")
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="reconciled",
+            message="Reconciled 'feature/reconcile-complete' with --force-with-lease",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr,
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        patch("gza.runner.task_footer"),
+    ):
+        result = execute_advance_action(
+            task=task,
+            action={
+                "type": "reconcile_branch_divergence",
+                "decision": FailedRecoveryDecision(
+                    task_id=task.id,
+                    action="reconcile",
+                    reason_code="BRANCH_UNPUSHABLE",
+                    reason_text="branch publication failed; reconcile local/origin refs",
+                    launch_mode="none",
+                    attempt_index=1,
+                    attempt_limit=1,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    ensure_pr.assert_called_once()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+    assert refreshed.pr_number is None
+
+
+def test_reconcile_branch_divergence_fix_continuation_preserves_follow_up_review_decision(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/fix-reconcile")
+    store.update(impl)
+    impl_unit = store.get_or_create_merge_unit_for_task(impl)
+    assert impl_unit is not None
+    store.set_merge_unit_state(impl_unit.id, "merged")
+
+    prior_review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert prior_review.id is not None
+    _mark_completed(prior_review)
+    store.update(prior_review)
+
+    fix = store.add(
+        "Fix feature",
+        task_type="fix",
+        based_on=impl.id,
+        same_branch=True,
+        create_review=True,
+    )
+    assert fix.id is not None
+    fix.branch = impl.branch
+    store.mark_failed(
+        fix,
+        log_file="logs/fix-reconcile.log",
+        has_commits=True,
+        branch=fix.branch,
+        failure_reason="BRANCH_UNPUSHABLE",
+        head_sha="head123",
+        base_sha="base456",
+    )
+    fix.output_content = "summary"
+    fix.diff_files_changed = 1
+    fix.diff_lines_added = 2
+    fix.diff_lines_removed = 0
+    store.update(fix)
+    persist_branch_publication_state(
+        store=store,
+        task=fix,
+        config=Config.load(tmp_path),
+        state=BranchPublicationState(
+            fix_commits_ahead_before_run=2,
+            fix_default_branch="main",
+            fix_was_merged_before_run=True,
+        ),
+        status="BRANCH_UNPUSHABLE",
+        exit_status="initial_failure",
+        head_sha="head123",
+    )
+
+    config = Config.load(tmp_path)
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        count_commits_ahead=lambda *_args: 3,
+        rev_parse_if_exists=lambda ref: {"feature/fix-reconcile": "head123", "main": "base456"}.get(ref),
+    )
+    ensure_result = SimpleNamespace(ok=True, status="created", error=None, pr_url="https://example.test/pr/3")
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="reconciled",
+            message="Reconciled 'feature/fix-reconcile' with --force-with-lease",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.runner.ensure_task_pr", return_value=ensure_result),
+        patch("gza.runner.sync_task_branch_if_live_pr", return_value=SimpleNamespace(ok=True, status="pushed")),
+        patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        patch("gza.runner.task_footer"),
+    ):
+        result = execute_advance_action(
+            task=fix,
+            action={
+                "type": "reconcile_branch_divergence",
+                "decision": FailedRecoveryDecision(
+                    task_id=fix.id,
+                    action="reconcile",
+                    reason_code="BRANCH_UNPUSHABLE",
+                    reason_text="branch publication failed; reconcile local/origin refs",
+                    launch_mode="none",
+                    attempt_index=1,
+                    attempt_limit=2,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    run_review.assert_called_once()
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    assert refreshed_impl.merge_status == "unmerged"
+    assert refreshed_impl.review_cleared_at is not None
+
+
+def test_reconcile_branch_divergence_fix_continuation_restores_merged_state_without_new_commits(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/fix-reconcile")
+    store.update(impl)
+    impl_unit = store.get_or_create_merge_unit_for_task(impl)
+    assert impl_unit is not None
+    store.set_merge_unit_state(impl_unit.id, "merged")
+
+    prior_review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert prior_review.id is not None
+    _mark_completed(prior_review)
+    store.update(prior_review)
+
+    fix = store.add(
+        "Fix feature",
+        task_type="fix",
+        based_on=impl.id,
+        same_branch=True,
+        create_review=True,
+    )
+    assert fix.id is not None
+    fix.branch = impl.branch
+    store.mark_failed(
+        fix,
+        log_file="logs/fix-reconcile.log",
+        has_commits=True,
+        branch=fix.branch,
+        failure_reason="BRANCH_UNPUSHABLE",
+        head_sha="head123",
+        base_sha="base456",
+    )
+    fix.output_content = "summary"
+    fix.diff_files_changed = 1
+    fix.diff_lines_added = 2
+    fix.diff_lines_removed = 0
+    store.update(fix)
+    persist_branch_publication_state(
+        store=store,
+        task=fix,
+        config=Config.load(tmp_path),
+        state=BranchPublicationState(
+            fix_commits_ahead_before_run=2,
+            fix_default_branch="main",
+            fix_was_merged_before_run=True,
+        ),
+        status="BRANCH_UNPUSHABLE",
+        exit_status="initial_failure",
+        head_sha="head123",
+    )
+
+    config = Config.load(tmp_path)
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        count_commits_ahead=lambda *_args: 2,
+        rev_parse_if_exists=lambda ref: {"feature/fix-reconcile": "head123", "main": "base456"}.get(ref),
+    )
+    ensure_result = SimpleNamespace(ok=True, status="created", error=None, pr_url="https://example.test/pr/4")
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="reconciled",
+            message="Reconciled 'feature/fix-reconcile' with --force-with-lease",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.runner.ensure_task_pr", return_value=ensure_result),
+        patch("gza.runner.sync_task_branch_if_live_pr", side_effect=AssertionError("sync should not run")),
+        patch("gza.runner._create_and_run_review_task", side_effect=AssertionError("review should not run")),
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        patch("gza.runner.task_footer"),
+    ):
+        result = execute_advance_action(
+            task=fix,
+            action={
+                "type": "reconcile_branch_divergence",
+                "decision": FailedRecoveryDecision(
+                    task_id=fix.id,
+                    action="reconcile",
+                    reason_code="BRANCH_UNPUSHABLE",
+                    reason_text="branch publication failed; reconcile local/origin refs",
+                    launch_mode="none",
+                    attempt_index=1,
+                    attempt_limit=2,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    assert refreshed_impl.merge_status == "merged"
+    assert refreshed_impl.review_cleared_at is None
 
 
 def test_reconcile_branch_divergence_conflict_creates_targeted_rebase_task(tmp_path: Path) -> None:

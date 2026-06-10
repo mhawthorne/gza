@@ -4362,6 +4362,7 @@ class TestFailureReasonTracking:
         from gza.db import KNOWN_FAILURE_REASONS
 
         assert "AGENT_FORFEIT" in KNOWN_FAILURE_REASONS
+        assert "BRANCH_UNPUSHABLE" in KNOWN_FAILURE_REASONS
         assert "CONFIG_ERROR" in KNOWN_FAILURE_REASONS
         assert "INFRASTRUCTURE_ERROR" in KNOWN_FAILURE_REASONS
         assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
