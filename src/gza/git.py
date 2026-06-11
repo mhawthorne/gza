@@ -1047,7 +1047,7 @@ class Git:
         ``merge_base``/``count_commits_ahead`` once fully merged, so this is the
         signal that tells a stale empty branch apart from a genuinely merged one.
         """
-        resolved = self._run(
+        resolved = self._run_readonly_cached(
             "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", check=False
         )
         if resolved.returncode != 0:
@@ -1055,7 +1055,9 @@ class Git:
         commit_sha = resolved.stdout.strip()
         if not commit_sha:
             return False
-        result = self._run("rev-list", "--first-parent", target, check=False)
+        result = self._run_readonly_cached(
+            "rev-list", "--first-parent", target, check=False
+        )
         if result.returncode != 0:
             return False
         return commit_sha in result.stdout.split()

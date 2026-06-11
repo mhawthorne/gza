@@ -1,7 +1,7 @@
 """Comprehensive tests for Git operations."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -1974,6 +1974,31 @@ class TestGitCached:
                 assert git.count_commits_ahead_checked("a", "b") == 3
 
         assert mock_run.call_count == 4
+
+    def test_cached_scope_reuses_is_on_first_parent_history_probes(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="feature-tip-sha\n", stderr=""),
+                MagicMock(
+                    returncode=0,
+                    stdout="main-head\nfeature-tip-sha\nolder-mainline\n",
+                    stderr="",
+                ),
+            ]
+
+            with git.cached():
+                assert git.is_on_first_parent_history("feature-tip", "main") is True
+                assert git.is_on_first_parent_history("feature-tip", "main") is True
+
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list == [
+            call("rev-parse", "--verify", "--quiet", "feature-tip^{commit}", check=False),
+            call("rev-list", "--first-parent", "main", check=False),
+        ]
 
     def test_cached_scope_does_not_leak_between_calls(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
