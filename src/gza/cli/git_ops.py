@@ -51,6 +51,7 @@ from ..git import (
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
     is_rebase_in_progress,
+    prime_advance_planning_refs,
     resolve_ref_if_possible,
 )
 from ..lineage_query import (
@@ -198,7 +199,6 @@ class SquashBranchReconcileResult:
     reason: str | None = None
     manual_source_ref: str | None = None
     expected_remote_oid: str | None = None
-
 
 def complete_branch_unpushable_after_reconcile(
     *,
@@ -2893,6 +2893,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
             except MergeTargetResolutionError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
+            prime_advance_planning_refs(
+                git,
+                branch_names=[task.branch] if task.branch else [],
+                target_branch=target_branch,
+                warning_logger=logger,
+            )
             if task.status != "failed" and target_branch is not None:
                 if resolve_task_merge_state_for_target(
                     store=store,
@@ -2959,6 +2965,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ]
         else:
             target_branch = _resolve_advance_target_branch(store, git, task=None)
+            branch_names = [
+                task.branch
+                for task in store.get_all()
+                if task.branch and task.status in {"completed", "failed", "unmerged", "dropped"}
+            ]
+            prime_advance_planning_refs(
+                git,
+                branch_names=branch_names,
+                target_branch=target_branch,
+                warning_logger=logger,
+            )
             owner_rows = list(
                 query_lineage_owner_rows(
                     store,

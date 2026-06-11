@@ -464,7 +464,12 @@ class TestBranchOperations:
             mock_run.return_value = MagicMock(returncode=0, stdout="main\nfeature/demo\n", stderr="")
 
             assert git.local_branch_names() == frozenset({"main", "feature/demo"})
-            mock_run.assert_called_once_with("for-each-ref", "--format=%(refname:strip=2)", "refs/heads/")
+            mock_run.assert_called_once_with(
+                "for-each-ref",
+                "--format=%(refname:strip=2)",
+                "refs/heads/",
+                check=True,
+            )
 
     def test_delete_branch_without_force(self, tmp_path: Path):
         """Test deleting a branch without force."""
@@ -2037,6 +2042,188 @@ class TestGitCached:
             with git.cached():
                 with pytest.raises(GitError, match="boom"):
                     git.rev_parse("missing")
+                with pytest.raises(GitError, match="boom"):
+                    git.rev_parse("missing")
+
+        assert mock_run.call_count == 2
+
+    def test_resolve_refs_batches_hits_and_misses(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="abc123 commit 1\nfeature/missing^{commit} missing\n",
+                stderr="",
+            )
+
+            with git.cached():
+                resolved = git.resolve_refs(["main", "feature/missing"])
+                assert resolved == {"main": "abc123", "feature/missing": None}
+                assert git.rev_parse_if_exists("main") == "abc123"
+                assert git.rev_parse_if_exists("feature/missing") is None
+                assert git.ref_exists("main") is True
+                assert git.ref_exists("feature/missing") is False
+
+        mock_run.assert_called_once_with(
+            "cat-file",
+            "--batch-check",
+            check=False,
+            stdin=b"main^{commit}\nfeature/missing^{commit}\n",
+        )
+
+    def test_resolve_refs_accepts_ambiguous_refs_with_batch_check_output(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="deadbeef commit 1\n",
+                stderr="warning: refname 'same' is ambiguous.\n",
+            )
+
+            with git.cached():
+                assert git.resolve_refs(["same"]) == {"same": "deadbeef"}
+                assert git.rev_parse_if_exists("same") == "deadbeef"
+
+        mock_run.assert_called_once()
+
+    def test_resolve_refs_supports_tree_peel(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="feedface tree 1\nmissing^{tree} missing\n",
+                stderr="",
+            )
+
+            with git.cached():
+                assert git.resolve_refs(["main", "missing"], peel="tree") == {
+                    "main": "feedface",
+                    "missing": None,
+                }
+
+        mock_run.assert_called_once_with(
+            "cat-file",
+            "--batch-check",
+            check=False,
+            stdin=b"main^{tree}\nmissing^{tree}\n",
+        )
+
+    def test_resolve_refs_raises_for_batch_failure(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="fatal: bad revision")
+            with pytest.raises(GitError, match="git cat-file --batch-check failed"):
+                git.resolve_refs(["bad"])
+
+    def test_branches_exist_batches_and_primes_branch_exists(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="main\nfeature/live\n",
+                stderr="",
+            )
+
+            with git.cached():
+                existing = git.branches_exist(["main", "feature/live", "feature/missing"])
+                assert existing == {
+                    "main": True,
+                    "feature/live": True,
+                    "feature/missing": False,
+                }
+                assert git.branch_exists("main") is True
+                assert git.branch_exists("feature/missing") is False
+
+        mock_run.assert_called_once_with(
+            "for-each-ref",
+            "--format=%(refname:strip=2)",
+            "refs/heads/",
+            check=True,
+        )
+
+    def test_refs_exist_batches_and_primes_ref_exists(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="abc123 commit 1\nmissing^{commit} missing\n",
+                stderr="",
+            )
+
+            with git.cached():
+                existing = git.refs_exist(["main", "missing"])
+                assert existing == {"main": True, "missing": False}
+                assert git.ref_exists("main") is True
+                assert git.ref_exists("missing") is False
+                assert git.rev_parse_if_exists("main") == "abc123"
+
+        mock_run.assert_called_once()
+
+    def test_rev_parse_preloaded_hit_matches_uncached_behavior(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="abc123 commit 1\n", stderr="")
+
+            with git.cached():
+                assert git.resolve_refs(["main"]) == {"main": "abc123"}
+                assert git.rev_parse("main") == "abc123"
+                assert git.rev_parse_if_exists("main") == "abc123"
+
+        mock_run.assert_called_once()
+
+    def test_rev_parse_if_exists_preloaded_miss_matches_uncached_behavior(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="missing^{commit} missing\n",
+                stderr="",
+            )
+
+            with git.cached():
+                assert git.resolve_refs(["missing"]) == {"missing": None}
+                assert git.rev_parse_if_exists("missing") is None
+                assert git.ref_exists("missing") is False
+
+        mock_run.assert_called_once()
+
+    def test_rev_parse_preloaded_miss_preserves_failure_path(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="missing^{commit} missing\n", stderr=""),
+                GitError("boom"),
+            ]
+
+            with git.cached():
+                assert git.resolve_refs(["missing"]) == {"missing": None}
                 with pytest.raises(GitError, match="boom"):
                     git.rev_parse("missing")
 

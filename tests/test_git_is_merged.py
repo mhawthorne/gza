@@ -5,6 +5,9 @@ from unittest.mock import MagicMock, patch
 
 from gza.git import Git
 
+TREE_SHA = "a" * 40
+OTHER_TREE_SHA = "b" * 40
+
 
 class TestIsMergedMergeTreeBased:
     """Test merge-tree based merge detection (default behavior)."""
@@ -19,8 +22,8 @@ class TestIsMergedMergeTreeBased:
             # Branch exists, merge-tree produces same tree as main
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
 
             result = git.is_merged("feature-branch", "main")
@@ -40,8 +43,8 @@ class TestIsMergedMergeTreeBased:
             # Branch exists, merge-tree produces different tree than main
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="different789"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{OTHER_TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
 
             result = git.is_merged("feature-branch", "main")
@@ -74,8 +77,8 @@ class TestIsMergedMergeTreeBased:
             mock_run.side_effect = [
                 MagicMock(returncode=1),  # branch_exists
                 MagicMock(returncode=0),  # ref_exists
-                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
 
             result = git.is_merged("origin/feature-branch", "main")
@@ -92,8 +95,8 @@ class TestIsMergedMergeTreeBased:
             # Branch exists, merge-tree shows same result as main (content merged)
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
 
             result = git.is_merged("squashed-branch", "main")
@@ -110,8 +113,8 @@ class TestIsMergedMergeTreeBased:
              patch.object(git, 'default_branch', return_value='main') as mock_default:
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="abc123def456"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="abc123def456"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
 
             git.is_merged("feature-branch")
@@ -145,8 +148,8 @@ class TestIsMergedMergeTreeBased:
             # (e.g., changes were cherry-picked or squash-merged separately)
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="same_tree_hash"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="same_tree_hash"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
 
             result = git.is_merged("diverged-branch", "main")
@@ -249,8 +252,8 @@ class TestIsMergedBothMethods:
             # Test merge-tree based
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="same_tree"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="same_tree"),  # rev-parse main^{tree}
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
             merge_tree_result = git.is_merged("feature-branch", "main")
 
@@ -274,8 +277,8 @@ class TestIsMergedBothMethods:
             # Test merge-tree based
             mock_run.side_effect = [
                 MagicMock(returncode=0),  # branch_exists
-                MagicMock(returncode=0, stdout="merged_tree"),  # merge-tree --write-tree
-                MagicMock(returncode=0, stdout="main_tree"),  # rev-parse main^{tree} (different)
+                MagicMock(returncode=0, stdout=TREE_SHA),  # merge-tree --write-tree
+                MagicMock(returncode=0, stdout=f"{OTHER_TREE_SHA} tree 1\n"),  # cat-file --batch-check
             ]
             merge_tree_result = git.is_merged("feature-branch", "main")
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from .git import prime_advance_planning_refs
 from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
     task_is_complete_for_lifecycle,
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
 
 LineageStatus = Literal["resolved", "actionable", "needs_attention", "waiting", "skipped"]
 ResolutionReason = Literal["lineage_complete", "branch_merged", "recovery_chain_completed"]
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -718,6 +721,30 @@ def resolve_lineage_owner_task_id(store: SqliteTaskStore, task_id: str) -> str |
     return owner.id if owner is not None else None
 
 
+def _candidate_owner_rows(
+    indexes: _LineageIndexes,
+    query: LineageOwnerQuery,
+    *,
+    owner_ids_filter: set[str] | None,
+    task_ids_filter: set[str] | None,
+) -> tuple[tuple[str, DbTask, tuple[DbTask, ...], DbTask], ...]:
+    candidates: list[tuple[str, DbTask, tuple[DbTask, ...], DbTask]] = []
+    for owner_id, owner_members in indexes.members_by_owner_id.items():
+        owner = indexes.task_by_id.get(owner_id)
+        if owner is None:
+            continue
+        if query.exclude_dropped_from_planning and owner.status == "dropped":
+            continue
+        if owner_ids_filter is not None and owner_id not in owner_ids_filter:
+            if task_ids_filter is None or not any(task.id in task_ids_filter for task in owner_members if task.id is not None):
+                continue
+        root = indexes.root_by_task_id.get(owner.id or "", owner)
+        if _is_broken_same_branch_owner(owner=owner, root=root):
+            continue
+        candidates.append((owner_id, owner, tuple(owner_members), root))
+    return tuple(candidates)
+
+
 def query_lineage_owner_rows(
     store: SqliteTaskStore,
     query: LineageOwnerQuery,
@@ -734,7 +761,6 @@ def query_lineage_owner_rows(
         target_branch=target_branch,
     )
     return rows
-
 
 def _query_lineage_owner_rows_with_context(
     store: SqliteTaskStore,
@@ -767,6 +793,12 @@ def _query_lineage_owner_rows_with_context(
     )
     owner_ids_filter = set(query.owner_task_ids) if query.owner_task_ids is not None else None
     task_ids_filter = set(query.task_ids) if query.task_ids is not None else None
+    candidate_owner_rows = _candidate_owner_rows(
+        indexes,
+        query,
+        owner_ids_filter=owner_ids_filter,
+        task_ids_filter=task_ids_filter,
+    )
     visible_failed_tasks = [
         task for task in list_failed_tasks_for_recovery(store, read_context=read_context) if task.id is not None
     ]
@@ -777,20 +809,20 @@ def _query_lineage_owner_rows_with_context(
         if task.id is not None
     }
     source_followup_cache: dict[str, SourceFollowupState] = {}
+    prime_advance_planning_refs(
+        git,
+        branch_names=(
+            task.branch
+            for _owner_id, _owner, owner_members, _root in candidate_owner_rows
+            for task in owner_members
+            if task.branch
+        ),
+        target_branch=target_branch,
+        warning_logger=_LOG,
+    )
 
     rows: list[LineageOwnerRow] = []
-    for owner_id, owner_members in indexes.members_by_owner_id.items():
-        owner = indexes.task_by_id.get(owner_id)
-        if owner is None:
-            continue
-        if query.exclude_dropped_from_planning and owner.status == "dropped":
-            continue
-        if owner_ids_filter is not None and owner_id not in owner_ids_filter:
-            if task_ids_filter is None or not any(task.id in task_ids_filter for task in owner_members if task.id is not None):
-                continue
-        root = indexes.root_by_task_id.get(owner.id or "", owner)
-        if _is_broken_same_branch_owner(owner=owner, root=root):
-            continue
+    for owner_id, owner, owner_members, root in candidate_owner_rows:
         merge_units_by_member = {
             task.id: indexes.merge_units_by_task_id[task.id]
             for task in owner_members

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -187,6 +187,58 @@ def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representa
     assert row.next_action is not None
     assert row.next_action["type"] in {"merge", "merge_with_followups"}
     assert "no branch" not in str(row.next_action.get("description", "")).lower()
+
+
+def test_query_lineage_owner_rows_uses_shared_ref_preload_helper(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Completed implement owner", task_type="implement")
+    assert task.id is not None
+    _set_completed(
+        task,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch="feature/shared-preload",
+        has_commits=True,
+    )
+    store.update(task)
+
+    unrelated = store.add("Completed unrelated owner", task_type="implement")
+    assert unrelated.id is not None
+    _set_completed(
+        unrelated,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch="feature/unrelated-preload",
+        has_commits=True,
+    )
+    store.update(unrelated)
+
+    git = MagicMock()
+    git.can_merge.return_value = False
+
+    with patch("gza.lineage_query.prime_advance_planning_refs") as preload:
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                include_skipped=True,
+                max_recovery_attempts=1,
+                owner_task_ids=(task.id,),
+            ),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert len(rows) == 1
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert tuple(preload.call_args.kwargs["branch_names"]) == ("feature/shared-preload",)
 
 
 def test_query_lineage_owner_rows_hides_failed_resume_resolved_by_completed_sibling_resume(tmp_path: Path) -> None:

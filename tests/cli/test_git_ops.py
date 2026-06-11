@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -97,6 +97,58 @@ def _add_completed_impl_with_approved_review(store, branch: str, *, when: dateti
     review.report_file = "reviews/fake.md"
     store.update(review)
     return task, review
+
+
+def _make_preload_recording_git(tmp_path: Path) -> tuple[MagicMock, list[tuple[tuple[str, ...], str]], list[tuple[str, ...]]]:
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    ref_calls: list[tuple[tuple[str, ...], str]] = []
+    branch_calls: list[tuple[str, ...]] = []
+
+    def _resolve_refs(refs, peel="commit"):
+        ref_tuple = tuple(refs)
+        ref_calls.append((ref_tuple, peel))
+        return {ref: f"{ref}-{peel}-sha" for ref in ref_tuple}
+
+    def _branches_exist(branches):
+        branch_tuple = tuple(branches)
+        branch_calls.append(branch_tuple)
+        return {branch: True for branch in branch_tuple}
+
+    fake_git.resolve_refs.side_effect = _resolve_refs
+    fake_git.branches_exist.side_effect = _branches_exist
+    return fake_git, ref_calls, branch_calls
+
+
+def _assert_scoped_preload_refs(
+    ref_calls: list[tuple[tuple[str, ...], str]],
+    branch_calls: list[tuple[str, ...]],
+    *,
+    requested_branch: str,
+    unrelated_branches: tuple[str, ...],
+    target_branch: str = "main",
+) -> None:
+    preloaded_refs = {ref for refs, _peel in ref_calls for ref in refs}
+    preloaded_branches = {branch for branches in branch_calls for branch in branches}
+
+    assert requested_branch in preloaded_branches
+    assert requested_branch in preloaded_refs
+    assert f"origin/{requested_branch}" in preloaded_refs
+    assert target_branch in preloaded_refs
+
+    for branch in unrelated_branches:
+        assert branch not in preloaded_branches
+        assert branch not in preloaded_refs
+        assert f"origin/{branch}" not in preloaded_refs
 
 
 def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -> None:
@@ -1285,7 +1337,7 @@ def test_cmd_advance_wraps_planning_in_git_cache(tmp_path: Path) -> None:
     assert cached_entries == ["entered"]
 
 
-def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> None:
+def test_cmd_advance_batches_ref_preloads_during_lifecycle_planning(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("Advance cached lifecycle planning", task_type="implement")
@@ -1301,13 +1353,40 @@ def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> No
     git.current_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
     git.default_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
 
-    branch_probe = ("show-ref", "--verify", "--quiet", "refs/heads/feature/cache-lifecycle")
     git_calls: list[tuple[str, ...]] = []
+    batch_stdins: list[bytes] = []
 
     def _fake_run(*args: str, check: bool = True, stdin: bytes | None = None):
-        del check, stdin
+        del check
         git_calls.append(args)
-        if args == branch_probe:
+        if args == ("for-each-ref", "--format=%(refname:strip=2)", "refs/heads/"):
+            return SimpleNamespace(returncode=0, stdout="feature/cache-lifecycle\n", stderr="")
+        if args == ("cat-file", "--batch-check"):
+            assert stdin is not None
+            batch_stdins.append(stdin)
+            request = stdin.decode().splitlines()
+            response_lines: list[str] = []
+            for line in request:
+                if line == "feature/cache-lifecycle^{commit}":
+                    response_lines.append("a" * 40 + " commit 1")
+                elif line == "origin/feature/cache-lifecycle^{commit}":
+                    response_lines.append("origin/feature/cache-lifecycle^{commit} missing")
+                elif line == "main^{commit}":
+                    response_lines.append("b" * 40 + " commit 1")
+                elif line == "main^{tree}":
+                    response_lines.append("c" * 40 + " tree 1")
+                else:
+                    raise AssertionError(f"Unexpected batch ref: {line!r}")
+            return SimpleNamespace(returncode=0, stdout="\n".join(response_lines) + "\n", stderr="")
+        if args == ("merge-base", "--is-ancestor", "main", "feature/cache-lifecycle"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ("rev-list", "--count", "main..feature/cache-lifecycle"):
+            return SimpleNamespace(returncode=0, stdout="2\n", stderr="")
+        if args == ("merge-tree", "--write-tree", "main", "feature/cache-lifecycle"):
+            return SimpleNamespace(returncode=0, stdout="target-tree\n", stderr="")
+        if args == ("rev-list", "--count", "origin/feature/cache-lifecycle..feature/cache-lifecycle"):
+            return SimpleNamespace(returncode=0, stdout="2\n", stderr="")
+        if args == ("rev-list", "--count", "feature/cache-lifecycle..origin/feature/cache-lifecycle"):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"Unexpected git command: {args!r}")
 
@@ -1316,6 +1395,8 @@ def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> No
     def _query_rows(*_args, **_kwargs):
         assert git._cache is not None
         assert git.branch_exists("feature/cache-lifecycle") is True
+        assert git.rev_parse_if_exists("feature/cache-lifecycle") == "a" * 40
+        assert git.ref_exists("origin/feature/cache-lifecycle") is False
         assert git.branch_exists("feature/cache-lifecycle") is True
         return iter(
             [
@@ -1338,6 +1419,8 @@ def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> No
     def _determine_next_action(*_args, **_kwargs):
         assert git._cache is not None
         assert git.branch_exists("feature/cache-lifecycle") is True
+        assert git.rev_parse_if_exists("main") == "b" * 40
+        assert git.ref_exists("origin/feature/cache-lifecycle") is False
         assert git.branch_exists("feature/cache-lifecycle") is True
         return {"type": "skip", "description": "nothing to do"}
 
@@ -1371,7 +1454,83 @@ def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> No
         )
 
     assert rc == 0
-    assert git_calls.count(branch_probe) == 1
+    assert ("show-ref", "--verify", "--quiet", "refs/heads/feature/cache-lifecycle") not in git_calls
+    assert ("rev-parse", "--verify", "--quiet", "feature/cache-lifecycle^{commit}") not in git_calls
+    assert ("rev-parse", "--verify", "--quiet", "origin/feature/cache-lifecycle^{commit}") not in git_calls
+    assert ("rev-parse", "--verify", "--quiet", "main^{commit}") not in git_calls
+    assert ("for-each-ref", "--format=%(refname:strip=2)", "refs/heads/") in git_calls
+    assert ("cat-file", "--batch-check") in git_calls
+    assert len(set(git_calls)) == 2
+    assert any(b"feature/cache-lifecycle^{commit}\n" in payload for payload in batch_stdins)
+
+
+def test_cmd_advance_uses_shared_ref_preload_helper(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Advance shared preload helper", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/shared-preload"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.current_branch.return_value = "main"
+    fake_git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
+        patch("gza.cli.git_ops.prime_advance_planning_refs") as preload,
+    ):
+        rc = cmd_advance(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=task.id,
+                dry_run=True,
+                auto=True,
+                max=None,
+                batch=None,
+                no_docker=True,
+                force=False,
+                plans=False,
+                unimplemented=False,
+                create=False,
+                no_resume_failed=False,
+                max_resume_attempts=None,
+                advance_type=None,
+                new=False,
+                max_review_cycles=None,
+                squash_threshold=None,
+            )
+        )
+
+    assert rc == 0
+    preload.assert_called_once_with(
+        fake_git,
+        branch_names=["feature/shared-preload"],
+        target_branch="main",
+        warning_logger=ANY,
+    )
 
 
 def test_cmd_advance_explicit_child_member_scopes_query_to_owner_lineage(tmp_path: Path) -> None:
@@ -1586,16 +1745,7 @@ def test_cmd_advance_explicit_task_plans_only_requested_lineage_refs(
         ),
     )
 
-    fake_git = MagicMock(spec=Git)
-    fake_git.repo_dir = tmp_path
-    fake_git.default_branch.return_value = "main"
-    fake_git.current_branch.return_value = "main"
-    fake_git.branch_exists.return_value = True
-    fake_git.ref_exists.return_value = True
-    fake_git.is_merged.return_value = False
-    fake_git.has_changes.return_value = False
-    fake_git.can_merge.return_value = True
-    fake_git.count_commits_ahead.return_value = 1
+    fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
 
     merge_sources: list[str] = []
     merge_checks: list[str] = []
@@ -1622,6 +1772,183 @@ def test_cmd_advance_explicit_task_plans_only_requested_lineage_refs(
     assert merge_sources
     assert set(merge_sources) == {requested.branch}
     assert set(merge_checks) == {f"origin/{requested.branch}"}
+    _assert_scoped_preload_refs(
+        ref_calls,
+        branch_calls,
+        requested_branch=requested.branch,
+        unrelated_branches=tuple(f"feature/unrelated-lineage-{index}" for index in range(3)),
+    )
+
+
+def test_cmd_advance_explicit_child_member_preloads_only_owner_lineage_refs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    requested, review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/member-owner-scope",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    unrelated_branches = tuple(f"feature/member-unrelated-{index}" for index in range(2))
+    for index, branch in enumerate(unrelated_branches):
+        _add_completed_impl_with_approved_review(
+            store,
+            branch,
+            when=datetime(2026, 5, 10, 10 + index, 0, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{requested.branch}")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, review.id)), "dry_run": True}))
+
+    assert rc == 0
+    _assert_scoped_preload_refs(
+        ref_calls,
+        branch_calls,
+        requested_branch=requested.branch,
+        unrelated_branches=unrelated_branches,
+    )
+
+
+def test_cmd_advance_explicit_failed_leaf_preloads_only_owner_lineage_refs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    requested, _review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/failed-leaf-owner-scope",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+
+    failed_rebase = store.add("Failed rebase leaf", task_type="rebase", based_on=requested.id, same_branch=True)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    failed_rebase.branch = requested.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    unrelated_branches = tuple(f"feature/failed-leaf-unrelated-{index}" for index in range(2))
+    for index, branch in enumerate(unrelated_branches):
+        _add_completed_impl_with_approved_review(
+            store,
+            branch,
+            when=datetime(2026, 5, 10, 11 + index, 0, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{requested.branch}")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed_rebase.id)), "dry_run": True}))
+
+    assert rc == 0
+    _assert_scoped_preload_refs(
+        ref_calls,
+        branch_calls,
+        requested_branch=requested.branch,
+        unrelated_branches=unrelated_branches,
+    )
+
+
+def test_cmd_advance_explicit_dropped_owner_fallback_preloads_only_requested_lineage_refs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Dropped owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "dropped"
+    owner.completed_at = datetime(2026, 5, 12, 9, 0, tzinfo=UTC)
+    owner.branch = "feature/dropped-owner-scope"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    requested = store.add("Completed descendant", task_type="rebase", based_on=owner.id, same_branch=True)
+    assert requested.id is not None
+    requested.status = "completed"
+    requested.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    requested.branch = owner.branch
+    requested.has_commits = True
+    requested.merge_status = "unmerged"
+    store.update(requested)
+
+    unrelated_branches = tuple(f"feature/dropped-owner-unrelated-{index}" for index in range(2))
+    for index, branch in enumerate(unrelated_branches):
+        _add_completed_impl_with_approved_review(
+            store,
+            branch,
+            when=datetime(2026, 5, 12, 11 + index, 0, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(owner.branch)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, requested.id)), "dry_run": True}))
+
+    assert rc == 0
+    _assert_scoped_preload_refs(
+        ref_calls,
+        branch_calls,
+        requested_branch=owner.branch,
+        unrelated_branches=unrelated_branches,
+    )
 
 
 def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(

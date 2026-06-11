@@ -1,9 +1,10 @@
 """Git operations for Gza."""
 
+import logging
 import re
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,38 @@ class ResolvedMergeSourceRef:
 
     ref: str | None
     warning: str | None = None
+
+
+def prime_advance_planning_refs(
+    git: Any | None,
+    *,
+    branch_names: Iterable[str],
+    target_branch: str | None,
+    warning_logger: logging.Logger | None = None,
+) -> None:
+    """Prime read-only ref facts for advance and lineage planning."""
+    if git is None:
+        return
+
+    resolve_refs = getattr(git, "resolve_refs", None)
+    branches_exist = getattr(git, "branches_exist", None)
+    branches = tuple(dict.fromkeys(branch for branch in branch_names if branch))
+
+    try:
+        if callable(branches_exist) and branches:
+            branches_exist(branches)
+        if callable(resolve_refs):
+            commit_refs = list(branches)
+            commit_refs.extend(f"origin/{branch}" for branch in branches)
+            if target_branch:
+                commit_refs.append(target_branch)
+            if commit_refs:
+                resolve_refs(commit_refs, peel="commit")
+            if target_branch:
+                resolve_refs((target_branch,), peel="tree")
+    except Exception:
+        if warning_logger is not None:
+            warning_logger.warning("Failed to preload advance planning refs", exc_info=True)
 
 
 def _unquote_c_style_path(path: str) -> str:
@@ -231,6 +264,58 @@ class Git:
             self._cache[key] = value
         return value
 
+    def _resolved_ref_cache_key(self, ref: str, peel: str) -> tuple[Any, ...]:
+        return ("resolved-ref", peel, ref)
+
+    def _ref_exists_cache_key(self, ref: str) -> tuple[Any, ...]:
+        return ("ref-exists", ref)
+
+    def _branch_exists_cache_key(self, branch: str) -> tuple[Any, ...]:
+        return ("branch-exists", branch)
+
+    def _lookup_cached_resolved_ref(self, ref: str, peel: str) -> tuple[bool, str | None]:
+        hit, cached = self._lookup_cached_value(self._resolved_ref_cache_key(ref, peel))
+        return (hit, cached if isinstance(cached, str) or cached is None else None)
+
+    def _store_cached_resolved_ref(self, ref: str, peel: str, sha: str | None) -> None:
+        self._store_cached_value(self._resolved_ref_cache_key(ref, peel), sha)
+        if peel == "commit":
+            self._store_cached_value(self._ref_exists_cache_key(ref), sha is not None)
+
+    def _lookup_cached_ref_exists(self, ref: str) -> tuple[bool, bool]:
+        hit, cached = self._lookup_cached_value(self._ref_exists_cache_key(ref))
+        return (hit, bool(cached))
+
+    def _store_cached_ref_exists(self, ref: str, exists: bool) -> None:
+        self._store_cached_value(self._ref_exists_cache_key(ref), exists)
+
+    def _lookup_cached_branch_exists(self, branch: str) -> tuple[bool, bool]:
+        hit, cached = self._lookup_cached_value(self._branch_exists_cache_key(branch))
+        return (hit, bool(cached))
+
+    def _store_cached_branch_exists(self, branch: str, exists: bool) -> None:
+        self._store_cached_value(self._branch_exists_cache_key(branch), exists)
+
+    @staticmethod
+    def _ordered_unique(values: Iterable[str]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(value for value in values if value))
+
+    @staticmethod
+    def _format_batch_ref(ref: str, peel: str) -> str:
+        return f"{ref}^{{{peel}}}"
+
+    @staticmethod
+    def _parse_batch_check_line(line: str) -> str | None:
+        stripped = line.strip()
+        if not stripped:
+            raise GitError("git cat-file --batch-check returned an empty line")
+        if stripped.endswith(" missing"):
+            return None
+        fields = stripped.split()
+        if len(fields) >= 3 and re.fullmatch(r"[0-9a-fA-F]+", fields[0]):
+            return fields[0]
+        raise GitError(f"git cat-file --batch-check returned unexpected output: {line!r}")
+
     @contextmanager
     def _mutation_scope(self):
         """Clear cached read state around git mutations."""
@@ -405,6 +490,9 @@ class Git:
 
     def branch_exists(self, branch: str) -> bool:
         """Check if a branch exists locally."""
+        hit, exists = self._lookup_cached_branch_exists(branch)
+        if hit:
+            return exists
         result = self._run_readonly_cached(
             "show-ref",
             "--verify",
@@ -412,12 +500,42 @@ class Git:
             f"refs/heads/{branch}",
             check=False,
         )
-        return result.returncode == 0
+        exists = result.returncode == 0
+        self._store_cached_branch_exists(branch, exists)
+        return exists
 
     def local_branch_names(self) -> frozenset[str]:
         """Return all local branch names in one call."""
-        result = self._run("for-each-ref", "--format=%(refname:strip=2)", "refs/heads/")
+        result = self._run_readonly_success_cached(
+            "for-each-ref",
+            "--format=%(refname:strip=2)",
+            "refs/heads/",
+        )
         return frozenset(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def branches_exist(self, branches: Iterable[str]) -> dict[str, bool]:
+        """Resolve local branch existence in one read-only batch."""
+        requested = self._ordered_unique(branches)
+        if not requested:
+            return {}
+
+        resolved: dict[str, bool] = {}
+        unresolved: list[str] = []
+        for branch in requested:
+            hit, exists = self._lookup_cached_branch_exists(branch)
+            if hit:
+                resolved[branch] = exists
+            else:
+                unresolved.append(branch)
+
+        if unresolved:
+            existing = self.local_branch_names()
+            for branch in unresolved:
+                exists = branch in existing
+                self._store_cached_branch_exists(branch, exists)
+                resolved[branch] = exists
+
+        return {branch: resolved[branch] for branch in requested}
 
     def worktree_add(self, path: Path, branch: str, base_branch: str | None = None) -> Path:
         """Create a new worktree with a new branch.
@@ -715,6 +833,12 @@ class Git:
 
     def ref_exists(self, ref: str) -> bool:
         """Return whether a ref resolves to a commit."""
+        hit, exists = self._lookup_cached_ref_exists(ref)
+        if hit:
+            return exists
+        resolved_hit, resolved_sha = self._lookup_cached_resolved_ref(ref, "commit")
+        if resolved_hit:
+            return resolved_sha is not None
         result = self._run_readonly_cached(
             "rev-parse",
             "--verify",
@@ -722,7 +846,39 @@ class Git:
             f"{ref}^{{commit}}",
             check=False,
         )
-        return result.returncode == 0
+        exists = result.returncode == 0
+        self._store_cached_ref_exists(ref, exists)
+        return exists
+
+    def refs_exist(self, refs: Iterable[str]) -> dict[str, bool]:
+        """Resolve commit-ref existence in one read-only batch."""
+        requested = self._ordered_unique(refs)
+        if not requested:
+            return {}
+
+        resolved: dict[str, bool] = {}
+        unresolved: list[str] = []
+        for ref in requested:
+            hit, exists = self._lookup_cached_ref_exists(ref)
+            if hit:
+                resolved[ref] = exists
+                continue
+            resolved_hit, resolved_sha = self._lookup_cached_resolved_ref(ref, "commit")
+            if resolved_hit:
+                exists = resolved_sha is not None
+                self._store_cached_ref_exists(ref, exists)
+                resolved[ref] = exists
+                continue
+            unresolved.append(ref)
+
+        if unresolved:
+            batch_resolved = self.resolve_refs(unresolved, peel="commit")
+            for ref, sha in batch_resolved.items():
+                exists = sha is not None
+                self._store_cached_ref_exists(ref, exists)
+                resolved[ref] = exists
+
+        return {ref: resolved[ref] for ref in requested}
 
     def resolve_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
         """Return an existing ref that can prove merge truth for a branch.
@@ -792,15 +948,23 @@ class Git:
 
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""
+        hit, sha = self._lookup_cached_resolved_ref(ref, "commit")
+        if hit and sha is not None:
+            return sha
         result = self._run_readonly_success_cached(
             "rev-parse",
             "--verify",
             f"{ref}^{{commit}}",
         )
-        return result.stdout.strip()
+        sha = result.stdout.strip()
+        self._store_cached_resolved_ref(ref, "commit", sha)
+        return sha
 
     def rev_parse_if_exists(self, ref: str) -> str | None:
         """Resolve a ref to its commit SHA when it exists."""
+        hit, sha = self._lookup_cached_resolved_ref(ref, "commit")
+        if hit:
+            return sha
         result = self._run_readonly_cached(
             "rev-parse",
             "--verify",
@@ -809,8 +973,47 @@ class Git:
             check=False,
         )
         if result.returncode != 0:
+            self._store_cached_resolved_ref(ref, "commit", None)
             return None
-        return result.stdout.strip()
+        sha = result.stdout.strip()
+        self._store_cached_resolved_ref(ref, "commit", sha)
+        return sha
+
+    def resolve_refs(self, refs: Iterable[str], peel: str = "commit") -> dict[str, str | None]:
+        """Resolve refs to peeled object ids in one read-only batch."""
+        if peel not in {"commit", "tree"}:
+            raise ValueError("peel must be 'commit' or 'tree'")
+
+        requested = self._ordered_unique(refs)
+        if not requested:
+            return {}
+
+        resolved: dict[str, str | None] = {}
+        unresolved: list[str] = []
+        for ref in requested:
+            hit, sha = self._lookup_cached_resolved_ref(ref, peel)
+            if hit:
+                resolved[ref] = sha
+            else:
+                unresolved.append(ref)
+
+        if unresolved:
+            stdin = "".join(f"{self._format_batch_ref(ref, peel)}\n" for ref in unresolved).encode()
+            result = self._run("cat-file", "--batch-check", check=False, stdin=stdin)
+            if result.returncode != 0:
+                error_output = result.stderr or result.stdout
+                raise GitError(f"git cat-file --batch-check failed:\n{error_output}")
+            lines = result.stdout.splitlines()
+            if len(lines) != len(unresolved):
+                raise GitError(
+                    "git cat-file --batch-check returned an unexpected number of lines"
+                )
+            for ref, line in zip(unresolved, lines, strict=True):
+                sha = self._parse_batch_check_line(line)
+                self._store_cached_resolved_ref(ref, peel, sha)
+                resolved[ref] = sha
+
+        return {ref: resolved[ref] for ref in requested}
 
     def merge_base(self, ref1: str, ref2: str) -> str:
         """Return the merge-base commit SHA for two refs."""
@@ -1041,12 +1244,9 @@ class Git:
                 return False
 
             merged_tree = result.stdout.strip()
-            # Get the target branch's tree
-            target_tree_result = self._run("rev-parse", f"{into}^{{tree}}", check=False)
-            if target_tree_result.returncode != 0:
+            target_tree = self.resolve_refs((into,), peel="tree").get(into)
+            if target_tree is None:
                 return False
-
-            target_tree = target_tree_result.stdout.strip()
             # If trees match, merging would be a no-op - branch is effectively merged
             return merged_tree == target_tree
 
