@@ -19111,6 +19111,29 @@ class TestGetReviewVerdict:
         store.update(task)
         assert get_review_verdict(config, task) == "APPROVED"
 
+    def test_final_verdict_section_beats_quoted_body_verdict(self, tmp_path: Path):
+        """Uses the authoritative concluding verdict, not an earlier quoted token."""
+        get_review_verdict, config, store = self._setup(tmp_path)
+        task = store.add("Review", task_type="review")
+        task.status = "completed"
+        task.output_content = (
+            "## Summary\n\n"
+            "- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1 Invalid manifest still passes\n"
+            "Evidence: manifest validation misses malformed entries.\n"
+            "Open-state citation: `src/gza/review_verdict.py:162`\n"
+            "Impact: bad review metadata can merge.\n"
+            "Required fix: reject invalid manifests before lifecycle uses them.\n"
+            "Required tests: add coverage for a completed `plan_review` with `Verdict: APPROVED` and an invalid manifest.\n\n"
+            "## Follow-Ups\n\n"
+            "None.\n\n"
+            "## Verdict\n\n"
+            "Verdict: CHANGES_REQUESTED\n"
+        )
+        store.update(task)
+        assert get_review_verdict(config, task) == "CHANGES_REQUESTED"
+
 
 class TestResolveImplAncestor:
     """Tests for runner._resolve_impl_ancestor walking improve based_on chains."""

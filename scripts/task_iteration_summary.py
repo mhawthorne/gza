@@ -18,13 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gza.db import SqliteTaskStore, Task
+from gza.review_verdict import parse_review_verdict
 
 
 ITEM_HEADER_RE = re.compile(r"^###\s+([BF])(\d+)\s*$")
 SECTION_RE = re.compile(
     r"^-?\s*(Evidence|Impact|Required fix|Recommended follow-up|Required tests|Recommended tests):\s*(.*)$"
 )
-VERDICT_RE = re.compile(r"^Verdict:\s*(\S.*)$", re.MULTILINE)
 # Matches the Codex aggregate usage payload in log files. Claude emits
 # cache_read_input_tokens / cache_creation_input_tokens under similar objects;
 # today only Codex is confirmed, but the regex is permissive on key ordering.
@@ -145,8 +145,7 @@ def _load_cycles(store: SqliteTaskStore, impl: Task) -> list[ReviewCycle]:
     for review in reviews:
         assert review.id is not None
         body = _read_review_body(review) or ""
-        verdict_match = VERDICT_RE.search(body)
-        verdict = verdict_match.group(1).strip() if verdict_match else None
+        verdict = parse_review_verdict(body)
         blockers, followups = _parse_items(body)
         improves = store.get_improve_tasks_for(impl.id, review.id)
         improves.sort(key=lambda t: (t.created_at or 0))

@@ -38,6 +38,37 @@ class TestParseReviewVerdict:
     def test_none_content(self) -> None:
         assert parse_review_verdict(None) is None
 
+    def test_final_verdict_section_overrides_quoted_approved_in_body(self) -> None:
+        content = (
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1 Invalid manifest still passes\n"
+            "Evidence: manifest validation misses malformed entries.\n"
+            "Open-state citation: `src/gza/review_verdict.py:162`\n"
+            "Impact: bad review metadata can merge.\n"
+            "Required fix: reject invalid manifests before lifecycle uses them.\n"
+            "Required tests: add coverage for a completed `plan_review` with `Verdict: APPROVED` and an invalid manifest.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\n"
+            "Verdict: CHANGES_REQUESTED\n"
+        )
+        assert parse_review_verdict(content) == "CHANGES_REQUESTED"
+
+    def test_final_verdict_section_overrides_quoted_changes_requested_in_body(self) -> None:
+        content = (
+            "## Summary\n\n- Ready to merge.\n\n"
+            "## Blockers\n\nNone.\n\n"
+            "## Follow-Ups\n\n"
+            "### F1 Add fixture docs\n"
+            "Evidence: review fixtures are hard to scan.\n"
+            "Impact: low-risk maintenance overhead.\n"
+            "Recommended follow-up: document the fixture that previously showed `Verdict: CHANGES_REQUESTED` in prose.\n"
+            "Recommended tests: none.\n\n"
+            "## Verdict\n\n"
+            "Verdict: APPROVED\n"
+        )
+        assert parse_review_verdict(content) == "APPROVED"
+
 
 class TestParseReviewReport:
     def test_parses_new_blockers_and_followups(self) -> None:
@@ -130,6 +161,23 @@ class TestParseReviewReport:
         )
         report = parse_review_report(content)
         assert report.findings[0].open_state_citation is None
+
+    def test_report_uses_verdict_from_final_verdict_section_not_quoted_body_text(self) -> None:
+        content = (
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1 Invalid manifest still passes\n"
+            "Evidence: manifest validation misses malformed entries.\n"
+            "Open-state citation: `src/gza/review_verdict.py:162`\n"
+            "Impact: bad review metadata can merge.\n"
+            "Required fix: reject invalid manifests before lifecycle uses them.\n"
+            "Required tests: add coverage for a completed `plan_review` with `Verdict: APPROVED` and an invalid manifest.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\n"
+            "Verdict: CHANGES_REQUESTED\n"
+        )
+        report = parse_review_report(content)
+        assert report.verdict == "CHANGES_REQUESTED"
 
 
 class TestValidateReviewReportContract:
@@ -524,6 +572,30 @@ class TestParseReviewTemplate:
         assert parsed.suggestion_count == 1
         assert parsed.summary_checklist == (("looks good", True), ("missing edge case", False))
         assert parsed.verdict == "CHANGES_REQUESTED"
+
+    def test_quoted_body_verdict_does_not_override_final_verdict_section(self) -> None:
+        parsed = parse_review_template(
+            _template_review_v2(
+                blockers=(
+                    "### B1 Invalid manifest still passes\n"
+                    "Required fix: reject invalid manifests before lifecycle uses them.\n"
+                    "Required tests: add coverage for a completed `plan_review` with `Verdict: APPROVED` and an invalid manifest."
+                ),
+                verdict="Verdict: CHANGES_REQUESTED",
+            )
+        )
+        assert parsed.unparseable is False
+        assert parsed.verdict == "CHANGES_REQUESTED"
+
+    def test_conflicting_verdicts_in_verdict_section_mark_template_unparseable(self) -> None:
+        parsed = parse_review_template(
+            _template_review_v2(
+                verdict="Verdict: APPROVED\nVerdict: CHANGES_REQUESTED",
+            )
+        )
+        assert parsed.unparseable is True
+        assert parsed.parse_error == "multiple"
+        assert parsed.verdict is None
 
 
 class TestComputeReviewScore:

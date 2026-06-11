@@ -28,21 +28,18 @@ _VERDICT_TOKEN = r"(APPROVED_WITH_FOLLOWUPS|APPROVED|CHANGES_REQUESTED|NEEDS_DIS
 # - **Verdict**: CHANGES_REQUESTED
 # - Verdict: NEEDS_DISCUSSION
 _INLINE_VERDICT_PATTERN = re.compile(
-    rf"\*{{0,2}}Verdict\*{{0,2}}:\s*\*{{0,2}}{_VERDICT_TOKEN}\*{{0,2}}",
-    re.IGNORECASE,
+    rf"^[^\S\r\n]*\*{{0,2}}Verdict\*{{0,2}}:\s*\*{{0,2}}({_VERDICT_TOKEN})\*{{0,2}}[^\S\r\n]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
-# Heading format:
-# ## Verdict
-#
-# **CHANGES_REQUESTED**
-_HEADING_VERDICT_PATTERN = re.compile(
-    rf"#{{2,6}}\s+Verdict\s*\n+\s*\*{{0,2}}{_VERDICT_TOKEN}\*{{0,2}}",
-    re.IGNORECASE,
+_VERDICT_TOKEN_LINE_PATTERN = re.compile(
+    rf"^[^\S\r\n]*\*{{0,2}}({_VERDICT_TOKEN})\*{{0,2}}[^\S\r\n]*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 _H2_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 _H3_PATTERN = re.compile(r"^###\s+(.+?)\s*$", re.MULTILINE)
+_HEADING_PATTERN = re.compile(r"^(#{2,6})\s+(.+?)\s*$", re.MULTILINE)
 _CHECKLIST_LINE_PATTERN = re.compile(
     r"^\s*(?:[-*]|\d+[.)])?\s*(yes|no)\s*[-:]\s*(.+?)\s*$",
     re.IGNORECASE,
@@ -159,16 +156,86 @@ class ParsedReview:
     parse_error: ReviewParseError | None = None
 
 
+@dataclass(frozen=True)
+class _VerdictExtraction:
+    verdict: str | None
+    has_h2_verdict_section: bool
+    section_verdicts: tuple[str, ...] = ()
+
+
+def _collect_verdict_matches(content: str, *, token_only: bool) -> list[tuple[int, str]]:
+    pattern = _VERDICT_TOKEN_LINE_PATTERN if token_only else _INLINE_VERDICT_PATTERN
+    return [(match.start(), match.group(1).upper()) for match in pattern.finditer(content)]
+
+
+def _collect_heading_verdict_matches(content: str) -> list[tuple[int, str]]:
+    matches = list(_HEADING_PATTERN.finditer(content))
+    verdicts: list[tuple[int, str]] = []
+    for idx, match in enumerate(matches):
+        heading_level = len(match.group(1))
+        heading_name = match.group(2).strip()
+        if _normalize_h2(heading_name) != "verdict":
+            continue
+        start = match.end()
+        end = len(content)
+        for later in matches[idx + 1 :]:
+            later_level = len(later.group(1))
+            if later_level <= heading_level:
+                end = later.start()
+                break
+        body = content[start:end]
+        for offset, verdict in _collect_verdict_matches(body, token_only=True):
+            verdicts.append((start + offset, verdict))
+    return verdicts
+
+
+def _extract_verdict_details(content: str) -> _VerdictExtraction:
+    h2_sections = list(_H2_PATTERN.finditer(content))
+    verdict_sections = [
+        (
+            match.end(),
+            h2_sections[idx + 1].start() if idx + 1 < len(h2_sections) else len(content),
+        )
+        for idx, match in enumerate(h2_sections)
+        if _normalize_h2(match.group(1)) == "verdict"
+    ]
+    if verdict_sections:
+        start, end = verdict_sections[-1]
+        section_body = content[start:end]
+        section_matches = sorted(
+            [
+                *_collect_verdict_matches(section_body, token_only=False),
+                *_collect_verdict_matches(section_body, token_only=True),
+            ],
+            key=lambda item: item[0],
+        )
+        unique_verdicts = tuple(dict.fromkeys(verdict for _, verdict in section_matches))
+        if len(unique_verdicts) == 1:
+            return _VerdictExtraction(
+                verdict=unique_verdicts[0],
+                has_h2_verdict_section=True,
+                section_verdicts=unique_verdicts,
+            )
+        return _VerdictExtraction(
+            verdict=None,
+            has_h2_verdict_section=True,
+            section_verdicts=unique_verdicts,
+        )
+
+    matches = sorted(
+        [
+            *_collect_verdict_matches(content, token_only=False),
+            *_collect_heading_verdict_matches(content),
+        ],
+        key=lambda item: item[0],
+    )
+    if not matches:
+        return _VerdictExtraction(verdict=None, has_h2_verdict_section=False)
+    return _VerdictExtraction(verdict=matches[-1][1], has_h2_verdict_section=False)
+
+
 def _extract_verdict(content: str) -> str | None:
-    inline_match = _INLINE_VERDICT_PATTERN.search(content)
-    if inline_match:
-        return inline_match.group(1).upper()
-
-    heading_match = _HEADING_VERDICT_PATTERN.search(content)
-    if heading_match:
-        return heading_match.group(1).upper()
-
-    return None
+    return _extract_verdict_details(content).verdict
 
 
 def _parse_fields(block: str, *, labels: list[str]) -> dict[str, str]:
@@ -314,7 +381,8 @@ def parse_review_template(content: str | None) -> ParsedReview:
     )
 
     checklist, checklist_malformed = _parse_checklist(summary_body)
-    verdict = _extract_verdict(content)
+    verdict_info = _extract_verdict_details(content)
+    verdict = verdict_info.verdict
     normalized_verdict: ReviewTemplateVerdict | None = None
     if verdict in {"APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}:
         normalized_verdict = cast(ReviewTemplateVerdict, verdict)
@@ -333,7 +401,9 @@ def parse_review_template(content: str | None) -> ParsedReview:
         parse_errors.append("malformed_suggestions_section")
     if checklist_malformed:
         parse_errors.append("malformed_checklist")
-    if normalized_verdict is None:
+    if verdict_info.has_h2_verdict_section and len(verdict_info.section_verdicts) > 1:
+        parse_errors.append("multiple")
+    elif normalized_verdict is None:
         parse_errors.append("missing_verdict")
 
     unparseable = bool(parse_errors)
