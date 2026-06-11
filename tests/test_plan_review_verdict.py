@@ -1,6 +1,7 @@
 """Tests for plan-review verdict and slice-manifest parsing."""
 
 import copy
+import json
 
 import pytest
 
@@ -77,16 +78,77 @@ def _report_for_manifest(manifest: dict) -> str:
     )
 
 
+def _report_with_authoritative_verdict_and_manifest_example(
+    *,
+    quoted_verdict: str,
+    final_verdict: str,
+) -> str:
+    manifest = _base_manifest()
+    manifest["verdict"] = final_verdict
+    return (
+        "## Guidance\n"
+        f"Use `Verdict: {quoted_verdict}` only as an example.\n\n"
+        "## Verdict\n\n"
+        f"{final_verdict}\n\n"
+        "## Slice Manifest\n"
+        "```json\n"
+        f"{json.dumps(manifest, indent=2)}\n"
+        "```\n"
+    )
+
+
 class TestParsePlanReviewVerdict:
     def test_parses_inline_and_heading_verdicts(self) -> None:
         assert parse_plan_review_verdict("Verdict: APPROVED") == "APPROVED"
         assert parse_plan_review_verdict("## Verdict\n\nCHANGES_REQUESTED\n") == "CHANGES_REQUESTED"
+
+    @pytest.mark.parametrize(
+        ("quoted_verdict", "final_verdict"),
+        [
+            ("CHANGES_REQUESTED", "APPROVED"),
+            ("APPROVED", "CHANGES_REQUESTED"),
+        ],
+    )
+    def test_prefers_authoritative_final_verdict_section_over_earlier_example_token(
+        self,
+        quoted_verdict: str,
+        final_verdict: str,
+    ) -> None:
+        content = (
+            "## Notes\n"
+            f'Example output may include "Verdict: {quoted_verdict}" in prose.\n\n'
+            "## Verdict\n\n"
+            f"{final_verdict}\n"
+        )
+
+        assert parse_plan_review_verdict(content) == final_verdict
 
     def test_parse_report_extracts_single_json_manifest(self) -> None:
         report = parse_plan_review_report(_report_for_manifest(_base_manifest()))
         assert report.verdict == "APPROVED"
         assert report.raw_manifest is not None
         assert report.raw_manifest["source_task_id"] == "gza-123"
+
+    @pytest.mark.parametrize(
+        ("quoted_verdict", "final_verdict"),
+        [
+            ("CHANGES_REQUESTED", "APPROVED"),
+            ("APPROVED", "CHANGES_REQUESTED"),
+        ],
+    )
+    def test_parse_report_uses_authoritative_final_verdict_section(
+        self,
+        quoted_verdict: str,
+        final_verdict: str,
+    ) -> None:
+        report = parse_plan_review_report(
+            _report_with_authoritative_verdict_and_manifest_example(
+                quoted_verdict=quoted_verdict,
+                final_verdict=final_verdict,
+            )
+        )
+
+        assert report.verdict == final_verdict
 
 
 class TestValidatePlanReviewReport:
