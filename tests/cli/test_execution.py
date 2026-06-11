@@ -16121,7 +16121,24 @@ class TestRunForeground:
         assert worker.task_id == task.id
         assert worker.exit_code == 0
 
-    def test_run_foreground_worker_mode_without_existing_metadata_completes_even_with_outer_owner_marker(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        "ambient_worker_env",
+        [
+            {},
+            {
+                "GZA_WORKER_ID": "ambient-outer-worker",
+                "GZA_WORKER_MODE": "1",
+                "GZA_REUSE_WORKER_OWNER": "outer",
+                "GZA_REUSE_WORKER_SESSION": "1",
+            },
+        ],
+        ids=["plain-shell", "ambient-worker-session"],
+    )
+    def test_run_foreground_worker_mode_without_existing_metadata_completes_even_with_outer_owner_marker(
+        self,
+        tmp_path: Path,
+        ambient_worker_env: dict[str, str],
+    ):
         """Ambient worker-mode fallback must complete the worker unless a real outer registration exists."""
         setup_config(tmp_path)
         config = Config.load(tmp_path)
@@ -16130,6 +16147,8 @@ class TestRunForeground:
         assert task.id is not None
 
         with (
+            patch.dict(os.environ, ambient_worker_env, clear=False),
+            _clear_foreground_worker_env(),
             patch.dict(
                 os.environ,
                 {
