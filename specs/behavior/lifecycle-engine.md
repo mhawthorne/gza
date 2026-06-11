@@ -74,6 +74,10 @@ operator changing a value is configuration, not a spec violation.
   with no implementation follow-up MUST enter automated `plan_review` first when
   `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
   then materialize bounded implementation slices only after an approved valid manifest.
+  If implement descendants exist for an approved manifest but the durable materialization
+  record is missing or incomplete, the engine MUST park with
+  `plan-review-materialization-repair-needed`; it MUST NOT silently treat a partial
+  prefix as a complete materialization.
   The legacy single-implement path is allowed only when
   `require_plan_review_before_implement` is off.
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
@@ -299,6 +303,7 @@ is a spec change. The accompanying human message is free text.
 | Reason code | State | Trigger (rule §) |
 |-------------|-------|------------------|
 | `awaiting-human-review` | awaiting_human | §1 completed held plan, no implement follow-up |
+| `plan-review-materialization-repair-needed` | needs_discussion | §1 approved manifest has implement descendants without a durable complete materialization record |
 | `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |
 | `project-scope-violation` | ScopeParked | §3 diff touches paths outside scope, not tagged `cross-project` |
 | `project-scope-unverified` | needs_discussion | §3 diff could not be inspected (fail closed) |

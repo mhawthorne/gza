@@ -66,6 +66,7 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 | Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up (`reason=awaiting-human-review`) |
 | Completed non-held plan with no plan review and `require_plan_review_before_implement=true` | `create_plan_review` — create and run plan-review task |
 | Completed non-held plan with approved valid plan review manifest | `materialize_plan_slices` — create sliced implement tasks |
+| Completed non-held plan with approved plan review slices partially present but no durable materialization record | `needs_discussion` — repair or drop the partial slice set before retrying (`reason=plan-review-materialization-repair-needed`) |
 | Completed non-held plan with `require_plan_review_before_implement=false` | `create_implement` — legacy compatibility path |
 | Plan with existing implement child | `skip` |
 

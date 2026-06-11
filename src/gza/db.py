@@ -4919,7 +4919,9 @@ class SqliteTaskStore:
     ) -> list[Task]:
         """Create many tasks and an artifact row in one transaction."""
         task_params = list(tasks)
-        with self._connect() as conn:
+        conn = cast(sqlite3.Connection, self._connect())
+        allocated_ids: list[str] = []
+        try:
             conn.execute("BEGIN")
             allocated_ids = [self._next_id(conn) for _ in task_params]
             resolved_task_params: list[NewTaskParams] = []
@@ -4978,7 +4980,16 @@ class SqliteTaskStore:
                 head_sha=artifact_head_sha,
                 metadata=resolved_artifact_metadata,
             )
+            conn.commit()
             return created_tasks
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def list_artifacts(self, task_id: str, kind: str | None = None) -> list[TaskArtifact]:
         """Return artifacts for one task, newest first."""

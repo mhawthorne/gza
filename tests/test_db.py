@@ -17,6 +17,7 @@ from gza.db import (
     SCHEMA_VERSION,
     ManualMigrationRequired,
     MergeTargetResolutionError,
+    NewTaskParams,
     SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
@@ -97,6 +98,33 @@ def test_set_task_changed_diff_persists_and_rebase_wrapper_still_works(tmp_path:
     refreshed_rebase = store.get(rebase.id)
     assert refreshed_rebase is not None
     assert refreshed_rebase.changed_diff is True
+
+
+def test_add_tasks_with_artifact_atomic_rollback_does_not_delete_reused_ids(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path)
+
+    seed = store.add("Seed task")
+    assert seed.id == "gza-1"
+
+    with patch.object(store, "_add_artifact_conn", side_effect=RuntimeError("artifact write failed")):
+        with pytest.raises(RuntimeError, match="artifact write failed"):
+            store.add_tasks_with_artifact_atomic(
+                tasks=[NewTaskParams(prompt="Batch task", task_type="implement")],
+                artifact_task_id=seed.id,
+                artifact_kind="plan_review_materialization",
+                artifact_label="plan_review_materialization",
+                artifact_path=".gza/artifacts/gza-1/plan-review-materialization.txt",
+                artifact_byte_size=0,
+                artifact_sha256=hashlib.sha256(b"").hexdigest(),
+            )
+
+    replacement = store.add("Replacement task")
+    assert replacement.id == "gza-2"
+
+    refreshed = store.get(replacement.id)
+    assert refreshed is not None
+    assert refreshed.prompt == "Replacement task"
 
 
 class TestTaskChaining:

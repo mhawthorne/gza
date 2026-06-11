@@ -18,6 +18,7 @@ from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL
+from gza.plan_review_materialization import load_materialized_plan_slice_set
 from gza.plan_review_verdict import (
     PlanReviewManifest,
     get_plan_review_outcome,
@@ -151,6 +152,14 @@ class ReviewVerifyAvailability:
 
 
 @dataclass(frozen=True)
+class PlanMaterializationState:
+    """Whether the current approved plan-review manifest is already materialized."""
+
+    materialized: bool
+    task_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -222,15 +231,20 @@ class AdvanceContext:
     closing_review_action: dict[str, Any] | None = None
     latest_plan_source: DbTask | None = None
     superseded_plan_source: DbTask | None = None
+    current_plan_review: DbTask | None = None
     active_plan_review_pending: DbTask | None = None
     active_plan_review_running: DbTask | None = None
     latest_completed_plan_review: DbTask | None = None
     plan_review_verdict: str | None = None
+    parsed_plan_review_manifest: PlanReviewManifest | None = None
     validated_plan_review_manifest: PlanReviewManifest | None = None
     plan_review_validation_error: str | None = None
+    current_plan_improve: DbTask | None = None
     active_plan_improve_pending: DbTask | None = None
     active_plan_improve_running: DbTask | None = None
+    plan_review_cycle_count: int = 0
     completed_plan_review_cycles: int = 0
+    plan_materialization_state: PlanMaterializationState | None = None
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
     failed_recovery_attention_reason: str | None = None
@@ -1539,6 +1553,12 @@ def _resolve_plan_review_state(
         default=None,
         key=_task_event_time,
     )
+    current_plan_review = (
+        active_plan_review_pending
+        or active_plan_review_running
+        or latest_completed_plan_review
+    )
+    current_plan_improve = active_plan_improve_pending or active_plan_improve_running
 
     plan_review_verdict: str | None = None
     validated_manifest: PlanReviewManifest | None = None
@@ -1561,19 +1581,31 @@ def _resolve_plan_review_state(
         store=store,
         latest_plan_source=latest_plan_source,
     )
+    plan_materialization_state = _resolve_plan_materialization_state(
+        config=config,
+        store=store,
+        latest_plan_source=latest_plan_source,
+        latest_completed_plan_review=latest_completed_plan_review,
+        manifest=validated_manifest,
+    )
 
     return {
         "latest_plan_source": latest_plan_source,
         "superseded_plan_source": latest_plan_source if latest_plan_source.id != task.id else None,
+        "current_plan_review": current_plan_review,
         "active_plan_review_pending": active_plan_review_pending,
         "active_plan_review_running": active_plan_review_running,
         "latest_completed_plan_review": latest_completed_plan_review,
         "plan_review_verdict": plan_review_verdict,
+        "parsed_plan_review_manifest": validated_manifest,
         "validated_plan_review_manifest": validated_manifest,
         "plan_review_validation_error": validation_error,
+        "current_plan_improve": current_plan_improve,
         "active_plan_improve_pending": active_plan_improve_pending,
         "active_plan_improve_running": active_plan_improve_running,
+        "plan_review_cycle_count": completed_plan_review_cycles,
         "completed_plan_review_cycles": completed_plan_review_cycles,
+        "plan_materialization_state": plan_materialization_state,
     }
 
 
@@ -1636,6 +1668,30 @@ def _plan_review_timeout_budget_minutes(config: Any) -> int:
     if value is None:
         value = getattr(config, "code_task_diff_timeout_cap_minutes", 30)
     return int(value or 30)
+
+
+def _resolve_plan_materialization_state(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    latest_plan_source: DbTask,
+    latest_completed_plan_review: DbTask | None,
+    manifest: PlanReviewManifest | None,
+) -> PlanMaterializationState:
+    if latest_completed_plan_review is None or manifest is None:
+        return PlanMaterializationState(materialized=False)
+    materialized_tasks = load_materialized_plan_slice_set(
+        store,
+        review_task=latest_completed_plan_review,
+        plan_source_task=latest_plan_source,
+        manifest=manifest,
+    )
+    if materialized_tasks is None:
+        return PlanMaterializationState(materialized=False)
+    return PlanMaterializationState(
+        materialized=True,
+        task_ids=tuple(task.id for task in materialized_tasks if task.id is not None),
+    )
 
 
 def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
@@ -2672,8 +2728,62 @@ ADVANCE_RULES: list[AdvanceRule] = [
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
             and ctx.has_non_dropped_implement_descendant
+            and (
+                not ctx.auto_implement_enabled
+                or not ctx.require_plan_review_before_implement
+                or ctx.latest_completed_plan_review is None
+                or (
+                    ctx.plan_materialization_state is not None
+                    and ctx.plan_materialization_state.materialized
+                )
+            )
         ),
-        action=lambda ctx: {"type": "skip", "description": "SKIP: implement task already exists for this plan"},
+        action=lambda ctx: {
+            "type": "skip",
+            "description": (
+                "SKIP: approved plan-review slices are already materialized"
+                if ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized
+                else "SKIP: implement task already exists for this plan"
+            ),
+        },
+    ),
+    AdvanceRule(
+        name="plan_partial_materialization_requires_repair",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.plan_review_verdict == "APPROVED"
+            and ctx.validated_plan_review_manifest is not None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
+        ),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: plan-review implement descendants exist without a recorded complete "
+                    "materialization; repair or drop the partial slice set before retrying."
+                ),
+            },
+            reason="plan-review-materialization-repair-needed",
+            subject_task_id=ctx.task.id,
+        ),
+    ),
+    AdvanceRule(
+        name="plan_needs_implement",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and not ctx.require_plan_review_before_implement
+        ),
+        action=lambda ctx: {"type": "create_implement", "description": "Create and start implement task"},
     ),
     AdvanceRule(
         name="plan_run_review",
@@ -2682,6 +2792,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.task.status == "completed"
             and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.active_plan_review_pending is not None
         ),
         action=lambda ctx: {
@@ -2697,6 +2808,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.task.status == "completed"
             and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.active_plan_review_running is not None
         ),
         action=lambda ctx: {
@@ -2710,12 +2822,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "APPROVED"
             and ctx.validated_plan_review_manifest is None
             and ctx.plan_review_validation_error is not None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: with_needs_attention(
             {
@@ -2739,6 +2854,10 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "APPROVED"
             and ctx.validated_plan_review_manifest is not None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: {
             "type": "materialize_plan_slices",
@@ -2753,10 +2872,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
             and ctx.active_plan_improve_pending is not None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: {
             "type": "run_plan_improve",
@@ -2769,10 +2892,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
             and ctx.active_plan_improve_running is not None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: {
             "type": "wait_plan_improve",
@@ -2785,10 +2912,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
             and ctx.completed_plan_review_cycles >= ctx.max_plan_review_cycles
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: with_needs_attention(
             {
@@ -2804,9 +2935,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "CHANGES_REQUESTED"
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: {
             "type": "create_plan_improve",
@@ -2820,10 +2955,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
             and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
             and ctx.latest_completed_plan_review is not None
             and ctx.plan_review_verdict in {None, "NEEDS_DISCUSSION"}
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
         ),
         action=lambda ctx: with_needs_attention(
             {
@@ -2878,17 +3017,6 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.advance_create_plan_reviews
         ),
         action=lambda ctx: {"type": "create_plan_review", "description": "Create and start plan review task"},
-    ),
-    AdvanceRule(
-        name="plan_needs_implement",
-        matches=lambda ctx: (
-            ctx.task_type in {"plan", "plan_improve"}
-            and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
-            and ctx.auto_implement_enabled
-            and not ctx.require_plan_review_before_implement
-        ),
-        action=lambda ctx: {"type": "create_implement", "description": "Create and start implement task"},
     ),
     AdvanceRule(
         name="explore_needs_followup_decision",
