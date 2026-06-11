@@ -9,7 +9,14 @@ from gza.db import SqliteTaskStore
 from gza.git import Git, GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.sync_ops import (
+    BranchSyncResult,
     BranchCohort,
+    _BranchPersistenceUpdate,
+    _UNSET,
+    _git_reconcile_update,
+    _merge_persistence_update,
+    _persist_branch_state,
+    _persist_branch_updates,
     build_branch_cohorts_for_task_ids,
     build_branch_cohorts_for_tasks,
     build_default_branch_cohorts,
@@ -1755,6 +1762,116 @@ def test_reconcile_task_branch_merge_truth_persists_preserved_empty_when_ref_una
     assert refreshed_unit is not None
     assert refreshed_unit.state == "empty"
     assert refreshed_unit.merged_at is None
+
+
+def test_git_reconcile_update_drops_merge_source_for_empty_result() -> None:
+    update = _git_reconcile_update(
+        BranchSyncResult(
+            branch="feature/empty-source",
+            task_ids=("task-1",),
+            merge_status="empty",
+            merge_source="github_pr",
+        )
+    )
+
+    assert update.merge_status == "empty"
+    assert update.merge_source is _UNSET
+
+
+def test_merge_persistence_update_drops_merge_source_when_resolved_state_is_not_merged() -> None:
+    update = _merge_persistence_update(
+        _BranchPersistenceUpdate(merge_status="empty"),
+        _BranchPersistenceUpdate(merge_source="github_pr"),
+        baseline_state="empty",
+    )
+
+    assert update.merge_status == "empty"
+    assert update.merge_source is _UNSET
+
+
+def test_persist_branch_updates_drops_merge_source_for_empty_unit_and_advances_sync_cooldown(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/persist-empty-source")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "empty")
+
+    sync_completed_at = datetime.now(UTC)
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id=unit.id,
+        merge_unit_state="empty",
+    )
+    result = BranchSyncResult(
+        branch=task.branch,
+        task_ids=(task.id,),
+        merge_status="empty",
+    )
+
+    _persist_branch_updates(
+        store,
+        [cohort],
+        [result],
+        [_BranchPersistenceUpdate(merge_source="github_pr")],
+        "main",
+        sync_completed_at=sync_completed_at,
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    refreshed_task = store.get(task.id)
+    assert refreshed_unit is not None
+    assert refreshed_task is not None
+    assert refreshed_unit.state == "empty"
+    assert refreshed_unit.merge_source is None
+    assert refreshed_unit.merged_at is None
+    assert refreshed_unit.sync_last_synced_at == sync_completed_at
+    assert refreshed_task.sync_last_synced_at == sync_completed_at
+    assert result.errors == []
+    assert build_default_branch_cohorts(store, recent_days=30, cooldown_seconds=300) == []
+
+
+def test_sync_branch_cohorts_persist_failure_marks_only_that_cohort_as_error(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    failing = _completed_branch_task(store, "Failing persist", "feature/persist-fails")
+    succeeding = _completed_branch_task(store, "Successful persist", "feature/persist-ok")
+
+    git = Mock()
+    git.default_branch.return_value = "main"
+
+    real_persist_branch_state = _persist_branch_state
+
+    def _failing_first_persist(*args, **kwargs):
+        tasks = args[1]
+        if tasks[0].branch == "feature/persist-fails":
+            raise RuntimeError("boom")
+        return real_persist_branch_state(*args, **kwargs)
+
+    with patch("gza.sync_ops._persist_branch_state", side_effect=_failing_first_persist):
+        results, partial = sync_branch_cohorts(
+            store,
+            git,
+            [
+                BranchCohort(branch=failing.branch, tasks=(failing,)),
+                BranchCohort(branch=succeeding.branch, tasks=(succeeding,)),
+            ],
+            include_git=False,
+            include_pr=False,
+            dry_run=False,
+            fetch_remote=False,
+        )
+
+    assert partial is True
+    assert len(results) == 2
+    assert results[0].errors == ["failed to persist sync state for branch 'feature/persist-fails': boom"]
+    assert results[1].errors == []
+    refreshed_failing = store.get(failing.id)
+    refreshed_succeeding = store.get(succeeding.id)
+    assert refreshed_failing is not None
+    assert refreshed_succeeding is not None
+    assert refreshed_failing.sync_last_synced_at is None
+    assert refreshed_succeeding.sync_last_synced_at is not None
 
 
 def test_reconcile_branch_merge_truth_warns_and_fails_closed_when_commit_count_unavailable(tmp_path):

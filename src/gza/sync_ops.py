@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -475,6 +476,46 @@ class _BranchPersistenceUpdate:
     base_sha: str | None | object = _UNSET
 
 
+def _cohort_baseline_merge_state(cohort: BranchCohort) -> str | None:
+    """Return the persisted merge state that update overlays resolve against."""
+    if cohort.merge_unit_state is not None:
+        return cohort.merge_unit_state
+    owner_tasks = cohort.merge_status_owner_tasks
+    if owner_tasks:
+        return owner_tasks[0].merge_status
+    code_tasks = cohort.code_tasks
+    if code_tasks:
+        return code_tasks[0].merge_status
+    return None
+
+
+def _resolved_persisted_merge_state(
+    merge_status: str | None | object,
+    *,
+    baseline_state: str | None,
+) -> str | None:
+    """Resolve an optional merge-status override to the state that will be persisted."""
+    if merge_status is _UNSET:
+        return baseline_state
+    return cast("str | None", merge_status) or "stale"
+
+
+def _drop_non_merged_provenance(
+    update: _BranchPersistenceUpdate,
+    *,
+    baseline_state: str | None,
+) -> _BranchPersistenceUpdate:
+    """Keep update objects internally consistent with merged-only provenance."""
+    if _resolved_persisted_merge_state(update.merge_status, baseline_state=baseline_state) != "merged":
+        update.merge_source = _UNSET
+    return update
+
+
+def _is_readonly_persist_error(exc: Exception) -> bool:
+    """Return whether a persist failure should still hard-fail the caller."""
+    return isinstance(exc, sqlite3.OperationalError) and "readonly" in str(exc).lower()
+
+
 def _provenance_persistence_update(
     *,
     head_sha: str | None,
@@ -497,7 +538,7 @@ def _git_reconcile_update(result: BranchSyncResult) -> _BranchPersistenceUpdate:
     )
     if result.merge_status is not None:
         update.merge_status = result.merge_status
-    if result.merge_source is not None:
+    if result.merge_status == "merged" and result.merge_source is not None:
         update.merge_source = result.merge_source
     if "refreshed diff stats" in result.actions:
         update.diff_stats = (
@@ -511,6 +552,8 @@ def _git_reconcile_update(result: BranchSyncResult) -> _BranchPersistenceUpdate:
 def _merge_persistence_update(
     base: _BranchPersistenceUpdate,
     overlay: _BranchPersistenceUpdate,
+    *,
+    baseline_state: str | None,
 ) -> _BranchPersistenceUpdate:
     """Overlay non-UNSET branch-state persistence fields."""
     if overlay.merge_status is not _UNSET:
@@ -529,7 +572,7 @@ def _merge_persistence_update(
         base.head_sha = overlay.head_sha
     if overlay.base_sha is not _UNSET:
         base.base_sha = overlay.base_sha
-    return base
+    return _drop_non_merged_provenance(base, baseline_state=baseline_state)
 
 
 def _enrich_branch_pr_state(
@@ -550,8 +593,7 @@ def _enrich_branch_pr_state(
 
     branch = cohort.branch
     representative = cohort.representative_task
-    owner_tasks = cohort.merge_status_owner_tasks
-    baseline_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
+    baseline_merge_status = _cohort_baseline_merge_state(cohort)
     desired_merge_status = result.merge_status if result.merge_status is not None else baseline_merge_status
     branch_exists = git.branch_exists(branch)
     remote_merged = (
@@ -625,20 +667,29 @@ def _enrich_branch_pr_state(
 
     result.reconciled = True
     result.merge_status = desired_merge_status
-    return _BranchPersistenceUpdate(
-        merge_status=(
-            desired_merge_status
-            if desired_merge_status != baseline_merge_status or cohort.has_non_owner_merge_status_rows
-            else _UNSET
+    if desired_merge_status != "merged":
+        result.merge_source = None
+    return _drop_non_merged_provenance(
+        _BranchPersistenceUpdate(
+            merge_status=(
+                desired_merge_status
+                if desired_merge_status != baseline_merge_status or cohort.has_non_owner_merge_status_rows
+                else _UNSET
+            ),
+            merge_source=(
+                result.merge_source
+                if desired_merge_status == "merged" and result.merge_source is not None
+                else _UNSET
+            ),
+            pr_number=(
+                resolved_pr.details.number
+                if resolved_pr.details is not None
+                else None if resolved_pr.clear_cached_number else _UNSET
+            ),
+            pr_state=result.pr_state,
+            pr_last_synced_at=pr_lookup_time,
         ),
-        merge_source=result.merge_source if result.merge_source is not None else _UNSET,
-        pr_number=(
-            resolved_pr.details.number
-            if resolved_pr.details is not None
-            else None if resolved_pr.clear_cached_number else _UNSET
-        ),
-        pr_state=result.pr_state,
-        pr_last_synced_at=pr_lookup_time,
+        baseline_state=baseline_merge_status,
     )
 
 
@@ -659,23 +710,31 @@ def _persist_branch_updates(
             continue
         if not cohort.code_tasks:
             continue
-        _persist_branch_state(
-            store,
-            cohort.code_tasks,
-            target_branch,
-            merge_unit_id=cohort.merge_unit_id,
-            merge_status=update.merge_status,
-            merge_source=update.merge_source,
-            diff_stats=update.diff_stats,
-            pr_number=update.pr_number,
-            pr_state=update.pr_state,
-            pr_last_synced_at=update.pr_last_synced_at,
-            head_sha=update.head_sha,
-            base_sha=update.base_sha,
-            sync_last_synced_at=(
-                sync_completed_at if sync_completed_at is not None else _UNSET
-            ),
-        )
+        try:
+            _persist_branch_state(
+                store,
+                cohort.code_tasks,
+                target_branch,
+                merge_unit_id=cohort.merge_unit_id,
+                merge_status=update.merge_status,
+                merge_source=update.merge_source,
+                diff_stats=update.diff_stats,
+                pr_number=update.pr_number,
+                pr_state=update.pr_state,
+                pr_last_synced_at=update.pr_last_synced_at,
+                head_sha=update.head_sha,
+                base_sha=update.base_sha,
+                sync_last_synced_at=(
+                    sync_completed_at if sync_completed_at is not None else _UNSET
+                ),
+            )
+        except Exception as exc:
+            if _is_readonly_persist_error(exc):
+                raise
+            merge_unit_detail = f" (merge unit {cohort.merge_unit_id})" if cohort.merge_unit_id is not None else ""
+            result.errors.append(
+                f"failed to persist sync state for branch '{cohort.branch}'{merge_unit_detail}: {exc}"
+            )
 
 
 def _resolve_persist_merge_unit(
@@ -904,7 +963,11 @@ def sync_branch_cohorts(
                 dry_run=dry_run,
                 fetched_this_run=fetched_this_run,
             )
-            updates[idx] = _merge_persistence_update(updates[idx], pr_update)
+            updates[idx] = _merge_persistence_update(
+                updates[idx],
+                pr_update,
+                baseline_state=_cohort_baseline_merge_state(cohort),
+            )
 
     if not dry_run:
         _persist_branch_updates(
@@ -982,10 +1045,19 @@ def _persist_branch_state(
                 if diff_stats is not _UNSET
                 else None
             )
+            resolved_state = _resolved_persisted_merge_state(merge_status, baseline_state=unit.state) or "stale"
+            resolved_merge_source: str | None | object = merge_source
+            if resolved_state != "merged":
+                resolved_merge_source = DB_UNSET
             store.set_merge_unit_state(
                 unit.id,
-                unit.state if merge_status is _UNSET else cast("str | None", merge_status) or "stale",
-                merge_source=cast(Any, cast("str | None", merge_source) if merge_source is not _UNSET else DB_UNSET),
+                resolved_state,
+                merged_by_task_id=DB_UNSET,
+                merge_source=cast(
+                    Any,
+                    cast("str | None", resolved_merge_source) if resolved_merge_source is not _UNSET else DB_UNSET,
+                ),
+                merged_at=DB_UNSET,
                 pr_number=cast(Any, cast("int | None", pr_number) if pr_number is not _UNSET else DB_UNSET),
                 pr_state=cast(Any, cast("str | None", pr_state) if pr_state is not _UNSET else DB_UNSET),
                 pr_last_synced_at=cast(
