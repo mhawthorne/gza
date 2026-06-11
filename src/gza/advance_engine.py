@@ -1974,6 +1974,253 @@ def _get_same_branch_rebase_descendants_for_root(store: SqliteTaskStore, root_ta
     ]
 
 
+def _build_base_advance_context(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+    has_branch: bool,
+    verify_command_available: bool,
+    effective_max_noop_improves: int,
+    effective_max_resume: int,
+    auto_implement_enabled: bool,
+    failed_recovery_decision: FailedRecoveryDecision | None,
+    failed_recovery_attention_reason: str | None,
+    has_implementation_followup: bool,
+    active_plan_child: DbTask | None,
+    active_implement_child: DbTask | None,
+    has_non_dropped_plan_or_implement_descendant: bool,
+    is_resumable_failed: bool,
+    has_resume_children: bool,
+    resume_chain_depth: int,
+) -> AdvanceContext:
+    """Build the DB-known portion of advance context shared by cheap and full paths."""
+    return AdvanceContext(
+        store=store,
+        task=task,
+        task_type=task.task_type,
+        has_branch=has_branch,
+        requires_review=config.require_review_before_merge,
+        create_reviews=config.advance_create_reviews,
+        verify_command_available=verify_command_available,
+        max_review_cycles=config.max_review_cycles,
+        max_noop_improve_cycles=effective_max_noop_improves,
+        max_resume_attempts=effective_max_resume,
+        auto_implement_enabled=auto_implement_enabled,
+        failed_recovery_decision=failed_recovery_decision,
+        failed_recovery_attention_reason=failed_recovery_attention_reason,
+        has_non_dropped_implement_descendant=has_implementation_followup,
+        active_plan_child=active_plan_child,
+        active_implement_child=active_implement_child,
+        has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
+        is_resumable_failed_task=is_resumable_failed,
+        has_resume_children=has_resume_children,
+        resume_chain_depth=resume_chain_depth,
+        failure_reason=task.failure_reason,
+    )
+
+
+def _resolve_db_known_wait_action(ctx: AdvanceContext) -> dict[str, Any] | None:
+    """Return the DB-proven closing-review wait action when git facts cannot change it."""
+    if not _closing_review_requires_automation(ctx):
+        return None
+    closing_review_action = ctx.closing_review_action
+    if closing_review_action is None or closing_review_action.get("type") != "wait_review":
+        return None
+    review_task = closing_review_action.get("review_task")
+    if not isinstance(review_task, DbTask) or review_task.status != "in_progress":
+        return None
+    return _closing_review_invariant_action(ctx)
+
+
+def _resolve_pre_closing_review_git_context(
+    ctx: AdvanceContext,
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    target_branch: str,
+    *,
+    persist_post_merge_rebase_state: bool,
+) -> AdvanceContext:
+    """Resolve git-backed facts needed before the closing-review invariant can win."""
+    task = ctx.task
+    review_root_task = ctx.review_root_task
+    if review_root_task is None:
+        raise AssertionError("git phase requires review_root_task")
+
+    merge_source = _resolve_current_merge_source(git, task.branch or "")
+    if persist_post_merge_rebase_state:
+        post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
+            store,
+            git,
+            task,
+            target_branch,
+            merge_source=merge_source,
+        )
+    else:
+        post_merge_rebase_state = resolve_post_merge_rebase_state(
+            store,
+            git,
+            task,
+            target_branch,
+            merge_source=merge_source,
+        )
+    merge_state = (
+        post_merge_rebase_state.resolved_merge_state
+        if persist_post_merge_rebase_state
+        else resolve_task_merge_state_for_target(
+            store=store,
+            task=task,
+            git=git,
+            target_branch=target_branch,
+        )
+    )
+    strict_scope_inspection = _resolve_strict_scope_inspection(
+        config,
+        git,
+        task,
+        merge_source_ref=merge_source.ref,
+        target_branch=target_branch,
+    )
+    can_merge = (
+        post_merge_rebase_state.already_merged
+        or merge_state_is_terminal_for_lifecycle(merge_state)
+        or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
+    )
+    rebase_root_task = review_root_task if review_root_task.task_type == "implement" else task
+    assert rebase_root_task.id is not None
+    rebase_children = _get_same_branch_rebase_descendants_for_root(store, rebase_root_task)
+    rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
+    failed_rebases = [c for c in rebase_children if c.status == "failed"]
+    rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
+
+    latest_completed_rebase: DbTask | None = None
+    completed_rebases = [
+        c
+        for c in rebase_children
+        if c.status == "completed" and c.completed_at is not None
+    ]
+    if completed_rebases:
+        latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
+
+    rebase_invalidates_review = False
+    review_preserved_by_rebase: DbTask | None = None
+    review_invalidated_by_rebase: DbTask | None = None
+    if (
+        latest_completed_rebase is not None
+        and ctx.latest_completed_review is not None
+        and latest_completed_rebase.completed_at is not None
+        and ctx.latest_completed_review.completed_at is not None
+        and latest_completed_rebase.completed_at > ctx.latest_completed_review.completed_at
+    ):
+        if latest_completed_rebase.changed_diff is False:
+            review_preserved_by_rebase = latest_completed_rebase
+        else:
+            rebase_invalidates_review = True
+            review_invalidated_by_rebase = latest_completed_rebase
+
+    rebase_failure_streak = _count_rebase_failure_streak(
+        task=task,
+        rebase_children=rebase_children,
+        latest_completed_rebase=latest_completed_rebase,
+        latest_completed_review=ctx.latest_completed_review,
+        latest_completed_code_change=ctx.latest_completed_code_change,
+        review_cleared_at=task.review_cleared_at,
+    )
+
+    return replace(
+        ctx,
+        merge_source_ref=merge_source.ref,
+        merge_source_warning=merge_source.warning,
+        post_merge_rebase_state=post_merge_rebase_state,
+        merge_state=merge_state,
+        can_merge=can_merge,
+        strict_scope_violation_paths=strict_scope_inspection.violation_paths,
+        strict_scope_inspection_error=strict_scope_inspection.inspection_error,
+        rebase_pending_or_running=rebase_pending_or_running,
+        rebase_failed=rebase_failed,
+        latest_completed_rebase=latest_completed_rebase,
+        rebase_failure_streak=rebase_failure_streak,
+        rebase_invalidates_review=rebase_invalidates_review,
+        review_preserved_by_rebase=review_preserved_by_rebase,
+        review_invalidated_by_rebase=review_invalidated_by_rebase,
+    )
+
+
+def _resolve_post_closing_review_git_context(
+    ctx: AdvanceContext,
+    config: Any,
+    git: Any,
+    target_branch: str,
+) -> AdvanceContext:
+    """Resolve late git-backed review-loop facts once pre-closing safety gates are clear."""
+    review_root_task = ctx.review_root_task
+    if review_root_task is None:
+        raise AssertionError("git phase requires review_root_task")
+
+    branch_tip_resolution = (
+        BranchTipResolution(None)
+        if ctx.post_merge_rebase_state is not None
+        and (
+            ctx.post_merge_rebase_state.already_merged
+            or merge_state_is_terminal_for_lifecycle(ctx.merge_state)
+        )
+        else _resolve_branch_tip(git, ctx.task.branch)
+    )
+    verify_availability = _review_verify_available_for_task(
+        config,
+        git,
+        review_root_task,
+        target_branch=target_branch,
+    )
+    duplicate_blocker_streak = None
+    if (
+        ctx.task.task_type == "implement"
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and not ctx.review_cleared
+        and ctx.active_review is None
+    ):
+        rebase_children = _get_same_branch_rebase_descendants_for_root(
+            ctx.store,
+            review_root_task if review_root_task.task_type == "implement" else ctx.task,
+        )
+        duplicate_blocker_streak = _count_duplicate_primary_blocker_streak(
+            config,
+            ctx.reviews or [],
+            [
+                rebase
+                for rebase in rebase_children
+                if rebase.status == "completed" and rebase.completed_at is not None
+            ],
+        )
+
+    latest_review_verify_provenance_state = _review_verify_provenance_state(
+        ctx.latest_completed_review,
+        branch_tip_resolution.sha,
+    )
+
+    return replace(
+        ctx,
+        verify_command_available=verify_availability.available,
+        current_branch_head_sha=branch_tip_resolution.sha,
+        current_branch_head_resolution_failure=branch_tip_resolution.failure,
+        verify_command_unavailable_failure=verify_availability.failure,
+        verify_command_unavailable_revision_range=verify_availability.revision_range,
+        latest_review_verify_provenance_state=latest_review_verify_provenance_state,
+        duplicate_blocker_streak=duplicate_blocker_streak,
+    )
+
+
+def _matches_rule_before_closing_review_invariant(ctx: AdvanceContext) -> bool:
+    """Return whether any higher-priority advance rule already matches this context."""
+    for rule in ADVANCE_RULES:
+        if rule.name == "closing_review_invariant":
+            return False
+        if rule.matches(ctx):
+            return True
+    raise AssertionError("closing_review_invariant rule missing from ADVANCE_RULES")
+
+
 def resolve_advance_context(
     config: Any,
     store: SqliteTaskStore,
@@ -2042,124 +2289,48 @@ def resolve_advance_context(
     auto_implement_enabled = task.auto_implement is not False
 
     if task.task_type == "plan":
-        return AdvanceContext(
+        return _build_base_advance_context(
+            config=config,
             store=store,
             task=task,
-            task_type=task.task_type,
             has_branch=bool(task.branch),
-            requires_review=config.require_review_before_merge,
-            create_reviews=config.advance_create_reviews,
             verify_command_available=verify_command_available,
-            max_review_cycles=config.max_review_cycles,
-            max_noop_improve_cycles=effective_max_noop_improves,
-            max_resume_attempts=effective_max_resume,
+            effective_max_noop_improves=effective_max_noop_improves,
+            effective_max_resume=effective_max_resume,
             auto_implement_enabled=auto_implement_enabled,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
-            has_non_dropped_implement_descendant=has_implementation_followup,
+            has_implementation_followup=has_implementation_followup,
             active_plan_child=active_plan_child,
             active_implement_child=active_implement_child,
             has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
-            is_resumable_failed_task=is_resumable_failed,
+            is_resumable_failed=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
-            failure_reason=task.failure_reason,
         )
 
     if not task.branch:
-        return AdvanceContext(
+        return _build_base_advance_context(
+            config=config,
             store=store,
             task=task,
-            task_type=task.task_type,
             has_branch=False,
-            requires_review=config.require_review_before_merge,
-            create_reviews=config.advance_create_reviews,
             verify_command_available=verify_command_available,
-            max_review_cycles=config.max_review_cycles,
-            max_noop_improve_cycles=effective_max_noop_improves,
-            max_resume_attempts=effective_max_resume,
+            effective_max_noop_improves=effective_max_noop_improves,
+            effective_max_resume=effective_max_resume,
             auto_implement_enabled=auto_implement_enabled,
             failed_recovery_decision=failed_recovery_decision,
             failed_recovery_attention_reason=failed_recovery_attention_reason,
-            has_non_dropped_implement_descendant=has_implementation_followup,
+            has_implementation_followup=has_implementation_followup,
             active_plan_child=active_plan_child,
             active_implement_child=active_implement_child,
             has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
-            is_resumable_failed_task=is_resumable_failed,
+            is_resumable_failed=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
-            failure_reason=task.failure_reason,
         )
 
-    merge_source = _resolve_current_merge_source(git, task.branch)
     review_root_task = _resolve_review_root_task(store, task)
-    if persist_post_merge_rebase_state:
-        post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
-            store,
-            git,
-            task,
-            target_branch,
-            merge_source=merge_source,
-        )
-    else:
-        post_merge_rebase_state = resolve_post_merge_rebase_state(
-            store,
-            git,
-            task,
-            target_branch,
-            merge_source=merge_source,
-        )
-    merge_state = (
-        post_merge_rebase_state.resolved_merge_state
-        if persist_post_merge_rebase_state
-        else resolve_task_merge_state_for_target(
-            store=store,
-            task=task,
-            git=git,
-            target_branch=target_branch,
-        )
-    )
-    branch_tip_resolution = (
-        BranchTipResolution(None)
-        if post_merge_rebase_state.already_merged or merge_state_is_terminal_for_lifecycle(merge_state)
-        else _resolve_branch_tip(git, task.branch)
-    )
-    current_branch_head_sha = branch_tip_resolution.sha
-    strict_scope_inspection = _resolve_strict_scope_inspection(
-        config,
-        git,
-        task,
-        merge_source_ref=merge_source.ref,
-        target_branch=target_branch,
-    )
-    verify_availability = _review_verify_available_for_task(
-        config,
-        git,
-        review_root_task,
-        target_branch=target_branch,
-    )
-    verify_command_available = verify_availability.available
-    can_merge = (
-        post_merge_rebase_state.already_merged
-        or merge_state_is_terminal_for_lifecycle(merge_state)
-        or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
-    )
-    rebase_root_task = review_root_task if review_root_task.task_type == "implement" else task
-    assert rebase_root_task.id is not None
-    rebase_children = _get_same_branch_rebase_descendants_for_root(store, rebase_root_task)
-    rebase_pending_or_running = next((c for c in rebase_children if c.status in {"pending", "in_progress"}), None)
-    failed_rebases = [c for c in rebase_children if c.status == "failed"]
-    rebase_failed = max(failed_rebases, key=_task_event_time) if failed_rebases else None
-
-    latest_completed_rebase: DbTask | None = None
-    completed_rebases = [
-        c
-        for c in rebase_children
-        if c.status == "completed" and c.completed_at is not None
-    ]
-    if completed_rebases:
-        latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
-
     (
         reviews,
         active_review,
@@ -2181,92 +2352,34 @@ def resolve_advance_context(
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
         closing_review_action,
-) = _resolve_review_state(config, store, review_root_task)
+    ) = _resolve_review_state(config, store, review_root_task)
 
-    rebase_invalidates_review = False
-    review_preserved_by_rebase: DbTask | None = None
-    review_invalidated_by_rebase: DbTask | None = None
-    if (
-        latest_completed_rebase is not None
-        and latest_completed_review is not None
-        and latest_completed_rebase.completed_at is not None
-        and latest_completed_review.completed_at is not None
-        and latest_completed_rebase.completed_at > latest_completed_review.completed_at
-    ):
-        if latest_completed_rebase.changed_diff is False:
-            review_preserved_by_rebase = latest_completed_rebase
-        else:
-            rebase_invalidates_review = True
-            review_invalidated_by_rebase = latest_completed_rebase
-
-    duplicate_blocker_streak = None
-    if (
-        task.task_type == "implement"
-        and review_verdict == "CHANGES_REQUESTED"
-        and not review_cleared
-        and active_review is None
-    ):
-        duplicate_blocker_streak = _count_duplicate_primary_blocker_streak(
-            config,
-            reviews,
-            completed_rebases,
-        )
-
-    rebase_failure_streak = _count_rebase_failure_streak(
-        task=task,
-        rebase_children=rebase_children,
-        latest_completed_rebase=latest_completed_rebase,
-        latest_completed_review=latest_completed_review,
-        latest_completed_code_change=latest_completed_code_change,
-        review_cleared_at=task.review_cleared_at,
-    )
-    latest_review_verify_provenance_state = _review_verify_provenance_state(
-        latest_completed_review,
-        current_branch_head_sha,
-    )
-
-    return AdvanceContext(
+    ctx = _build_base_advance_context(
+        config=config,
         store=store,
         task=task,
-        task_type=task.task_type,
         has_branch=True,
-        requires_review=config.require_review_before_merge,
-        create_reviews=config.advance_create_reviews,
         verify_command_available=verify_command_available,
-        max_review_cycles=config.max_review_cycles,
-        max_noop_improve_cycles=effective_max_noop_improves,
-        max_resume_attempts=effective_max_resume,
+        effective_max_noop_improves=effective_max_noop_improves,
+        effective_max_resume=effective_max_resume,
         auto_implement_enabled=auto_implement_enabled,
-        has_non_dropped_implement_descendant=has_implementation_followup,
+        failed_recovery_decision=failed_recovery_decision,
+        failed_recovery_attention_reason=failed_recovery_attention_reason,
+        has_implementation_followup=has_implementation_followup,
         active_plan_child=active_plan_child,
         active_implement_child=active_implement_child,
         has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
-        failed_recovery_decision=failed_recovery_decision,
-        failed_recovery_attention_reason=failed_recovery_attention_reason,
-        merge_source_ref=merge_source.ref,
-        merge_source_warning=merge_source.warning,
-        post_merge_rebase_state=post_merge_rebase_state,
-        merge_state=merge_state,
-        can_merge=can_merge,
-        strict_scope_violation_paths=strict_scope_inspection.violation_paths,
-        strict_scope_inspection_error=strict_scope_inspection.inspection_error,
-        rebase_pending_or_running=rebase_pending_or_running,
-        rebase_failed=rebase_failed,
-        latest_completed_rebase=latest_completed_rebase,
-        rebase_failure_streak=rebase_failure_streak,
-        rebase_invalidates_review=rebase_invalidates_review,
-        review_preserved_by_rebase=review_preserved_by_rebase,
-        review_invalidated_by_rebase=review_invalidated_by_rebase,
+        is_resumable_failed=is_resumable_failed,
+        has_resume_children=has_resume_children,
+        resume_chain_depth=resume_chain_depth,
+    )
+    ctx = replace(
+        ctx,
         reviews=reviews,
         review_root_task=review_root_task,
         active_review=active_review,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,
-        current_branch_head_sha=current_branch_head_sha,
-        current_branch_head_resolution_failure=branch_tip_resolution.failure,
-        verify_command_unavailable_failure=verify_availability.failure,
-        verify_command_unavailable_revision_range=verify_availability.revision_range,
-        latest_review_verify_provenance_state=latest_review_verify_provenance_state,
         review_cleared=review_cleared,
         review_verdict=review_verdict,
         review_report=review_report,
@@ -2280,14 +2393,25 @@ def resolve_advance_context(
         consecutive_noop_improves=consecutive_noop_improves,
         noop_improve_allowed=noop_improve_allowed,
         noop_improve_trigger=noop_improve_trigger,
-        duplicate_blocker_streak=duplicate_blocker_streak,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
-        is_resumable_failed_task=is_resumable_failed,
-        has_resume_children=has_resume_children,
-        resume_chain_depth=resume_chain_depth,
-        failure_reason=task.failure_reason,
+    )
+    ctx = _resolve_pre_closing_review_git_context(
+        ctx,
+        config,
+        store,
+        git,
+        target_branch,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+    )
+    if _resolve_db_known_wait_action(ctx) is not None or _matches_rule_before_closing_review_invariant(ctx):
+        return ctx
+    return _resolve_post_closing_review_git_context(
+        ctx,
+        config,
+        git,
+        target_branch,
     )
 
 

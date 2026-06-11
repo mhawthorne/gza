@@ -65,12 +65,15 @@ class _FakeGit:
         self._name_status_error_by_range = name_status_error_by_range or {}
         self._resolve_fresh_merge_source_ref_error = resolve_fresh_merge_source_ref_error
         self._rev_parse_errors = rev_parse_errors or {}
+        self.can_merge_calls: list[tuple[str, str]] = []
         self.rev_parse_calls: list[str] = []
         self.is_ancestor_calls: list[tuple[str, str]] = []
         self.behind_calls: list[tuple[str, str]] = []
         self.name_status_calls: list[str] = []
+        self.resolve_fresh_merge_source_calls: list[str] = []
 
     def can_merge(self, source_branch: str, target_branch: str) -> bool:
+        self.can_merge_calls.append((source_branch, target_branch))
         return self._can_merge_by_ref.get((source_branch, target_branch), self._can_merge)
 
     def is_merged(self, source_branch: str, target_branch: str) -> bool:
@@ -96,6 +99,7 @@ class _FakeGit:
     def resolve_fresh_merge_source(self, branch: str):
         from gza.git import ResolvedMergeSourceRef
 
+        self.resolve_fresh_merge_source_calls.append(branch)
         if self._merge_source_result is not None:
             ref, warning = self._merge_source_result
             return ResolvedMergeSourceRef(ref, warning)
@@ -5617,6 +5621,181 @@ def test_failed_improve_does_not_require_closing_review(tmp_path: Path) -> None:
     )
 
     assert action is None
+
+
+def test_closing_review_in_progress_db_known_wait_matches_full_path_and_skips_late_git_resolution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/closing-review-in-progress",
+        when=datetime(2026, 5, 20, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 20, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 20, 11, 0, tzinfo=UTC),
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    closing_review = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert closing_review.id is not None
+    closing_review.status = "in_progress"
+    closing_review.created_at = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
+    store.update(closing_review)
+
+    early_git = _FakeGit(can_merge=True)
+    early_action = determine_next_action(config, store, early_git, impl, "main")
+
+    monkeypatch.setattr(advance_engine_module, "_resolve_db_known_wait_action", lambda _ctx: None)
+    full_git = _FakeGit(can_merge=True)
+    full_action = determine_next_action(config, store, full_git, impl, "main")
+
+    assert early_action == full_action
+    assert early_action["type"] == "wait_review"
+    assert early_action["description"] == f"SKIP: closing review {closing_review.id} is in_progress"
+    assert early_action.get("review_task") is not None
+    assert early_action["review_task"].id == closing_review.id
+    assert set(early_action) == {"type", "description", "review_task"}
+    assert early_git.resolve_fresh_merge_source_calls
+    assert early_git.can_merge_calls == [(impl.branch, "main")]
+    assert early_git.rev_parse_calls
+    assert len(full_git.rev_parse_calls) > len(early_git.rev_parse_calls)
+    assert len(full_git.resolve_fresh_merge_source_calls) > len(early_git.resolve_fresh_merge_source_calls)
+
+def test_closing_review_in_progress_still_respects_strict_scope_violation(tmp_path: Path) -> None:
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/pending-closing-review-scope",
+        when=datetime(2026, 5, 21, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 21, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 21, 11, 0, tzinfo=UTC),
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    closing_review = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert closing_review.id is not None
+    closing_review.status = "in_progress"
+    closing_review.created_at = datetime(2026, 5, 21, 12, 0, tzinfo=UTC)
+    store.update(closing_review)
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={f"main...{impl.branch}": "A\tREADME.md\n"},
+    )
+    action = determine_next_action(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "project-scope-violation"
+    assert action["subject_task_id"] == impl.id
+    assert git.name_status_calls == [f"main...{impl.branch}"]
+    assert git.resolve_fresh_merge_source_calls
+
+
+def test_closing_review_in_progress_still_respects_diverged_merge_source(tmp_path: Path) -> None:
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/closing-review-diverged",
+        when=datetime(2026, 5, 22, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 22, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 22, 11, 0, tzinfo=UTC),
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    closing_review = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert closing_review.id is not None
+    closing_review.status = "in_progress"
+    closing_review.created_at = datetime(2026, 5, 22, 12, 0, tzinfo=UTC)
+    store.update(closing_review)
+
+    warning = (
+        "Local branch 'feat/closing-review-diverged' and remote-tracking ref "
+        "'origin/feat/closing-review-diverged' diverged. Push, fetch, or reconcile them before "
+        "advancing or merging."
+    )
+    git = _FakeGit(
+        can_merge=True,
+        merge_source_result=(None, warning),
+    )
+
+    action = determine_next_action(config, store, git, impl, "main")
+
+    assert action["type"] == "reconcile_branch_divergence"
+    assert "Reconcile diverged local/origin refs" in action["description"]
+
+
+def test_closing_review_in_progress_still_respects_manual_merge_source_warning(tmp_path: Path) -> None:
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/closing-review-manual-warning",
+        when=datetime(2026, 5, 23, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 23, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 23, 11, 0, tzinfo=UTC),
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    closing_review = store.add("Closing review", task_type="review", depends_on=impl.id)
+    assert closing_review.id is not None
+    closing_review.status = "in_progress"
+    closing_review.created_at = datetime(2026, 5, 23, 12, 0, tzinfo=UTC)
+    store.update(closing_review)
+
+    warning = "Could not resolve freshest merge source for branch 'feat/closing-review-manual-warning' against 'main'"
+    git = _FakeGit(
+        can_merge=True,
+        merge_source_result=(None, warning),
+    )
+
+    action = determine_next_action(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["description"] == f"SKIP: {warning}"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
 
 
 def test_unmerged_view_shows_fix_after_review_as_stale(tmp_path: Path):
