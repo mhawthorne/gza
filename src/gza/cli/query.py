@@ -104,6 +104,7 @@ from ._common import (
     get_task_status_color,
     pager_context,
     parse_cli_tag_filters,
+    resolve_effective_plan_review_manifest_state,
     resolve_id,
     validate_cli_tag_values,
 )
@@ -331,6 +332,44 @@ def _implementation_review_rebase_detail(
         reason = "diff changed" if ctx.review_invalidated_by_rebase.changed_diff is True else "change unknown"
         return f"invalidated by rebase {ctx.review_invalidated_by_rebase.id} ({reason})"
     return None
+
+
+def _plan_review_source_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Resolve the reviewed plan source for one plan_review task."""
+    if task.task_type != "plan_review" or not task.depends_on:
+        return None
+    source_task = store.get(task.depends_on)
+    if source_task is None or source_task.task_type not in {"plan", "plan_improve"}:
+        return None
+    return source_task
+
+
+def _plan_review_detail(
+    *,
+    task: DbTask,
+    config: Config,
+    store: SqliteTaskStore,
+) -> tuple[str | None, str | None]:
+    """Return parsed plan-review verdict plus compact manifest state text."""
+    source_task = _plan_review_source_task(store, task)
+    if source_task is None:
+        return None, None
+    manifest_state = resolve_effective_plan_review_manifest_state(
+        store,
+        config,
+        review_task=task,
+        plan_source_task=source_task,
+    )
+    verdict = manifest_state.verdict
+    manifest_detail: str | None = None
+    if manifest_state.manifest is not None:
+        manifest_detail = (
+            f"{manifest_state.source} manifest valid "
+            f"({len(manifest_state.manifest.slices)} slices)"
+        )
+    elif manifest_state.validation_error:
+        manifest_detail = f"{manifest_state.source} manifest invalid ({manifest_state.validation_error})"
+    return verdict, manifest_detail
 
 
 def _resolve_show_lifecycle_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
@@ -1040,7 +1079,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         else:
             parent_label = ""
 
-        if compact_child and task.task_type in {"review", "improve"}:
+        if compact_child and task.task_type in {"review", "improve", "plan_review", "plan_improve"}:
             compact_parts = [f"{type_label}{merge_label}{parent_label}"]
             if task.task_type == "review":
                 verdict = get_review_verdict(config, task)
@@ -1049,6 +1088,12 @@ def cmd_history(args: argparse.Namespace) -> int:
                     if task.review_score is not None:
                         verdict_part = f"{verdict_part} ({task.review_score})"
                     compact_parts.append(verdict_part)
+            elif task.task_type == "plan_review":
+                verdict, manifest_detail = _plan_review_detail(task=task, config=config, store=store)
+                if verdict:
+                    compact_parts.append(f"verdict: {verdict}")
+                if manifest_detail:
+                    compact_parts.append(manifest_detail)
             stats_str = format_stats(task)
             if stats_str:
                 compact_parts.append(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -3285,7 +3330,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
 
     def _prompt_text(t: DbTask) -> str:
         type_str = t.task_type or "implement"
-        if type_str not in {"plan", "implement"}:
+        if type_str not in {"plan", "plan_improve", "plan_review", "implement"}:
             return ""
         if t.slug:
             value = _strip_slug_date_prefix(t.slug)
@@ -3395,6 +3440,18 @@ def cmd_lineage(args: argparse.Namespace) -> int:
                 pieces.append(merge_part)
             pieces.append(prompt_part)
             console.print(" ".join(pieces).rstrip())
+
+            detail_prefix = " " * prefix_width + "   "
+            if t.task_type == "review":
+                verdict = get_review_verdict(config, t)
+                if verdict:
+                    console.print(f"{detail_prefix}verdict: {rich_escape(verdict)}")
+            elif t.task_type == "plan_review":
+                verdict, manifest_detail = _plan_review_detail(task=t, config=config, store=store)
+                if verdict:
+                    console.print(f"{detail_prefix}verdict: {rich_escape(verdict)}")
+                if manifest_detail:
+                    console.print(f"{detail_prefix}{rich_escape(manifest_detail)}")
 
     def _immediate_parent_entries(current_task: DbTask) -> list[tuple[DbTask, str]]:
         entries: list[tuple[DbTask, str]] = []
@@ -3767,6 +3824,15 @@ def _cmd_show_output(
                     f"[{c['label']}]Review Verify Failure:[/{c['label']}] "
                     f"[{c['value']}]{task.review_verify_failure}[/{c['value']}]"
                 )
+    if task.task_type == "plan_review":
+        verdict, manifest_detail = _plan_review_detail(task=task, config=config, store=store)
+        if verdict:
+            console.print(f"[{c['label']}]Verdict:[/{c['label']}] [{c['value']}]{verdict}[/{c['value']}]")
+        if manifest_detail:
+            console.print(
+                f"[{c['label']}]Slice Manifest:[/{c['label']}] "
+                f"[{c['value']}]{manifest_detail}[/{c['value']}]"
+            )
     if task.session_id:
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 

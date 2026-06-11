@@ -4599,6 +4599,116 @@ class TestShowCommand:
         assert "implement task already exists for this plan" not in output
         assert "lifecycle unavailable" not in output
 
+    def test_show_plan_review_displays_verdict_and_manifest_state(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan reviewed feature", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(plan)
+
+        review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        review.output_content = (
+            "## Verdict\n\n"
+            "Verdict: APPROVED\n\n"
+            "## Slice Manifest\n"
+            "```json\n"
+            "{\n"
+            '  "schema_version": 1,\n'
+            f'  "source_task_id": "{plan.id}",\n'
+            '  "source_task_type": "plan",\n'
+            '  "verdict": "APPROVED",\n'
+            '  "slice_quality": {\n'
+            '    "fits_single_task_budget": true,\n'
+            '    "timeout_budget_minutes": 45,\n'
+            '    "max_expected_files_changed_per_slice": 8,\n'
+            '    "rationale": "Each slice has one clear verification boundary."\n'
+            "  },\n"
+            '  "slices": [\n'
+            "    {\n"
+            '      "slice_id": "S1",\n'
+            '      "title": "Implement slice one",\n'
+            '      "prompt": "Implement slice one",\n'
+            '      "scope": ["Add the first slice"],\n'
+            '      "out_of_scope": [],\n'
+            '      "acceptance_criteria": ["Slice one works"],\n'
+            '      "depends_on_slices": [],\n'
+            '      "based_on_slice": null,\n'
+            '      "review_scope": "Slice one only.",\n'
+            '      "estimated_complexity": "medium",\n'
+            '      "expected_timeout_minutes": 30,\n'
+            '      "requires_code_review": true,\n'
+            '      "tags": ["auth"]\n'
+            "    }\n"
+            "  ],\n"
+            '  "manual_override": {"commands": ["uv run gza plan-review <review-id> --edit-slices"]}\n'
+            "}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.can_merge.return_value = True
+        git.worktree_list.return_value = []
+
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(review.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verdict: APPROVED" in output
+        assert "Slice Manifest: review manifest valid (1 slices)" in output
+
+    def test_lineage_shows_plan_review_verdict_as_compact_child_metadata(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli.query import cmd_lineage
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan reviewed feature", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(plan)
+
+        review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        exit_code = cmd_lineage(argparse.Namespace(project_dir=tmp_path, task_id=str(plan.id)))
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        normalized = " ".join(output.split())
+        assert "plan_review [depends]" in normalized or "plan_review [plan_review]" in normalized
+        assert "verdict: CHANGES_REQUESTED" in normalized
+
     def test_show_held_plan_displays_auto_implement_hold_guidance(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

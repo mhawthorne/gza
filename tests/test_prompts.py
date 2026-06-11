@@ -463,12 +463,16 @@ class TestPromptBuilderBuild:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
+        config.get_plan_slice_target_timeout_minutes.return_value = 45
+        config.max_plan_slices = None
 
         report_path = Path("/workspace/.gza/plan-reviews/test.md")
         result = PromptBuilder().build(task, config, store, report_path=report_path)
 
         assert str(report_path) in result
         assert "## Plan source to review:" in result
+        assert f"Source task id: {plan.id}" in result
+        assert "Source task type: plan" in result
         assert "Plan body." in result
         assert "APPROVED" in result
         assert "CHANGES_REQUESTED" in result
@@ -476,6 +480,50 @@ class TestPromptBuilderBuild:
         assert "```json" in result
         assert "source_task_id" in result
         assert "requires_code_review" in result
+        assert "exactly one fenced ```json block" in result
+        assert "Treat `45` minutes as the target maximum per slice." in result
+        assert "`depends_on_slices` may contain at most one earlier slice ID" in result
+
+    def test_build_plan_review_type_with_plan_improve_source_includes_exact_source_identity(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        plan = store.add(prompt="Design feature", task_type="plan")
+        plan.output_content = "## Overview of the approach\n\nOriginal plan."
+        store.update(plan)
+
+        review = store.add(prompt="Review the plan", task_type="plan_review", depends_on=plan.id)
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        revised_plan = store.add(
+            prompt="Revise the plan",
+            task_type="plan_improve",
+            depends_on=review.id,
+            based_on=plan.id,
+        )
+        revised_plan.output_content = "## Overview of the approach\n\nRevised plan body."
+        store.update(revised_plan)
+
+        task = store.add(
+            prompt="Review the revised plan",
+            task_type="plan_review",
+            depends_on=revised_plan.id,
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.get_plan_slice_target_timeout_minutes.return_value = 45
+        config.max_plan_slices = None
+
+        report_path = Path("/workspace/.gza/plan-reviews/revised-test.md")
+        result = PromptBuilder().build(task, config, store, report_path=report_path)
+
+        assert "## Plan source to review:" in result
+        assert f"Source task id: {revised_plan.id}" in result
+        assert "Source task type: plan_improve" in result
+        assert "Revised plan body." in result
 
     def test_build_plan_improve_type_with_report_path_and_feedback_context(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -496,6 +544,8 @@ class TestPromptBuilderBuild:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
+        config.get_plan_slice_target_timeout_minutes.return_value = 45
+        config.max_plan_slices = None
 
         report_path = Path("/workspace/.gza/revised-plans/test.md")
         result = PromptBuilder().build(task, config, store, report_path=report_path)
@@ -504,9 +554,12 @@ class TestPromptBuilderBuild:
         assert "## Review feedback to address:" in result
         assert "Verdict: CHANGES_REQUESTED" in result
         assert "## Latest plan source:" in result
+        assert f"Source task id: {plan.id}" in result
+        assert "Source task type: plan" in result
         assert "Original plan." in result
         assert "## Required implementation steps" in result
         assert "## Acceptance criteria" in result
+        assert "This task produces a replacement plan artifact, not code." in result
 
     def test_build_review_type_with_report_path(self, tmp_path: Path):
         """Test that review type includes review instructions."""

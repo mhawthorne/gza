@@ -3300,20 +3300,27 @@ def _build_context_from_chain(
     def _int_or_default(value: object, default: int) -> int:
         return value if isinstance(value, int) else default
 
+    def _plan_source_context_block(heading: str, source_task: Task) -> str:
+        metadata = (
+            f"{heading}"
+            f"Source task id: {source_task.id}\n"
+            f"Source task type: {source_task.task_type}\n"
+        )
+        source_content = _get_task_output(source_task, project_dir)
+        if source_content:
+            return metadata + "\n" + source_content
+        return (
+            metadata
+            + f"\n(plan source task {source_task.id} exists but content unavailable on this machine - flag as blocker)"
+        )
+
     # For plan review tasks, include the reviewed plan source.
     if task.task_type == "plan_review" and task.depends_on:
         source_task = store.get(task.depends_on)
         if source_task is not None:
-            source_content = _get_task_output(source_task, project_dir)
-            heading = "## Plan source to review:\n"
-            if source_content:
-                context_parts.append(heading)
-                context_parts.append(source_content)
-            else:
-                context_parts.append(
-                    heading
-                    + f"(plan source task {source_task.id} exists but content unavailable on this machine - flag as blocker)"
-                )
+            context_parts.append(
+                _plan_source_context_block("## Plan source to review:\n", source_task)
+            )
 
     # For plan improvement tasks, include the triggering plan review and latest plan source.
     if task.task_type == "plan_improve":
@@ -3333,15 +3340,12 @@ def _build_context_from_chain(
         if task.based_on:
             source_task = store.get(task.based_on)
             if source_task is not None:
-                source_content = _get_task_output(source_task, project_dir)
-                if source_content:
-                    context_parts.append("\n## Latest plan source:\n")
-                    context_parts.append(source_content)
-                else:
-                    context_parts.append(
-                        "\n## Latest plan source:\n"
-                        f"(plan source task {source_task.id} exists but content unavailable on this machine - flag as blocker)"
+                context_parts.append(
+                    "\n"
+                    + _plan_source_context_block(
+                        "## Latest plan source:\n", source_task
                     )
+                )
 
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":

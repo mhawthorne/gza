@@ -1,13 +1,17 @@
-This is a `plan_improve` task. Revise the latest plan source so it addresses the triggering `plan_review` feedback and becomes ready for another plan-review pass.
+This is a `plan_improve` task. Revise the latest plan source so it addresses the triggering `plan_review` feedback and becomes ready for another automated plan-review pass.
+
+This task produces a replacement plan artifact, not code. The revised report becomes the latest plan source for downstream lifecycle decisions, including future slice manifests.
 
 Output contract:
 - Write the revised plan to `{report_path}`.
-- Replace the plan text itself; this artifact becomes the latest plan source for downstream lifecycle decisions.
+- Replace the plan text itself; do not write review commentary around it.
 - Preserve the structure expected of a plan artifact:
   - `## Overview of the approach`
   - `## Key design decisions`
   - `## Required implementation steps`
   - `## Acceptance criteria`
   - `## Potential risks or considerations`
-- Address every blocking issue from the triggering plan review explicitly in the revised plan.
-- Keep the revision scoped to plan quality and task slicing; do not implement code in this task.
+- Incorporate the triggering `plan_review` feedback directly into the revised plan.
+- If the review challenged slice sizing or sequencing, revise the plan so a future reviewer can produce bounded slices without guessing.
+- Keep the revision scoped to plan quality, sequencing, acceptance criteria, and sliceability. Do not implement code in this task.
+- Do not output a plan-review verdict or JSON manifest in this task unless the plan source itself explicitly needs an example manifest as part of the design.

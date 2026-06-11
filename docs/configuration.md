@@ -1593,6 +1593,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `--force` | Skip dependency merge precondition checks when running the implement task |
 
 When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
+Using `uv run gza edit <plan-id> --no-hold-for-review` also clears the hold, but that path releases the completed plan back into the automated `plan_review` lifecycle rather than directly creating implementation work.
 
 ### plan-review
 
@@ -1617,6 +1618,7 @@ gza plan-review <task_id> [options]
 | `--force` | Skip dependency merge precondition checks when running the plan review task |
 
 `--edit-slices` and `--materialize` operate on a completed `plan_review` task ID rather than a plan source ID. `--edit-slices` persists a validated override artifact tied to that review, and `--materialize` reuses an existing non-dropped slice set for the same review/manifest instead of creating duplicates. If a stored override artifact is malformed or no longer validates, both commands exit non-zero with an invalid override-manifest error and create no implementation tasks.
+The primary unattended path is still `plan -> plan_review -> materialized implement slices`; this command is the direct manual surface for reruns, slice overrides, and explicit materialization.
 
 ### plan-improve
 

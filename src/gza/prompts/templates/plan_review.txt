@@ -1,17 +1,37 @@
-This is a `plan_review` task. Review the attached plan artifact for completeness, sequencing, and whether it can be split into bounded implementation slices.
+This is a `plan_review` task. Review the attached plan artifact for completeness, sequencing, and whether it can be decomposed into bounded implementation slices that the lifecycle can materialize automatically.
+
+This is a strict contract task. The existing parser, validator, and slice materializer will consume your output directly. Do not improvise the machine-readable shape.
+
+Sizing and sequencing requirements:
+- Every approved slice must fit one implement task budget. Treat `{plan_slice_target_timeout_minutes}` minutes as the target maximum per slice.
+- If you cannot honestly keep every slice within that budget, do not approve the plan.
+- V1 slicing is linear or single-immediate-predecessor only. `depends_on_slices` may contain at most one earlier slice ID.
+- If a slice continues work on a prior slice branch, set `based_on_slice` to that same earlier slice ID and make `depends_on_slices` exactly `["that-slice-id"]`.
+- If a slice only needs ordering, keep `based_on_slice` as `null` and use `depends_on_slices` with the earlier slice ID.
+- If `max_plan_slices` is not `unset`, keep the slice count at or below `{max_plan_slices}`.
 
 Output contract:
 - Write the final report to `{report_path}`.
-- Include a `## Verdict` section with exactly one verdict: `APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_DISCUSSION`.
-- If the verdict is `APPROVED`, include exactly one `## Slice Manifest` section containing exactly one fenced ```json block.
-- The JSON manifest must include:
+- Include a `## Verdict` section with exactly one verdict line: `Verdict: APPROVED`, `Verdict: CHANGES_REQUESTED`, or `Verdict: NEEDS_DISCUSSION`.
+- If the verdict is not `APPROVED`, do not include a JSON manifest unless you are emitting the same top-level metadata with an empty or omitted slice list for explanation only. Do not invent partial approved slices.
+- If the verdict is `APPROVED`, include exactly one `## Slice Manifest` section containing exactly one fenced ```json block and no additional JSON fences anywhere else in the report.
+- The JSON block must be a single object with this exact top-level shape:
   - `schema_version`
   - `source_task_id`
   - `source_task_type`
   - `verdict`
   - `slice_quality`
   - `slices`
-- Each approved slice must include:
+  - `manual_override`
+- `source_task_id` must match the reviewed latest plan source task ID.
+- `source_task_type` must be `plan` or `plan_improve`, matching the reviewed source.
+- The JSON `verdict` must exactly match the markdown verdict.
+- `slice_quality.fits_single_task_budget` must be `true` for `APPROVED`.
+- `slice_quality` must also include:
+  - `timeout_budget_minutes`
+  - `max_expected_files_changed_per_slice`
+  - `rationale`
+- For `APPROVED`, `slices` must be non-empty and every slice object must include:
   - `slice_id`
   - `title`
   - `prompt`
@@ -25,5 +45,16 @@ Output contract:
   - `expected_timeout_minutes`
   - `requires_code_review`
   - `tags`
-- Keep approved slices within a single-task budget. If you cannot honestly produce bounded slices, do not approve the plan.
-- If the plan is not ready, explain the gaps in the report and use `CHANGES_REQUESTED` or `NEEDS_DISCUSSION` instead of emitting invalid slices.
+- Every slice must set `requires_code_review` to `true`.
+- Every slice must include non-empty `prompt`, `scope`, `acceptance_criteria`, and `review_scope`.
+- `slice_id` values must be unique and stable within the manifest.
+- All dependency references must point only to earlier slices.
+- `manual_override.commands` must be a list of operator commands for correcting or materializing slices.
+
+Required report structure:
+- `## Verdict`
+- `## Summary`
+- `## Slice Manifest` when verdict is `APPROVED`
+- `## Issues` when verdict is `CHANGES_REQUESTED` or `NEEDS_DISCUSSION`
+
+If the plan is not ready for safe automatic slicing, explain why and use `CHANGES_REQUESTED` or `NEEDS_DISCUSSION` instead of emitting an invalid approval.

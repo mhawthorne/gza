@@ -70,7 +70,8 @@ stateDiagram-v2
 
     Planned --> PlanReviewing: auto_implement\n(create/run plan_review)
     Planned --> AwaitingHuman: plan held\n(auto_implement = false)
-    PlanReviewing --> Implementing: APPROVED valid manifest\n(materialize slices)
+    PlanReviewing --> SlicingMaterializing: APPROVED valid manifest
+    SlicingMaterializing --> Implementing: materialize reviewed slices
     PlanReviewing --> PlanImproving: CHANGES_REQUESTED
     PlanReviewing --> HumanParked: invalid manifest / unknown verdict / needs discussion
     PlanImproving --> PlanReviewing: revised plan completes
@@ -157,6 +158,11 @@ time, so each row names what would let us remove it.
 | State / reason | Trigger (intent) | How a human clears it | Path to removing the stop |
 |----------------|------------------|------------------------|---------------------------|
 | `AwaitingHuman` — plan held | A plan completed but auto-implement is off for this lineage. | Review the plan; start the implement task, or re-enable automatic follow-up. | Per-lineage policy: trusted plans MAY auto-implement. |
+| `HumanParked` — manual plan-review creation | A completed plan needs automated plan review, but `advance_create_plan_reviews` is off and no review exists yet. | Create a `plan_review` manually or re-enable automatic plan-review creation. | Re-enable auto-creation once the project trusts the plan-review gate. |
+| `HumanParked` — invalid plan-review slices | A plan review said `APPROVED`, but the slice manifest was missing, malformed, oversized, cyclic, ambiguous, or otherwise invalid. | Fix the plan review output or use `uv run gza plan-review <review-id> --edit-slices`, then materialize again. | Stronger structured prompting and deterministic validation feedback. |
+| `HumanParked` — plan review needs discussion | The plan review explicitly concluded that automation cannot safely approve or revise the plan on its own. | Resolve the design ambiguity, revise the plan, then re-run plan review. | Better plan prompts and richer source context. |
+| `HumanParked` — unknown plan-review verdict | The plan-review verdict could not be classified. | Re-run or correct the plan-review output. | More reliable plan-review verdict extraction. |
+| `HumanParked` — plan-review cycle limit | `plan_review` → `plan_improve` loops hit `max_plan_review_cycles` without approval. | Take over the planning work, fix the design gaps, then restart the review loop. | Better plan-improve quality and better escalation hints. |
 | `needs_discussion` — explore dangling | An explore task completed with no plan/implement follow-up. | Decide: drop it, or spawn follow-up work. | Auto-summarize explore output and propose next work. |
 | `ScopeParked` — out of scope | The branch diff touches paths outside the work unit's declared project scope and it is not tagged `cross-project`. | Tag `cross-project` and re-advance if intended, or fix the branch. | Clearer per-task scope declaration up front. |
 | `needs_discussion` — scope unverifiable | The scope of the diff could not be checked reliably (bad ref/diff). | Fix the ref/diff problem, or tag `cross-project` if the wide scope is intended. | More robust diff inspection. |

@@ -303,6 +303,11 @@ is a spec change. The accompanying human message is free text.
 | Reason code | State | Trigger (rule §) |
 |-------------|-------|------------------|
 | `awaiting-human-review` | awaiting_human | §1 completed held plan, no implement follow-up |
+| `plan-review-needs-manual-creation` | needs_discussion | §1 completed non-held plan needs plan review, but auto-creation is off |
+| `plan-review-invalid-slices` | needs_discussion | §1 approved plan review has no valid effective slice manifest |
+| `plan-review-needs-discussion` | needs_discussion | §1 completed plan review returned `NEEDS_DISCUSSION` |
+| `plan-review-unknown-verdict` | needs_discussion | §1 completed plan review verdict missing or unparseable |
+| `plan-review-max-cycles-reached` | needs_discussion | §1 `plan_review` / `plan_improve` loop hit `max_plan_review_cycles` |
 | `plan-review-materialization-repair-needed` | needs_discussion | §1 approved manifest has implement descendants without a durable complete materialization record |
 | `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |
 | `project-scope-violation` | ScopeParked | §3 diff touches paths outside scope, not tagged `cross-project` |
