@@ -735,9 +735,22 @@ def _candidate_owner_rows(
             continue
         if query.exclude_dropped_from_planning and owner.status == "dropped":
             continue
-        if owner_ids_filter is not None and owner_id not in owner_ids_filter:
-            if task_ids_filter is None or not any(task.id in task_ids_filter for task in owner_members if task.id is not None):
+        member_matches_task_filter = False
+        if task_ids_filter is not None:
+            member_matches_task_filter = any(
+                task.id in task_ids_filter for task in owner_members if task.id is not None
+            )
+            if not member_matches_task_filter:
+                member_matches_task_filter = any(
+                    task.id in task_ids_filter
+                    for task in indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
+                    if task.id is not None
+                )
+        if owner_ids_filter is not None:
+            if owner_id not in owner_ids_filter:
                 continue
+        if task_ids_filter is not None and not member_matches_task_filter:
+            continue
         root = indexes.root_by_task_id.get(owner.id or "", owner)
         if _is_broken_same_branch_owner(owner=owner, root=root):
             continue

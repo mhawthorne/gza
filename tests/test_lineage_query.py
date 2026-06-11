@@ -241,6 +241,322 @@ def test_query_lineage_owner_rows_uses_shared_ref_preload_helper(tmp_path: Path)
     assert tuple(preload.call_args.kwargs["branch_names"]) == ("feature/shared-preload",)
 
 
+def test_query_lineage_owner_rows_task_id_filter_limits_shared_ref_preload_to_matching_owner_lineage(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Requested owner", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch="feature/requested-owner",
+        has_commits=True,
+    )
+    store.update(owner)
+
+    member = store.add(
+        "Requested member",
+        task_type="improve",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    assert member.id is not None
+    _set_completed(
+        member,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch="feature/requested-owner",
+        has_commits=True,
+    )
+    store.update(member)
+
+    unrelated_owner = store.add("Unrelated owner", task_type="implement")
+    assert unrelated_owner.id is not None
+    _set_completed(
+        unrelated_owner,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        branch="feature/unrelated-owner",
+        has_commits=True,
+    )
+    store.update(unrelated_owner)
+
+    git = MagicMock()
+    git.can_merge.return_value = False
+
+    with patch("gza.lineage_query.prime_advance_planning_refs") as preload:
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                include_skipped=True,
+                max_recovery_attempts=1,
+                task_ids=(member.id,),
+            ),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert len(rows) == 1
+    assert rows[0].owner_task.id == owner.id
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert set(preload.call_args.kwargs["branch_names"]) == {"feature/requested-owner"}
+
+
+def test_query_lineage_owner_rows_task_id_filter_keeps_skipped_same_branch_manual_resolution(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "in_progress"
+    impl.branch = "feature/canonical"
+    impl.has_commits = True
+    store.update(impl)
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    _set_completed(
+        orphan,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch="feature/orphan",
+        has_commits=True,
+    )
+    orphan.merge_status = "unmerged"
+    store.update(orphan)
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    unrelated_owner = store.add("Unrelated owner", task_type="implement")
+    assert unrelated_owner.id is not None
+    _set_completed(
+        unrelated_owner,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        branch="feature/unrelated-owner",
+        has_commits=True,
+    )
+    unrelated_owner.merge_status = "unmerged"
+    store.update(unrelated_owner)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    unfiltered_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    with patch("gza.lineage_query.prime_advance_planning_refs") as preload:
+        filtered_rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                include_skipped=True,
+                max_recovery_attempts=1,
+                task_ids=(orphan.id,),
+            ),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert len(unfiltered_rows) == 2
+    baseline_row = next(row for row in unfiltered_rows if row.owner_task.id == impl.id)
+    assert baseline_row.next_action is not None
+    assert baseline_row.next_action["type"] == "needs_discussion"
+    assert baseline_row.next_action["needs_attention_reason"] == "no-descendant-on-the-impl-branch"
+
+    assert len(filtered_rows) == 1
+    filtered_row = filtered_rows[0]
+    assert filtered_row.owner_task.id == impl.id
+    assert filtered_row.lifecycle_action_task is None
+    assert filtered_row.next_action == baseline_row.next_action
+    assert {task.id for task in filtered_row.unresolved_tasks if task.id is not None} == {orphan.id}
+
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert tuple(preload.call_args.kwargs["branch_names"]) == ("feature/canonical",)
+
+
+def test_query_lineage_owner_rows_mixed_owner_and_task_filters_exclude_mismatched_owner_lineage(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner_a = store.add("Owner A", task_type="implement")
+    assert owner_a.id is not None
+    _set_completed(
+        owner_a,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch="feature/owner-a",
+        has_commits=True,
+    )
+    store.update(owner_a)
+
+    member_a = store.add(
+        "Member A",
+        task_type="improve",
+        based_on=owner_a.id,
+        same_branch=True,
+    )
+    assert member_a.id is not None
+    _set_completed(
+        member_a,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch="feature/owner-a",
+        has_commits=True,
+    )
+    store.update(member_a)
+
+    owner_b = store.add("Owner B", task_type="implement")
+    assert owner_b.id is not None
+    _set_completed(
+        owner_b,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        branch="feature/owner-b",
+        has_commits=True,
+    )
+    store.update(owner_b)
+
+    member_b = store.add(
+        "Member B",
+        task_type="improve",
+        based_on=owner_b.id,
+        same_branch=True,
+    )
+    assert member_b.id is not None
+    _set_completed(
+        member_b,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        branch="feature/owner-b",
+        has_commits=True,
+    )
+    store.update(member_b)
+
+    git = MagicMock()
+    git.can_merge.return_value = False
+
+    with patch("gza.lineage_query.prime_advance_planning_refs") as preload:
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                include_skipped=True,
+                max_recovery_attempts=1,
+                owner_task_ids=(owner_a.id,),
+                task_ids=(member_b.id,),
+            ),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows == ()
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert tuple(preload.call_args.kwargs["branch_names"]) == ()
+
+
+def test_query_lineage_owner_rows_mixed_owner_and_task_filters_keep_matching_owner_lineage(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner_a = store.add("Owner A", task_type="implement")
+    assert owner_a.id is not None
+    _set_completed(
+        owner_a,
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+        branch="feature/owner-a",
+        has_commits=True,
+    )
+    store.update(owner_a)
+
+    member_a = store.add(
+        "Member A",
+        task_type="improve",
+        based_on=owner_a.id,
+        same_branch=True,
+    )
+    assert member_a.id is not None
+    _set_completed(
+        member_a,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch="feature/owner-a",
+        has_commits=True,
+    )
+    store.update(member_a)
+
+    owner_b = store.add("Owner B", task_type="implement")
+    assert owner_b.id is not None
+    _set_completed(
+        owner_b,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        branch="feature/owner-b",
+        has_commits=True,
+    )
+    store.update(owner_b)
+
+    git = MagicMock()
+    git.can_merge.return_value = False
+
+    with patch("gza.lineage_query.prime_advance_planning_refs") as preload:
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                include_skipped=True,
+                max_recovery_attempts=1,
+                owner_task_ids=(owner_a.id,),
+                task_ids=(member_a.id,),
+            ),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert len(rows) == 1
+    assert rows[0].owner_task.id == owner_a.id
+    preload.assert_called_once_with(
+        git,
+        branch_names=ANY,
+        target_branch="main",
+        warning_logger=ANY,
+    )
+    assert tuple(preload.call_args.kwargs["branch_names"]) == ("feature/owner-a", "feature/owner-a")
+
+
 def test_query_lineage_owner_rows_hides_failed_resume_resolved_by_completed_sibling_resume(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

@@ -1576,8 +1576,8 @@ def test_cmd_advance_explicit_child_member_scopes_query_to_owner_lineage(tmp_pat
 
     assert rc == 0
     assert len(captured_queries) == 1
-    assert captured_queries[0].owner_task_ids == (impl.id,)
-    assert captured_queries[0].task_ids is None
+    assert captured_queries[0].task_ids == (review.id,)
+    assert captured_queries[0].owner_task_ids is None
 
 
 def test_cmd_advance_explicit_failed_leaf_scopes_query_to_owner_lineage(tmp_path: Path) -> None:
@@ -1635,8 +1635,8 @@ def test_cmd_advance_explicit_failed_leaf_scopes_query_to_owner_lineage(tmp_path
 
     assert rc == 0
     assert len(captured_queries) == 1
-    assert captured_queries[0].owner_task_ids == (impl.id,)
-    assert captured_queries[0].task_ids is None
+    assert captured_queries[0].task_ids == (failed_rebase.id,)
+    assert captured_queries[0].owner_task_ids is None
 
 
 def test_cmd_advance_explicit_dropped_owner_fallback_scopes_second_query_to_owner_lineage(
@@ -1707,9 +1707,11 @@ def test_cmd_advance_explicit_dropped_owner_fallback_scopes_second_query_to_owne
 
     assert rc == 0
     assert len(captured_queries) == 2
-    assert captured_queries[0].owner_task_ids == (owner.id,)
+    assert captured_queries[0].task_ids == (descendant.id,)
+    assert captured_queries[0].owner_task_ids is None
     assert captured_queries[0].exclude_dropped_from_planning is True
-    assert captured_queries[1].owner_task_ids == (owner.id,)
+    assert captured_queries[1].task_ids == (descendant.id,)
+    assert captured_queries[1].owner_task_ids is None
     assert captured_queries[1].exclude_dropped_from_planning is False
     assert "No eligible tasks to advance" in capsys.readouterr().out
 
@@ -1884,6 +1886,80 @@ def test_cmd_advance_explicit_failed_leaf_preloads_only_owner_lineage_refs(
         ref_calls,
         branch_calls,
         requested_branch=requested.branch,
+        unrelated_branches=unrelated_branches,
+    )
+
+
+def test_cmd_advance_explicit_orphan_same_branch_leaf_uses_representative_row(
+    tmp_path: Path,
+    monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "in_progress"
+    impl.branch = "feature/canonical"
+    impl.has_commits = True
+    store.update(impl)
+
+    orphan = store.add("Completed orphan rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert orphan.id is not None
+    orphan.status = "completed"
+    orphan.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    orphan.branch = "feature/orphan"
+    orphan.has_commits = True
+    orphan.merge_status = "unmerged"
+    store.update(orphan)
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    unrelated_branches = tuple(f"feature/orphan-unrelated-{index}" for index in range(2))
+    for index, branch in enumerate(unrelated_branches):
+        _add_completed_impl_with_approved_review(
+            store,
+            branch,
+            when=datetime(2026, 5, 12, 11 + index, 0, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, orphan.id)), "dry_run": True}))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Needs attention (1 task):" in output
+    assert f'{impl.id} implement "Implement feature"' in output
+    assert "reason=no-descendant-on-the-impl-branch" in output
+    assert "pending command evaluation" not in output
+    _assert_scoped_preload_refs(
+        ref_calls,
+        branch_calls,
+        requested_branch=impl.branch,
         unrelated_branches=unrelated_branches,
     )
 
