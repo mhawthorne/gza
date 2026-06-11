@@ -870,7 +870,7 @@ def test_query_lineage_owner_rows_promotes_completed_plan_descendant_over_explor
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == plan.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "create_implement"
+    assert row.next_action["type"] == "create_plan_review"
 
 
 def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human(tmp_path: Path) -> None:

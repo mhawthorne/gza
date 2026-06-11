@@ -3,6 +3,7 @@
 
 import argparse
 import io
+import json
 import os
 import re
 import signal as signal_mod
@@ -4681,6 +4682,263 @@ class TestImplementCommand:
         assert refreshed is not None
         assert refreshed.auto_implement is True
 
+    def test_implement_prefers_approved_plan_review_manifest(self, tmp_path: Path):
+        """Manual implement should materialize approved slices instead of one legacy task."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\n"
+            "Verdict: APPROVED\n\n"
+            "## Slice Manifest\n"
+            "```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan_task.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Implement foundation slice.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]},"
+            "{\"slice_id\":\"S2\",\"title\":\"Follow-up\",\"prompt\":\"Implement follow-up slice.\","
+            "\"scope\":[\"Add executor\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Executor works\"],"
+            "\"depends_on_slices\":[\"S1\"],\"based_on_slice\":\"S1\",\"review_scope\":\"Follow-up only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-b\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        created = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(created) == 2
+        created.sort(key=lambda task: task_id_numeric_key(task.id))
+        assert created[0].based_on == plan_task.id
+        assert created[0].depends_on is None
+        assert "Implement foundation slice." in created[0].prompt
+        assert created[1].depends_on == created[0].id
+        assert created[1].based_on == created[0].id
+        assert created[1].same_branch is True
+        assert "Implement follow-up slice." in created[1].prompt
+        assert "Created implement task" in result.stdout
+
+    def test_implement_queue_reuses_existing_materialized_slices(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\n"
+            "Verdict: APPROVED\n\n"
+            "## Slice Manifest\n"
+            "```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan_task.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Implement foundation slice.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        first = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        second = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert first.returncode == 0
+        assert second.returncode == 0
+        created = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(created) == 1
+        assert "Created implement task" in first.stdout
+        assert "Reused implement task" in second.stdout
+        assert "Created implement task" not in second.stdout
+
+    def test_cmd_implement_reused_materialized_slices_survive_prepare_failure(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_implement
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\n"
+            "Verdict: APPROVED\n\n"
+            "## Slice Manifest\n"
+            "```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan_task.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Implement foundation slice.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]},"
+            "{\"slice_id\":\"S2\",\"title\":\"Follow-up\",\"prompt\":\"Implement follow-up slice.\","
+            "\"scope\":[\"Add executor\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Executor works\"],"
+            "\"depends_on_slices\":[\"S1\"],\"based_on_slice\":\"S1\",\"review_scope\":\"Follow-up only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-b\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        first = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0
+
+        created = [task for task in store.get_all() if task.task_type == "implement"]
+        created.sort(key=lambda task: task_id_numeric_key(task.id))
+        assert len(created) == 2
+        original_ids = [task.id for task in created]
+
+        materialization_artifacts = store.list_artifacts(review.id, kind="plan_review_materialization")
+        assert len(materialization_artifacts) == 1
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            plan_task_id=plan_task.id,
+            prompt=None,
+            group=None,
+            depends_on=None,
+            review=False,
+            same_branch=False,
+            branch_type=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            review_scope=None,
+            background=False,
+            queue=False,
+            force=False,
+            create_pr=False,
+        )
+
+        with patch(
+            "gza.cli._common.prepare_task_startup_phase",
+            side_effect=RuntimeError("startup exploded"),
+        ):
+            rc = cmd_implement(args)
+
+        assert rc == 1
+        refreshed = [store.get(task_id) for task_id in original_ids]
+        assert all(task is not None for task in refreshed)
+        assert [task.id for task in refreshed if task is not None] == original_ids
+        assert all(task.status == "pending" for task in refreshed if task is not None)
+        assert store.list_artifacts(review.id, kind="plan_review_materialization") == materialization_artifacts
+
+    def test_cmd_implement_capacity_failure_leaves_no_materialized_slices(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_implement
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        store = make_store(tmp_path)
+
+        running = store.add("Running task", task_type="implement")
+        running.status = "in_progress"
+        running.running_pid = os.getpid()
+        store.update(running)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\n"
+            "Verdict: APPROVED\n\n"
+            "## Slice Manifest\n"
+            "```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan_task.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Implement foundation slice.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            plan_task_id=plan_task.id,
+            prompt=None,
+            group=None,
+            depends_on=None,
+            review=False,
+            same_branch=False,
+            branch_type=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            review_scope=None,
+            background=False,
+            queue=False,
+            force=False,
+            create_pr=False,
+        )
+
+        rc = cmd_implement(args)
+
+        assert rc == 1
+        assert len([task for task in store.get_all() if task.task_type == "implement" and task.id != running.id]) == 0
+
     def test_implement_rejects_depends_on_flag(self, tmp_path: Path):
         """Implement command should fail fast for removed --depends-on flag."""
 
@@ -4706,6 +4964,285 @@ class TestImplementCommand:
 
         assert result.returncode == 2
         assert "unrecognized arguments: --depends-on" in result.stderr
+
+
+class TestPlanReviewAndImproveCommands:
+    def test_plan_review_queue_creates_branchless_review_task(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        result = run_gza("plan-review", str(plan.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        created = get_latest_task(store, task_type="plan_review", depends_on=plan.id)
+        assert created is not None
+        assert created.based_on is None
+        assert "Created plan review task" in result.stdout
+
+    def test_plan_review_background_spawns_worker(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        with patch("gza.cli.execution._spawn_background_worker", return_value=0) as spawn_background:
+            result = run_gza(
+                "plan-review",
+                str(plan.id),
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        created = get_latest_task(store, task_type="plan_review", depends_on=plan.id)
+        assert created is not None
+        spawn_background.assert_called_once()
+        assert spawn_background.call_args.kwargs["task_id"] == created.id
+
+    def test_cmd_plan_review_edit_slices_and_materialize_by_review_id(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_plan_review
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Original prompt.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        def _write_override(cmd: list[str]) -> SimpleNamespace:
+            path = Path(cmd[-1])
+            edited = json.loads(path.read_text())
+            edited["slices"][0]["prompt"] = "Edited prompt."
+            path.write_text(json.dumps(edited, indent=2))
+            return SimpleNamespace(returncode=0)
+
+        edit_args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            task_id=review.id,
+            rerun=False,
+            edit_slices=True,
+            materialize=False,
+            queue=False,
+            background=False,
+            model=None,
+            provider=None,
+            force=False,
+        )
+        materialize_args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            task_id=review.id,
+            rerun=False,
+            edit_slices=False,
+            materialize=True,
+            queue=False,
+            background=False,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._launch_editor", side_effect=_write_override):
+            assert cmd_plan_review(edit_args) == 0
+
+        assert cmd_plan_review(materialize_args) == 0
+        assert cmd_plan_review(materialize_args) == 0
+
+        created = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(created) == 1
+        assert "Edited prompt." in created[0].prompt
+
+    def test_cmd_plan_review_edit_slices_invalid_manifest_creates_no_tasks(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_plan_review
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Original prompt.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+
+        def _write_invalid_override(cmd: list[str]) -> SimpleNamespace:
+            path = Path(cmd[-1])
+            edited = json.loads(path.read_text())
+            edited["slices"][0]["acceptance_criteria"] = []
+            path.write_text(json.dumps(edited, indent=2))
+            return SimpleNamespace(returncode=0)
+
+        edit_args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            task_id=review.id,
+            rerun=False,
+            edit_slices=True,
+            materialize=False,
+            queue=False,
+            background=False,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        with patch("gza.cli.execution._launch_editor", side_effect=_write_invalid_override):
+            assert cmd_plan_review(edit_args) == 1
+
+        assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
+
+    def test_plan_improve_queue_creates_revised_plan_task(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        result = run_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        created = get_latest_task(store, task_type="plan_improve", depends_on=review.id, based_on=plan.id)
+        assert created is not None
+        assert "Created plan improve task" in result.stdout
+
+    def test_plan_improve_background_spawns_worker(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        with patch("gza.cli.execution._spawn_background_worker", return_value=0) as spawn_background:
+            result = run_gza(
+                "plan-improve",
+                str(review.id),
+                "--background",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        created = get_latest_task(store, task_type="plan_improve", depends_on=review.id, based_on=plan.id)
+        assert created is not None
+        spawn_background.assert_called_once()
+        assert spawn_background.call_args.kwargs["task_id"] == created.id
+
+    @pytest.mark.parametrize(
+        ("status", "output_content", "expected_fragment"),
+        [
+            ("pending", None, "requires a completed CHANGES_REQUESTED plan_review"),
+            ("in_progress", None, "requires a completed CHANGES_REQUESTED plan_review"),
+            ("completed", "## Verdict\n\nVerdict: APPROVED\n", "has verdict APPROVED"),
+        ],
+    )
+    def test_plan_improve_rejects_non_changes_requested_review_states(
+        self,
+        tmp_path: Path,
+        status: str,
+        output_content: str | None,
+        expected_fragment: str,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        review.status = status
+        if status == "completed":
+            review.completed_at = datetime.now(UTC)
+        elif status == "in_progress":
+            review.started_at = datetime.now(UTC)
+        review.output_content = output_content
+        store.update(review)
+
+        result = run_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert expected_fragment in result.stdout
+        assert [task for task in store.get_all() if task.task_type == "plan_improve"] == []
 
 
 class TestImproveCommand:

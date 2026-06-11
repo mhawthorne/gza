@@ -18,6 +18,7 @@ from ..concurrency import (
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git, GitError
+from ..plan_review_verdict import PlanReviewManifest
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
 from ..review_verdict import is_verify_blocked_only_review
 from ..runner import (
@@ -34,7 +35,13 @@ from ..runner import (
     _task_is_cross_project,
     _worktree_execution_dir,
 )
-from ._common import _create_improve_task, _create_retry_task, _prepare_task_for_reserved_launch, resolve_improve_action
+from ._common import (
+    PlanReviewMaterializationResult,
+    _create_improve_task,
+    _create_retry_task,
+    _prepare_task_for_reserved_launch,
+    resolve_improve_action,
+)
 from .advance_engine import (
     classify_advance_action,
     failed_recovery_decision_to_attention_action,
@@ -92,6 +99,9 @@ class AdvanceActionExecutionContext:
     ] | None = None
     spawn_iterate_recovery: Callable[[DbTask, Literal["resume", "retry"], DbTask], int] | None = None
     create_retry_task: Callable[[DbTask], DbTask] | None = None
+    create_plan_review_task: Callable[[DbTask], DbTask] | None = None
+    create_plan_improve_task: Callable[[DbTask, DbTask], DbTask] | None = None
+    materialize_plan_slices: Callable[[DbTask, DbTask, PlanReviewManifest], PlanReviewMaterializationResult] | None = None
     create_targeted_rebase_task: Callable[[DbTask, str], DbTask] | None = None
     reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
     config: Any | None = None
@@ -178,6 +188,11 @@ def _fresh_verify_resolves_verify_only_review(
 
 _WORKER_ACTIONS = frozenset(
     {
+        "create_plan_review",
+        "run_plan_review",
+        "create_plan_improve",
+        "run_plan_improve",
+        "materialize_plan_slices",
         "create_review",
         "run_review",
         "verify_noop_improve_then_review",
@@ -767,6 +782,238 @@ def execute_advance_action(
     )
     if iterate_routed_result is not None:
         return iterate_routed_result
+
+    if action_type == "create_plan_review":
+        if task.id is None:
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing task id")
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Create plan review"),
+                worker_consuming=True,
+                work_done=True,
+            )
+
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="plan_review",
+        )
+        if blocked is not None:
+            return blocked
+        if context.create_plan_review_task is None:
+            if permit is not None:
+                permit.release()
+            return AdvanceActionExecutionResult(action_type=action_type, status="error", message="plan review creation is unavailable")
+        plan_review_task = context.create_plan_review_task(task)
+        prepared_plan_review_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=plan_review_task,
+            worker_label="plan_review",
+            rollback_on_failure=True,
+            permit=permit,
+        )
+        if prepared_plan_review_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_plan_review_task.id is not None
+
+        rc = context.spawn_worker(prepared_plan_review_task, "plan_review")
+        _release_reserved_launch_if_left(prepared_plan_review_task)
+        result = _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_plan_review_task.id,
+            worker_label="plan_review",
+            created_task=prepared_plan_review_task,
+        )
+        result.success_message = f"Created plan review task {prepared_plan_review_task.id}"
+        return result
+
+    if action_type == "run_plan_review":
+        pending_plan_review_task = action.get("plan_review_task")
+        if not isinstance(pending_plan_review_task, DbTask) or pending_plan_review_task.id is None:
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing plan review task")
+        plan_review_task = pending_plan_review_task
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Run plan review"),
+                worker_consuming=True,
+                work_done=True,
+                handled_task_id=plan_review_task.id,
+                created_task=plan_review_task,
+            )
+
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="plan_review",
+        )
+        if blocked is not None:
+            return blocked
+        prepared_plan_review_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=plan_review_task,
+            worker_label="plan_review",
+            rollback_on_failure=False,
+            permit=permit,
+        )
+        if prepared_plan_review_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_plan_review_task.id is not None
+
+        rc = context.spawn_worker(prepared_plan_review_task, "plan_review")
+        _release_reserved_launch_if_left(prepared_plan_review_task)
+        return _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_plan_review_task.id,
+            worker_label="plan_review",
+            created_task=prepared_plan_review_task,
+        )
+
+    if action_type == "create_plan_improve":
+        review_task = action.get("plan_review_task")
+        plan_source_task = action.get("plan_source_task")
+        if (
+            not isinstance(review_task, DbTask)
+            or review_task.id is None
+            or not isinstance(plan_source_task, DbTask)
+            or plan_source_task.id is None
+        ):
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing plan improve inputs")
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Create plan improve"),
+                worker_consuming=True,
+                work_done=True,
+            )
+
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="plan_improve",
+        )
+        if blocked is not None:
+            return blocked
+        if context.create_plan_improve_task is None:
+            if permit is not None:
+                permit.release()
+            return AdvanceActionExecutionResult(action_type=action_type, status="error", message="plan improve creation is unavailable")
+        plan_improve_task = context.create_plan_improve_task(plan_source_task, review_task)
+        prepared_plan_improve_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=plan_improve_task,
+            worker_label="plan_improve",
+            rollback_on_failure=True,
+            permit=permit,
+        )
+        if prepared_plan_improve_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_plan_improve_task.id is not None
+
+        rc = context.spawn_worker(prepared_plan_improve_task, "plan_improve")
+        _release_reserved_launch_if_left(prepared_plan_improve_task)
+        result = _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_plan_improve_task.id,
+            worker_label="plan_improve",
+            created_task=prepared_plan_improve_task,
+        )
+        result.success_message = f"Created plan improve task {prepared_plan_improve_task.id}"
+        return result
+
+    if action_type == "run_plan_improve":
+        pending_plan_improve_task = action.get("plan_improve_task")
+        if not isinstance(pending_plan_improve_task, DbTask) or pending_plan_improve_task.id is None:
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing plan improve task")
+        plan_improve_task = pending_plan_improve_task
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Run plan improve"),
+                worker_consuming=True,
+                work_done=True,
+                handled_task_id=plan_improve_task.id,
+                created_task=plan_improve_task,
+            )
+
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="plan_improve",
+        )
+        if blocked is not None:
+            return blocked
+        prepared_plan_improve_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=plan_improve_task,
+            worker_label="plan_improve",
+            rollback_on_failure=False,
+            permit=permit,
+        )
+        if prepared_plan_improve_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_plan_improve_task.id is not None
+
+        rc = context.spawn_worker(prepared_plan_improve_task, "plan_improve")
+        _release_reserved_launch_if_left(prepared_plan_improve_task)
+        return _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_plan_improve_task.id,
+            worker_label="plan_improve",
+            created_task=prepared_plan_improve_task,
+        )
+
+    if action_type == "materialize_plan_slices":
+        review_task = action.get("plan_review_task")
+        plan_source_task = action.get("plan_source_task")
+        manifest = action.get("manifest")
+        if (
+            not isinstance(review_task, DbTask)
+            or review_task.id is None
+            or not isinstance(plan_source_task, DbTask)
+            or plan_source_task.id is None
+            or not isinstance(manifest, PlanReviewManifest)
+        ):
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing plan materialization inputs")
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Materialize plan slices"),
+                work_done=True,
+            )
+
+        if context.materialize_plan_slices is None:
+            return AdvanceActionExecutionResult(action_type=action_type, status="error", message="plan slice materialization is unavailable")
+        materialization = context.materialize_plan_slices(plan_source_task, review_task, manifest)
+        created_tasks = materialization.tasks
+        created_ids = ", ".join(task.id or "unknown" for task in created_tasks)
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            message=f"Materialized implementation slices: {created_ids}",
+            success_message=f"Materialized implementation slices: {created_ids}",
+            work_done=bool(created_tasks),
+            handled_task_id=review_task.id,
+            created_task=created_tasks[0] if created_tasks else None,
+        )
 
     if action_type == "create_review":
         if task.id is None:

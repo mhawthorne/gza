@@ -7,7 +7,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +35,7 @@ __all__ = [
     "InvalidTaskIdError",
     "ManualMigrationRequired",
     "MergeTargetResolutionError",
+    "NewTaskParams",
     "SchemaIntegrityError",
     "Task",
     "TaskArtifact",
@@ -380,7 +381,7 @@ class Task:
     id: str | None  # None for unsaved tasks; project-prefixed decimal (e.g. "gza-1234")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
-    task_type: str = "implement"  # explore, plan, implement, review, improve, rebase, internal
+    task_type: str = "implement"  # task, explore, plan, plan_review, plan_improve, implement, review, improve, fix, rebase, internal
     slug: str | None = None  # YYYYMMDD-slug format (DB column: slug, was task_id)
     branch: str | None = None
     log_file: str | None = None
@@ -543,6 +544,35 @@ class TaskArtifact:
     exit_status: str | None = None
     head_sha: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class NewTaskParams:
+    """Parameters for creating one task inside a shared write transaction."""
+
+    prompt: str
+    task_id: str | None = None
+    task_type: str = "implement"
+    based_on: str | None = None
+    group: str | None = None
+    tags: tuple[str, ...] = ()
+    depends_on: str | None = None
+    spec: str | None = None
+    review_scope: str | None = None
+    create_review: bool = False
+    auto_implement: bool = True
+    create_pr: bool = False
+    same_branch: bool = False
+    base_branch: str | None = None
+    task_type_hint: str | None = None
+    model: str | None = None
+    provider: str | None = None
+    provider_is_explicit: bool | None = None
+    model_is_explicit: bool | None = None
+    recovery_origin: str | None = None
+    trigger_source: str | None = None
+    urgent: bool = False
+    skip_learnings: bool = False
 
 
 @dataclass(frozen=True)
@@ -3700,57 +3730,87 @@ class SqliteTaskStore:
         skip_learnings: bool = False,
     ) -> Task:
         """Add a new task. Returns the created Task with its generated string ID."""
+        params = NewTaskParams(
+            prompt=prompt,
+            task_type=task_type,
+            based_on=based_on,
+            group=group,
+            tags=tuple(tags or ()),
+            depends_on=depends_on,
+            spec=spec,
+            review_scope=review_scope,
+            create_review=create_review,
+            auto_implement=auto_implement,
+            create_pr=create_pr,
+            same_branch=same_branch,
+            base_branch=base_branch,
+            task_type_hint=task_type_hint,
+            model=model,
+            provider=provider,
+            provider_is_explicit=provider_is_explicit,
+            model_is_explicit=model_is_explicit,
+            recovery_origin=recovery_origin,
+            trigger_source=trigger_source,
+            urgent=urgent,
+            skip_learnings=skip_learnings,
+        )
+        with self._connect() as conn:
+            return self._add_task_conn(conn, params)
+
+    def _add_task_conn(self, conn: sqlite3.Connection, params: NewTaskParams) -> Task:
+        """Insert one task using an already-open connection."""
         now = _format_db_timestamp(datetime.now(UTC))
         assert now is not None
-        normalized_tags = _normalize_tags(tags)
-        if group is not None:
-            normalized_tags = _normalize_tags((*normalized_tags, group))
+        normalized_tags = _normalize_tags(params.tags)
+        if params.group is not None:
+            normalized_tags = _normalize_tags((*normalized_tags, params.group))
         persisted_group = normalized_tags[0] if len(normalized_tags) == 1 else None
+        provider_is_explicit = params.provider_is_explicit
         if provider_is_explicit is None:
-            provider_is_explicit = provider is not None
+            provider_is_explicit = params.provider is not None
+        model_is_explicit = params.model_is_explicit
         if model_is_explicit is None:
-            model_is_explicit = model is not None
-        with self._connect() as conn:
-            new_id = self._next_id(conn)
-            conn.execute(
-                """
-                INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    self._project_id,
-                    new_id,
-                    prompt,
-                    task_type,
-                    based_on,
-                    now,
-                    persisted_group,
-                    depends_on,
-                    spec,
-                    review_scope,
-                    1 if create_review else 0,
-                    1 if auto_implement else 0,
-                    1 if create_pr else 0,
-                    1 if same_branch else 0,
-                    base_branch,
-                    task_type_hint,
-                    model,
-                    provider,
-                    1 if provider_is_explicit else 0,
-                    1 if model_is_explicit else 0,
-                    recovery_origin,
-                    trigger_source,
-                    1 if urgent else 0,
-                    1 if skip_learnings else 0,
-                ),
-            )
-            self._replace_task_tags_conn(conn, new_id, normalized_tags)
-            row = conn.execute(
-                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
-                (self._project_id, new_id),
-            ).fetchone()
-            assert row is not None
-            return self._rows_to_tasks(conn, [row])[0]
+            model_is_explicit = params.model is not None
+        new_id = params.task_id or self._next_id(conn)
+        conn.execute(
+            """
+            INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self._project_id,
+                new_id,
+                params.prompt,
+                params.task_type,
+                params.based_on,
+                now,
+                persisted_group,
+                params.depends_on,
+                params.spec,
+                params.review_scope,
+                1 if params.create_review else 0,
+                1 if params.auto_implement else 0,
+                1 if params.create_pr else 0,
+                1 if params.same_branch else 0,
+                params.base_branch,
+                params.task_type_hint,
+                params.model,
+                params.provider,
+                1 if provider_is_explicit else 0,
+                1 if model_is_explicit else 0,
+                params.recovery_origin,
+                params.trigger_source,
+                1 if params.urgent else 0,
+                1 if params.skip_learnings else 0,
+            ),
+        )
+        self._replace_task_tags_conn(conn, new_id, normalized_tags)
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+            (self._project_id, new_id),
+        ).fetchone()
+        assert row is not None
+        return self._rows_to_tasks(conn, [row])[0]
 
     def get(self, task_id: str) -> Task | None:
         """Get a task by its string ID (e.g. 'gza-1234')."""
@@ -4699,103 +4759,226 @@ class SqliteTaskStore:
         artifact_id: int | None = None,
     ) -> TaskArtifact:
         """Insert or update one task artifact row and return the canonical stored record."""
+        with self._connect() as conn:
+            return self._add_artifact_conn(
+                conn,
+                task_id,
+                kind=kind,
+                label=label,
+                path=path,
+                content_type=content_type,
+                byte_size=byte_size,
+                sha256=sha256,
+                created_at=created_at,
+                producer=producer,
+                command=command,
+                status=status,
+                exit_status=exit_status,
+                head_sha=head_sha,
+                metadata=metadata,
+                artifact_id=artifact_id,
+            )
+
+    def _add_artifact_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        kind: str,
+        label: str | None = None,
+        path: str,
+        content_type: str = "text/plain; charset=utf-8",
+        byte_size: int,
+        sha256: str,
+        created_at: datetime | None = None,
+        producer: str | None = None,
+        command: str | None = None,
+        status: str | None = None,
+        exit_status: str | None = None,
+        head_sha: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        artifact_id: int | None = None,
+    ) -> TaskArtifact:
+        """Insert or update one task artifact row using an already-open connection."""
         created_at_text = _format_db_timestamp(created_at or datetime.now(UTC))
         assert created_at_text is not None
         normalized_path = normalize_artifact_path(path)
         metadata_json = json.dumps(metadata, sort_keys=True) if metadata is not None else None
-        with self._connect() as conn:
-            if artifact_id is None:
-                cur = conn.execute(
-                    """
-                    INSERT INTO task_artifacts(
-                        project_id,
-                        task_id,
-                        kind,
-                        label,
-                        path,
-                        content_type,
-                        byte_size,
-                        sha256,
-                        created_at,
-                        producer,
-                        command,
-                        status,
-                        exit_status,
-                        head_sha,
-                        metadata_json
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        self._project_id,
-                        task_id,
-                        kind,
-                        label,
-                        normalized_path,
-                        content_type,
-                        byte_size,
-                        sha256,
-                        created_at_text,
-                        producer,
-                        command,
-                        status,
-                        exit_status,
-                        head_sha,
-                        metadata_json,
-                    ),
-                )
-                assert cur.lastrowid is not None
-                resolved_id = int(cur.lastrowid)
-            else:
-                conn.execute(
-                    """
-                    UPDATE task_artifacts
-                    SET kind = ?,
-                        label = ?,
-                        path = ?,
-                        content_type = ?,
-                        byte_size = ?,
-                        sha256 = ?,
-                        created_at = ?,
-                        producer = ?,
-                        command = ?,
-                        status = ?,
-                        exit_status = ?,
-                        head_sha = ?,
-                        metadata_json = ?
-                    WHERE project_id = ? AND task_id = ? AND id = ?
-                    """,
-                    (
-                        kind,
-                        label,
-                        normalized_path,
-                        content_type,
-                        byte_size,
-                        sha256,
-                        created_at_text,
-                        producer,
-                        command,
-                        status,
-                        exit_status,
-                        head_sha,
-                        metadata_json,
-                        self._project_id,
-                        task_id,
-                        artifact_id,
-                    ),
-                )
-                resolved_id = artifact_id
-            row = conn.execute(
+        if artifact_id is None:
+            cur = conn.execute(
                 """
-                SELECT *
-                FROM task_artifacts
+                INSERT INTO task_artifacts(
+                    project_id,
+                    task_id,
+                    kind,
+                    label,
+                    path,
+                    content_type,
+                    byte_size,
+                    sha256,
+                    created_at,
+                    producer,
+                    command,
+                    status,
+                    exit_status,
+                    head_sha,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._project_id,
+                    task_id,
+                    kind,
+                    label,
+                    normalized_path,
+                    content_type,
+                    byte_size,
+                    sha256,
+                    created_at_text,
+                    producer,
+                    command,
+                    status,
+                    exit_status,
+                    head_sha,
+                    metadata_json,
+                ),
+            )
+            assert cur.lastrowid is not None
+            resolved_id = int(cur.lastrowid)
+        else:
+            conn.execute(
+                """
+                UPDATE task_artifacts
+                SET kind = ?,
+                    label = ?,
+                    path = ?,
+                    content_type = ?,
+                    byte_size = ?,
+                    sha256 = ?,
+                    created_at = ?,
+                    producer = ?,
+                    command = ?,
+                    status = ?,
+                    exit_status = ?,
+                    head_sha = ?,
+                    metadata_json = ?
                 WHERE project_id = ? AND task_id = ? AND id = ?
                 """,
-                (self._project_id, task_id, resolved_id),
-            ).fetchone()
+                (
+                    kind,
+                    label,
+                    normalized_path,
+                    content_type,
+                    byte_size,
+                    sha256,
+                    created_at_text,
+                    producer,
+                    command,
+                    status,
+                    exit_status,
+                    head_sha,
+                    metadata_json,
+                    self._project_id,
+                    task_id,
+                    artifact_id,
+                ),
+            )
+            resolved_id = artifact_id
+        row = conn.execute(
+            """
+            SELECT *
+            FROM task_artifacts
+            WHERE project_id = ? AND task_id = ? AND id = ?
+            """,
+            (self._project_id, task_id, resolved_id),
+        ).fetchone()
         artifact = self._row_to_task_artifact(row)
         assert artifact is not None
         return artifact
+
+    def add_tasks_with_artifact_atomic(
+        self,
+        *,
+        tasks: Iterable[NewTaskParams],
+        artifact_task_id: str,
+        artifact_kind: str,
+        artifact_label: str | None,
+        artifact_path: str,
+        artifact_byte_size: int,
+        artifact_sha256: str,
+        artifact_content_type: str = "text/plain; charset=utf-8",
+        artifact_created_at: datetime | None = None,
+        artifact_producer: str | None = None,
+        artifact_command: str | None = None,
+        artifact_status: str | None = None,
+        artifact_exit_status: str | None = None,
+        artifact_head_sha: str | None = None,
+        artifact_metadata: dict[str, Any] | None = None,
+        artifact_metadata_builder: Callable[[list[Task]], dict[str, Any] | None] | None = None,
+    ) -> list[Task]:
+        """Create many tasks and an artifact row in one transaction."""
+        task_params = list(tasks)
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            allocated_ids = [self._next_id(conn) for _ in task_params]
+            resolved_task_params: list[NewTaskParams] = []
+            for index, params in enumerate(task_params):
+                depends_on = params.depends_on
+                if isinstance(depends_on, str) and depends_on.startswith("__new_task_idx__:"):
+                    depends_on = allocated_ids[int(depends_on.split(":", 1)[1])]
+                based_on = params.based_on
+                if isinstance(based_on, str) and based_on.startswith("__new_task_idx__:"):
+                    based_on = allocated_ids[int(based_on.split(":", 1)[1])]
+                resolved_task_params.append(
+                    NewTaskParams(
+                        prompt=params.prompt,
+                        task_id=allocated_ids[index],
+                        task_type=params.task_type,
+                        based_on=based_on,
+                        group=params.group,
+                        tags=params.tags,
+                        depends_on=depends_on,
+                        spec=params.spec,
+                        review_scope=params.review_scope,
+                        create_review=params.create_review,
+                        auto_implement=params.auto_implement,
+                        create_pr=params.create_pr,
+                        same_branch=params.same_branch,
+                        base_branch=params.base_branch,
+                        task_type_hint=params.task_type_hint,
+                        model=params.model,
+                        provider=params.provider,
+                        provider_is_explicit=params.provider_is_explicit,
+                        model_is_explicit=params.model_is_explicit,
+                        recovery_origin=params.recovery_origin,
+                        trigger_source=params.trigger_source,
+                        urgent=params.urgent,
+                        skip_learnings=params.skip_learnings,
+                    )
+                )
+            created_tasks = [self._add_task_conn(conn, params) for params in resolved_task_params]
+            resolved_artifact_metadata = artifact_metadata
+            if artifact_metadata_builder is not None:
+                resolved_artifact_metadata = artifact_metadata_builder(created_tasks)
+            self._add_artifact_conn(
+                conn,
+                artifact_task_id,
+                kind=artifact_kind,
+                label=artifact_label,
+                path=artifact_path,
+                content_type=artifact_content_type,
+                byte_size=artifact_byte_size,
+                sha256=artifact_sha256,
+                created_at=artifact_created_at,
+                producer=artifact_producer,
+                command=artifact_command,
+                status=artifact_status,
+                exit_status=artifact_exit_status,
+                head_sha=artifact_head_sha,
+                metadata=resolved_artifact_metadata,
+            )
+            return created_tasks
 
     def list_artifacts(self, task_id: str, kind: str | None = None) -> list[TaskArtifact]:
         """Return artifacts for one task, newest first."""

@@ -6,10 +6,11 @@ import os
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +18,7 @@ from typing import Any, Literal
 from ..advance_engine import (
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
+    _resolve_latest_plan_source,
     count_completed_review_cycles,
 )
 from ..concurrency import (
@@ -39,6 +41,7 @@ from ..db import (
     InvalidTaskIdError,
     SqliteTaskStore,
     Task as DbTask,
+    _launch_editor,
     _normalize_tags,
     add_task_interactive,
     edit_task_interactive,
@@ -62,6 +65,7 @@ from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
+from ..plan_review_verdict import get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
 from ..query import (
     get_base_task_slug as _get_base_task_slug,
@@ -79,6 +83,7 @@ from ..recovery_engine import (
 )
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, remove_task_startup_artifacts
+from ..task_types import CLI_ADD_TASK_TYPES
 from ..workers import WorkerRegistry
 from ._common import (
     _REUSE_WORKER_OWNER_ENV,
@@ -86,14 +91,19 @@ from ._common import (
     _REUSE_WORKER_REENTRY_ENV,
     _REUSE_WORKER_SESSION_ENV,
     DuplicateReviewError,
+    PlanReviewMaterializationResult,
     _allow_pr_required_retry,
     _create_implementation_task_from_source,
     _create_improve_task,
     _create_or_reuse_followup_tasks,
+    _create_plan_improve_task,
+    _create_plan_review_task,
     _create_rebase_task,
     _create_resume_task,
     _create_retry_task,
     _create_review_task,
+    _materialize_plan_review_slices,
+    _plan_review_timeout_budget_minutes,
     _prepare_task_for_immediate_execution,
     _prepare_task_for_reserved_launch,
     _resolved_review_scope_metadata,
@@ -109,9 +119,11 @@ from ._common import (
     get_store,
     get_task_step_count,
     parse_cli_tag_filters,
+    persist_plan_review_override_manifest,
     phase1_error,
     print_phase1_message,
     resolve_comments_improve_action,
+    resolve_effective_plan_review_manifest,
     resolve_id,
     resolve_improve_action,
     run_with_recovery,
@@ -970,6 +982,391 @@ def cmd_run_inline(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_plan_review(args: argparse.Namespace) -> int:
+    """Create or reuse a plan-review task for a completed plan source and optionally run it."""
+    config = Config.load(args.project_dir)
+    if hasattr(args, "no_docker") and args.no_docker:
+        config.use_docker = False
+
+    if hasattr(args, "max_turns") and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    store = get_store(config)
+    plan_source_id = resolve_id(config, args.task_id)
+    plan_source_task = store.get(plan_source_id)
+    if plan_source_task is None:
+        return phase1_error(args, f"Task {plan_source_id} not found")
+    if getattr(args, "edit_slices", False) or getattr(args, "materialize", False):
+        return _cmd_plan_review_manifest_action(args, config=config, store=store, review_task=plan_source_task)
+    if plan_source_task.task_type not in {"plan", "plan_improve"}:
+        return phase1_error(
+            args,
+            f"Task {plan_source_task.id} is a {plan_source_task.task_type} task. "
+            "Expected a completed plan or plan_improve task.",
+        )
+    if plan_source_task.status != "completed":
+        return phase1_error(
+            args,
+            f"Task {plan_source_task.id} is {plan_source_task.status}. "
+            "Plan review requires a completed plan source.",
+        )
+
+    reserved_launch = _reserve_immediate_execution_permit(args=args, config=config, store=store)
+    if reserved_launch is False:
+        return 1
+
+    with _release_reserved_launch_unless_transferred(reserved_launch) as mark_launch_transferred:
+        existing_review = None if getattr(args, "rerun", False) else _latest_non_dropped_plan_review_for_source(
+            store,
+            plan_source_task,
+        )
+        if existing_review is not None and existing_review.status == "completed":
+            print_phase1_message(
+                args,
+                f"Plan review {existing_review.id} already completed for {plan_source_task.id}. "
+                "Use --rerun to create a new review attempt.",
+            )
+            return 0
+
+        if existing_review is not None:
+            plan_review_task = existing_review
+            created_new_review = False
+            action_message = f"Reusing {existing_review.status} plan review task {existing_review.id}"
+        else:
+            model = args.model if hasattr(args, "model") and args.model else None
+            provider = args.provider if hasattr(args, "provider") and args.provider else None
+            plan_review_task = _create_plan_review_task(
+                store,
+                plan_source_task,
+                trigger_source="manual",
+                model=model,
+                provider=provider,
+            )
+            created_new_review = True
+            action_message = None
+        assert plan_review_task.id is not None
+
+        def _emit_plan_review_created() -> None:
+            if action_message is not None:
+                print(f"✓ {action_message}")
+            else:
+                print(f"✓ Created plan review task {plan_review_task.id}")
+            print(f"  Plan source: {plan_source_task.id}")
+
+        prepared_plan_review_task, _launch_permit = _finalize_immediate_execution_task(
+            args=args,
+            config=config,
+            rollback_on_failure=created_new_review,
+            task=plan_review_task,
+            emit_created=_emit_plan_review_created,
+            reserved_permit=reserved_launch if isinstance(reserved_launch, LaunchPermit) else None,
+        )
+        if prepared_plan_review_task is None:
+            return 1
+        plan_review_task = prepared_plan_review_task
+        mark_launch_transferred()
+
+    if hasattr(args, "queue") and args.queue:
+        return 0
+
+    if hasattr(args, "background") and args.background:
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [plan_review_task.id]
+        rc = _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=plan_review_task.id,
+            prepared_task=plan_review_task,
+        )
+        release_task_launch_permit(str(plan_review_task.id))
+        return rc
+
+    print(f"\nRunning plan review task {plan_review_task.id}...")
+    rc = _run_foreground(
+        config,
+        task_id=plan_review_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("plan-review"),
+    )
+    release_task_launch_permit(str(plan_review_task.id))
+    return rc
+
+
+def _drop_new_tasks(store: SqliteTaskStore, tasks: list[DbTask]) -> None:
+    for task in tasks:
+        if task.id is None:
+            continue
+        fresh = store.get(task.id)
+        if fresh is None or fresh.status != "pending":
+            continue
+        fresh.status = "dropped"
+        store.update(fresh)
+
+
+def _emit_plan_slice_materialization(
+    materialization: PlanReviewMaterializationResult,
+    *,
+    plan_source_id: str,
+    plan_review_id: str,
+) -> None:
+    verb = "Created" if materialization.created else "Reused"
+    for task in materialization.tasks:
+        print(f"✓ {verb} implement task {task.id}")
+        print(f"  Plan source: {plan_source_id}")
+        print(f"  Plan review: {plan_review_id}")
+
+
+def _edit_plan_review_manifest_file(
+    *,
+    review_task: DbTask,
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temp_path = handle.name
+
+    try:
+        result = _launch_editor([editor, temp_path])
+        if result.returncode != 0:
+            print(f"Error: editor exited with status {result.returncode} for review {review_task.id}")
+            return None
+        with open(temp_path, encoding="utf-8") as handle:
+            edited = json.load(handle)
+    except json.JSONDecodeError as exc:
+        print(f"Error: edited manifest is not valid JSON: {exc}")
+        return None
+    finally:
+        os.unlink(temp_path)
+
+    if not isinstance(edited, dict):
+        print("Error: edited manifest must be a JSON object")
+        return None
+    return edited
+
+
+def _cmd_plan_review_manifest_action(
+    args: argparse.Namespace,
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    review_task: DbTask,
+) -> int:
+    if getattr(args, "rerun", False):
+        return phase1_error(args, "--rerun cannot be combined with --edit-slices or --materialize")
+    if getattr(args, "queue", False) or getattr(args, "background", False):
+        return phase1_error(args, "--queue/--background are not supported with --edit-slices or --materialize")
+    if review_task.task_type != "plan_review":
+        return phase1_error(
+            args,
+            f"Task {review_task.id} is a {review_task.task_type} task. "
+            "Expected a completed plan_review task for manifest override/materialization.",
+        )
+    if review_task.status != "completed":
+        return phase1_error(args, f"Task {review_task.id} is {review_task.status}. Plan review must be completed.")
+    if review_task.depends_on is None:
+        return phase1_error(args, f"Plan review {review_task.id} is missing its plan-source dependency.")
+
+    plan_source_task = store.get(review_task.depends_on)
+    if plan_source_task is None:
+        return phase1_error(args, f"Plan source {review_task.depends_on} for review {review_task.id} was not found.")
+    if plan_source_task.task_type not in {"plan", "plan_improve"}:
+        return phase1_error(
+            args,
+            f"Plan review {review_task.id} depends on {plan_source_task.id} "
+            f"({plan_source_task.task_type}), not a plan source.",
+        )
+
+    manifest, manifest_source = resolve_effective_plan_review_manifest(
+        store,
+        config,
+        review_task=review_task,
+        plan_source_task=plan_source_task,
+    )
+    if manifest is None:
+        return phase1_error(
+            args,
+            f"Plan review {review_task.id} does not have a valid approved slice manifest to override or materialize.",
+        )
+
+    if getattr(args, "edit_slices", False):
+        edited_raw = _edit_plan_review_manifest_file(review_task=review_task, manifest=asdict(manifest))
+        if edited_raw is None:
+            return 1
+        try:
+            validated = validate_plan_review_manifest(
+                edited_raw,
+                markdown_verdict="APPROVED",
+                source_task_id=plan_source_task.id or "",
+                source_task_type=plan_source_task.task_type,
+                max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+                max_plan_slices=getattr(config, "max_plan_slices", None),
+            )
+        except ValueError as exc:
+            print(f"Error: edited manifest is invalid: {exc}")
+            return 1
+        persist_plan_review_override_manifest(
+            store,
+            config,
+            review_task=review_task,
+            plan_source_task=plan_source_task,
+            manifest=validated,
+        )
+        print(f"✓ Saved validated slice override for plan review {review_task.id}")
+        print(f"  Plan source: {plan_source_task.id}")
+        return 0
+
+    materialization = _materialize_plan_review_slices(
+        config,
+        store,
+        plan_source_task,
+        review_task,
+        manifest,
+        trigger_source="manual",
+        require_review_before_merge=getattr(config, "require_review_before_merge", True),
+    )
+    created_ids = ", ".join(task.id or "unknown" for task in materialization.tasks)
+    print(f"✓ Materialized implementation slices for plan review {review_task.id}")
+    print(f"  Manifest source: {manifest_source}")
+    print(f"  Tasks: {created_ids}")
+    return 0
+
+
+def cmd_plan_improve(args: argparse.Namespace) -> int:
+    """Create or reuse a revised-plan task for a plan review and optionally run it."""
+    config = Config.load(args.project_dir)
+    if hasattr(args, "no_docker") and args.no_docker:
+        config.use_docker = False
+
+    if hasattr(args, "max_turns") and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    store = get_store(config)
+    review_task_id = resolve_id(config, args.task_id)
+    review_task = store.get(review_task_id)
+    if review_task is None:
+        return phase1_error(args, f"Task {review_task_id} not found")
+    if review_task.task_type != "plan_review":
+        return phase1_error(
+            args,
+            f"Task {review_task.id} is a {review_task.task_type} task. Expected a plan_review task.",
+        )
+    if review_task.depends_on is None:
+        return phase1_error(args, f"Plan review {review_task.id} is missing its plan-source dependency.")
+
+    plan_source_task = store.get(review_task.depends_on)
+    if plan_source_task is None:
+        return phase1_error(args, f"Plan source {review_task.depends_on} for review {review_task.id} was not found.")
+    if plan_source_task.task_type not in {"plan", "plan_improve"}:
+        return phase1_error(
+            args,
+            f"Plan review {review_task.id} depends on {plan_source_task.id} "
+            f"({plan_source_task.task_type}), not a plan source.",
+        )
+    if review_task.status != "completed":
+        return phase1_error(
+            args,
+            f"Task {review_task.id} is {review_task.status}. plan-improve requires a completed CHANGES_REQUESTED plan_review.",
+        )
+
+    review_outcome = get_plan_review_outcome(
+        Path(config.project_dir),
+        review_task,
+        source_task_id=plan_source_task.id or "",
+        source_task_type=plan_source_task.task_type,
+        max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+    )
+    if review_outcome.verdict != "CHANGES_REQUESTED":
+        verdict_label = review_outcome.verdict or "unavailable"
+        return phase1_error(
+            args,
+            f"Plan review {review_task.id} has verdict {verdict_label}. "
+            "plan-improve requires a completed CHANGES_REQUESTED plan_review.",
+        )
+
+    reserved_launch = _reserve_immediate_execution_permit(args=args, config=config, store=store)
+    if reserved_launch is False:
+        return 1
+
+    with _release_reserved_launch_unless_transferred(reserved_launch) as mark_launch_transferred:
+        existing_improve = _matching_plan_improve_for_review(store, plan_source_task, review_task)
+        if existing_improve is not None and existing_improve.status == "completed":
+            print_phase1_message(
+                args,
+                f"Plan improve {existing_improve.id} already completed for review {review_task.id}.",
+            )
+            return 0
+
+        if existing_improve is not None:
+            plan_improve_task = existing_improve
+            created_new_improve = False
+            action_message = f"Reusing {existing_improve.status} plan improve task {existing_improve.id}"
+        else:
+            model = args.model if hasattr(args, "model") and args.model else None
+            provider = args.provider if hasattr(args, "provider") and args.provider else None
+            plan_improve_task = _create_plan_improve_task(
+                store,
+                plan_source_task,
+                review_task,
+                trigger_source="manual",
+                model=model,
+                provider=provider,
+            )
+            created_new_improve = True
+            action_message = None
+        assert plan_improve_task.id is not None
+
+        def _emit_plan_improve_created() -> None:
+            if action_message is not None:
+                print(f"✓ {action_message}")
+            else:
+                print(f"✓ Created plan improve task {plan_improve_task.id}")
+            print(f"  Plan source: {plan_source_task.id}")
+            print(f"  Review: {review_task.id}")
+
+        prepared_plan_improve_task, _launch_permit = _finalize_immediate_execution_task(
+            args=args,
+            config=config,
+            rollback_on_failure=created_new_improve,
+            task=plan_improve_task,
+            emit_created=_emit_plan_improve_created,
+            reserved_permit=reserved_launch if isinstance(reserved_launch, LaunchPermit) else None,
+        )
+        if prepared_plan_improve_task is None:
+            return 1
+        plan_improve_task = prepared_plan_improve_task
+        mark_launch_transferred()
+
+    if hasattr(args, "queue") and args.queue:
+        return 0
+
+    if hasattr(args, "background") and args.background:
+        worker_args = argparse.Namespace(**vars(args))
+        worker_args.task_ids = [plan_improve_task.id]
+        rc = _spawn_background_worker(
+            worker_args,
+            config,
+            task_id=plan_improve_task.id,
+            prepared_task=plan_improve_task,
+        )
+        release_task_launch_permit(str(plan_improve_task.id))
+        return rc
+
+    print(f"\nRunning plan improve task {plan_improve_task.id}...")
+    rc = _run_foreground(
+        config,
+        task_id=plan_improve_task.id,
+        force=getattr(args, "force", False),
+        invocation=_foreground_command_invocation("plan-improve"),
+    )
+    release_task_launch_permit(str(plan_improve_task.id))
+    return rc
+
+
 def cmd_implement(args: argparse.Namespace) -> int:
     """Create an implementation task from a completed plan task and run it."""
     config = Config.load(args.project_dir)
@@ -992,14 +1389,6 @@ def cmd_implement(args: argparse.Namespace) -> int:
     if plan_task.status != "completed":
         return phase1_error(args, f"Task {plan_task.id} is {plan_task.status}. Plan task must be completed.")
 
-    prompt = args.prompt
-    if not prompt:
-        slug = _get_base_task_slug(plan_task)
-        if slug:
-            prompt = f"Implement plan from task {plan_task.id}: {slug}"
-        else:
-            prompt = f"Implement plan from task {plan_task.id}"
-
     try:
         tags = _selected_tags_for_new_task(args)
     except ValueError as exc:
@@ -1016,7 +1405,107 @@ def cmd_implement(args: argparse.Namespace) -> int:
     if reserved_launch is False:
         return 1
 
-    try:
+    latest_plan_source = _resolve_latest_plan_source(store, plan_task)
+    approved_review = _latest_non_dropped_plan_review_for_source(store, latest_plan_source)
+    approved_manifest = None
+    if approved_review is not None and approved_review.status == "completed" and latest_plan_source.id is not None:
+        approved_manifest, _manifest_source = resolve_effective_plan_review_manifest(
+            store,
+            config,
+            review_task=approved_review,
+            plan_source_task=latest_plan_source,
+        )
+
+    with _release_reserved_launch_unless_transferred(reserved_launch) as mark_launch_transferred:
+        if approved_manifest is not None and approved_review is not None:
+            assert latest_plan_source.id is not None
+            assert approved_review.id is not None
+            plan_source_id = latest_plan_source.id
+            plan_review_id = approved_review.id
+            materialization = _materialize_plan_review_slices(
+                config,
+                store,
+                latest_plan_source,
+                approved_review,
+                approved_manifest,
+                trigger_source="manual",
+                require_review_before_merge=create_review or getattr(config, "require_review_before_merge", True),
+            )
+            if not materialization.tasks:
+                return phase1_error(args, f"Plan review {approved_review.id} did not materialize any implementation slices.")
+            plan_task.auto_implement = True
+            store.update(plan_task)
+
+            if hasattr(args, "queue") and args.queue:
+                _emit_plan_slice_materialization(
+                    materialization,
+                    plan_source_id=plan_source_id,
+                    plan_review_id=plan_review_id,
+                )
+                return 0
+
+            first_task = materialization.tasks[0]
+            assert first_task.id is not None
+
+            def _emit_created() -> None:
+                _emit_plan_slice_materialization(
+                    materialization,
+                    plan_source_id=plan_source_id,
+                    plan_review_id=plan_review_id,
+                )
+
+            prepared_first_task, _launch_permit = _finalize_immediate_execution_task(
+                args=args,
+                config=config,
+                rollback_on_failure=materialization.created,
+                rollback_cleanup=(
+                    (lambda: _drop_new_tasks(store, materialization.tasks))
+                    if materialization.created
+                    else None
+                ),
+                task=first_task,
+                emit_created=_emit_created,
+                reserved_permit=reserved_launch if isinstance(reserved_launch, LaunchPermit) else None,
+            )
+            if prepared_first_task is None:
+                return 1
+            mark_launch_transferred()
+
+            if hasattr(args, "background") and args.background:
+                worker_args = argparse.Namespace(**vars(args))
+                prepared_first_task_id = prepared_first_task.id
+                assert prepared_first_task_id is not None
+                task_ids = [prepared_first_task_id]
+                worker_args.task_ids = task_ids
+                rc = _spawn_background_workers(
+                    worker_args,
+                    config,
+                    prepared_tasks={prepared_first_task_id: prepared_first_task},
+                )
+                for task_id in task_ids:
+                    release_task_launch_permit(str(task_id))
+                return rc
+
+            prepared_first_task_id = prepared_first_task.id
+            assert prepared_first_task_id is not None
+            print(f"\nRunning implement task {prepared_first_task_id}...")
+            rc = _run_foreground(
+                config,
+                task_id=prepared_first_task_id,
+                force=getattr(args, "force", False),
+                invocation=_foreground_command_invocation("implement"),
+            )
+            release_task_launch_permit(prepared_first_task_id)
+            return rc
+
+        prompt = args.prompt
+        if not prompt:
+            slug = _get_base_task_slug(plan_task)
+            if slug:
+                prompt = f"Implement plan from task {plan_task.id}: {slug}"
+            else:
+                prompt = f"Implement plan from task {plan_task.id}"
+
         impl_task = _create_implementation_task_from_source(
             store,
             plan_task,
@@ -1032,59 +1521,56 @@ def cmd_implement(args: argparse.Namespace) -> int:
             provider=provider,
             skip_learnings=skip_learnings,
         )
-    except Exception:
-        if isinstance(reserved_launch, LaunchPermit):
-            reserved_launch.release()
-        raise
-    assert impl_task.id is not None
-
-    def _emit_impl_created() -> None:
-        print(f"✓ Created implement task {impl_task.id}")
-        print(f"  Depends on: plan {plan_task.id}")
-
-    prepared_impl_task, _impl_launch_permit = _finalize_immediate_execution_task(
-        args=args,
-        config=config,
-        rollback_on_failure=True,
-        task=impl_task,
-        emit_created=_emit_impl_created,
-        reserved_permit=reserved_launch if isinstance(reserved_launch, LaunchPermit) else None,
-    )
-    if prepared_impl_task is None:
-        return 1
-    impl_task = prepared_impl_task
-
-    plan_task.auto_implement = True
-    store.update(plan_task)
-
-    # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
-        return 0
-
-    # Handle background mode - spawn worker to run the implement task
-    if hasattr(args, 'background') and args.background:
         assert impl_task.id is not None
-        worker_args = argparse.Namespace(**vars(args))
-        worker_args.task_ids = [impl_task.id]
-        rc = _spawn_background_worker(
-            worker_args,
+
+        def _emit_impl_created() -> None:
+            print(f"✓ Created implement task {impl_task.id}")
+            print(f"  Depends on: plan {plan_task.id}")
+
+        prepared_impl_task, _impl_launch_permit = _finalize_immediate_execution_task(
+            args=args,
+            config=config,
+            rollback_on_failure=True,
+            task=impl_task,
+            emit_created=_emit_impl_created,
+            reserved_permit=reserved_launch if isinstance(reserved_launch, LaunchPermit) else None,
+        )
+        if prepared_impl_task is None:
+            return 1
+        impl_task = prepared_impl_task
+        mark_launch_transferred()
+
+        plan_task.auto_implement = True
+        store.update(plan_task)
+
+        # Handle queue mode - add to queue without executing
+        if hasattr(args, 'queue') and args.queue:
+            return 0
+
+        # Handle background mode - spawn worker to run the implement task
+        if hasattr(args, 'background') and args.background:
+            assert impl_task.id is not None
+            worker_args = argparse.Namespace(**vars(args))
+            worker_args.task_ids = [impl_task.id]
+            rc = _spawn_background_worker(
+                worker_args,
+                config,
+                task_id=impl_task.id,
+                prepared_task=impl_task,
+            )
+            release_task_launch_permit(str(impl_task.id))
+            return rc
+
+        # Default: run the implement task immediately
+        print(f"\nRunning implement task {impl_task.id}...")
+        rc = _run_foreground(
             config,
             task_id=impl_task.id,
-            prepared_task=impl_task,
+            force=getattr(args, "force", False),
+            invocation=_foreground_command_invocation("implement"),
         )
         release_task_launch_permit(str(impl_task.id))
         return rc
-
-    # Default: run the implement task immediately
-    print(f"\nRunning implement task {impl_task.id}...")
-    rc = _run_foreground(
-        config,
-        task_id=impl_task.id,
-        force=getattr(args, "force", False),
-        invocation=_foreground_command_invocation("implement"),
-    )
-    release_task_launch_permit(str(impl_task.id))
-    return rc
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
@@ -1406,7 +1892,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         task_type = "implement"
 
     # Validate task type
-    valid_types = ["explore", "plan", "implement", "review"]
+    valid_types = [task_type for task_type in CLI_ADD_TASK_TYPES if task_type != "improve"]
     if task_type == "improve":
         print("Error: Cannot create improve tasks directly. Use 'gza improve <task_id>' instead.")
         return 1
@@ -1471,6 +1957,40 @@ def cmd_add(args: argparse.Namespace) -> int:
         dep_task = store.get(depends_on)
         if not dep_task:
             print(f"Error: Task {depends_on} not found")
+            return 1
+    else:
+        dep_task = None
+
+    if task_type == "plan_review":
+        if depends_on is None:
+            print("Error: plan_review tasks require --depends-on <plan-or-plan-improve-id>")
+            return 1
+        if based_on is not None:
+            print("Error: plan_review tasks cannot set --based-on; use --depends-on for the reviewed plan source")
+            return 1
+        assert dep_task is not None
+        if dep_task.task_type not in {"plan", "plan_improve"}:
+            print("Error: plan_review --depends-on must reference a plan or plan_improve task")
+            return 1
+
+    if task_type == "plan_improve":
+        if based_on is None:
+            print("Error: plan_improve tasks require --based-on <plan-or-plan-improve-id>")
+            return 1
+        if depends_on is None:
+            print("Error: plan_improve tasks require --depends-on <plan-review-id>")
+            return 1
+        assert dep_task is not None
+        if dep_task.task_type != "plan_review":
+            print("Error: plan_improve --depends-on must reference a plan_review task")
+            return 1
+        based_on_task = store.get(based_on)
+        assert based_on_task is not None
+        if based_on_task.task_type not in {"plan", "plan_improve"}:
+            print("Error: plan_improve --based-on must reference a plan or plan_improve task")
+            return 1
+        if dep_task.depends_on != based_on_task.id:
+            print("Error: plan_improve must be based on the same plan source reviewed by its plan_review dependency")
             return 1
 
     # Handle --prompt-file argument
@@ -2235,6 +2755,55 @@ def _review_targets_implementation(review_task: DbTask, impl_task_id: str) -> bo
     if review_task.based_on is not None:
         return review_task.based_on == impl_task_id
     return review_task.depends_on == impl_task_id
+
+
+def _latest_non_dropped_plan_review_for_source(
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+) -> DbTask | None:
+    assert plan_source_task.id is not None
+    candidates = [
+        child
+        for child in store.get_lineage_children(plan_source_task.id)
+        if child.task_type == "plan_review"
+        and child.depends_on == plan_source_task.id
+        and child.status != "dropped"
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda task: (
+            task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+            task_id_numeric_key(task.id),
+        ),
+    )
+
+
+def _matching_plan_improve_for_review(
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+    review_task: DbTask,
+) -> DbTask | None:
+    assert plan_source_task.id is not None
+    assert review_task.id is not None
+    candidates = [
+        child
+        for child in store.get_lineage_children(plan_source_task.id)
+        if child.task_type == "plan_improve"
+        and child.based_on == plan_source_task.id
+        and child.depends_on == review_task.id
+        and child.status != "dropped"
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda task: (
+            task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+            task_id_numeric_key(task.id),
+        ),
+    )
 
 
 def cmd_improve(args: argparse.Namespace) -> int:

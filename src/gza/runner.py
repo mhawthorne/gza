@@ -1900,6 +1900,8 @@ def _resolve_task_timeout_budget(
 
 DEFAULT_REPORT_DIR = f".{APP_NAME}/explorations"
 PLAN_DIR = f".{APP_NAME}/plans"
+PLAN_REVIEW_DIR = f".{APP_NAME}/plan-reviews"
+PLAN_IMPROVE_DIR = f".{APP_NAME}/revised-plans"
 REVIEW_DIR = f".{APP_NAME}/reviews"
 INTERNAL_DIR = f".{APP_NAME}/internal"
 SUMMARY_DIR = f".{APP_NAME}/summaries"
@@ -1931,6 +1933,10 @@ def get_task_output_paths(
         report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.slug}.md"
     elif task.task_type == "plan":
         report_path = project_dir / PLAN_DIR / f"{task.slug}.md"
+    elif task.task_type == "plan_review":
+        report_path = project_dir / PLAN_REVIEW_DIR / f"{task.slug}.md"
+    elif task.task_type == "plan_improve":
+        report_path = project_dir / PLAN_IMPROVE_DIR / f"{task.slug}.md"
     elif task.task_type == "review":
         report_path = project_dir / REVIEW_DIR / f"{task.slug}.md"
     elif task.task_type in ("internal", "learn"):
@@ -3293,6 +3299,49 @@ def _build_context_from_chain(
 
     def _int_or_default(value: object, default: int) -> int:
         return value if isinstance(value, int) else default
+
+    # For plan review tasks, include the reviewed plan source.
+    if task.task_type == "plan_review" and task.depends_on:
+        source_task = store.get(task.depends_on)
+        if source_task is not None:
+            source_content = _get_task_output(source_task, project_dir)
+            heading = "## Plan source to review:\n"
+            if source_content:
+                context_parts.append(heading)
+                context_parts.append(source_content)
+            else:
+                context_parts.append(
+                    heading
+                    + f"(plan source task {source_task.id} exists but content unavailable on this machine - flag as blocker)"
+                )
+
+    # For plan improvement tasks, include the triggering plan review and latest plan source.
+    if task.task_type == "plan_improve":
+        if task.depends_on:
+            review_task = store.get(task.depends_on)
+            if review_task is not None and review_task.task_type == "plan_review":
+                review_content = _get_task_output(review_task, project_dir)
+                if review_content:
+                    context_parts.append("## Review feedback to address:\n")
+                    context_parts.append(review_content)
+                else:
+                    context_parts.append(
+                        "## Review feedback to address:\n"
+                        f"(plan review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
+                    )
+
+        if task.based_on:
+            source_task = store.get(task.based_on)
+            if source_task is not None:
+                source_content = _get_task_output(source_task, project_dir)
+                if source_content:
+                    context_parts.append("\n## Latest plan source:\n")
+                    context_parts.append(source_content)
+                else:
+                    context_parts.append(
+                        "\n## Latest plan source:\n"
+                        f"(plan source task {source_task.id} exists but content unavailable on this machine - flag as blocker)"
+                    )
 
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":
@@ -6815,9 +6864,17 @@ def _run_inner(
     interaction_mode: str = "observe_only",
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
-    # For explore, plan, review, and internal tasks, run without creating a branch.
+    # For branchless task types, run without creating a branch.
     # Keep temporary "learn" compatibility for pre-migration rows.
-    if task.task_type in ("explore", "plan", "review", "internal", "learn"):
+    if task.task_type in (
+        "explore",
+        "plan",
+        "plan_review",
+        "plan_improve",
+        "review",
+        "internal",
+        "learn",
+    ):
         return _run_non_code_task(
             task,
             task_config,
@@ -7311,7 +7368,7 @@ def _run_non_code_task(
     invocation: RunInvocationContext | None = None,
     interaction_mode: str = "observe_only",
 ) -> int:
-    """Run a non-code task (explore, plan, review, internal) in a worktree (no branch creation).
+    """Run a branchless task in a worktree without branch creation.
 
     Args:
         task: Task to run

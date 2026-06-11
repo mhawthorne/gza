@@ -123,6 +123,8 @@ def resolved_dependency_satisfies_task_readiness(
     read_context: RecoveryReadContext | None = None,
 ) -> bool:
     """Return whether a resolved completed dependency makes ``dependent`` runnable."""
+    if dependent.same_branch:
+        return True
     if dependent.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
         return True
     if prereq.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
@@ -178,7 +180,7 @@ def dependency_readiness(
     read_context: RecoveryReadContext | None = None,
 ) -> DependencyReadiness:
     """Return structured dependency readiness for ``task``."""
-    if task.same_branch or not task.depends_on:
+    if not task.depends_on:
         return DependencyReadiness(ready=True)
 
     direct_dep = read_context.get_task(task.depends_on) if read_context is not None else store.get(task.depends_on)
@@ -273,6 +275,8 @@ def _resolved_dependency_lineage_satisfies_task_readiness(
     read_context: RecoveryReadContext | None = None,
 ) -> bool:
     """Return readiness using canonical merge-unit state for the dependency lineage."""
+    if dependent.same_branch:
+        return True
     if dependent.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:
         return True
     if resolved_dep.task_type not in MERGE_REQUIRED_DEPENDENCY_TASK_TYPES:

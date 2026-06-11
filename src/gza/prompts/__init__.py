@@ -154,8 +154,8 @@ class PromptBuilder:
                 " `docs/internal/`. Consult relevant files when making design decisions."
             )
 
-        # Add context from based_on chain (walk up the chain to find plan tasks)
-        if task.based_on or task.task_type in ("implement", "review"):
+        # Add context from lineage/review chains for task types that derive from prior work.
+        if task.based_on or task.depends_on or task.task_type in ("implement", "review"):
             from gza.runner import _build_context_from_chain
             context = _build_context_from_chain(
                 task,
@@ -177,6 +177,16 @@ class PromptBuilder:
         elif task.task_type == "plan":
             if report_path:
                 base_prompt += "\n\n" + _load_template("plan.txt").format(
+                    report_path=report_path
+                )
+        elif task.task_type == "plan_review":
+            if report_path:
+                base_prompt += "\n\n" + _load_template("plan_review.txt").format(
+                    report_path=report_path
+                )
+        elif task.task_type == "plan_improve":
+            if report_path:
+                base_prompt += "\n\n" + _load_template("plan_improve.txt").format(
                     report_path=report_path
                 )
         elif task.task_type == "review":

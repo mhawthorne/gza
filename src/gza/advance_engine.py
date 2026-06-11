@@ -18,6 +18,10 @@ from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL
+from gza.plan_review_verdict import (
+    PlanReviewManifest,
+    get_plan_review_outcome,
+)
 from gza.project_discovery import (
     parse_name_status_project_paths,
     resolve_affected_repo_projects,
@@ -74,6 +78,10 @@ WORKER_CONSUMING_ACTIONS = frozenset(
     {
         "needs_rebase",
         "create_implement",
+        "create_plan_review",
+        "run_plan_review",
+        "create_plan_improve",
+        "run_plan_improve",
         "create_review",
         "run_review",
         "verify_noop_improve_then_review",
@@ -155,6 +163,11 @@ class AdvanceContext:
     create_reviews: bool
     verify_command_available: bool
     max_review_cycles: int
+    advance_create_plan_reviews: bool
+    require_plan_review_before_implement: bool
+    max_plan_review_cycles: int
+    max_plan_slices: int | None
+    plan_slice_target_timeout_minutes: int
     max_noop_improve_cycles: int
     max_resume_attempts: int
 
@@ -207,6 +220,17 @@ class AdvanceContext:
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
     closing_review_action: dict[str, Any] | None = None
+    latest_plan_source: DbTask | None = None
+    superseded_plan_source: DbTask | None = None
+    active_plan_review_pending: DbTask | None = None
+    active_plan_review_running: DbTask | None = None
+    latest_completed_plan_review: DbTask | None = None
+    plan_review_verdict: str | None = None
+    validated_plan_review_manifest: PlanReviewManifest | None = None
+    plan_review_validation_error: str | None = None
+    active_plan_improve_pending: DbTask | None = None
+    active_plan_improve_running: DbTask | None = None
+    completed_plan_review_cycles: int = 0
 
     failed_recovery_decision: FailedRecoveryDecision | None = None
     failed_recovery_attention_reason: str | None = None
@@ -1389,7 +1413,7 @@ def classify_advance_action(action: Mapping[str, Any]) -> str:
     if is_needs_attention_action(action):
         return "needs_attention"
     action_type = str(action.get("type", "skip"))
-    if action_type in {"skip", "wait_review", "wait_improve"}:
+    if action_type in {"skip", "wait_review", "wait_improve", "wait_plan_review", "wait_plan_improve"}:
         return "skip"
     return "actionable"
 
@@ -1450,6 +1474,168 @@ def _normalize_time(value: datetime | None) -> datetime:
 def _task_event_time(task: DbTask) -> datetime:
     """Return the best available lifecycle timestamp for ordering tasks."""
     return _normalize_time(task.completed_at or task.created_at)
+
+
+def _resolve_latest_plan_source(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Resolve the latest non-dropped plan source in a plan revision chain."""
+    latest = task
+    for descendant in walk_based_on_descendants(store, task):
+        if descendant.task_type != "plan_improve":
+            continue
+        if descendant.status in {"dropped", "pending", "in_progress"}:
+            continue
+        if descendant.status != "completed":
+            continue
+        if _task_event_time(descendant) >= _task_event_time(latest):
+            latest = descendant
+    return latest
+
+
+def _resolve_plan_review_state(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> dict[str, Any]:
+    """Resolve plan-review lifecycle state for plan and plan_improve sources."""
+    latest_plan_source = _resolve_latest_plan_source(store, task)
+    if latest_plan_source.id is None:
+        return {"latest_plan_source": latest_plan_source}
+
+    source_children = store.get_lineage_children(latest_plan_source.id)
+    plan_reviews = [
+        child
+        for child in source_children
+        if child.task_type == "plan_review" and child.depends_on == latest_plan_source.id and child.status != "dropped"
+    ]
+    plan_improves = [
+        child
+        for child in source_children
+        if child.task_type == "plan_improve" and child.based_on == latest_plan_source.id and child.status != "dropped"
+    ]
+
+    active_plan_review_pending = max(
+        (child for child in plan_reviews if child.status == "pending"),
+        default=None,
+        key=_task_event_time,
+    )
+    active_plan_review_running = max(
+        (child for child in plan_reviews if child.status == "in_progress"),
+        default=None,
+        key=_task_event_time,
+    )
+    latest_completed_plan_review = max(
+        (child for child in plan_reviews if child.status == "completed"),
+        default=None,
+        key=_task_event_time,
+    )
+    active_plan_improve_pending = max(
+        (child for child in plan_improves if child.status == "pending"),
+        default=None,
+        key=_task_event_time,
+    )
+    active_plan_improve_running = max(
+        (child for child in plan_improves if child.status == "in_progress"),
+        default=None,
+        key=_task_event_time,
+    )
+
+    plan_review_verdict: str | None = None
+    validated_manifest: PlanReviewManifest | None = None
+    validation_error: str | None = None
+    if latest_completed_plan_review is not None and latest_plan_source.id is not None:
+        outcome = get_plan_review_outcome(
+            Path(config.project_dir),
+            latest_completed_plan_review,
+            source_task_id=latest_plan_source.id,
+            source_task_type=latest_plan_source.task_type,
+            max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+            max_plan_slices=getattr(config, "max_plan_slices", None),
+        )
+        plan_review_verdict = outcome.verdict
+        validated_manifest = outcome.manifest
+        validation_error = outcome.validation_error
+
+    completed_plan_review_cycles = _count_consecutive_plan_review_cycles(
+        config=config,
+        store=store,
+        latest_plan_source=latest_plan_source,
+    )
+
+    return {
+        "latest_plan_source": latest_plan_source,
+        "superseded_plan_source": latest_plan_source if latest_plan_source.id != task.id else None,
+        "active_plan_review_pending": active_plan_review_pending,
+        "active_plan_review_running": active_plan_review_running,
+        "latest_completed_plan_review": latest_completed_plan_review,
+        "plan_review_verdict": plan_review_verdict,
+        "validated_plan_review_manifest": validated_manifest,
+        "plan_review_validation_error": validation_error,
+        "active_plan_improve_pending": active_plan_improve_pending,
+        "active_plan_improve_running": active_plan_improve_running,
+        "completed_plan_review_cycles": completed_plan_review_cycles,
+    }
+
+
+def _count_consecutive_plan_review_cycles(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    latest_plan_source: DbTask,
+) -> int:
+    """Count consecutive CHANGES_REQUESTED reviews across the current revision chain."""
+    if latest_plan_source.id is None:
+        return 0
+
+    cycles = 0
+    current_source: DbTask | None = latest_plan_source
+    while current_source is not None and current_source.id is not None:
+        source_children = store.get_lineage_children(current_source.id)
+        latest_completed_review = max(
+            (
+                child
+                for child in source_children
+                if child.task_type == "plan_review"
+                and child.depends_on == current_source.id
+                and child.status == "completed"
+                and child.status != "dropped"
+            ),
+            default=None,
+            key=_task_event_time,
+        )
+        if latest_completed_review is None:
+            break
+
+        outcome = get_plan_review_outcome(
+            Path(config.project_dir),
+            latest_completed_review,
+            source_task_id=current_source.id,
+            source_task_type=current_source.task_type,
+            max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+            max_plan_slices=getattr(config, "max_plan_slices", None),
+        )
+        if outcome.verdict != "CHANGES_REQUESTED":
+            break
+        cycles += 1
+
+        if current_source.task_type != "plan_improve" or current_source.based_on is None:
+            break
+        parent_source = store.get(current_source.based_on)
+        if parent_source is None or parent_source.task_type not in {"plan", "plan_improve"}:
+            break
+        current_source = parent_source
+
+    return cycles
+
+
+def _plan_review_timeout_budget_minutes(config: Any) -> int:
+    getter = getattr(config, "get_plan_slice_target_timeout_minutes", None)
+    if callable(getter):
+        return int(getter())
+    value = getattr(config, "plan_slice_target_timeout_minutes", None)
+    if value is None:
+        value = getattr(config, "code_task_diff_timeout_cap_minutes", 30)
+    return int(value or 30)
 
 
 def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
@@ -2004,6 +2190,11 @@ def _build_base_advance_context(
         create_reviews=config.advance_create_reviews,
         verify_command_available=verify_command_available,
         max_review_cycles=config.max_review_cycles,
+        advance_create_plan_reviews=getattr(config, "advance_create_plan_reviews", True),
+        require_plan_review_before_implement=getattr(config, "require_plan_review_before_implement", True),
+        max_plan_review_cycles=getattr(config, "max_plan_review_cycles", 2),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+        plan_slice_target_timeout_minutes=_plan_review_timeout_budget_minutes(config),
         max_noop_improve_cycles=effective_max_noop_improves,
         max_resume_attempts=effective_max_resume,
         auto_implement_enabled=auto_implement_enabled,
@@ -2286,10 +2477,14 @@ def resolve_advance_context(
             non_dropped_implement_source_ids=impl_based_on_ids,
         )
     )
+    if task.task_type == "plan_improve" and impl_based_on_ids is None:
+        impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
+    if task.task_type == "plan_improve":
+        has_implementation_followup = task.id in (impl_based_on_ids or set())
     auto_implement_enabled = task.auto_implement is not False
 
-    if task.task_type == "plan":
-        return _build_base_advance_context(
+    if task.task_type in {"plan", "plan_improve"}:
+        base_ctx = _build_base_advance_context(
             config=config,
             store=store,
             task=task,
@@ -2308,6 +2503,7 @@ def resolve_advance_context(
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
         )
+        return replace(base_ctx, **_resolve_plan_review_state(config=config, store=store, task=task))
 
     if not task.branch:
         return _build_base_advance_context(
@@ -2439,9 +2635,21 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=_failed_task_skip_action,
     ),
     AdvanceRule(
+        name="superseded_plan_source",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and ctx.superseded_plan_source is not None
+        ),
+        action=lambda ctx: {
+            "type": "skip",
+            "description": f"SKIP: newer plan source {_task_id(ctx.superseded_plan_source)} supersedes this plan revision",
+        },
+    ),
+    AdvanceRule(
         name="awaiting_human_plan_review",
         matches=lambda ctx: (
-            ctx.task_type == "plan"
+            ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
             and not ctx.has_non_dropped_implement_descendant
             and not ctx.auto_implement_enabled
@@ -2459,23 +2667,228 @@ ADVANCE_RULES: list[AdvanceRule] = [
         ),
     ),
     AdvanceRule(
-        name="plan_needs_implement",
-        matches=lambda ctx: (
-            ctx.task_type == "plan"
-            and ctx.task.status == "completed"
-            and not ctx.has_non_dropped_implement_descendant
-            and ctx.auto_implement_enabled
-        ),
-        action=lambda ctx: {"type": "create_implement", "description": "Create and start implement task"},
-    ),
-    AdvanceRule(
         name="plan_has_implement",
         matches=lambda ctx: (
-            ctx.task_type == "plan"
+            ctx.task_type in {"plan", "plan_improve"}
             and ctx.task.status == "completed"
             and ctx.has_non_dropped_implement_descendant
         ),
         action=lambda ctx: {"type": "skip", "description": "SKIP: implement task already exists for this plan"},
+    ),
+    AdvanceRule(
+        name="plan_run_review",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.active_plan_review_pending is not None
+        ),
+        action=lambda ctx: {
+            "type": "run_plan_review",
+            "description": f"Run pending plan review {_task_id(ctx.active_plan_review_pending)}",
+            "plan_review_task": ctx.active_plan_review_pending,
+        },
+    ),
+    AdvanceRule(
+        name="plan_wait_review",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.active_plan_review_running is not None
+        ),
+        action=lambda ctx: {
+            "type": "wait_plan_review",
+            "description": f"Wait for plan review {_task_id(ctx.active_plan_review_running)}",
+            "plan_review_task": ctx.active_plan_review_running,
+        },
+    ),
+    AdvanceRule(
+        name="plan_invalid_approved_review",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.plan_review_verdict == "APPROVED"
+            and ctx.validated_plan_review_manifest is None
+            and ctx.plan_review_validation_error is not None
+        ),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: approved plan review has an invalid slice manifest"
+                    f" ({ctx.plan_review_validation_error})"
+                ),
+            },
+            reason="plan-review-invalid-slices",
+            subject_task_id=ctx.task.id,
+        ),
+    ),
+    AdvanceRule(
+        name="plan_materialize_approved_review",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.plan_review_verdict == "APPROVED"
+            and ctx.validated_plan_review_manifest is not None
+        ),
+        action=lambda ctx: {
+            "type": "materialize_plan_slices",
+            "description": f"Materialize implementation slices from plan review {_task_id(ctx.latest_completed_plan_review)}",
+            "plan_review_task": ctx.latest_completed_plan_review,
+            "manifest": ctx.validated_plan_review_manifest,
+            "plan_source_task": ctx.latest_plan_source or ctx.task,
+        },
+    ),
+    AdvanceRule(
+        name="plan_run_improve",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.plan_review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_plan_improve_pending is not None
+        ),
+        action=lambda ctx: {
+            "type": "run_plan_improve",
+            "description": f"Run pending plan improve {_task_id(ctx.active_plan_improve_pending)}",
+            "plan_improve_task": ctx.active_plan_improve_pending,
+        },
+    ),
+    AdvanceRule(
+        name="plan_wait_improve",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.plan_review_verdict == "CHANGES_REQUESTED"
+            and ctx.active_plan_improve_running is not None
+        ),
+        action=lambda ctx: {
+            "type": "wait_plan_improve",
+            "description": f"Wait for plan improve {_task_id(ctx.active_plan_improve_running)}",
+            "plan_improve_task": ctx.active_plan_improve_running,
+        },
+    ),
+    AdvanceRule(
+        name="plan_max_cycles_reached",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.plan_review_verdict == "CHANGES_REQUESTED"
+            and ctx.completed_plan_review_cycles >= ctx.max_plan_review_cycles
+        ),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: plan review reached max_plan_review_cycles without approval",
+            },
+            reason="plan-review-max-cycles-reached",
+            subject_task_id=ctx.task.id,
+        ),
+    ),
+    AdvanceRule(
+        name="plan_create_improve",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.plan_review_verdict == "CHANGES_REQUESTED"
+        ),
+        action=lambda ctx: {
+            "type": "create_plan_improve",
+            "description": f"Create and start plan improve task for plan review {_task_id(ctx.latest_completed_plan_review)}",
+            "plan_review_task": ctx.latest_completed_plan_review,
+            "plan_source_task": ctx.latest_plan_source or ctx.task,
+        },
+    ),
+    AdvanceRule(
+        name="plan_review_needs_discussion",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.latest_completed_plan_review is not None
+            and ctx.plan_review_verdict in {None, "NEEDS_DISCUSSION"}
+        ),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: plan review requires discussion"
+                    if ctx.plan_review_verdict == "NEEDS_DISCUSSION"
+                    else "SKIP: plan review verdict is unknown or unparseable"
+                ),
+            },
+            reason=(
+                "plan-review-needs-discussion"
+                if ctx.plan_review_verdict == "NEEDS_DISCUSSION"
+                else "plan-review-unknown-verdict"
+            ),
+            subject_task_id=ctx.task.id,
+        ),
+    ),
+    AdvanceRule(
+        name="plan_review_manual_creation_required",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and not ctx.advance_create_plan_reviews
+            and ctx.active_plan_review_pending is None
+            and ctx.active_plan_review_running is None
+            and ctx.latest_completed_plan_review is None
+        ),
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: no plan review exists and advance_create_plan_reviews=false",
+            },
+            reason="plan-review-needs-manual-creation",
+            subject_task_id=ctx.task.id,
+        ),
+    ),
+    AdvanceRule(
+        name="plan_create_review",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.active_plan_review_pending is None
+            and ctx.active_plan_review_running is None
+            and ctx.latest_completed_plan_review is None
+            and ctx.advance_create_plan_reviews
+        ),
+        action=lambda ctx: {"type": "create_plan_review", "description": "Create and start plan review task"},
+    ),
+    AdvanceRule(
+        name="plan_needs_implement",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and not ctx.require_plan_review_before_implement
+        ),
+        action=lambda ctx: {"type": "create_implement", "description": "Create and start implement task"},
     ),
     AdvanceRule(
         name="explore_needs_followup_decision",

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from gza.advance_engine import (
     ADVANCE_RULES,
     WORKER_CONSUMING_ACTIONS,
+    _count_consecutive_plan_review_cycles,
     _resolve_and_persist_post_merge_rebase_state,
     classify_advance_action,
     evaluate_advance_rules,
@@ -549,6 +552,8 @@ def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
 def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
     assert "needs_rebase" in WORKER_CONSUMING_ACTIONS
     assert "create_implement" in WORKER_CONSUMING_ACTIONS
+    assert "create_plan_review" in WORKER_CONSUMING_ACTIONS
+    assert "run_plan_improve" in WORKER_CONSUMING_ACTIONS
 
 
 def test_completed_explore_without_followup_needs_discussion(tmp_path: Path) -> None:
@@ -641,7 +646,7 @@ def test_branch_bearing_completed_explore_with_pending_implement_descendant_does
     assert action.get("needs_attention_reason") is None
 
 
-def test_completed_plan_with_only_dropped_implement_descendant_still_needs_implement(tmp_path: Path) -> None:
+def test_completed_plan_with_only_dropped_implement_descendant_creates_plan_review_by_default(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -657,8 +662,393 @@ def test_completed_plan_with_only_dropped_implement_descendant_still_needs_imple
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
 
+    assert action["type"] == "create_plan_review"
+    assert action["description"] == "Create and start plan review task"
+
+
+def test_completed_plan_with_plan_review_creation_disabled_needs_manual_creation_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_plan_reviews = False
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "plan-review-needs-manual-creation"
+
+
+def test_completed_plan_uses_legacy_single_implement_only_when_plan_review_gate_disabled(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_plan_review_before_implement = False
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
     assert action["type"] == "create_implement"
-    assert action["description"] == "Create and start implement task"
+
+
+def test_completed_plan_review_changes_requested_creates_plan_improve(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "create_plan_improve"
+
+
+def test_completed_plan_review_with_pending_plan_improve_returns_run_plan_improve(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    improve = store.add(
+        "Revise the plan",
+        task_type="plan_improve",
+        based_on=plan.id,
+        depends_on=review.id,
+    )
+    improve.status = "pending"
+    store.update(improve)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "run_plan_improve"
+    assert action["plan_improve_task"].id == improve.id
+
+
+def test_completed_plan_review_with_running_plan_improve_returns_wait_plan_improve(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    improve = store.add(
+        "Revise the plan",
+        task_type="plan_improve",
+        based_on=plan.id,
+        depends_on=review.id,
+    )
+    improve.status = "in_progress"
+    improve.started_at = datetime.now(UTC)
+    store.update(improve)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "wait_plan_improve"
+    assert action["plan_improve_task"].id == improve.id
+
+
+def test_completed_plan_improve_supersedes_source_only_after_completion(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_plan_review_cycles = 3
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 1, 13, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    improve = store.add(
+        "Revise the plan",
+        task_type="plan_improve",
+        based_on=plan.id,
+        depends_on=review.id,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
+    store.update(improve)
+
+    revised_review = store.add("Review revised plan", task_type="plan_review", depends_on=improve.id)
+    revised_review.status = "completed"
+    revised_review.completed_at = datetime(2026, 6, 1, 15, 0, tzinfo=UTC)
+    revised_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(revised_review)
+
+    original_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+    revised_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve, "main")
+
+    assert original_action["type"] == "skip"
+    assert revised_action["type"] == "create_plan_improve"
+    assert revised_action["plan_source_task"].id == improve.id
+    assert revised_action["plan_review_task"].id == revised_review.id
+
+
+def test_plan_review_cycle_limit_counts_across_plan_improve_chain(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_plan_review_cycles = 2
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    first_review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert first_review.id is not None
+    first_review.status = "completed"
+    first_review.completed_at = datetime(2026, 6, 1, 13, 0, tzinfo=UTC)
+    first_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(first_review)
+
+    improve = store.add("Revise the plan", task_type="plan_improve", based_on=plan.id, depends_on=first_review.id)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
+    store.update(improve)
+
+    second_review = store.add("Review revised plan", task_type="plan_review", depends_on=improve.id)
+    second_review.status = "completed"
+    second_review.completed_at = datetime(2026, 6, 1, 15, 0, tzinfo=UTC)
+    second_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(second_review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "plan-review-max-cycles-reached"
+
+
+def test_plan_review_first_rejection_below_limit_creates_one_plan_improve(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_plan_review_cycles = 2
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "create_plan_improve"
+    assert action["plan_review_task"].id == review.id
+
+
+def test_completed_plan_review_with_invalid_approved_manifest_needs_discussion(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "plan-review-invalid-slices"
+
+
+def test_completed_plan_review_with_valid_approved_manifest_materializes_slices(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    manifest = {
+        "schema_version": 1,
+        "source_task_id": plan.id,
+        "source_task_type": "plan",
+        "verdict": "APPROVED",
+        "slice_quality": {
+            "fits_single_task_budget": True,
+            "timeout_budget_minutes": 30,
+            "max_expected_files_changed_per_slice": 8,
+            "rationale": "Bounded slices.",
+        },
+        "slices": [
+            {
+                "slice_id": "S1",
+                "title": "Foundation",
+                "prompt": "Implement slice S1.",
+                "scope": ["Add parser"],
+                "out_of_scope": ["Executor"],
+                "acceptance_criteria": ["Parser works"],
+                "depends_on_slices": [],
+                "based_on_slice": None,
+                "review_scope": "Parser only.",
+                "estimated_complexity": "medium",
+                "expected_timeout_minutes": 30,
+                "requires_code_review": True,
+                "tags": ["lifecycle"],
+            }
+        ],
+    }
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = (
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+        + json.dumps(manifest)
+        + "\n```\n"
+    )
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "materialize_plan_slices"
+
+
+def test_completed_plan_review_uses_derived_timeout_budget_for_valid_approved_manifest(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.code_task_diff_timeout_cap_minutes = 45
+    config.plan_slice_target_timeout_minutes = None
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    manifest = {
+        "schema_version": 1,
+        "source_task_id": plan.id,
+        "source_task_type": "plan",
+        "verdict": "APPROVED",
+        "slice_quality": {
+            "fits_single_task_budget": True,
+            "timeout_budget_minutes": 45,
+            "max_expected_files_changed_per_slice": 8,
+            "rationale": "Bounded slices.",
+        },
+        "slices": [
+            {
+                "slice_id": "S1",
+                "title": "Foundation",
+                "prompt": "Implement slice S1.",
+                "scope": ["Add parser"],
+                "out_of_scope": ["Executor"],
+                "acceptance_criteria": ["Parser works"],
+                "depends_on_slices": [],
+                "based_on_slice": None,
+                "review_scope": "Parser only.",
+                "estimated_complexity": "medium",
+                "expected_timeout_minutes": 45,
+                "requires_code_review": True,
+                "tags": ["lifecycle"],
+            }
+        ],
+    }
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = (
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+        + json.dumps(manifest)
+        + "\n```\n"
+    )
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "materialize_plan_slices"
+
+
+def test_plan_review_cycle_count_uses_derived_timeout_budget_when_unset(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.code_task_diff_timeout_cap_minutes = 62
+    config.plan_slice_target_timeout_minutes = None
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    with patch("gza.advance_engine.get_plan_review_outcome") as mocked_outcome:
+        mocked_outcome.return_value = SimpleNamespace(
+            verdict="CHANGES_REQUESTED",
+            manifest=None,
+            validation_error=None,
+        )
+
+        cycles = _count_consecutive_plan_review_cycles(
+            config=config,
+            store=store,
+            latest_plan_source=plan,
+        )
+
+    assert cycles == 1
+    assert mocked_outcome.call_args.kwargs["max_slice_timeout_minutes"] == 62
 
 
 def test_completed_held_plan_awaits_human_review(tmp_path: Path) -> None:
@@ -5206,6 +5596,20 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         },
         requires_review=True,
         create_reviews=False,
+        superseded_plan_source=SimpleNamespace(id="testproject-plan-improve"),
+        active_plan_review_pending=SimpleNamespace(id="testproject-plan-review-pending"),
+        active_plan_review_running=SimpleNamespace(id="testproject-plan-review-running"),
+        latest_completed_plan_review=SimpleNamespace(id="testproject-plan-review-completed"),
+        plan_review_verdict=None,
+        validated_plan_review_manifest=None,
+        plan_review_validation_error=None,
+        active_plan_improve_pending=SimpleNamespace(id="testproject-plan-improve-pending"),
+        active_plan_improve_running=SimpleNamespace(id="testproject-plan-improve-running"),
+        advance_create_plan_reviews=True,
+        require_plan_review_before_implement=True,
+        completed_plan_review_cycles=0,
+        max_plan_review_cycles=2,
+        latest_plan_source=None,
     )
 
     names_with_needs_attention: set[str] = set()
@@ -5219,6 +5623,10 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
     assert names_with_needs_attention == {
         "failed_task_skip",
         "awaiting_human_plan_review",
+        "plan_invalid_approved_review",
+        "plan_max_cycles_reached",
+        "plan_review_manual_creation_required",
+        "plan_review_needs_discussion",
         "explore_needs_followup_decision",
         "merge_source_needs_manual_resolution",
         "strict_project_scope_unverified",

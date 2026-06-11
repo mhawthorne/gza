@@ -222,6 +222,11 @@
 
 # --- Lifecycle ---
 
+# Auto-create plan_review tasks for completed non-held plans; manual attention is required instead
+# when plan-review creation is disabled.
+# Default: true
+# advance_create_plan_reviews: true
+
 # Auto-create review tasks in lifecycle flows when review gating still requires them; manual
 # attention is required instead when review creation is disabled.
 # Default: true
@@ -240,6 +245,14 @@
 # Default: 2
 # max_noop_improve_cycles: 2
 
+# Cap for plan_review/plan_improve loops in lifecycle automation.
+# Default: 2
+# max_plan_review_cycles: 2
+
+# Optional cap on auto-materialized implementation slices from one approved plan review.
+# Default: null
+# max_plan_slices: null
+
 # Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed
 # bounded resume/retry policy used by advance, iterate improve recovery, and watch.
 # Default: 1
@@ -249,10 +262,20 @@
 # Default: 3
 # max_review_cycles: 3
 
+# Optional reviewer budget target for one implementation slice; when unset it derives from code-
+# task timeout sizing.
+# Default: code_task_diff_timeout_cap_minutes or 45
+# plan_slice_target_timeout_minutes: 45
+
 # Enable GitHub PR discovery, commenting, and auto-create flows. Set false to skip all gh-backed
 # PR operations for the project.
 # Default: true
 # pr_integration: true
+
+# Require a current approved plan_review before lifecycle automation materializes implementation
+# work from a plan.
+# Default: true
+# require_plan_review_before_implement: true
 
 # Require a valid current review before lifecycle auto-merge.
 # Default: true

@@ -450,6 +450,64 @@ class TestPromptBuilderBuild:
         assert "Do NOT edit specs, source files, tests, or other files" in result
         assert "Describe any intended spec or code changes inside the written plan" in result
 
+    def test_build_plan_review_type_with_report_path_and_plan_context(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        plan = store.add(prompt="Design feature", task_type="plan")
+        plan.slug = "20260611-design-feature"
+        plan.report_file = ".gza/plans/20260611-design-feature.md"
+        plan.output_content = "## Overview of the approach\n\nPlan body."
+        store.update(plan)
+
+        task = store.add(prompt="Review the plan", task_type="plan_review", depends_on=plan.id)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        report_path = Path("/workspace/.gza/plan-reviews/test.md")
+        result = PromptBuilder().build(task, config, store, report_path=report_path)
+
+        assert str(report_path) in result
+        assert "## Plan source to review:" in result
+        assert "Plan body." in result
+        assert "APPROVED" in result
+        assert "CHANGES_REQUESTED" in result
+        assert "NEEDS_DISCUSSION" in result
+        assert "```json" in result
+        assert "source_task_id" in result
+        assert "requires_code_review" in result
+
+    def test_build_plan_improve_type_with_report_path_and_feedback_context(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        plan = store.add(prompt="Design feature", task_type="plan")
+        plan.output_content = "## Overview of the approach\n\nOriginal plan."
+        store.update(plan)
+        review = store.add(prompt="Review the plan", task_type="plan_review", depends_on=plan.id)
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        task = store.add(
+            prompt="Revise the plan",
+            task_type="plan_improve",
+            depends_on=review.id,
+            based_on=plan.id,
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        report_path = Path("/workspace/.gza/revised-plans/test.md")
+        result = PromptBuilder().build(task, config, store, report_path=report_path)
+
+        assert str(report_path) in result
+        assert "## Review feedback to address:" in result
+        assert "Verdict: CHANGES_REQUESTED" in result
+        assert "## Latest plan source:" in result
+        assert "Original plan." in result
+        assert "## Required implementation steps" in result
+        assert "## Acceptance criteria" in result
+
     def test_build_review_type_with_report_path(self, tmp_path: Path):
         """Test that review type includes review instructions."""
         db_path = tmp_path / "test.db"

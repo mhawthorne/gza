@@ -58,6 +58,11 @@ Gza reads configuration from three YAML layers:
 | `code_task_diff_timeout_large_minutes` | Integer | `45` | Timeout budget used for large code diffs; must be `>= code_task_diff_timeout_medium_minutes` after defaults and overrides are merged |
 | `code_task_diff_timeout_cap_minutes` | Integer | `45` | Hard maximum applied to code-task budgets after base timeout resolution and diff-size scaling |
 | `pr_integration` | Boolean | `true` | Enable GitHub PR discovery/comment/create flows; set `false` to skip all `gh`-backed PR operations for the project |
+| `advance_create_plan_reviews` | Boolean | `true` | Auto-create `plan_review` tasks for completed non-held plans; when disabled, lifecycle parks for manual plan-review creation instead |
+| `require_plan_review_before_implement` | Boolean | `true` | Require an approved `plan_review` before lifecycle automation materializes implementation work from a plan |
+| `max_plan_review_cycles` | Integer | `2` | Cap for `plan_review` / `plan_improve` loops before lifecycle automation parks for discussion |
+| `max_plan_slices` | Integer or null | `null` | Optional cap on how many implementation slices one approved plan review may materialize automatically |
+| `plan_slice_target_timeout_minutes` | Integer or null | `code_task_diff_timeout_cap_minutes` | Optional reviewer sizing budget for one implementation slice; when unset it derives from code-task timeout sizing |
 | `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
 | `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
 | `max_failed_closing_review_retries` | Integer | `3` | Max consecutive failed closing-review attempts before a lineage is parked as `needs_attention`; set `0` to escalate immediately on first failure |
@@ -100,7 +105,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `require_review_before_merge`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_noop_improve_cycles`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -378,6 +383,8 @@ Preferred approach for multi-provider setups:
 provider: claude
 task_providers:
   review: claude
+  plan_review: codex
+  plan_improve: codex
   implement: codex
 providers:
   claude:
@@ -390,6 +397,11 @@ providers:
   codex:
     model: o4-mini
     reasoning_effort: medium
+    task_types:
+      plan_review:
+        timeout_minutes: 45
+      plan_improve:
+        timeout_minutes: 30
 ```
 
 ### Task Types Configuration (Legacy-Compatible)
@@ -406,12 +418,21 @@ task_types:
     model: claude-opus-4
     reasoning_effort: medium
     max_turns: 30
+  plan_review:
+    reasoning_effort: high
+    timeout_minutes: 45
+  plan_improve:
+    reasoning_effort: medium
+    timeout_minutes: 30
   review:
     reasoning_effort: high
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`
+Valid task types: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`
+
+The generic task-type routing keys apply to plan-review work the same way they apply to existing task types:
+`task_providers.plan_review`, `task_types.plan_review`, and `providers.<provider>.task_types.plan_review` route and shape `plan_review`; `plan_improve` uses the corresponding `plan_improve` keys.
 
 Top-level `task_types` and `model` are still supported for backward compatibility. They are used as fallbacks when no provider-scoped value exists.
 
@@ -1230,7 +1251,7 @@ gza history [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
 | `--type-not TYPE` | Exclude the given task type |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
@@ -1259,7 +1280,7 @@ gza incomplete [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N unresolved rows (default: 5; use `0` for all) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
 | `--days N` | Show only unresolved rows from the last N days |
 | `--date-field FIELD` | Date field for `--days`: `created`, `completed`, or `effective` (default: `effective`) |
 | `--tree` | Render unresolved lineages as trees instead of one-line summaries |
@@ -1536,7 +1557,13 @@ Internally, queue-style task listing is routed through the unified task query la
 
 ### implement
 
-Create an implementation task from a completed plan task.
+Create implementation from a completed plan task. When the latest completed plan source
+already has an approved valid `plan_review` manifest, `gza implement <plan-id>` prefers
+materializing the reviewed slices instead of creating one legacy monolithic implement task.
+If no approved manifest exists, it falls back to the single-task compatibility path. Re-running
+`gza implement <plan-id>` after those reviewed slices already exist reuses the same non-dropped
+slice tasks instead of recreating or dropping them, and the command output says `Reused`
+rather than `Created`.
 
 ```bash
 gza implement <plan_task_id> [prompt] [options]
@@ -1562,6 +1589,53 @@ gza implement <plan_task_id> [prompt] [options]
 | `--force` | Skip dependency merge precondition checks when running the implement task |
 
 When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
+
+### plan-review
+
+Create and optionally run a `plan_review` task for a completed plan source.
+
+```bash
+gza plan-review <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed task ID for a completed `plan` or `plan_improve` source |
+| `--rerun` | Create a fresh review attempt even if a completed review already exists |
+| `--edit-slices` | Open a completed approved `plan_review` by review ID in `$EDITOR`, validate the edited manifest, and persist it as a review-tied override |
+| `--materialize` | Materialize implementation slices exactly once from a completed approved `plan_review` by review ID |
+| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
+| `--force` | Skip dependency merge precondition checks when running the plan review task |
+
+`--edit-slices` and `--materialize` operate on a completed `plan_review` task ID rather than a plan source ID. `--edit-slices` persists a validated override artifact tied to that review, and `--materialize` reuses an existing non-dropped slice set for the same review/manifest instead of creating duplicates.
+
+### plan-improve
+
+Create and optionally run a `plan_improve` task from a completed `plan_review`
+whose verdict is `CHANGES_REQUESTED`.
+
+```bash
+gza plan-improve <task_id> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Full prefixed completed `CHANGES_REQUESTED` `plan_review` task ID to revise |
+| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--background`, `-b` | Run worker in background |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--max-turns N` | Override max_turns setting for this run |
+| `--model MODEL` | Override model for this task |
+| `--provider PROVIDER` | Override provider for this task |
+| `--force` | Skip dependency merge precondition checks when running the plan improve task |
+
+`gza plan-improve` rejects pending, in-progress, approved, or discussion-only plan
+reviews and creates no revised-plan task in those states.
 
 ### extract
 

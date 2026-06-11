@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.cli._common import _create_retry_task, resolve_improve_action
+from gza.cli._common import _create_retry_task, _materialize_plan_review_slices, resolve_improve_action
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
@@ -30,6 +30,7 @@ from gza.git import GitError
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.runner import ReviewVerifyResult
 from gza.runner import CrossProjectReviewVerifyResult, ProjectBoundary
+from gza.plan_review_verdict import validate_plan_review_manifest
 
 from .conftest import make_store, setup_config
 
@@ -239,6 +240,312 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
     assert attention is not None
     assert attention.task.id == impl.id
     assert attention.action["subject_task_id"] == impl.id
+
+
+def test_materialize_plan_review_slices_includes_slice_prompt_and_provenance(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    plan.tags = ("root-tag",)
+    store.update(plan)
+
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    store.update(review)
+
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Materialize prompts",
+                    "prompt": "Use this distinctive reviewer-authored slice prompt.",
+                    "scope": ["Keep provenance"],
+                    "out_of_scope": ["CLI changes"],
+                    "acceptance_criteria": ["Prompt preserved exactly"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Prompt materialization only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": ["slice-tag"],
+                }
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+
+    materialization = _materialize_plan_review_slices(
+        Config.load(tmp_path),
+        store,
+        plan,
+        review,
+        manifest,
+        trigger_source="manual",
+        require_review_before_merge=True,
+    )
+
+    assert materialization.created is True
+    assert len(materialization.tasks) == 1
+    created_task = store.get(materialization.tasks[0].id)
+    assert created_task is not None
+    assert "Use this distinctive reviewer-authored slice prompt." in created_task.prompt
+    assert f"Implement plan slice S1 from {plan.id}" in created_task.prompt
+    assert f"based on plan review {review.id}" in created_task.prompt
+    assert "Scope:\n- Keep provenance" in created_task.prompt
+
+
+def test_materialize_plan_review_slices_reuses_existing_materialization(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Materialize prompts",
+                    "prompt": "Use this distinctive reviewer-authored slice prompt.",
+                    "scope": ["Keep provenance"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["Prompt preserved exactly"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Prompt materialization only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": ["slice-tag"],
+                }
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+
+    first = _materialize_plan_review_slices(
+        config,
+        store,
+        plan,
+        review,
+        manifest,
+        trigger_source="manual",
+        require_review_before_merge=True,
+    )
+    second = _materialize_plan_review_slices(
+        config,
+        store,
+        plan,
+        review,
+        manifest,
+        trigger_source="manual",
+        require_review_before_merge=True,
+    )
+
+    assert first.created is True
+    assert second.created is False
+    assert [task.id for task in first.tasks] == [task.id for task in second.tasks]
+    assert len([task for task in store.get_all() if task.task_type == "implement"]) == 1
+
+
+def test_materialize_plan_review_slices_rolls_back_partial_task_creation_on_failure(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Foundation",
+                    "prompt": "Create the first slice.",
+                    "scope": ["One"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["First slice exists"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Foundation only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": [],
+                },
+                {
+                    "slice_id": "S2",
+                    "title": "Follow-up",
+                    "prompt": "Create the second slice.",
+                    "scope": ["Two"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["Second slice exists"],
+                    "depends_on_slices": ["S1"],
+                    "based_on_slice": None,
+                    "review_scope": "Follow-up only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": [],
+                },
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+
+    original_add_task_conn = store._add_task_conn
+    call_count = 0
+
+    def flaky_add_task_conn(conn: Any, params: Any) -> DbTask:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("boom during second slice insert")
+        return original_add_task_conn(conn, params)
+
+    with patch.object(store, "_add_task_conn", side_effect=flaky_add_task_conn):
+        with pytest.raises(RuntimeError, match="boom during second slice insert"):
+            _materialize_plan_review_slices(
+                config,
+                store,
+                plan,
+                review,
+                manifest,
+                trigger_source="manual",
+                require_review_before_merge=True,
+            )
+
+    assert [task for task in store.get_all() if task.task_type == "implement"] == []
+    assert store.list_artifacts(review.id, kind="plan_review_materialization") == []
+
+
+def test_materialize_plan_review_slices_rerun_recovers_after_artifact_write_failure(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Foundation",
+                    "prompt": "Create the slice.",
+                    "scope": ["One"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["Slice exists"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Foundation only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": [],
+                }
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+
+    with patch.object(store, "_add_artifact_conn", side_effect=RuntimeError("artifact write failed")):
+        with pytest.raises(RuntimeError, match="artifact write failed"):
+            _materialize_plan_review_slices(
+                config,
+                store,
+                plan,
+                review,
+                manifest,
+                trigger_source="manual",
+                require_review_before_merge=True,
+            )
+
+    assert [task for task in store.get_all() if task.task_type == "implement"] == []
+    assert store.list_artifacts(review.id, kind="plan_review_materialization") == []
+
+    materialization = _materialize_plan_review_slices(
+        config,
+        store,
+        plan,
+        review,
+        manifest,
+        trigger_source="manual",
+        require_review_before_merge=True,
+    )
+
+    assert materialization.created is True
+    assert len(materialization.tasks) == 1
+    assert len([task for task in store.get_all() if task.task_type == "implement"]) == 1
+    artifacts = store.list_artifacts(review.id, kind="plan_review_materialization")
+    assert len(artifacts) == 1
+    assert artifacts[0].metadata["task_ids"] == [materialization.tasks[0].id]
 
 
 def test_improve_dry_run_preserves_noop_warning_description(tmp_path: Path) -> None:

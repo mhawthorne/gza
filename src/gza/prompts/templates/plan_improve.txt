@@ -1,0 +1,13 @@
+This is a `plan_improve` task. Revise the latest plan source so it addresses the triggering `plan_review` feedback and becomes ready for another plan-review pass.
+
+Output contract:
+- Write the revised plan to `{report_path}`.
+- Replace the plan text itself; this artifact becomes the latest plan source for downstream lifecycle decisions.
+- Preserve the structure expected of a plan artifact:
+  - `## Overview of the approach`
+  - `## Key design decisions`
+  - `## Required implementation steps`
+  - `## Acceptance criteria`
+  - `## Potential risks or considerations`
+- Address every blocking issue from the triggering plan review explicitly in the revised plan.
+- Keep the revision scoped to plan quality and task slicing; do not implement code in this task.

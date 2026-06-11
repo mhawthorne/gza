@@ -81,7 +81,7 @@ def _create_completed_review(store, impl, *, verdict: str = "APPROVED"):
     return review
 
 
-def test_advance_creates_implement_for_completed_plan(tmp_path: Path, capsys) -> None:
+def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     plan = _create_completed_plan(store, "Design auth system")
@@ -101,20 +101,19 @@ def test_advance_creates_implement_for_completed_plan(tmp_path: Path, capsys) ->
         rc = cmd_advance(_advance_args(tmp_path))
 
     assert rc == 0
-    assert "Created implement task" in capsys.readouterr().out
-    impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
-    assert len(impl_tasks) == 1
-    assert impl_tasks[0].depends_on == plan.id
-    assert impl_tasks[0].based_on is None
-    assert impl_tasks[0].prompt == f"Implement plan from task {plan.id}: design-auth-system"
-    assert spawn_calls == [impl_tasks[0].id]
+    assert "Created plan review task" in capsys.readouterr().out
+    plan_review_tasks = [task for task in store.get_all() if task.task_type == "plan_review"]
+    assert len(plan_review_tasks) == 1
+    assert plan_review_tasks[0].depends_on == plan.id
+    assert plan_review_tasks[0].based_on is None
+    assert spawn_calls == [plan_review_tasks[0].id]
 
 
-def test_advance_create_implement_inherits_review_scope_from_completed_plan(tmp_path: Path, capsys) -> None:
+def test_advance_create_plan_review_inherits_tags_from_completed_plan(tmp_path: Path, capsys) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     plan = _create_completed_plan(store, "Design auth slice")
-    plan.review_scope = "slice F-A1 + F-A2: only review the classifier and persistence slice"
+    plan.tags = ("lifecycle", "planner")
     store.update(plan)
 
     with (
@@ -124,13 +123,13 @@ def test_advance_create_implement_inherits_review_scope_from_completed_plan(tmp_
         rc = cmd_advance(_advance_args(tmp_path))
 
     assert rc == 0
-    assert "Created implement task" in capsys.readouterr().out
-    impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
-    assert len(impl_tasks) == 1
-    assert impl_tasks[0].review_scope == plan.review_scope
+    assert "Created plan review task" in capsys.readouterr().out
+    plan_review_tasks = [task for task in store.get_all() if task.task_type == "plan_review"]
+    assert len(plan_review_tasks) == 1
+    assert plan_review_tasks[0].tags == plan.tags
 
 
-def test_advance_create_implement_startup_failure_rolls_back_child_and_skips_spawn(
+def test_advance_create_plan_review_startup_failure_rolls_back_child_and_skips_spawn(
     tmp_path: Path,
     capsys,
 ) -> None:
@@ -151,9 +150,9 @@ def test_advance_create_implement_startup_failure_rolls_back_child_and_skips_spa
     assert rc == 1
     output = capsys.readouterr()
     assert "creator boom" in output.err
-    assert "Created implement task" not in output.out
-    impl_tasks = [task for task in store.get_all() if task.task_type == "implement"]
-    assert impl_tasks == []
+    assert "Created plan review task" not in output.out
+    plan_review_tasks = [task for task in store.get_all() if task.task_type == "plan_review"]
+    assert plan_review_tasks == []
     logs_dir = tmp_path / ".gza" / "logs"
     if logs_dir.exists():
         assert list(logs_dir.iterdir()) == []
@@ -214,7 +213,7 @@ def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None
     output = capsys.readouterr().out
     assert rc == 0
     assert str(plan.id) in output
-    assert "Create and start implement" in output
+    assert "Create and start plan review" in output
     assert "Merge" not in output
 
 

@@ -32,7 +32,7 @@ The contract is defined over these concepts, independent of how they are stored.
 
 - **Task** — one unit of agent execution with a type and an execution status. Tasks are
   the *atoms*; the engine spawns them and reads their results.
-  - **Types:** `plan`, `explore`, `implement`, `review`, `improve`, `rebase`.
+  - **Types:** `plan`, `plan_review`, `plan_improve`, `explore`, `implement`, `review`, `improve`, `rebase`.
   - **Execution status:** `pending` → `in_progress` → `completed` | `failed`.
 - **Work unit** (a.k.a. *merge unit* / *implementation lineage*) — the *molecule*: the
   set of related tasks that together produce one mergeable change on one branch. This is
@@ -68,8 +68,12 @@ stateDiagram-v2
     [*] --> Planned: plan task completes
     [*] --> Implementing: implement task created
 
-    Planned --> Implementing: auto_implement\n(create implement)
+    Planned --> PlanReviewing: auto_implement\n(create/run plan_review)
     Planned --> AwaitingHuman: plan held\n(auto_implement = false)
+    PlanReviewing --> Implementing: APPROVED valid manifest\n(materialize slices)
+    PlanReviewing --> PlanImproving: CHANGES_REQUESTED
+    PlanReviewing --> HumanParked: invalid manifest / unknown verdict / needs discussion
+    PlanImproving --> PlanReviewing: revised plan completes
 
     Implementing --> Implemented: implement completes\n(branch exists)
     Implementing --> Recovering: implement fails

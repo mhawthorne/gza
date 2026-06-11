@@ -110,15 +110,30 @@ class TestGetTaskOutputPaths:
             assert "summaries" in str(summary_path)
 
     def test_non_code_task_types_return_report_path(self, tmp_path: Path):
-        """Non-code task types (explore, plan, review, internal) return a report_path."""
+        """Non-code task types return a report_path."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        for task_type in ("explore", "plan", "review", "internal", "learn"):
+        for task_type in ("explore", "plan", "plan_review", "plan_improve", "review", "internal", "learn"):
             task = self._make_task(store, task_type)
             report_path, summary_path = get_task_output_paths(task, tmp_path)
             assert report_path is not None, f"{task_type} should have report_path"
             assert summary_path is None, f"{task_type} should not have summary_path"
+
+    def test_plan_review_and_plan_improve_use_explicit_artifact_directories(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_review = self._make_task(store, "plan_review")
+        plan_improve = self._make_task(store, "plan_improve")
+
+        plan_review_path, _ = get_task_output_paths(plan_review, tmp_path)
+        plan_improve_path, _ = get_task_output_paths(plan_improve, tmp_path)
+
+        assert plan_review_path is not None
+        assert plan_improve_path is not None
+        assert "plan-reviews" in str(plan_review_path)
+        assert "revised-plans" in str(plan_improve_path)
 
     def test_no_task_id_returns_none(self, tmp_path: Path):
         """Tasks without a task_id return (None, None)."""
@@ -7359,6 +7374,75 @@ class TestNonCodeReportArtifactContract:
         assert refreshed.output_content is None
         host_report = tmp_path / ".gza" / "plans" / f"{plan_task.slug}.md"
         assert not host_report.exists()
+
+    @pytest.mark.parametrize(
+        ("task_type", "artifact_dir"),
+        [
+            ("plan_review", "plan-reviews"),
+            ("plan_improve", "revised-plans"),
+        ],
+    )
+    def test_run_inner_routes_plan_review_and_plan_improve_through_branchless_runner(
+        self,
+        tmp_path: Path,
+        task_type: str,
+        artifact_dir: str,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt=f"Run {task_type}", task_type=task_type)
+        task.slug = f"20260213-{task_type}"
+        store.update(task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = False
+        config.timeout_minutes = 10
+        config.max_steps = 50
+
+        report_text = f"# {task_type}\n\nVerdict: APPROVED\n"
+
+        def provider_run(
+            _config,
+            _prompt,
+            _log_file,
+            work_dir,
+            resume_session_id=None,
+            on_session_id=None,
+            on_step_count=None,
+        ):
+            report_dir = work_dir / ".gza" / artifact_dir
+            report_dir.mkdir(parents=True, exist_ok=True)
+            (report_dir / f"{task.slug}.md").write_text(report_text)
+            return RunResult(
+                exit_code=0,
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                session_id=f"{task_type}-session",
+                error_type=None,
+            )
+
+        provider = Mock()
+        provider.name = "MockProvider"
+        provider.run.side_effect = provider_run
+
+        with patch("gza.runner.console"), patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None):
+            exit_code = _run_inner(task, config, config, store, provider, git=None, resume=False)
+
+        assert exit_code == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.branch is None
+        assert refreshed.output_content == report_text
+        assert refreshed.report_file == f".gza/{artifact_dir}/{task.slug}.md"
+        assert (tmp_path / refreshed.report_file).read_text() == report_text
 
     def test_missing_report_artifact_recovered_from_log(self, tmp_path: Path):
         """If the expected report is missing but a 'result' log entry has text, recover and complete."""

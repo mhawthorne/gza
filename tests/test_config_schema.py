@@ -70,3 +70,37 @@ def test_config_load_parses_pr_integration_false(tmp_path) -> None:
     config = Config.load(tmp_path)
 
     assert config.pr_integration is False
+
+
+def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
+    """Plan-review lifecycle controls should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "advance_create_plan_reviews: false\n"
+        "require_plan_review_before_implement: false\n"
+        "max_plan_review_cycles: 4\n"
+        "max_plan_slices: 7\n"
+        "plan_slice_target_timeout_minutes: 25\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.advance_create_plan_reviews is False
+    assert config.require_plan_review_before_implement is False
+    assert config.max_plan_review_cycles == 4
+    assert config.max_plan_slices == 7
+    assert config.plan_slice_target_timeout_minutes == 25
+    assert config.get_plan_slice_target_timeout_minutes() == 25
+
+
+def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path) -> None:
+    """Unset plan slice timeout should derive from the code-task timeout cap."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "code_task_diff_timeout_cap_minutes: 62\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.plan_slice_target_timeout_minutes is None
+    assert config.get_plan_slice_target_timeout_minutes() == 62

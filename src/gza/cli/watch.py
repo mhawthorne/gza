@@ -61,9 +61,12 @@ from ..workers import WorkerRegistry
 from ._common import (
     _TASK_ID_RE,
     _create_implementation_task_from_source,
+    _create_plan_improve_task,
+    _create_plan_review_task,
     _create_rebase_task,
     _create_resume_task,
     _create_retry_task,
+    _materialize_plan_review_slices,
     _precondition_blocking_dependency_id,
     _prepare_task_for_immediate_execution,
     _spawn_background_resume_worker,
@@ -1495,6 +1498,12 @@ def _run_cycle(
             trigger_source="watch",
         )
 
+    def _create_plan_review_from_task(parent_task: DbTask) -> DbTask:
+        return _create_plan_review_task(store, parent_task, trigger_source="watch")
+
+    def _create_plan_improve_from_task(parent_task: DbTask, review_task: DbTask) -> DbTask:
+        return _create_plan_improve_task(store, parent_task, review_task, trigger_source="watch")
+
     executor_context = AdvanceActionExecutionContext(
         store=store,
         trigger_source="watch",
@@ -1516,6 +1525,17 @@ def _run_cycle(
         create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="watch"),
         create_rebase_task=_create_rebase_from_task,
         create_implement_task=_create_implement_from_task,
+        create_plan_review_task=_create_plan_review_from_task,
+        create_plan_improve_task=_create_plan_improve_from_task,
+        materialize_plan_slices=lambda plan_task, review_task, manifest: _materialize_plan_review_slices(
+            config,
+            store,
+            plan_task,
+            review_task,
+            manifest,
+            trigger_source="plan-review",
+            require_review_before_merge=config.require_review_before_merge,
+        ),
         create_targeted_rebase_task=_create_targeted_rebase_from_task,
         spawn_worker=_watch_spawn_worker,
         spawn_resume_worker=_watch_spawn_resume_worker,

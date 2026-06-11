@@ -66,14 +66,19 @@ DEFAULT_CLAUDE_ARGS = [
     "--allowedTools", "Read", "Write", "Edit", "Glob", "Grep", "Bash",
 ]
 DEFAULT_ADVANCE_CREATE_REVIEWS = True
+DEFAULT_ADVANCE_CREATE_PLAN_REVIEWS = True
 DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE = True
+DEFAULT_REQUIRE_PLAN_REVIEW_BEFORE_IMPLEMENT = True
 DEFAULT_PR_INTEGRATION = True
 REMOVED_ADVANCE_REVIEW_KEY = "advance_requires_review"
 RENAMED_REQUIRE_REVIEW_KEY = "require_review_before_merge"
 DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
+DEFAULT_MAX_PLAN_REVIEW_CYCLES = 2
 DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 2
+DEFAULT_MAX_PLAN_SLICES: int | None = None
+DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES: int | None = None
 DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
 DEFAULT_MAX_CONCURRENT = 5
 DEFAULT_WATCH_BATCH = 5
@@ -111,8 +116,10 @@ VALID_CONFIG_FIELDS = {
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
     "verify_command", "inner_verify_command",
-    "advance_create_reviews", "require_review_before_merge", "pr_integration", "advance_mode", "max_resume_attempts",
-    "max_review_cycles", "max_noop_improve_cycles", "max_failed_closing_review_retries", "max_concurrent",
+    "advance_create_reviews", "advance_create_plan_reviews", "require_review_before_merge",
+    "require_plan_review_before_implement", "pr_integration", "advance_mode", "max_resume_attempts",
+    "max_review_cycles", "max_plan_review_cycles", "max_noop_improve_cycles", "max_plan_slices",
+    "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
@@ -185,12 +192,17 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "verify_command": None,
     "inner_verify_command": None,
     "advance_create_reviews": None,
+    "advance_create_plan_reviews": None,
     "require_review_before_merge": None,
+    "require_plan_review_before_implement": None,
     "pr_integration": None,
     "max_resume_attempts": None,
     "max_concurrent": None,
     "max_review_cycles": None,
+    "max_plan_review_cycles": None,
     "max_noop_improve_cycles": None,
+    "max_plan_slices": None,
+    "plan_slice_target_timeout_minutes": None,
     "max_failed_closing_review_retries": None,
     "watch": {
         "batch": None,
@@ -288,7 +300,9 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "verify_command": None,
     "inner_verify_command": None,
     "advance_create_reviews": None,
+    "advance_create_plan_reviews": None,
     "require_review_before_merge": None,
+    "require_plan_review_before_implement": None,
     "pr_integration": None,
     "watch": {
         "batch": None,
@@ -305,7 +319,10 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "max_resume_attempts": None,
     "max_concurrent": None,
     "max_review_cycles": None,
+    "max_plan_review_cycles": None,
     "max_noop_improve_cycles": None,
+    "max_plan_slices": None,
+    "plan_slice_target_timeout_minutes": None,
     "max_failed_closing_review_retries": None,
     "interactive_worktree_dir": None,
     "merge_squash_threshold": None,
@@ -906,13 +923,18 @@ class Config:
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
     inner_verify_command: str = DEFAULT_INNER_VERIFY_COMMAND
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
+    advance_create_plan_reviews: bool = DEFAULT_ADVANCE_CREATE_PLAN_REVIEWS
     require_review_before_merge: bool = DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE
+    require_plan_review_before_implement: bool = DEFAULT_REQUIRE_PLAN_REVIEW_BEFORE_IMPLEMENT
     pr_integration: bool = DEFAULT_PR_INTEGRATION
     advance_mode: str = DEFAULT_ADVANCE_MODE
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
+    max_plan_review_cycles: int = DEFAULT_MAX_PLAN_REVIEW_CYCLES
     max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
+    max_plan_slices: int | None = DEFAULT_MAX_PLAN_SLICES
+    plan_slice_target_timeout_minutes: int | None = DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
     interactive_worktree_dir: str = DEFAULT_INTERACTIVE_WORKTREE_DIR
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
@@ -1125,6 +1147,14 @@ class Config:
     def get_timeout_minutes_for_task_type(self, task_type: str) -> int:
         """Get timeout_minutes for a task type using the configured default provider."""
         return self.get_timeout_minutes_for_task(task_type, self.provider)
+
+    def get_plan_slice_target_timeout_minutes(self) -> int:
+        """Return the reviewer budget target used for plan-slice sizing."""
+        if self.plan_slice_target_timeout_minutes is not None:
+            return self.plan_slice_target_timeout_minutes
+        if self.code_task_diff_timeout_cap_minutes is not None:
+            return self.code_task_diff_timeout_cap_minutes
+        return DEFAULT_CODE_TASK_DIFF_TIMEOUT_CAP_MINUTES
 
     @property
     def worktree_path(self) -> Path:
@@ -1782,11 +1812,27 @@ class Config:
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             raise ConfigError("'advance_create_reviews' must be a boolean (true/false)")
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
+        if "advance_create_plan_reviews" in data and not isinstance(data["advance_create_plan_reviews"], bool):
+            raise ConfigError("'advance_create_plan_reviews' must be a boolean (true/false)")
+        advance_create_plan_reviews = bool(
+            data.get("advance_create_plan_reviews", DEFAULT_ADVANCE_CREATE_PLAN_REVIEWS)
+        )
 
         if "require_review_before_merge" in data and not isinstance(data["require_review_before_merge"], bool):
             raise ConfigError("'require_review_before_merge' must be a boolean (true/false)")
         require_review_before_merge = bool(
             data.get("require_review_before_merge", DEFAULT_REQUIRE_REVIEW_BEFORE_MERGE)
+        )
+        if (
+            "require_plan_review_before_implement" in data
+            and not isinstance(data["require_plan_review_before_implement"], bool)
+        ):
+            raise ConfigError("'require_plan_review_before_implement' must be a boolean (true/false)")
+        require_plan_review_before_implement = bool(
+            data.get(
+                "require_plan_review_before_implement",
+                DEFAULT_REQUIRE_PLAN_REVIEW_BEFORE_IMPLEMENT,
+            )
         )
         if "pr_integration" in data and not isinstance(data["pr_integration"], bool):
             raise ConfigError("'pr_integration' must be a boolean (true/false)")
@@ -1800,11 +1846,29 @@ class Config:
         max_review_cycles = _load_strict_int_field(data, "max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES)
         if max_review_cycles <= 0:
             raise ConfigError("'max_review_cycles' must be positive")
+        max_plan_review_cycles = _load_strict_int_field(
+            data,
+            "max_plan_review_cycles",
+            DEFAULT_MAX_PLAN_REVIEW_CYCLES,
+        )
+        if max_plan_review_cycles <= 0:
+            raise ConfigError("'max_plan_review_cycles' must be positive")
         max_noop_improve_cycles = _load_strict_int_field(
             data, "max_noop_improve_cycles", DEFAULT_MAX_NOOP_IMPROVE_CYCLES
         )
         if max_noop_improve_cycles <= 0:
             raise ConfigError("'max_noop_improve_cycles' must be positive")
+        max_plan_slices = _validate_optional_positive_int_field(
+            data.get("max_plan_slices", DEFAULT_MAX_PLAN_SLICES),
+            "max_plan_slices",
+        )
+        plan_slice_target_timeout_minutes = _validate_optional_positive_int_field(
+            data.get(
+                "plan_slice_target_timeout_minutes",
+                DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES,
+            ),
+            "plan_slice_target_timeout_minutes",
+        )
         max_failed_closing_review_retries = _load_strict_int_field(
             data, "max_failed_closing_review_retries", DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
         )
@@ -2133,13 +2197,18 @@ class Config:
             verify_command=verify_command,
             inner_verify_command=inner_verify_command,
             advance_create_reviews=advance_create_reviews,
+            advance_create_plan_reviews=advance_create_plan_reviews,
             require_review_before_merge=require_review_before_merge,
+            require_plan_review_before_implement=require_plan_review_before_implement,
             pr_integration=pr_integration,
             advance_mode=advance_mode,
             max_resume_attempts=max_resume_attempts,
             max_concurrent=max_concurrent,
             max_review_cycles=max_review_cycles,
+            max_plan_review_cycles=max_plan_review_cycles,
             max_noop_improve_cycles=max_noop_improve_cycles,
+            max_plan_slices=max_plan_slices,
+            plan_slice_target_timeout_minutes=plan_slice_target_timeout_minutes,
             max_failed_closing_review_retries=max_failed_closing_review_retries,
             watch=watch_config,
             iterate_max_iterations=iterate_max_iterations,
@@ -2554,9 +2623,16 @@ class Config:
             )
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             errors.append("'advance_create_reviews' must be a boolean (true/false)")
+        if "advance_create_plan_reviews" in data and not isinstance(data["advance_create_plan_reviews"], bool):
+            errors.append("'advance_create_plan_reviews' must be a boolean (true/false)")
 
         if "require_review_before_merge" in data and not isinstance(data["require_review_before_merge"], bool):
             errors.append("'require_review_before_merge' must be a boolean (true/false)")
+        if (
+            "require_plan_review_before_implement" in data
+            and not isinstance(data["require_plan_review_before_implement"], bool)
+        ):
+            errors.append("'require_plan_review_before_implement' must be a boolean (true/false)")
         if "pr_integration" in data and not isinstance(data["pr_integration"], bool):
             errors.append("'pr_integration' must be a boolean (true/false)")
         if "max_resume_attempts" in data:
@@ -2574,11 +2650,26 @@ class Config:
                 errors.append("'max_review_cycles' must be an integer")
             elif data["max_review_cycles"] <= 0:
                 errors.append("'max_review_cycles' must be positive")
+        if "max_plan_review_cycles" in data:
+            if not _is_strict_int(data["max_plan_review_cycles"]):
+                errors.append("'max_plan_review_cycles' must be an integer")
+            elif data["max_plan_review_cycles"] <= 0:
+                errors.append("'max_plan_review_cycles' must be positive")
         if "max_noop_improve_cycles" in data:
             if not _is_strict_int(data["max_noop_improve_cycles"]):
                 errors.append("'max_noop_improve_cycles' must be an integer")
             elif data["max_noop_improve_cycles"] <= 0:
                 errors.append("'max_noop_improve_cycles' must be positive")
+        _validate_optional_positive_int_field(
+            data.get("max_plan_slices"),
+            "max_plan_slices",
+            errors=errors,
+        )
+        _validate_optional_positive_int_field(
+            data.get("plan_slice_target_timeout_minutes"),
+            "plan_slice_target_timeout_minutes",
+            errors=errors,
+        )
         if "max_failed_closing_review_retries" in data:
             if not _is_strict_int(data["max_failed_closing_review_retries"]):
                 errors.append("'max_failed_closing_review_retries' must be an integer")

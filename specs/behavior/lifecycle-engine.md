@@ -70,22 +70,17 @@ operator changing a value is configuration, not a spec violation.
 
 ### §1 — Plan and explore intake
 
-- `auto_implement` defaults **on**. A completed `plan` with no implement child MUST create
-  and run its `implement` unless holding was explicitly chosen at plan-creation time. This
-  keeps `awaiting_human` rare: the plan stage is not a routine human checkpoint — the
-  review-before-merge gate is (see
-  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 3).
+- `auto_implement` defaults **on**. A completed non-held `plan` (or completed `plan_improve`)
+  with no implementation follow-up MUST enter automated `plan_review` first when
+  `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
+  then materialize bounded implementation slices only after an approved valid manifest.
+  The legacy single-implement path is allowed only when
+  `require_plan_review_before_implement` is off.
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
   `awaiting_human` with parked reason `awaiting-human-review`.
 - A completed `explore` with no plan/implement follow-up MUST go to `needs_discussion`
   (decide: drop or spawn follow-up). The engine MUST NOT silently leave it pending (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 6).
-
-> **Planned (aspirational — not yet contract):** an *automatic* plan-review / plan-refine
-> step will run on every plan before its implement — an agent gate analogous to code
-> review, **not** a human stop. Whether it is a review→improve loop or a single refine
-> pass, and its exact task type/name, are TBD and will be decided when the work is done.
-> This is distinct from the interactive `/gza-plan-review` skill (a human-driven gate).
 
 ### §2 — No actionable branch
 

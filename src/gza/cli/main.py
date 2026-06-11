@@ -27,6 +27,7 @@ from ..db import (
     run_v27_migration,
 )
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
+from ..task_types import CLI_ADD_TASK_TYPES
 from ._common import (
     GzaArgumentParser,
     SortingHelpFormatter,
@@ -59,6 +60,8 @@ from .execution import (
     cmd_improve,
     cmd_iterate,
     cmd_mark_completed,
+    cmd_plan_improve,
+    cmd_plan_review,
     cmd_resume,
     cmd_retry,
     cmd_review,
@@ -1496,7 +1499,7 @@ def main() -> int:
     )
     add_parser.add_argument(
         "--type",
-        choices=["explore", "plan", "implement", "review", "improve"],
+        choices=list(CLI_ADD_TASK_TYPES),
         help="Set task type (default: implement)",
     )
     add_parser.add_argument(
@@ -2052,7 +2055,11 @@ def main() -> int:
     # implement command
     implement_parser = subparsers.add_parser(
         "implement",
-        help="Create an implementation task from a completed plan task",
+        help="Create implementation from a completed plan, preferring an approved slice manifest when available",
+        description=(
+            "Create implementation from a completed plan, preferring an approved "
+            "slice manifest when one exists for the latest reviewed plan source."
+        ),
     )
     implement_parser.add_argument(
         "plan_task_id",
@@ -2141,6 +2148,118 @@ def main() -> int:
         help="Skip dependency precondition checks when running the implement task",
     )
     add_common_args(implement_parser)
+
+    # plan-review command
+    plan_review_parser = subparsers.add_parser(
+        "plan-review",
+        help="Create and optionally run a plan_review task for a completed plan or revised-plan source",
+    )
+    plan_review_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID for a completed plan source, or a completed plan_review for override/materialize actions",
+    )
+    plan_review_mode = plan_review_parser.add_mutually_exclusive_group()
+    plan_review_mode.add_argument(
+        "--rerun",
+        action="store_true",
+        help="Create a fresh plan_review even if a completed one already exists for this plan source",
+    )
+    plan_review_mode.add_argument(
+        "--edit-slices",
+        action="store_true",
+        help="Edit and validate a completed approved plan_review manifest override tied to the review ID",
+    )
+    plan_review_mode.add_argument(
+        "--materialize",
+        action="store_true",
+        help="Materialize implementation slices exactly once from a completed approved plan_review ID",
+    )
+    plan_review_parser.add_argument(
+        "--queue", "-q",
+        action="store_true",
+        help="Add task to queue without executing immediately",
+    )
+    plan_review_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    plan_review_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
+    )
+    plan_review_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
+    plan_review_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override model for this task",
+    )
+    plan_review_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        help="Override provider for this task",
+    )
+    plan_review_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the plan review task",
+    )
+    add_common_args(plan_review_parser)
+
+    # plan-improve command
+    plan_improve_parser = subparsers.add_parser(
+        "plan-improve",
+        help="Create and optionally run a plan_improve task from a completed CHANGES_REQUESTED plan-review task",
+    )
+    plan_improve_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed completed CHANGES_REQUESTED plan_review task ID to revise",
+    )
+    plan_improve_parser.add_argument(
+        "--queue", "-q",
+        action="store_true",
+        help="Add task to queue without executing immediately",
+    )
+    plan_improve_parser.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run worker in background (detached mode)",
+    )
+    plan_improve_parser.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
+    )
+    plan_improve_parser.add_argument(
+        "--max-turns",
+        type=int,
+        metavar="N",
+        help="Override max_turns setting from gza.yaml for this run",
+    )
+    plan_improve_parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help="Override model for this task",
+    )
+    plan_improve_parser.add_argument(
+        "--provider",
+        metavar="PROVIDER",
+        help="Override provider for this task",
+    )
+    plan_improve_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip dependency precondition checks when running the plan improve task",
+    )
+    add_common_args(plan_improve_parser)
 
     # extract command
     extract_parser = subparsers.add_parser(
@@ -2722,6 +2841,10 @@ def main() -> int:
             return cmd_retry(args)
         elif args.command == "improve":
             return cmd_improve(args)
+        elif args.command == "plan-review":
+            return cmd_plan_review(args)
+        elif args.command == "plan-improve":
+            return cmd_plan_improve(args)
         elif args.command == "fix":
             return cmd_fix(args)
         elif args.command == "iterate":

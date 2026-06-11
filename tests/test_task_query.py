@@ -108,8 +108,8 @@ def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_
     assert len(result.rows) == 1
     row = result.rows[0]
     assert hasattr(row, "owner_task")
-    assert row.values["next_action"] == "create_implement"
-    assert row.values["next_action_reason"] == "Create and start implement task"
+    assert row.values["next_action"] == "create_plan_review"
+    assert row.values["next_action_reason"] == "Create and start plan review task"
 
 
 def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_available(tmp_path: Path) -> None:

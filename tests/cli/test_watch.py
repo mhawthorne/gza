@@ -5149,23 +5149,21 @@ def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp
         )
 
     assert result.work_done is True
-    assert spawn_worker.call_count == 0
-    assert spawn_iterate.call_count == 1
-    iterate_args = spawn_iterate.call_args.args[0]
-    created_impl = spawn_iterate.call_args.args[2]
-    assert iterate_args.max_iterations == 7
-    assert created_impl.task_type == "implement"
-    assert created_impl.depends_on == plan.id
+    assert spawn_iterate.call_count == 0
+    assert spawn_worker.call_count == 1
+    created_plan_review = spawn_worker.call_args.kwargs["prepared_task"]
+    assert created_plan_review.task_type == "plan_review"
+    assert created_plan_review.depends_on == plan.id
 
 
-def test_watch_create_implement_inherits_review_scope_from_completed_plan(tmp_path: Path) -> None:
+def test_watch_create_plan_review_inherits_tags_from_completed_plan(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     plan = store.add("Plan scoped slice", task_type="plan")
     assert plan.id is not None
     plan.status = "completed"
     plan.completed_at = datetime.now(UTC)
-    plan.review_scope = "slice F-A1 + F-A2: only review the classifier and persistence slice"
+    plan.tags = ("lifecycle", "planner")
     store.update(plan)
 
     config = Config.load(tmp_path)
@@ -5179,7 +5177,7 @@ def test_watch_create_implement_inherits_review_scope_from_completed_plan(tmp_pa
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
             config=config,
@@ -5191,10 +5189,10 @@ def test_watch_create_implement_inherits_review_scope_from_completed_plan(tmp_pa
         )
 
     assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    created_impl = spawn_iterate.call_args.args[2]
-    assert created_impl.depends_on == plan.id
-    assert created_impl.review_scope == plan.review_scope
+    assert spawn_iterate.call_count == 0
+    created_plan_review = spawn_worker.call_args.kwargs["prepared_task"]
+    assert created_plan_review.depends_on == plan.id
+    assert created_plan_review.tags == plan.tags
 
 
 @pytest.mark.parametrize(

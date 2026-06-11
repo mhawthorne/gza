@@ -43,12 +43,24 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         True,
         "Auto-create review tasks in lifecycle flows when review gating still requires them; manual attention is required instead when review creation is disabled.",
     ),
+    ConfigKeySpec(
+        "advance_create_plan_reviews",
+        "bool",
+        True,
+        "Auto-create plan_review tasks for completed non-held plans; manual attention is required instead when plan-review creation is disabled.",
+    ),
     ConfigKeySpec("advance_mode", "str", "default", "Mode selector for `gza advance` behavior."),
     ConfigKeySpec(
         "require_review_before_merge",
         "bool",
         True,
         "Require a valid current review before lifecycle auto-merge.",
+    ),
+    ConfigKeySpec(
+        "require_plan_review_before_implement",
+        "bool",
+        True,
+        "Require a current approved plan_review before lifecycle automation materializes implementation work from a plan.",
     ),
     ConfigKeySpec(
         "pr_integration",
@@ -93,7 +105,16 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch.",
     ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
+    ConfigKeySpec("max_plan_review_cycles", "int", 2, "Cap for plan_review/plan_improve loops in lifecycle automation."),
     ConfigKeySpec("max_noop_improve_cycles", "int", 2, "Cap for consecutive no-op improves before lifecycle automation stops for discussion."),
+    ConfigKeySpec("max_plan_slices", "int | null", None, "Optional cap on auto-materialized implementation slices from one approved plan review."),
+    ConfigKeySpec(
+        "plan_slice_target_timeout_minutes",
+        "int | null",
+        "code_task_diff_timeout_cap_minutes or 45",
+        "Optional reviewer budget target for one implementation slice; when unset it derives from code-task timeout sizing.",
+        example_value=45,
+    ),
     ConfigKeySpec("max_failed_closing_review_retries", "int", 3, "Max consecutive failed closing-review attempts before the lineage is parked as needs_attention; 0 escalates on first failure."),
     ConfigKeySpec(
         "max_concurrent",

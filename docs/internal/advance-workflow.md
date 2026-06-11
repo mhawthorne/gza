@@ -64,7 +64,9 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 | Condition | Action |
 |-----------|--------|
 | Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up (`reason=awaiting-human-review`) |
-| Plan with no implement child | `create_implement` — create and run implement task |
+| Completed non-held plan with no plan review and `require_plan_review_before_implement=true` | `create_plan_review` — create and run plan-review task |
+| Completed non-held plan with approved valid plan review manifest | `materialize_plan_slices` — create sliced implement tasks |
+| Completed non-held plan with `require_plan_review_before_implement=false` | `create_implement` — legacy compatibility path |
 | Plan with existing implement child | `skip` |
 
 ### 2. Explore source follow-up
@@ -222,7 +224,12 @@ These actions create background workers and count toward the batch limit. The so
 | `verify_noop_improve_then_review` | `gza advance`: re-runs `verify_command` on the current implementation tip, persists that verify provenance on the implementation row, then clears a verify-only blocker or creates/spawns a fresh review; failures still park with `improve-no-op`. `gza watch`: routes the same decision through iterate for unmerged implementation chains. |
 | `improve` | `gza advance`: creates/resumes/retries improve work directly. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` and lets iterate choose the improve action. |
 | `run_improve` | `gza advance`: spawns worker for existing pending improve. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` instead of the child improve directly. |
-| `create_implement` | Creates implement task for a plan, spawns worker |
+| `create_plan_review` | Creates `plan_review` task for a completed plan source, spawns worker |
+| `run_plan_review` | Starts an existing pending `plan_review` task |
+| `create_plan_improve` | Creates `plan_improve` task after `CHANGES_REQUESTED` plan review, spawns worker |
+| `run_plan_improve` | Starts an existing pending `plan_improve` task |
+| `materialize_plan_slices` | Creates sliced implement tasks from an approved plan-review manifest |
+| `create_implement` | Creates implement task for a plan, spawns worker (legacy compatibility path when plan-review gate is disabled) |
 | `resume` | Creates resume task, spawns worker |
 | `retry` | Creates retry task, spawns worker |
 
@@ -282,7 +289,7 @@ Rebase tasks need git identity for `git rebase --continue`. The Docker container
 
 ## Output
 
-For worker-spawning actions that first create or reuse a child task (`create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`), operator output must distinguish task selection/creation success from worker-launch failure. If task creation succeeds, or if the executor reuses an existing eligible recovery task, but the background worker fails to start, `gza advance` should print the relevant created/reused task ID and a separate `Failed to start ... worker` line rather than collapsing that state into `✗ Created ...`.
+For worker-spawning actions that first create or reuse a child task (`create_plan_review`, `create_plan_improve`, `create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`), operator output must distinguish task selection/creation success from worker-launch failure. If task creation succeeds, or if the executor reuses an existing eligible recovery task, but the background worker fails to start, `gza advance` should print the relevant created/reused task ID and a separate `Failed to start ... worker` line rather than collapsing that state into `✗ Created ...`.
 
 ```
 Will advance N task(s):

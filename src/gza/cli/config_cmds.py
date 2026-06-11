@@ -839,7 +839,9 @@ def _cmd_stats_reviews(
         for ri in ri_tasks:
             if ri.task_type != "review":
                 continue
-            content = review_content.get(ri.id)  # type: ignore
+            if ri.id is None:
+                continue
+            content = review_content.get(ri.id)
             if content is None:
                 continue
             must_fix, sugg = _count_review_issues(content)

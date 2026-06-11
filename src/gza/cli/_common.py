@@ -15,8 +15,9 @@ import tempfile
 import threading
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -24,6 +25,8 @@ from rich.markup import escape as rich_escape
 from rich.pager import Pager
 from rich.panel import Panel
 
+from ..artifact_paths import resolve_artifact_path
+from ..artifacts import store_command_output_artifact
 from ..branch_resolution import resolve_rebase_target_branch, resolve_rebase_target_task
 from ..concurrency import (
     LaunchPermit,
@@ -39,6 +42,7 @@ from ..console import (
 )
 from ..db import (
     ManualMigrationRequired,
+    NewTaskParams,
     SqliteTaskStore,
     StoreOpenMode,
     Task as DbTask,
@@ -52,6 +56,12 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..operator_state import inspect_empty_merge_unit
+from ..plan_review_verdict import (
+    PlanReviewManifest,
+    PlanReviewValidationError,
+    get_plan_review_outcome,
+    validate_plan_review_manifest,
+)
 from ..prompts import PromptBuilder
 from ..recovery_engine import FailedRecoveryDecision, classify_recovery_row, decide_failed_task_recovery
 from ..review_scope import extract_review_scope_from_prompt
@@ -75,6 +85,7 @@ from ..runner import (
     remove_task_startup_artifacts,
     run,
 )
+from ..task_types import CLI_FILTER_TASK_TYPES
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
 
@@ -82,6 +93,17 @@ _REUSE_WORKER_OWNER_ENV = "GZA_REUSE_WORKER_OWNER"
 _REUSE_WORKER_OWNER_OUTER = "outer"
 _REUSE_WORKER_REENTRY_ENV = "GZA_REUSE_WORKER_REENTRY"
 _REUSE_WORKER_SESSION_ENV = "GZA_REUSE_WORKER_SESSION"
+_PLAN_REVIEW_OVERRIDE_ARTIFACT_KIND = "plan_review_manifest_override"
+_PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND = "plan_review_materialization"
+_PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class PlanReviewMaterializationResult:
+    """Materialized or reused implementation slice set for an approved plan review."""
+
+    tasks: list[DbTask]
+    created: bool
 
 
 def format_task_status_text(task: DbTask) -> str:
@@ -2109,6 +2131,58 @@ def _create_improve_task(
     )
 
 
+def _create_plan_review_task(
+    store: SqliteTaskStore,
+    plan_task: DbTask,
+    *,
+    trigger_source: str,
+    model: str | None = None,
+    provider: str | None = None,
+) -> DbTask:
+    """Create a plan_review task for a plan or revised-plan source."""
+    assert plan_task.id is not None
+    if plan_task.task_type not in {"plan", "plan_improve"}:
+        raise ValueError("plan_review source must be a plan or plan_improve task")
+    return store.add(
+        prompt=f"Review plan source {plan_task.id}",
+        task_type="plan_review",
+        depends_on=plan_task.id,
+        based_on=None,
+        tags=plan_task.tags,
+        model=model,
+        provider=provider,
+        trigger_source=trigger_source,
+    )
+
+
+def _create_plan_improve_task(
+    store: SqliteTaskStore,
+    plan_task: DbTask,
+    review_task: DbTask,
+    *,
+    trigger_source: str,
+    model: str | None = None,
+    provider: str | None = None,
+) -> DbTask:
+    """Create a plan_improve task for a plan review that requested changes."""
+    assert plan_task.id is not None
+    assert review_task.id is not None
+    if plan_task.task_type not in {"plan", "plan_improve"}:
+        raise ValueError("plan_improve source must be a plan or plan_improve task")
+    if review_task.task_type != "plan_review":
+        raise ValueError("plan_improve dependency must be a plan_review task")
+    return store.add(
+        prompt=f"Revise plan source {plan_task.id} based on plan review {review_task.id}",
+        task_type="plan_improve",
+        depends_on=review_task.id,
+        based_on=plan_task.id,
+        tags=plan_task.tags,
+        model=model,
+        provider=provider,
+        trigger_source=trigger_source,
+    )
+
+
 from ..query import _LINEAGE_REL_LABELS, TaskLineageNode as _TaskLineageNode  # noqa: E402
 
 
@@ -2273,6 +2347,274 @@ def _create_implementation_task_from_source(
         skip_learnings=skip_learnings,
         trigger_source=trigger_source,
     )
+
+
+def _materialize_plan_review_slices(
+    config: Config,
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+    review_task: DbTask,
+    manifest: PlanReviewManifest,
+    *,
+    trigger_source: str,
+    require_review_before_merge: bool,
+) -> PlanReviewMaterializationResult:
+    """Create implementation tasks from an approved plan-review manifest exactly once."""
+    assert plan_source_task.id is not None
+    assert review_task.id is not None
+    reused_tasks = _load_materialized_plan_slice_set(
+        store,
+        review_task=review_task,
+        plan_source_task=plan_source_task,
+        manifest=manifest,
+    )
+    if reused_tasks is not None:
+        return PlanReviewMaterializationResult(tasks=reused_tasks, created=False)
+
+    task_specs: list[NewTaskParams] = []
+    slice_task_index_by_id: dict[str, int] = {}
+
+    for slice_manifest in manifest.slices:
+        depends_on_task_id = None
+        if slice_manifest.depends_on_slices:
+            depends_on_task_id = f"__new_task_idx__:{slice_task_index_by_id[slice_manifest.depends_on_slices[0]]}"
+
+        based_on_task_id = plan_source_task.id
+        same_branch = False
+        if slice_manifest.based_on_slice is not None:
+            based_on_task_id = f"__new_task_idx__:{slice_task_index_by_id[slice_manifest.based_on_slice]}"
+            same_branch = True
+
+        prompt = (
+            f"Implement plan slice {slice_manifest.slice_id} from {plan_source_task.id} "
+            f"based on plan review {review_task.id}: {slice_manifest.title}\n\n"
+            f"Slice prompt:\n{slice_manifest.prompt}\n\n"
+            f"Scope:\n- " + "\n- ".join(slice_manifest.scope)
+        )
+        if slice_manifest.out_of_scope:
+            prompt += "\n\nOut of scope:\n- " + "\n- ".join(slice_manifest.out_of_scope)
+        if slice_manifest.acceptance_criteria:
+            prompt += "\n\nAcceptance criteria:\n- " + "\n- ".join(slice_manifest.acceptance_criteria)
+
+        task_specs.append(
+            NewTaskParams(
+                prompt=prompt,
+                task_type="implement",
+                depends_on=depends_on_task_id,
+                based_on=based_on_task_id,
+                same_branch=same_branch,
+                tags=tuple(dict.fromkeys((*plan_source_task.tags, *slice_manifest.tags))),
+                review_scope=slice_manifest.review_scope,
+                create_review=require_review_before_merge,
+                trigger_source=trigger_source,
+            )
+        )
+        slice_task_index_by_id[slice_manifest.slice_id] = len(task_specs) - 1
+
+    created_tasks = store.add_tasks_with_artifact_atomic(
+        tasks=task_specs,
+        artifact_task_id=review_task.id,
+        artifact_kind=_PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+        artifact_label="plan_review_materialization",
+        artifact_path=(
+            f".gza/artifacts/{review_task.id}/"
+            f"plan_review_materialization-{_plan_review_manifest_digest(manifest)[:12]}.txt"
+        ),
+        artifact_byte_size=0,
+        artifact_sha256=sha256(b"").hexdigest(),
+        artifact_producer="gza.cli.plan-review",
+        artifact_status="materialized",
+        artifact_metadata_builder=lambda tasks: {
+            "schema_version": _PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+            "review_task_id": review_task.id,
+            "source_task_id": plan_source_task.id,
+            "source_task_type": plan_source_task.task_type,
+            "manifest_digest": _plan_review_manifest_digest(manifest),
+            "task_ids": [task.id for task in tasks if task.id is not None],
+        },
+    )
+    return PlanReviewMaterializationResult(tasks=created_tasks, created=True)
+
+
+def _plan_review_timeout_budget_minutes(config: Config) -> int:
+    return int(config.get_plan_slice_target_timeout_minutes())
+
+
+def _serialize_plan_review_manifest(manifest: PlanReviewManifest) -> str:
+    return json.dumps(asdict(manifest), indent=2, sort_keys=True) + "\n"
+
+
+def _plan_review_manifest_digest(manifest: PlanReviewManifest) -> str:
+    return sha256(_serialize_plan_review_manifest(manifest).encode("utf-8")).hexdigest()
+
+
+def _latest_plan_review_override_artifact(
+    store: SqliteTaskStore,
+    review_task: DbTask,
+) -> Any | None:
+    if review_task.id is None:
+        return None
+    artifacts = store.list_artifacts(review_task.id, kind=_PLAN_REVIEW_OVERRIDE_ARTIFACT_KIND)
+    if not artifacts:
+        return None
+    return max(artifacts, key=lambda artifact: artifact.created_at)
+
+
+def _read_plan_review_override_manifest(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    review_task: DbTask,
+    plan_source_task: DbTask,
+) -> PlanReviewManifest | None:
+    artifact = _latest_plan_review_override_artifact(store, review_task)
+    if artifact is None:
+        return None
+    artifact_path = resolve_artifact_path(Path(config.project_dir), artifact.path)
+    raw_manifest = json.loads(artifact_path.read_text())
+    if not isinstance(raw_manifest, dict):
+        raise PlanReviewValidationError("stored plan review override is not a JSON object")
+    return validate_plan_review_manifest(
+        raw_manifest,
+        markdown_verdict="APPROVED",
+        source_task_id=plan_source_task.id or "",
+        source_task_type=plan_source_task.task_type,
+        max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+    )
+
+
+def resolve_effective_plan_review_manifest(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    review_task: DbTask,
+    plan_source_task: DbTask,
+) -> tuple[PlanReviewManifest | None, str]:
+    """Return the manifest that should drive manual materialization for a review."""
+    override_manifest = _read_plan_review_override_manifest(
+        store,
+        config,
+        review_task=review_task,
+        plan_source_task=plan_source_task,
+    )
+    if override_manifest is not None:
+        return override_manifest, "override"
+
+    outcome = get_plan_review_outcome(
+        Path(config.project_dir),
+        review_task,
+        source_task_id=plan_source_task.id or "",
+        source_task_type=plan_source_task.task_type,
+        max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+    )
+    if outcome.verdict != "APPROVED" or outcome.manifest is None:
+        return None, "review"
+    return outcome.manifest, "review"
+
+
+def persist_plan_review_override_manifest(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    review_task: DbTask,
+    plan_source_task: DbTask,
+    manifest: PlanReviewManifest,
+) -> None:
+    if review_task.id is None or plan_source_task.id is None:
+        raise ValueError("review_task.id and plan_source_task.id are required")
+    store_command_output_artifact(
+        store,
+        review_task,
+        config,
+        kind=_PLAN_REVIEW_OVERRIDE_ARTIFACT_KIND,
+        producer="gza.cli.plan-review",
+        label="plan_review_manifest_override",
+        output=_serialize_plan_review_manifest(manifest),
+        status="validated",
+        metadata={
+            "schema_version": _PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+            "review_task_id": review_task.id,
+            "source_task_id": plan_source_task.id,
+            "source_task_type": plan_source_task.task_type,
+            "manifest_digest": _plan_review_manifest_digest(manifest),
+        },
+    )
+
+
+def _record_plan_materialization(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    review_task: DbTask,
+    plan_source_task: DbTask,
+    manifest: PlanReviewManifest,
+    materialized_tasks: list[DbTask],
+) -> None:
+    if review_task.id is None or plan_source_task.id is None:
+        raise ValueError("review_task.id and plan_source_task.id are required")
+    store_command_output_artifact(
+        store,
+        review_task,
+        config,
+        kind=_PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+        producer="gza.cli.plan-review",
+        label="plan_review_materialization",
+        output="",
+        status="materialized",
+        metadata={
+            "schema_version": _PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+            "review_task_id": review_task.id,
+            "source_task_id": plan_source_task.id,
+            "source_task_type": plan_source_task.task_type,
+            "manifest_digest": _plan_review_manifest_digest(manifest),
+            "task_ids": [task.id for task in materialized_tasks if task.id is not None],
+        },
+    )
+
+
+def _load_materialized_plan_slice_set(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    plan_source_task: DbTask,
+    manifest: PlanReviewManifest,
+) -> list[DbTask] | None:
+    if review_task.id is None or plan_source_task.id is None:
+        return None
+    expected_digest = _plan_review_manifest_digest(manifest)
+    artifacts = sorted(
+        store.list_artifacts(review_task.id, kind=_PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND),
+        key=lambda artifact: artifact.created_at,
+        reverse=True,
+    )
+    for artifact in artifacts:
+        metadata = artifact.metadata or {}
+        if metadata.get("schema_version") != _PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION:
+            continue
+        if metadata.get("review_task_id") != review_task.id:
+            continue
+        if metadata.get("source_task_id") != plan_source_task.id:
+            continue
+        if metadata.get("manifest_digest") != expected_digest:
+            continue
+        task_ids = metadata.get("task_ids")
+        if not isinstance(task_ids, list) or not task_ids:
+            continue
+        materialized_tasks: list[DbTask] = []
+        for task_id in task_ids:
+            if not isinstance(task_id, str):
+                materialized_tasks = []
+                break
+            materialized_task = store.get(task_id)
+            if materialized_task is None or materialized_task.status == "dropped":
+                materialized_tasks = []
+                break
+            materialized_tasks.append(materialized_task)
+        if materialized_tasks:
+            return materialized_tasks
+    return None
 
 
 def _create_resume_task(
@@ -3245,13 +3587,13 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--type",
         type=str,
-        choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
+        choices=list(CLI_FILTER_TASK_TYPES),
         help="Filter tasks by task_type",
     )
     parser.add_argument(
         "--type-not",
         type=str,
-        choices=["explore", "plan", "implement", "review", "improve", "fix", "rebase", "internal"],
+        choices=list(CLI_FILTER_TASK_TYPES),
         help="Exclude tasks by task_type",
     )
     parser.add_argument(

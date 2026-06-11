@@ -46,7 +46,7 @@ def test_docs_task_type_use_internal_not_learn() -> None:
     learnings_content = (docs_root / "internal" / "learnings.md").read_text()
 
     # configuration.md should list internal in task type filters
-    assert "explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`" in config_content
+    assert "explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`" in config_content
 
     # learnings doc should describe internal task mechanics
     assert "skip_learnings=True" in learnings_content
@@ -151,6 +151,8 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `--review-id ID` | Explicit full prefixed review task ID to base the improve on",
         "| `task_id` | Full prefixed task ID (implement, improve, review, or fix",
         "| `plan_task_id` | Full prefixed completed plan task ID to implement",
+        "| `task_id` | Full prefixed task ID for a completed `plan` or `plan_improve` source |",
+        "| `task_id` | Full prefixed completed `CHANGES_REQUESTED` `plan_review` task ID to revise |",
         "| `task_id` | Specific full prefixed task ID to advance",
         "| `impl_task_id` | Full prefixed implementation task ID to iterate",
         "| `task_id` | Full prefixed task ID(s) whose branch cohorts should be synced",
@@ -173,6 +175,8 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
         "| `--force` | Skip dependency merge precondition checks when starting the resumed task |",
         "| `--force` | Skip dependency merge precondition checks when starting the retry task |",
         "| `--force` | Skip dependency merge precondition checks when running the improve task |",
+        "| `--force` | Skip dependency merge precondition checks when running the plan review task |",
+        "| `--force` | Skip dependency merge precondition checks when running the plan improve task |",
         "| `--force` | Skip dependency merge precondition checks when running the implement task |",
         "| `--force` | Skip dependency merge precondition checks when advance starts workers |",
         "| `--force` | Skip dependency merge precondition checks when iterate starts workers |",
@@ -311,7 +315,7 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "gza comment <task_id> <text> [options]",
         "### fix",
         "gza fix <task_id> [options]",
-        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
+        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
         "| `--status-not STATUS` | Exclude the given status |",
         "| `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |",
     ]
@@ -719,7 +723,7 @@ def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> 
     assert "| `resume` | Creates resume task, spawns worker |" in worker_actions_section
     assert "| `retry` | Creates retry task, spawns worker |" in worker_actions_section
 
-    assert "`create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`" in output_section
+    assert "`create_plan_review`, `create_plan_improve`, `create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`" in output_section
     assert "created/reused task ID" in output_section
     assert "`awaiting_human` — review the plan, then run `uv run gza implement <id>`" in internal_content
 

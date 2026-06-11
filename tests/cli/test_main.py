@@ -924,6 +924,25 @@ class TestHelpOutput:
 
         assert result.returncode == 0
         assert "--depends-on" not in result.stdout
+        assert "approved slice manifest" in " ".join(result.stdout.split())
+
+    def test_plan_review_and_plan_improve_help_cover_direct_commands(self, tmp_path):
+        """Direct plan-review commands should be documented in parser help."""
+        setup_config(tmp_path)
+
+        review_help = run_gza("plan-review", "--help", "--project", str(tmp_path))
+        improve_help = run_gza("plan-improve", "--help", "--project", str(tmp_path))
+
+        assert review_help.returncode == 0
+        assert improve_help.returncode == 0
+        assert "--rerun" in review_help.stdout
+        assert "--edit-slices" in review_help.stdout
+        assert "--materialize" in review_help.stdout
+        normalized_review_help = " ".join(review_help.stdout.split())
+        assert "completed plan source" in normalized_review_help
+        assert "completed plan_review" in normalized_review_help
+        normalized_improve_help = " ".join(improve_help.stdout.split())
+        assert "completed CHANGES_REQUESTED plan_review task ID to revise" in normalized_improve_help
 
     def test_extract_help_and_docs_describe_commit_mode(self, tmp_path):
         """`extract --help` and docs should document commit-based extraction and background ordering semantics."""

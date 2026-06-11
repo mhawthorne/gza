@@ -216,3 +216,35 @@ def test_failed_held_plan_dependency_stays_blocked_after_completed_retry_descend
     released_readiness = store.get_dependency_readiness(downstream)
     assert released_readiness.ready is True
     assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
+
+
+def test_same_branch_dependency_waits_for_completed_predecessor_before_pickup(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    first_slice = store.add("First slice", task_type="implement")
+    assert first_slice.id is not None
+    second_slice = store.add(
+        "Second slice",
+        task_type="implement",
+        depends_on=first_slice.id,
+        based_on=first_slice.id,
+        same_branch=True,
+    )
+    assert second_slice.id is not None
+
+    blocked = store.get_dependency_readiness(second_slice)
+    assert blocked.ready is False
+    assert blocked.reason == "pending"
+    assert [task.id for task in store.get_pending_pickup()] == [first_slice.id]
+
+    claim = store.try_mark_in_progress(second_slice.id, 12345)
+    assert claim.task is None
+    assert claim.refusal_reason == "blocked"
+    assert claim.readiness_reason == "pending"
+    assert claim.blocking_task_id == first_slice.id
+
+    store.mark_completed(first_slice, has_commits=True, branch="feature/plan-slice-1")
+
+    released = store.get_dependency_readiness(second_slice)
+    assert released.ready is True
+    assert [task.id for task in store.get_pending_pickup()] == [second_slice.id]

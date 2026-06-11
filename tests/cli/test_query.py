@@ -12885,8 +12885,8 @@ class TestIncompleteCommand:
         assert json.loads(result.stdout) == [
             {
                 "id": plan.id,
-                "next_action": "create_implement",
-                "next_action_reason": "Create and start implement task",
+                "next_action": "create_plan_review",
+                "next_action_reason": "Create and start plan review task",
             }
         ]
         assert result.stderr == ""
