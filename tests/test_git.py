@@ -1940,3 +1940,104 @@ class TestExtractionGitHelpers:
         assert result.stdout == "stdout"
         assert result.stderr == "stderr"
         mock_run.assert_called_once_with("apply", "--check", "--reverse", str(patch_file), check=False)
+
+
+class TestGitCached:
+    """Tests for per-invocation git read caching."""
+
+    def test_cached_scope_reuses_readonly_helper_results(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="abc123\n", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="3\n", stderr=""),
+            ]
+
+            with git.cached():
+                assert git.rev_parse_if_exists("main") == "abc123"
+                assert git.rev_parse_if_exists("main") == "abc123"
+                assert git.branch_exists("x") is True
+                assert git.branch_exists("x") is True
+                assert git.is_ancestor("a", "b") is True
+                assert git.is_ancestor("a", "b") is True
+                assert git.count_commits_ahead_checked("a", "b") == 3
+                assert git.count_commits_ahead_checked("a", "b") == 3
+
+        assert mock_run.call_count == 4
+
+    def test_cached_scope_does_not_leak_between_calls(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="abc123\n", stderr="")
+
+            with git.cached():
+                assert git.rev_parse_if_exists("main") == "abc123"
+                assert git.rev_parse_if_exists("main") == "abc123"
+
+            assert git.rev_parse_if_exists("main") == "abc123"
+
+            with git.cached():
+                assert git.rev_parse_if_exists("main") == "abc123"
+
+        assert mock_run.call_count == 3
+
+    def test_mutation_clears_active_cache(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
+
+            with git.cached():
+                assert git.branch_exists("x") is True
+                git.checkout("feature/demo")
+                assert git.branch_exists("x") is True
+
+        assert mock_run.call_count == 3
+
+    def test_nested_cached_scope_does_not_restore_stale_reads_after_mutation(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
+
+            with git.cached():
+                assert git.branch_exists("feature/demo") is False
+                with git.cached():
+                    git.create_branch("feature/demo")
+                assert git.branch_exists("feature/demo") is True
+
+        assert mock_run.call_count == 3
+
+    def test_rev_parse_caches_successes_only(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run", side_effect=GitError("boom")) as mock_run:
+            with git.cached():
+                with pytest.raises(GitError, match="boom"):
+                    git.rev_parse("missing")
+                with pytest.raises(GitError, match="boom"):
+                    git.rev_parse("missing")
+
+        assert mock_run.call_count == 2

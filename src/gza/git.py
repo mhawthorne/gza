@@ -4,8 +4,10 @@ import re
 import shutil
 import subprocess
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class GitError(Exception):
@@ -192,6 +194,77 @@ class Git:
 
     def __init__(self, repo_dir: Path):
         self.repo_dir = repo_dir
+        self._cache: dict[tuple[Any, ...], Any] | None = None
+
+    @contextmanager
+    def cached(self):
+        """Enable a per-invocation cache for repeated read-only probes."""
+        created_cache = self._cache is None
+        if created_cache:
+            self._cache = {}
+        try:
+            yield self
+        finally:
+            if created_cache:
+                self._cache = None
+
+    def clear_cache(self) -> None:
+        """Drop the active per-invocation cache, if any."""
+        if self._cache is not None:
+            self._cache.clear()
+
+    def _cache_key(
+        self,
+        *args: str,
+        check: bool,
+        stdin: bytes | None = None,
+    ) -> tuple[Any, ...]:
+        return (args, check, ("stdin-id", id(stdin)) if stdin is not None else None)
+
+    def _lookup_cached_value(self, key: tuple[Any, ...]) -> tuple[bool, Any]:
+        if self._cache is None or key not in self._cache:
+            return (False, None)
+        return (True, self._cache[key])
+
+    def _store_cached_value(self, key: tuple[Any, ...], value: Any) -> Any:
+        if self._cache is not None:
+            self._cache[key] = value
+        return value
+
+    @contextmanager
+    def _mutation_scope(self):
+        """Clear cached read state around git mutations."""
+        self.clear_cache()
+        try:
+            yield
+        finally:
+            self.clear_cache()
+
+    def _run_readonly_cached(
+        self,
+        *args: str,
+        check: bool = False,
+        stdin: bytes | None = None,
+    ) -> subprocess.CompletedProcess:
+        key = self._cache_key(*args, check=check, stdin=stdin)
+        hit, cached = self._lookup_cached_value(key)
+        if hit:
+            return cached
+        result = self._run(*args, check=check) if stdin is None else self._run(*args, check=check, stdin=stdin)
+        return self._store_cached_value(key, result)
+
+    def _run_readonly_success_cached(
+        self,
+        *args: str,
+        check: bool = True,
+        stdin: bytes | None = None,
+    ) -> subprocess.CompletedProcess:
+        key = self._cache_key(*args, check=check, stdin=stdin)
+        hit, cached = self._lookup_cached_value(key)
+        if hit:
+            return cached
+        result = self._run(*args, check=check) if stdin is None else self._run(*args, check=check, stdin=stdin)
+        return self._store_cached_value(key, result)
 
     def _run(self, *args: str, check: bool = True, stdin: bytes | None = None) -> subprocess.CompletedProcess:
         """Run a git command.
@@ -238,11 +311,13 @@ class Git:
 
     def checkout(self, branch: str) -> None:
         """Checkout a branch."""
-        self._run("checkout", branch)
+        with self._mutation_scope():
+            self._run("checkout", branch)
 
     def pull(self) -> bool:
         """Pull latest changes. Returns True if successful."""
-        result = self._run("pull", "--ff-only", check=False)
+        with self._mutation_scope():
+            result = self._run("pull", "--ff-only", check=False)
         return result.returncode == 0
 
     def fetch(self, remote: str = "origin") -> None:
@@ -254,7 +329,8 @@ class Git:
         Raises:
             GitError: If the fetch fails
         """
-        self._run("fetch", remote)
+        with self._mutation_scope():
+            self._run("fetch", remote)
 
     def remote_exists(self, remote: str = "origin") -> bool:
         """Return True when a named git remote is configured."""
@@ -263,9 +339,10 @@ class Git:
 
     def create_branch(self, branch: str, force: bool = False) -> None:
         """Create and checkout a new branch."""
-        if force:
-            self._run("branch", "-D", branch, check=False)
-        self._run("checkout", "-b", branch)
+        with self._mutation_scope():
+            if force:
+                self._run("branch", "-D", branch, check=False)
+            self._run("checkout", "-b", branch)
 
     def has_changes(self, path: str = ".", include_untracked: bool = True) -> bool:
         """Check if there are uncommitted changes or untracked files.
@@ -313,19 +390,28 @@ class Git:
 
     def add(self, path: str = ".") -> None:
         """Stage changes."""
-        self._run("add", path)
+        with self._mutation_scope():
+            self._run("add", path)
 
     def commit(self, message: str) -> None:
         """Create a commit."""
-        self._run("commit", "-m", message)
+        with self._mutation_scope():
+            self._run("commit", "-m", message)
 
     def amend(self) -> None:
         """Amend the last commit with staged changes."""
-        self._run("commit", "--amend", "--no-edit")
+        with self._mutation_scope():
+            self._run("commit", "--amend", "--no-edit")
 
     def branch_exists(self, branch: str) -> bool:
         """Check if a branch exists locally."""
-        result = self._run("show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+        result = self._run_readonly_cached(
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        )
         return result.returncode == 0
 
     def local_branch_names(self) -> frozenset[str]:
@@ -344,29 +430,30 @@ class Git:
         Returns:
             The path to the created worktree
         """
-        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._mutation_scope():
+            path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Remove existing worktree if it exists (handles stale worktrees)
-        if path.exists():
-            self.worktree_remove(path, force=True)
+            # Remove existing worktree if it exists (handles stale worktrees)
+            if path.exists():
+                self.worktree_remove(path, force=True)
 
-        # Create worktree with new branch
-        args = ["worktree", "add", "-b", branch, str(path)]
-        if base_branch:
-            args.append(base_branch)
-        self._run(*args)
+            # Create worktree with new branch
+            args = ["worktree", "add", "-b", branch, str(path)]
+            if base_branch:
+                args.append(base_branch)
+            self._run(*args)
 
-        # Push the new branch to origin with upstream tracking
-        # This ensures git push works without errors later
-        worktree_git = Git(path)
-        try:
-            worktree_git.push_branch(branch, remote="origin", set_upstream=True)
-        except GitError:
-            # If push fails (e.g., no network, no remote configured), continue
-            # The branch is still created locally and the task can proceed
-            pass
+            # Push the new branch to origin with upstream tracking
+            # This ensures git push works without errors later
+            worktree_git = Git(path)
+            try:
+                worktree_git.push_branch(branch, remote="origin", set_upstream=True)
+            except GitError:
+                # If push fails (e.g., no network, no remote configured), continue
+                # The branch is still created locally and the task can proceed
+                pass
 
-        return path
+            return path
 
     def worktree_remove(self, path: Path, force: bool = False) -> subprocess.CompletedProcess:
         """Remove a worktree.
@@ -382,7 +469,8 @@ class Git:
         if force:
             args.append("--force")
         args.append(str(path))
-        return self._run(*args, check=False)
+        with self._mutation_scope():
+            return self._run(*args, check=False)
 
     def worktree_list(self) -> list[dict]:
         """List all worktrees.
@@ -471,7 +559,8 @@ class Git:
         if set_upstream:
             args.append("-u")
         args.extend([remote, branch])
-        self._run(*args)
+        with self._mutation_scope():
+            self._run(*args)
 
     def push_force_with_lease(self, branch: str, remote: str = "origin") -> None:
         """Force push a branch with lease protection.
@@ -483,7 +572,8 @@ class Git:
         Raises:
             GitError: If the force push fails
         """
-        self._run("push", "--force-with-lease", remote, branch)
+        with self._mutation_scope():
+            self._run("push", "--force-with-lease", remote, branch)
 
     def push_ref_force_with_lease(
         self,
@@ -495,12 +585,13 @@ class Git:
     ) -> None:
         """Force-push ``source_ref`` to ``branch`` with an explicit lease."""
         remote_branch_ref = f"refs/heads/{branch}"
-        self._run(
-            "push",
-            f"--force-with-lease={remote_branch_ref}:{expected_remote_oid}",
-            remote,
-            f"{source_ref}:{remote_branch_ref}",
-        )
+        with self._mutation_scope():
+            self._run(
+                "push",
+                f"--force-with-lease={remote_branch_ref}:{expected_remote_oid}",
+                remote,
+                f"{source_ref}:{remote_branch_ref}",
+            )
 
     def get_log(self, revision_range: str, oneline: bool = True) -> str:
         """Get git log output for a revision range.
@@ -624,7 +715,13 @@ class Git:
 
     def ref_exists(self, ref: str) -> bool:
         """Return whether a ref resolves to a commit."""
-        result = self._run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        result = self._run_readonly_cached(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{ref}^{{commit}}",
+            check=False,
+        )
         return result.returncode == 0
 
     def resolve_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
@@ -695,12 +792,22 @@ class Git:
 
     def rev_parse(self, ref: str) -> str:
         """Resolve a ref to its commit SHA."""
-        result = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
+        result = self._run_readonly_success_cached(
+            "rev-parse",
+            "--verify",
+            f"{ref}^{{commit}}",
+        )
         return result.stdout.strip()
 
     def rev_parse_if_exists(self, ref: str) -> str | None:
         """Resolve a ref to its commit SHA when it exists."""
-        result = self._run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        result = self._run_readonly_cached(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{ref}^{{commit}}",
+            check=False,
+        )
         if result.returncode != 0:
             return None
         return result.stdout.strip()
@@ -712,7 +819,7 @@ class Git:
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """Return True when ``ancestor`` is reachable from ``descendant``."""
-        result = self._run(
+        result = self._run_readonly_cached(
             "merge-base",
             "--is-ancestor",
             ancestor,
@@ -760,7 +867,8 @@ class Git:
         args = ["update-ref", ref, new_oid]
         if old_oid is not None:
             args.append(old_oid)
-        self._run(*args)
+        with self._mutation_scope():
+            self._run(*args)
 
     def get_diff_name_status(
         self,
@@ -862,7 +970,8 @@ class Git:
 
     def apply_patch_file_result(self, patch_file: Path) -> GitApplyResult:
         """Run ``git apply --3way`` and return the raw result."""
-        result = self._run("apply", "--3way", str(patch_file), check=False)
+        with self._mutation_scope():
+            result = self._run("apply", "--3way", str(patch_file), check=False)
         return GitApplyResult(
             returncode=result.returncode,
             stdout=result.stdout,
@@ -983,7 +1092,8 @@ class Git:
         else:
             args.append("--no-ff")
         args.append(branch)
-        self._run(*args)
+        with self._mutation_scope():
+            self._run(*args)
 
         # Auto-commit after squash merge
         if squash:
@@ -1000,7 +1110,8 @@ class Git:
         Raises:
             GitError: If aborting the merge fails
         """
-        self._run("merge", "--abort")
+        with self._mutation_scope():
+            self._run("merge", "--abort")
 
     def reset_hard_head(self) -> None:
         """Reset tracked files to HEAD, discarding local tracked changes.
@@ -1012,7 +1123,8 @@ class Git:
 
     def reset_hard(self, ref: str) -> None:
         """Reset tracked files to the given ref, discarding local tracked changes."""
-        self._run("reset", "--hard", ref)
+        with self._mutation_scope():
+            self._run("reset", "--hard", ref)
 
     def rebase(self, branch: str) -> None:
         """Rebase the current branch onto another branch.
@@ -1023,7 +1135,8 @@ class Git:
         Raises:
             GitError: If the rebase fails
         """
-        self._run("rebase", branch)
+        with self._mutation_scope():
+            self._run("rebase", branch)
 
     def rebase_abort(self) -> None:
         """Abort a rebase in progress and restore clean state.
@@ -1034,7 +1147,8 @@ class Git:
         Raises:
             GitError: If aborting the rebase fails
         """
-        self._run("rebase", "--abort")
+        with self._mutation_scope():
+            self._run("rebase", "--abort")
 
     def delete_branch(self, branch: str, force: bool = False) -> None:
         """Delete a local branch.
@@ -1052,14 +1166,20 @@ class Git:
         else:
             args.append("-d")
         args.append(branch)
-        self._run(*args)
+        with self._mutation_scope():
+            self._run(*args)
 
     def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
         """Count how many commits a branch is ahead of base.
 
         Returns ``None`` when git cannot prove the count.
         """
-        result = self._run("rev-list", "--count", f"{base}..{branch}", check=False)
+        result = self._run_readonly_cached(
+            "rev-list",
+            "--count",
+            f"{base}..{branch}",
+            check=False,
+        )
         if result.returncode != 0:
             return None
         try:

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2845,282 +2846,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
     failed_task_recovery_warnings: list[str] = []
     target_branch: str | None = None
 
-    # Determine which tasks to advance
-    if task_id is not None:
-        task = store.get(task_id)
-        if not task:
-            return phase1_error(args, f"Task {task_id} not found")
-        if task.status == 'failed':
-            if no_resume_failed:
-                return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
-        else:
-            if task.status != 'completed':
-                return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
-        try:
-            target_branch = _resolve_advance_target_branch(store, git, task=task)
-        except MergeTargetResolutionError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        if task.status != "failed" and target_branch is not None:
-            if resolve_task_merge_state_for_target(
-                store=store,
-                task=task,
-                git=git,
-                target_branch=target_branch,
-            ) == "merged":
-                print(f"Task {task_id} is already merged")
-                return 0
-        owner_rows = list(
-            query_lineage_owner_rows(
-                store,
-                LineageOwnerQuery(
-                    limit=None,
-                    task_types=(advance_type,) if advance_type else None,
-                    include_skipped=True,
-                    exclude_dropped_from_planning=True,
-                    max_recovery_attempts=max_resume_attempts,
-                ),
-                config=config,
-                git=git,
-                target_branch=target_branch,
-            )
-        )
-        owner_rows = [
-            row
-            for row in owner_rows
-            if task.id == row.owner_task.id
-            or any(member.id == task.id for member in row.members if member.id is not None)
-            or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
-        ]
-        dropped_owner_lineage = False
-        if not owner_rows and task.status != "dropped":
-            dropped_owner_rows = [
-                row
-                for row in query_lineage_owner_rows(
-                    store,
-                    LineageOwnerQuery(
-                        limit=None,
-                        task_types=(advance_type,) if advance_type else None,
-                        include_skipped=True,
-                        max_recovery_attempts=max_resume_attempts,
-                    ),
-                    config=config,
-                    git=git,
-                    target_branch=target_branch,
-                )
-                if row.owner_task.status == "dropped"
-                and (
-                    task.id == row.owner_task.id
-                    or any(member.id == task.id for member in row.members if member.id is not None)
-                    or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
-                )
-            ]
-            if dropped_owner_rows:
-                dropped_owner_lineage = True
-        if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
-            planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
-            owner_rows = [
-                LineageOwnerRow(
-                    owner_task=task,
-                    members=(planning_task,),
-                    tree=None,
-                    lineage_status="skipped",
-                    next_action={"type": "unknown", "description": "pending command evaluation"},
-                    next_action_reason="pending command evaluation",
-                    unresolved_tasks=(planning_task,),
-                    unresolved_leaf_summary=(),
-                    lifecycle_action_task=planning_task if planning_task.status != "failed" else None,
-                    recovery_action_task=planning_task if planning_task.status == "failed" else None,
-                    recovery_leaf_task=task if task.status == "failed" else None,
-                )
-            ]
-    else:
-        target_branch = _resolve_advance_target_branch(store, git, task=None)
-        owner_rows = list(
-            query_lineage_owner_rows(
-                store,
-                LineageOwnerQuery(
-                    limit=None,
-                    task_types=(advance_type,) if advance_type else None,
-                    include_skipped=True,
-                    exclude_dropped_from_planning=True,
-                    max_recovery_attempts=max_resume_attempts,
-                ),
-                config=config,
-                git=git,
-                target_branch=target_branch,
-            )
-        )
-        if not no_resume_failed:
-            list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings)
-        if no_resume_failed:
-            owner_rows = [
-                row
-                for row in owner_rows
-                if row.lifecycle_action_task is not None or row.recovery_action_task is None
-            ]
-
-    if not owner_rows and not new_mode:
-        print("No eligible tasks to advance")
-        return 0
-
-    # Apply --max limit
-    if max_tasks is not None:
-        owner_rows = owner_rows[:max_tasks]
-
-    # Use the currently checked-out branch as the target for conflict checks,
-    # merge execution, and rebase task creation.
-    actual_current_branch = git.current_branch()
-    if target_branch is None:
-        target_branch = actual_current_branch
-    use_iterate_mode = _advance_uses_iterate(config)
-
-    def _worker_args() -> argparse.Namespace:
-        return argparse.Namespace(
-            no_docker=getattr(args, 'no_docker', False),
-            max_turns=None,
-            force=force,
-        )
-
-    def _build_action_context(*, dry_run_mode: bool) -> AdvanceActionExecutionContext:
-        def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
-            assert parent_task.id is not None
-            assert parent_task.branch is not None
-            return _create_rebase_task(
-                store,
-                parent_task.id,
-                parent_task.branch,
-                target_branch,
-                trigger_source="manual",
-            )
-
-        def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
-            assert parent_task.id is not None
-            assert parent_task.branch is not None
-            return _create_rebase_task(
-                store,
-                parent_task.id,
-                parent_task.branch,
-                rebase_target,
-                trigger_source="manual",
-            )
-
-        def _create_implement_from_task(parent_task: DbTask) -> DbTask:
-            return _create_implementation_task_from_source(
-                store,
-                parent_task,
-                prompt=_unimplemented_implement_prompt(parent_task),
-                trigger_source="manual",
-            )
-
-        return AdvanceActionExecutionContext(
-            store=store,
-            trigger_source="manual",
-            dry_run=dry_run_mode,
-            max_resume_attempts=max_resume_attempts,
-            use_iterate_for_create_implement=use_iterate_mode,
-            use_iterate_for_needs_rebase=use_iterate_mode,
-            can_spawn_worker=lambda _kind: workers_started < effective_start_budget,
-            no_worker_capacity_message=lambda worker_label: (
-                f"SKIP: batch limit reached ({workers_started}/{batch_limit}), cannot start {worker_label} worker"
-                if batch_limit is not None and workers_started >= batch_limit
-                else f"SKIP: {capacity_message}"
-            ),
-            prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
-                config,
-                task,
-                rollback_on_failure=rollback_on_failure,
-            ),
-            prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="manual"),
-            create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="manual"),
-            create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="manual"),
-            create_rebase_task=_create_rebase_from_task,
-            create_implement_task=_create_implement_from_task,
-            create_targeted_rebase_task=_create_targeted_rebase_from_task,
-            spawn_worker=lambda task_obj, _kind: _spawn_background_worker(
-                _worker_args(), config, task_id=str(task_obj.id), quiet=True, prepared_task=task_obj
-            ),
-            spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
-                _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
-            ),
-            is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
-                store,
-                git,
-                t,
-                target_branch,
-                merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
-            ).already_merged,
-            config=config,
-            git=git,
-            spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
-                argparse.Namespace(
-                    no_docker=getattr(args, 'no_docker', False),
-                    force=force,
-                ),
-                config,
-                task_obj,
-                max_iterations=config.iterate_max_iterations,
-                auto_iterate=True,
-                quiet=True,
-                prepared_task_id=str(prepared_task.id) if prepared_task is not None and prepared_task.id is not None else None,
-                prepared_phase=prepared_phase,
-                prepared_action_type=prepared_action_type,
-            ),
-            spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
-                argparse.Namespace(
-                    no_docker=getattr(args, 'no_docker', False),
-                    force=force,
-                ),
-                config,
-                prepared_task,
-                max_iterations=config.iterate_max_iterations,
-                resume=False,
-                retry=False,
-                auto_iterate=True,
-                quiet=True,
-                prepared_task_id=str(prepared_task.id),
-                prepared_resume=mode == "resume",
-                prepared_phase="preloop",
-            ),
-            reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
-        )
-
-    plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
-    for row in owner_rows:
-        action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
-        precomputed_action = row.next_action
-        action = (
-            precomputed_action
-            if (
-                precomputed_action is not None
-                and str(precomputed_action.get("type", "")) != "unknown"
-                and row.lifecycle_action_task is None
-                and row.recovery_action_task is None
-            )
-            else determine_next_action(
-            config,
-            store,
-            git,
-            action_task,
-            target_branch,
-            max_resume_attempts=max_resume_attempts,
-            )
-        )
-        plan.append((row, action_task, action))
-
-    # Sort so merges execute before worker spawns. See _ADVANCE_ACTION_ORDER for
-    # the rationale. The sort is stable, preserving DB order within each group.
-    # dry-run output inherits this order, so it accurately reflects execution.
-    plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
-
-    attention_plan = [
-        (
-            resolve_subject_task(store, action, row, fallback_task=row.owner_task),
-            action,
-        )
-        for row, _task, action in plan
-        if classify_advance_action(action) == "needs_attention"
-    ]
+    # Cache planning-only git reads. Execution runs outside this scope so
+    # mutating actions always operate on fresh subprocess state.
+    planning_cache = nullcontext()
+    cached = getattr(git, "cached", None)
+    if callable(cached):
+        candidate = cached()
+        if hasattr(candidate, "__enter__") and hasattr(candidate, "__exit__"):
+            planning_cache = candidate
 
     def _print_needs_attention_section(items: list[tuple[DbTask, dict]]) -> None:
         if not items:
@@ -3134,57 +2867,331 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if needs_attention_recommends_fix(aaction):
                 console.print(f"  [{_color}]Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
-    preview_context = _build_action_context(dry_run_mode=True)
-    preview_attention_plan = list(attention_plan)
+    plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
     preview_actionable_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
+    new_pending_tasks: list = []
 
-    for row, task, action in plan:
-        if classify_advance_action(action) != "actionable":
-            continue
-        description = action["description"]
-        if action["type"] in {"merge", "merge_with_followups"} and dry_run:
-            resolved_subject = (
-                _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
-                if task.id is not None
-                else None
+    with planning_cache:
+        # Determine which tasks to advance
+        if task_id is not None:
+            task = store.get(task_id)
+            if not task:
+                return phase1_error(args, f"Task {task_id} not found")
+            if task.status == 'failed':
+                if no_resume_failed:
+                    return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
+            else:
+                if task.status != 'completed':
+                    return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
+            try:
+                target_branch = _resolve_advance_target_branch(store, git, task=task)
+            except MergeTargetResolutionError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            if task.status != "failed" and target_branch is not None:
+                if resolve_task_merge_state_for_target(
+                    store=store,
+                    task=task,
+                    git=git,
+                    target_branch=target_branch,
+                ) == "merged":
+                    print(f"Task {task_id} is already merged")
+                    return 0
+            owner_rows = list(
+                query_lineage_owner_rows(
+                    store,
+                    LineageOwnerQuery(
+                        limit=None,
+                        task_types=(advance_type,) if advance_type else None,
+                        include_skipped=True,
+                        exclude_dropped_from_planning=True,
+                        max_recovery_attempts=max_resume_attempts,
+                    ),
+                    config=config,
+                    git=git,
+                    target_branch=target_branch,
+                )
             )
-            commit_count = _auto_squash_commit_count(
-                config,
-                git,
-                resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
-                target_branch,
-            )
-            if commit_count is not None:
-                description = f"{description} (auto-squash, {commit_count} commits)"
-        elif is_worker_consuming_advance_action(action["type"]):
-            preview_result = execute_advance_action(task=task, action=action, context=preview_context)
-            attention = resolve_execution_needs_attention(task, preview_result)
-            if attention is not None:
-                preview_attention_plan.append((getattr(attention, "task", row.owner_task), attention.action))
-                continue
-            if preview_result.status == "dry_run" and preview_result.message:
-                description = preview_result.message
-        preview_actionable_rows.append((row, task, action, description))
-
-    # If the plan is empty or every item is a skip, there's nothing actionable
-    # (unless --new is set, in which case we still want to start pending tasks).
-    if not preview_actionable_rows and not dry_run:
-        if not new_mode:
-            print("No eligible tasks to advance")
-            _print_needs_attention_section(preview_attention_plan)
-            if plan:
-                print()
-                for row, _task, action in plan:
-                    if classify_advance_action(action) != "skip":
-                        continue
-                    display_task = row.owner_task
-                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    _color = _advance_action_color(action['type'])
-                    console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
-                print()
-            return 0
+            owner_rows = [
+                row
+                for row in owner_rows
+                if task.id == row.owner_task.id
+                or any(member.id == task.id for member in row.members if member.id is not None)
+                or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
+            ]
+            dropped_owner_lineage = False
+            if not owner_rows and task.status != "dropped":
+                dropped_owner_rows = [
+                    row
+                    for row in query_lineage_owner_rows(
+                        store,
+                        LineageOwnerQuery(
+                            limit=None,
+                            task_types=(advance_type,) if advance_type else None,
+                            include_skipped=True,
+                            max_recovery_attempts=max_resume_attempts,
+                        ),
+                        config=config,
+                        git=git,
+                        target_branch=target_branch,
+                    )
+                    if row.owner_task.status == "dropped"
+                    and (
+                        task.id == row.owner_task.id
+                        or any(member.id == task.id for member in row.members if member.id is not None)
+                        or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
+                    )
+                ]
+                if dropped_owner_rows:
+                    dropped_owner_lineage = True
+            if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
+                planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
+                owner_rows = [
+                    LineageOwnerRow(
+                        owner_task=task,
+                        members=(planning_task,),
+                        tree=None,
+                        lineage_status="skipped",
+                        next_action={"type": "unknown", "description": "pending command evaluation"},
+                        next_action_reason="pending command evaluation",
+                        unresolved_tasks=(planning_task,),
+                        unresolved_leaf_summary=(),
+                        lifecycle_action_task=planning_task if planning_task.status != "failed" else None,
+                        recovery_action_task=planning_task if planning_task.status == "failed" else None,
+                        recovery_leaf_task=task if task.status == "failed" else None,
+                    )
+                ]
         else:
+            target_branch = _resolve_advance_target_branch(store, git, task=None)
+            owner_rows = list(
+                query_lineage_owner_rows(
+                    store,
+                    LineageOwnerQuery(
+                        limit=None,
+                        task_types=(advance_type,) if advance_type else None,
+                        include_skipped=True,
+                        exclude_dropped_from_planning=True,
+                        max_recovery_attempts=max_resume_attempts,
+                    ),
+                    config=config,
+                    git=git,
+                    target_branch=target_branch,
+                )
+            )
+            if not no_resume_failed:
+                list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings)
+            if no_resume_failed:
+                owner_rows = [
+                    row
+                    for row in owner_rows
+                    if row.lifecycle_action_task is not None or row.recovery_action_task is None
+                ]
+
+        if not owner_rows and not new_mode:
+            print("No eligible tasks to advance")
+            return 0
+
+        # Apply --max limit
+        if max_tasks is not None:
+            owner_rows = owner_rows[:max_tasks]
+
+        # Use the currently checked-out branch as the target for conflict checks,
+        # merge execution, and rebase task creation.
+        actual_current_branch = git.current_branch()
+        if target_branch is None:
+            target_branch = actual_current_branch
+        use_iterate_mode = _advance_uses_iterate(config)
+
+        def _worker_args() -> argparse.Namespace:
+            return argparse.Namespace(
+                no_docker=getattr(args, 'no_docker', False),
+                max_turns=None,
+                force=force,
+            )
+
+        def _build_action_context(*, dry_run_mode: bool) -> AdvanceActionExecutionContext:
+            def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
+                assert parent_task.id is not None
+                assert parent_task.branch is not None
+                return _create_rebase_task(
+                    store,
+                    parent_task.id,
+                    parent_task.branch,
+                    target_branch,
+                    trigger_source="manual",
+                )
+
+            def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
+                assert parent_task.id is not None
+                assert parent_task.branch is not None
+                return _create_rebase_task(
+                    store,
+                    parent_task.id,
+                    parent_task.branch,
+                    rebase_target,
+                    trigger_source="manual",
+                )
+
+            def _create_implement_from_task(parent_task: DbTask) -> DbTask:
+                return _create_implementation_task_from_source(
+                    store,
+                    parent_task,
+                    prompt=_unimplemented_implement_prompt(parent_task),
+                    trigger_source="manual",
+                )
+
+            return AdvanceActionExecutionContext(
+                store=store,
+                trigger_source="manual",
+                dry_run=dry_run_mode,
+                max_resume_attempts=max_resume_attempts,
+                use_iterate_for_create_implement=use_iterate_mode,
+                use_iterate_for_needs_rebase=use_iterate_mode,
+                can_spawn_worker=lambda _kind: workers_started < effective_start_budget,
+                no_worker_capacity_message=lambda worker_label: (
+                    f"SKIP: batch limit reached ({workers_started}/{batch_limit}), cannot start {worker_label} worker"
+                    if batch_limit is not None and workers_started >= batch_limit
+                    else f"SKIP: {capacity_message}"
+                ),
+                prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
+                    config,
+                    task,
+                    rollback_on_failure=rollback_on_failure,
+                ),
+                prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="manual"),
+                create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="manual"),
+                create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="manual"),
+                create_rebase_task=_create_rebase_from_task,
+                create_implement_task=_create_implement_from_task,
+                create_targeted_rebase_task=_create_targeted_rebase_from_task,
+                spawn_worker=lambda task_obj, _kind: _spawn_background_worker(
+                    _worker_args(), config, task_id=str(task_obj.id), quiet=True, prepared_task=task_obj
+                ),
+                spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
+                    _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
+                ),
+                is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
+                    store,
+                    git,
+                    t,
+                    target_branch,
+                    merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+                ).already_merged,
+                config=config,
+                git=git,
+                spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
+                    argparse.Namespace(
+                        no_docker=getattr(args, 'no_docker', False),
+                        force=force,
+                    ),
+                    config,
+                    task_obj,
+                    max_iterations=config.iterate_max_iterations,
+                    auto_iterate=True,
+                    quiet=True,
+                    prepared_task_id=str(prepared_task.id) if prepared_task is not None and prepared_task.id is not None else None,
+                    prepared_phase=prepared_phase,
+                    prepared_action_type=prepared_action_type,
+                ),
+                spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
+                    argparse.Namespace(
+                        no_docker=getattr(args, 'no_docker', False),
+                        force=force,
+                    ),
+                    config,
+                    prepared_task,
+                    max_iterations=config.iterate_max_iterations,
+                    resume=False,
+                    retry=False,
+                    auto_iterate=True,
+                    quiet=True,
+                    prepared_task_id=str(prepared_task.id),
+                    prepared_resume=mode == "resume",
+                    prepared_phase="preloop",
+                ),
+                reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
+            )
+
+        for row in owner_rows:
+            action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
+            precomputed_action = row.next_action
+            action = (
+                precomputed_action
+                if (
+                    precomputed_action is not None
+                    and str(precomputed_action.get("type", "")) != "unknown"
+                    and row.lifecycle_action_task is None
+                    and row.recovery_action_task is None
+                )
+                else determine_next_action(
+                    config,
+                    store,
+                    git,
+                    action_task,
+                    target_branch,
+                    max_resume_attempts=max_resume_attempts,
+                )
+            )
+            plan.append((row, action_task, action))
+
+        plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
+
+        attention_plan = [
+            (
+                resolve_subject_task(store, action, row, fallback_task=row.owner_task),
+                action,
+            )
+            for row, _task, action in plan
+            if classify_advance_action(action) == "needs_attention"
+        ]
+
+        preview_context = _build_action_context(dry_run_mode=True)
+        preview_attention_plan = list(attention_plan)
+
+        for row, task, action in plan:
+            if classify_advance_action(action) != "actionable":
+                continue
+            description = action["description"]
+            if action["type"] in {"merge", "merge_with_followups"} and dry_run:
+                resolved_subject = (
+                    _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
+                    if task.id is not None
+                    else None
+                )
+                commit_count = _auto_squash_commit_count(
+                    config,
+                    git,
+                    resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
+                    target_branch,
+                )
+                if commit_count is not None:
+                    description = f"{description} (auto-squash, {commit_count} commits)"
+            elif is_worker_consuming_advance_action(action["type"]):
+                preview_result = execute_advance_action(task=task, action=action, context=preview_context)
+                attention = resolve_execution_needs_attention(task, preview_result)
+                if attention is not None:
+                    preview_attention_plan.append((getattr(attention, "task", row.owner_task), attention.action))
+                    continue
+                if preview_result.status == "dry_run" and preview_result.message:
+                    description = preview_result.message
+            preview_actionable_rows.append((row, task, action, description))
+
+        if not preview_actionable_rows and not dry_run:
+            if not new_mode:
+                print("No eligible tasks to advance")
+                _print_needs_attention_section(preview_attention_plan)
+                if plan:
+                    print()
+                    for row, _task, action in plan:
+                        if classify_advance_action(action) != "skip":
+                            continue
+                        display_task = row.owner_task
+                        prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                        console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        _color = _advance_action_color(action['type'])
+                        console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                    print()
+                return 0
             if preview_attention_plan:
                 _print_needs_attention_section(preview_attention_plan)
                 print()
@@ -3199,11 +3206,53 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 print()
 
-    if dry_run:
-        for warning in failed_task_recovery_warnings:
-            print(f"Warning: {warning}", file=sys.stderr)
+        if dry_run:
+            for warning in failed_task_recovery_warnings:
+                print(f"Warning: {warning}", file=sys.stderr)
+            if preview_actionable_rows:
+                print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
+                for row, _task, action, description in preview_actionable_rows:
+                    display_task = row.owner_task
+                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    _color = _advance_action_color(action['type'])
+                    console.print(f"      [{_color}]→ {description}[/{_color}]")
+                    print()
+            elif not preview_attention_plan:
+                print("No eligible tasks to advance")
+            _print_needs_attention_section(preview_attention_plan)
+            if plan:
+                skip_rows_printed = False
+                for row, _task, action in plan:
+                    if classify_advance_action(action) != "skip":
+                        continue
+                    if not skip_rows_printed:
+                        print()
+                        skip_rows_printed = True
+                    display_task = row.owner_task
+                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    _color = _advance_action_color(action['type'])
+                    console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                    print()
+            if new_mode and batch_limit is not None:
+                planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
+                remaining = max(0, effective_start_budget - planned_workers)
+                if remaining > 0:
+                    pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
+                    if pending_tasks:
+                        print(f"Would start {len(pending_tasks)} new pending task(s):\n")
+                        for pt in pending_tasks:
+                            prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
+                            console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                            console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
+                            print()
+                    else:
+                        print("No pending tasks available to fill batch\n")
+            return 0
+
         if preview_actionable_rows:
-            print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
+            print(f"Will advance {len(preview_actionable_rows)} task(s):\n")
             for row, _task, action, description in preview_actionable_rows:
                 display_task = row.owner_task
                 prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
@@ -3211,79 +3260,35 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 _color = _advance_action_color(action['type'])
                 console.print(f"      [{_color}]→ {description}[/{_color}]")
                 print()
-        elif not preview_attention_plan:
-            print("No eligible tasks to advance")
-        _print_needs_attention_section(preview_attention_plan)
-        if plan:
-            skip_rows_printed = False
-            for row, _task, action in plan:
-                if classify_advance_action(action) != "skip":
-                    continue
-                if not skip_rows_printed:
-                    print()
-                    skip_rows_printed = True
-                display_task = row.owner_task
-                prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                _color = _advance_action_color(action['type'])
-                console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+            if preview_attention_plan:
+                _print_needs_attention_section(preview_attention_plan)
                 print()
+        elif preview_attention_plan:
+            _print_needs_attention_section(preview_attention_plan)
+            print()
+
         if new_mode and batch_limit is not None:
             planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
             remaining = max(0, effective_start_budget - planned_workers)
             if remaining > 0:
-                pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
-                if pending_tasks:
-                    print(f"Would start {len(pending_tasks)} new pending task(s):\n")
-                    for pt in pending_tasks:
+                new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
+                if new_pending_tasks:
+                    print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
+                    for pt in new_pending_tasks:
                         prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
                         console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                         console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
                         print()
-                else:
-                    print("No pending tasks available to fill batch\n")
-        return 0
 
-    # Show the plan and prompt for confirmation
-    if preview_actionable_rows:
-        print(f"Will advance {len(preview_actionable_rows)} task(s):\n")
-        for row, _task, action, description in preview_actionable_rows:
-            display_task = row.owner_task
-            prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-            console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-            _color = _advance_action_color(action['type'])
-            console.print(f"      [{_color}]→ {description}[/{_color}]")
-            print()
-        if preview_attention_plan:
-            _print_needs_attention_section(preview_attention_plan)
-            print()
-    elif preview_attention_plan:
-        _print_needs_attention_section(preview_attention_plan)
-        print()
-
-    new_pending_tasks: list = []
-    if new_mode and batch_limit is not None:
-        planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
-        remaining = max(0, effective_start_budget - planned_workers)
-        if remaining > 0:
-            new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
-            if new_pending_tasks:
-                print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
-                for pt in new_pending_tasks:
-                    prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
-                    console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
-                    print()
-
-    if not auto and (preview_actionable_rows or new_mode):
-        try:
-            answer = input("Proceed? [Y/n] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
-        if answer not in ('', 'y', 'yes'):
-            print("Aborted.")
-            return 0
+        if not auto and (preview_actionable_rows or new_mode):
+            try:
+                answer = input("Proceed? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if answer not in ('', 'y', 'yes'):
+                print("Aborted.")
+                return 0
 
     # Execute actions
     success_count = 0

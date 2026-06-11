@@ -22,7 +22,7 @@ from gza.advance_engine import (
 )
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task as DbTask
-from gza.git import GitError
+from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
@@ -5046,6 +5046,52 @@ def test_resolve_advance_context_reuses_persisted_merge_state_resolution(tmp_pat
     assert calls == [impl.id]
     assert ctx.merge_state == "unmerged"
     assert ctx.merge_source_warning == warning
+
+
+def test_resolve_advance_context_collapses_repeated_git_ref_requests_with_cache(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/cache-refs",
+        when=datetime(2026, 5, 18, 9, 0, tzinfo=UTC),
+    )
+
+    git = Git(tmp_path)
+    git.can_merge = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+    git.is_merged = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(*args: str, check: bool = True, stdin: bytes | None = None):
+        del stdin
+        calls.append(args)
+        if args == ("show-ref", "--verify", "--quiet", "refs/heads/feature/cache-refs"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ("rev-parse", "--verify", "--quiet", "origin/feature/cache-refs^{commit}"):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        if args == ("rev-parse", "--verify", "--quiet", "feature/cache-refs^{commit}"):
+            return SimpleNamespace(returncode=0, stdout="branch-tip\n", stderr="")
+        if args == ("rev-parse", "--verify", "--quiet", "main^{commit}"):
+            return SimpleNamespace(returncode=0, stdout="target-tip\n", stderr="")
+        if args == ("merge-base", "--is-ancestor", "main", "feature/cache-refs"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ("rev-list", "--count", "main..feature/cache-refs"):
+            return SimpleNamespace(returncode=0, stdout="2\n", stderr="")
+        raise AssertionError(f"Unexpected git command: {args!r} check={check}")
+
+    git._run = fake_run  # type: ignore[method-assign]
+
+    with git.cached():
+        ctx = resolve_advance_context(config, store, git, impl, "main")
+
+    assert ctx.merge_state == "unmerged"
+    assert calls.count(("show-ref", "--verify", "--quiet", "refs/heads/feature/cache-refs")) == 1
+    assert calls.count(("rev-parse", "--verify", "--quiet", "origin/feature/cache-refs^{commit}")) == 1
+    assert calls.count(("rev-parse", "--verify", "--quiet", "feature/cache-refs^{commit}")) == 1
+    assert calls.count(("rev-parse", "--verify", "--quiet", "main^{commit}")) == 1
+    assert calls.count(("merge-base", "--is-ancestor", "main", "feature/cache-refs")) == 1
+    assert calls.count(("rev-list", "--count", "main..feature/cache-refs")) == 1
 
 
 def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path) -> None:

@@ -1193,6 +1193,167 @@ def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missi
     assert "✓ Merged" in output
 
 
+def test_cmd_advance_wraps_planning_in_git_cache(tmp_path: Path) -> None:
+    from contextlib import contextmanager
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Advance cached planning", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/cache-planning"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.current_branch.return_value = "main"
+    fake_git.default_branch.return_value = "main"
+    cached_entries: list[str] = []
+
+    @contextmanager
+    def _cached_scope():
+        cached_entries.append("entered")
+        yield fake_git
+
+    fake_git.cached.side_effect = _cached_scope
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
+    ):
+        rc = cmd_advance(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=task.id,
+                dry_run=True,
+                auto=True,
+                max=None,
+                batch=None,
+                no_docker=True,
+                force=False,
+                plans=False,
+                unimplemented=False,
+                create=False,
+                no_resume_failed=False,
+                max_resume_attempts=None,
+                advance_type=None,
+                new=False,
+                max_review_cycles=None,
+                squash_threshold=None,
+            )
+        )
+
+    assert rc == 0
+    assert cached_entries == ["entered"]
+
+
+def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Advance cached lifecycle planning", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/cache-lifecycle"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = Git(tmp_path)
+    git.current_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
+    git.default_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
+
+    branch_probe = ("show-ref", "--verify", "--quiet", "refs/heads/feature/cache-lifecycle")
+    git_calls: list[tuple[str, ...]] = []
+
+    def _fake_run(*args: str, check: bool = True, stdin: bytes | None = None):
+        del check, stdin
+        git_calls.append(args)
+        if args == branch_probe:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"Unexpected git command: {args!r}")
+
+    git._run = _fake_run  # type: ignore[method-assign]
+
+    def _query_rows(*_args, **_kwargs):
+        assert git._cache is not None
+        assert git.branch_exists("feature/cache-lifecycle") is True
+        assert git.branch_exists("feature/cache-lifecycle") is True
+        return iter(
+            [
+                LineageOwnerRow(
+                    owner_task=task,
+                    members=(task,),
+                    tree=None,
+                    lineage_status="skipped",
+                    next_action={"type": "skip", "description": "nothing to do"},
+                    next_action_reason="precomputed",
+                    unresolved_tasks=(task,),
+                    unresolved_leaf_summary=(),
+                    lifecycle_action_task=task,
+                    recovery_action_task=None,
+                    recovery_leaf_task=None,
+                )
+            ]
+        )
+
+    def _determine_next_action(*_args, **_kwargs):
+        assert git._cache is not None
+        assert git.branch_exists("feature/cache-lifecycle") is True
+        assert git.branch_exists("feature/cache-lifecycle") is True
+        return {"type": "skip", "description": "nothing to do"}
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_determine_next_action),
+    ):
+        rc = cmd_advance(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=task.id,
+                dry_run=True,
+                auto=True,
+                max=None,
+                batch=None,
+                no_docker=True,
+                force=False,
+                plans=False,
+                unimplemented=False,
+                create=False,
+                no_resume_failed=False,
+                max_resume_attempts=None,
+                advance_type=None,
+                new=False,
+                max_review_cycles=None,
+                squash_threshold=None,
+            )
+        )
+
+    assert rc == 0
+    assert git_calls.count(branch_probe) == 1
+
+
 def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     tmp_path: Path,
     monkeypatch,
