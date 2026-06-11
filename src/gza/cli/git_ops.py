@@ -53,7 +53,12 @@ from ..git import (
     is_rebase_in_progress,
     resolve_ref_if_possible,
 )
-from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
+from ..lineage_query import (
+    LineageOwnerQuery,
+    LineageOwnerRow,
+    query_lineage_owner_rows,
+    resolve_lineage_owner_task_id,
+)
 from ..log_paths import resolve_ops_log_path
 from ..merge_state import resolve_task_merge_state_for_target
 from ..pickup import (
@@ -2897,6 +2902,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ) == "merged":
                     print(f"Task {task_id} is already merged")
                     return 0
+            owner_task_id = resolve_lineage_owner_task_id(store, task.id) if task.id is not None else None
             owner_rows = list(
                 query_lineage_owner_rows(
                     store,
@@ -2906,19 +2912,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         include_skipped=True,
                         exclude_dropped_from_planning=True,
                         max_recovery_attempts=max_resume_attempts,
+                        owner_task_ids=(owner_task_id,) if owner_task_id is not None else None,
                     ),
                     config=config,
                     git=git,
                     target_branch=target_branch,
                 )
             )
-            owner_rows = [
-                row
-                for row in owner_rows
-                if task.id == row.owner_task.id
-                or any(member.id == task.id for member in row.members if member.id is not None)
-                or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
-            ]
             dropped_owner_lineage = False
             if not owner_rows and task.status != "dropped":
                 dropped_owner_rows = [
@@ -2930,17 +2930,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             task_types=(advance_type,) if advance_type else None,
                             include_skipped=True,
                             max_recovery_attempts=max_resume_attempts,
+                            owner_task_ids=(owner_task_id,) if owner_task_id is not None else None,
                         ),
                         config=config,
                         git=git,
                         target_branch=target_branch,
                     )
                     if row.owner_task.status == "dropped"
-                    and (
-                        task.id == row.owner_task.id
-                        or any(member.id == task.id for member in row.members if member.id is not None)
-                        or any(member.id == task.id for member in row.unresolved_tasks if member.id is not None)
-                    )
                 ]
                 if dropped_owner_rows:
                     dropped_owner_lineage = True

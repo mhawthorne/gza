@@ -712,6 +712,12 @@ def _resolve_owner_merge_unit(
     return max(units.values(), key=lambda unit: (unit.updated_at, unit.id))
 
 
+def resolve_lineage_owner_task_id(store: SqliteTaskStore, task_id: str) -> str | None:
+    """Return the lineage owner id for a task without planning every owner row."""
+    owner = _load_indexes(store).owner_by_task_id.get(task_id)
+    return owner.id if owner is not None else None
+
+
 def query_lineage_owner_rows(
     store: SqliteTaskStore,
     query: LineageOwnerQuery,
@@ -1138,4 +1144,5 @@ __all__ = [
     "filter_display_unresolved_tasks_for_incomplete",
     "is_lineage_resolved",
     "query_lineage_owner_rows",
+    "resolve_lineage_owner_task_id",
 ]

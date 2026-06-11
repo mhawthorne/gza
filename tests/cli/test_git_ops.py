@@ -4,6 +4,7 @@ import argparse
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -77,6 +78,25 @@ def _add_mergeable_impl_with_failed_rebase(store, branch: str):
     review.report_file = "reviews/fake.md"
     store.update(review)
     return task
+
+
+def _add_completed_impl_with_approved_review(store, branch: str, *, when: datetime) -> tuple[Any, Any]:
+    task = store.add(f"Implement {branch}", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = when
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = when
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+    return task, review
 
 
 def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -> None:
@@ -1352,6 +1372,256 @@ def test_cmd_advance_keeps_lifecycle_planning_in_git_cache(tmp_path: Path) -> No
 
     assert rc == 0
     assert git_calls.count(branch_probe) == 1
+
+
+def test_cmd_advance_explicit_child_member_scopes_query_to_owner_lineage(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl, review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/member-owner-scope",
+        when=datetime.now(UTC),
+    )
+
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, review),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(impl,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.current_branch.return_value = "main"
+    fake_git.default_branch.return_value = "main"
+
+    captured_queries: list = []
+
+    def _query_rows(_store, query, **_kwargs):
+        captured_queries.append(query)
+        return [row]
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, review.id)), "dry_run": True}))
+
+    assert rc == 0
+    assert len(captured_queries) == 1
+    assert captured_queries[0].owner_task_ids == (impl.id,)
+    assert captured_queries[0].task_ids is None
+
+
+def test_cmd_advance_explicit_failed_leaf_scopes_query_to_owner_lineage(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    impl, _review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/failed-leaf-owner-scope",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+
+    failed_rebase = store.add("Failed rebase leaf", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "MERGE_CONFLICT"
+    store.update(failed_rebase)
+
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, failed_rebase),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "needs_discussion",
+            "description": "failed rebase still blocks merge",
+            "needs_attention_reason": "rebase-failed",
+            "subject_task_id": failed_rebase.id,
+        },
+        next_action_reason="rebase-failed",
+        unresolved_tasks=(failed_rebase,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+        recovery_action_task=failed_rebase,
+        recovery_leaf_task=failed_rebase,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.current_branch.return_value = "main"
+    fake_git.default_branch.return_value = "main"
+
+    captured_queries: list = []
+
+    def _query_rows(_store, query, **_kwargs):
+        captured_queries.append(query)
+        return [row]
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed_rebase.id)), "dry_run": True}))
+
+    assert rc == 0
+    assert len(captured_queries) == 1
+    assert captured_queries[0].owner_task_ids == (impl.id,)
+    assert captured_queries[0].task_ids is None
+
+
+def test_cmd_advance_explicit_dropped_owner_fallback_scopes_second_query_to_owner_lineage(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Dropped owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "dropped"
+    owner.completed_at = datetime(2026, 5, 12, 9, 0, tzinfo=UTC)
+    owner.branch = "feature/dropped-owner-scope"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    descendant = store.add("Completed descendant", task_type="rebase", based_on=owner.id, same_branch=True)
+    assert descendant.id is not None
+    descendant.status = "completed"
+    descendant.completed_at = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+    descendant.branch = owner.branch
+    descendant.has_commits = True
+    descendant.merge_status = "unmerged"
+    store.update(descendant)
+
+    dropped_row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, descendant),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "dropped"},
+        next_action_reason="dropped",
+        unresolved_tasks=(descendant,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=descendant,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.current_branch.return_value = "main"
+    fake_git.default_branch.return_value = "main"
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(owner.branch)
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = False
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    captured_queries: list = []
+
+    def _query_rows(_store, query, **_kwargs):
+        captured_queries.append(query)
+        if query.exclude_dropped_from_planning:
+            return []
+        return [dropped_row]
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, descendant.id)), "dry_run": True}))
+
+    assert rc == 0
+    assert len(captured_queries) == 2
+    assert captured_queries[0].owner_task_ids == (owner.id,)
+    assert captured_queries[0].exclude_dropped_from_planning is True
+    assert captured_queries[1].owner_task_ids == (owner.id,)
+    assert captured_queries[1].exclude_dropped_from_planning is False
+    assert "No eligible tasks to advance" in capsys.readouterr().out
+
+
+def test_cmd_advance_explicit_task_plans_only_requested_lineage_refs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    requested, _ = _add_completed_impl_with_approved_review(
+        store,
+        "feature/requested-lineage",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    for index in range(3):
+        _add_completed_impl_with_approved_review(
+            store,
+            f"feature/unrelated-lineage-{index}",
+            when=datetime(2026, 5, 10, 10 + index, 0, tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review_task: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    merge_sources: list[str] = []
+    merge_checks: list[str] = []
+
+    def _resolve_fresh_merge_source(branch: str):
+        merge_sources.append(branch)
+        return ResolvedMergeSourceRef(f"origin/{branch}")
+
+    def _can_merge(source_ref: str, target_branch: str):
+        assert target_branch == "main"
+        merge_checks.append(source_ref)
+        return True
+
+    fake_git.resolve_fresh_merge_source.side_effect = _resolve_fresh_merge_source
+    fake_git.can_merge.side_effect = _can_merge
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, requested.id)), "dry_run": True}))
+
+    assert rc == 0
+    assert merge_sources
+    assert set(merge_sources) == {requested.branch}
+    assert set(merge_checks) == {f"origin/{requested.branch}"}
 
 
 def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
