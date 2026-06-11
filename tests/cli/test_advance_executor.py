@@ -311,9 +311,183 @@ def test_materialize_plan_review_slices_includes_slice_prompt_and_provenance(tmp
     created_task = store.get(materialization.tasks[0].id)
     assert created_task is not None
     assert "Use this distinctive reviewer-authored slice prompt." in created_task.prompt
-    assert f"Implement plan slice S1 from {plan.id}" in created_task.prompt
-    assert f"based on plan review {review.id}" in created_task.prompt
+    assert f"- Plan source: {plan.id}" in created_task.prompt
+    assert f"- Plan review: {review.id}" in created_task.prompt
+    assert "- Slice: S1 (Materialize prompts)" in created_task.prompt
     assert "Scope:\n- Keep provenance" in created_task.prompt
+    assert "Out of scope:\n- CLI changes" in created_task.prompt
+    assert "Acceptance criteria:\n- Prompt preserved exactly" in created_task.prompt
+
+
+def test_materialize_plan_review_slices_revalidates_manifest_before_creating_tasks(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Foundation",
+                    "prompt": "Create the slice.",
+                    "scope": ["One"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["Slice exists"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Foundation only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": [],
+                }
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+
+    with patch("gza.cli._common.validate_plan_review_manifest", side_effect=ValueError("invalid manifest")):
+        with pytest.raises(ValueError, match="invalid manifest"):
+            _materialize_plan_review_slices(
+                config,
+                store,
+                plan,
+                review,
+                manifest,
+                trigger_source="manual",
+                require_review_before_merge=True,
+            )
+
+    assert [task for task in store.get_all() if task.task_type == "implement"] == []
+    assert store.list_artifacts(review.id, kind="plan_review_materialization") == []
+
+
+def test_execute_create_plan_review_reports_created_task_when_spawn_fails(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: 1,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        create_plan_review_task=lambda task: store.add(
+            f"Review {task.id}",
+            task_type="plan_review",
+            depends_on=task.id,
+            trigger_source="manual",
+        ),
+    )
+
+    result = execute_advance_action(
+        task=plan,
+        action={"type": "create_plan_review"},
+        context=context,
+    )
+
+    assert result.status == "error"
+    assert result.created_task is not None
+    assert result.created_task.task_type == "plan_review"
+    assert result.created_task.id == result.handled_task_id
+    assert result.error_message == f"Failed to start plan_review worker for task {result.handled_task_id}"
+    persisted = store.get(result.handled_task_id)
+    assert persisted is not None
+    assert persisted.task_type == "plan_review"
+
+
+def test_execute_create_plan_improve_reports_created_task_when_spawn_fails(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: 1,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        create_plan_improve_task=lambda source_task, review_task: store.add(
+            f"Improve {source_task.id} from {review_task.id}",
+            task_type="plan_improve",
+            based_on=source_task.id,
+            depends_on=review_task.id,
+            trigger_source="manual",
+        ),
+    )
+
+    result = execute_advance_action(
+        task=plan,
+        action={
+            "type": "create_plan_improve",
+            "plan_source_task": plan,
+            "plan_review_task": review,
+        },
+        context=context,
+    )
+
+    assert result.status == "error"
+    assert result.created_task is not None
+    assert result.created_task.task_type == "plan_improve"
+    assert result.created_task.id == result.handled_task_id
+    assert result.error_message == f"Failed to start plan_improve worker for task {result.handled_task_id}"
+    persisted = store.get(result.handled_task_id)
+    assert persisted is not None
+    assert persisted.task_type == "plan_improve"
 
 
 def test_materialize_plan_review_slices_reuses_existing_materialization(tmp_path: Path) -> None:

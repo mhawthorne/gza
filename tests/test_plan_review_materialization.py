@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -313,3 +314,69 @@ def test_load_materialized_plan_slice_set_reuses_legacy_manual_materialization_w
 
     assert loaded is not None
     assert [task.id for task in loaded] == [task.id for task in created_tasks]
+
+
+def test_build_plan_review_slice_task_specs_maps_linear_dependencies_and_branch_continuation(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+    manifest = _validated_manifest(plan.id)
+    assert manifest is not None
+
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=manifest,
+        trigger_source="plan-review",
+        require_review_before_merge=True,
+    )
+
+    assert len(task_specs) == 2
+    assert task_specs[0].based_on == plan.id
+    assert task_specs[0].depends_on is None
+    assert task_specs[0].same_branch is False
+    assert task_specs[0].create_review is True
+    assert task_specs[0].review_scope == "Parser only."
+    assert task_specs[0].trigger_source == "plan-review"
+    assert task_specs[1].depends_on == "__new_task_idx__:0"
+    assert task_specs[1].based_on == "__new_task_idx__:0"
+    assert task_specs[1].same_branch is True
+    assert task_specs[1].create_review is True
+
+
+def test_build_plan_review_slice_task_specs_keeps_independent_ordered_slice_on_plan_source_branch(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+    manifest = _validated_manifest(plan.id)
+    assert manifest is not None
+
+    independent_manifest = replace(
+        manifest,
+        slices=(
+            manifest.slices[0],
+            replace(manifest.slices[1], based_on_slice=None),
+        ),
+    )
+
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=independent_manifest,
+        trigger_source="plan-review",
+        require_review_before_merge=True,
+    )
+
+    assert task_specs[1].depends_on == "__new_task_idx__:0"
+    assert task_specs[1].based_on == plan.id
+    assert task_specs[1].same_branch is False

@@ -5197,6 +5197,120 @@ def test_watch_create_plan_review_inherits_tags_from_completed_plan(tmp_path: Pa
 
 @pytest.mark.parametrize(
     ("action_type", "child_type", "action_key"),
+    [
+        ("run_plan_review", "plan_review", "plan_review_task"),
+        ("run_plan_improve", "plan_improve", "plan_improve_task"),
+    ],
+)
+def test_watch_cycle_does_not_double_start_pending_plan_review_children_started_in_advance_step(
+    tmp_path: Path,
+    action_type: str,
+    child_type: str,
+    action_key: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan feature", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    child_kwargs: dict[str, object] = {"task_type": child_type}
+    if child_type == "plan_review":
+        child_kwargs["depends_on"] = plan.id
+    else:
+        review = store.add("Review plan", task_type="plan_review", depends_on=plan.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+        child_kwargs["depends_on"] = review.id
+        child_kwargs["based_on"] = plan.id
+    child = store.add("Child task", **child_kwargs)
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": action_type, action_key: child}),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == child.id
+
+
+def test_watch_cycle_plan_review_action_counts_against_batch_capacity(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan feature", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    pending_plan_review = store.add("Pending plan review", task_type="plan_review", depends_on=plan.id)
+    assert pending_plan_review.id is not None
+    unrelated_pending = store.add("Pending queue plan", task_type="plan")
+    assert unrelated_pending.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.determine_next_action",
+            side_effect=[
+                {"type": "run_plan_review", "plan_review_task": pending_plan_review},
+                {"type": "skip", "description": "SKIP: pending plan review already running"},
+            ],
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan_review.id
+
+
+@pytest.mark.parametrize(
+    ("action_type", "child_type", "action_key"),
     [("run_review", "review", "review_task"), ("run_improve", "improve", "improve_task")],
 )
 def test_watch_cycle_does_not_double_start_pending_child_started_in_advance_step(

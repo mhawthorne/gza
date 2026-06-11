@@ -52,16 +52,11 @@ def build_plan_review_slice_task_specs(
             based_on_task_id = f"__new_task_idx__:{slice_task_index_by_id[slice_manifest.based_on_slice]}"
             same_branch = True
 
-        prompt = (
-            f"Implement plan slice {slice_manifest.slice_id} from {plan_source_task.id} "
-            f"based on plan review {review_task.id}: {slice_manifest.title}\n\n"
-            f"Slice prompt:\n{slice_manifest.prompt}\n\n"
-            f"Scope:\n- " + "\n- ".join(slice_manifest.scope)
+        prompt = _build_plan_review_slice_prompt(
+            plan_source_task_id=plan_source_task.id,
+            review_task_id=review_task.id,
+            slice_manifest=slice_manifest,
         )
-        if slice_manifest.out_of_scope:
-            prompt += "\n\nOut of scope:\n- " + "\n- ".join(slice_manifest.out_of_scope)
-        if slice_manifest.acceptance_criteria:
-            prompt += "\n\nAcceptance criteria:\n- " + "\n- ".join(slice_manifest.acceptance_criteria)
 
         task_specs.append(
             NewTaskParams(
@@ -79,6 +74,52 @@ def build_plan_review_slice_task_specs(
         slice_task_index_by_id[slice_manifest.slice_id] = len(task_specs) - 1
 
     return task_specs
+
+
+def _build_plan_review_slice_prompt(
+    *,
+    plan_source_task_id: str,
+    review_task_id: str,
+    slice_manifest: object,
+) -> str:
+    """Build the compact provenance prompt for one materialized implement slice."""
+    slice_id = getattr(slice_manifest, "slice_id")
+    title = getattr(slice_manifest, "title")
+    prompt = getattr(slice_manifest, "prompt")
+    scope = getattr(slice_manifest, "scope")
+    out_of_scope = getattr(slice_manifest, "out_of_scope")
+    acceptance_criteria = getattr(slice_manifest, "acceptance_criteria")
+
+    lines = [
+        f"Implement approved plan-review slice {slice_id}: {title}",
+        "",
+        "Provenance:",
+        f"- Plan source: {plan_source_task_id}",
+        f"- Plan review: {review_task_id}",
+        f"- Slice: {slice_id} ({title})",
+        "",
+        "Slice prompt:",
+        prompt,
+        "",
+        "Scope:",
+        *(f"- {item}" for item in scope),
+    ]
+    if out_of_scope:
+        lines.extend(
+            [
+                "",
+                "Out of scope:",
+                *(f"- {item}" for item in out_of_scope),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Acceptance criteria:",
+            *(f"- {item}" for item in acceptance_criteria),
+        ]
+    )
+    return "\n".join(lines)
 
 
 def load_materialized_plan_slice_set(

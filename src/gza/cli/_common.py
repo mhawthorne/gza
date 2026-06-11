@@ -2375,6 +2375,14 @@ def _materialize_plan_review_slices(
     """Create implementation tasks from an approved plan-review manifest exactly once."""
     assert plan_source_task.id is not None
     assert review_task.id is not None
+    manifest = validate_plan_review_manifest(
+        json.loads(json.dumps(asdict(manifest))),
+        markdown_verdict="APPROVED",
+        source_task_id=plan_source_task.id,
+        source_task_type=plan_source_task.task_type,
+        max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+    )
     reused_tasks = load_materialized_plan_slice_set(
         store,
         review_task=review_task,
