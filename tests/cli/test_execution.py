@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
 from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
@@ -170,6 +171,28 @@ def _assert_immediate_launch_lock_released(config: Config, store: SqliteTaskStor
     finally:
         permit.release()
     assert _PROCESS_LOCKS == {}
+
+
+def _store_plan_review_override_artifact(
+    tmp_path: Path,
+    store: SqliteTaskStore,
+    review_task_id: str,
+    *,
+    output: str,
+) -> None:
+    config = Config.load(tmp_path)
+    review_task = store.get(review_task_id)
+    assert review_task is not None
+    store_command_output_artifact(
+        store,
+        review_task,
+        config,
+        kind="plan_review_manifest_override",
+        producer="tests.cli.test_execution",
+        label="plan_review_manifest_override",
+        output=output,
+        status="completed",
+    )
 
 
 def _advance_new_batch_error(tmp_path: Path) -> tuple[list[str], str]:
@@ -4738,6 +4761,115 @@ class TestImplementCommand:
         assert "Implement follow-up slice." in created[1].prompt
         assert "Created implement task" in result.stdout
 
+    def test_implement_rejects_invalid_approved_plan_review_manifest(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: APPROVED\n"
+        store.update(review)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
+        assert f"Plan review {review.id} is APPROVED but its slice manifest is invalid" in result.stdout
+        assert "approved plan review report must include a json manifest block" in result.stdout
+
+    def test_implement_rejects_invalid_approved_override_manifest(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan_task.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Implement foundation slice.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+        _store_plan_review_override_artifact(tmp_path, store, review.id, output="[]")
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
+        assert f"Plan review {review.id} is APPROVED but its override manifest is invalid" in result.stdout
+        assert "stored plan review override is not a JSON object" in result.stdout
+
+    def test_implement_falls_back_when_no_completed_approved_plan_review_exists(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        created = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(created) == 1
+        assert created[0].depends_on == plan_task.id
+        assert "Created implement task" in result.stdout
+
+    def test_implement_warns_when_falling_back_after_non_approved_plan_review(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review auth migration plan", task_type="plan_review", depends_on=plan_task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        created = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(created) == 1
+        assert (
+            f"Warning: latest completed plan review {review.id} has verdict CHANGES_REQUESTED; "
+            "falling back to legacy single implement task."
+        ) in result.stdout
+
     def test_implement_queue_reuses_existing_materialized_slices(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -5149,6 +5281,47 @@ class TestPlanReviewAndImproveCommands:
             assert cmd_plan_review(edit_args) == 1
 
         assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
+
+    def test_plan_review_materialize_rejects_invalid_override_manifest(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{plan.id}\",\"source_task_type\":\"plan\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Original prompt.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+        store.update(review)
+        _store_plan_review_override_artifact(tmp_path, store, review.id, output="[]")
+
+        result = run_gza("plan-review", str(review.id), "--materialize", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
+        assert store.list_artifacts(review.id, kind="plan_review_materialization") == []
+        assert f"Plan review {review.id} has an invalid override manifest" in result.stdout
+        assert "stored plan review override is not a JSON object" in result.stdout
 
     def test_plan_improve_queue_creates_revised_plan_task(self, tmp_path: Path) -> None:
         setup_config(tmp_path)

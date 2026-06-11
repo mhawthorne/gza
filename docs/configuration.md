@@ -1560,7 +1560,11 @@ Internally, queue-style task listing is routed through the unified task query la
 Create implementation from a completed plan task. When the latest completed plan source
 already has an approved valid `plan_review` manifest, `gza implement <plan-id>` prefers
 materializing the reviewed slices instead of creating one legacy monolithic implement task.
-If no approved manifest exists, it falls back to the single-task compatibility path. Re-running
+If the latest completed approved review exists but its effective manifest is invalid or missing,
+including a malformed stored override artifact, the command exits non-zero instead of silently
+creating a monolithic implement task. If no
+completed approved review exists, the command keeps the single-task compatibility fallback; when
+that fallback bypasses a completed non-approved review, it prints a warning. Re-running
 `gza implement <plan-id>` after those reviewed slices already exist reuses the same non-dropped
 slice tasks instead of recreating or dropping them, and the command output says `Reused`
 rather than `Created`.
@@ -1612,7 +1616,7 @@ gza plan-review <task_id> [options]
 | `--provider PROVIDER` | Override provider for this task |
 | `--force` | Skip dependency merge precondition checks when running the plan review task |
 
-`--edit-slices` and `--materialize` operate on a completed `plan_review` task ID rather than a plan source ID. `--edit-slices` persists a validated override artifact tied to that review, and `--materialize` reuses an existing non-dropped slice set for the same review/manifest instead of creating duplicates.
+`--edit-slices` and `--materialize` operate on a completed `plan_review` task ID rather than a plan source ID. `--edit-slices` persists a validated override artifact tied to that review, and `--materialize` reuses an existing non-dropped slice set for the same review/manifest instead of creating duplicates. If a stored override artifact is malformed or no longer validates, both commands exit non-zero with an invalid override-manifest error and create no implementation tasks.
 
 ### plan-improve
 

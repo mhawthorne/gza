@@ -123,7 +123,7 @@ from ._common import (
     phase1_error,
     print_phase1_message,
     resolve_comments_improve_action,
-    resolve_effective_plan_review_manifest,
+    resolve_effective_plan_review_manifest_state,
     resolve_id,
     resolve_improve_action,
     run_with_recovery,
@@ -1179,13 +1179,27 @@ def _cmd_plan_review_manifest_action(
             f"({plan_source_task.task_type}), not a plan source.",
         )
 
-    manifest, manifest_source = resolve_effective_plan_review_manifest(
+    manifest_state = resolve_effective_plan_review_manifest_state(
         store,
         config,
         review_task=review_task,
         plan_source_task=plan_source_task,
     )
+    manifest = manifest_state.manifest
+    manifest_source = manifest_state.source
     if manifest is None:
+        if manifest_state.source == "override":
+            detail = manifest_state.validation_error or "missing approved override manifest"
+            return phase1_error(
+                args,
+                f"Plan review {review_task.id} has an invalid override manifest: {detail}",
+            )
+        if manifest_state.verdict == "APPROVED":
+            detail = manifest_state.validation_error or "missing approved slice manifest"
+            return phase1_error(
+                args,
+                f"Plan review {review_task.id} is APPROVED but its slice manifest is invalid: {detail}",
+            )
         return phase1_error(
             args,
             f"Plan review {review_task.id} does not have a valid approved slice manifest to override or materialize.",
@@ -1406,14 +1420,46 @@ def cmd_implement(args: argparse.Namespace) -> int:
         return 1
 
     latest_plan_source = _resolve_latest_plan_source(store, plan_task)
-    approved_review = _latest_non_dropped_plan_review_for_source(store, latest_plan_source)
+    latest_plan_review = _latest_non_dropped_plan_review_for_source(store, latest_plan_source)
+    latest_completed_plan_review = _latest_completed_non_dropped_plan_review_for_source(
+        store,
+        latest_plan_source,
+    )
+    approved_review = latest_completed_plan_review
     approved_manifest = None
-    if approved_review is not None and approved_review.status == "completed" and latest_plan_source.id is not None:
-        approved_manifest, _manifest_source = resolve_effective_plan_review_manifest(
+    fallback_warning: str | None = None
+    if approved_review is not None and latest_plan_source.id is not None:
+        manifest_state = resolve_effective_plan_review_manifest_state(
             store,
             config,
             review_task=approved_review,
             plan_source_task=latest_plan_source,
+        )
+        approved_manifest = manifest_state.manifest if manifest_state.verdict == "APPROVED" else None
+        if manifest_state.verdict == "APPROVED" and approved_manifest is None:
+            manifest_source_label = (
+                "override manifest" if manifest_state.source == "override" else "slice manifest"
+            )
+            detail = manifest_state.validation_error or "missing approved slice manifest"
+            return phase1_error(
+                args,
+                f"Plan review {approved_review.id} is APPROVED but its {manifest_source_label} is invalid: {detail}",
+            )
+        if approved_manifest is None and manifest_state.verdict not in {None, "APPROVED"}:
+            fallback_warning = (
+                f"Warning: latest completed plan review {approved_review.id} has verdict "
+                f"{manifest_state.verdict}; falling back to legacy single implement task."
+            )
+        elif approved_manifest is None and manifest_state.verdict is None:
+            detail = manifest_state.validation_error or "missing verdict"
+            fallback_warning = (
+                f"Warning: latest completed plan review {approved_review.id} is not usable "
+                f"({detail}); falling back to legacy single implement task."
+            )
+    elif latest_plan_review is not None:
+        fallback_warning = (
+            f"Warning: latest plan review {latest_plan_review.id} is {latest_plan_review.status}; "
+            "falling back to legacy single implement task."
         )
 
     with _release_reserved_launch_unless_transferred(reserved_launch) as mark_launch_transferred:
@@ -1497,6 +1543,9 @@ def cmd_implement(args: argparse.Namespace) -> int:
             )
             release_task_launch_permit(prepared_first_task_id)
             return rc
+
+        if fallback_warning is not None:
+            print(fallback_warning)
 
         prompt = args.prompt
         if not prompt:
@@ -2768,6 +2817,29 @@ def _latest_non_dropped_plan_review_for_source(
         if child.task_type == "plan_review"
         and child.depends_on == plan_source_task.id
         and child.status != "dropped"
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda task: (
+            task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+            task_id_numeric_key(task.id),
+        ),
+    )
+
+
+def _latest_completed_non_dropped_plan_review_for_source(
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+) -> DbTask | None:
+    assert plan_source_task.id is not None
+    candidates = [
+        child
+        for child in store.get_lineage_children(plan_source_task.id)
+        if child.task_type == "plan_review"
+        and child.depends_on == plan_source_task.id
+        and child.status == "completed"
     ]
     if not candidates:
         return None

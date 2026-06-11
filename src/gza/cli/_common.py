@@ -109,6 +109,16 @@ class PlanReviewMaterializationResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class EffectivePlanReviewManifestState:
+    """Resolved effective manifest state for a completed plan review."""
+
+    manifest: PlanReviewManifest | None
+    source: str
+    verdict: str | None
+    validation_error: str | None = None
+
+
 def format_task_status_text(task: DbTask) -> str:
     """Return the inline status label used by lineage-oriented displays."""
     if task.status == "failed":
@@ -2465,14 +2475,45 @@ def resolve_effective_plan_review_manifest(
     plan_source_task: DbTask,
 ) -> tuple[PlanReviewManifest | None, str]:
     """Return the manifest that should drive manual materialization for a review."""
-    override_manifest = _read_plan_review_override_manifest(
+    state = resolve_effective_plan_review_manifest_state(
         store,
         config,
         review_task=review_task,
         plan_source_task=plan_source_task,
     )
-    if override_manifest is not None:
-        return override_manifest, "override"
+    return state.manifest, state.source
+
+
+def resolve_effective_plan_review_manifest_state(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    review_task: DbTask,
+    plan_source_task: DbTask,
+) -> EffectivePlanReviewManifestState:
+    """Return the effective manual-materialization manifest plus validation details."""
+    override_artifact = _latest_plan_review_override_artifact(store, review_task)
+    if override_artifact is not None:
+        try:
+            override_manifest = _read_plan_review_override_manifest(
+                store,
+                config,
+                review_task=review_task,
+                plan_source_task=plan_source_task,
+            )
+        except (OSError, ValueError, PlanReviewValidationError) as exc:
+            return EffectivePlanReviewManifestState(
+                manifest=None,
+                source="override",
+                verdict="APPROVED",
+                validation_error=str(exc),
+            )
+        if override_manifest is not None:
+            return EffectivePlanReviewManifestState(
+                manifest=override_manifest,
+                source="override",
+                verdict="APPROVED",
+            )
 
     outcome = get_plan_review_outcome(
         Path(config.project_dir),
@@ -2482,9 +2523,12 @@ def resolve_effective_plan_review_manifest(
         max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
         max_plan_slices=getattr(config, "max_plan_slices", None),
     )
-    if outcome.verdict != "APPROVED" or outcome.manifest is None:
-        return None, "review"
-    return outcome.manifest, "review"
+    return EffectivePlanReviewManifestState(
+        manifest=outcome.manifest,
+        source="review",
+        verdict=outcome.verdict,
+        validation_error=outcome.validation_error,
+    )
 
 
 def persist_plan_review_override_manifest(
