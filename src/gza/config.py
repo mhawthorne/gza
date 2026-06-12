@@ -90,7 +90,7 @@ DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL = 60
 DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
-DEFAULT_WATCH_RESTART_FAILED_BATCH = 1
+DEFAULT_WATCH_RECOVERY_SLOTS = 1
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
@@ -210,6 +210,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "no_activity_timeout": None,
         "max_idle": None,
         "max_iterations": None,
+        "recovery_slots": None,
         "restart_failed_batch": None,
         "failure_backoff_initial": None,
         "failure_backoff_max": None,
@@ -310,6 +311,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "no_activity_timeout": None,
         "max_idle": None,
         "max_iterations": None,
+        "recovery_slots": None,
         "restart_failed_batch": None,
         "failure_backoff_initial": None,
         "failure_backoff_max": None,
@@ -349,6 +351,18 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
 }
 
 _LOCAL_OVERRIDE_NOTICE_SHOWN: set[str] = set()
+_DEPRECATED_CONFIG_WARNING_SHOWN: set[str] = set()
+
+
+def _warn_deprecated_config_alias_once(alias_key: str, replacement_key: str) -> None:
+    if alias_key in _DEPRECATED_CONFIG_WARNING_SHOWN:
+        return
+    _DEPRECATED_CONFIG_WARNING_SHOWN.add(alias_key)
+    warnings.warn(
+        f"'{alias_key}' is deprecated; use '{replacement_key}'.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
 
 def discover_project_dir(start: Path) -> Path:
@@ -851,7 +865,7 @@ class WatchConfig:
     no_activity_timeout: int = DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT
     max_idle: int | None = DEFAULT_WATCH_MAX_IDLE
     max_iterations: int = DEFAULT_WATCH_MAX_ITERATIONS
-    restart_failed_batch: int = DEFAULT_WATCH_RESTART_FAILED_BATCH
+    recovery_slots: int = DEFAULT_WATCH_RECOVERY_SLOTS
     failure_backoff_initial: int = DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL
     failure_backoff_max: int = DEFAULT_WATCH_FAILURE_BACKOFF_MAX
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
@@ -1925,14 +1939,28 @@ class Config:
             raise ConfigError("watch.max_iterations must be a positive integer")
         if watch_max_iterations < 1:
             raise ConfigError("watch.max_iterations must be a positive integer")
-        try:
-            watch_restart_failed_batch = int(
-                watch_data.get("restart_failed_batch", DEFAULT_WATCH_RESTART_FAILED_BATCH)
-            )
-        except (TypeError, ValueError):
-            raise ConfigError("watch.restart_failed_batch must be a positive integer")
-        if watch_restart_failed_batch < 1:
-            raise ConfigError("watch.restart_failed_batch must be a positive integer")
+        recovery_slots_raw = watch_data.get("recovery_slots")
+        restart_failed_batch_raw = watch_data.get("restart_failed_batch")
+        if recovery_slots_raw is not None and not _is_strict_int(recovery_slots_raw):
+            raise ConfigError("watch.recovery_slots must be a non-negative integer")
+        if restart_failed_batch_raw is not None and not _is_strict_int(restart_failed_batch_raw):
+            raise ConfigError("watch.restart_failed_batch must be a non-negative integer")
+        if recovery_slots_raw is not None and restart_failed_batch_raw is not None:
+            if cast(int, recovery_slots_raw) != cast(int, restart_failed_batch_raw):
+                raise ConfigError(
+                    "watch.recovery_slots and deprecated watch.restart_failed_batch must not conflict"
+                )
+            _warn_deprecated_config_alias_once("watch.restart_failed_batch", "watch.recovery_slots")
+            watch_recovery_slots = cast(int, recovery_slots_raw)
+        elif recovery_slots_raw is not None:
+            watch_recovery_slots = cast(int, recovery_slots_raw)
+        elif restart_failed_batch_raw is not None:
+            _warn_deprecated_config_alias_once("watch.restart_failed_batch", "watch.recovery_slots")
+            watch_recovery_slots = cast(int, restart_failed_batch_raw)
+        else:
+            watch_recovery_slots = DEFAULT_WATCH_RECOVERY_SLOTS
+        if watch_recovery_slots < 0:
+            raise ConfigError("watch.recovery_slots must be a non-negative integer")
         try:
             watch_failure_backoff_initial = int(
                 watch_data.get("failure_backoff_initial", DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL)
@@ -1978,7 +2006,7 @@ class Config:
             no_activity_timeout=watch_no_activity_timeout,
             max_idle=watch_max_idle,
             max_iterations=watch_max_iterations,
-            restart_failed_batch=watch_restart_failed_batch,
+            recovery_slots=watch_recovery_slots,
             failure_backoff_initial=watch_failure_backoff_initial,
             failure_backoff_max=watch_failure_backoff_max,
             failure_halt_after=watch_failure_halt_after,
@@ -2466,12 +2494,35 @@ class Config:
                 if "max_iterations" in watch_data:
                     if not isinstance(watch_data["max_iterations"], int) or watch_data["max_iterations"] < 1:
                         errors.append("watch.max_iterations must be a positive integer")
+                recovery_slots_raw = watch_data.get("recovery_slots")
+                restart_failed_batch_raw = watch_data.get("restart_failed_batch")
+                if "recovery_slots" in watch_data:
+                    if not isinstance(recovery_slots_raw, int) or isinstance(recovery_slots_raw, bool):
+                        errors.append("watch.recovery_slots must be a non-negative integer")
+                    elif recovery_slots_raw < 0:
+                        errors.append("watch.recovery_slots must be a non-negative integer")
                 if "restart_failed_batch" in watch_data:
                     if (
-                        not isinstance(watch_data["restart_failed_batch"], int)
-                        or watch_data["restart_failed_batch"] < 1
+                        not isinstance(restart_failed_batch_raw, int)
+                        or isinstance(restart_failed_batch_raw, bool)
                     ):
-                        errors.append("watch.restart_failed_batch must be a positive integer")
+                        errors.append("watch.restart_failed_batch must be a non-negative integer")
+                    elif restart_failed_batch_raw < 0:
+                        errors.append("watch.restart_failed_batch must be a non-negative integer")
+                    else:
+                        warnings.append("'watch.restart_failed_batch' is deprecated; use 'watch.recovery_slots'.")
+                if (
+                    isinstance(recovery_slots_raw, int)
+                    and not isinstance(recovery_slots_raw, bool)
+                    and recovery_slots_raw >= 0
+                    and isinstance(restart_failed_batch_raw, int)
+                    and not isinstance(restart_failed_batch_raw, bool)
+                    and restart_failed_batch_raw >= 0
+                    and recovery_slots_raw != restart_failed_batch_raw
+                ):
+                    errors.append(
+                        "watch.recovery_slots and deprecated watch.restart_failed_batch must not conflict"
+                    )
                 if "failure_backoff_initial" in watch_data:
                     if (
                         not isinstance(watch_data["failure_backoff_initial"], int)

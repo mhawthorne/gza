@@ -62,7 +62,11 @@ Each watch cycle MUST execute these phases in order:
 3. **Evaluate direct lifecycle work first.** Execute merge-ready and other direct
    non-worker actions before spawning any new workers (S4).
 4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
-   lifecycle worker starts selected by the shared engine.
+   lifecycle worker starts selected by the shared engine. Recovery allocation is not a
+   pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before
+   pending pickup, and `--recovery-only` MUST gate pending pickup entirely while any
+   actionable in-scope recovery remains, even if that recovery action is direct and does
+   not consume a worker slot.
 5. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
    parked states, recovery decisions, and failures.
 6. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
@@ -93,6 +97,20 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   task state. Either source alone is insufficient after crashes or restarts.
 - Stale or dead worker state MUST be reconciled before capacity is computed.
 - `slots` MUST equal `max(0, batch - running)`.
+- `watch.recovery_slots` (default `1`) MUST reserve that many worker slots per cycle for
+  actionable failed-task recovery before pending pickup, capped by available slots and
+  actionable in-scope worker-consuming recovery count.
+- The rule is uniform for worker-consuming recovery. There is no separate batch-1 policy:
+  with batch 1 and the default `watch.recovery_slots = 1`, plain watch gives the single
+  slot to worker-consuming recovery until that lane drains. `--pending-only` is the
+  operator escape hatch for single-slot pending-only behavior, and `--recovery-only` is
+  the `recovery_slots = batch` extreme that also suppresses pending pickup while direct
+  actionable recovery remains.
+- Eligibility remains owned by the shared recovery engine. The supervisor MUST use the
+  same `decide_failed_task_recovery(...)` policy regardless of watch mode and MUST NOT
+  invent a separate recovery-only eligibility predicate. Recovery-only lane gating may
+  still depend on the presence of any actionable recovery, including direct reconcile
+  actions that do not consume worker slots.
 - Only worker-consuming actions spend a slot. Direct actions such as merge,
   merge-with-followups, scope evaluation, re-exec decisions, and attention emission MUST
   NOT consume slots.
@@ -227,12 +245,19 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.poll` | Delay between completed cycles |
 | `watch.max_idle` | Consecutive idle loop time before clean exit |
 | `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch |
+| `watch.recovery_slots` | Slots per cycle reserved for failed-task recovery before pending pickup |
 | `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
 | `watch.no_activity_timeout` | Reconciliation threshold for deciding a live in-progress worker has gone silent and must be failed/reconciled |
 | `--tag` / `--any-tag` | Supervisor execution scope |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
+
+Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to
+`--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and
+`watch.restart_failed_batch` maps to `watch.recovery_slots`. This task does not redesign
+stale-worker reaping or the `recovery_already_running` backstop; see `gza-4574` for that
+separate work.
 
 ## Boundary with the engine
 

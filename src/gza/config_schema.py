@@ -193,10 +193,16 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("watch.max_iterations", "int", 10, "Default review/improve loop cap in `gza watch`."),
     ConfigKeySpec("watch.poll", "int", 300, "Polling interval seconds for `gza watch`."),
     ConfigKeySpec(
+        "watch.recovery_slots",
+        "int",
+        1,
+        "Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is pending-only.",
+    ),
+    ConfigKeySpec(
         "watch.restart_failed_batch",
         "int",
         1,
-        "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active.",
+        "Deprecated alias for `watch.recovery_slots`.",
     ),
     ConfigKeySpec("work_count", "int", 1, "Default task count for each `gza work` run."),
     ConfigKeySpec("worktree_dir", "str", "/tmp/gza-worktrees", "Base directory for git worktrees."),

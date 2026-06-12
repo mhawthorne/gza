@@ -334,7 +334,7 @@ In interactive mode, the same `Needs attention` section is part of the plan prev
 | `gza improve` | Advance creates improve tasks equivalent to `gza improve --queue` |
 | `gza rebase` | Advance creates rebase tasks equivalent to `gza rebase --background` |
 | `gza merge` | Advance merges directly, same as `gza merge <id>` |
-| `gza watch` | Runs advance in a loop with sleep intervals; with `--restart-failed`, drains actionable failed-task recovery before pending queue work |
+| `gza watch` | Runs advance in a loop with sleep intervals; `watch.recovery_slots` reserves failed-task recovery capacity before pending pickup |
 
 ## Watch integration
 
@@ -348,14 +348,16 @@ At the start of each watch pass, watch also fingerprints the installed `gza` Pyt
 
 When `main_checkout_isolate: true`, `gza watch` still plans against the repo default branch but executes merge attempts inside a dedicated detached integration checkout reset to the default-branch tip (`config.main_checkout_integration_path`). Successful isolated merges are then promoted onto the real default-branch ref before `merge_status` flips to `merged`; if the default branch is attached in another checkout, watch hard-resets that checkout to the new tip so it stays clean. Rebase/conflict-resolution ownership is unchanged: conflicts create rebase tasks on the task branch, and those tasks run through the normal rebase workflow.
 
-Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue. `gza watch --restart-failed` is opt-in only for recovery-first queue ordering.
+Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue, but it now exposes that policy through a two-lane split. `watch.recovery_slots` (default `1`) reserves that many worker slots per watch pass for actionable failed-task recovery before pending pickup, and leaves the remaining `batch - recovery_slots` worker slots for pending work. The rule is uniform for worker-consuming recovery: batch-1 plain watch gives the single slot to worker-consuming recovery first; `--pending-only` or `watch.recovery_slots: 0` are the escape hatch for operators who intentionally want single-slot pending-only behavior. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot.
 
-When `--restart-failed` is enabled:
+When the recovery lane is active:
 
-- Watch evaluates failed tasks through the shared recovery engine before starting fresh pending work
-- Recovery work is recovery-first: actionable failed tasks drain before pending queue pickup, and newly failed actionable tasks continue to outrank pending work for that session
+- Watch evaluates failed tasks through the shared recovery engine before spending the reserved pending slots
+- Actionable failed tasks are selected oldest-created first, but they only consume the configured recovery slots for that watch pass
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
-- `gza watch --restart-failed --dry-run` prints the failed-task recovery decision report, including shared `Needs attention` rows by default, and exits
+- `gza watch --recovery-only --dry-run` prints the failed-task recovery decision report, including shared `Needs attention` rows by default, and exits
 - Fully recovered failed ancestors are omitted from that report and from live watch recovery logs; only unresolved failed tasks and their completed recovery descendants remain visible through the normal advance plan
-- Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted from live `--restart-failed` failure transition output and do not contribute to backoff or halt streaks
+- Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted from live recovery-lane failure transition output and do not contribute to backoff or halt streaks
 - `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery
+
+Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.

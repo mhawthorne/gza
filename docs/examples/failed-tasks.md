@@ -43,14 +43,14 @@ You have two options for recovering:
 | `uv run gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
 | `uv run gza retry` | Create a new retry attempt | Task needs another run; implement retries fork fresh, same-branch follow-ups stay on the shared branch |
 
-For bulk unattended recovery after fixing an environment issue, use watch recovery mode:
+For bulk unattended recovery after fixing an environment issue, use the watch recovery lane:
 
 | Command | Behavior | Use when |
 |---------|----------|----------|
-| `uv run gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task | You want watch to recover the failed queue first, then continue normal processing |
-| `uv run gza watch --restart-failed --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or need operator attention before starting recovery |
-| `uv run gza watch --restart-failed --dry-run --show-skipped` | Include ordinary skipped failed tasks in the recovery decision report | You want to inspect why some non-attention failed tasks would still be skipped |
-| `uv run gza watch --restart-failed --show-skipped` | Include skipped failed tasks in live watch logs | You want restart-failed watch logs to explain why some failed tasks are being skipped |
+| `uv run gza watch --recovery-only` | Send the full watch batch to failed-task recovery, choosing `resume` or `retry` per task | You want watch to drain the failed queue before resuming normal pending processing |
+| `uv run gza watch --recovery-only --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or need operator attention before starting recovery |
+| `uv run gza watch --recovery-only --dry-run --show-skipped` | Include ordinary skipped failed tasks in the recovery decision report | You want to inspect why some non-attention failed tasks would still be skipped |
+| `uv run gza watch --recovery-only --show-skipped` | Include skipped failed tasks in live watch logs | You want recovery-only watch logs to explain why some failed tasks are being skipped |
 
 ## Resume a task
 
@@ -97,13 +97,13 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 ## Recover failed tasks with watch
 
-`uv run gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work. Plain `uv run gza watch` and `uv run gza watch --restart-failed` use the same bounded shared recovery policy; `--restart-failed` only changes queue priority.
+`uv run gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for actionable failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `uv run gza watch --recovery-only` to dedicate the full batch to failed-task recovery, or `uv run gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
 
 Preview the recovery plan first:
 
 ```bash
-$ uv run gza watch --restart-failed --dry-run
-Failed recovery plan (tags=*, mode=restart-failed)
+$ uv run gza watch --recovery-only --dry-run
+Failed recovery plan (tags=*, mode=recovery-only)
 
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
 retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
@@ -119,8 +119,8 @@ Fully recovered failed ancestors are omitted from this report entirely. Once a r
 Include ordinary skipped tasks when you need the full picture:
 
 ```bash
-$ uv run gza watch --restart-failed --dry-run --show-skipped
-Failed recovery plan (tags=*, mode=restart-failed)
+$ uv run gza watch --recovery-only --dry-run --show-skipped
+Failed recovery plan (tags=*, mode=recovery-only)
 
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
 retry  gza-102 plan      via worker  reason=INFRASTRUCTURE_ERROR attempt=1/2
@@ -132,15 +132,15 @@ Needs attention (1 task):
 Summary: 2 actionable (1 resume, 1 retry), 1 needs attention, 1 skipped
 ```
 
-The same `--show-skipped` flag also controls live `uv run gza watch --restart-failed` logging. Shared needs-attention recovery rows are shown by default; without `--show-skipped`, only ordinary non-attention skip decisions stay silent in the watch log.
+The same `--show-skipped` flag also controls live `uv run gza watch --recovery-only` logging. Shared needs-attention recovery rows are shown by default; without `--show-skipped`, only ordinary non-attention skip decisions stay silent in the watch log.
 
 Then run recovery mode for real:
 
 ```bash
-$ uv run gza watch --restart-failed
+$ uv run gza watch --recovery-only
 ```
 
-`--max-resume-attempts` controls that shared policy as a toggle: set it to `0` to disable unattended recovery entirely; any positive value enables the same fixed bounded automatic recovery policy used by plain watch and by `--restart-failed`.
+`--max-resume-attempts` controls that shared policy as a toggle: set it to `0` to disable unattended recovery entirely; any positive value enables the same fixed bounded automatic recovery policy used by plain watch and by the recovery lane. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only` and `--restart-failed-batch` maps to `--recovery-slots`.
 
 ## Check history for failed tasks
 

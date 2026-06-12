@@ -802,17 +802,40 @@ def main() -> int:
         help="Max iterate review/improve loops when watch launches implement tasks (default: watch.max_iterations or 10)",
     )
     watch_parser.add_argument(
+        "--recovery-slots",
+        type=int,
+        metavar="N",
+        dest="recovery_slots",
+        help="Slots per watch pass reserved for failed-task recovery before pending pickup (default: watch.recovery_slots or 1)",
+    )
+    watch_recovery_mode = watch_parser.add_mutually_exclusive_group()
+    watch_recovery_mode.add_argument(
+        "--recovery-only",
+        action="store_const",
+        const="recovery-only",
+        dest="recovery_mode",
+        help="Send the full batch to failed-task recovery; pending pickup waits until recovery drains",
+    )
+    watch_recovery_mode.add_argument(
+        "--pending-only",
+        action="store_const",
+        const="pending-only",
+        dest="recovery_mode",
+        help="Disable failed-task recovery and use all slots for pending pickup",
+    )
+    watch_recovery_mode.add_argument(
         "--restart-failed",
-        action="store_true",
-        dest="restart_failed",
-        help="Drain failed-task recovery before pending queue work using the shared bounded recovery policy",
+        action="store_const",
+        const="recovery-only",
+        dest="recovery_mode",
+        help=argparse.SUPPRESS,
     )
     watch_parser.add_argument(
         "--restart-failed-batch",
         type=int,
         metavar="N",
-        dest="restart_failed_batch",
-        help="Max concurrent failed-task recovery launches while --restart-failed is active (default: watch.restart_failed_batch or 1)",
+        dest="recovery_slots",
+        help=argparse.SUPPRESS,
     )
     watch_parser.add_argument(
         "--max-resume-attempts",
@@ -825,13 +848,13 @@ def main() -> int:
         "--dry-run",
         action="store_true",
         dest="dry_run",
-        help="Show what watch would do without executing; with --restart-failed, print the failed-recovery report and exit",
+        help="Show what watch would do without executing; with --recovery-only, print the failed-recovery report and exit",
     )
     watch_parser.add_argument(
         "--show-skipped",
         action="store_true",
         dest="show_skipped",
-        help="With --restart-failed, include skipped failed tasks in the dry-run recovery report and live watch logs",
+        help="With --recovery-only, include skipped failed tasks in the dry-run recovery report and live watch logs",
     )
     watch_parser.add_argument(
         "--quiet",

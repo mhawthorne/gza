@@ -69,7 +69,7 @@ Gza reads configuration from three YAML layers:
 | `max_concurrent` | Integer | `watch.batch` or `5` | Hard global ceiling on concurrently running task-executing processes across `work`, `watch`, `advance`, iterate/recovery helpers, and internal task runners. Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5` |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
-| `watch` | Dict | `{batch: 5, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, restart_failed_batch: 1}` | Defaults for `gza watch` loop behavior |
+| `watch` | Dict | `{batch: 5, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1}` | Defaults for `gza watch` loop behavior |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
 | `theme` | String | `minimal` | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |
@@ -996,6 +996,7 @@ watch.no_activity_timeout
 watch.no_progress_cycles
 watch.max_iterations
 watch.poll
+watch.recovery_slots
 watch.restart_failed_batch
 work_count
 worktree_dir
@@ -1773,11 +1774,12 @@ need to break out promptly from a long or blocked watch pass.
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
 | `--max-idle SECS` | Exit after consecutive idle watch-loop time (default: `watch.max_idle`, no limit when unset) |
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
-| `--restart-failed` | Drain failed-task recovery before pending queue work using the shared bounded recovery policy |
-| `--restart-failed-batch N` | Max concurrent failed-recovery launches (default: `watch.restart_failed_batch` or `1`) |
-| `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and `--restart-failed` |
-| `--dry-run` | Show what watch would do without executing; with `--restart-failed`, print the full failed-recovery report and exit |
-| `--show-skipped` | With `--restart-failed`, include skipped failed tasks in the dry-run recovery report and live watch logs |
+| `--recovery-slots N` | Slots per watch pass reserved for failed-task recovery before pending pickup (default: `watch.recovery_slots` or `1`) |
+| `--recovery-only` | Send the full batch to failed-task recovery; pending pickup waits until recovery drains |
+| `--pending-only` | Disable failed-task recovery and spend all watch slots on pending pickup |
+| `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and the recovery lane |
+| `--dry-run` | Show what watch would do without executing; with `--recovery-only`, print the full failed-recovery report and exit |
+| `--show-skipped` | With `--recovery-only`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next watch-pass boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order |
@@ -1810,7 +1812,7 @@ When watch detects that the installed `gza` package fingerprint has changed sinc
 
 If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
 
-`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope oldest-created failed task first, showing actionable `resume` and `retry` decisions plus any shared `Needs attention` rows by default, then exits without entering the normal watch loop. Plain `uv run gza watch` and `uv run gza watch --restart-failed` both use the same bounded shared recovery policy; `--restart-failed` only changes selection order by draining actionable failed tasks before pending pickup. `max_resume_attempts` is a recovery toggle for this shared policy (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Ordinary skipped tasks stay hidden by default; pass `--show-skipped` to include those non-attention skips with launch mode and attempt counts in both the dry-run report and live watch logs. Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted entirely from this recovery surface rather than being counted as skipped. In live `--restart-failed` watch runs, those resolved-by-merge failures are also omitted from failure transition lines and backoff/halt accounting.
+`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope, showing actionable `resume` and `retry` decisions plus any shared `Needs attention` rows by default, then exits without entering the normal watch loop. Plain `uv run gza watch` now reserves a recovery lane by default: default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to actionable failed-task recovery before pending pickup, with the remaining `batch - 1` slots left for pending work. The rule is uniform for worker-consuming recovery: at batch 1, default plain watch gives the single slot to worker-consuming recovery first; use `--pending-only` or `watch.recovery_slots: 0` when you intentionally want pending-only behavior on a single slot. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot. `max_resume_attempts` is still the shared recovery toggle (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Ordinary skipped tasks stay hidden by default; pass `--show-skipped` to include those non-attention skips with launch mode and attempt counts in both the dry-run report and live watch logs. Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted entirely from this recovery surface rather than being counted as skipped. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.
 
 ### learnings
 

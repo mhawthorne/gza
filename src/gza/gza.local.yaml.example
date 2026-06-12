@@ -309,7 +309,11 @@
 #   Polling interval seconds for `gza watch`.
 #   Default: 300
 #   poll: 300
-#   Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active.
+#   Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is
+#   pending-only.
+#   Default: 1
+#   recovery_slots: 1
+#   Deprecated alias for `watch.recovery_slots`.
 #   Default: 1
 #   restart_failed_batch: 1
 

@@ -1814,7 +1814,7 @@ def _config_to_effective_dict(config: Config) -> dict:
             "no_activity_timeout": config.watch.no_activity_timeout,
             "max_idle": config.watch.max_idle,
             "max_iterations": config.watch.max_iterations,
-            "restart_failed_batch": config.watch.restart_failed_batch,
+            "recovery_slots": config.watch.recovery_slots,
             "failure_backoff_initial": config.watch.failure_backoff_initial,
             "failure_backoff_max": config.watch.failure_backoff_max,
             "failure_halt_after": config.watch.failure_halt_after,

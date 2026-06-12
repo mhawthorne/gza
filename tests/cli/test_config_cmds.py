@@ -1494,10 +1494,12 @@ class TestLocalConfigOverrides:
         result = run_gza("config", "keys", "--project", str(tmp_path))
 
         assert result.returncode == 0
+        assert "watch.recovery_slots" in result.stdout
         assert "watch.restart_failed_batch" in result.stdout
         assert "watch.no_activity_timeout" in result.stdout
         assert "max_concurrent" in result.stdout
-        assert "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active." in result.stdout
+        assert "Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is pending-only." in result.stdout
+        assert "Deprecated alias for `watch.recovery_slots`." in result.stdout
         assert "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`." in result.stdout
         assert "Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`." in result.stdout
         assert (
@@ -1532,12 +1534,17 @@ class TestLocalConfigOverrides:
         assert result.returncode == 0
         payload = json.loads(result.stdout)
         keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
+        assert keyed_entries["watch.recovery_slots"]["default"] == 1
         assert keyed_entries["watch.restart_failed_batch"]["default"] == 1
         assert keyed_entries["watch.no_activity_timeout"]["default"] == 60
         assert keyed_entries["max_concurrent"]["default"] == "watch.batch or 5"
         assert (
+            keyed_entries["watch.recovery_slots"]["description"]
+            == "Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is pending-only."
+        )
+        assert (
             keyed_entries["watch.restart_failed_batch"]["description"]
-            == "Max concurrent failed-task recovery launches while `gza watch --restart-failed` is active."
+            == "Deprecated alias for `watch.recovery_slots`."
         )
         assert (
             keyed_entries["watch.no_activity_timeout"]["description"]
@@ -4540,6 +4547,45 @@ class TestWatchConfigValidation:
             "  failure_backoff_max: 60\n",
         )
         with pytest.raises(ConfigError, match="watch.failure_backoff_max must be >= watch.failure_backoff_initial"):
+            Config.load(tmp_path)
+
+    def test_config_watch_recovery_slots_zero_loads(self, tmp_path: Path) -> None:
+        """Config.load accepts watch.recovery_slots=0 for pending-only mode."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "watch:\n  recovery_slots: 0\n")
+        config = Config.load(tmp_path)
+        assert config.watch.recovery_slots == 0
+
+    def test_config_watch_restart_failed_batch_alias_loads_with_warning(self, tmp_path: Path) -> None:
+        """Legacy watch.restart_failed_batch should map to watch.recovery_slots."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "watch:\n  restart_failed_batch: 2\n")
+        with pytest.warns(DeprecationWarning, match="watch.restart_failed_batch"):
+            config = Config.load(tmp_path)
+        assert config.watch.recovery_slots == 2
+
+    @pytest.mark.parametrize(
+        ("config_body", "message"),
+        [
+            ("watch:\n  recovery_slots: -1\n", "watch.recovery_slots must be a non-negative integer"),
+            ("watch:\n  recovery_slots: nope\n", "watch.recovery_slots must be a non-negative integer"),
+            (
+                "watch:\n  recovery_slots: 1\n  restart_failed_batch: 2\n",
+                "watch.recovery_slots and deprecated watch.restart_failed_batch must not conflict",
+            ),
+        ],
+    )
+    def test_config_watch_recovery_slot_validation(self, tmp_path: Path, config_body: str, message: str) -> None:
+        """Config.load/validate should reject invalid or conflicting recovery-slot settings."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, config_body)
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert message in errors
+        with pytest.raises(ConfigError, match=re.escape(message)):
             Config.load(tmp_path)
 
     def test_review_verify_timeout_and_deprecated_recommend_rebase_defaults_load(self, tmp_path: Path) -> None:

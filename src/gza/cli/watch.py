@@ -689,10 +689,15 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--max-idle", str(args.max_idle)])
     if getattr(args, "max_iterations", None) is not None:
         argv.extend(["--max-iterations", str(args.max_iterations)])
-    if getattr(args, "restart_failed", False):
-        argv.append("--restart-failed")
-    if getattr(args, "restart_failed_batch", None) is not None:
-        argv.extend(["--restart-failed-batch", str(args.restart_failed_batch)])
+    recovery_mode = getattr(args, "recovery_mode", None)
+    if recovery_mode is None and getattr(args, "restart_failed", False):
+        recovery_mode = "recovery-only"
+    if recovery_mode == "recovery-only":
+        argv.append("--recovery-only")
+    elif recovery_mode == "pending-only":
+        argv.append("--pending-only")
+    if getattr(args, "recovery_slots", None) is not None:
+        argv.extend(["--recovery-slots", str(args.recovery_slots)])
     if getattr(args, "max_resume_attempts", None) is not None:
         argv.extend(["--max-resume-attempts", str(args.max_resume_attempts)])
     if getattr(args, "dry_run", False):
@@ -1049,6 +1054,12 @@ class _CycleResult:
 
 
 @dataclass(frozen=True)
+class WatchSlotAllocation:
+    recovery_slots: int
+    pending_slots: int
+
+
+@dataclass(frozen=True)
 class _ObservedFailure:
     task_id: str
     task_type: str
@@ -1060,6 +1071,30 @@ class _RecoveryReport:
     actionable_count: int
     resume_count: int
     retry_count: int
+
+
+def allocate_watch_slots(
+    *,
+    slots: int,
+    recovery_slots_config: int,
+    actionable_recovery_count: int,
+    worker_consuming_recovery_count: int,
+    pending_count: int,
+    gate_pending_on_actionable_recovery: bool = False,
+) -> WatchSlotAllocation:
+    del pending_count
+    recovery_slots = min(slots, recovery_slots_config, worker_consuming_recovery_count)
+    pending_slots = max(0, slots - recovery_slots)
+    if (
+        gate_pending_on_actionable_recovery
+        and recovery_slots_config > 0
+        and actionable_recovery_count > 0
+    ):
+        pending_slots = 0
+    return WatchSlotAllocation(
+        recovery_slots=recovery_slots,
+        pending_slots=pending_slots,
+    )
 
 
 def _iter_status_transitions(
@@ -1172,7 +1207,7 @@ def _emit_recovery_dry_run_report(
         max_recovery_attempts=max_recovery_attempts,
     )
     scope = ",".join(tags) if tags else "*"
-    print(f"Failed recovery plan (tags={scope}, mode=restart-failed)")
+    print(f"Failed recovery plan (tags={scope}, mode=recovery-only)")
     print()
     actionable = resume = retry = 0
     attention_rows: list[tuple[DbTask, dict[str, object]]] = []
@@ -1279,8 +1314,10 @@ def _run_cycle(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
     quiet: bool = False,
+    recovery_slots: int = 1,
+    recovery_mode: str | None = None,
     restart_failed: bool = False,
-    restart_failed_batch: int = 1,
+    restart_failed_batch: int | None = None,
     max_recovery_attempts: int = 1,
     show_skipped: bool = False,
     auto_restart_on_drift: bool = True,
@@ -1293,6 +1330,11 @@ def _run_cycle(
     )
 
     tags = normalize_tag_filters(tags)
+    if restart_failed:
+        recovery_slots = batch if restart_failed_batch is None else restart_failed_batch
+        recovery_mode = "recovery-only"
+    elif restart_failed_batch is not None:
+        recovery_slots = restart_failed_batch
 
     log.begin_cycle()
     _warn_if_installed_gza_changed(
@@ -2009,19 +2051,16 @@ def _run_cycle(
 
     # 2) Recovery queue for failed tasks.
     pending_recovery_task_ids: set[str] = set()
-    if restart_failed:
-        log.emit("QUEUE", "recovery queue enabled (--restart-failed)")
-    failed_decisions: list[tuple[DbTask, FailedRecoveryDecision]] = []
-    actionable_failed: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision]] = []
+    actionable_failed: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool]] = []
+    worker_consuming_recovery_count = 0
     for row in recovery_rows:
         failed = row.recovery_leaf_task
         assert failed is not None
         if failed.id is None:
             continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
-        failed_decisions.append((failed, decision))
         if decision.action == "skip":
-            if restart_failed and show_skipped:
+            if recovery_slots > 0 and show_skipped:
                 log.emit(
                     "SKIP",
                     f"{row.owner_task.id} failed {failed.task_type}: {decision.reason_code}",
@@ -2030,7 +2069,11 @@ def _run_cycle(
             continue
         if decision.recovery_task_id is not None:
             pending_recovery_task_ids.add(decision.recovery_task_id)
-        actionable_failed.append((row, failed, decision))
+        recovery_action = failed_recovery_decision_to_action(failed, decision)
+        worker_consuming_recovery = is_worker_consuming_advance_action(str(recovery_action.get("type", "")))
+        actionable_failed.append((row, failed, decision, recovery_action, worker_consuming_recovery))
+        if worker_consuming_recovery:
+            worker_consuming_recovery_count += 1
 
     pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
     pending_candidates = [
@@ -2041,21 +2084,23 @@ def _run_cycle(
         and str(task.id) not in pending_recovery_task_ids
         and str(task.id) not in step1_handled_child_task_ids
     ]
-    if restart_failed:
-        recovery_slots = max(0, min(slots, restart_failed_batch))
-    else:
-        # Plain watch keeps pending pickup ahead of failed recovery while still
-        # sharing the same bounded recovery policy with restart-failed mode.
-        reserved_for_pending = min(slots, len(pending_candidates))
-        recovery_slots = max(0, slots - reserved_for_pending)
-    started_recovery_task_ids: set[str] = set()
-    launched_recovery_count = 0
-    for row, failed, decision in actionable_failed:
-        if decision.action != "reconcile" and recovery_slots <= 0:
+    slot_allocation = allocate_watch_slots(
+        slots=slots,
+        recovery_slots_config=recovery_slots,
+        actionable_recovery_count=len(actionable_failed),
+        worker_consuming_recovery_count=worker_consuming_recovery_count,
+        pending_count=len(pending_candidates),
+        gate_pending_on_actionable_recovery=recovery_mode == "recovery-only",
+    )
+    reserved_recovery_slots = slot_allocation.recovery_slots
+    pending_slots = slot_allocation.pending_slots
+    for row, failed, decision, recovery_action, worker_consuming_recovery in actionable_failed:
+        if recovery_slots <= 0:
             break
+        if worker_consuming_recovery and reserved_recovery_slots <= 0:
+            continue
         if failed.id is None:
             continue
-        recovery_action = failed_recovery_decision_to_action(failed, decision)
         if not dry_run:
             no_progress_attention = _maybe_park_watch_no_progress(
                 store=store,
@@ -2082,7 +2127,6 @@ def _run_cycle(
                     ),
                 )
                 work_done = True
-                launched_recovery_count += 1
                 continue
             exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
             if exec_result.status == "skip":
@@ -2127,7 +2171,6 @@ def _run_cycle(
                     dedupe_key=f"recovery-reconcile-success:{failed.id}",
                 )
                 work_done = True
-                launched_recovery_count += 1
                 continue
             continue
         if decision.action == "resume":
@@ -2142,9 +2185,8 @@ def _run_cycle(
                     ),
                 )
                 slots -= 1
-                recovery_slots -= 1
+                reserved_recovery_slots -= 1
                 work_done = True
-                launched_recovery_count += 1
                 continue
             if decision.launch_mode == "worker":
                 reserved_launch = _reserve_watch_launch("resume", str(failed.id))
@@ -2244,9 +2286,8 @@ def _run_cycle(
                     ),
                 )
                 slots -= 1
-                recovery_slots -= 1
+                reserved_recovery_slots -= 1
                 work_done = True
-                launched_recovery_count += 1
                 continue
             reserved_launch = _reserve_watch_launch(
                 "iterate" if decision.launch_mode != "worker" else "retry",
@@ -2334,11 +2375,9 @@ def _run_cycle(
             failed_task=failed,
         )
         started_task_ids.add(recovered_task_id)
-        started_recovery_task_ids.add(recovered_task_id)
         slots -= 1
-        recovery_slots -= 1
+        reserved_recovery_slots -= 1
         work_done = True
-        launched_recovery_count += 1
         log.emit(
             "RECOVR",
             (
@@ -2347,28 +2386,22 @@ def _run_cycle(
             ),
         )
 
-    recovery_phase_active = restart_failed and (
-        launched_recovery_count > 0
-        or len(actionable_failed) > launched_recovery_count
-        or any(
-            decision.reason_code == "recovery_already_running"
-            for _failed, decision in failed_decisions
-        )
-    )
-    if restart_failed and not recovery_phase_active:
-        log.emit("QUEUE", "recovery queue exhausted; switching to pending queue")
-
     # 3) Start new queued tasks (consumes slots)
-    if not recovery_phase_active:
+    def consume_pending_slot() -> None:
+        nonlocal pending_slots, slots
+        pending_slots -= 1
+        slots = max(0, slots - 1)
+
+    if pending_slots > 0:
         log.emit("QUEUE", "pending queue active")
-    if slots > 0 and not recovery_phase_active:
+    if pending_slots > 0:
         for task in pending_tasks:
-            if slots <= 0:
+            if pending_slots <= 0:
                 break
             assert task.id is not None
             if str(task.id) in started_task_ids:
                 continue
-            if restart_failed and str(task.id) in pending_recovery_task_ids:
+            if str(task.id) in pending_recovery_task_ids:
                 continue
             if str(task.id) in step1_handled_child_task_ids:
                 continue
@@ -2383,7 +2416,7 @@ def _run_cycle(
                     )
                     log.emit("START", f"{task.id} {task_type} \"{dry_run_prompt}\" [dry-run]")
                     started_task_ids.add(str(task.id))
-                    slots -= 1
+                    consume_pending_slot()
                     work_done = True
                     continue
                 no_progress_attention = _maybe_park_watch_no_progress(
@@ -2449,7 +2482,7 @@ def _run_cycle(
                     action_task=refreshed_pending_task,
                     failed_task=None,
                 )
-                slots -= 1
+                consume_pending_slot()
                 work_done = True
                 started_task_ids.add(str(task.id))
                 started_prompt = _format_prompt_for_width(
@@ -2468,7 +2501,7 @@ def _run_cycle(
                 )
                 log.emit("START", f"{task.id} {task_type} \"{dry_run_prompt}\" [dry-run]")
                 started_task_ids.add(str(task.id))
-                slots -= 1
+                consume_pending_slot()
                 work_done = True
                 continue
             no_progress_attention = _maybe_park_watch_no_progress(
@@ -2509,7 +2542,7 @@ def _run_cycle(
                 action_task=refreshed_pending_task,
                 failed_task=None,
             )
-            slots -= 1
+            consume_pending_slot()
             work_done = True
             started_task_ids.add(str(task.id))
             started_prompt = _format_prompt_for_width(
@@ -2540,13 +2573,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
     max_iterations = (
         args.max_iterations if args.max_iterations is not None else config.watch.max_iterations
     )
-    restart_failed = bool(getattr(args, "restart_failed", False))
+    recovery_mode = getattr(args, "recovery_mode", None)
+    if recovery_mode is None and getattr(args, "restart_failed", False):
+        recovery_mode = "recovery-only"
     auto_restart_on_drift = bool(getattr(args, "auto_restart_on_drift", True))
-    restart_failed_batch = (
-        args.restart_failed_batch
-        if getattr(args, "restart_failed_batch", None) is not None
-        else config.watch.restart_failed_batch
-    )
+    recovery_slots_arg = getattr(args, "recovery_slots", None)
+    if recovery_slots_arg is None:
+        recovery_slots_arg = getattr(args, "restart_failed_batch", None)
+    recovery_slots = recovery_slots_arg if recovery_slots_arg is not None else config.watch.recovery_slots
     max_recovery_attempts = (
         args.max_resume_attempts
         if getattr(args, "max_resume_attempts", None) is not None
@@ -2573,9 +2607,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if max_iterations < 1:
         print("Error: --max-iterations must be a positive integer")
         return 1
-    if restart_failed_batch < 1:
-        print("Error: --restart-failed-batch must be a positive integer")
+    if recovery_slots < 0:
+        print("Error: --recovery-slots must be a non-negative integer")
         return 1
+    if recovery_mode == "recovery-only":
+        recovery_slots = batch
+    elif recovery_mode == "pending-only":
+        recovery_slots = 0
     if max_recovery_attempts < 0:
         print("Error: --max-resume-attempts must be non-negative")
         return 1
@@ -2619,7 +2657,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         previous_snapshot = _task_snapshot(store)
 
         # Preview the first watch pass and ask for confirmation before executing
-        if restart_failed and dry_run:
+        if recovery_mode == "recovery-only" and dry_run:
             _emit_recovery_dry_run_report(
                 store=store,
                 tags=tag_filters,
@@ -2647,8 +2685,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 tags=tag_filters,
                 any_tag=any_tag,
-                restart_failed=restart_failed,
-                restart_failed_batch=restart_failed_batch,
+                recovery_slots=recovery_slots,
+                recovery_mode=recovery_mode,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
                 auto_restart_on_drift=auto_restart_on_drift,
@@ -2676,7 +2714,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 config=config,
                 log=log,
-                restart_failed_mode=restart_failed,
+                restart_failed_mode=recovery_mode == "recovery-only",
                 max_recovery_attempts=max_recovery_attempts,
             )
             previous_snapshot = pre_cycle_snapshot
@@ -2691,8 +2729,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 tags=tag_filters,
                 any_tag=any_tag,
-                restart_failed=restart_failed,
-                restart_failed_batch=restart_failed_batch,
+                recovery_slots=recovery_slots,
+                recovery_mode=recovery_mode,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
                 auto_restart_on_drift=auto_restart_on_drift,
@@ -2706,7 +2744,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 config=config,
                 log=log,
-                restart_failed_mode=restart_failed,
+                restart_failed_mode=recovery_mode == "recovery-only",
                 max_recovery_attempts=max_recovery_attempts,
             )
             completed_ids = _collect_completed_transition_ids(
@@ -2727,7 +2765,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 current_snapshot,
                 store=store,
                 max_recovery_attempts=max_recovery_attempts,
-                restart_failed_mode=restart_failed,
+                restart_failed_mode=recovery_mode == "recovery-only",
                 tags=tag_filters,
                 any_tag=any_tag,
             )

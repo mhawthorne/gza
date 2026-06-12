@@ -182,7 +182,7 @@ _INCOMPLETE_DEPRECATION_LINES: tuple[str, ...] = (
     "  `uv run gza unmerged` for unmerged code work",
     "  `uv run gza advance --unimplemented` for completed plan/explore work without implementation",
     "  `uv run gza history --status failed` for factual failed-task history",
-    "  `uv run gza watch --restart-failed --dry-run` for failed-task recovery decisions",
+    "  `uv run gza watch --recovery-only --dry-run` for failed-task recovery decisions",
     "  `uv run gza next` / `uv run gza next --all` for pending and blocked queue state",
     "  `/gza-summary` for synthesized operator triage and next-step guidance",
     "",

@@ -640,8 +640,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "uv run gza watch [options]" in watch_section
     assert "If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant" in iterate_section
     assert "The same manual-only warning path also applies when an older failed task is blocked by a newer failed recovery descendant" in iterate_section
-    assert "`uv run gza watch --restart-failed --dry-run` is the recovery inspection surface" in watch_section
-    assert "Plain `uv run gza watch` and `uv run gza watch --restart-failed` both use the same bounded shared recovery policy" in watch_section
+    assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in watch_section
+    assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to actionable failed-task recovery before pending pickup" in watch_section
     assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in watch_section
     assert "Only list recovery and pending lanes matching tag filters" in config_content
     assert "Only list pending tasks matching tag filters" not in config_content
@@ -658,8 +658,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
         "implement retries fork fresh, same-branch follow-ups stay on the shared branch |"
         in failed_tasks_content
     )
-    assert "| `uv run gza watch --restart-failed` | Drain actionable failed tasks before pending queue work, choosing `resume` or `retry` per task |" in failed_tasks_content
-    assert "`uv run gza watch --restart-failed` adds an explicit recovery phase ahead of normal pending work." in failed_tasks_content
+    assert "| `uv run gza watch --recovery-only` | Send the full watch batch to failed-task recovery, choosing `resume` or `retry` per task |" in failed_tasks_content
+    assert "`uv run gza watch` now has a built-in two-lane split." in failed_tasks_content
 
     for line in failed_tasks_content.splitlines():
         assert not line.lstrip().startswith("$ gza ")

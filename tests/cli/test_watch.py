@@ -23,6 +23,7 @@ from gza.cli.git_ops import (
     ensure_watch_main_checkout,
 )
 from gza.cli.watch import (
+    WatchSlotAllocation,
     _collect_advance_completed_tasks,
     _collect_completed_transition_ids,
     _collect_live_running_state,
@@ -46,6 +47,7 @@ from gza.cli.watch import (
     _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
     _WatchLog,
+    allocate_watch_slots,
     cmd_watch,
 )
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
@@ -843,11 +845,53 @@ def test_watch_cycle_default_auto_resume_prioritizes_oldest_created_failed_task(
     assert spawned_task.id == prepared_child_id
 
 
+@pytest.mark.parametrize(
+    (
+        "slots",
+        "recovery_slots_config",
+        "actionable_recovery_count",
+        "worker_consuming_recovery_count",
+        "pending_count",
+        "gate_pending_on_actionable_recovery",
+        "expected",
+    ),
+    [
+        (1, 1, 1, 1, 3, False, WatchSlotAllocation(recovery_slots=1, pending_slots=0)),
+        (5, 1, 1, 1, 7, False, WatchSlotAllocation(recovery_slots=1, pending_slots=4)),
+        (5, 0, 3, 3, 7, False, WatchSlotAllocation(recovery_slots=0, pending_slots=5)),
+        (3, 9, 4, 4, 2, False, WatchSlotAllocation(recovery_slots=3, pending_slots=0)),
+        (4, 1, 0, 0, 9, False, WatchSlotAllocation(recovery_slots=0, pending_slots=4)),
+        (1, 1, 1, 0, 1, True, WatchSlotAllocation(recovery_slots=0, pending_slots=0)),
+        (2, 2, 1, 0, 3, True, WatchSlotAllocation(recovery_slots=0, pending_slots=0)),
+    ],
+)
+def test_allocate_watch_slots(
+    slots: int,
+    recovery_slots_config: int,
+    actionable_recovery_count: int,
+    worker_consuming_recovery_count: int,
+    pending_count: int,
+    gate_pending_on_actionable_recovery: bool,
+    expected: WatchSlotAllocation,
+) -> None:
+    assert (
+        allocate_watch_slots(
+            slots=slots,
+            recovery_slots_config=recovery_slots_config,
+            actionable_recovery_count=actionable_recovery_count,
+            worker_consuming_recovery_count=worker_consuming_recovery_count,
+            pending_count=pending_count,
+            gate_pending_on_actionable_recovery=gate_pending_on_actionable_recovery,
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
-def test_watch_cycle_plain_mode_prioritizes_pending_over_actionable_failed_recovery(
+def test_watch_cycle_plain_mode_batch_one_defaults_to_recovery_first(
     tmp_path: Path, task_type: str
 ) -> None:
-    """Plain watch should launch pending work first when slots are saturated."""
+    """Plain watch should spend the single batch-1 slot on recovery before pending work."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -883,14 +927,17 @@ def test_watch_cycle_plain_mode_prioritizes_pending_over_actionable_failed_recov
         )
 
     assert result.work_done is True
-    assert spawn_resume.call_count == 0
-    assert spawn_iterate.call_count == 1
-    spawned_args = spawn_iterate.call_args.args[0]
-    spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_args.resume is False
-    assert spawned_task.id == pending_impl.id
+    assert spawn_resume.call_count + spawn_iterate.call_count == 1
+    if spawn_iterate.call_count == 1:
+        spawned_args = spawn_iterate.call_args.args[0]
+        spawned_task = spawn_iterate.call_args.args[2]
+        assert spawned_args.resume is False
+        prepared_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
+        assert isinstance(prepared_child_id, str)
+        assert spawned_task.id == prepared_child_id
+    assert store.get(pending_impl.id).status == "pending"
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert not any("RECOVR" in line and f"{failed.id} resume via" in line for line in log_text.splitlines())
+    assert any("RECOVR" in line and failed.id in line for line in log_text.splitlines())
 
 
 def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path: Path) -> None:
@@ -1194,9 +1241,9 @@ def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next
     assert len(pending_children) == 0
 
 
-def test_watch_cycle_default_mode_attempt_cap_skips_failed_resume_and_starts_pending(tmp_path: Path) -> None:
-    """Plain watch should leave capped failed chains alone and move on to pending work."""
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+def test_watch_cycle_default_mode_non_actionable_failed_row_starts_pending(tmp_path: Path) -> None:
+    """Plain watch should move on to pending work when the scoped failed row is not auto-recoverable."""
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 0\n")
     store = make_store(tmp_path)
 
     root = store.add("Failed root", task_type="implement", tags=("backlog",))
@@ -1898,51 +1945,8 @@ def test_watch_cycle_blocked_pending_recovery_child_waits_for_dependency_then_re
     assert len(store.get_based_on_children(failed.id)) == 1
 
 
-def test_watch_cycle_restart_failed_drains_failed_queue_before_pending_queue(tmp_path: Path) -> None:
-    """Pending work must not start while actionable failed tasks remain beyond restart_failed_batch."""
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    for idx in range(2):
-        failed = store.add(f"Failed implement {idx}", task_type="implement")
-        assert failed.id is not None
-        failed.status = "failed"
-        failed.failure_reason = "INFRASTRUCTURE_ERROR"
-        failed.completed_at = datetime.now(UTC)
-        store.update(failed)
-
-    pending_plan = store.add("Pending plan", task_type="plan")
-    assert pending_plan.id is not None
-
-    config = Config.load(tmp_path)
-    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
-
-    with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
-    ):
-        result = _run_cycle(
-            config=config,
-            store=store,
-            batch=4,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-            restart_failed=True,
-            restart_failed_batch=1,
-            max_recovery_attempts=config.max_resume_attempts,
-        )
-
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    assert spawn_worker.call_count == 0
-    assert store.get(pending_plan.id).status == "pending"
-
-
-def test_watch_cycle_pending_queue_starts_only_after_recovery_exhaustion(tmp_path: Path) -> None:
-    """Pending work should begin on a later watch pass only after recovery work is fully exhausted."""
+def test_watch_cycle_default_batch_launches_recovery_and_pending_in_same_pass(tmp_path: Path) -> None:
+    """Default watch should reserve one recovery slot and still start pending work in the same pass."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1965,37 +1969,291 @@ def test_watch_cycle_pending_queue_starts_only_after_recovery_exhaustion(tmp_pat
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result_first = _run_cycle(
+        result = _run_cycle(
             config=config,
             store=store,
-            batch=4,
+            batch=5,
             max_iterations=10,
             dry_run=False,
             log=log,
-            restart_failed=True,
-            restart_failed_batch=1,
-            max_recovery_attempts=config.max_resume_attempts,
-        )
-        recovery_child = store.get_based_on_children(failed.id)[0]
-        recovery_child.status = "completed"
-        store.update(recovery_child)
-        result_second = _run_cycle(
-            config=config,
-            store=store,
-            batch=4,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-            restart_failed=True,
-            restart_failed_batch=1,
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result_first.work_done is True
-    assert result_second.work_done is True
+    assert result.work_done is True
     assert spawn_iterate.call_count == 1
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+
+
+def test_watch_cycle_pending_only_mode_skips_recovery_and_runs_pending(tmp_path: Path) -> None:
+    """Pending-only mode should leave failed recovery untouched and spend all slots on pending work."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=4,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 0
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+    assert store.get_based_on_children(failed.id) == []
+
+
+def test_watch_cycle_pending_only_mode_skips_reconcile_recovery_and_runs_pending(tmp_path: Path) -> None:
+    """Pending-only mode should not execute direct reconcile recovery actions."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/pending-only-reconcile"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            side_effect=AssertionError("pending-only should not execute reconcile recovery"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+    log_text = log_path.read_text()
+    assert "RECOVR" not in log_text
+    assert "reconcile branch publication" not in log_text
+
+
+def test_watch_cycle_default_recovery_slot_caps_pending_implement_starts(tmp_path: Path) -> None:
+    """One actionable recovery with batch 3 should leave room for only two pending implement starts."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-recovery-slot-cap"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_impls = [store.add(f"Pending implement {index}", task_type="implement") for index in range(4)]
+    pending_ids = {task.id for task in pending_impls}
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 3
+    recovery_calls = [call for call in spawn_iterate.call_args_list if call.args[2].based_on == failed.id]
+    pending_calls = [call for call in spawn_iterate.call_args_list if call.args[2].id in pending_ids]
+    assert len(recovery_calls) == 1
+    assert len(pending_calls) == 2
+
+
+def test_watch_cycle_dry_run_caps_pending_implement_preview_to_allocated_slots(tmp_path: Path) -> None:
+    """Dry-run should preview only the pending implement starts allowed after recovery reservation."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-dry-run-cap"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_impls = [store.add(f"Pending implement {index}", task_type="implement") for index in range(4)]
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    start_lines = [line for line in log_lines if "START" in line and "[dry-run]" in line]
+    assert len(start_lines) == 2
+    assert any("RECOVR" in line and "[dry-run]" in line for line in log_lines)
+    assert any(str(pending_impls[0].id) in line for line in start_lines)
+    assert any(str(pending_impls[1].id) in line for line in start_lines)
+    assert all(str(pending_impls[2].id) not in line for line in start_lines)
+    assert all(str(pending_impls[3].id) not in line for line in start_lines)
+
+
+def test_watch_cycle_dry_run_caps_pending_nonimplement_preview_to_allocated_slots(tmp_path: Path) -> None:
+    """Dry-run should apply the same pending slot cap to non-implement queue previews."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-dry-run-plan-cap"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plans = [store.add(f"Pending plan {index}", task_type="plan") for index in range(4)]
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    start_lines = [line for line in log_lines if "START" in line and "[dry-run]" in line]
+    assert len(start_lines) == 2
+    assert any("RECOVR" in line and "[dry-run]" in line for line in log_lines)
+    assert any(str(pending_plans[0].id) in line for line in start_lines)
+    assert any(str(pending_plans[1].id) in line for line in start_lines)
+    assert all(str(pending_plans[2].id) not in line for line in start_lines)
+    assert all(str(pending_plans[3].id) not in line for line in start_lines)
+
+
+def test_watch_cycle_pending_only_dry_run_skips_reconcile_preview_and_shows_pending(tmp_path: Path) -> None:
+    """Pending-only dry-run should suppress reconcile preview while still previewing pending pickup."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/pending-only-dry-run-reconcile"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            side_effect=AssertionError("pending-only dry-run should not execute reconcile recovery"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            recovery_slots=0,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    start_lines = [line for line in log_lines if "START" in line and "[dry-run]" in line]
+    assert len(start_lines) == 1
+    assert str(pending_plan.id) in start_lines[0]
+    assert all("RECOVR" not in line for line in log_lines)
+    assert all("reconcile branch publication" not in line for line in log_lines)
 
 
 def test_watch_cycle_restart_failed_manual_failure_child_does_not_block_pending_queue(tmp_path: Path) -> None:
@@ -2264,7 +2522,7 @@ def test_watch_cycle_executes_branch_unpushable_reconcile_without_worker_slots(t
         result = _run_cycle(
             config=config,
             store=store,
-            batch=0,
+            batch=1,
             max_iterations=10,
             dry_run=False,
             log=log,
@@ -2281,6 +2539,139 @@ def test_watch_cycle_executes_branch_unpushable_reconcile_without_worker_slots(t
     assert "RECOVR" in text
     assert "reconcile branch publication" in text
     assert "REPAIR" in text
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "success_message"),
+    [
+        ("error", "Reconcile attempt failed", None),
+        ("skip", "Reconcile requires manual repair", None),
+        ("success", "Reconciled branch publication", "Reconciled branch publication"),
+    ],
+)
+def test_watch_cycle_direct_reconcile_does_not_block_pending_worker_slot(
+    tmp_path: Path,
+    status: str,
+    message: str,
+    success_message: str | None,
+) -> None:
+    """Direct reconcile recovery should not suppress pending pickup when no worker slot is consumed."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = f"feature/reconcile-pending-{status}"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="reconcile_branch_divergence",
+                status=status,
+                message=message,
+                success_message=success_message,
+                work_done=status == "success",
+                worker_consuming=False,
+            ),
+        ) as execute_action,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    execute_action.assert_called_once()
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+    log_text = log_path.read_text()
+    assert "START" in log_text
+    assert str(pending_plan.id) in log_text
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_watch_cycle_recovery_only_direct_reconcile_blocks_pending_pickup(
+    tmp_path: Path,
+    dry_run: bool,
+) -> None:
+    """Recovery-only watch should drain actionable direct recovery before pending pickup."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = f"feature/recovery-only-direct-reconcile-{dry_run}"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="reconcile_branch_divergence",
+                status="success",
+                message="Reconciled branch publication",
+                success_message="Reconciled branch publication",
+                work_done=True,
+                worker_consuming=False,
+            ),
+        ) as execute_action,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=dry_run,
+            log=log,
+            recovery_slots=1,
+            recovery_mode="recovery-only",
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    if dry_run:
+        execute_action.assert_not_called()
+    else:
+        execute_action.assert_called_once()
+    spawn_worker.assert_not_called()
+    log_text = log_path.read_text()
+    assert "RECOVR" in log_text
+    assert "START" not in log_text
+    assert str(pending_plan.id) not in log_text
 
 
 def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_consumed(tmp_path: Path) -> None:
@@ -2323,7 +2714,7 @@ def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_co
         first = _run_cycle(
             config=config,
             store=store,
-            batch=0,
+            batch=1,
             max_iterations=10,
             dry_run=False,
             log=log,
@@ -2333,7 +2724,7 @@ def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_co
         second = _run_cycle(
             config=config,
             store=store,
-            batch=0,
+            batch=1,
             max_iterations=10,
             dry_run=False,
             log=log,
@@ -2377,8 +2768,8 @@ def test_watch_cycle_branchless_pr_required_parks_without_reconcile_attempt(
         quiet=True,
         yes=True,
         group=None,
-        restart_failed=True,
-        restart_failed_batch=None,
+        recovery_mode="recovery-only",
+        recovery_slots=None,
         max_resume_attempts=None,
     )
 
@@ -2454,7 +2845,7 @@ def test_watch_cycle_reconcile_completes_failed_branch_unpushable_task(tmp_path:
         result = _run_cycle(
             config=config,
             store=store,
-            batch=0,
+            batch=1,
             max_iterations=10,
             dry_run=False,
             log=log,
@@ -2559,8 +2950,8 @@ def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Pa
     assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
 
 
-def test_watch_cycle_restart_failed_in_progress_recovery_child_blocks_pending_queue(tmp_path: Path) -> None:
-    """Restart-failed should wait while an existing recovery child is still in progress."""
+def test_watch_cycle_recovery_only_in_progress_recovery_child_does_not_block_pending_queue(tmp_path: Path) -> None:
+    """An in-progress recovery child should not suppress pending pickup on its own."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2601,8 +2992,9 @@ def test_watch_cycle_restart_failed_in_progress_recovery_child_blocks_pending_qu
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is False
-    assert spawn_worker.call_count == 0
+    assert result.work_done is True
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
 
 
 @pytest.mark.parametrize(
@@ -8480,8 +8872,8 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         poll=12,
         max_idle=60,
         max_iterations=7,
-        restart_failed=True,
-        restart_failed_batch=2,
+        recovery_mode="recovery-only",
+        recovery_slots=2,
         max_resume_attempts=4,
         dry_run=False,
         show_skipped=True,
@@ -8509,8 +8901,8 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         "60",
         "--max-iterations",
         "7",
-        "--restart-failed",
-        "--restart-failed-batch",
+        "--recovery-only",
+        "--recovery-slots",
         "2",
         "--max-resume-attempts",
         "4",
@@ -8628,8 +9020,8 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
         resumed_reexec=False,
         tags=["release"],
         any_tag=False,
-        restart_failed=True,
-        restart_failed_batch=1,
+        recovery_mode="recovery-only",
+        recovery_slots=1,
         max_resume_attempts=2,
         show_skipped=False,
         auto_restart_on_drift=True,
@@ -8672,8 +9064,8 @@ def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None
             "5",
             "--max-iterations",
             "10",
-            "--restart-failed",
-            "--restart-failed-batch",
+            "--recovery-only",
+            "--recovery-slots",
             "1",
             "--max-resume-attempts",
             "2",
@@ -11112,8 +11504,8 @@ def test_watch_cycle_quiet_logs_start_failed_when_recovery_iterate_spawn_fails(
     assert f"{failed.id} -> {child_id}: iterate worker spawn failed" in log_text
 
 
-def test_watch_cycle_restart_failed_queue_events_use_queue_label(tmp_path: Path) -> None:
-    """Restart-failed queue transitions should use QUEUE, not PHASE."""
+def test_watch_cycle_queue_events_use_queue_label(tmp_path: Path) -> None:
+    """Pending queue transitions should use QUEUE, not PHASE."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
     plan = store.add("Plan follow-up", task_type="plan")
@@ -11142,8 +11534,6 @@ def test_watch_cycle_restart_failed_queue_events_use_queue_label(tmp_path: Path)
     assert result.work_done is True
     log_lines = log_path.read_text().splitlines()
     queue_lines = [line for line in log_lines if line.split(maxsplit=2)[1] == "QUEUE"]
-    assert any("recovery queue enabled (--restart-failed)" in line for line in queue_lines)
-    assert any("recovery queue exhausted; switching to pending queue" in line for line in queue_lines)
     assert any("pending queue active" in line for line in queue_lines)
     assert not any(line.split(maxsplit=2)[1] == "PHASE" for line in log_lines)
 
