@@ -7,7 +7,7 @@ A long-running foreground loop that maintains a target number of concurrent work
 ## Motivation
 
 Today, running a sustained workload requires either:
-- Manual invocations: `gza advance --batch 5 --new`, wait, repeat
+- Manual invocations: `gza advance --batch 2 --new`, wait, repeat
 - Manually running `gza iterate` on individual implement tasks
 - Scripts wrapping gza in a `while true` loop
 
@@ -21,7 +21,7 @@ gza watch [--batch N] [--poll S] [--max-idle T] [--dry-run]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--batch N` | 5 | Target number of concurrent workers to maintain |
+| `--batch N` | 2 | Target number of concurrent workers to maintain |
 | `--poll S` | 300 | Seconds between polling cycles |
 | `--max-idle T` | (none) | Exit after T seconds of consecutive idle time (no flag = run forever) |
 | `--max-iterations N` | 10 | Max review/improve iterations for iterate mode on implement tasks |
@@ -33,7 +33,7 @@ Defaults can be set in `gza.yaml` so the CLI flags are optional:
 
 ```yaml
 watch:
-  batch: 5
+  batch: 2
   poll: 300
   max_idle: null
   max_iterations: 10

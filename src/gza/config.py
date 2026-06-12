@@ -81,7 +81,7 @@ DEFAULT_MAX_PLAN_SLICES: int | None = None
 DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES: int | None = None
 DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
 DEFAULT_MAX_CONCURRENT = 5
-DEFAULT_WATCH_BATCH = 5
+DEFAULT_WATCH_BATCH = 2
 DEFAULT_WATCH_POLL = 300
 DEFAULT_WATCH_NO_ACTIVITY_TIMEOUT = 60
 DEFAULT_WATCH_MAX_IDLE: int | None = None
@@ -1907,8 +1907,10 @@ class Config:
             max_concurrent = _load_strict_int_field(data, "max_concurrent", DEFAULT_MAX_CONCURRENT)
             if max_concurrent <= 0:
                 raise ConfigError("'max_concurrent' must be positive")
-        else:
+        elif "batch" in watch_data:
             max_concurrent = watch_batch
+        else:
+            max_concurrent = DEFAULT_MAX_CONCURRENT
         try:
             watch_poll = int(watch_data.get("poll", DEFAULT_WATCH_POLL))
         except (TypeError, ValueError):

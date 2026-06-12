@@ -619,6 +619,7 @@ class TestHelpOutput:
         result = run_gza("watch", "--help", "--project", str(tmp_path))
         assert result.returncode == 0
         text = " ".join(result.stdout.split())
+        assert "default: watch.batch or 2" in text
         assert "--recovery-slots" in text
         assert "--recovery-only" in text
         assert "--pending-only" in text
@@ -653,6 +654,14 @@ class TestHelpOutput:
         assert "Print the recovery decision report and exit" in failed_tasks_docs
         assert "--show-skipped" in failed_tasks_docs
         assert "`--max-resume-attempts` controls that shared policy as a toggle" in failed_tasks_docs
+
+    def test_watch_docs_distinguish_watch_batch_from_global_max_concurrent_fallback(self, tmp_path):
+        """watch docs should explain that only an explicit watch.batch changes the global fallback cap."""
+        setup_config(tmp_path)
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "when `max_concurrent` is unset, an explicitly configured `watch.batch` also becomes the global cap" in docs_text
+        assert "otherwise the fallback global cap remains `5`" in docs_text
 
     def test_watch_help_and_docs_describe_next_pass_drift_restart(self, tmp_path):
         """watch help/docs should describe next-pass drift restart without drain gating."""

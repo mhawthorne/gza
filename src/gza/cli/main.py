@@ -779,7 +779,7 @@ def main() -> int:
         "--batch",
         type=int,
         metavar="N",
-        help="Target number of concurrent workers to maintain, capped by max_concurrent (default: watch.batch or 5)",
+        help="Target number of concurrent workers to maintain, capped by max_concurrent (default: watch.batch or 2)",
     )
     watch_parser.add_argument(
         "--poll",

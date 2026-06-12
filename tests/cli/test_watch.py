@@ -1945,8 +1945,8 @@ def test_watch_cycle_blocked_pending_recovery_child_waits_for_dependency_then_re
     assert len(store.get_based_on_children(failed.id)) == 1
 
 
-def test_watch_cycle_default_batch_launches_recovery_and_pending_in_same_pass(tmp_path: Path) -> None:
-    """Default watch should reserve one recovery slot and still start pending work in the same pass."""
+def test_watch_cycle_two_slot_batch_launches_recovery_and_pending_in_same_pass(tmp_path: Path) -> None:
+    """A two-slot pass should launch one recovery and one pending task together."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1972,7 +1972,7 @@ def test_watch_cycle_default_batch_launches_recovery_and_pending_in_same_pass(tm
         result = _run_cycle(
             config=config,
             store=store,
-            batch=5,
+            batch=2,
             max_iterations=10,
             dry_run=False,
             log=log,
@@ -1980,6 +1980,58 @@ def test_watch_cycle_default_batch_launches_recovery_and_pending_in_same_pass(tm
         )
 
     assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+
+
+def test_cmd_watch_without_explicit_batch_uses_default_capacity_for_recovery_and_pending(
+    tmp_path: Path,
+) -> None:
+    """Plain watch with omitted --batch should still launch recovery and pending work in the same pass."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=None,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    def run_real_cycle_once_then_idle(**kwargs):
+        if not hasattr(run_real_cycle_once_then_idle, "seen"):
+            run_real_cycle_once_then_idle.seen = True  # type: ignore[attr-defined]
+            return _run_cycle(**kwargs)
+        return _CycleResult(work_done=False, running=0, pending=0)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._run_cycle", side_effect=run_real_cycle_once_then_idle),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
     assert spawn_iterate.call_count == 1
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id

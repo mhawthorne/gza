@@ -1501,7 +1501,11 @@ class TestLocalConfigOverrides:
         assert "Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is pending-only." in result.stdout
         assert "Deprecated alias for `watch.recovery_slots`." in result.stdout
         assert "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`." in result.stdout
-        assert "Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`." in result.stdout
+        assert (
+            "Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5`."
+            in result.stdout
+        )
+        assert "explicit watch.batch or 5" in result.stdout
         assert (
             "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
             in result.stdout
@@ -1534,30 +1538,20 @@ class TestLocalConfigOverrides:
         assert result.returncode == 0
         payload = json.loads(result.stdout)
         keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
-        assert keyed_entries["watch.recovery_slots"]["default"] == 1
-        assert keyed_entries["watch.restart_failed_batch"]["default"] == 1
-        assert keyed_entries["watch.no_activity_timeout"]["default"] == 60
-        assert keyed_entries["max_concurrent"]["default"] == "watch.batch or 5"
-        assert (
-            keyed_entries["watch.recovery_slots"]["description"]
-            == "Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is pending-only."
-        )
-        assert (
-            keyed_entries["watch.restart_failed_batch"]["description"]
-            == "Deprecated alias for `watch.recovery_slots`."
-        )
-        assert (
-            keyed_entries["watch.no_activity_timeout"]["description"]
-            == "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`."
-        )
-        assert (
-            keyed_entries["max_concurrent"]["description"]
-            == "Hard global ceiling on concurrently running task-executing processes across all commands. Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`."
-        )
-        assert (
-            keyed_entries["max_resume_attempts"]["description"]
-            == "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
-        )
+        assert keyed_entries["watch.batch"]["type"] == "int"
+        assert keyed_entries["watch.recovery_slots"]["type"] == "int"
+        assert keyed_entries["watch.restart_failed_batch"]["type"] == "int"
+        assert keyed_entries["watch.no_activity_timeout"]["type"] == "int"
+        assert keyed_entries["max_concurrent"]["type"] == "int"
+        assert keyed_entries["max_concurrent"]["default"] == "explicit watch.batch or 5"
+        assert "Default concurrent worker target" in keyed_entries["watch.batch"]["description"]
+        assert "reserved for failed-task recovery" in keyed_entries["watch.recovery_slots"]["description"]
+        assert "pending-only" in keyed_entries["watch.recovery_slots"]["description"]
+        assert "Deprecated alias" in keyed_entries["watch.restart_failed_batch"]["description"]
+        assert "live-but-silent worker" in keyed_entries["watch.no_activity_timeout"]["description"]
+        assert "explicitly configured `watch.batch` becomes the cap" in keyed_entries["max_concurrent"]["description"]
+        assert "fallback remains `5`" in keyed_entries["max_concurrent"]["description"]
+        assert "fixed bounded resume/retry policy" in keyed_entries["max_resume_attempts"]["description"]
 
     def test_config_example_stdout_matches_committed_full_example(self, tmp_path: Path):
         """`gza config example` should render the committed full example artifact."""
@@ -1600,6 +1594,9 @@ class TestLocalConfigOverrides:
 
         assert rendered.returncode == 0
         assert '"watch.batch or 5"' not in rendered.stdout
+        assert '"explicit watch.batch or 5"' not in rendered.stdout
+        assert "# Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the" in rendered.stdout
+        assert "# cap; if `watch.batch` is omitted, the fallback remains `5`." in rendered.stdout
         assert "# max_concurrent: 5" in rendered.stdout
         assert rendered.stdout == Path(f"src/gza/{artifact_name}").read_text(encoding="utf-8")
 
@@ -4406,13 +4403,13 @@ class TestWatchConfigValidation:
         assert config.watch.batch == 7
         assert config.max_concurrent == 7
 
-    def test_config_max_concurrent_defaults_to_five_when_both_fields_are_unset(self, tmp_path: Path) -> None:
-        """Absent max_concurrent and watch.batch should preserve the legacy default of 5."""
+    def test_config_max_concurrent_defaults_to_global_fallback_when_watch_batch_omitted(self, tmp_path: Path) -> None:
+        """Absent max_concurrent and watch.batch should keep the global fallback cap."""
         from gza.config import Config
 
-        self._write_config(tmp_path, "")
+        self._write_config(tmp_path, "watch:\n  poll: 45\n")
         config = Config.load(tmp_path)
-        assert config.watch.batch == 5
+        assert config.watch.batch == 2
         assert config.max_concurrent == 5
 
     def test_config_explicit_max_concurrent_overrides_watch_batch(self, tmp_path: Path) -> None:

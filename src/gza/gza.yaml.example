@@ -328,8 +328,8 @@ project_name: my-project
 
 # watch:
 #   Default concurrent worker target for `gza watch`.
-#   Default: 5
-#   batch: 5
+#   Default: 2
+#   batch: 2
 #   Initial cooldown after a non-auto-resumable watch failure.
 #   Default: 60
 #   failure_backoff_initial: 60
@@ -417,6 +417,7 @@ project_name: my-project
 # --- Other ---
 
 # Hard global ceiling on concurrently running task-executing processes across all commands.
-# Explicit `max_concurrent` wins; otherwise Gza uses `watch.batch`, then `5`.
-# Default: watch.batch or 5
+# Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the
+# cap; if `watch.batch` is omitted, the fallback remains `5`.
+# Default: explicit watch.batch or 5
 # max_concurrent: 5
