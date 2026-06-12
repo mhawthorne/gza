@@ -16,7 +16,8 @@ What's missing is a single command that **continuously maintains N concurrent wo
 ## Command
 
 ```bash
-gza watch [--batch N] [--poll S] [--max-idle T] [--dry-run]
+gza watch [--batch N] [--poll S] [--max-idle T] [--max-iterations N] \
+  [--recovery-slots N | --recovery-only | --pending-only] [--dry-run]
 ```
 
 | Flag | Default | Description |
@@ -25,7 +26,13 @@ gza watch [--batch N] [--poll S] [--max-idle T] [--dry-run]
 | `--poll S` | 300 | Seconds between polling cycles |
 | `--max-idle T` | (none) | Exit after T seconds of consecutive idle time (no flag = run forever) |
 | `--max-iterations N` | 10 | Max review/improve iterations for iterate mode on implement tasks |
+| `--recovery-slots N` | 1 | Slots per cycle reserved for actionable failed-task recovery before pending pickup |
+| `--recovery-only` | false | Preset: dedicate the full batch to failed-task recovery and suppress pending pickup until actionable recovery drains |
+| `--pending-only` | false | Preset: disable failed-task recovery and use all slots for pending work |
 | `--dry-run` | false | Show what each cycle would do without executing |
+
+Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to
+`--recovery-only`, and `--restart-failed-batch N` maps to `--recovery-slots N`.
 
 ### Config
 
@@ -37,9 +44,14 @@ watch:
   poll: 300
   max_idle: null
   max_iterations: 10
+  recovery_slots: 1
 ```
 
-CLI flags override config values.
+CLI flags override config values. `watch.restart_failed_batch` remains a deprecated
+compatibility alias for `watch.recovery_slots`.
+
+For the prescriptive runtime contract, including the exact recovery-lane gating rules,
+see [../behavior/watch-supervisor.md](../behavior/watch-supervisor.md).
 
 ## Core Loop
 
@@ -50,9 +62,9 @@ while True:
 
     if slots > 0:
         # 1. Merge anything that's ready (merges don't consume a slot)
-        # 2. Resume timeout/max-turns failures (consumes a slot)
-        # 3. Spawn iterate workers for pending implement tasks (consumes a slot)
-        # 4. Spawn plain workers for pending plan/explore tasks (consumes a slot)
+        # 2. Allocate worker slots between recovery and pending lanes
+        # 3. Run actionable failed-task recovery in the recovery lane
+        # 4. Spawn pending work in the remaining slots
         fill_slots(slots)
 
     if no_work_done_this_cycle:
@@ -80,9 +92,11 @@ When slots are available, fill them in this priority order:
 
 1. **Merges** — merge completed tasks that are ready. Merges don't consume a slot (they're synchronous and fast). This runs first so that newly freed branches don't cause rebase conflicts for other tasks.
 
-2. **Resume failed tasks** — tasks that failed with `MAX_TURNS`, `MAX_STEPS`, or `TEST_FAILURE` and have a session_id. Each resume consumes a slot. Respects `max_resume_attempts` config. Only resume tasks where the failure reason indicates a timeout/resource limit. Leave `KILLED`, `WORKER_DIED`, `UNKNOWN` failures alone — those need human attention.
+2. **Allocate recovery vs pending lanes** — worker-consuming failed-task recovery is no longer "whatever slots are left after pending pickup." Each cycle reserves `min(slots, recovery_slots, worker_consuming_recovery_count)` worker slots for the recovery lane and gives the remainder to pending work. With the default `recovery_slots: 1`, plain watch always gives worker-consuming recovery first claim on one worker slot per cycle when an in-scope worker-consuming recovery action exists. This rule is uniform: at `--batch 1`, the default plain watch becomes recovery-first until the worker-consuming recovery lane drains. Operators who want a single-slot pending-only loop must opt into `--pending-only`.
 
-3. **Start new pending tasks** — pull from the pending queue (ordered by urgent flag, then insertion order). For implement tasks, spawn in **iterate mode** with `--max-iterations` so the worker does the full review/improve loop autonomously. For plan/explore tasks, spawn as plain workers (no iterate).
+3. **Run failed-task recovery** — the recovery lane uses the shared recovery engine, so eligibility is not limited to timeout/resource resumes. Actionable recovery may include `resume`, `retry`, or direct reconcile-style handling for failed tasks such as `WORKER_DIED`, depending on the shared policy. Direct reconcile-style recovery remains actionable for mode gating even when it does not spend a worker slot in plain watch. `--recovery-only` is the `recovery_slots = batch` extreme and suppresses pending pickup while any actionable in-scope recovery remains, including direct actions that do not themselves consume a worker slot.
+
+4. **Start new pending tasks** — pull from the pending queue (ordered by urgent flag, then insertion order) only after the recovery lane has taken its reserved share for the cycle. For implement tasks, spawn in **iterate mode** with `--max-iterations` so the worker does the full review/improve loop autonomously. For plan/explore tasks, spawn as plain workers (no iterate).
 
 ### Iterate mode for implement tasks
 

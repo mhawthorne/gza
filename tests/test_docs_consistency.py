@@ -90,6 +90,16 @@ def test_behavior_specs_cross_link_watch_supervisor_boundary() -> None:
     assert "Installed-code drift triggers re-exec at the next" in supervisor
 
 
+def test_watch_feature_spec_distinguishes_worker_consuming_capacity_from_direct_recovery() -> None:
+    """Feature spec should match the watch scheduler contract for recovery slot usage."""
+    repo_root = Path(__file__).resolve().parents[1]
+    feature_spec = (repo_root / "specs" / "features" / "watch-loop.md").read_text()
+
+    assert "min(slots, recovery_slots, worker_consuming_recovery_count)" in feature_spec
+    assert "Direct reconcile-style recovery remains actionable for mode gating even when it does not spend a worker slot in plain watch." in feature_spec
+    assert "min(slots, recovery_slots, actionable_recovery_count)" not in feature_spec
+
+
 def test_practices_document_gitignored_derived_artifacts_as_non_blockers() -> None:
     """Internal practices should forbid review blockers on gitignored installed artifacts."""
     repo_root = Path(__file__).resolve().parents[1]
