@@ -100,7 +100,10 @@ Produce a concise report with:
 - Reference existing gza commands to continue workflow:
   - `uv run gza show <TASK_ID>`
   - `uv run gza log <TASK_ID>`
-  - `uv run gza implement <TASK_ID> [--review] "..."`
+  - For a `Go` recommendation, or if the operator wants to proceed despite prior concerns, use AskUserQuestion before giving the implement command:
+    - Ask which tag(s) to attach with repeatable `--tag`; suggest inheriting the plan task's existing tags by default.
+    - Ask whether this implement task should pass `--pr` to auto-create or reuse a GitHub PR after completion.
+    - Thread the answers into the final queued command, for example: `uv run gza implement -q <TASK_ID> --tag <tag> [--pr]`
   - `uv run gza add --type plan "..."` (for remediation planning)
 
 ## Output template

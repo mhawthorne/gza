@@ -762,6 +762,28 @@ class TestSkillContentValidation:
         assert "supports `42` or `#42`" not in content
         assert "strip the leading `#`" not in content
 
+    def test_gza_plan_review_go_path_defaults_to_queued_implement(self):
+        """gza-plan-review should point go-path follow-up actions to queued implement."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-plan-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "uv run gza implement -q <TASK_ID>" in content
+        assert 'uv run gza implement <TASK_ID> [--review] "..."' not in content
+
+    def test_gza_plan_review_go_path_collects_tags_and_pr_requirement(self):
+        """gza-plan-review should ask about tags and PR requirement before suggesting implement."""
+        from gza.skills_utils import get_skills_source_path
+
+        skill_file = get_skills_source_path() / "gza-plan-review" / "SKILL.md"
+        content = skill_file.read_text()
+
+        assert "use AskUserQuestion before giving the implement command" in content
+        assert "suggest inheriting the plan task's existing tags by default" in content
+        assert "Ask whether this implement task should pass `--pr`" in content
+        assert "uv run gza implement -q <TASK_ID> --tag <tag> [--pr]" in content
+
     def test_gza_explore_summarize_requires_full_prefixed_task_id(self):
         """gza-explore-summarize should require full prefixed IDs instead of numeric shorthand."""
         from gza.skills_utils import get_skills_source_path
