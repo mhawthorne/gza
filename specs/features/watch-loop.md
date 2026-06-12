@@ -26,7 +26,7 @@ gza watch [--batch N] [--poll S] [--max-idle T] [--max-iterations N] \
 | `--poll S` | 300 | Seconds between polling cycles |
 | `--max-idle T` | (none) | Exit after T seconds of consecutive idle time (no flag = run forever) |
 | `--max-iterations N` | 10 | Max review/improve iterations for iterate mode on implement tasks |
-| `--recovery-slots N` | 1 | Slots per cycle reserved for actionable failed-task recovery before pending pickup |
+| `--recovery-slots N` | 1 | Slots per cycle reserved for worker-consuming failed-task recovery before pending pickup |
 | `--recovery-only` | false | Preset: dedicate the full batch to failed-task recovery and suppress pending pickup until actionable recovery drains |
 | `--pending-only` | false | Preset: disable failed-task recovery and use all slots for pending work |
 | `--dry-run` | false | Show what each cycle would do without executing |

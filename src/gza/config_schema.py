@@ -196,7 +196,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "watch.recovery_slots",
         "int",
         1,
-        "Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is pending-only.",
+        "Slots per `gza watch` pass reserved for worker-consuming failed-task recovery before pending pickup; `0` is pending-only.",
     ),
     ConfigKeySpec(
         "watch.restart_failed_batch",

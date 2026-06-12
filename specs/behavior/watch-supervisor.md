@@ -245,7 +245,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.poll` | Delay between completed cycles |
 | `watch.max_idle` | Consecutive idle loop time before clean exit |
 | `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch |
-| `watch.recovery_slots` | Slots per cycle reserved for failed-task recovery before pending pickup |
+| `watch.recovery_slots` | Slots per cycle reserved for worker-consuming failed-task recovery before pending pickup |
 | `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |

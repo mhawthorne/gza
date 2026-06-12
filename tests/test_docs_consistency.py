@@ -96,6 +96,11 @@ def test_watch_feature_spec_distinguishes_worker_consuming_capacity_from_direct_
     feature_spec = (repo_root / "specs" / "features" / "watch-loop.md").read_text()
 
     assert "min(slots, recovery_slots, worker_consuming_recovery_count)" in feature_spec
+    assert (
+        "| `--recovery-slots N` | 1 | Slots per cy"
+        "cle reserved for worker-consuming failed-task recovery before pending pickup |"
+        in feature_spec
+    )
     assert "Direct reconcile-style recovery remains actionable for mode gating even when it does not spend a worker slot in plain watch." in feature_spec
     assert "min(slots, recovery_slots, actionable_recovery_count)" not in feature_spec
 
@@ -651,7 +656,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant" in iterate_section
     assert "The same manual-only warning path also applies when an older failed task is blocked by a newer failed recovery descendant" in iterate_section
     assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in watch_section
-    assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to actionable failed-task recovery before pending pickup" in watch_section
+    assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup" in watch_section
+    assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
     assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in watch_section
     assert "Only list recovery and pending lanes matching tag filters" in config_content
     assert "Only list pending tasks matching tag filters" not in config_content

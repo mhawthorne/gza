@@ -806,7 +806,7 @@ def main() -> int:
         type=int,
         metavar="N",
         dest="recovery_slots",
-        help="Slots per watch pass reserved for failed-task recovery before pending pickup (default: watch.recovery_slots or 1)",
+        help="Slots per watch pass reserved for worker-consuming failed-task recovery before pending pickup (default: watch.recovery_slots or 1)",
     )
     watch_recovery_mode = watch_parser.add_mutually_exclusive_group()
     watch_recovery_mode.add_argument(

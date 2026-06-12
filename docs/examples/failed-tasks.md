@@ -97,7 +97,7 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 ## Recover failed tasks with watch
 
-`uv run gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for actionable failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `uv run gza watch --recovery-only` to dedicate the full batch to failed-task recovery, or `uv run gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
+`uv run gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for worker-consuming failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `uv run gza watch --recovery-only` to dedicate the full batch to failed-task recovery, or `uv run gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
 
 Preview the recovery plan first:
 

@@ -354,8 +354,8 @@ project_name: my-project
 #   Polling interval seconds for `gza watch`.
 #   Default: 300
 #   poll: 300
-#   Slots per `gza watch` pass reserved for failed-task recovery before pending pickup; `0` is
-#   pending-only.
+#   Slots per `gza watch` pass reserved for worker-consuming failed-task recovery before pending
+#   pickup; `0` is pending-only.
 #   Default: 1
 #   recovery_slots: 1
 #   Deprecated alias for `watch.recovery_slots`.

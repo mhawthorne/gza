@@ -722,7 +722,7 @@ class TestHelpOutput:
         failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
         internal_docs = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
 
-        assert "reserved for failed-task recovery before pending pickup" in help_text
+        assert "reserved for worker-consuming failed-task recovery before pending pickup" in help_text
         assert "default `watch.recovery_slots = 1`" in docs_text
         assert "`uv run gza watch --recovery-only`" in failed_tasks_docs
         assert "`watch.recovery_slots`" in internal_docs
