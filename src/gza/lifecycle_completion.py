@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .db import Task
 
-TERMINAL_MERGE_STATES = frozenset({"merged", "empty"})
+TERMINAL_MERGE_STATES = frozenset({"merged", "empty", "redundant"})
 
 
 def merge_state_is_terminal_for_lifecycle(merge_state: str | None) -> bool:
@@ -44,7 +44,7 @@ def should_auto_create_review_for_completed_code_task(
         return True
     if not task.has_commits:
         return False
-    if merge_state == "empty":
+    if merge_state in {"empty", "redundant"}:
         return False
     return True
 
@@ -62,7 +62,7 @@ def auto_review_skip_message_for_completed_code_task(
             f"Skipping auto-review for {task.id}: "
             "completed with no task commits; nothing to review."
         )
-    if merge_state == "empty":
+    if merge_state in {"empty", "redundant"}:
         return (
             f"Skipping auto-review for {task.id}: "
             "no unique commits vs target (nothing to review)."

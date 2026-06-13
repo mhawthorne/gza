@@ -110,7 +110,7 @@ def task_satisfies_merge_dependency(
 
     if merge_state == "merged":
         return True
-    if merge_state == "empty":
+    if merge_state in {"empty", "redundant"}:
         return empty_prereq_satisfies_dependency(store, prereq, dependent)
     return False
 
@@ -291,7 +291,7 @@ def _resolved_dependency_lineage_satisfies_task_readiness(
         return task_satisfies_merge_dependency(store, resolved_dep, dependent, read_context=read_context)
     if merge_unit.state == "merged":
         return True
-    if merge_unit.state == "empty":
+    if merge_unit.state in {"empty", "redundant"}:
         prereq = merge_resolution.attached_task or direct_dep
         return empty_prereq_satisfies_dependency(store, prereq, dependent)
     return False

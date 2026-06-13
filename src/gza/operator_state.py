@@ -17,7 +17,12 @@ EMPTY_PREREQ_RELEASE_VALVE_DETAIL = (
     "empty prerequisite; manual release tracked by "
     "gza-4072 / `gza edit --clear-depends-on`"
 )
+REDUNDANT_PREREQ_RELEASE_VALVE_DETAIL = (
+    "redundant prerequisite; commits already present on target; manual release tracked by "
+    "gza-4072 / `gza edit --clear-depends-on`"
+)
 MOOT_EMPTY_LIFECYCLE_DETAIL = "moot (no unique commits vs target)"
+MOOT_REDUNDANT_LIFECYCLE_DETAIL = "moot (commits already present on target)"
 
 
 @dataclass(frozen=True)
@@ -26,6 +31,13 @@ class EmptyMergeUnitLookup:
 
     is_empty: bool
     warning: str | None = None
+
+
+def effective_no_work_merge_state(task: DbTask, raw_state: str | None) -> str | None:
+    """Return the operator-effective no-work state for legacy empty rows."""
+    if raw_state == "empty" and task.has_commits is True:
+        return "redundant"
+    return raw_state
 
 
 def blocked_by_empty_prereq_label(
@@ -42,7 +54,17 @@ def blocked_by_empty_prereq_label(
         return None
     if resolved_dependency_satisfies_task_readiness(store, dep, task, read_context=read_context):
         return None
-    return f"blocked by {dep.id} ({EMPTY_PREREQ_RELEASE_VALVE_DETAIL})"
+    unit = (
+        read_context.resolve_merge_unit_for_task(dep.id)
+        if read_context is not None
+        else store.resolve_merge_unit_for_task(dep.id)
+    )
+    detail = (
+        REDUNDANT_PREREQ_RELEASE_VALVE_DETAIL
+        if unit is not None and effective_no_work_merge_state(dep, unit.state) == "redundant"
+        else EMPTY_PREREQ_RELEASE_VALVE_DETAIL
+    )
+    return f"blocked by {dep.id} ({detail})"
 
 
 def blocked_by_awaiting_plan_review_label(
@@ -104,7 +126,7 @@ def _resolve_empty_prereq_candidate(
             if read_context is not None
             else store.resolve_merge_unit_for_task(dep.id)
         )
-        if unit is not None and unit.state == "empty":
+        if unit is not None and effective_no_work_merge_state(dep, unit.state) in {"empty", "redundant"}:
             return dep
 
     dep = read_context.resolve_dependency_completion(task) if read_context is not None else store.resolve_dependency_completion(task)
@@ -115,16 +137,23 @@ def _resolve_empty_prereq_candidate(
         if read_context is not None
         else store.resolve_merge_unit_for_task(dep.id)
     )
-    if unit is None or unit.state != "empty":
+    if unit is None or effective_no_work_merge_state(dep, unit.state) not in {"empty", "redundant"}:
         return None
     return dep
 
 
-def moot_empty_lifecycle_detail(merge_state: str | None) -> str | None:
-    """Return the lifecycle label for operator surfaces when a row is empty."""
+def terminal_no_work_lifecycle_detail(merge_state: str | None) -> str | None:
+    """Return the lifecycle label for terminal no-work operator surfaces."""
     if merge_state == "empty":
         return MOOT_EMPTY_LIFECYCLE_DETAIL
+    if merge_state == "redundant":
+        return MOOT_REDUNDANT_LIFECYCLE_DETAIL
     return None
+
+
+def moot_empty_lifecycle_detail(merge_state: str | None) -> str | None:
+    """Compatibility wrapper for callers that render no-work lifecycle details."""
+    return terminal_no_work_lifecycle_detail(merge_state)
 
 
 def inspect_empty_merge_unit(
@@ -142,4 +171,6 @@ def inspect_empty_merge_unit(
             is_empty=False,
             warning=f"empty/moot merge-unit lookup unavailable: {detail}",
         )
-    return EmptyMergeUnitLookup(is_empty=unit is not None and unit.state == "empty")
+    return EmptyMergeUnitLookup(
+        is_empty=unit is not None and effective_no_work_merge_state(task, unit.state) in {"empty", "redundant"}
+    )

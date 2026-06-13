@@ -220,36 +220,38 @@ Failed tasks are evaluated by the same ordered engine, through one shared recove
 - Recovery limit reached, ambiguous, or a terminal manual situation (e.g. failed resume
   descendants, dropped recovery terminal) → `needs_discussion` / manual review (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariants 2 and 6).
-- Before treating merge-unit state `empty` as a terminal "nothing left to do" outcome,
-  the engine MUST apply the shared empty-recovery predicate from
-  [recovery.md](recovery.md). A failed task with an `empty` merge unit but recoverable
-  session-backed execution evidence MUST continue through recovery instead of being
-  suppressed as moot.
+- Before treating merge-unit state `empty` or `redundant` as a terminal "nothing left to
+  do" outcome for a failed task, the engine MUST apply the shared recovery predicate from
+  [recovery.md](recovery.md). A failed task with terminal no-work merge state but
+  recoverable session-backed execution evidence MUST continue through recovery instead of
+  being suppressed as moot.
 - A failed task whose work has *already landed* by an independent valid path — a completed
   recovery descendant, or a merged sibling/lineage member that actually contributed the commits —
   MUST be omitted silently; there is nothing to recover. **Branch reachability from the target is
   not, by itself, proof of landing.** A branch is a landed representative only if it contributed
   **at least one commit that is now contained in the target**. A branch whose tip is merely an
-  ancestor of the target with **no unique commits is `empty`, not landed** — it represents the
-  absence of work, and MUST be routed through the shared empty-recovery predicate
-  ([recovery.md](recovery.md) §1), never silently omitted by this clause.
+  ancestor of the target with **no unique commits** is split by task provenance: no task
+  commits means `empty`; task commits already represented on target means `redundant`.
+  Neither state is landed by itself, and both MUST be routed through the shared recovery
+  predicate ([recovery.md](recovery.md) §1), never silently omitted by this clause.
 
 For any failed task with a recoverable failure — timeout-style resumable failures *and* retryable
 failures (e.g. `WORKER_DIED`) alike — the engine MUST prefer the shared recovery decision
 (`resume`, `retry`, bounded retry, or manual stop) **before any reachability- or merge-style
 suppression**. The "already landed" exception only applies when the work landed by an independent
 valid path, such as a completed recovery descendant or a different merged lineage member that
-contributed commits. The same failed task being reachable-from-target, marked merged, or `empty`
-on its own MUST never satisfy that exception.
+contributed commits. The same failed task being reachable-from-target, marked merged, `empty`,
+or `redundant` on its own MUST never satisfy that exception.
 
 Recovery and lifecycle progress are independent: a unit that carries both a recovered
 failure *and* actionable merge/review work remains eligible for the latter.
 
 ### §8 — Merge
 
-- A completed `implement` task with no task commits, or with merge-unit state `empty`,
-  is terminal moot: it MUST NOT create, run, wait on, or require a review, and it MUST
-  remain absent from actionable `unmerged` and lifecycle-`incomplete` surfaces.
+- A completed `implement` task with no task commits, or with merge-unit state `empty` or
+  `redundant`, is terminal moot: it MUST NOT create, run, wait on, or require a review,
+  and it MUST remain absent from actionable `unmerged` and lifecycle-`incomplete`
+  surfaces.
 - Reviews all cleared/addressed, with no newer rebase or closing-review requirement
   invalidating that state → `merge`.
 - A non-implementation unit, or a unit that does not require review → `merge`.
@@ -269,8 +271,9 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `unmerged`.
 
 Note: the "implementation unit with no review" rule above applies only when the
-implementation still has reviewable commits or diff against the target. Terminal empty
-implementations are covered by the moot rule and do not require review creation.
+implementation still has reviewable commits or diff against the target. Terminal
+empty/redundant implementations are covered by the moot rule and do not require review
+creation.
 
 ### §9 — PR publication for completed code tasks
 

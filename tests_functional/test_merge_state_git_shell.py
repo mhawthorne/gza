@@ -10,11 +10,11 @@ from gza.merge_state import resolve_task_merge_state_for_target
 from tests_functional.git_helpers import init_basic_repo
 
 
-def _make_completed_task(store: SqliteTaskStore, *, branch: str) -> object:
+def _make_completed_task(store: SqliteTaskStore, *, branch: str, has_commits: bool = True) -> object:
     task = store.add(f"Task for {branch}", task_type="implement")
     task.status = "completed"
     task.completed_at = datetime.now(UTC)
-    task.has_commits = True
+    task.has_commits = has_commits
     task.branch = branch
     store.update(task)
     return task
@@ -26,7 +26,7 @@ def test_resolve_task_merge_state_empty_branch_real_git_repo(tmp_path: Path) -> 
 
     git._run("checkout", "-b", "feature/empty")
     git._run("checkout", "main")
-    task = _make_completed_task(store, branch="feature/empty")
+    task = _make_completed_task(store, branch="feature/empty", has_commits=False)
 
     assert resolve_task_merge_state_for_target(
         store=store,
@@ -50,7 +50,7 @@ def test_resolve_task_merge_state_stale_empty_branch_after_main_advances(tmp_pat
     (tmp_path / "advance.txt").write_text("main moved on\n")
     git._run("add", "advance.txt")
     git._run("commit", "-m", "Main advances after branch creation")
-    task = _make_completed_task(store, branch="feature/stale-empty")
+    task = _make_completed_task(store, branch="feature/stale-empty", has_commits=False)
 
     assert resolve_task_merge_state_for_target(
         store=store,

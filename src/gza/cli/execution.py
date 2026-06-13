@@ -274,6 +274,18 @@ def _format_iterate_terminal_merge_state_message(
     if not merge_state_is_terminal_for_lifecycle(merge_state):
         return None
 
+    if merge_state == "redundant":
+        if resolved_from_failed_ancestor:
+            return (
+                "No remaining iterate action: "
+                f"failed implementation {requested_impl_task.id} was fully recovered by descendant "
+                f"{iterate_task.id}; commits are already present on target."
+            )
+        return (
+            "No remaining iterate action: "
+            f"implementation {iterate_task.id}'s commits are already present on target."
+        )
+
     if merge_state == "empty":
         if resolve_pending_recovery_execution_mode(iterate_task) is not None:
             return None

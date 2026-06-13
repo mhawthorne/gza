@@ -52,7 +52,9 @@ class _FakeGit:
         return self._on_first_parent
 
 
-def test_resolve_task_merge_state_classifies_zero_commit_branch_as_empty(tmp_path: Path) -> None:
+def test_resolve_task_merge_state_classifies_zero_commit_branch_with_commits_as_redundant(
+    tmp_path: Path,
+) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     task = store.add("Implement empty branch", task_type="implement")
     store.mark_completed(task, has_commits=True, branch="feature/empty-branch")
@@ -77,7 +79,7 @@ def test_resolve_task_merge_state_classifies_zero_commit_branch_as_empty(tmp_pat
         target_branch="main",
     )
 
-    assert result == "empty"
+    assert result == "redundant"
 
 
 def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate(
@@ -112,7 +114,7 @@ def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate
     assert "keeping merge state at 'merged' instead of classifying 'empty'" in caplog.text
 
 
-def test_resolve_task_merge_state_prefers_empty_over_merged_when_branch_has_no_unique_commits(
+def test_resolve_task_merge_state_prefers_redundant_over_merged_when_task_commits_have_no_unique_commits(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -136,7 +138,7 @@ def test_resolve_task_merge_state_prefers_empty_over_merged_when_branch_has_no_u
         target_branch="main",
     )
 
-    assert state == "empty"
+    assert state == "redundant"
 
 
 def test_classify_stale_empty_branch_on_mainline_is_empty_not_merged() -> None:
@@ -153,10 +155,29 @@ def test_classify_stale_empty_branch_on_mainline_is_empty_not_merged() -> None:
         ),
         source_branch="feature/empty",
         target_branch="main",
+        source_has_commits=False,
     )
 
     assert result.state == "empty"
-    assert result.reason == "no-unique-commits"
+    assert result.reason == "no-task-commits"
+
+
+def test_classify_zero_unique_commits_with_task_commits_is_redundant() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="feature/redundant",
+            ref_shas={"feature/redundant": "old-main-sha", "main": "advanced-main-sha"},
+            ahead_count=0,
+            merged=True,
+            on_first_parent=True,
+        ),
+        source_branch="feature/redundant",
+        target_branch="main",
+        source_has_commits=True,
+    )
+
+    assert result.state == "redundant"
+    assert result.reason == "no-unique-commits-with-task-commits"
 
 
 def test_classify_no_ff_merged_side_branch_is_merged() -> None:
@@ -174,6 +195,7 @@ def test_classify_no_ff_merged_side_branch_is_merged() -> None:
         ),
         source_branch="feature/merged",
         target_branch="main",
+        source_has_commits=True,
     )
 
     assert result.state == "merged"
@@ -188,7 +210,7 @@ def test_resolve_task_merge_state_stale_empty_branch_is_empty_not_merged(
     task = store.add("Never-worked branch", task_type="implement")
     task.status = "completed"
     task.completed_at = datetime.now(UTC)
-    task.has_commits = True
+    task.has_commits = False
     task.branch = "feature/empty"
     task.merge_status = "merged"
     store.update(task)

@@ -80,6 +80,31 @@ def test_dependency_precondition_empty_policy_can_unblock_dependency(
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
+def test_dependency_precondition_redundant_unit_uses_empty_release_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-redundant")
+    assert dependency.id is not None
+    unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
 def test_dependency_precondition_blocks_when_unit_is_unmerged_but_legacy_row_says_merged(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 

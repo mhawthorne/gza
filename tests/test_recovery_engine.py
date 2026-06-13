@@ -81,6 +81,17 @@ def _attach_empty_merge_unit(store, task) -> None:
     store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
 
+def _attach_redundant_merge_unit(store, task) -> None:
+    assert task.id is not None
+    unit = store.create_merge_unit(
+        source_branch=task.branch or f"feature/{task.id}",
+        target_branch="main",
+        owner_task_id=task.id,
+        state="redundant",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+
 class _StubMergeGit:
     def __init__(
         self,
@@ -491,6 +502,53 @@ def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without
     assert decision.reason_code == "merge_unit_empty"
     assert decision.reason_text == "moot (empty branch with no recorded provider execution)"
     assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Never-ran redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-redundant-zero"
+    failed.branch = "feature/moot-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == "moot (commits already present on target)"
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_failed_redundant_branch_with_provider_execution_remains_recoverable(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Executed redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-redundant-executed"
+    failed.branch = "feature/recoverable-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 2
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action != "skip"
+    assert decision.reason_code != "merge_unit_redundant"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
 def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachability_probe_fails(
@@ -914,7 +972,7 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
     assert git.count_commits_ahead_checked_calls == 1
 
 
-def test_is_resolved_by_landed_lineage_treats_reachable_merged_branch_with_zero_ahead_commits_as_landed(
+def test_is_resolved_by_landed_lineage_does_not_treat_redundant_branch_as_landed(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -936,7 +994,7 @@ def test_is_resolved_by_landed_lineage_treats_reachable_merged_branch_with_zero_
         existing_branches=frozenset({failed.branch}),
     )
 
-    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
 
 
 def test_is_resolved_by_landed_lineage_does_not_treat_reachable_empty_branch_as_landed(tmp_path: Path) -> None:

@@ -18,7 +18,7 @@ from gza.git import ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
-from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL
+from gza.operator_state import terminal_no_work_lifecycle_detail
 from gza.plan_review_materialization import load_materialized_plan_slice_set
 from gza.plan_review_verdict import (
     PlanReviewManifest,
@@ -830,18 +830,22 @@ def _target_already_merged_description(ctx: AdvanceContext) -> str:
     state = ctx.post_merge_rebase_state
     reason = state.reason if state is not None else None
     if reason == "merge-unit-empty":
-        return f"SKIP: {MOOT_EMPTY_LIFECYCLE_DETAIL}"
+        return f"SKIP: {terminal_no_work_lifecycle_detail('empty')}"
+    if reason == "merge-unit-redundant":
+        return f"SKIP: {terminal_no_work_lifecycle_detail('redundant')}"
     return f"SKIP: target implementation already merged ({reason or 'post-merge proof'})"
 
 
 def _merge_terminal_description(ctx: AdvanceContext) -> str:
-    if getattr(ctx, "merge_state", None) == "empty":
-        return f"SKIP: {MOOT_EMPTY_LIFECYCLE_DETAIL}"
+    detail = terminal_no_work_lifecycle_detail(getattr(ctx, "merge_state", None))
+    if detail is not None:
+        return f"SKIP: {detail}"
     return "SKIP: already merged into target branch"
 
 
-def _empty_merge_state_description(_ctx: AdvanceContext) -> str:
-    return f"SKIP: {MOOT_EMPTY_LIFECYCLE_DETAIL}"
+def _empty_merge_state_description(ctx: AdvanceContext) -> str:
+    detail = terminal_no_work_lifecycle_detail(getattr(ctx, "merge_state", None))
+    return f"SKIP: {detail or terminal_no_work_lifecycle_detail('empty')}"
 
 
 def _rebase_target_missing_merge_unit_description(ctx: AdvanceContext) -> str:
@@ -3071,7 +3075,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="empty_branch",
-        matches=lambda ctx: ctx.merge_state == "empty",
+        matches=lambda ctx: ctx.merge_state in {"empty", "redundant"},
         action=lambda ctx: {"type": "skip", "description": _empty_merge_state_description(ctx)},
     ),
     AdvanceRule(

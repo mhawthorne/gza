@@ -15,7 +15,7 @@ from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
     task_is_complete_for_lifecycle,
 )
-from .operator_state import blocked_by_empty_prereq_label
+from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
     SourceFollowupState,
@@ -218,7 +218,9 @@ def _matches_task_filters(
 
 
 def _effective_merge_state(task: DbTask, *, merge_unit: MergeUnit | None) -> str | None:
-    return merge_unit.state if merge_unit is not None else task.merge_status
+    if merge_unit is not None:
+        return effective_no_work_merge_state(task, merge_unit.state)
+    return task.merge_status
 
 
 def _task_effective_merge_state(
@@ -265,11 +267,13 @@ def _matches_merge_chain_state(
         return True
     if "empty" in merge_states and merge_state == "empty":
         return True
+    if "redundant" in merge_states and merge_state == "redundant":
+        return True
     if (
         "needs_merge" in merge_states
         and task.status == "completed"
         and task.has_commits
-        and merge_state not in {"merged", "empty"}
+        and merge_state not in {"merged", "empty", "redundant"}
     ):
         return True
     return False

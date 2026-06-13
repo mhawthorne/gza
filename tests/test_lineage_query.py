@@ -915,11 +915,15 @@ def test_query_lineage_owner_rows_empty_prereq_surfaces_release_valve_by_default
     config = Config.load(tmp_path)
 
     dep = store.add("Empty prerequisite", task_type="implement")
-    store.mark_completed(dep, has_commits=True, branch="feature/lineage-empty-toggle")
+    store.mark_completed(dep, has_commits=False, branch="feature/lineage-empty-toggle")
     assert dep.id is not None
-    unit = store.resolve_merge_unit_for_task(dep.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "empty")
+    unit = store.create_merge_unit(
+        source_branch=dep.branch,
+        target_branch=store.default_merge_target(),
+        owner_task_id=dep.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
 
     downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
     assert downstream.id is not None
@@ -1037,7 +1041,7 @@ def test_blocked_by_empty_prereq_label_uses_completed_retry_descendant_from_read
     assert retry.id is not None
     retry.status = "completed"
     retry.branch = "feature/retry-empty-prereq"
-    retry.has_commits = True
+    retry.has_commits = False
     retry.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
     store.update(retry)
 

@@ -78,16 +78,17 @@ records provenance on recovery edges.
 
 A task `T` with `depends_on = D` MUST NOT run until `D`'s work is **satisfied**.
 
-- **Satisfied** means the merge unit of the satisfying task is in state `merged` or
-  `empty`. For a merge-required dependency, `status == "completed"` alone is **not**
+- **Satisfied** means the merge unit of the satisfying task is in state `merged`, `empty`,
+  or `redundant`. For a merge-required dependency, `status == "completed"` alone is **not**
   sufficient — the dependency's branch MUST actually be merged into the work unit's
-  canonical local target (lifecycle P4), or be provably `empty` (no unique commits — a
-  no-op contributes nothing to merge and so cannot block). A completed held plan
+  canonical local target (lifecycle P4), be provably `empty` (the task/branch carried no
+  commits), or be provably `redundant` (the task carried commits already represented on
+  the target). A completed held plan
   (`task_type == "plan"` with `auto_implement == false`) is a distinct exception:
   direct dependents MUST stay blocked until the hold is explicitly released.
 - **Retry-chain satisfaction.** If `D` itself is `failed` or `dropped`, satisfaction MUST
   follow the `based_on` recovery chain rooted at `D`: the **first `status == "completed"`
-  descendant** (whose merge unit is then `merged`/`empty`) satisfies the dependency.
+  descendant** (whose merge unit is then `merged`/`empty`/`redundant`) satisfies the dependency.
   `dropped` descendants MUST be skipped (P3). The walk MUST be over `based_on`, never
   `depends_on` (E1).
 - **Fail closed.** If the satisfying task completed but its branch is not yet merged into
@@ -156,14 +157,17 @@ It is the object L1/L2 ultimately resolve against.
 
 - A merge unit is identified by a **(source branch, target branch)** pair within a
   project and carries a **canonical owner task** for provenance.
-- Its **state** is `merged`, `unmerged`, or `empty`. `empty` means branch inspection
-  proved **no unique commits** — a moot/no-op unit. `empty` MUST satisfy a dependency
-  exactly as `merged` does (there is nothing to merge, so nothing to wait for), and MUST
-  NOT be re-reported as `unmerged`/blocking. `empty` and `merged` are **distinct**: a branch that
-  is merely reachable from the target with no unique commits is `empty`, **never** `merged`/landed,
-  and MUST NOT be treated as a landed representative for failed-task recovery suppression (see
-  `recovery.md` R5 / `lifecycle-engine.md` §7). "Reachable from target" alone does not prove work
-  landed — only contributed commits do.
+- Its **state** is `merged`, `unmerged`, `empty`, or `redundant`. `empty` means the
+  task/branch carried no commits of its own. `redundant` means the task carried commits,
+  but branch inspection proved the target already contains equivalent work and no unique
+  commits remain to land. Both `empty` and `redundant` are terminal for lifecycle and
+  dependency-readiness policy: there is nothing left to merge, so they MUST NOT be
+  re-reported as `unmerged`/blocking once proven. `empty`, `redundant`, and `merged` are
+  **distinct**: a branch that is merely reachable from the target with no unique commits
+  is never automatically `merged`/landed, and MUST NOT be treated as a landed
+  representative for failed-task recovery suppression (see `recovery.md` R5 /
+  `lifecycle-engine.md` §7). "Reachable from target" alone does not prove work landed —
+  only contributed commits do.
 - A unit MAY be **superseded** (e.g. on re-sync); resolution MUST consider only the active
   (non-superseded) unit.
 - Tasks attach many-to-one to a merge unit. The unit, not any single task, is the "needs
@@ -191,6 +195,6 @@ with that work as it lands.*
   no (P5/E1): lineage membership, ownership, and recovery satisfaction follow `based_on`
   only, and `depends_on` is purely scheduling. Confirm no resolution path legitimately
   needs to walk `depends_on`.
-- **OQ4 — `empty` semantics are mid-flight.** The merge-unit `empty` state and its
-  dependency-satisfaction behavior (L1, ownership) are being built under gza-4065. The
-  contract here must be kept in lockstep with that plan and the moot/empty behavior work.
+- **OQ4 — No-work semantics are mid-flight.** The merge-unit `empty`/`redundant` states
+  and their dependency-satisfaction behavior (L1, ownership) must stay in lockstep with
+  the lifecycle and recovery contracts as that implementation evolves.

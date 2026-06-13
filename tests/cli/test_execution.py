@@ -17,6 +17,7 @@ import pytest
 
 from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
+from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
@@ -59,6 +60,40 @@ def _background_work_status_error(tmp_path: Path) -> tuple[list[str], str]:
     return (
         ["work", str(task.id), "--background", "--no-docker", "--project", str(tmp_path)],
         f"Error: Task {task.id} is not pending (status: completed)",
+    )
+
+
+def test_format_iterate_terminal_merge_state_message_distinguishes_redundant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    requested = store.add("Requested implementation", task_type="implement")
+    requested.status = "failed"
+    store.update(requested)
+    iterate = store.add("Recovered implementation", task_type="implement", based_on=requested.id)
+    iterate.status = "completed"
+    iterate.has_commits = True
+    store.update(iterate)
+
+    assert _format_iterate_terminal_merge_state_message(
+        store=store,
+        requested_impl_task=iterate,
+        iterate_task=iterate,
+        resolved_from_failed_ancestor=False,
+        merge_state="redundant",
+    ) == (
+        "No remaining iterate action: "
+        f"implementation {iterate.id}'s commits are already present on target."
+    )
+    assert _format_iterate_terminal_merge_state_message(
+        store=store,
+        requested_impl_task=requested,
+        iterate_task=iterate,
+        resolved_from_failed_ancestor=True,
+        merge_state="redundant",
+    ) == (
+        "No remaining iterate action: "
+        f"failed implementation {requested.id} was fully recovered by descendant {iterate.id}; "
+        "commits are already present on target."
     )
 
 

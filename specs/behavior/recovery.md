@@ -2,7 +2,7 @@
 
 > **Status: Draft.** This document is the prescriptive contract for failed-task recovery:
 > when gza MUST resume an existing provider session, when it MUST start a fresh retry,
-> when an empty merge unit is moot versus still recoverable, and when automation MUST
+> when an empty/redundant merge unit is moot versus still recoverable, and when automation MUST
 > stop for a human.
 >
 > Read [00-overview.md](00-overview.md) for lifecycle states,
@@ -28,9 +28,9 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
 - **R1 — Resume and retry are different actions.** `resume` continues an existing
   provider session/thread. `retry` starts a fresh execution attempt. The two MUST NOT be
   conflated.
-- **R2 — Empty is not enough.** An `empty` merge unit alone MUST NOT decide whether a
-  failed task is moot or recoverable. The policy MUST inspect recorded provider execution
-  evidence first.
+- **R2 — Terminal no-work state is not enough.** An `empty` or `redundant` merge unit
+  alone MUST NOT decide whether a failed task is moot or recoverable. The policy MUST
+  inspect recorded provider execution evidence first.
 - **R3 — Fail closed for lost-work risk.** When evidence is incomplete, the policy MUST
   prefer "attempt recovery once" over "declare moot and silently drop work".
 - **R4 — Recovery is bounded.** Automatic recovery MUST stop at a named budget and then
@@ -39,9 +39,10 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
   or completed representative, recovery MUST suppress the older failed row instead of
   re-queueing it. **Branch reachability from the target is not, by itself, a valid landed
   representative**: a branch counts as landed only if it contributed at least one commit now
-  contained in the target. An `empty` branch (no commits ahead of the target) never satisfies R5 —
-  it is governed by the empty-recovery predicate (§1), not by landed suppression. This rule and
-  `lifecycle-engine.md` §7 ("already landed") MUST stay in lockstep.
+  contained in the target. An `empty` or `redundant` branch (no unique commits ahead of
+  the target) never satisfies R5 — it is governed by the no-work recovery predicate (§1),
+  not by landed suppression. This rule and `lifecycle-engine.md` §7 ("already landed")
+  MUST stay in lockstep.
 - **R6 — A recovery row carries its action.** A task created to carry recovery
   (`recovery_origin = resume` or `recovery_origin = retry`) MUST be executed with that
   action whenever it runs, by **any** launch path (pending-queue worker pickup, `iterate`,
@@ -50,14 +51,13 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
 
 ## Decision model
 
-### 1. Empty merge units split into moot vs recoverable
+### 1. Terminal no-work merge units split into moot vs recoverable
 
 The operative condition is **"the branch has no commits ahead of the merge target"**. This surfaces
-either as an active merge-unit state of `empty`, **or** as a failed task with no merge unit at all
-(`merge_status` absent / `None`) whose branch is reachable-but-empty vs the target. In **both** cases
+either as an active merge-unit state of `empty`/`redundant`, **or** as a failed task with no merge unit at all
+(`merge_status` absent / `None`) whose branch is reachable-but-empty vs the target. In all cases
 the policy MUST evaluate the single shared predicate below — it MUST NOT gate solely on the literal
-`empty` merge-unit enum, since a task that died before its first commit may never have acquired a
-merge unit:
+merge-unit enum, since a task that died before its first commit may never have acquired a merge unit:
 
 - `empty_task_requires_recovery(task)` is **true** iff all of the following hold:
   - the task status is `failed`
@@ -71,11 +71,11 @@ merge unit:
 
 Consequences:
 
-- `empty` + predicate **false** = **moot**. The task MUST stay out of failed-task
-  recovery queues and dry-run recovery surfaces.
-- `empty` + predicate **true** = **recoverable**. The task MUST stay eligible for the
-  normal recovery policy and MUST NOT be suppressed merely because the branch currently
-  has no commits to land.
+- `empty`/`redundant` + predicate **false** = **moot**. The task MUST stay out of
+  failed-task recovery queues and dry-run recovery surfaces.
+- `empty`/`redundant` + predicate **true** = **recoverable**. The task MUST stay eligible
+  for the normal recovery policy and MUST NOT be suppressed merely because the branch
+  currently has no commits to land.
 
 ### 2. Resume vs retry vs manual
 
@@ -106,10 +106,10 @@ resolved by a valid representative, including:
 - a completed automatic sibling recovery that already resolved the replaced attempt
 - another valid landed representative for the same code by an independent path
 
-The same failed task being `empty` on its own MUST NOT count as proof of resolution. A branch that
-is merely reachable from the target but contributed **no unique commits** is `empty`, not a landed
-representative, and MUST NOT count as proof of resolution either (see R5 and `lifecycle-engine.md`
-§7).
+The same failed task being `empty` or `redundant` on its own MUST NOT count as proof of
+resolution. A branch that is merely reachable from the target but has **no unique commits**
+is terminal no-work, not a landed representative, and MUST NOT count as proof of
+resolution either (see R5 and `lifecycle-engine.md` §7).
 
 ### 4. Executing a pending recovery row
 
@@ -151,13 +151,13 @@ its stored action.
   dead/silent descendant work to terminal failure or park the original failed subject via
   the shared no-progress attention backstop after the configured unchanged-repeat limit.
 
-- Operator wording MUST distinguish **moot empty work** from **empty but resumable
-  failed work**.
-- `iterate` MUST check the shared empty-recovery predicate before printing an `empty` /
-  "no remaining commits to land" terminal message, and MUST NOT print that terminal for a
-  pending resume row with a continuable session (see §4).
-- Failed-task recovery queues and dry-run reports MUST omit moot empty tasks and retain
-  recoverable empty tasks.
+- Operator wording MUST distinguish **moot terminal no-work** from **terminal no-work but
+  resumable failed work**, and MUST distinguish `empty` from `redundant` labels.
+- `iterate` MUST check the shared recovery predicate before printing an `empty` /
+  `redundant` terminal message, and MUST NOT print that terminal for a pending resume row
+  with a continuable session (see §4).
+- Failed-task recovery queues and dry-run reports MUST omit moot empty/redundant tasks and
+  retain recoverable empty/redundant tasks.
 - `watch`, `advance`, `iterate`, and query/recovery-lane surfaces MUST agree on the same
   recovery decision for the same task.
 

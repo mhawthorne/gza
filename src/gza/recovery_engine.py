@@ -17,7 +17,7 @@ from .failure_policy import is_resumable_failure_reason
 from .git import Git, GitError
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .merge_state import classify_branch_merge_state_for_target, resolve_task_merge_state_for_target
-from .operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL
+from .operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from .recovery_read_context import RecoveryReadContext
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ class _MergeContext:
     default_branch: str | None
     existing_branches: frozenset[str] | None = None
     resolution_error: str | None = None
-    branch_resolution: dict[str, str] = field(default_factory=dict)
+    branch_resolution: dict[tuple[str, bool | None], str] = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
     _warning_keys: set[str] = field(default_factory=set)
 
@@ -802,7 +802,8 @@ def _is_resolved_by_landed_lineage(
 
     if merge_context.git is not None and target_branch is not None and task.branch:
         try:
-            branch_merge_state = merge_context.branch_resolution.get(task.branch)
+            branch_resolution_key = (task.branch, task.has_commits)
+            branch_merge_state = merge_context.branch_resolution.get(branch_resolution_key)
             if branch_merge_state is None:
                 if merge_context.existing_branches is not None:
                     branch_exists = task.branch in merge_context.existing_branches
@@ -817,8 +818,9 @@ def _is_resolved_by_landed_lineage(
                             source_branch=task.branch,
                             target_branch=target_branch,
                             merged_proof=merged_proof,
+                            source_has_commits=task.has_commits,
                         ).state
-                merge_context.branch_resolution[task.branch] = branch_merge_state
+                merge_context.branch_resolution[branch_resolution_key] = branch_merge_state
             branch_merged = branch_merge_state == "merged" or (
                 branch_merge_state == "empty" and _task_has_recoverable_real_work(task)
             )
@@ -1148,6 +1150,25 @@ def _failed_task_requires_operator_recovery(
     merge_context: _MergeContext,
     read_context: RecoveryReadContext | None = None,
 ) -> bool:
+    def _resolved_recovery_merge_state() -> str | None:
+        merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+        if (
+            merge_state is None
+            and merge_context.git is not None
+            and task.branch
+        ):
+            try:
+                target_branch = _resolve_merge_context_target_branch(store, merge_context)
+            except MergeTargetResolutionError:
+                return None
+            return resolve_task_merge_state_for_target(
+                store=store,
+                task=task,
+                git=merge_context.git,
+                target_branch=target_branch,
+            )
+        return merge_state
+
     reason = task.failure_reason or "UNKNOWN"
     if reason == "PREREQUISITE_UNMERGED":
         reconciliation = _reconcile_historical_prerequisite_unmerged_failure(
@@ -1168,17 +1189,23 @@ def _failed_task_requires_operator_recovery(
             )
         if reconciliation == "recoverable_real_work":
             return True
-        merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+        merge_state = _resolved_recovery_merge_state()
+        if merge_state == "redundant":
+            return _task_has_executed_resumable_session(task)
         return merge_state != "empty" or empty_task_requires_recovery(
             store,
             task,
+            merge_state=merge_state,
             merge_context=merge_context,
             read_context=read_context,
         )
-    merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+    merge_state = _resolved_recovery_merge_state()
+    if merge_state == "redundant":
+        return _task_has_executed_resumable_session(task)
     return merge_state != "empty" or empty_task_requires_recovery(
         store,
         task,
+        merge_state=merge_state,
         merge_context=merge_context,
         read_context=read_context,
     )
@@ -1333,6 +1360,16 @@ def decide_failed_task_recovery(
                 attempt_limit=attempt_limit,
             )
     merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+    if merge_state == "redundant":
+        if not _task_has_executed_resumable_session(task):
+            return _skip_decision(
+                task_id=task_id,
+                reason_code="merge_unit_redundant",
+                reason_text=MOOT_REDUNDANT_LIFECYCLE_DETAIL,
+                attempt_index=attempt_index,
+                attempt_limit=attempt_limit,
+            )
+
     if merge_state == "empty":
         empty_recovery_state = _classify_empty_task_recovery_state(
             store,

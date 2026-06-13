@@ -11,7 +11,7 @@ from typing import Any, Literal, cast
 from .db import SqliteTaskStore, Task as DbTask
 from .git import ResolvedMergeSourceRef, resolve_ref_if_possible
 
-MergeBranchState = Literal["merged", "unmerged", "empty", "unknown"]
+MergeBranchState = Literal["merged", "unmerged", "empty", "redundant", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -34,15 +34,16 @@ def classify_proven_merged_state(
     git: Any,
     source_ref: str,
     target_branch: str,
+    source_has_commits: bool | None = None,
     on_warning: Callable[[str], None] | None = None,
 ) -> str:
-    """Classify a proved-merged source as ``merged`` or zero-commit ``empty``."""
+    """Classify a proved-merged source as ``merged`` or zero-commit no-work."""
     current_target_state = "merged"
     count_commits_ahead_checked = getattr(git, "count_commits_ahead_checked", None)
     if callable(count_commits_ahead_checked):
         ahead_count = count_commits_ahead_checked(source_ref, target_branch)
         if isinstance(ahead_count, Integral) and ahead_count <= 0:
-            current_target_state = "empty"
+            current_target_state = "redundant" if source_has_commits is True else "empty"
         elif ahead_count is None and on_warning is not None:
             on_warning(
                 f"Could not prove whether merged source {source_ref!r} is empty against "
@@ -118,6 +119,7 @@ def classify_branch_merge_state_for_target(
     target_branch: str,
     persisted_state: str | None = None,
     merged_proof: bool | None = None,
+    source_has_commits: bool | None = None,
 ) -> BranchMergeClassification:
     """Classify branch merge truth relative to ``target_branch``."""
 
@@ -128,7 +130,7 @@ def classify_branch_merge_state_for_target(
     target_sha = target_resolution.sha
 
     if source_ref is None:
-        if persisted_state in {"merged", "unmerged", "empty"}:
+        if persisted_state in {"merged", "unmerged", "empty", "redundant"}:
             persisted_branch_state = cast(MergeBranchState, persisted_state)
             return BranchMergeClassification(
                 state=persisted_branch_state,
@@ -164,6 +166,7 @@ def classify_branch_merge_state_for_target(
                     git=git,
                     source_ref=source_ref,
                     target_branch=target_branch,
+                    source_has_commits=source_has_commits,
                 ),
             )
             return BranchMergeClassification(
@@ -178,7 +181,7 @@ def classify_branch_merge_state_for_target(
                 source_sha=None,
                 target_sha=target_sha,
             )
-        if persisted_state in {"merged", "unmerged", "empty"}:
+        if persisted_state in {"merged", "unmerged", "empty", "redundant"}:
             persisted_branch_state = cast(MergeBranchState, persisted_state)
             return BranchMergeClassification(
                 state=persisted_branch_state,
@@ -205,6 +208,7 @@ def classify_branch_merge_state_for_target(
                     git=git,
                     source_ref=source_ref,
                     target_branch=target_branch,
+                    source_has_commits=source_has_commits,
                 ),
             )
             return BranchMergeClassification(
@@ -280,9 +284,18 @@ def classify_branch_merge_state_for_target(
                 source_sha=source_sha,
                 target_sha=target_sha,
             )
+        if source_has_commits is True:
+            no_work_state: MergeBranchState = "redundant"
+            reason = "no-unique-commits-with-task-commits"
+        elif source_has_commits is False:
+            no_work_state = "empty"
+            reason = "no-task-commits"
+        else:
+            no_work_state = "empty"
+            reason = "no-unique-commits"
         return BranchMergeClassification(
-            state="empty",
-            reason="no-unique-commits",
+            state=no_work_state,
+            reason=reason,
             source_ref=source_ref,
             target_ref=target_branch,
             source_sha=source_sha,
@@ -311,8 +324,8 @@ def classify_branch_merge_state_for_target(
 
     if source_sha == target_sha:
         return BranchMergeClassification(
-            state="empty",
-            reason="equal-tips-no-count-proof",
+        state="redundant" if source_has_commits is True else "empty",
+        reason="equal-tips-with-task-commits" if source_has_commits is True else "equal-tips-no-count-proof",
             source_ref=source_ref,
             target_ref=target_branch,
             source_sha=source_sha,
@@ -361,8 +374,8 @@ def resolve_task_merge_state_for_target(
             merged_proof = False
 
     if resolved_merge_unit is not None and resolved_merge_unit.target_branch == target_branch:
-        if resolved_merge_unit.state == "empty":
-            return "empty"
+        if resolved_merge_unit.state in {"empty", "redundant"}:
+            return resolved_merge_unit.state
         if resolved_merge_unit.state == "merged" and not merged_proof:
             return "merged"
 
@@ -378,8 +391,9 @@ def resolve_task_merge_state_for_target(
         target_branch=target_branch,
         persisted_state=persisted_state,
         merged_proof=merged_proof,
+        source_has_commits=task.has_commits,
     )
-    current_target_state = classification.state if classification.state in {"merged", "empty"} else None
+    current_target_state = classification.state if classification.state in {"merged", "empty", "redundant"} else None
 
     if (
         current_target_state == "merged"
