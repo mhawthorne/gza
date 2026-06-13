@@ -347,12 +347,14 @@ def test_merge_first_docs_and_fix_skill_schema_stay_in_sync() -> None:
 
     required_snippets = [
         "autonomous_verify_timeout_seconds",
+        "review_verify_timeout_grace_seconds",
         "recommend_rebase_behind_commits",
         "Deprecated compatibility key; accepted but ignored",
         "Projected `next_action` values come from the shared live lifecycle planner",
         "Cleanly mergeable branches continue to the normal review or merge actions",
         "verify:",
         "autonomous_verify_timeout_seconds: <int>",
+        "review_verify_timeout_grace_seconds: <int>",
         "blockers:",
     ]
     for snippet in required_snippets:

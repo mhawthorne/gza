@@ -4592,6 +4592,7 @@ class TestWatchConfigValidation:
         self._write_config(tmp_path, "")
         config = Config.load(tmp_path)
         assert config.autonomous_verify_timeout_seconds == 120
+        assert config.review_verify_timeout_grace_seconds == 5
         assert config.max_noop_improve_cycles == 1
         assert config.recommend_rebase_behind_commits == 1
 
@@ -4601,10 +4602,13 @@ class TestWatchConfigValidation:
 
         self._write_config(
             tmp_path,
-            "autonomous_verify_timeout_seconds: 240\nrecommend_rebase_behind_commits: 0\n",
+            "autonomous_verify_timeout_seconds: 240\n"
+            "review_verify_timeout_grace_seconds: 9\n"
+            "recommend_rebase_behind_commits: 0\n",
         )
         config = Config.load(tmp_path)
         assert config.autonomous_verify_timeout_seconds == 240
+        assert config.review_verify_timeout_grace_seconds == 9
         assert config.recommend_rebase_behind_commits == 0
 
     @pytest.mark.parametrize(
@@ -4666,6 +4670,10 @@ class TestWatchConfigValidation:
             ("autonomous_verify_timeout_seconds", "true", "'autonomous_verify_timeout_seconds' must be an integer"),
             ("autonomous_verify_timeout_seconds", "0", "'autonomous_verify_timeout_seconds' must be positive"),
             ("autonomous_verify_timeout_seconds", "-1", "'autonomous_verify_timeout_seconds' must be positive"),
+            ("review_verify_timeout_grace_seconds", "nope", "'review_verify_timeout_grace_seconds' must be an integer"),
+            ("review_verify_timeout_grace_seconds", "true", "'review_verify_timeout_grace_seconds' must be an integer"),
+            ("review_verify_timeout_grace_seconds", "0", "'review_verify_timeout_grace_seconds' must be positive"),
+            ("review_verify_timeout_grace_seconds", "-1", "'review_verify_timeout_grace_seconds' must be positive"),
             ("recommend_rebase_behind_commits", "nope", "'recommend_rebase_behind_commits' must be an integer"),
             ("recommend_rebase_behind_commits", "-1", "'recommend_rebase_behind_commits' must be non-negative"),
         ],

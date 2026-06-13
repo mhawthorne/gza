@@ -102,6 +102,7 @@ DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = 120
+DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS = 5
 DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD = 400
 DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD = 1200
 DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES = 30
@@ -125,6 +126,7 @@ VALID_CONFIG_FIELDS = {
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
+    "review_verify_timeout_grace_seconds",
     "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
     "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
     "code_task_diff_timeout_cap_minutes",
@@ -228,6 +230,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
     "autonomous_verify_timeout_seconds": None,
+    "review_verify_timeout_grace_seconds": None,
     "code_task_diff_timeout_medium_threshold": None,
     "code_task_diff_timeout_large_threshold": None,
     "code_task_diff_timeout_medium_minutes": None,
@@ -336,6 +339,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
     "autonomous_verify_timeout_seconds": None,
+    "review_verify_timeout_grace_seconds": None,
     "code_task_diff_timeout_medium_threshold": None,
     "code_task_diff_timeout_large_threshold": None,
     "code_task_diff_timeout_medium_minutes": None,
@@ -962,6 +966,7 @@ class Config:
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     autonomous_verify_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
+    review_verify_timeout_grace_seconds: int = DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
     code_task_diff_timeout_medium_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD
     code_task_diff_timeout_large_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD
     code_task_diff_timeout_medium_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES
@@ -2079,6 +2084,13 @@ class Config:
         )
         if autonomous_verify_timeout_seconds < 1:
             raise ConfigError("'autonomous_verify_timeout_seconds' must be positive")
+        review_verify_timeout_grace_seconds = _load_strict_int_field(
+            data,
+            "review_verify_timeout_grace_seconds",
+            DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+        )
+        if review_verify_timeout_grace_seconds < 1:
+            raise ConfigError("'review_verify_timeout_grace_seconds' must be positive")
 
         resolved_code_task_timeout_scaling = _resolve_code_task_timeout_scaling_fields(data)
         assert resolved_code_task_timeout_scaling is not None
@@ -2257,6 +2269,7 @@ class Config:
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
             autonomous_verify_timeout_seconds=autonomous_verify_timeout_seconds,
+            review_verify_timeout_grace_seconds=review_verify_timeout_grace_seconds,
             code_task_diff_timeout_medium_threshold=code_task_diff_timeout_medium_threshold,
             code_task_diff_timeout_large_threshold=code_task_diff_timeout_large_threshold,
             code_task_diff_timeout_medium_minutes=code_task_diff_timeout_medium_minutes,
@@ -2669,6 +2682,11 @@ class Config:
                 errors.append("'autonomous_verify_timeout_seconds' must be an integer")
             elif data["autonomous_verify_timeout_seconds"] <= 0:
                 errors.append("'autonomous_verify_timeout_seconds' must be positive")
+        if "review_verify_timeout_grace_seconds" in data:
+            if not _is_strict_int(data["review_verify_timeout_grace_seconds"]):
+                errors.append("'review_verify_timeout_grace_seconds' must be an integer")
+            elif data["review_verify_timeout_grace_seconds"] <= 0:
+                errors.append("'review_verify_timeout_grace_seconds' must be positive")
 
         _resolve_code_task_timeout_scaling_fields(data, errors=errors)
 

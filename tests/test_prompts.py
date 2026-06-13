@@ -1054,6 +1054,21 @@ class TestPromptBuilderImproveTask:
         result = PromptBuilder().improve_task_prompt(task_id=5, review_id=None, has_comments=True)
         assert result == "Improve implementation of task 5 based on unresolved comments"
 
+    def test_improve_template_treats_verify_timeout_output_as_diagnostic_input(self):
+        """Improve template should tell agents to inspect captured verify timeout output before reruns."""
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "improve.txt"
+        ).read_text(encoding="utf-8")
+
+        assert "persisted `verify_command_output` artifact reference" in template
+        assert "inspect that captured stdout/stderr before rerunning the full command" in template
+        assert "SIGTERM-triggered stack dumps" in template
+
 
 class TestPromptBuilderReviewTask:
     """Tests for PromptBuilder.review_task_prompt()."""

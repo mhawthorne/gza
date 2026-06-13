@@ -158,6 +158,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("code_task_diff_timeout_cap_minutes", "int", 45, "Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling."),
     ConfigKeySpec("review_context_file_limit", "int", 12, "Max changed files included in large review context excerpts."),
     ConfigKeySpec("autonomous_verify_timeout_seconds", "int", 120, "Timeout in seconds for lifecycle/automation-initiated verify_command runs."),
+    ConfigKeySpec("review_verify_timeout_grace_seconds", "int", 5, "Grace period in seconds after SIGTERM before lifecycle review verification escalates to SIGKILL."),
     ConfigKeySpec("recommend_rebase_behind_commits", "int", 1, "Deprecated compatibility key; accepted but ignored."),
     ConfigKeySpec("review_diff_medium_threshold", "int", 2000, "Medium diff threshold for review prompt shaping."),
     ConfigKeySpec("review_diff_small_threshold", "int", 500, "Small diff threshold for full inline review diffs."),

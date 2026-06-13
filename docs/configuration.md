@@ -52,6 +52,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `autonomous_verify_timeout_seconds` | Integer | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
+| `review_verify_timeout_grace_seconds` | Integer | `5` | Grace period after SIGTERM before lifecycle review verification escalates to SIGKILL |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
 | `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
 | `code_task_diff_timeout_medium_minutes` | Integer | `30` | Timeout budget used for medium-sized code diffs |
@@ -105,7 +106,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -2076,6 +2077,7 @@ docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_turns: 80
 autonomous_verify_timeout_seconds: 180
+review_verify_timeout_grace_seconds: 5
 verify_command: ./bin/tests
 inner_verify_command: ./bin/tests --quick
 code_task_diff_timeout_medium_threshold: 500

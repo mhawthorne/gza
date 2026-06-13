@@ -64,3 +64,17 @@ def test_full_config_example_groups_code_task_diff_timeout_keys_under_execution(
     assert execution_start < timeout_index < branching_start
     _, other_header, other_section = rendered.partition("# --- Other ---")
     assert not other_header or timeout_key not in other_section
+
+
+def test_full_config_example_groups_review_verify_timeout_grace_under_review() -> None:
+    rendered = render_config_example()
+
+    review_start = rendered.index("# --- Review ---")
+    learnings_start = rendered.index("# --- Learnings ---")
+    grace_key = "# review_verify_timeout_grace_seconds:"
+
+    grace_index = rendered.index(grace_key)
+
+    assert review_start < grace_index < learnings_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or grace_key not in other_section
