@@ -96,6 +96,10 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
 - Live-worker accounting MUST consider both the worker registry and persisted in-progress
   task state. Either source alone is insufficient after crashes or restarts.
 - Stale or dead worker state MUST be reconciled before capacity is computed.
+- Reconciliation MUST cover both `in_progress` tasks and `pending` tasks that are
+  explicitly associated with a registered running-status worker entry. A plain pending
+  queue item with no registered worker remains runnable and MUST NOT be reaped just
+  because it has no process metadata.
 - `slots` MUST equal `max(0, batch - running)`.
 - `watch.recovery_slots` (default `1`) MUST reserve that many worker slots per cycle for
   actionable failed-task recovery before pending pickup, capped by available slots and
@@ -123,6 +127,10 @@ This is the process-level expression of overview invariant 1.
 
 - If the needed work for a lineage already exists as `pending` or `in_progress`, watch
   MUST wait/adopt that work rather than create another child for the same step.
+- A `pending` task with a registered worker that is dead/stale and silent past
+  `watch.no_activity_timeout` is not live existing work. Watch MUST reconcile it to a
+  terminal failure (`NO_ACTIVITY`) before treating the lineage as something to wait on
+  or adopt.
 - If a worker is already live for the implementation lineage an iterate start would own,
   watch MUST NOT start a second iterate worker for that lineage.
 - Re-running watch after a crash, operator restart, or code re-exec MUST NOT treat
@@ -253,15 +261,18 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
-| `watch.no_activity_timeout` | Reconciliation threshold for deciding a live in-progress worker has gone silent and must be failed/reconciled |
+| `watch.no_activity_timeout` | Reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
 | `--tag` / `--any-tag` | Supervisor execution scope |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to
 `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and
-`watch.restart_failed_batch` maps to `watch.recovery_slots`. This task does not redesign
-stale-worker reaping or the `recovery_already_running` backstop; see `gza-4574` for that
-separate work.
+`watch.restart_failed_batch` maps to `watch.recovery_slots`. Recovery-lane no-progress
+parking applies to unchanged existing recovery descendants too: when watch repeatedly
+selects the same `recovery_already_pending` or `recovery_already_running` descendant with
+unchanged descendant liveness evidence, the shared `watch-no-progress-backstop` MUST park
+that failed subject after `watch.no_progress_cycles` so later actionable recovery
+candidates can continue.
 
 ## Boundary with the engine
 

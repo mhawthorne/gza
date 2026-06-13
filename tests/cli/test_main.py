@@ -699,7 +699,7 @@ class TestHelpOutput:
         example_text = " ".join(Path("src/gza/gza.yaml.example").read_text().split())
 
         assert "Exit after SECS of consecutive idle watch cycles" in help_text
-        assert "`watch.no_activity_timeout` controls when watch reconciliation marks a still-running worker `NO_ACTIVITY`" in docs_text
+        assert "`watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`" in docs_text
         assert "`watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles." in docs_text
         assert "no_activity_timeout: 60" in example_text
 

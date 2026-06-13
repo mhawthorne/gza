@@ -1797,7 +1797,7 @@ watch:
   max_idle: null
 ```
 
-`watch.no_activity_timeout` controls when watch reconciliation marks a still-running worker `NO_ACTIVITY` because its task log has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
+`watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY` because its task log or startup evidence has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever.
 

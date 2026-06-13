@@ -567,6 +567,25 @@ def _refresh_watch_no_progress_after_state_change(
     refresh_watch_progress_after_state_change(store, candidate=candidate)
 
 
+def _resolve_recovery_action_task(
+    store: SqliteTaskStore,
+    *,
+    failed_task: DbTask,
+    recovery_task_id: str | None,
+) -> DbTask:
+    if recovery_task_id is None:
+        return failed_task
+    action_task = store.get(recovery_task_id)
+    return action_task or failed_task
+
+
+def _is_watch_observable_recovery_skip(decision: FailedRecoveryDecision) -> bool:
+    return decision.action == "skip" and decision.reason_code in {
+        "recovery_already_pending",
+        "recovery_already_running",
+    }
+
+
 def _pending_queue_dispatch_action(task: DbTask) -> dict[str, Any]:
     """Build the stable watch action used for pending-queue no-progress tracking."""
     if task.task_type == "implement":
@@ -2216,15 +2235,20 @@ def _run_cycle(
 
     # 2) Recovery queue for failed tasks.
     pending_recovery_task_ids: set[str] = set()
-    actionable_failed: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool]] = []
+    actionable_failed: list[
+        tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
+    ] = []
     worker_consuming_recovery_count = 0
+    parked_recovery_subject_ids: set[str] = set()
     for row in recovery_rows:
         failed = row.recovery_leaf_task
         assert failed is not None
         if failed.id is None:
             continue
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
-        if decision.action == "skip":
+        if decision.action != "skip" and decision.recovery_task_id is not None:
+            pending_recovery_task_ids.add(decision.recovery_task_id)
+        if decision.action == "skip" and not _is_watch_observable_recovery_skip(decision):
             if recovery_slots > 0 and show_skipped:
                 log.emit(
                     "SKIP",
@@ -2232,12 +2256,27 @@ def _run_cycle(
                     dedupe_key=f"recovery-skip:{row.owner_task.id}:{decision.reason_code}",
                 )
             continue
-        if decision.recovery_task_id is not None:
-            pending_recovery_task_ids.add(decision.recovery_task_id)
         recovery_action = failed_recovery_decision_to_action(failed, decision)
         worker_consuming_recovery = is_worker_consuming_advance_action(str(recovery_action.get("type", "")))
-        actionable_failed.append((row, failed, decision, recovery_action, worker_consuming_recovery))
-        if worker_consuming_recovery:
+        action_task = _resolve_recovery_action_task(
+            store,
+            failed_task=failed,
+            recovery_task_id=decision.recovery_task_id,
+        )
+        if not dry_run:
+            candidate = build_watch_progress_candidate(
+                store,
+                subject_task=failed,
+                action=recovery_action,
+                action_task=action_task,
+                failed_task=failed,
+            )
+            if get_active_watch_no_progress_attention(store, candidate=candidate) is not None:
+                parked_recovery_subject_ids.add(str(failed.id))
+                if decision.recovery_task_id is not None:
+                    pending_recovery_task_ids.add(decision.recovery_task_id)
+        actionable_failed.append((row, failed, decision, recovery_action, worker_consuming_recovery, action_task))
+        if worker_consuming_recovery and str(failed.id) not in parked_recovery_subject_ids:
             worker_consuming_recovery_count += 1
 
     pending_tasks = _pending_runnable_tasks(store, tags=tags, any_tag=any_tag)
@@ -2252,35 +2291,79 @@ def _run_cycle(
     slot_allocation = allocate_watch_slots(
         slots=slots,
         recovery_slots_config=recovery_slots,
-        actionable_recovery_count=len(actionable_failed),
+        actionable_recovery_count=sum(
+            1
+            for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
+            if str(failed.id) not in parked_recovery_subject_ids
+        ),
         worker_consuming_recovery_count=worker_consuming_recovery_count,
         pending_count=len(pending_candidates),
-        gate_pending_on_actionable_recovery=recovery_mode == "recovery-only",
+        gate_pending_on_actionable_recovery=(
+            recovery_mode == "recovery-only"
+            and any(
+                str(failed.id) not in parked_recovery_subject_ids
+                for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
+            )
+        ),
     )
     reserved_recovery_slots = slot_allocation.recovery_slots
     pending_slots = slot_allocation.pending_slots
-    for row, failed, decision, recovery_action, worker_consuming_recovery in actionable_failed:
+    nonparked_recovery_subject_ids = {
+        str(failed.id)
+        for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
+        if str(failed.id) not in parked_recovery_subject_ids
+    }
+    recovery_started_this_cycle = False
+    for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
         if recovery_slots <= 0:
             break
-        if worker_consuming_recovery and reserved_recovery_slots <= 0:
-            continue
         if failed.id is None:
+            continue
+        if str(failed.id) in parked_recovery_subject_ids:
+            if not dry_run:
+                candidate = build_watch_progress_candidate(
+                    store,
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task=action_task,
+                    failed_task=failed,
+                )
+                active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+                if active_attention is not None:
+                    log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                        message=_watch_needs_attention_message(failed, active_attention),
+                    )
+            continue
+        if worker_consuming_recovery and reserved_recovery_slots <= 0:
             continue
         if not dry_run:
             no_progress_attention = _maybe_park_watch_no_progress(
                 store=store,
                 subject_task=failed,
                 action=recovery_action,
-                action_task=failed,
+                action_task=action_task,
                 failed_task=failed,
                 no_progress_cycles=config.watch.no_progress_cycles,
             )
             if no_progress_attention is not None:
+                parked_recovery_subject_ids.add(str(failed.id))
+                nonparked_recovery_subject_ids.discard(str(failed.id))
+                if decision.recovery_task_id is not None:
+                    pending_recovery_task_ids.add(decision.recovery_task_id)
                 log.emit_attention(
                     attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
                     message=_watch_needs_attention_message(failed, no_progress_attention),
                 )
                 continue
+        if decision.action == "skip":
+            if recovery_slots > 0 and show_skipped:
+                log.emit(
+                    "SKIP",
+                    f"{row.owner_task.id} failed {failed.task_type}: {decision.reason_code}",
+                    dedupe_key=f"recovery-skip:{row.owner_task.id}:{decision.reason_code}",
+                )
+            continue
         if decision.action == "reconcile":
             if dry_run:
                 log.emit(
@@ -2320,9 +2403,10 @@ def _run_cycle(
                     store=store,
                     subject_task=failed,
                     action=recovery_action,
-                    action_task=failed,
+                    action_task=action_task,
                     failed_task=failed,
                 )
+                recovery_started_this_cycle = True
                 log.emit(
                     "RECOVR",
                     (
@@ -2539,6 +2623,7 @@ def _run_cycle(
             action_task=refreshed_recovered_task,
             failed_task=failed,
         )
+        recovery_started_this_cycle = True
         started_task_ids.add(recovered_task_id)
         slots -= 1
         reserved_recovery_slots -= 1
@@ -2550,6 +2635,10 @@ def _run_cycle(
                 f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
             ),
         )
+
+    if recovery_mode == "recovery-only" and pending_slots <= 0 and not recovery_started_this_cycle:
+        if not nonparked_recovery_subject_ids:
+            pending_slots = slots
 
     # 3) Start new queued tasks (consumes slots)
     def consume_pending_slot() -> None:

@@ -341,36 +341,106 @@ def _task_looks_stuck(config: Config, task: DbTask) -> bool:
     written to within the threshold.  This catches preflight hangs such as a
     CLI blocking on an update/login prompt.
     """
+    return _task_is_silent_past_timeout(config, task)
+
+
+def _candidate_activity_log_paths(config: Config, task: DbTask, worker: WorkerMetadata | None = None) -> list[Path]:
+    """Return task/worker log paths that count as startup or execution evidence."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for rel_path in (task.log_file, worker.startup_log_file if worker is not None else None):
+        if not rel_path:
+            continue
+        candidate = config.project_dir / rel_path
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        paths.append(candidate)
+    return paths
+
+
+def _task_started_at(task: DbTask, worker: WorkerMetadata | None = None) -> datetime | None:
+    """Return the best available startup timestamp for reconciliation."""
+    if task.started_at is not None:
+        return task.started_at
+    if worker is None:
+        return None
+    return _normalize_timestamp(worker.started_at)
+
+
+def _task_is_silent_past_timeout(
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None = None,
+) -> bool:
+    """Return whether the task/worker pair has been silent longer than the threshold."""
     threshold = config.watch.no_activity_timeout
-    if task.started_at is None:
+    started_at = _task_started_at(task, worker)
+    if started_at is None:
         return False
     now = datetime.now(UTC)
-    age = (now - task.started_at).total_seconds()
+    age = (now - started_at).total_seconds()
     if age <= threshold:
         return False
-    if not task.log_file:
+    stats: list[os.stat_result] = []
+    latest_mtime = 0.0
+    for log_path in _candidate_activity_log_paths(config, task, worker):
+        for candidate in (log_path, ops_log_path_for(log_path)):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            stats.append(stat)
+            latest_mtime = max(latest_mtime, stat.st_mtime)
+    if not stats:
         return True
-    log_path = config.project_dir / task.log_file
-    try:
-        stat = log_path.stat()
-    except OSError:
-        stat = None
-    ops_path = ops_log_path_for(log_path)
-    try:
-        ops_stat = ops_path.stat()
-    except OSError:
-        ops_stat = None
-    if stat is None and ops_stat is None:
-        return True
-    total_size = (stat.st_size if stat is not None else 0) + (ops_stat.st_size if ops_stat is not None else 0)
+    total_size = sum(stat.st_size for stat in stats)
     if total_size == 0:
         return True
-    latest_mtime = max(
-        stat.st_mtime if stat is not None else 0.0,
-        ops_stat.st_mtime if ops_stat is not None else 0.0,
-    )
     mtime_age = now.timestamp() - latest_mtime
     return mtime_age > threshold
+
+
+def _running_workers_by_task_id(registry: WorkerRegistry) -> dict[str, WorkerMetadata]:
+    """Index running-status worker entries by task ID."""
+    workers_by_task_id: dict[str, WorkerMetadata] = {}
+    for worker in registry.list_all():
+        if worker.task_id is None or worker.status != "running":
+            continue
+        workers_by_task_id.setdefault(str(worker.task_id), worker)
+    return workers_by_task_id
+
+
+def _task_worker_is_dead(task: DbTask, worker: WorkerMetadata | None, registry: WorkerRegistry | None) -> bool:
+    """Return whether the claimed worker for a task is dead/stale."""
+    if worker is not None and registry is not None:
+        return not registry.is_running(worker.worker_id)
+    if task.running_pid is None:
+        return task.started_at is not None
+    if task.running_pid <= 0:
+        return True
+    try:
+        os.kill(task.running_pid, 0)
+        return False
+    except OSError:
+        return True
+
+
+def _mark_worker_reconciled(
+    registry: WorkerRegistry | None,
+    worker: WorkerMetadata | None,
+    *,
+    completion_reason: str,
+) -> None:
+    """Stop a stale running worker entry from counting toward capacity."""
+    if registry is None or worker is None or worker.status != "running":
+        return
+    registry.mark_completed(
+        worker.worker_id,
+        exit_code=worker.exit_code if worker.exit_code is not None else 1,
+        status="failed",
+        completion_reason=completion_reason,
+    )
 
 
 def _normalize_timestamp(value: datetime | str | None) -> datetime | None:
@@ -424,6 +494,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
     """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
     try:
         store = get_store(config)
+        registry = WorkerRegistry(config.workers_path)
     except ManualMigrationRequired:
         # DB needs gza migrate — skip reconciliation silently
         return
@@ -434,25 +505,13 @@ def reconcile_in_progress_tasks(config: Config) -> None:
         print(f"Warning: Skipping task reconciliation due to unexpected error: {exc}", file=sys.stderr)
         return
 
+    workers_by_task_id = _running_workers_by_task_id(registry)
+
     for task in store.get_in_progress():
         task_label = f"{task.id}" if task.id is not None else "<unknown>"
         try:
-            is_dead = False
-            if task.running_pid is None:
-                # No PID tracked — mark as orphaned if the task was actually started.
-                if task.started_at is not None:
-                    is_dead = True
-                else:
-                    continue
-            elif task.running_pid <= 0:
-                is_dead = True
-            else:
-                try:
-                    os.kill(task.running_pid, 0)
-                except OSError:
-                    is_dead = True
-
-            if is_dead:
+            worker = workers_by_task_id.get(str(task.id)) if task.id is not None else None
+            if _task_worker_is_dead(task, worker, registry):
                 has_commits = _branch_has_commits(config, task.branch)
                 mark_task_failed_from_cause(
                     task=task,
@@ -464,6 +523,11 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                     has_commits=has_commits,
                     error_type=None,
                     exit_code=None,
+                )
+                _mark_worker_reconciled(
+                    registry,
+                    worker,
+                    completion_reason="watch reconciliation detected dead in-progress worker",
                 )
                 continue
 
@@ -496,6 +560,43 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                     error_type=None,
                     exit_code=None,
                 )
+                _mark_worker_reconciled(
+                    registry,
+                    worker,
+                    completion_reason="watch reconciliation marked in-progress worker NO_ACTIVITY",
+                )
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
+
+    for task_id, worker in workers_by_task_id.items():
+        task_label = task_id
+        try:
+            pending_task = store.get(task_id)
+            if pending_task is None or pending_task.status != "pending":
+                continue
+            if registry.is_running(worker.worker_id):
+                continue
+            if not _task_is_silent_past_timeout(config, pending_task, worker):
+                continue
+            has_commits = _branch_has_commits(config, pending_task.branch)
+            mark_task_failed_from_cause(
+                task=pending_task,
+                config=config,
+                store=store,
+                log_file=pending_task.log_file or worker.startup_log_file,
+                branch=pending_task.branch,
+                explicit_reason="NO_ACTIVITY",
+                has_commits=has_commits,
+                error_type=None,
+                exit_code=worker.exit_code,
+            )
+            _mark_worker_reconciled(
+                registry,
+                worker,
+                completion_reason="watch reconciliation detected dead pending worker with no activity",
+            )
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
         except Exception as exc:
@@ -503,7 +604,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
 
 
 def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
-    """Fail prepared recovery rows whose detached worker died before the row was claimed."""
+    """Fail prepared recovery rows whose worker already recorded a pre-claim startup failure."""
     try:
         store = get_store(config)
         registry = WorkerRegistry(config.workers_path)
@@ -519,9 +620,7 @@ def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
     for worker in registry.list_all(include_completed=True):
         if worker.task_id is None:
             continue
-        worker_dead = worker.status == "running" and not registry.is_running(worker.worker_id)
-        worker_failed = worker.status == "failed"
-        if not worker_dead and not worker_failed:
+        if worker.status != "failed":
             continue
 
         task_label = worker.task_id
@@ -530,8 +629,6 @@ def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
             if task is None or task.status != "pending":
                 continue
             if classify_recovery_row(store, task) not in {"resume", "retry"}:
-                continue
-            if not (worker_dead or worker_failed or worker.startup_log_file):
                 continue
 
             has_commits = _branch_has_commits(config, task.branch)
@@ -1332,6 +1429,8 @@ def _spawn_background_worker(
             worker_id=worker_id,
             task_id=task_id_for_child,
             pid=pid,
+            task_slug=selected_task.slug,
+            log_file=selected_task.log_file,
             startup_log_file=startup_log_rel,
             tmux_session=tmux_session,
         )
@@ -1379,12 +1478,18 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
                 break
 
     store = get_store(config)
+    task_claimed = False
 
     # Set up signal handlers for graceful shutdown
     def signal_handler(signum, frame):
         print("\nReceived shutdown signal, cleaning up...")
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=1, status="failed")
+            registry.mark_completed(
+                worker_id,
+                exit_code=1,
+                status="failed",
+                completion_reason="startup failure before task claim" if not task_claimed else None,
+            )
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1412,21 +1517,42 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         startup_task = store.get(explicit_task_id)
         if startup_task:
             startup_log_path = startup_log_path_for_task(config, startup_task)
+            if worker_id:
+                startup_meta = registry.get(worker_id)
+                registry.ensure_running(
+                    WorkerMetadata(
+                        worker_id=worker_id,
+                        task_id=startup_task.id,
+                        task_slug=startup_task.slug,
+                        pid=os.getpid(),
+                        log_file=startup_task.log_file,
+                        startup_log_file=startup_meta.startup_log_file if startup_meta else None,
+                    )
+                )
 
     def _on_task_claimed(claimed_task: DbTask) -> None:
         nonlocal startup_task
         nonlocal startup_log_path
         nonlocal startup_header_written
+        nonlocal task_claimed
 
         startup_task = claimed_task
+        task_claimed = True
         if startup_log_path is None:
             startup_log_path = startup_log_path_for_task(config, claimed_task)
 
-        if worker_id and claimed_task.id is not None:
+        if worker_id:
             meta = registry.get(worker_id)
-            if meta and meta.task_id != claimed_task.id:
-                meta.task_id = claimed_task.id
-                registry.update(meta)
+            registry.ensure_running(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=claimed_task.id,
+                    task_slug=claimed_task.slug,
+                    pid=os.getpid(),
+                    log_file=claimed_task.log_file,
+                    startup_log_file=meta.startup_log_file if meta else None,
+                )
+            )
 
         if startup_log_path and not startup_header_written:
             startup_log_path.write_text(
@@ -1457,7 +1583,12 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             rebase_exit_code = _auto_rebase_before_resume(config, explicit_run_task_id)
             if rebase_exit_code != 0:
                 if worker_id:
-                    registry.mark_completed(worker_id, exit_code=rebase_exit_code, status="failed")
+                    registry.mark_completed(
+                        worker_id,
+                        exit_code=rebase_exit_code,
+                        status="failed",
+                        completion_reason="startup failure before task claim",
+                    )
                 return rebase_exit_code
         run_kwargs: dict[str, Any] = {
             "resume": resume,
@@ -1474,7 +1605,12 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         # Update worker status on completion
         if worker_id:
             status = "completed" if exit_code == 0 else "failed"
-            registry.mark_completed(worker_id, exit_code=exit_code, status=status)
+            registry.mark_completed(
+                worker_id,
+                exit_code=exit_code,
+                status=status,
+                completion_reason="startup failure before task claim" if status == "failed" and not task_claimed else None,
+            )
 
         return exit_code
 
@@ -1502,7 +1638,12 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             with open(startup_log_path, "a") as f:
                 f.write(f"[{datetime.now(UTC).isoformat()}] worker crashed: {e}\n")
         if worker_id:
-            registry.mark_completed(worker_id, exit_code=1, status="failed")
+            registry.mark_completed(
+                worker_id,
+                exit_code=1,
+                status="failed",
+                completion_reason=None if task_claimed else "startup failure before task claim",
+            )
         return 1
     finally:
         if previous_worker_id is None:
@@ -1591,6 +1732,8 @@ def _spawn_background_resume_worker(
             worker_id=worker_id,
             task_id=task.id,
             pid=proc.pid,
+            task_slug=task.slug,
+            log_file=task.log_file,
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
@@ -1694,6 +1837,8 @@ def _spawn_background_iterate_worker(
             worker_id=worker_id,
             task_id=display_task.id,
             pid=proc.pid,
+            task_slug=display_task.slug,
+            log_file=display_task.log_file,
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)

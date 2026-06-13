@@ -5690,6 +5690,7 @@ def run(
         console.print("No pending tasks found")
         return 0
     requested_create_pr = bool(create_pr or task.create_pr)
+    ensure_task_log_path(config, store, task)
     if on_task_claimed is not None:
         on_task_claimed(task)
     if pr_retry_mode:

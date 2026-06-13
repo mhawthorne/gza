@@ -1500,7 +1500,7 @@ class TestLocalConfigOverrides:
         assert "max_concurrent" in result.stdout
         assert "Slots per `gza watch` pass reserved for worker-consuming failed-task recovery before pending pickup; `0` is pending-only." in result.stdout
         assert "Deprecated alias for `watch.recovery_slots`." in result.stdout
-        assert "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`." in result.stdout
+        assert "Seconds before watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`." in result.stdout
         assert (
             "Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5`."
             in result.stdout
@@ -1548,7 +1548,7 @@ class TestLocalConfigOverrides:
         assert "reserved for worker-consuming failed-task recovery" in keyed_entries["watch.recovery_slots"]["description"]
         assert "pending-only" in keyed_entries["watch.recovery_slots"]["description"]
         assert "Deprecated alias" in keyed_entries["watch.restart_failed_batch"]["description"]
-        assert "live-but-silent worker" in keyed_entries["watch.no_activity_timeout"]["description"]
+        assert "silent registered worker for a pending or in-progress task" in keyed_entries["watch.no_activity_timeout"]["description"]
         assert "explicitly configured `watch.batch` becomes the cap" in keyed_entries["max_concurrent"]["description"]
         assert "fallback remains `5`" in keyed_entries["max_concurrent"]["description"]
         assert "fixed bounded resume/retry policy" in keyed_entries["max_resume_attempts"]["description"]
