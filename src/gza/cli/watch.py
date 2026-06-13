@@ -567,6 +567,33 @@ def _refresh_watch_no_progress_after_state_change(
     refresh_watch_progress_after_state_change(store, candidate=candidate)
 
 
+def _recovery_action_evidence_changed(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task_before: DbTask | None,
+    action_task_after: DbTask | None,
+    failed_task: DbTask | None,
+) -> bool:
+    """Return whether the tracked recovery-child evidence changed across a reuse launch."""
+    previous_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task_before,
+        failed_task=failed_task,
+    )
+    refreshed_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task_after,
+        failed_task=failed_task,
+    )
+    return previous_candidate.evidence_fingerprint != refreshed_candidate.evidence_fingerprint
+
+
 def _resolve_recovery_action_task(
     store: SqliteTaskStore,
     *,
@@ -2616,13 +2643,24 @@ def _run_cycle(
         if rc != 0:
             continue
         refreshed_recovered_task = store.get(recovered_task_id)
-        _refresh_watch_no_progress_after_state_change(
-            store=store,
-            subject_task=failed,
-            action=recovery_action,
-            action_task=refreshed_recovered_task,
-            failed_task=failed,
-        )
+        if (
+            not decision.reuse_existing
+            or _recovery_action_evidence_changed(
+                store=store,
+                subject_task=failed,
+                action=recovery_action,
+                action_task_before=action_task,
+                action_task_after=refreshed_recovered_task,
+                failed_task=failed,
+            )
+        ):
+            _refresh_watch_no_progress_after_state_change(
+                store=store,
+                subject_task=failed,
+                action=recovery_action,
+                action_task=refreshed_recovered_task,
+                failed_task=failed,
+            )
         recovery_started_this_cycle = True
         started_task_ids.add(recovered_task_id)
         slots -= 1

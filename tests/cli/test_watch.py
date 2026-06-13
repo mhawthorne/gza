@@ -38,6 +38,7 @@ from gza.cli.watch import (
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
     _query_owner_rows,
+    _refresh_watch_no_progress_after_state_change,
     _resolve_watch_attention_display_task,
     _run_cycle,
     _should_reexec_watch,
@@ -9120,6 +9121,65 @@ def test_watch_cycle_reused_pending_recovery_liveness_transition_resets_no_progr
 
     text = log_path.read_text()
     assert "ATTENTION" not in text
+
+
+def test_watch_cycle_unchanged_reused_pending_recovery_spawn_does_not_refresh_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-reuse-unchanged"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery_child = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    recovery_child.session_id = failed.session_id
+    store.update(recovery_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    real_refresh = _refresh_watch_no_progress_after_state_change
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._refresh_watch_no_progress_after_state_change", wraps=real_refresh) as refresh_spy,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert refresh_spy.call_count == 0
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+    assert len(observations) == 1
+    assert observations[0].action_task_id == recovery_child.id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
 
 
 def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_path: Path) -> None:
