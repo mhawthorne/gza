@@ -4687,6 +4687,46 @@ class TestImplementCommand:
         assert impl_task.based_on is None
         assert impl_task.depends_on == plan_task.id
 
+    def test_implement_inherits_plan_tags_when_no_tag_override_supplied(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan authentication rollout", task_type="plan", tags=("202606-recovery", "v0.5.0"))
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
+        assert impl_task is not None
+        assert impl_task.tags == plan_task.tags
+
+    def test_implement_explicit_tag_override_replaces_inherited_plan_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan authentication rollout", task_type="plan", tags=("202606-recovery", "v0.5.0"))
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = run_gza(
+            "implement",
+            str(plan_task.id),
+            "--tag",
+            "manual-override",
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
+        assert impl_task is not None
+        assert impl_task.tags == ("manual-override",)
+
     def test_implement_clears_hold_for_review_after_creating_child(self, tmp_path: Path):
         """Manual implementation approval should release the plan hold once the child exists."""
 
@@ -18737,6 +18777,41 @@ class TestRecoveryTaskScopeCloning:
         retried = _create_retry_task(store, original, trigger_source="manual")
 
         assert retried.review_scope == original.review_scope
+
+    def test_resume_task_inherits_source_tags(self, tmp_path: Path):
+        from gza.cli._common import _create_resume_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        original.status = "failed"
+        original.session_id = "session-123"
+        store.update(original)
+
+        resumed = _create_resume_task(store, original, trigger_source="manual")
+
+        assert resumed.tags == original.tags
+
+    def test_retry_task_inherits_source_tags(self, tmp_path: Path):
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        original.status = "failed"
+        store.update(original)
+
+        retried = _create_retry_task(store, original, trigger_source="manual")
+
+        assert retried.tags == original.tags
 
 
 class TestAddCommandWithNoLearnings:

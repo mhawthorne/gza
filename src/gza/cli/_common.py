@@ -49,6 +49,7 @@ from ..db import (
     task_id_numeric_key,
     task_owns_merge_status,
 )
+from ..derived_tags import resolve_derived_task_tags
 from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
 from ..lineage import resolve_impl_task
@@ -1746,6 +1747,7 @@ def _create_rebase_task(
             if parent_task is not None
             else None
         ),
+        tags=resolve_derived_task_tags(parent_task) if parent_task is not None else (),
         skip_learnings=True,
         trigger_source=trigger_source,
     )
@@ -2134,7 +2136,7 @@ def _create_improve_task(
         depends_on=review_task.id if review_task is not None else None,
         based_on=based_on_id,
         same_branch=True,
-        tags=impl_task.tags,
+        tags=resolve_derived_task_tags(impl_task),
         review_scope=_resolved_review_scope_metadata(impl_task),
         create_review=create_review,
         create_pr=create_pr,
@@ -2347,7 +2349,7 @@ def _create_implementation_task_from_source(
         prompt=prompt,
         task_type="implement",
         depends_on=source_task.id,
-        tags=source_task.tags if tags is None else tags,
+        tags=resolve_derived_task_tags(source_task, explicit_tags=tags),
         review_scope=review_scope if review_scope is not None else _resolved_review_scope_metadata(source_task),
         create_review=create_review,
         create_pr=create_pr,
@@ -2593,7 +2595,7 @@ def _create_resume_task(
     new_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
-        tags=original_task.tags,
+        tags=resolve_derived_task_tags(original_task),
         spec=original_task.spec,
         review_scope=original_task.review_scope,
         depends_on=original_task.depends_on,
@@ -2646,7 +2648,7 @@ def _create_retry_task(
     retry_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
-        tags=original_task.tags,
+        tags=resolve_derived_task_tags(original_task),
         spec=original_task.spec,
         review_scope=original_task.review_scope,
         depends_on=original_task.depends_on,

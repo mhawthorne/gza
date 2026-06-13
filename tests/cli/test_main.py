@@ -606,11 +606,14 @@ class TestHelpOutput:
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "use 'uv run gza queue --tag TAG' to preview matching recovery candidates plus pending pickup order" in watch_text
+        assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_text
         assert "pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'" in queue_text
+        assert "queue reports the blocker without starting it" in queue_text
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
         assert "Only list recovery and pending lanes matching tag filters" in docs_text
         assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in docs_text
+        assert "if a matching lineage is blocked by an out-of-scope derived child, queue reports the blocker without starting it" in docs_text
         assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_recovery_lane_flags(self, tmp_path):

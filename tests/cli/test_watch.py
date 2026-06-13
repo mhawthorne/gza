@@ -3537,6 +3537,304 @@ def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
     assert "INFO      scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
 
 
+def test_watch_cycle_reports_out_of_scope_runnable_child_without_starting_it(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add(
+        "Scoped recovery owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Out of scope implement child",
+        task_type="implement",
+        based_on=plan.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert plan.id in log_text
+    assert child.id in log_text
+    assert f"START     {child.id}" not in log_text
+
+
+def test_watch_cycle_reports_depends_on_only_out_of_scope_runnable_child_without_starting_it(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    explore = store.add(
+        "Scoped recovery owner",
+        task_type="explore",
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert explore.id is not None
+    explore.status = "completed"
+    explore.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(explore)
+
+    child = store.add(
+        "Out of scope implement child",
+        task_type="implement",
+        depends_on=explore.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert explore.id in log_text
+    assert child.id in log_text
+    assert f"START     {child.id}" not in log_text
+
+
+def test_watch_cycle_reports_blocked_out_of_scope_pending_child_without_starting_it(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    blocked_by = store.add("Blocking dependency")
+    assert blocked_by.id is not None
+
+    plan = store.add(
+        "Scoped recovery owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Blocked out of scope implement child",
+        task_type="implement",
+        based_on=plan.id,
+        depends_on=blocked_by.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert plan.id in log_text
+    assert child.id in log_text
+    assert "blocked implement" in log_text
+    assert f"START     {child.id}" not in log_text
+
+
+def test_watch_cycle_reports_failed_owner_with_out_of_scope_resume_child_without_starting_it(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add(
+        "Scoped failed implementation",
+        task_type="implement",
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert failed.id is not None
+    store.mark_failed(failed, "timed out")
+
+    resume_child = store.add(
+        "Pre-existing out of scope resume child",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="resume",
+        tags=("v0.5.0",),
+    )
+    assert resume_child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert failed.id in log_text
+    assert resume_child.id in log_text
+    assert f"START     {resume_child.id}" not in log_text
+
+
+def test_watch_cycle_does_not_warn_when_depends_on_only_child_inherits_scope_tag(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    explore = store.add(
+        "Scoped recovery owner",
+        task_type="explore",
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert explore.id is not None
+    explore.status = "completed"
+    explore.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(explore)
+
+    child = store.add(
+        "Inherited scope implement child",
+        task_type="implement",
+        depends_on=explore.id,
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" not in log_text
+    assert f"START     {child.id}" in log_text
+
+
+def test_watch_cycle_does_not_warn_when_runnable_scoped_owner_has_out_of_scope_dependent_child(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add(
+        "Scoped runnable owner",
+        task_type="implement",
+        tags=("202606-recovery",),
+    )
+    assert owner.id is not None
+
+    child = store.add(
+        "Out of scope dependent child",
+        task_type="review",
+        depends_on=owner.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" not in log_text
+    assert f"START     {owner.id}" in log_text
+    assert child.id not in log_text
+
+
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
     """batch=2 should still schedule one task when one iterate process is active."""
     setup_config(tmp_path)
