@@ -3191,6 +3191,54 @@ class TestQueueCommand:
         assert child.id in result.stdout
         assert "out-of-scope child" in result.stdout
 
+    def test_queue_tag_scope_reports_owner_missing_from_lineage_projection(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        unrelated = store.add(
+            "Visible scoped pending task",
+            task_type="implement",
+            tags=("202606-recovery",),
+        )
+        assert unrelated.id is not None
+
+        plan = store.add(
+            "Scoped owner hidden from owner rows",
+            task_type="plan",
+            tags=("202606-recovery", "v0.5.0"),
+            auto_implement=False,
+        )
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+        store.update(plan)
+
+        child = store.add(
+            "Out of scope implement child",
+            task_type="implement",
+            based_on=plan.id,
+            tags=("v0.5.0",),
+        )
+        assert child.id is not None
+
+        result = run_gza(
+            "queue",
+            "--tag",
+            "202606-recovery",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert unrelated.id in result.stdout
+        assert "Scope gap:" in result.stdout
+        assert plan.id in result.stdout
+        assert child.id in result.stdout
+        assert "out-of-scope child" in result.stdout
+
     def test_queue_tag_scope_reports_blocked_out_of_scope_pending_child(
         self,
         tmp_path: Path,
@@ -3236,6 +3284,55 @@ class TestQueueCommand:
         assert child.id in result.stdout
         assert "out-of-scope child" in result.stdout
         assert "blocked implement" in result.stdout
+
+    def test_queue_tag_scope_reports_independent_out_of_scope_child_even_with_runnable_in_scope_sibling(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add(
+            "Scoped owner",
+            task_type="plan",
+            tags=("202606-recovery", "v0.5.0"),
+            auto_implement=False,
+        )
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+        store.update(plan)
+
+        in_scope_child = store.add(
+            "Runnable in-scope child",
+            task_type="implement",
+            based_on=plan.id,
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        assert in_scope_child.id is not None
+
+        out_of_scope_child = store.add(
+            "Independent out-of-scope child",
+            task_type="review",
+            based_on=plan.id,
+            tags=("v0.5.0",),
+        )
+        assert out_of_scope_child.id is not None
+
+        result = run_gza(
+            "queue",
+            "--tag",
+            "202606-recovery",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert in_scope_child.id in result.stdout
+        assert "Scope gap:" in result.stdout
+        assert plan.id in result.stdout
+        assert out_of_scope_child.id in result.stdout
+        assert "out-of-scope child" in result.stdout
 
     def test_queue_tag_scope_reports_failed_owner_with_out_of_scope_retry_child(
         self,

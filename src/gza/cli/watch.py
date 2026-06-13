@@ -44,9 +44,11 @@ from ..recovery_engine import (
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
+    ScopedTagScopeGap,
     TaskQueryPresets,
     TaskQueryService,
     TaskRow,
+    collect_scoped_tag_scope_gaps,
     normalize_tag_filters,
     task_matches_tag_filters,
 )
@@ -1112,14 +1114,6 @@ class _ObservedFailure:
     reason: str
 
 
-@dataclass(frozen=True)
-class _ScopedScopeGap:
-    owner_task: DbTask
-    blocking_task: DbTask
-    blocking_state: str
-    missing_tags: tuple[str, ...]
-
-
 @dataclass
 class _RecoveryReport:
     actionable_count: int
@@ -1181,143 +1175,35 @@ def _task_matches_tags(
     return task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized_tags, any_tag=any_tag)
 
 
-def _missing_scope_tags_for_task(
-    task: DbTask,
-    *,
-    tags: tuple[str, ...] | None,
-    any_tag: bool,
-) -> tuple[str, ...]:
-    normalized_tags = normalize_tag_filters(tags)
-    if normalized_tags is None:
-        return ()
-    if any_tag:
-        return normalized_tags
-    task_tag_values = set(task.tags)
-    return tuple(tag for tag in normalized_tags if tag not in task_tag_values)
-
-
-def _collect_scoped_scope_gaps(
-    store: SqliteTaskStore,
-    *,
-    tags: tuple[str, ...] | None,
-    any_tag: bool,
-) -> list[_ScopedScopeGap]:
-    normalized_tags = normalize_tag_filters(tags)
-    if normalized_tags is None:
-        return []
-
-    def _owner_has_in_scope_runnable_work(owner: DbTask) -> bool:
-        owner_id = owner.id
-        if owner_id is None or owner.task_type == "internal":
-            return False
-        if task_matches_tag_filters(
-            task_tags=owner.tags,
-            tag_filters=normalized_tags,
-            any_tag=any_tag,
-        ):
-            if owner.status == "in_progress":
-                return True
-            if owner.status == "pending" and not store.is_task_blocked(owner)[0]:
-                return True
-        for task in lineage.walk_lineage_descendants(store, owner):
-            if task.id is None or task.task_type == "internal":
-                continue
-            if not task_matches_tag_filters(
-                task_tags=task.tags,
-                tag_filters=normalized_tags,
-                any_tag=any_tag,
-            ):
-                continue
-            if task.status == "in_progress":
-                return True
-            if task.status == "pending" and not store.is_task_blocked(task)[0]:
-                return True
-        return False
-
-    gaps: list[_ScopedScopeGap] = []
-    seen_blocking_task_ids: set[str] = set()
-    for owner in sorted(
-        store.get_all(),
-        key=lambda task: (task.created_at or datetime.min.replace(tzinfo=UTC), task_id_numeric_key(task.id or "")),
-    ):
-        owner_id = owner.id
-        if owner_id is None or owner.task_type == "internal" or owner.status == "dropped":
-            continue
-        if not task_matches_tag_filters(
-            task_tags=owner.tags,
-            tag_filters=normalized_tags,
-            any_tag=any_tag,
-        ):
-            continue
-        if _owner_has_in_scope_runnable_work(owner):
-            continue
-
-        matching_gap: _ScopedScopeGap | None = None
-        for task in sorted(
-            lineage.walk_lineage_descendants(store, owner),
-            key=lambda member: (
-                0 if member.status == "in_progress" else 1,
-                task_id_numeric_key(member.id or ""),
-            ),
-        ):
-            task_id = task.id
-            if (
-                task_id is None
-                or task_id == owner_id
-                or task_id in seen_blocking_task_ids
-                or task.task_type == "internal"
-            ):
-                continue
-            if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized_tags, any_tag=any_tag):
-                continue
-            if task.status == "in_progress":
-                blocking_state = "running"
-            elif task.status == "pending":
-                blocking_state = "blocked" if store.is_task_blocked(task)[0] else "runnable"
-            else:
-                continue
-            matching_gap = _ScopedScopeGap(
-                owner_task=owner,
-                blocking_task=task,
-                blocking_state=blocking_state,
-                missing_tags=_missing_scope_tags_for_task(task, tags=normalized_tags, any_tag=any_tag),
-            )
-            break
-        if matching_gap is not None:
-            blocking_task_id = matching_gap.blocking_task.id
-            if blocking_task_id is not None:
-                seen_blocking_task_ids.add(blocking_task_id)
-            gaps.append(matching_gap)
-    return gaps
-
-
 def _format_scope_gap_message(
-    gap: _ScopedScopeGap,
+    gap: ScopedTagScopeGap,
     *,
     tags: tuple[str, ...] | None,
     any_tag: bool,
 ) -> str:
     mode = "any" if any_tag else "all"
-    blocker_id = gap.blocking_task.id or "unknown"
-    owner_id = gap.owner_task.id or "unknown"
-    blocker_tags = ",".join(gap.blocking_task.tags) if gap.blocking_task.tags else "-"
-    missing = ",".join(gap.missing_tags) if gap.missing_tags else "-"
-    if gap.missing_tags:
-        hint_tags = gap.missing_tags if not any_tag else gap.missing_tags[:1]
-        hint_flags = " ".join(f"--add-tag {tag}" for tag in hint_tags)
-        hint = f"hint: `uv run gza edit {blocker_id} {hint_flags}` or broaden the scope"
+    owner_id = getattr(gap, "owner_id", "unknown")
+    blocker_id = getattr(gap, "blocking_child_id", "unknown")
+    blocker_tags_value = getattr(gap, "child_tags", ())
+    blocker_tags = ",".join(blocker_tags_value) if blocker_tags_value else "-"
+    missing_tags = getattr(gap, "missing_filter_tags", ())
+    missing = ",".join(missing_tags) if missing_tags else "-"
+    suggested_next_command = getattr(gap, "suggested_next_command", "uv run gza watch")
+    if missing_tags:
+        hint = f"hint: `{suggested_next_command}` or broaden the scope"
     else:
         hint = "hint: broaden the scope"
     return (
         f"{owner_id} is blocked by out-of-scope child {blocker_id} "
-        f"({gap.blocking_state} {gap.blocking_task.task_type}, tags={blocker_tags}, "
+        f"({getattr(gap, 'blocking_state', 'blocked')} {getattr(gap, 'child_task_type', 'task')}, "
+        f"status={getattr(gap, 'child_status', 'unknown')}, tags={blocker_tags}, "
         f"scope_mode={mode}, missing_scope={missing}); watch/queue will not start it. {hint}"
     )
 
 
 def _print_queue_scope_gaps(
     *,
-    gaps: Sequence[_ScopedScopeGap],
+    gaps: Sequence[ScopedTagScopeGap],
     tags: tuple[str, ...] | None,
     any_tag: bool,
 ) -> None:
@@ -1619,15 +1505,16 @@ def _run_cycle(
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
     git = Git(config.project_dir)
     target_branch = git.default_branch()
-    for gap in _collect_scoped_scope_gaps(
+    for gap in collect_scoped_tag_scope_gaps(
         store,
-        tags=tags,
+        tag_filters=tags,
         any_tag=any_tag,
+        config=config,
+        git=git,
+        target_branch=target_branch,
     ):
-        blocker_id = gap.blocking_task.id or "unknown"
-        owner_id = gap.owner_task.id or "unknown"
         log.emit_attention(
-            attention_key=f"scope-gap:{owner_id}:{blocker_id}",
+            attention_key=f"scope-gap:{gap.owner_id}:{gap.blocking_child_id}",
             message=_format_scope_gap_message(gap, tags=tags, any_tag=any_tag),
         )
     impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
@@ -3164,10 +3051,15 @@ def cmd_queue(args: argparse.Namespace) -> int:
         return 1
 
     normalized_tag_filters = normalize_tag_filters(tag_filters)
-    scope_gaps = _collect_scoped_scope_gaps(
+    queue_git = Git(config.project_dir)
+    queue_target_branch = queue_git.default_branch()
+    scope_gaps = collect_scoped_tag_scope_gaps(
         store,
-        tags=normalized_tag_filters,
+        tag_filters=normalized_tag_filters,
         any_tag=any_tag,
+        config=config,
+        git=queue_git,
+        target_branch=queue_target_branch,
     )
 
     if action in {"bump", "unbump", "move", "next", "clear"}:
