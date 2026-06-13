@@ -48,6 +48,7 @@ from ..db import (
     task_id_numeric_key,
     validate_prompt,
 )
+from ..derived_tags import resolve_derived_task_tags
 from ..extractions import (
     ExtractionDraft,
     ExtractionError,
@@ -3186,7 +3187,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         same_branch=True,
         review_scope=_resolved_review_scope_metadata(impl_task),
         create_review=create_review,
-        tags=impl_task.tags,
+        tags=resolve_derived_task_tags(impl_task),
         model=args.model if hasattr(args, "model") and args.model else None,
         provider=args.provider if hasattr(args, "provider") and args.provider else None,
         trigger_source="manual",

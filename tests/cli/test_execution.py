@@ -6759,6 +6759,27 @@ class TestFixCommand:
         assert fix_task.same_branch is True
         assert fix_task.group == "infra"
 
+    def test_fix_inherits_parent_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add(
+            "Add retries",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-retries"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        fix_tasks = [t for t in store.get_all() if t.task_type == "fix"]
+        assert len(fix_tasks) == 1
+        assert fix_tasks[0].tags == impl_task.tags
+
     def test_fix_inherits_resolved_scope_and_re_reviews_stay_scoped(self, tmp_path: Path):
         """Fix tasks created from legacy sliced implementations must preserve the review scope."""
         from gza.cli.execution import cmd_fix

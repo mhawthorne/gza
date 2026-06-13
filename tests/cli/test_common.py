@@ -6,6 +6,8 @@ import pytest
 from gza.cli._common import (
     _build_failure_diagnostics,
     _create_improve_task,
+    _create_plan_improve_task,
+    _create_plan_review_task,
     _create_rebase_task,
     _extract_last_agent_message_for_failure,
     _failure_next_steps,
@@ -204,6 +206,44 @@ class TestRunWithResume:
 
 
 class TestDerivedTaskReviewScopePropagation:
+    def test_create_plan_review_task_inherits_parent_tags(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add(
+            "Plan scoped slice",
+            task_type="plan",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+
+        plan_review_task = _create_plan_review_task(
+            store,
+            plan_task,
+            trigger_source="manual",
+        )
+
+        assert plan_review_task.tags == plan_task.tags
+
+    def test_create_plan_improve_task_inherits_parent_tags(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add(
+            "Plan scoped slice",
+            task_type="plan",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        review_task = store.add(
+            "Review scoped slice",
+            task_type="plan_review",
+            depends_on=plan_task.id,
+        )
+
+        plan_improve_task = _create_plan_improve_task(
+            store,
+            plan_task,
+            review_task,
+            trigger_source="manual",
+        )
+
+        assert plan_improve_task.tags == plan_task.tags
+
     def test_create_improve_task_inherits_parent_tags(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(
