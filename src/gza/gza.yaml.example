@@ -345,7 +345,8 @@ project_name: my-project
 #   Default review/improve loop cap in `gza watch`.
 #   Default: 10
 #   max_iterations: 10
-#   Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`.
+#   Seconds before watch reconciliation marks a silent registered worker for a pending or in-
+#   progress task `NO_ACTIVITY`.
 #   Default: 60
 #   no_activity_timeout: 60
 #   Repeated unchanged watch-action cycles before the subject is parked for manual attention.

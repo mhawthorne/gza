@@ -3745,8 +3745,11 @@ class TestBackgroundWorkerCommand:
         workers = registry.list_all(include_completed=True)
         assert len(workers) == 1
         worker = workers[0]
+        refreshed_task = store.get(task.id)
+        assert refreshed_task is not None
         assert worker.startup_log_file == f".gza/workers/{worker.worker_id}-startup.log"
-        assert worker.log_file is None
+        assert worker.log_file == refreshed_task.log_file
+        assert worker.task_slug == refreshed_task.slug
         assert (tmp_path / worker.startup_log_file).exists()
 
     def test_work_background_existing_task_startup_failure_surfaces_before_detach(self, tmp_path: Path):
@@ -4293,8 +4296,8 @@ class TestReconciliation:
         assert refreshed is not None
         assert refreshed.status == "in_progress"
 
-    def test_reconciliation_terminalizes_dead_pending_recovery_task(self, tmp_path: Path):
-        """Dead detached workers for pending recovery rows should consume a bounded recovery attempt."""
+    def test_reconciliation_leaves_recent_dead_pending_recovery_worker_pending(self, tmp_path: Path):
+        """Dead running recovery workers younger than the no-activity threshold must remain pending."""
         from gza.cli._common import reconcile_dead_pending_recovery_tasks
         from gza.config import Config
         from gza.workers import WorkerMetadata, WorkerRegistry
@@ -4326,6 +4329,56 @@ class TestReconciliation:
                 worker_id="w-dead-recovery",
                 task_id=retry_child.id,
                 pid=999999,
+                status="running",
+                startup_log_file=".gza/workers/retry-child.startup.log",
+            )
+        )
+
+        reconcile_dead_pending_recovery_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+
+        worker = registry.get("w-dead-recovery")
+        assert worker is not None
+        assert worker.status == "running"
+        assert worker.completion_reason is None
+
+    def test_reconciliation_terminalizes_failed_pending_recovery_start_failure(self, tmp_path: Path):
+        """Failed pre-claim recovery workers should still terminalize the prepared child immediately."""
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.status = "pending"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-failed-recovery",
+                task_id=retry_child.id,
+                pid=999999,
+                status="failed",
                 startup_log_file=".gza/workers/retry-child.startup.log",
             )
         )
@@ -4338,14 +4391,153 @@ class TestReconciliation:
         assert refreshed.failure_reason == "WORKER_DIED"
         assert refreshed.log_file == ".gza/workers/retry-child.startup.log"
 
-        worker = registry.get("w-dead-recovery")
+        worker = registry.get("w-failed-recovery")
         assert worker is not None
         assert worker.status == "failed"
         assert worker.completion_reason == "startup failure before task claim"
 
+    def test_reconciliation_fails_silent_pending_task_with_dead_registered_worker(self, tmp_path: Path):
+        """Pending tasks with dead registered workers past the silence timeout should fail NO_ACTIVITY."""
+        import os
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Pending task with stale worker")
+        assert task.id is not None
+        task.running_pid = 12345
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        config.watch.no_activity_timeout = 1
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-pending",
+                task_id=task.id,
+                pid=os.getpid(),
+                started_at=(datetime.now(UTC) - timedelta(seconds=90)).isoformat(),
+                status="running",
+            )
+        )
+
+        with patch("gza.cli._common.WorkerRegistry.is_running", return_value=False):
+            reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "NO_ACTIVITY"
+        assert refreshed.running_pid is None
+        assert refreshed.completed_at is not None
+
+        worker = registry.get("w-dead-pending")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "watch reconciliation detected dead pending worker with no activity"
+        assert all(running.worker_id != "w-dead-pending" for running in registry.list_all())
+
+    def test_reconciliation_fails_silent_pending_recovery_task_with_stale_logs(self, tmp_path: Path):
+        """Pending recovery rows with dead running workers and stale startup/task logs should fail NO_ACTIVITY."""
+        import os
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.log_file = ".gza/logs/retry-child.log"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        config.watch.no_activity_timeout = 1
+        registry = WorkerRegistry(config.workers_path)
+        stale_started_at = datetime.now(UTC) - timedelta(seconds=90)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-pending-recovery",
+                task_id=retry_child.id,
+                pid=os.getpid(),
+                started_at=stale_started_at.isoformat(),
+                status="running",
+                startup_log_file=".gza/workers/retry-child.startup.log",
+            )
+        )
+        startup_log = tmp_path / ".gza" / "workers" / "retry-child.startup.log"
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("startup evidence\n")
+        task_log = tmp_path / ".gza" / "logs" / "retry-child.log"
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        task_log.write_text("task evidence\n")
+        stale_mtime = stale_started_at.timestamp()
+        os.utime(startup_log, (stale_mtime, stale_mtime))
+        os.utime(task_log, (stale_mtime, stale_mtime))
+
+        with patch("gza.cli._common.WorkerRegistry.is_running", return_value=False):
+            reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "NO_ACTIVITY"
+        assert refreshed.log_file == ".gza/logs/retry-child.log"
+
+        worker = registry.get("w-dead-pending-recovery")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "watch reconciliation detected dead pending worker with no activity"
+
+    def test_reconciliation_leaves_plain_pending_task_without_registered_worker_runnable(self, tmp_path: Path):
+        """Ordinary pending queue items with no worker registry entry must remain pending."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Plain pending task")
+        assert task.id is not None
+        task.running_pid = 54321
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        config.watch.no_activity_timeout = 1
+
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.running_pid == 54321
+
     def test_prune_terminal_dead_workers_removes_completed_task_worker(self, tmp_path: Path):
         """Terminal task workers with dead PIDs should be pruned from the registry."""
-        import subprocess
+        import os
+        from unittest.mock import patch
 
         from gza.cli._common import prune_terminal_dead_workers
         from gza.config import Config
@@ -4359,24 +4551,20 @@ class TestReconciliation:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        # Use a PID known to be dead: start a process, wait for it to exit, then use its PID.
-        proc = subprocess.Popen(["true"])
-        proc.wait()
-        dead_pid = proc.pid
-
         config = Config.load(tmp_path)
         registry = WorkerRegistry(config.workers_path)
         registry.register(
             WorkerMetadata(
                 worker_id="w-prune-terminal",
                 task_id=task.id,
-                pid=dead_pid,
+                pid=os.getpid(),
                 status="running",
             )
         )
         assert registry.get("w-prune-terminal") is not None
 
-        prune_terminal_dead_workers(config)
+        with patch("gza.cli._common.WorkerRegistry.is_running", return_value=False):
+            prune_terminal_dead_workers(config)
 
         assert registry.get("w-prune-terminal") is None
 
@@ -4686,6 +4874,46 @@ class TestImplementCommand:
         assert impl_task.prompt == f"Implement plan from task {plan_task.id}: plan-auth-migration"
         assert impl_task.based_on is None
         assert impl_task.depends_on == plan_task.id
+
+    def test_implement_inherits_plan_tags_when_no_tag_override_supplied(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan authentication rollout", task_type="plan", tags=("202606-recovery", "v0.5.0"))
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
+        assert impl_task is not None
+        assert impl_task.tags == plan_task.tags
+
+    def test_implement_explicit_tag_override_replaces_inherited_plan_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan authentication rollout", task_type="plan", tags=("202606-recovery", "v0.5.0"))
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = run_gza(
+            "implement",
+            str(plan_task.id),
+            "--tag",
+            "manual-override",
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
+        assert impl_task is not None
+        assert impl_task.tags == ("manual-override",)
 
     def test_implement_clears_hold_for_review_after_creating_child(self, tmp_path: Path):
         """Manual implementation approval should release the plan hold once the child exists."""
@@ -6718,6 +6946,27 @@ class TestFixCommand:
         assert fix_task.depends_on == review2.id
         assert fix_task.same_branch is True
         assert fix_task.group == "infra"
+
+    def test_fix_inherits_parent_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add(
+            "Add retries",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        impl_task.status = "completed"
+        impl_task.branch = "test-project/20260129-add-retries"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        fix_tasks = [t for t in store.get_all() if t.task_type == "fix"]
+        assert len(fix_tasks) == 1
+        assert fix_tasks[0].tags == impl_task.tags
 
     def test_fix_inherits_resolved_scope_and_re_reviews_stay_scoped(self, tmp_path: Path):
         """Fix tasks created from legacy sliced implementations must preserve the review scope."""
@@ -18198,6 +18447,47 @@ class TestRunAsWorker:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.exit_code == 1
+        assert worker.completion_reason == "startup failure before task claim"
+
+    def test_run_as_worker_claim_updates_registry_with_task_log_evidence(self, tmp_path: Path):
+        """Claim callback should persist task/log evidence to the worker registry immediately."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker claim metadata")
+        assert task.id is not None
+        task.log_file = ".gza/logs/worker-claim.log"
+        store.update(task)
+
+        registry = self._register_current_worker(config, task.id, "w-worker-claim-log")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        def fake_run(
+            _config,
+            task_id=None,
+            resume=False,
+            open_after=False,
+            skip_precondition_check=False,
+            on_task_claimed=None,
+        ):
+            assert task_id == task.id
+            claimed = store.get(task.id)
+            assert claimed is not None
+            if on_task_claimed is not None:
+                on_task_claimed(claimed)
+            return 0
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", side_effect=fake_run):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 0
+        worker = registry.get("w-worker-claim-log")
+        assert worker is not None
+        assert worker.status == "completed"
+        assert worker.task_id == task.id
+        assert worker.task_slug == task.slug
+        assert worker.log_file == ".gza/logs/worker-claim.log"
 
     def test_run_as_worker_exception_marks_failed_and_ps_shows_startup_failure(self, tmp_path: Path):
         """Exception cleanup keeps worker/task failed and startup failure visible in ps rows."""
@@ -18270,6 +18560,40 @@ class TestRunAsWorker:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.exit_code == 1
+
+    def test_run_as_worker_signal_before_task_claim_marks_startup_failure(self, tmp_path: Path):
+        """Signal cleanup before task claim should not raise an unbound-local error."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker signal before claim")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-signal-preclaim")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        installed_handlers: dict[int, object] = {}
+
+        def capture_signal(signum, handler):
+            installed_handlers[signum] = handler
+            if signum == signal_mod.SIGINT:
+                sigterm = installed_handlers.get(signal_mod.SIGTERM)
+                assert callable(sigterm)
+                sigterm(signal_mod.SIGTERM, None)
+            return None
+
+        with patch("gza.cli.signal.signal", side_effect=capture_signal):
+            with patch("gza.cli.run") as mock_run:
+                with pytest.raises(SystemExit) as exc:
+                    _run_as_worker(args, config)
+
+        assert exc.value.code == 1
+        mock_run.assert_not_called()
+        worker = registry.get("w-worker-signal-preclaim")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
+        assert worker.completion_reason == "startup failure before task claim"
 
     def test_run_as_worker_backfills_task_id_after_no_id_claim(self, tmp_path: Path):
         """No-id worker mode updates worker metadata with the claimed DB task ID."""
@@ -18737,6 +19061,41 @@ class TestRecoveryTaskScopeCloning:
         retried = _create_retry_task(store, original, trigger_source="manual")
 
         assert retried.review_scope == original.review_scope
+
+    def test_resume_task_inherits_source_tags(self, tmp_path: Path):
+        from gza.cli._common import _create_resume_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        original.status = "failed"
+        original.session_id = "session-123"
+        store.update(original)
+
+        resumed = _create_resume_task(store, original, trigger_source="manual")
+
+        assert resumed.tags == original.tags
+
+    def test_retry_task_inherits_source_tags(self, tmp_path: Path):
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        original.status = "failed"
+        store.update(original)
+
+        retried = _create_retry_task(store, original, trigger_source="manual")
+
+        assert retried.tags == original.tags
 
 
 class TestAddCommandWithNoLearnings:

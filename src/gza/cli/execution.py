@@ -48,6 +48,7 @@ from ..db import (
     task_id_numeric_key,
     validate_prompt,
 )
+from ..derived_tags import resolve_derived_task_tags
 from ..extractions import (
     ExtractionDraft,
     ExtractionError,
@@ -460,6 +461,13 @@ def _selected_tag_filters(args: argparse.Namespace) -> tuple[tuple[str, ...] | N
 def _selected_tags_for_new_task(args: argparse.Namespace) -> tuple[str, ...]:
     tags, _any_tag = parse_cli_tag_filters(args)
     return tags or ()
+
+
+def _selected_tag_override_for_derived_task(
+    args: argparse.Namespace,
+) -> tuple[str, ...] | None:
+    """Return explicit derived-task tag override, preserving omission as ``None``."""
+    return parse_cli_tag_filters(args)[0]
 
 
 def _extract_run_args(args: argparse.Namespace, task_ids: list[str]) -> argparse.Namespace:
@@ -1404,7 +1412,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         return phase1_error(args, f"Task {plan_task.id} is {plan_task.status}. Plan task must be completed.")
 
     try:
-        tags = _selected_tags_for_new_task(args)
+        tags = _selected_tag_override_for_derived_task(args)
     except ValueError as exc:
         return phase1_error(args, str(exc))
     create_review = args.review if hasattr(args, 'review') and args.review else False
@@ -3179,7 +3187,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         same_branch=True,
         review_scope=_resolved_review_scope_metadata(impl_task),
         create_review=create_review,
-        tags=impl_task.tags,
+        tags=resolve_derived_task_tags(impl_task),
         model=args.model if hasattr(args, "model") and args.model else None,
         provider=args.provider if hasattr(args, "provider") and args.provider else None,
         trigger_source="manual",

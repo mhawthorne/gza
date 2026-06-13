@@ -1191,6 +1191,7 @@ def _skip_decision(
     reason_text: str,
     attempt_index: int,
     attempt_limit: int,
+    recovery_task_id: str | None = None,
 ) -> FailedRecoveryDecision:
     return FailedRecoveryDecision(
         task_id=task_id,
@@ -1200,7 +1201,18 @@ def _skip_decision(
         launch_mode="none",
         attempt_index=attempt_index,
         attempt_limit=attempt_limit,
+        recovery_task_id=recovery_task_id,
     )
+
+
+def _single_descendant_id_with_status(tasks: list[DbTask], *, status: str) -> str | None:
+    matching_ids = sorted(
+        {task.id for task in tasks if task.status == status and task.id is not None},
+        key=task_id_numeric_key,
+    )
+    if len(matching_ids) != 1:
+        return None
+    return matching_ids[0]
 
 
 def decide_failed_task_recovery(
@@ -1439,6 +1451,7 @@ def decide_failed_task_recovery(
                 reason_text=reason_text,
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
+                recovery_task_id=_single_descendant_id_with_status(recovery_children, status=status),
             )
     for status, reason_code, reason_text in _DESCENDANT_SUPERSEDED_REASONS:
         if any(child.status == status for child in deeper_descendants):
@@ -1448,6 +1461,7 @@ def decide_failed_task_recovery(
                 reason_text=reason_text,
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
+                recovery_task_id=_single_descendant_id_with_status(deeper_descendants, status=status),
             )
     unresolved_terminals = _list_unresolved_recovery_terminal_descendants(snapshot)
     matching_failed_terminals = _matching_failed_terminal_descendants(
@@ -1508,6 +1522,7 @@ def decide_failed_task_recovery(
             reason_text="recovery child already pending",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
+            recovery_task_id=_single_descendant_id_with_status(all_pending_children, status="pending"),
         )
     reason_text = "dependency merge prerequisite now satisfied"
     if reason != "PREREQUISITE_UNMERGED":

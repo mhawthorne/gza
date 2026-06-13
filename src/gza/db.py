@@ -605,6 +605,8 @@ class WatchProgressObservation:
     subject_task_id: str | None = None
     action_task_id: str | None = None
     action_task_status: str | None = None
+    action_task_started_at: datetime | None = None
+    action_task_running_pid: int | None = None
     failed_task_id: str | None = None
     recovery_task_id: str | None = None
     merge_unit_id: str | None = None
@@ -814,6 +816,8 @@ CREATE TABLE IF NOT EXISTS watch_progress_observations (
     subject_task_id TEXT,
     action_task_id TEXT,
     action_task_status TEXT,
+    action_task_started_at TEXT,
+    action_task_running_pid INTEGER,
     failed_task_id TEXT,
     recovery_task_id TEXT,
     merge_unit_id TEXT,
@@ -910,6 +914,8 @@ CREATE TABLE IF NOT EXISTS watch_progress_observations (
     subject_task_id TEXT,
     action_task_id TEXT,
     action_task_status TEXT,
+    action_task_started_at TEXT,
+    action_task_running_pid INTEGER,
     failed_task_id TEXT,
     recovery_task_id TEXT,
     merge_unit_id TEXT,
@@ -932,8 +938,14 @@ ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT;
 ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT;
 """
 
+# Migration from v52 to v53: persist watch action-task liveness evidence
+MIGRATION_V52_TO_V53 = """
+ALTER TABLE watch_progress_observations ADD COLUMN action_task_started_at TEXT;
+ALTER TABLE watch_progress_observations ADD COLUMN action_task_running_pid INTEGER;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 52
+SCHEMA_VERSION = 53
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1606,6 +1618,29 @@ _QUERY_ONLY_REQUIRED_COMMENT_COLUMNS: tuple[str, ...] = (
     "created_at",
     "resolved_at",
 )
+_QUERY_ONLY_REQUIRED_WATCH_PROGRESS_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "subject_kind",
+    "subject_id",
+    "action_type",
+    "action_reason",
+    "subject_task_id",
+    "action_task_id",
+    "action_task_status",
+    "failed_task_id",
+    "recovery_task_id",
+    "merge_unit_id",
+    "merge_unit_state",
+    "merge_unit_head_sha",
+    "evidence_fingerprint",
+    "streak",
+    "parked_reason",
+    "observed_at",
+)
+_QUERY_ONLY_OPTIONAL_WATCH_PROGRESS_COLUMNS: tuple[str, ...] = (
+    "action_task_started_at",
+    "action_task_running_pid",
+)
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
     "id",
@@ -1665,7 +1700,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -1883,6 +1918,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         50: ("task_artifacts", "created_at"),
         51: ("watch_progress_observations", "observed_at"),
         52: ("tasks", "review_verify_artifact_file"),
+        53: ("watch_progress_observations", "action_task_running_pid"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1928,6 +1964,13 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 "Auto-migration to v51 incomplete: missing required index "
                 "idx_watch_progress_subject"
             )
+    if target_version >= 53:
+        for column in ("action_task_started_at", "action_task_running_pid"):
+            if not _table_has_column(conn, "watch_progress_observations", column):
+                raise RuntimeError(
+                    "Auto-migration to v53 incomplete: missing required column "
+                    f"watch_progress_observations.{column}"
+                )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -2025,6 +2068,18 @@ def _ensure_required_auto_migration_artifacts(
         (52, "tasks", "review_verify_markdown", "ALTER TABLE tasks ADD COLUMN review_verify_markdown TEXT"),
         (52, "tasks", "review_verify_cwd", "ALTER TABLE tasks ADD COLUMN review_verify_cwd TEXT"),
         (52, "tasks", "review_verify_artifact_file", "ALTER TABLE tasks ADD COLUMN review_verify_artifact_file TEXT"),
+        (
+            53,
+            "watch_progress_observations",
+            "action_task_started_at",
+            "ALTER TABLE watch_progress_observations ADD COLUMN action_task_started_at TEXT",
+        ),
+        (
+            53,
+            "watch_progress_observations",
+            "action_task_running_pid",
+            "ALTER TABLE watch_progress_observations ADD COLUMN action_task_running_pid INTEGER",
+        ),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -2182,6 +2237,8 @@ def _ensure_required_auto_migration_artifacts(
                         subject_task_id TEXT,
                         action_task_id TEXT,
                         action_task_status TEXT,
+                        action_task_started_at TEXT,
+                        action_task_running_pid INTEGER,
                         failed_task_id TEXT,
                         recovery_task_id TEXT,
                         merge_unit_id TEXT,
@@ -2770,6 +2827,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (50, MIGRATION_V49_TO_V50),
     (51, MIGRATION_V50_TO_V51),
     (52, MIGRATION_V51_TO_V52),
+    (53, MIGRATION_V52_TO_V53),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3000,7 +3058,7 @@ class SqliteTaskStore:
     def supports_watch_progress_observations(self) -> bool:
         """Return whether restart-safe watch observation storage is available."""
         if self._open_mode == "query_only":
-            return self._query_only_table_exists.get("watch_progress_observations", False)
+            return self._query_only_supports_watch_progress_observations()
         with self._connect() as conn:
             return _table_exists(conn, "watch_progress_observations")
 
@@ -3277,6 +3335,20 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing required column task_comments.source; "
                 "task comments will use default source values."
             )
+        if self._query_only_table_exists.get("watch_progress_observations", False):
+            if not self._query_only_supports_watch_progress_observations():
+                self._startup_warnings.append(
+                    "Query-only DB open detected incomplete watch_progress_observations schema; "
+                    "watch-progress observations will be unavailable."
+                )
+            elif any(
+                not self._query_only_has_column("watch_progress_observations", column)
+                for column in _QUERY_ONLY_OPTIONAL_WATCH_PROGRESS_COLUMNS
+            ):
+                self._startup_warnings.append(
+                    "Query-only DB open detected missing optional watch-progress liveness columns; "
+                    "action-task started_at/running_pid evidence will be unavailable."
+                )
         run_steps_issue = self._query_only_run_steps_warning()
         if run_steps_issue is not None:
             self._startup_warnings.append(run_steps_issue)
@@ -3323,6 +3395,15 @@ class SqliteTaskStore:
         return self._query_only_table_exists.get("task_comments", False) and all(
             self._query_only_has_column("task_comments", column)
             for column in _QUERY_ONLY_REQUIRED_COMMENT_COLUMNS
+        )
+
+    def _query_only_supports_watch_progress_observations(self) -> bool:
+        """Return True when query-only reads can safely use watch-progress artifacts."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("watch_progress_observations", False) and all(
+            self._query_only_has_column("watch_progress_observations", column)
+            for column in _QUERY_ONLY_REQUIRED_WATCH_PROGRESS_COLUMNS
         )
 
     def _query_only_supports_run_steps(self) -> bool:
@@ -4692,6 +4773,9 @@ class SqliteTaskStore:
     def _row_to_watch_progress_observation(self, row: sqlite3.Row | None) -> WatchProgressObservation | None:
         if row is None:
             return None
+        row_keys = set(row.keys())
+        action_task_started_at_raw = row["action_task_started_at"] if "action_task_started_at" in row_keys else None
+        action_task_running_pid_raw = row["action_task_running_pid"] if "action_task_running_pid" in row_keys else None
         return WatchProgressObservation(
             subject_kind=str(row["subject_kind"]),
             subject_id=str(row["subject_id"]),
@@ -4700,6 +4784,8 @@ class SqliteTaskStore:
             subject_task_id=str(row["subject_task_id"]) if row["subject_task_id"] is not None else None,
             action_task_id=str(row["action_task_id"]) if row["action_task_id"] is not None else None,
             action_task_status=str(row["action_task_status"]) if row["action_task_status"] is not None else None,
+            action_task_started_at=_parse_db_timestamp(action_task_started_at_raw),
+            action_task_running_pid=int(action_task_running_pid_raw) if action_task_running_pid_raw is not None else None,
             failed_task_id=str(row["failed_task_id"]) if row["failed_task_id"] is not None else None,
             recovery_task_id=str(row["recovery_task_id"]) if row["recovery_task_id"] is not None else None,
             merge_unit_id=str(row["merge_unit_id"]) if row["merge_unit_id"] is not None else None,
@@ -5129,6 +5215,8 @@ class SqliteTaskStore:
                     subject_task_id,
                     action_task_id,
                     action_task_status,
+                    action_task_started_at,
+                    action_task_running_pid,
                     failed_task_id,
                     recovery_task_id,
                     merge_unit_id,
@@ -5139,12 +5227,14 @@ class SqliteTaskStore:
                     parked_reason,
                     observed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, subject_kind, subject_id, action_type, action_reason)
                 DO UPDATE SET
                     subject_task_id = excluded.subject_task_id,
                     action_task_id = excluded.action_task_id,
                     action_task_status = excluded.action_task_status,
+                    action_task_started_at = excluded.action_task_started_at,
+                    action_task_running_pid = excluded.action_task_running_pid,
                     failed_task_id = excluded.failed_task_id,
                     recovery_task_id = excluded.recovery_task_id,
                     merge_unit_id = excluded.merge_unit_id,
@@ -5164,6 +5254,8 @@ class SqliteTaskStore:
                     observation.subject_task_id,
                     observation.action_task_id,
                     observation.action_task_status,
+                    _format_db_timestamp(observation.action_task_started_at),
+                    observation.action_task_running_pid,
                     observation.failed_task_id,
                     observation.recovery_task_id,
                     observation.merge_unit_id,
