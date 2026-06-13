@@ -1970,6 +1970,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -1990,6 +1991,8 @@ class TestReviewContextFromChain:
         assert len(verify_calls) == 2
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
         assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
+        assert verify_calls[0].kwargs["timeout_grace_seconds"] == 5.0
+        assert verify_calls[1].kwargs["timeout_grace_seconds"] == 5.0
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
@@ -2067,6 +2070,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2129,6 +2133,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2188,6 +2193,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2250,6 +2256,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2301,6 +2308,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2384,6 +2392,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2992,6 +3001,7 @@ class TestReviewContextFromChain:
         assert "## Verify Timeout Guidance" in context
         assert "Treat this as a test-performance investigation first" in context
         assert "Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps" in context
+        assert "Inspect the captured `## verify_command result`" in context
 
     def test_improve_context_excludes_verify_timeout_guidance_for_code_blocker_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -10830,6 +10840,7 @@ class TestExtractedRunInnerHelpers:
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.verify_command = "uv run pytest tests/ -q"
         config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 9.0
 
         worktree_git = Mock(spec=Git)
         worktree_git.repo_dir = tmp_path
@@ -10853,7 +10864,7 @@ class TestExtractedRunInnerHelpers:
                     reviewed_head_sha="abc1234",
                     reviewed_base_sha="cafebabe",
                 ),
-            ),
+            ) as mock_review_verify,
             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
@@ -10870,6 +10881,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
+        assert mock_review_verify.call_args.kwargs["timeout_grace_seconds"] == 9.0
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -15055,6 +15067,7 @@ class TestProviderPromptSanitization:
         config.timeout_minutes = 10
         config.verify_command = ""
         config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 8.0
 
         captured_prompts: list[str] = []
 
@@ -15130,6 +15143,7 @@ class TestProviderPromptSanitization:
         assert "- Status: failed" in prompt
         assert "bar failed" in prompt
         mock_cross_project_verify.assert_called_once()
+        assert mock_cross_project_verify.call_args.kwargs["timeout_grace_seconds"] == 8.0
         assert mock_cross_project_verify.call_args.kwargs["reviewed_branch"] == impl.branch
         assert mock_cross_project_verify.call_args.kwargs["reviewed_head_sha"] == "deadbeef"
         assert mock_cross_project_verify.call_args.kwargs["reviewed_base_sha"] == "cafebabe"

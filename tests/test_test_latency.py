@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import signal
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import gza.test_latency as test_latency
 from gza.test_latency import MeasuredTest, build_report, render_json, render_markdown, render_summary
@@ -94,3 +96,54 @@ def test_default_report_path_uses_tmp_under_repo_root(monkeypatch) -> None:
 
     assert markdown_path == "/repo/tmp/test-latency-20260530033159.md"
     assert json_path == "/repo/tmp/test-latency-20260530033159.json"
+
+
+def test_build_partial_summary_marks_sigterm_output() -> None:
+    plugin = test_latency._TimingPlugin()
+    plugin.test_durations.extend(
+        [
+            MeasuredTest("tests/test_alpha.py::test_fast", 0.020),
+            MeasuredTest("tests/test_alpha.py::test_slow", 0.120),
+        ]
+    )
+    state = test_latency._SigtermSummaryState(
+        plugin=plugin,
+        started=10.0,
+        previous_handler=signal.SIG_DFL,
+    )
+
+    summary = test_latency._build_partial_summary(state)
+
+    assert summary.startswith("latency: p50=")
+    assert "n=2" in summary
+    assert "(partial before SIGTERM)" in summary
+
+
+def test_install_sigterm_summary_handler_emits_summary_then_reemits(monkeypatch, capsys) -> None:
+    plugin = test_latency._TimingPlugin()
+    plugin.test_durations.append(MeasuredTest("tests/test_alpha.py::test_slow", 0.120))
+    previous_handler = object()
+    recorded_reemit: list[tuple[int, object]] = []
+
+    monkeypatch.setattr(
+        test_latency,
+        "_reemit_sigterm",
+        lambda signum, frame, previous: recorded_reemit.append((signum, previous)),
+    )
+
+    with patch("gza.test_latency.signal.getsignal", return_value=previous_handler), patch(
+        "gza.test_latency.time.perf_counter",
+        return_value=15.0,
+    ), patch(
+        "gza.test_latency.signal.signal",
+        side_effect=lambda sig, handler: recorded_reemit.append((sig, handler)),
+    ):
+        test_latency._install_sigterm_summary_handler(plugin, started=10.0)
+        handler = recorded_reemit[0][1]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    captured = capsys.readouterr()
+    assert "latency: p50=" in captured.err
+    assert "(partial before SIGTERM)" in captured.err
+    assert recorded_reemit[-1] == (signal.SIGTERM, previous_handler)

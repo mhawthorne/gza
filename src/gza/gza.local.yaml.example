@@ -367,3 +367,8 @@
 # cap; if `watch.batch` is omitted, the fallback remains `5`.
 # Default: explicit watch.batch or 5
 # max_concurrent: 5
+
+# Grace period in seconds after SIGTERM before autonomous review verification escalates to
+# SIGKILL.
+# Default: 5
+# review_verify_timeout_grace_seconds: 5

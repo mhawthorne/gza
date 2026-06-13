@@ -263,6 +263,8 @@ class TestPromptBuilderBuild:
 
         assert "## Verify Timeout Guidance" in result
         assert "Treat this as a test-performance investigation first" in result
+        assert "inspect its captured stdout/stderr" in result
+        assert "`verify_command_output` artifacts" in result
 
     def test_build_improve_prompt_omits_verify_timeout_guidance_for_timeout_shaped_review_with_product_code_citation(
         self, tmp_path: Path

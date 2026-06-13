@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gza.test_harness import register_sigterm_faulthandler
+from gza.pytest_timeout_diagnostics import register_sigterm_faulthandler
 
 UNIT_TEST_TIMEOUT_MS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_MS", "1000"))
 UNIT_TEST_TIMEOUT_SECONDS = UNIT_TEST_TIMEOUT_MS / 1000

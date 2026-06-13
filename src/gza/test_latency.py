@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
-from typing import cast
+from typing import Any, TypeAlias, cast
 
 import pytest
 
@@ -63,6 +63,51 @@ class _TimingPlugin:
         if report.when != "call":
             return
         self.test_durations.append(MeasuredTest(nodeid=report.nodeid, duration_seconds=report.duration))
+
+
+SignalHandler: TypeAlias = Callable[[int, FrameType | None], Any] | int | None
+
+
+@dataclass
+class _SigtermSummaryState:
+    """Mutable state used to emit a partial summary if pytest is SIGTERM'd."""
+
+    plugin: _TimingPlugin
+    started: float
+    previous_handler: SignalHandler
+
+
+def _build_partial_summary(state: _SigtermSummaryState) -> str:
+    report = build_report(
+        state.plugin.test_durations,
+        time.perf_counter() - state.started,
+        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    )
+    return f"{render_summary(report)} (partial before SIGTERM)"
+
+
+def _reemit_sigterm(signum: int, frame: FrameType | None, previous_handler: SignalHandler) -> None:
+    if callable(previous_handler):
+        cast(Callable[[int, FrameType | None], Any], previous_handler)(signum, frame)
+        return
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> SignalHandler:
+    if not hasattr(signal, "SIGTERM"):
+        return None
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    state = _SigtermSummaryState(plugin=plugin, started=started, previous_handler=previous_handler)
+
+    def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
+        sys.stderr.write(_build_partial_summary(state) + "\n")
+        sys.stderr.flush()
+        sys.stdout.flush()
+        _reemit_sigterm(signum, frame, state.previous_handler)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    return previous_handler
 
 
 def _format_ms(duration_seconds: float) -> str:
@@ -269,83 +314,66 @@ def _current_timestamp() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _build_current_report(test_durations: list[MeasuredTest], started_at: float) -> LatencyReport:
-    return build_report(
-        test_durations,
-        time.perf_counter() - started_at,
+@dataclass
+class _SigtermSummaryState:
+    """Mutable state used to emit a partial summary if pytest is SIGTERM'd."""
+
+    plugin: _TimingPlugin
+    started: float
+    previous_handler: SignalHandler
+
+
+SignalHandler: TypeAlias = Callable[[int, FrameType | None], Any] | int | None
+
+
+def _build_partial_summary(state: _SigtermSummaryState) -> str:
+    report = build_report(
+        state.plugin.test_durations,
+        time.perf_counter() - state.started,
         _current_timestamp(),
     )
+    return f"{render_summary(report)} (partial before SIGTERM)"
 
 
-def _emit_sigterm_summary(test_durations: list[MeasuredTest], started_at: float) -> None:
-    report = _build_current_report(test_durations, started_at)
-    sys.stderr.write("\n")
-    sys.stderr.write(render_summary(report))
-    sys.stderr.write("\n")
-    sys.stderr.flush()
-    sys.stdout.flush()
+def _reemit_sigterm(signum: int, frame: FrameType | None, previous_handler: SignalHandler) -> None:
+    if callable(previous_handler):
+        cast(Callable[[int, FrameType | None], Any], previous_handler)(signum, frame)
+        return
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
-_SignalHandler = Callable[[int, FrameType | None], object] | int | None
+def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> SignalHandler:
+    if not hasattr(signal, "SIGTERM"):
+        return None
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    state = _SigtermSummaryState(plugin=plugin, started=started, previous_handler=previous_handler)
+
+    def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
+        sys.stderr.write(_build_partial_summary(state) + "\n")
+        sys.stderr.flush()
+        sys.stdout.flush()
+        _reemit_sigterm(signum, frame, state.previous_handler)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    return previous_handler
 
 
-@dataclass
-class _SigtermSummaryHandler:
-    """Emit the current summary before allowing SIGTERM shutdown to continue."""
-
-    test_durations: list[MeasuredTest]
-    started_at: float
-    previous_handler: _SignalHandler = None
-    installed: bool = False
-    emitted: bool = False
-
-    def install(self) -> None:
-        sigterm = getattr(signal, "SIGTERM", None)
-        if sigterm is None:
-            return
-        self.previous_handler = signal.getsignal(sigterm)
-        signal.signal(sigterm, self._handle_sigterm)
-        self.installed = True
-
-    def restore(self) -> None:
-        if not self.installed:
-            return
-        sigterm = getattr(signal, "SIGTERM", None)
-        if sigterm is None or self.previous_handler is None:
-            self.installed = False
-            return
-        signal.signal(sigterm, cast(signal.Handlers, self.previous_handler))
-        self.installed = False
-
-    def _handle_sigterm(self, signum: int, _frame: FrameType | None) -> None:
-        if not self.emitted:
-            self.emitted = True
-            _emit_sigterm_summary(self.test_durations, self.started_at)
-        previous_handler = self.previous_handler
-        self.restore()
-        if callable(previous_handler):
-            cast(Callable[[int, FrameType | None], object], previous_handler)(signum, _frame)
-            raise SystemExit(128 + signum)
-        if previous_handler == signal.SIG_IGN:
-            raise SystemExit(128 + signum)
-        os.kill(os.getpid(), signum)
-
-
-def run_pytest(pytest_args: list[str], *, summary_on_sigterm: bool = False) -> tuple[int, list[MeasuredTest], float]:
+def run_pytest(pytest_args: list[str], *, emit_sigterm_summary: bool = False) -> tuple[int, list[MeasuredTest], float]:
     """Run pytest and capture call-phase durations."""
     plugin = _TimingPlugin()
     started = time.perf_counter()
-    sigterm_handler = _SigtermSummaryHandler(plugin.test_durations, started) if summary_on_sigterm else None
-    if sigterm_handler is not None:
-        sigterm_handler.install()
+    previous_sigterm_handler: SignalHandler = None
+    if emit_sigterm_summary:
+        previous_sigterm_handler = _install_sigterm_summary_handler(plugin, started)
     # Redirect pytest's stdout to stderr so progress is visible on the terminal
     # while keeping our rendered report (markdown/JSON) on stdout pipeable.
     try:
         with redirect_stdout(sys.stderr):
             exit_code = pytest.main(pytest_args, plugins=[plugin])
     finally:
-        if sigterm_handler is not None:
-            sigterm_handler.restore()
+        if emit_sigterm_summary and hasattr(signal, "SIGTERM") and previous_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
     finished = time.perf_counter()
     return int(exit_code), plugin.test_durations, finished - started
 
@@ -403,7 +431,10 @@ def _default_report_path(json_mode: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     pytest_args = _default_pytest_args(args.pytest_args)
-    exit_code, test_durations, total_wall_time_seconds = run_pytest(pytest_args, summary_on_sigterm=args.summary)
+    exit_code, test_durations, total_wall_time_seconds = run_pytest(
+        pytest_args,
+        emit_sigterm_summary=args.summary,
+    )
     if exit_code != 0:
         return exit_code
     report = build_report(test_durations, total_wall_time_seconds, _current_timestamp())

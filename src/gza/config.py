@@ -472,6 +472,19 @@ def _load_strict_int_field(data: dict, field_name: str, default: int) -> int:
     return value
 
 
+def _is_strict_number(value: object) -> bool:
+    """Return True for real int/float scalars (exclude booleans)."""
+    return (isinstance(value, int | float)) and not isinstance(value, bool)
+
+
+def _load_strict_number_field(data: dict, field_name: str, default: int | float) -> float:
+    """Load a numeric config field without string coercion."""
+    value = data.get(field_name, default)
+    if not _is_strict_number(value):
+        raise ConfigError(f"'{field_name}' must be a number")
+    return float(value)
+
+
 def _validate_optional_positive_int_field(
     value: object,
     field_name: str,
@@ -966,7 +979,7 @@ class Config:
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     autonomous_verify_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
-    review_verify_timeout_grace_seconds: int = DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
+    review_verify_timeout_grace_seconds: float = DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
     code_task_diff_timeout_medium_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD
     code_task_diff_timeout_large_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD
     code_task_diff_timeout_medium_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES
@@ -2084,7 +2097,7 @@ class Config:
         )
         if autonomous_verify_timeout_seconds < 1:
             raise ConfigError("'autonomous_verify_timeout_seconds' must be positive")
-        review_verify_timeout_grace_seconds = _load_strict_int_field(
+        review_verify_timeout_grace_seconds = _load_strict_number_field(
             data,
             "review_verify_timeout_grace_seconds",
             DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
@@ -2683,9 +2696,9 @@ class Config:
             elif data["autonomous_verify_timeout_seconds"] <= 0:
                 errors.append("'autonomous_verify_timeout_seconds' must be positive")
         if "review_verify_timeout_grace_seconds" in data:
-            if not _is_strict_int(data["review_verify_timeout_grace_seconds"]):
-                errors.append("'review_verify_timeout_grace_seconds' must be an integer")
-            elif data["review_verify_timeout_grace_seconds"] <= 0:
+            if not _is_strict_number(data["review_verify_timeout_grace_seconds"]):
+                errors.append("'review_verify_timeout_grace_seconds' must be a number")
+            elif float(data["review_verify_timeout_grace_seconds"]) < 1:
                 errors.append("'review_verify_timeout_grace_seconds' must be positive")
 
         _resolve_code_task_timeout_scaling_fields(data, errors=errors)

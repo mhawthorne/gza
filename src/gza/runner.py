@@ -2735,16 +2735,20 @@ def _resolve_review_verify_timeout_seconds(config: Config | object) -> int:
     return timeout_seconds
 
 
-def _resolve_review_verify_timeout_grace_seconds(config: Config | object) -> int:
+def _resolve_review_verify_timeout_grace_seconds(config: Config | object) -> float:
     """Return the configured graceful review verify termination window with fallback."""
     grace_seconds = getattr(
         config,
         "review_verify_timeout_grace_seconds",
         REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
     )
-    if not isinstance(grace_seconds, int) or grace_seconds < 1:
+    if (
+        not isinstance(grace_seconds, int | float)
+        or isinstance(grace_seconds, bool)
+        or grace_seconds < 1
+    ):
         return REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
-    return grace_seconds
+    return float(grace_seconds)
 
 
 def _signal_review_verify_process_group(process: subprocess.Popen[Any], sig: int) -> bool:
@@ -2867,7 +2871,7 @@ def _drain_review_verify_process_pipes_until_deadline(
 def _wait_for_review_verify_process_group_exit(
     process: subprocess.Popen[bytes],
     *,
-    grace_seconds: int,
+    grace_seconds: float,
     initial_stdout: str | bytes | None,
     initial_stderr: str | bytes | None,
 ) -> tuple[bytes, bytes, bool]:
@@ -2922,7 +2926,7 @@ def _run_review_verify_command_with_timeout_diagnostics(
     *,
     cwd: Path,
     timeout_seconds: int,
-    termination_grace_seconds: int,
+    termination_grace_seconds: float,
 ) -> _ReviewVerifyCommandRun:
     """Run review verification and preserve output across graceful timeout escalation."""
     def _resolved_returncode(process: subprocess.Popen[Any]) -> int:
@@ -2979,6 +2983,14 @@ def _run_review_verify_command_with_timeout_diagnostics(
         )
 
 
+def _resolve_review_verify_timeout_settings(config: object) -> tuple[int, float]:
+    """Resolve validated review verify timeout budgets with defensive fallbacks."""
+    return (
+        _resolve_review_verify_timeout_seconds(config),
+        _resolve_review_verify_timeout_grace_seconds(config),
+    )
+
+
 def _run_review_verify_command(
     verify_command: str,
     *,
@@ -2987,7 +2999,7 @@ def _run_review_verify_command(
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
     timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
-    timeout_grace_seconds: int = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+    timeout_grace_seconds: float = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
 ) -> ReviewVerifyResult:
     """Run the configured verify command for an autonomous review iteration."""
     captured_at = datetime.now(UTC)
@@ -3140,6 +3152,7 @@ def _run_review_verify_commands_for_projects(
     worktree_git: Git,
     worktree_path: Path,
     timeout_seconds: int,
+    timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
@@ -3157,7 +3170,7 @@ def _run_review_verify_commands_for_projects(
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=timeout_seconds,
-            timeout_grace_seconds=_resolve_review_verify_timeout_grace_seconds(config),
+            timeout_grace_seconds=timeout_grace_seconds,
         )
         scope = _format_repo_project_scope(_project_boundary(config).scope_root)
         return CrossProjectReviewVerifyResult(
@@ -3222,7 +3235,7 @@ def _run_review_verify_commands_for_projects(
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=timeout_seconds,
-            timeout_grace_seconds=_resolve_review_verify_timeout_grace_seconds(config),
+            timeout_grace_seconds=timeout_grace_seconds,
         )
         project_results.append(
             ProjectReviewVerifyResult(
@@ -3670,7 +3683,10 @@ def _build_context_from_chain(
                             "- Re-run the exact configured `verify_command` once from the current branch tip to confirm the timeout is still current."
                         )
                         context_parts.append(
-                            "- If it still times out, run a narrower subset or diagnostic mode that can identify the slow or stuck phase without immediately rerunning the entire suite."
+                            "- Inspect the captured `## verify_command result`, its `Failing output (trimmed)`, and any referenced `verify_command_output` artifacts before rerunning the full suite; that captured stdout/stderr may already contain the slow-test summary or SIGTERM stack dump you need."
+                        )
+                        context_parts.append(
+                            "- If it still times out, run a narrower pytest duration probe such as `uv run pytest tests/ --durations=20` or the configured pytest subset with `--durations=20`."
                         )
                         context_parts.append(
                             "- Compare against the baseline branch when practical to determine whether this branch introduced the slowdown."
@@ -4061,8 +4077,7 @@ def _capture_noop_improve_review_verify_result(
     if not _task_is_cross_project(task) and not verify_command.strip():
         return None
 
-    timeout_seconds = _resolve_review_verify_timeout_seconds(config)
-    timeout_grace_seconds = _resolve_review_verify_timeout_grace_seconds(config)
+    timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
 
     provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(config))
     reviewed_base_sha: str | None = None
@@ -4094,6 +4109,7 @@ def _capture_noop_improve_review_verify_result(
                 worktree_git=worktree_git,
                 worktree_path=worktree_git.repo_dir,
                 timeout_seconds=timeout_seconds,
+                timeout_grace_seconds=timeout_grace_seconds,
                 reviewed_branch=branch_name,
                 reviewed_head_sha=reviewed_head_sha,
                 reviewed_base_sha=reviewed_base_sha,
@@ -7781,8 +7797,10 @@ def _run_non_code_task(
                 _task_is_cross_project(task) or verify_command.strip()
             )
             if should_run_review_verify:
-                autonomous_verify_timeout_seconds = _resolve_review_verify_timeout_seconds(config)
-                review_verify_timeout_grace_seconds = _resolve_review_verify_timeout_grace_seconds(config)
+                (
+                    autonomous_verify_timeout_seconds,
+                    review_verify_timeout_grace_seconds,
+                ) = _resolve_review_verify_timeout_settings(config)
                 reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
                 reviewed_base_sha = _resolve_review_verify_base_sha(git, default_branch)
                 if reviewed_head_sha is None:
@@ -7807,6 +7825,7 @@ def _run_non_code_task(
                             worktree_git=worktree_git,
                             worktree_path=worktree_path,
                             timeout_seconds=autonomous_verify_timeout_seconds,
+                            timeout_grace_seconds=review_verify_timeout_grace_seconds,
                             reviewed_branch=reviewed_branch,
                             reviewed_head_sha=reviewed_head_sha,
                             reviewed_base_sha=reviewed_base_sha,

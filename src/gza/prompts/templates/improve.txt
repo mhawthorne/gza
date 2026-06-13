@@ -16,6 +16,7 @@ Work through each blocking item systematically. For each item:
 - Verify your change addresses the issue described.
 - Add or update targeted tests that cover the specific failure mode called out in the feedback.
 - If the feedback concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
+- If the context includes a failed or timed-out `## verify_command result`, inspect its captured stdout/stderr, `Failing output (trimmed)`, and any referenced `verify_command_output` artifacts before rerunning the full verify command.
 
 Before finishing, verify that every blocking item has an explicit closure condition in your final report:
 - The review item you addressed
