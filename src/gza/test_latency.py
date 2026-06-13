@@ -65,51 +65,6 @@ class _TimingPlugin:
         self.test_durations.append(MeasuredTest(nodeid=report.nodeid, duration_seconds=report.duration))
 
 
-SignalHandler: TypeAlias = Callable[[int, FrameType | None], Any] | int | None
-
-
-@dataclass
-class _SigtermSummaryState:
-    """Mutable state used to emit a partial summary if pytest is SIGTERM'd."""
-
-    plugin: _TimingPlugin
-    started: float
-    previous_handler: SignalHandler
-
-
-def _build_partial_summary(state: _SigtermSummaryState) -> str:
-    report = build_report(
-        state.plugin.test_durations,
-        time.perf_counter() - state.started,
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    )
-    return f"{render_summary(report)} (partial before SIGTERM)"
-
-
-def _reemit_sigterm(signum: int, frame: FrameType | None, previous_handler: SignalHandler) -> None:
-    if callable(previous_handler):
-        cast(Callable[[int, FrameType | None], Any], previous_handler)(signum, frame)
-        return
-    signal.signal(signum, signal.SIG_DFL)
-    os.kill(os.getpid(), signum)
-
-
-def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> SignalHandler:
-    if not hasattr(signal, "SIGTERM"):
-        return None
-    previous_handler = signal.getsignal(signal.SIGTERM)
-    state = _SigtermSummaryState(plugin=plugin, started=started, previous_handler=previous_handler)
-
-    def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
-        sys.stderr.write(_build_partial_summary(state) + "\n")
-        sys.stderr.flush()
-        sys.stdout.flush()
-        _reemit_sigterm(signum, frame, state.previous_handler)
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-    return previous_handler
-
-
 def _format_ms(duration_seconds: float) -> str:
     milliseconds = duration_seconds * 1000
     if milliseconds >= 1000:
