@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from gza.branch_resolution import resolve_rebase_target_task
+from gza.config import DEFAULT_MAX_NOOP_IMPROVE_CYCLES
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_owns_merge_status
 from gza.git import ResolvedMergeSourceRef
@@ -2483,7 +2484,9 @@ def resolve_advance_context(
     assert task.id is not None
 
     effective_max_resume = max_resume_attempts if max_resume_attempts is not None else config.max_resume_attempts
-    effective_max_noop_improves = int(getattr(config, "max_noop_improve_cycles", 2))
+    effective_max_noop_improves = int(
+        getattr(config, "max_noop_improve_cycles", DEFAULT_MAX_NOOP_IMPROVE_CYCLES)
+    )
     verify_command_available = bool(
         isinstance(getattr(config, "verify_command", None), str)
         and getattr(config, "verify_command", "").strip()

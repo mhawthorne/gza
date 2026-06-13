@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
+from typing import Any, TypeAlias, cast
 
 import pytest
 
@@ -260,14 +265,70 @@ def render_summary(report: LatencyReport) -> str:
     )
 
 
-def run_pytest(pytest_args: list[str]) -> tuple[int, list[MeasuredTest], float]:
+def _current_timestamp() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class _SigtermSummaryState:
+    """Mutable state used to emit a partial summary if pytest is SIGTERM'd."""
+
+    plugin: _TimingPlugin
+    started: float
+    previous_handler: SignalHandler
+
+
+SignalHandler: TypeAlias = Callable[[int, FrameType | None], Any] | int | None
+
+
+def _build_partial_summary(state: _SigtermSummaryState) -> str:
+    report = build_report(
+        state.plugin.test_durations,
+        time.perf_counter() - state.started,
+        _current_timestamp(),
+    )
+    return f"{render_summary(report)} (partial before SIGTERM)"
+
+
+def _reemit_sigterm(signum: int, frame: FrameType | None, previous_handler: SignalHandler) -> None:
+    if callable(previous_handler):
+        cast(Callable[[int, FrameType | None], Any], previous_handler)(signum, frame)
+        return
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> SignalHandler:
+    if not hasattr(signal, "SIGTERM"):
+        return None
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    state = _SigtermSummaryState(plugin=plugin, started=started, previous_handler=previous_handler)
+
+    def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
+        sys.stderr.write(_build_partial_summary(state) + "\n")
+        sys.stderr.flush()
+        sys.stdout.flush()
+        _reemit_sigterm(signum, frame, state.previous_handler)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    return previous_handler
+
+
+def run_pytest(pytest_args: list[str], *, emit_sigterm_summary: bool = False) -> tuple[int, list[MeasuredTest], float]:
     """Run pytest and capture call-phase durations."""
     plugin = _TimingPlugin()
     started = time.perf_counter()
+    previous_sigterm_handler: SignalHandler = None
+    if emit_sigterm_summary:
+        previous_sigterm_handler = _install_sigterm_summary_handler(plugin, started)
     # Redirect pytest's stdout to stderr so progress is visible on the terminal
     # while keeping our rendered report (markdown/JSON) on stdout pipeable.
-    with redirect_stdout(sys.stderr):
-        exit_code = pytest.main(pytest_args, plugins=[plugin])
+    try:
+        with redirect_stdout(sys.stderr):
+            exit_code = pytest.main(pytest_args, plugins=[plugin])
+    finally:
+        if emit_sigterm_summary and hasattr(signal, "SIGTERM") and previous_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
     finished = time.perf_counter()
     return int(exit_code), plugin.test_durations, finished - started
 
@@ -325,14 +386,13 @@ def _default_report_path(json_mode: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     pytest_args = _default_pytest_args(args.pytest_args)
-    exit_code, test_durations, total_wall_time_seconds = run_pytest(pytest_args)
+    exit_code, test_durations, total_wall_time_seconds = run_pytest(
+        pytest_args,
+        emit_sigterm_summary=args.summary,
+    )
     if exit_code != 0:
         return exit_code
-    report = build_report(
-        test_durations,
-        total_wall_time_seconds,
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    )
+    report = build_report(test_durations, total_wall_time_seconds, _current_timestamp())
     if args.summary:
         _write_output(render_summary(report) + "\n", args.output)
         return 0

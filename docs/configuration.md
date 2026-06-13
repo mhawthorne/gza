@@ -51,7 +51,8 @@ Gza reads configuration from three YAML layers:
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
-| `review_verify_timeout_seconds` | Integer | `120` | Timeout for autonomous review `verify_command` runs |
+| `autonomous_verify_timeout_seconds` | Integer | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
+| `review_verify_timeout_grace_seconds` | Float | `5` | Grace period after SIGTERM before autonomous review verification escalates to SIGKILL |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
 | `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
 | `code_task_diff_timeout_medium_minutes` | Integer | `30` | Timeout budget used for medium-sized code diffs |
@@ -64,7 +65,7 @@ Gza reads configuration from three YAML layers:
 | `max_plan_slices` | Integer or null | `null` | Optional cap on how many implementation slices one approved plan review may materialize automatically |
 | `plan_slice_target_timeout_minutes` | Integer or null | `code_task_diff_timeout_cap_minutes` | Optional reviewer sizing budget for one implementation slice; when unset it derives from code-task timeout sizing |
 | `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
-| `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
+| `max_noop_improve_cycles` | Integer | `1` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
 | `max_failed_closing_review_retries` | Integer | `3` | Max consecutive failed closing-review attempts before a lineage is parked as `needs_attention`; set `0` to escalate immediately on first failure |
 | `max_concurrent` | Integer | explicit `watch.batch` or `5` | Hard global ceiling on concurrently running task-executing processes across `work`, `watch`, `advance`, iterate/recovery helpers, and internal task runners. Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5` |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
@@ -105,7 +106,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -492,7 +493,8 @@ inner_verify_command: ./bin/tests --quick
 - `verify_command` remains the required final gate before a code task reports success.
 - `inner_verify_command` is optional and is intended for fast edit-loop checks during implementation.
 - When `inner_verify_command` is unset, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
-- Autonomous review verification is separate and remains bounded by `review_verify_timeout_seconds`.
+- Autonomous review verification is separate and remains bounded by `autonomous_verify_timeout_seconds`.
+- When autonomous review verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
 
 ---
 
@@ -960,7 +962,8 @@ providers.*.task_types.*.model
 providers.*.task_types.*.reasoning_effort
 providers.*.task_types.*.timeout_minutes
 review_context_file_limit
-review_verify_timeout_seconds
+autonomous_verify_timeout_seconds
+review_verify_timeout_grace_seconds
 recommend_rebase_behind_commits
 review_diff_medium_threshold
 review_diff_small_threshold
@@ -1532,7 +1535,7 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--tag TAG` | Only list recovery and pending lanes matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`) |
+| `--tag TAG` | Only list recovery and pending lanes matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; if a matching lineage is blocked by an out-of-scope derived child, queue reports the blocker without starting it) |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 | `-n, --limit N` | Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks) |
 | `--all` | Show all runnable tasks (blocked tasks are always shown) |
@@ -1782,7 +1785,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--show-skipped` | With `--recovery-only`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next watch-pass boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
-| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order |
+| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order. Scoped watch reports out-of-scope derived blockers but does not start them |
 | `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
 
 `uv run gza watch` combines the two surfaces above: it runs recovery decisions, review/rebase/merge lifecycle work, and pending-lane pickup in one loop. Recovery and pending are still distinct sets even when watch is driving both.
@@ -1797,7 +1800,7 @@ watch:
   max_idle: null
 ```
 
-`watch.no_activity_timeout` controls when watch reconciliation marks a still-running worker `NO_ACTIVITY` because its task log has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
+`watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY` because its task log or startup evidence has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever.
 
@@ -2075,12 +2078,13 @@ use_docker: true
 docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_turns: 80
-review_verify_timeout_seconds: 180
+autonomous_verify_timeout_seconds: 180
+review_verify_timeout_grace_seconds: 5
 verify_command: ./bin/tests
 inner_verify_command: ./bin/tests --quick
 code_task_diff_timeout_medium_threshold: 500
 code_task_diff_timeout_large_threshold: 1500
-max_noop_improve_cycles: 2
+max_noop_improve_cycles: 1
 work_count: 3
 
 # Custom volume mounts (optional)

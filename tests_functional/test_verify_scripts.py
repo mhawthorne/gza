@@ -95,6 +95,7 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["PYTEST_XDIST_WORKERS"] = "7"
     result = subprocess.run(
         ["bash", "bin/tests"],
         cwd=fixture_root,
@@ -106,7 +107,12 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
 
     assert result.returncode == 0, result.stderr
     assert "use_venv=1" in result.stdout
-    assert "-m gza.test_latency" in tool_log.read_text(encoding="utf-8")
+    tool_invocations = tool_log.read_text(encoding="utf-8")
+    assert "python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2" in tool_invocations
+    assert (
+        "pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2"
+        in tool_invocations
+    )
     assert uv_log.read_text(encoding="utf-8") == ""
 
 
@@ -122,6 +128,7 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["PYTEST_XDIST_WORKERS"] = "7"
     result = subprocess.run(
         ["bash", "bin/tests"],
         cwd=fixture_root,
@@ -134,7 +141,8 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     assert result.returncode == 0, result.stderr
     assert "use_venv=0" in result.stdout
     uv_invocations = uv_log.read_text(encoding="utf-8")
-    assert "uv run python -m gza.test_latency" in uv_invocations
+    assert "uv run python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2" in uv_invocations
+    assert "uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2" in uv_invocations
 
 
 @pytest.mark.timeout(30, method="signal")

@@ -16,6 +16,7 @@ Work through each blocking item systematically. For each item:
 - Verify your change addresses the issue described.
 - Add or update targeted tests that cover the specific failure mode called out in the feedback.
 - If the feedback concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
+- If the context includes a failed or timed-out `## verify_command result`, inspect its captured stdout/stderr, `Failing output (trimmed)`, and any referenced `verify_command_output` artifacts before rerunning the full verify command.
 
 Before finishing, verify that every blocking item has an explicit closure condition in your final report:
 - The review item you addressed
@@ -29,5 +30,6 @@ If a Blocker (review Must-Fix item) or comment no longer applies because the cod
 Do not leave blocking feedback items partially addressed. The goal is to resolve all gating feedback in a single pass without creating extra scope.
 Treat a cited path or line range as an instance of a class of issue, not the full scope of the fix. If a blocker calls out one path for a broader issue, audit every analogous path for the same problem and fix them in this pass. When multiple sites share the same fix shape, prefer a centralized helper or shared code path over per-call-site patches. "Extra scope" means unrelated changes, not other instances of the same blocker class.
 When a blocker's `Open-state citation:` enumerates multiple paths or line ranges (a reviewer-enumerated class), treat the entire set as the closure condition for that one blocker - fix every cited instance in this pass, not just the first.
+If the context includes a `## verify_command result` section, `Failing output (trimmed)`, or a persisted `verify_command_output` artifact reference, inspect that captured stdout/stderr before rerunning the full command. Timeout captures may already contain actionable diagnostics such as slow-phase summaries or SIGTERM-triggered stack dumps.
 
 Before adopting a fix that weakens a bound or guardrail (test timeout, fail-fast flag, lint rule, type check, verify gate), read `docs/internal/practices.md`. The default remedy is to fix the underlying issue at the smallest unit (the specific test, file, or call site that hit the bound), or re-classify that unit to a looser bound deliberately - not to relax the suite-wide default. If the inbound review's only blocker is a verify timeout, treat that as a test-performance investigation, not a code-correctness one.

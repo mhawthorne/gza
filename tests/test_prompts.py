@@ -237,7 +237,7 @@ class TestPromptBuilderBuild:
             "## Blockers\n\n"
             "### B1 verify_command failure: timed out during pytest\n"
             "Evidence: verify_command timed out after 120s while running the configured suite.\n"
-            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Open-state citation: `bin/tests:150-155`\n"
             "Impact: the branch cannot be verified autonomously.\n"
             "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
             "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
@@ -263,6 +263,55 @@ class TestPromptBuilderBuild:
 
         assert "## Verify Timeout Guidance" in result
         assert "Treat this as a test-performance investigation first" in result
+        assert "inspect its captured stdout/stderr" in result
+        assert "`verify_command_output` artifacts" in result
+
+    def test_build_improve_prompt_omits_verify_timeout_guidance_for_timeout_shaped_review_with_product_code_citation(
+        self, tmp_path: Path
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement comment-addressed change", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: timed out during pytest\n"
+            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Impact: the branch cannot be verified autonomously.\n"
+            "Required fix: investigate the cited product-code path before rerunning verify.\n"
+            "Required tests: add targeted regression coverage for the cited path.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve from review",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = ""
+
+        summary_path = tmp_path / ".gza" / "summaries" / "improve-timeout-product-code.md"
+        result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
+
+        assert "## Verify Timeout Guidance" not in result
 
     def test_build_improve_prompt_omits_verify_timeout_guidance_for_code_blocker_review(
         self, tmp_path: Path
@@ -1006,6 +1055,21 @@ class TestPromptBuilderImproveTask:
         """Prompt should support improve tasks with comments and no review."""
         result = PromptBuilder().improve_task_prompt(task_id=5, review_id=None, has_comments=True)
         assert result == "Improve implementation of task 5 based on unresolved comments"
+
+    def test_improve_template_treats_verify_timeout_output_as_diagnostic_input(self):
+        """Improve template should tell agents to inspect captured verify timeout output before reruns."""
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "improve.txt"
+        ).read_text(encoding="utf-8")
+
+        assert "persisted `verify_command_output` artifact reference" in template
+        assert "inspect that captured stdout/stderr before rerunning the full command" in template
+        assert "SIGTERM-triggered stack dumps" in template
 
 
 class TestPromptBuilderReviewTask:

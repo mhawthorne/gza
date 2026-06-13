@@ -7,9 +7,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, TypeVar
 
-from gza.db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
-from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
-from gza.operator_state import blocked_by_empty_prereq_label
+from . import lineage
+from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
+from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from .operator_state import blocked_by_empty_prereq_label
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -137,6 +138,20 @@ class TaskQueryResult:
     def to_json(self) -> list[dict[str, object]]:
         """Return JSON-serializable row dictionaries."""
         return [dict(row.values) for row in self.rows]
+
+
+@dataclass(frozen=True)
+class ScopedTagScopeGap:
+    """Detectable in-scope owner blocked by an out-of-scope derived child."""
+
+    owner_id: str
+    blocking_child_id: str
+    child_task_type: str
+    child_status: str
+    child_tags: tuple[str, ...]
+    missing_filter_tags: tuple[str, ...]
+    suggested_next_command: str
+    blocking_state: str
 
 
 class TaskProjectionPreset:
@@ -1123,6 +1138,177 @@ def task_matches_tag_filters(
     requested = set(tag_filters)
     task_values = set(task_tags)
     return bool(task_values & requested) if any_tag else requested.issubset(task_values)
+
+
+def missing_scope_tags_for_task(
+    task: DbTask,
+    *,
+    tag_filters: tuple[str, ...] | None,
+    any_tag: bool,
+) -> tuple[str, ...]:
+    """Return the filter tags missing from ``task`` for the active matching mode."""
+    normalized = normalize_tag_filters(tag_filters)
+    if normalized is None:
+        return ()
+    if any_tag:
+        return normalized
+    task_tag_values = set(task.tags)
+    return tuple(tag for tag in normalized if tag not in task_tag_values)
+
+
+def collect_scoped_tag_scope_gaps(
+    store: SqliteTaskStore,
+    *,
+    tag_filters: tuple[str, ...] | None,
+    any_tag: bool,
+    config: Any | None = None,
+    git: Any | None = None,
+    target_branch: str | None = None,
+) -> list[ScopedTagScopeGap]:
+    """Return in-scope owners blocked by detectable out-of-scope derived children."""
+    normalized = normalize_tag_filters(tag_filters)
+    if normalized is None:
+        return []
+
+    def _task_is_in_scope_runnable_or_running(task: DbTask) -> bool:
+        if task.id is None or task.task_type == "internal":
+            return False
+        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag):
+            return False
+        if task.status == "in_progress":
+            return True
+        if task.status == "pending" and not store.is_task_blocked(task)[0]:
+            return True
+        return False
+
+    def _scope_gap_is_suppressed_by_in_scope_dependency(task: DbTask) -> bool:
+        if task.status != "pending":
+            return False
+        blocked, blocking_id, _blocking_status = store.is_task_blocked(task)
+        if not blocked or blocking_id is None:
+            return False
+        blocking_task = store.get(blocking_id)
+        if blocking_task is None:
+            return False
+        return _task_is_in_scope_runnable_or_running(blocking_task)
+
+    gaps: list[ScopedTagScopeGap] = []
+    seen_blocking_child_ids: set[str] = set()
+    owner_rows = list(
+        query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                tags=normalized,
+                any_tag=any_tag,
+                include_skipped=True,
+                exclude_dropped_from_planning=True,
+            ),
+            config=config,
+            git=git,
+            target_branch=target_branch,
+        )
+    )
+    members_by_owner_id = {}
+    for row in owner_rows:
+        owner_id = row.owner_task.id
+        if owner_id is None:
+            continue
+        merged_candidates: dict[str, DbTask] = {}
+        for task in row.members:
+            if task.id is None or task.id == owner_id or task.task_type == "internal":
+                continue
+            merged_candidates[task.id] = task
+        for task in lineage.walk_lineage_descendants(store, row.owner_task):
+            if task.id is None or task.id == owner_id or task.task_type == "internal":
+                continue
+            merged_candidates[task.id] = task
+        members_by_owner_id[owner_id] = tuple(merged_candidates.values())
+    candidate_owners_by_id: dict[str, DbTask] = {}
+    for task in store.get_all():
+        if (
+            task.id is None
+            or task.task_type == "internal"
+            or task.status == "dropped"
+            or not task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
+        ):
+            continue
+        candidate_owners_by_id[task.id] = task
+    for row in owner_rows:
+        owner_id = row.owner_task.id
+        if owner_id is not None:
+            candidate_owners_by_id.setdefault(owner_id, row.owner_task)
+    candidate_owners = sorted(
+        candidate_owners_by_id.values(),
+        key=lambda task: (
+            task.created_at or datetime.min.replace(tzinfo=UTC),
+            task_id_numeric_key(task.id or ""),
+        ),
+    )
+    for owner in candidate_owners:
+        owner_id = owner.id
+        if owner_id is None or owner.task_type == "internal" or owner.status == "dropped":
+            continue
+
+        explicit_members = members_by_owner_id.get(owner_id)
+        if explicit_members is not None:
+            candidate_members = explicit_members
+        else:
+            candidate_members = tuple(
+                task
+                for task in lineage.walk_lineage_descendants(store, owner)
+                if task.id is not None and task.id != owner_id and task.task_type != "internal"
+            )
+
+        candidates = sorted(
+            candidate_members,
+            key=lambda task: (
+                0 if task.status == "in_progress" else 1,
+                task_id_numeric_key(task.id or ""),
+            ),
+        )
+        for task in candidates:
+            task_id = task.id
+            assert task_id is not None
+            if task_id in seen_blocking_child_ids:
+                continue
+            if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag):
+                continue
+            if _scope_gap_is_suppressed_by_in_scope_dependency(task):
+                continue
+            if task.status == "in_progress":
+                blocking_state = "running"
+            elif task.status == "pending":
+                blocking_state = "blocked" if store.is_task_blocked(task)[0] else "runnable"
+            else:
+                continue
+
+            missing_tags = missing_scope_tags_for_task(
+                task,
+                tag_filters=normalized,
+                any_tag=any_tag,
+            )
+            if missing_tags:
+                hint_tags = missing_tags if not any_tag else missing_tags[:1]
+                hint_flags = " ".join(f"--add-tag {tag}" for tag in hint_tags)
+                suggested = f"uv run gza edit {task_id} {hint_flags}"
+            else:
+                suggested = "uv run gza watch"
+            gaps.append(
+                ScopedTagScopeGap(
+                    owner_id=owner_id,
+                    blocking_child_id=task_id,
+                    child_task_type=task.task_type,
+                    child_status=task.status,
+                    child_tags=tuple(task.tags),
+                    missing_filter_tags=missing_tags,
+                    suggested_next_command=suggested,
+                    blocking_state=blocking_state,
+                )
+            )
+            seen_blocking_child_ids.add(task_id)
+            break
+    return gaps
 
 
 def projection_fields(projection: ProjectionSpec, *, scope: QueryScope) -> tuple[str, ...]:

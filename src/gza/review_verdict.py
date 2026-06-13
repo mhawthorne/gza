@@ -520,6 +520,9 @@ def _contains_verify_timeout_marker(text: str) -> bool:
         return False
     if _VERIFY_TIMEOUT_PATTERNS[0].search(text) or _VERIFY_TIMEOUT_PATTERNS[1].search(text):
         return True
+    lowered = text.lower()
+    if "verify_command" in lowered and ("timed out" in lowered or "timeout" in lowered):
+        return True
     return bool(_VERIFY_COMMAND_PATTERN.search(text) and _VERIFY_TIMEOUT_PATTERNS[2].search(text))
 
 
@@ -538,10 +541,61 @@ def _contains_explicit_verify_timeout_subject(text: str) -> bool:
     return "verify_command" in lowered and ("timed out" in lowered or "timeout" in lowered)
 
 
-def _contains_open_state_like_citation(text: str) -> bool:
+def _extract_open_state_like_citation_tokens(text: str) -> tuple[str, ...]:
     if not text:
+        return ()
+    return tuple(match.group(0).strip("`") for match in _OPEN_STATE_CITATION_TOKEN_PATTERN.finditer(text))
+
+
+def _citation_path_from_token(token: str) -> str:
+    normalized = token.strip().strip("`")
+    return re.sub(r":\d+(?:-\d+)?$", "", normalized)
+
+
+def _citation_points_at_verify_harness(path: str) -> bool:
+    normalized = path.strip().strip("`").lstrip("./")
+    if not normalized:
         return False
-    return bool(_OPEN_STATE_CITATION_TOKEN_PATTERN.search(text))
+    if normalized.startswith(("bin/", "scripts/", "tests/", "tests_functional/")):
+        return True
+    return normalized in {
+        "gza.yaml",
+        "gza.local.yaml",
+        "pyproject.toml",
+        "pytest.ini",
+        "mypy.ini",
+        "tox.ini",
+    }
+
+
+def _citation_points_at_product_code(path: str) -> bool:
+    normalized = path.strip().strip("`").lstrip("./")
+    if not normalized:
+        return False
+    if normalized.startswith("src/"):
+        return True
+    return not _citation_points_at_verify_harness(normalized)
+
+
+def _iter_structured_field_citation_tokens(finding: ReviewFinding) -> tuple[str, ...]:
+    structured_fields = (
+        finding.evidence,
+        finding.open_state_citation,
+        finding.impact,
+        finding.fix_or_followup,
+        finding.tests,
+    )
+    tokens: list[str] = []
+    for field in structured_fields:
+        tokens.extend(_extract_open_state_like_citation_tokens(field or ""))
+    return tuple(tokens)
+
+
+def _structured_fields_have_product_code_citation(finding: ReviewFinding) -> bool:
+    for token in _iter_structured_field_citation_tokens(finding):
+        if _citation_points_at_product_code(_citation_path_from_token(token)):
+            return True
+    return False
 
 
 def _has_explicit_verify_timeout_subject_in_structured_fields(finding: ReviewFinding) -> bool:
@@ -583,13 +637,7 @@ def _classify_blocker_finding(finding: ReviewFinding) -> str:
         if not _has_explicit_verify_timeout_subject_in_structured_fields(finding):
             return "code"
 
-        code_citation_fields = (
-            finding.evidence,
-            finding.impact,
-            finding.fix_or_followup,
-            finding.tests,
-        )
-        if any(_contains_open_state_like_citation(field or "") for field in code_citation_fields):
+        if _structured_fields_have_product_code_citation(finding):
             return "code"
         return "verify_timeout"
     if _contains_verify_failure_marker(text):

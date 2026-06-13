@@ -331,6 +331,23 @@ def test_functional_suite_conftest_injects_functional_watchdog() -> None:
     assert explicit_timeout.markers == []
 
 
+def test_functional_suite_conftest_registers_sigterm_faulthandler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tests_functional/conftest.py should enable SIGTERM faulthandler dumps for verify shutdowns."""
+    repo_root = Path(__file__).resolve().parents[1]
+    conftest_path = repo_root / "tests_functional" / "conftest.py"
+    calls: list[bool] = []
+
+    def _fake_register() -> bool:
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr("gza.pytest_timeout_diagnostics.register_sigterm_faulthandler", _fake_register)
+
+    _load_module(conftest_path, "tests_functional_sigterm_conftest")
+
+    assert calls == [True]
+
+
 def test_functional_subprocess_timeouts_within_watchdog() -> None:
     """tests_functional subprocess.run(timeout=N) calls must stay within the suite watchdog."""
     repo_root = Path(__file__).resolve().parents[1]

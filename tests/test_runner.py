@@ -1801,57 +1801,67 @@ class TestReviewContextFromChain:
 
     def test_run_review_verify_command_reports_timeout(self, tmp_path: Path):
         """Timed-out autonomous review verify should become a failed verify section."""
+        timed_out = Mock(
+            timed_out=True,
+            forced_kill=True,
+            stdout="partial pytest output\n",
+            stderr="still running\n",
+        )
         with patch(
-            "gza.runner.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(
-                cmd=["bash", "-lc", "uv run pytest tests/ -q"],
-                timeout=120,
-                output="partial pytest output\n",
-                stderr="still running\n",
-            ),
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=timed_out,
         ):
             result = _run_review_verify_command(
                 "uv run pytest tests/ -q",
                 cwd=tmp_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5,
             )
 
         rendered = _format_review_verify_result(result)
         assert result.status == "failed"
         assert result.exit_status == "timed out"
         assert "verify_command timed out after 120s" in rendered
+        assert "verify_command exceeded 120s; sent SIGTERM, waited 5s, then sent SIGKILL" in rendered
         assert "partial pytest output" in rendered
         assert "still running" in rendered
 
     def test_run_review_verify_command_reports_custom_timeout(self, tmp_path: Path):
         """Timeout wording should reflect the configured autonomous review timeout."""
+        timed_out = Mock(
+            timed_out=True,
+            forced_kill=False,
+            stdout="partial pytest output\n",
+            stderr="still running\n",
+        )
         with patch(
-            "gza.runner.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(
-                cmd=["bash", "-lc", "uv run pytest tests/ -q"],
-                timeout=240,
-                output="partial pytest output\n",
-                stderr="still running\n",
-            ),
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=timed_out,
         ):
             result = _run_review_verify_command(
                 "uv run pytest tests/ -q",
                 cwd=tmp_path,
                 timeout_seconds=240,
+                timeout_grace_seconds=7,
             )
 
         assert "verify_command timed out after 240s" in _format_review_verify_result(result)
+        assert (
+            "verify_command exceeded 240s; sent SIGTERM, waited 7s, and the process group exited during grace"
+            in _format_review_verify_result(result)
+        )
 
     def test_run_review_verify_command_warns_when_near_timeout_budget(self, tmp_path: Path):
         """Completed review verify runs should warn operators before they start timing out."""
-        completed = subprocess.CompletedProcess(
-            args=["bash", "-lc", "printf 'all good\\n'"],
+        helper_result = Mock(
             returncode=0,
             stdout="all good\n",
             stderr="",
+            timed_out=False,
+            forced_kill=False,
         )
 
-        with patch("gza.runner.subprocess.run", return_value=completed), \
+        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", return_value=helper_result), \
              patch("gza.runner.console.print") as mock_print, \
              patch("gza.runner.logger.warning") as mock_warning, \
              patch("gza.runner.time.monotonic", side_effect=[100.0, 108.3]):
@@ -1872,14 +1882,15 @@ class TestReviewContextFromChain:
 
     def test_run_review_verify_command_skips_warning_when_well_under_budget(self, tmp_path: Path):
         """Fast review verify runs should not emit near-timeout warnings."""
-        completed = subprocess.CompletedProcess(
-            args=["bash", "-lc", "printf 'all good\\n'"],
+        helper_result = Mock(
             returncode=0,
             stdout="all good\n",
             stderr="",
+            timed_out=False,
+            forced_kill=False,
         )
 
-        with patch("gza.runner.subprocess.run", return_value=completed), \
+        with patch("gza.runner._run_review_verify_command_with_timeout_diagnostics", return_value=helper_result), \
              patch("gza.runner.console.print") as mock_print, \
              patch("gza.runner.logger.warning") as mock_warning, \
              patch("gza.runner.time.monotonic", side_effect=[200.0, 205.0]):
@@ -1959,6 +1970,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -1979,6 +1991,8 @@ class TestReviewContextFromChain:
         assert len(verify_calls) == 2
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
         assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
+        assert verify_calls[0].kwargs["timeout_grace_seconds"] == 5.0
+        assert verify_calls[1].kwargs["timeout_grace_seconds"] == 5.0
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
@@ -2056,6 +2070,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2118,6 +2133,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2177,6 +2193,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2239,6 +2256,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2290,6 +2308,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2373,6 +2392,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2912,9 +2932,9 @@ class TestReviewContextFromChain:
         review_task.output_content = (
             "## Summary\n\n- Verify timed out.\n\n"
             "## Blockers\n\n"
-            "### B1 verify_command failure: timed out during pytest\n"
-            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
-            "Open-state citation: `src/gza/runner.py:903`\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: lifecycle verify timed out at `120s` while running `./bin/tests`.\n"
+            "Open-state citation: `bin/tests:150-155`\n"
             "Impact: the branch cannot be verified autonomously.\n"
             "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
             "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
@@ -2935,6 +2955,7 @@ class TestReviewContextFromChain:
 
         assert "## Verify Timeout Guidance" in context
         assert "Treat this as a test-performance investigation first" in context
+        assert "Inspect the captured `## verify_command result`, trimmed output, and any referenced `verify_command_output` artifact" in context
         assert "do not silently relax suite-wide guardrails or change `verify_timeout`" in context
 
     def test_improve_context_includes_verify_timeout_guidance_for_evidence_only_timeout_review(
@@ -2979,6 +3000,8 @@ class TestReviewContextFromChain:
 
         assert "## Verify Timeout Guidance" in context
         assert "Treat this as a test-performance investigation first" in context
+        assert "Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps" in context
+        assert "Inspect the captured `## verify_command result`" in context
 
     def test_improve_context_excludes_verify_timeout_guidance_for_code_blocker_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -10816,7 +10839,8 @@ class TestExtractedRunInnerHelpers:
         config.log_path = tmp_path / "logs"
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.verify_command = "uv run pytest tests/ -q"
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 9.0
 
         worktree_git = Mock(spec=Git)
         worktree_git.repo_dir = tmp_path
@@ -10840,7 +10864,7 @@ class TestExtractedRunInnerHelpers:
                     reviewed_head_sha="abc1234",
                     reviewed_base_sha="cafebabe",
                 ),
-            ),
+            ) as mock_review_verify,
             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
@@ -10857,6 +10881,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
+        assert mock_review_verify.call_args.kwargs["timeout_grace_seconds"] == 9.0
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -14791,7 +14816,7 @@ class TestProviderPromptSanitization:
             f"tree_fingerprint={failed_fingerprint}\\n"
             "lint failed\\n' && exit 7"
         )
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -14898,7 +14923,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = "printf 'all good\\n'"
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -14972,7 +14997,7 @@ class TestProviderPromptSanitization:
         config.timeout_minutes = 10
         large_output = ("x" * 4500) + " ENDMARK"
         config.verify_command = f"printf '%s' '{large_output}' && exit 9"
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -15041,7 +15066,8 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 8.0
 
         captured_prompts: list[str] = []
 
@@ -15117,6 +15143,7 @@ class TestProviderPromptSanitization:
         assert "- Status: failed" in prompt
         assert "bar failed" in prompt
         mock_cross_project_verify.assert_called_once()
+        assert mock_cross_project_verify.call_args.kwargs["timeout_grace_seconds"] == 8.0
         assert mock_cross_project_verify.call_args.kwargs["reviewed_branch"] == impl.branch
         assert mock_cross_project_verify.call_args.kwargs["reviewed_head_sha"] == "deadbeef"
         assert mock_cross_project_verify.call_args.kwargs["reviewed_base_sha"] == "cafebabe"
@@ -15154,7 +15181,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -15333,7 +15360,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15441,7 +15468,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15565,7 +15592,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15705,7 +15732,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15841,7 +15868,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = "uv run pytest tests/ -q"
-        config.review_verify_timeout_seconds = 240
+        config.autonomous_verify_timeout_seconds = 240
 
         captured_prompts: list[str] = []
 
@@ -15870,14 +15897,15 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
+        timed_out = Mock(
+            timed_out=True,
+            forced_kill=True,
+            stdout="partial pytest output\n",
+            stderr="still running\n",
+        )
         with patch(
-            "gza.runner.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(
-                cmd=["bash", "-lc", config.verify_command],
-                timeout=240,
-                output="partial pytest output\n",
-                stderr="still running\n",
-            ),
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=timed_out,
         ), patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
            patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
@@ -15890,9 +15918,21 @@ class TestProviderPromptSanitization:
         assert "- Exit status: timed out" in prompt
         assert "- Reviewed head: `deadbeef`" in prompt
         assert "verify_command timed out after 240s" in prompt
+        assert "sent SIGTERM, waited 5s, then sent SIGKILL" in prompt
         assert "partial pytest output" in prompt
         assert "still running" in prompt
         assert "## Original request:" in prompt
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_markdown is not None
+        assert "sent SIGTERM, waited 5s, then sent SIGKILL" in refreshed.review_verify_markdown
+        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
+        assert len(artifacts) == 1
+        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == (
+            "verify_command exceeded 240s; sent SIGTERM, waited 5s, then sent SIGKILL\n"
+            "partial pytest output\n"
+            "still running"
+        )
 
     def test_review_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

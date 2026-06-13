@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from gza.db import SqliteTaskStore
-from gza.lineage import get_plan_for_task, get_root_impl, resolve_impl_task
+from gza.lineage import get_plan_for_task, get_root_impl, resolve_impl_task, walk_lineage_descendants
 
 
 def test_get_plan_for_task_finds_plan_through_retry_chain(tmp_path: Path) -> None:
@@ -55,6 +55,21 @@ def test_get_root_impl_returns_oldest_retry_ancestor(tmp_path: Path) -> None:
     retry3 = store.add("Retry 3", task_type="implement", based_on=retry2.id)
 
     assert get_root_impl(store, retry3).id == root.id
+
+
+def test_walk_lineage_descendants_follows_both_based_on_and_depends_on_links(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    root = store.add("Root plan", task_type="plan")
+    based_child = store.add("Based child", task_type="implement", based_on=root.id)
+    depends_child = store.add("Depends child", task_type="implement", depends_on=root.id)
+    grandchild = store.add("Grandchild", task_type="review", depends_on=depends_child.id)
+
+    descendants = list(walk_lineage_descendants(store, root))
+    descendant_ids = {task.id for task in descendants}
+
+    assert based_child.id in descendant_ids
+    assert depends_child.id in descendant_ids
+    assert grandchild.id in descendant_ids
 
 
 def test_resolve_impl_task_for_implement_review_improve_and_fix(tmp_path: Path) -> None:

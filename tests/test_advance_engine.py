@@ -461,9 +461,9 @@ def _timeout_only_review_report() -> str:
     return (
         "## Summary\n\n- Verify timed out.\n\n"
         "## Blockers\n\n"
-        "### B1 verify_command failure: timed out during pytest\n"
-        "Evidence: verify_command timed out after 120s while running the configured suite.\n"
-        "Open-state citation: `src/gza/runner.py:903`\n"
+        "### B1 verify_command failure: full verification timed out\n"
+        "Evidence: lifecycle verify timed out at `120s` while running `./bin/tests`; the timeout hit near `bin/tests:150-155`.\n"
+        "Open-state citation: `bin/tests:150-155`\n"
         "Impact: the branch cannot be verified autonomously.\n"
         "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
         "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
@@ -483,6 +483,22 @@ def _timeout_only_review_report_evidence_only() -> str:
         "Impact: the branch cannot be considered verified.\n"
         "Required fix: investigate the test-performance regression.\n"
         "Required tests: rerun the exact configured verify_command after narrowing the slowdown.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _timeout_review_with_product_code_open_state_citation() -> str:
+    return (
+        "## Summary\n\n- Verify timed out.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: full verification timed out\n"
+        "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+        "Open-state citation: `src/gza/runner.py:903`\n"
+        "Impact: product code still leaves the branch unable to pass autonomous verification.\n"
+        "Required fix: fix the cited product-code path before rerunning verify_command.\n"
+        "Required tests: add targeted runner coverage and rerun verify_command.\n\n"
         "## Follow-Ups\n\nNone.\n\n"
         "## Questions / Assumptions\n\nNone.\n\n"
         "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
@@ -558,6 +574,7 @@ def _unstructured_mixed_review_report() -> str:
 def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 2
 
     failed = store.add("Fix failing tests", task_type="implement")
     failed.status = "failed"
@@ -2976,6 +2993,7 @@ def test_one_noop_improve_permits_another_improve_with_warning_description(tmp_p
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 2
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -3335,6 +3353,44 @@ def test_verify_timeout_only_reviews_reverify_instead_of_parking_when_noop_limit
     assert action.get("needs_attention_reason") != "verify-blocked-no-code-issues"
 
 
+def test_verify_timeout_only_review_hits_threshold_one_with_single_noop_improve(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/verify-timeout-threshold-one",
+        when=datetime(2026, 5, 18, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    review.output_content = _timeout_only_review_report()
+    review.review_verify_head_sha = "stale-sha"
+    store.update(review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 18, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "fresh-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_noop_improve_then_review"
+    assert action["current_branch_head_sha"] == "fresh-sha"
+
+
 def test_verify_timeout_only_reviews_still_park_without_noop_limit_trigger(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -3371,6 +3427,81 @@ def test_verify_timeout_only_reviews_still_park_without_noop_limit_trigger(tmp_p
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+
+
+def test_code_blocker_hits_threshold_one_with_single_noop_improve_and_parks(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/code-blocker-threshold-one",
+        when=datetime(2026, 5, 18, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Guard is still missing.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing empty-input guard\n"
+        "Evidence: src/gza/foo.py:10-12 indexes the first item before validating input.\n"
+        "Open-state citation: `src/gza/foo.py:10-12`\n"
+        "Impact: empty selections still raise IndexError.\n"
+        "Required fix: return early when the selection is empty.\n"
+        "Required tests: add an empty-selection regression and rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 18, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+
+
+def test_product_code_open_state_citation_prevents_verify_noop_reverify(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/product-code-open-state-citation",
+        when=datetime(2026, 5, 18, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    review.output_content = _timeout_review_with_product_code_open_state_citation()
+    store.update(review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 18, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 @pytest.mark.parametrize(
@@ -5556,6 +5687,54 @@ def test_single_verify_timeout_only_review_still_creates_improve(tmp_path: Path)
 
     assert action["type"] == "improve"
     assert action["review_task"].id == review.id
+
+
+def test_missing_max_noop_improve_config_falls_back_to_authoritative_default(tmp_path: Path) -> None:
+    class _MissingMaxNoopImproveConfig:
+        def __init__(self, base_config: Config) -> None:
+            self._base_config = base_config
+
+        def __getattr__(self, name: str) -> object:
+            if name == "max_noop_improve_cycles":
+                raise AttributeError(name)
+            return getattr(self._base_config, name)
+
+    store = _make_store(tmp_path)
+    base_config = Config.load(tmp_path)
+    base_config.verify_command = "uv run pytest tests/ -q"
+    config = _MissingMaxNoopImproveConfig(base_config)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/missing-max-noop-config",
+        when=datetime(2026, 5, 18, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    review.output_content = _timeout_only_review_report()
+    review.review_verify_head_sha = "stale-sha"
+    store.update(review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 18, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "fresh-sha"},
+    )
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.max_noop_improve_cycles == 1
+    assert action["type"] == "verify_noop_improve_then_review"
 
 
 def test_two_consecutive_evidence_only_verify_timeout_reviews_need_attention(tmp_path: Path) -> None:

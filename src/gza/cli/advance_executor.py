@@ -29,6 +29,7 @@ from ..runner import (
     _get_task_output,
     _project_boundary,
     _resolve_review_verify_base_sha,
+    _resolve_review_verify_timeout_settings,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
     _task_has_current_passing_review_verify_evidence,
@@ -270,9 +271,7 @@ def run_noop_improve_verify_then_review(
 
     worktree_label = task.slug or task.id or "review-verify"
     worktree_path = Path(context.config.worktree_path) / f"{worktree_label}-noop-review-verify"
-    timeout_seconds = getattr(context.config, "review_verify_timeout_seconds", 120)
-    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
-        timeout_seconds = 120
+    timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
 
     def _append_cleanup_failure(message: str, cleanup_failure: str | None) -> str:
         if cleanup_failure is None:
@@ -326,6 +325,7 @@ def run_noop_improve_verify_then_review(
                     worktree_git=worktree_git,
                     worktree_path=worktree_path,
                     timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
                     reviewed_branch=task.branch,
                     reviewed_head_sha=reviewed_head_sha,
                     reviewed_base_sha=reviewed_base_sha,
@@ -346,6 +346,7 @@ def run_noop_improve_verify_then_review(
                     reviewed_head_sha=reviewed_head_sha,
                     reviewed_base_sha=reviewed_base_sha,
                     timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
                 )
                 verify_markdown = _format_review_verify_result(verify_result)
     except _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS as exc:

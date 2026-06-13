@@ -25,6 +25,8 @@ class WatchProgressCandidate:
     action_reason: str
     action_task_id: str | None
     action_task_status: str | None
+    action_task_started_at: datetime | None
+    action_task_running_pid: int | None
     failed_task_id: str | None
     recovery_task_id: str | None
     merge_unit_id: str | None
@@ -133,11 +135,17 @@ def build_watch_progress_candidate(
     recovery_task_id_str = recovery_task_id if isinstance(recovery_task_id, str) and recovery_task_id else None
     action_task_id = action_task.id if action_task is not None else None
     action_task_status = action_task.status if action_task is not None else None
+    action_task_started_at = action_task.started_at if action_task is not None else None
+    action_task_running_pid = action_task.running_pid if action_task is not None else None
     failed_task_id = failed_task.id if failed_task is not None else None
     evidence = {
         "subject_task_id": subject_task.id,
         "action_task_id": action_task_id,
         "action_task_status": action_task_status,
+        "action_task_started_at": (
+            _normalize_time(action_task_started_at).isoformat() if action_task_started_at is not None else None
+        ),
+        "action_task_running_pid": action_task_running_pid,
         "failed_task_id": failed_task_id,
         "recovery_task_id": recovery_task_id_str,
         "merge_unit_id": merge_unit_id,
@@ -154,6 +162,8 @@ def build_watch_progress_candidate(
         action_reason=action_reason,
         action_task_id=action_task_id,
         action_task_status=action_task_status,
+        action_task_started_at=action_task_started_at,
+        action_task_running_pid=action_task_running_pid,
         failed_task_id=failed_task_id,
         recovery_task_id=recovery_task_id_str,
         merge_unit_id=merge_unit_id,
@@ -265,6 +275,8 @@ def observe_watch_progress_and_maybe_park(
             subject_task_id=candidate.subject_task_id,
             action_task_id=candidate.action_task_id,
             action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
             failed_task_id=candidate.failed_task_id,
             recovery_task_id=candidate.recovery_task_id,
             merge_unit_id=candidate.merge_unit_id,
@@ -310,6 +322,8 @@ def refresh_watch_progress_after_state_change(
             subject_task_id=candidate.subject_task_id,
             action_task_id=candidate.action_task_id,
             action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
             failed_task_id=candidate.failed_task_id,
             recovery_task_id=candidate.recovery_task_id,
             merge_unit_id=candidate.merge_unit_id,
