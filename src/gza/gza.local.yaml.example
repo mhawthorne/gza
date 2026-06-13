@@ -242,8 +242,8 @@
 # max_failed_closing_review_retries: 3
 
 # Cap for consecutive no-op improves before lifecycle automation stops for discussion.
-# Default: 2
-# max_noop_improve_cycles: 2
+# Default: 1
+# max_noop_improve_cycles: 1
 
 # Cap for plan_review/plan_improve loops in lifecycle automation.
 # Default: 2
@@ -300,7 +300,8 @@
 #   Default review/improve loop cap in `gza watch`.
 #   Default: 10
 #   max_iterations: 10
-#   Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`.
+#   Seconds before watch reconciliation marks a silent registered worker for a pending or in-
+#   progress task `NO_ACTIVITY`.
 #   Default: 60
 #   no_activity_timeout: 60
 #   Repeated unchanged watch-action cycles before the subject is parked for manual attention.
@@ -319,6 +320,10 @@
 
 # --- Review ---
 
+# Timeout in seconds for lifecycle/automation-initiated verify_command runs.
+# Default: 120
+# autonomous_verify_timeout_seconds: 120
+
 # Deprecated compatibility key; accepted but ignored.
 # Default: 1
 # recommend_rebase_behind_commits: 1
@@ -335,9 +340,9 @@
 # Default: 500
 # review_diff_small_threshold: 500
 
-# Timeout in seconds for autonomous review verify_command runs.
-# Default: 120
-# review_verify_timeout_seconds: 120
+# Grace period in seconds after SIGTERM before lifecycle review verification escalates to SIGKILL.
+# Default: 5
+# review_verify_timeout_grace_seconds: 5
 
 # --- Output ---
 

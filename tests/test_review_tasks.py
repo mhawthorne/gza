@@ -236,7 +236,7 @@ class TestCreateReviewTask:
         task = _task(
             id="gza-1234",
             slug="20260315-1234-impl-add-feature-1",
-            group="mygroup",
+            tags=("202606-recovery", "v0.5.0"),
             based_on=None,
         )
         create_review_task(store, task, trigger_source="manual", prompt_mode="auto")
@@ -244,7 +244,7 @@ class TestCreateReviewTask:
         assert call_kwargs["prompt"] == "review add-feature"
         assert call_kwargs["task_type"] == "review"
         assert call_kwargs["depends_on"] == "gza-1234"
-        assert call_kwargs["tags"] == ("mygroup",)
+        assert call_kwargs["tags"] == ("202606-recovery", "v0.5.0")
         assert call_kwargs["based_on"] == "gza-1234"
 
     def test_auto_prompt_mode_strips_nested_known_suffixes_from_lineage(self):
@@ -277,6 +277,14 @@ class TestCreateReviewTask:
         call_kwargs = store.add.call_args[1]
         assert call_kwargs["model"] == "opus-4"
         assert call_kwargs["provider"] == "anthropic"
+
+    def test_inherits_parent_tags(self):
+        store = self._mock_store()
+        task = _task(id=10, tags=("202606-recovery", "v0.5.0"))
+
+        create_review_task(store, task, trigger_source="manual")
+
+        assert store.add.call_args.kwargs["tags"] == task.tags
 
     def test_model_and_provider_default_to_none(self):
         store = self._mock_store()
@@ -417,7 +425,7 @@ class TestFollowupTasks:
     def test_create_or_reuse_followup_task_is_idempotent(self):
         store = MagicMock()
         review_task = _task(id="gza-200", task_type="review")
-        impl_task = _task(id="gza-101", task_type="implement", group="grp-a")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("202606-recovery",))
         finding = ReviewFinding(
             id="F1",
             severity="FOLLOWUP",
@@ -446,13 +454,47 @@ class TestFollowupTasks:
         assert created_now is False
         store.add.assert_not_called()
 
+    def test_create_or_reuse_followup_task_reuse_does_not_retroactively_mutate_existing_child(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("202606-recovery", "v0.5.0"))
+        finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Title",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add validation",
+            tests=None,
+        )
+        existing = _task(
+            id="gza-401",
+            task_type="implement",
+            tags=("legacy-only",),
+            prompt="Follow-up F1 from review gza-200 for task gza-101: add validation",
+        )
+        store.get_based_on_children.return_value = [existing]
+
+        reused, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            trigger_source="manual",
+        )
+
+        assert reused.tags == ("legacy-only",)
+        assert created_now is False
+        store.add.assert_not_called()
+
     def test_create_or_reuse_followup_task_creates_when_missing(self):
         store = MagicMock()
         review_task = _task(id="gza-200", task_type="review")
         impl_task = _task(
             id="gza-101",
             task_type="implement",
-            group="grp-a",
+            tags=("202606-recovery", "v0.5.0"),
             review_scope="slice F-A1 + F-A2: preserve scoped review boundaries",
         )
         finding = ReviewFinding(
@@ -492,7 +534,7 @@ class TestFollowupTasks:
         assert kwargs["based_on"] == "gza-200"
         assert kwargs["depends_on"] == "gza-101"
         assert kwargs["review_scope"] == impl_task.review_scope
-        assert kwargs["tags"] == ("grp-a",)
+        assert kwargs["tags"] == impl_task.tags
 
     def test_create_or_reuse_followup_task_resolves_legacy_prompt_scope_when_field_missing(self):
         store = MagicMock()

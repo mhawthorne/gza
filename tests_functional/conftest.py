@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
+from gza.test_harness import register_sigterm_faulthandler
+
 FUNCTIONAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", "4"))
+
+register_sigterm_faulthandler()
 
 
 def pytest_collection_modifyitems(items):

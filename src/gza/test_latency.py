@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
+from typing import cast
 
 import pytest
 
@@ -260,14 +265,87 @@ def render_summary(report: LatencyReport) -> str:
     )
 
 
-def run_pytest(pytest_args: list[str]) -> tuple[int, list[MeasuredTest], float]:
+def _current_timestamp() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _build_current_report(test_durations: list[MeasuredTest], started_at: float) -> LatencyReport:
+    return build_report(
+        test_durations,
+        time.perf_counter() - started_at,
+        _current_timestamp(),
+    )
+
+
+def _emit_sigterm_summary(test_durations: list[MeasuredTest], started_at: float) -> None:
+    report = _build_current_report(test_durations, started_at)
+    sys.stderr.write("\n")
+    sys.stderr.write(render_summary(report))
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+    sys.stdout.flush()
+
+
+_SignalHandler = Callable[[int, FrameType | None], object] | int | None
+
+
+@dataclass
+class _SigtermSummaryHandler:
+    """Emit the current summary before allowing SIGTERM shutdown to continue."""
+
+    test_durations: list[MeasuredTest]
+    started_at: float
+    previous_handler: _SignalHandler = None
+    installed: bool = False
+    emitted: bool = False
+
+    def install(self) -> None:
+        sigterm = getattr(signal, "SIGTERM", None)
+        if sigterm is None:
+            return
+        self.previous_handler = signal.getsignal(sigterm)
+        signal.signal(sigterm, self._handle_sigterm)
+        self.installed = True
+
+    def restore(self) -> None:
+        if not self.installed:
+            return
+        sigterm = getattr(signal, "SIGTERM", None)
+        if sigterm is None or self.previous_handler is None:
+            self.installed = False
+            return
+        signal.signal(sigterm, cast(signal.Handlers, self.previous_handler))
+        self.installed = False
+
+    def _handle_sigterm(self, signum: int, _frame: FrameType | None) -> None:
+        if not self.emitted:
+            self.emitted = True
+            _emit_sigterm_summary(self.test_durations, self.started_at)
+        previous_handler = self.previous_handler
+        self.restore()
+        if callable(previous_handler):
+            cast(Callable[[int, FrameType | None], object], previous_handler)(signum, _frame)
+            raise SystemExit(128 + signum)
+        if previous_handler == signal.SIG_IGN:
+            raise SystemExit(128 + signum)
+        os.kill(os.getpid(), signum)
+
+
+def run_pytest(pytest_args: list[str], *, summary_on_sigterm: bool = False) -> tuple[int, list[MeasuredTest], float]:
     """Run pytest and capture call-phase durations."""
     plugin = _TimingPlugin()
     started = time.perf_counter()
+    sigterm_handler = _SigtermSummaryHandler(plugin.test_durations, started) if summary_on_sigterm else None
+    if sigterm_handler is not None:
+        sigterm_handler.install()
     # Redirect pytest's stdout to stderr so progress is visible on the terminal
     # while keeping our rendered report (markdown/JSON) on stdout pipeable.
-    with redirect_stdout(sys.stderr):
-        exit_code = pytest.main(pytest_args, plugins=[plugin])
+    try:
+        with redirect_stdout(sys.stderr):
+            exit_code = pytest.main(pytest_args, plugins=[plugin])
+    finally:
+        if sigterm_handler is not None:
+            sigterm_handler.restore()
     finished = time.perf_counter()
     return int(exit_code), plugin.test_durations, finished - started
 
@@ -325,14 +403,10 @@ def _default_report_path(json_mode: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     pytest_args = _default_pytest_args(args.pytest_args)
-    exit_code, test_durations, total_wall_time_seconds = run_pytest(pytest_args)
+    exit_code, test_durations, total_wall_time_seconds = run_pytest(pytest_args, summary_on_sigterm=args.summary)
     if exit_code != 0:
         return exit_code
-    report = build_report(
-        test_durations,
-        total_wall_time_seconds,
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    )
+    report = build_report(test_durations, total_wall_time_seconds, _current_timestamp())
     if args.summary:
         _write_output(render_summary(report) + "\n", args.output)
         return 0

@@ -236,15 +236,15 @@ class TestValidateReviewReportContract:
 
 
 class TestVerifyBlockedReviewClassification:
-    def test_classifies_timeout_only_review_from_structured_blocker_with_open_state_citation(
+    def test_classifies_verify_timeout_blocker_when_structured_citation_points_at_verify_harness(
         self,
     ) -> None:
         content = (
             "## Summary\n\n- Verify timed out.\n\n"
             "## Blockers\n\n"
-            "### B1 verify_command failure: timed out during pytest\n"
-            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
-            "Open-state citation: `src/gza/runner.py:903`\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: lifecycle verify timed out at `120s` while running `./bin/tests`.\n"
+            "Open-state citation: `bin/tests:150-155`\n"
             "Impact: the branch cannot be verified autonomously.\n"
             "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
             "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
@@ -262,13 +262,87 @@ class TestVerifyBlockedReviewClassification:
         assert is_verify_timeout_only_review(content) is True
         assert is_verify_blocked_only_review(content) is True
 
+    def test_classifies_verify_timeout_blocker_when_structured_fields_cite_verify_harness(self) -> None:
+        content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: lifecycle verify timed out at `120s` while running `./bin/tests`; the harness stalled near `bin/tests:150-155`.\n"
+            "Open-state citation: `bin/tests:150-155`\n"
+            "Impact: autonomous verification cannot finish while the suite stays over budget.\n"
+            "Required fix: inspect the verify harness around `bin/tests:150-155` before changing product code.\n"
+            "Required tests: rerun `./bin/tests` and capture whether the timeout reproduces from the current tip.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 1
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is True
+        assert is_verify_blocked_only_review(content) is True
+
+    def test_keeps_timeout_shaped_blocker_as_code_when_structured_fields_cite_src(self) -> None:
+        content = (
+            "## Summary\n\n- Timeout is a symptom of a real defect.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: `src/gza/review_verdict.py:590-605` loops over every review finding until verify_command times out.\n"
+            "Open-state citation: `src/gza/review_verdict.py:590-605`\n"
+            "Impact: product code keeps the suite running past the verify budget.\n"
+            "Required fix: stop the pathological loop in `src/gza/review_verdict.py:590-605` before rerunning verify_command.\n"
+            "Required tests: add regression coverage for the looping branch and rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
+    def test_keeps_timeout_shaped_blocker_as_code_when_only_open_state_citation_points_at_src(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Timeout is a symptom of a real defect.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
+            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Impact: product code still leaves the review path unable to complete under the verify budget.\n"
+            "Required fix: fix the cited product-code path before rerunning autonomous verification.\n"
+            "Required tests: add targeted regression coverage for the runner path and rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
     def test_does_not_classify_mixed_timeout_and_code_review_as_timeout_only(self) -> None:
         content = (
             "## Summary\n\n- Mixed blockers.\n\n"
             "## Blockers\n\n"
             "### B1 verify_command failure: timed out during pytest\n"
             "Evidence: verify_command timed out after 120s while running the configured suite.\n"
-            "Open-state citation: `src/gza/runner.py:903`\n"
+            "Open-state citation: `bin/tests:150-155`\n"
             "Impact: branch cannot be verified.\n"
             "Required fix: investigate the slowdown.\n"
             "Required tests: rerun the suite.\n\n"

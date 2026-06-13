@@ -43,6 +43,7 @@ from ..db import (
     task_id_numeric_key,
 )
 from ..dependency_preconditions import task_is_merged
+from ..derived_tags import resolve_derived_task_tags
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import (
     Git,
@@ -2541,7 +2542,7 @@ def _cmd_advance_unimplemented(
             prompt=prompt_text,
             task_type="implement",
             depends_on=task.id,
-            tags=task.tags,
+            tags=resolve_derived_task_tags(task),
             trigger_source="manual",
         )
         print(f"✓ Created implement task {impl_task.id} for {task.task_type} {task.id}")

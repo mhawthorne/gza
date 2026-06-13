@@ -22,6 +22,7 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
+    WatchProgressObservation,
     _ClosingSqliteConnection,
     _is_readonly_operational_error,
     _is_readonly_snapshot_operational_error,
@@ -6878,6 +6879,48 @@ def _drop_task_artifacts_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_watch_progress_observations_column(db_path: Path, column_name: str) -> None:
+    """Rebuild watch_progress_observations without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE watch_progress_observations RENAME TO watch_progress_observations_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(watch_progress_observations_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(watch_progress_observations_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(name for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE watch_progress_observations ({', '.join(col_defs)})")
+    conn.execute(
+        "INSERT INTO watch_progress_observations "
+        f"({cols_str}) SELECT {cols_str} FROM watch_progress_observations_old"
+    )
+    conn.execute("DROP TABLE watch_progress_observations_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watch_progress_subject "
+        "ON watch_progress_observations(project_id, subject_kind, subject_id)"
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -8962,6 +9005,68 @@ class TestSharedDbIsolationAndImportGating:
         assert merged_units[0].merge_source is None
         assert filtered_units == []
         assert any("merge_units.merge_source" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_pre_v53_watch_progress_reads_without_liveness_columns(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should degrade pre-v53 watch-progress liveness fields to None."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        observed_at = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+        started_at = datetime(2026, 6, 1, 11, 55, tzinfo=UTC)
+        store.upsert_watch_progress_observation(
+            WatchProgressObservation(
+                subject_kind="lineage",
+                subject_id="gza-100",
+                action_type="retry",
+                action_reason="recovery_already_running",
+                subject_task_id="gza-90",
+                action_task_id="gza-101",
+                action_task_status="pending",
+                action_task_started_at=started_at,
+                action_task_running_pid=4242,
+                failed_task_id="gza-90",
+                recovery_task_id="gza-101",
+                evidence_fingerprint="fp-1",
+                streak=2,
+                parked_reason="watch-no-progress-backstop",
+                observed_at=observed_at,
+            )
+        )
+
+        _drop_watch_progress_observations_column(db_path, "action_task_started_at")
+        _drop_watch_progress_observations_column(db_path, "action_task_running_pid")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 52")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            observations = query_store.list_watch_progress_observations(
+                subject_kind="lineage",
+                subject_id="gza-100",
+            )
+            observation = query_store.get_watch_progress_observation(
+                subject_kind="lineage",
+                subject_id="gza-100",
+                action_type="retry",
+                action_reason="recovery_already_running",
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert len(observations) == 1
+        assert observation == observations[0]
+        assert observation is not None
+        assert observation.action_task_id == "gza-101"
+        assert observation.action_task_status == "pending"
+        assert observation.action_task_started_at is None
+        assert observation.action_task_running_pid is None
+        assert observation.observed_at == observed_at
+        assert any("watch-progress liveness columns" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_pre_v43_db_missing_changed_diff_reads_with_null(
         self, tmp_path: Path

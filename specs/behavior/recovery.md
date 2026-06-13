@@ -144,6 +144,12 @@ its stored action.
   attempt MUST count toward that budget first. Automation MAY spend the remaining bounded
   attempt(s) before escalating to shared needs-attention; it MUST NOT park immediately on
   the first same-action startup-abort descendant alone.
+- A bounded automatic recovery attempt starts when automation creates a recovery edge/child
+  or adopts an existing explicit recovery descendant for execution.
+- A non-terminal recovery descendant MUST NOT leave the original failed subject recoverable
+  forever. When the descendant stays non-terminal, watch MUST either reconcile proven
+  dead/silent descendant work to terminal failure or park the original failed subject via
+  the shared no-progress attention backstop after the configured unchanged-repeat limit.
 
 - Operator wording MUST distinguish **moot empty work** from **empty but resumable
   failed work**.

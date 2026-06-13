@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import re
+import selectors
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -31,10 +33,11 @@ from .branch_resolution import resolve_rebase_target_branch
 from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
+    DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
-    DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS,
+    DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
     BranchStrategy,
     Config,
     is_model_compatible_with_provider,
@@ -1954,7 +1957,8 @@ REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
-REVIEW_VERIFY_TIMEOUT_SECONDS = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
+AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
+REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS = DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -2708,6 +2712,273 @@ def _format_review_verify_result(
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class _ReviewVerifyCommandRun:
+    """Low-level review verify process outcome including timeout diagnostics."""
+
+    returncode: int
+    stdout: str | bytes | None
+    stderr: str | bytes | None
+    timed_out: bool = False
+    forced_kill: bool = False
+
+
+def _resolve_review_verify_timeout_seconds(config: Config | object) -> int:
+    """Return the configured autonomous review verify budget with fallback."""
+    timeout_seconds = getattr(
+        config,
+        "autonomous_verify_timeout_seconds",
+        AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
+    )
+    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        return AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
+    return timeout_seconds
+
+
+def _resolve_review_verify_timeout_grace_seconds(config: Config | object) -> int:
+    """Return the configured graceful review verify termination window with fallback."""
+    grace_seconds = getattr(
+        config,
+        "review_verify_timeout_grace_seconds",
+        REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+    )
+    if not isinstance(grace_seconds, int) or grace_seconds < 1:
+        return REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
+    return grace_seconds
+
+
+def _signal_review_verify_process_group(process: subprocess.Popen[Any], sig: int) -> bool:
+    """Best-effort signal delivery for a review verify process group."""
+    if hasattr(os, "killpg") and process.pid > 0:
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+    if process.poll() is not None:
+        return False
+    try:
+        process.send_signal(sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def _review_verify_process_group_alive(process: subprocess.Popen[Any]) -> bool:
+    """Return whether the tracked verify process group still exists."""
+    if process.poll() is None:
+        return True
+    if hasattr(os, "killpg") and process.pid > 0:
+        try:
+            os.killpg(process.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _coerce_review_verify_pipe_bytes(output: str | bytes | None) -> bytes:
+    """Normalize review verify pipe fragments to bytes for bounded post-timeout draining."""
+    if output is None:
+        return b""
+    if isinstance(output, bytes):
+        return output
+    return output.encode("utf-8", errors="replace")
+
+
+def _register_review_verify_process_pipes(
+    selector: selectors.BaseSelector,
+    process: subprocess.Popen[bytes],
+) -> None:
+    """Register verify stdout and stderr pipes for non-blocking reads."""
+    for name, stream in {"stdout": process.stdout, "stderr": process.stderr}.items():
+        if stream is None or stream.closed:
+            continue
+        fd = stream.fileno()
+        os.set_blocking(fd, False)
+        selector.register(fd, selectors.EVENT_READ, data=name)
+
+
+def _read_review_verify_process_pipe_events(
+    selector: selectors.BaseSelector,
+    events: list[tuple[selectors.SelectorKey, int]],
+    *,
+    stdout: bytearray,
+    stderr: bytearray,
+) -> None:
+    """Consume ready review verify pipe chunks into the provided collectors."""
+    collectors = {
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    for key, _mask in events:
+        try:
+            chunk = os.read(key.fd, 65536)
+        except BlockingIOError:
+            continue
+        except OSError:
+            selector.unregister(key.fd)
+            continue
+        if chunk:
+            collectors[cast(str, key.data)].extend(chunk)
+            continue
+        selector.unregister(key.fd)
+
+
+def _drain_review_verify_process_pipes_until_deadline(
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+    initial_stdout: str | bytes | None,
+    initial_stderr: str | bytes | None,
+) -> tuple[bytes, bytes]:
+    """Read whatever pipe output is currently available without waiting for EOF."""
+    stdout = bytearray(_coerce_review_verify_pipe_bytes(initial_stdout))
+    stderr = bytearray(_coerce_review_verify_pipe_bytes(initial_stderr))
+    selector = selectors.DefaultSelector()
+    try:
+        _register_review_verify_process_pipes(selector, process)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            events = selector.select(timeout=min(remaining, 0.05))
+            if not events:
+                continue
+            _read_review_verify_process_pipe_events(
+                selector,
+                events,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        return bytes(stdout), bytes(stderr)
+    finally:
+        selector.close()
+
+
+def _wait_for_review_verify_process_group_exit(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: int,
+    initial_stdout: str | bytes | None,
+    initial_stderr: str | bytes | None,
+) -> tuple[bytes, bytes, bool]:
+    """Collect timeout output until the verify process group exits or grace expires."""
+    deadline = time.monotonic() + grace_seconds
+    stdout = bytearray(_coerce_review_verify_pipe_bytes(initial_stdout))
+    stderr = bytearray(_coerce_review_verify_pipe_bytes(initial_stderr))
+    exited_during_grace = False
+    selector = selectors.DefaultSelector()
+    try:
+        _register_review_verify_process_pipes(selector, process)
+        while True:
+            process_group_alive = _review_verify_process_group_alive(process)
+            if not process_group_alive:
+                exited_during_grace = True
+                if not selector.get_map():
+                    return bytes(stdout), bytes(stderr), True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            if not selector.get_map():
+                time.sleep(min(remaining, 0.01))
+                continue
+
+            events = selector.select(timeout=min(remaining, 0.05))
+            if not events:
+                continue
+            _read_review_verify_process_pipe_events(
+                selector,
+                events,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        if selector.get_map():
+            events = selector.select(timeout=0)
+            if events:
+                _read_review_verify_process_pipe_events(
+                    selector,
+                    events,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+        return bytes(stdout), bytes(stderr), exited_during_grace or not _review_verify_process_group_alive(process)
+    finally:
+        selector.close()
+
+
+def _run_review_verify_command_with_timeout_diagnostics(
+    verify_command: str,
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    termination_grace_seconds: int,
+) -> _ReviewVerifyCommandRun:
+    """Run review verification and preserve output across graceful timeout escalation."""
+    def _resolved_returncode(process: subprocess.Popen[Any]) -> int:
+        return process.returncode if process.returncode is not None else 1
+
+    process = subprocess.Popen(
+        ["bash", "-lc", verify_command],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        bufsize=0,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        completed_stdout, completed_stderr = process.communicate(timeout=timeout_seconds)
+        return _ReviewVerifyCommandRun(
+            returncode=_resolved_returncode(process),
+            stdout=completed_stdout,
+            stderr=completed_stderr,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _signal_review_verify_process_group(process, signal.SIGTERM)
+        timeout_stdout, timeout_stderr, exited_during_grace = _wait_for_review_verify_process_group_exit(
+            process,
+            grace_seconds=termination_grace_seconds,
+            initial_stdout=exc.stdout,
+            initial_stderr=exc.stderr,
+        )
+        if exited_during_grace:
+            return _ReviewVerifyCommandRun(
+                returncode=_resolved_returncode(process),
+                stdout=timeout_stdout,
+                stderr=timeout_stderr,
+                timed_out=True,
+                forced_kill=False,
+            )
+        _signal_review_verify_process_group(process, signal.SIGKILL)
+        kill_deadline = time.monotonic() + 1.0
+        timeout_stdout, timeout_stderr = _drain_review_verify_process_pipes_until_deadline(
+            process,
+            deadline=kill_deadline,
+            initial_stdout=timeout_stdout,
+            initial_stderr=timeout_stderr,
+        )
+        while _review_verify_process_group_alive(process) and time.monotonic() < kill_deadline:
+            time.sleep(0.01)
+        return _ReviewVerifyCommandRun(
+            returncode=_resolved_returncode(process),
+            stdout=timeout_stdout,
+            stderr=timeout_stderr,
+            timed_out=True,
+            forced_kill=True,
+        )
+
+
 def _run_review_verify_command(
     verify_command: str,
     *,
@@ -2715,32 +2986,18 @@ def _run_review_verify_command(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
-    timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
+    timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
+    timeout_grace_seconds: int = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
 ) -> ReviewVerifyResult:
     """Run the configured verify command for an autonomous review iteration."""
     captured_at = datetime.now(UTC)
     started_at = time.monotonic()
     try:
-        result = subprocess.run(
-            ["bash", "-lc", verify_command],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return _make_review_verify_result(
+        result = _run_review_verify_command_with_timeout_diagnostics(
             verify_command,
-            status="failed",
-            exit_status="timed out",
-            captured_at=captured_at,
-            reviewed_branch=reviewed_branch,
-            reviewed_head_sha=reviewed_head_sha,
-            reviewed_base_sha=reviewed_base_sha,
-            working_directory=str(cwd),
-            failure=f"verify_command timed out after {timeout_seconds}s",
-            output=_combine_review_verify_output(exc.stdout, exc.stderr),
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            termination_grace_seconds=timeout_grace_seconds,
         )
     except OSError as exc:
         return _make_review_verify_result(
@@ -2753,6 +3010,28 @@ def _run_review_verify_command(
             reviewed_base_sha=reviewed_base_sha,
             working_directory=str(cwd),
             failure=f"failed to launch verify_command: {exc}",
+        )
+    if result.timed_out:
+        timeout_diagnostic = (
+            f"verify_command exceeded {timeout_seconds}s; sent SIGTERM, waited "
+            f"{timeout_grace_seconds}s, and the process group exited during grace"
+        )
+        if result.forced_kill:
+            timeout_diagnostic = (
+                f"verify_command exceeded {timeout_seconds}s; sent SIGTERM, waited "
+                f"{timeout_grace_seconds}s, then sent SIGKILL"
+            )
+        return _make_review_verify_result(
+            verify_command,
+            status="failed",
+            exit_status="timed out",
+            captured_at=captured_at,
+            reviewed_branch=reviewed_branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+            working_directory=str(cwd),
+            failure=f"verify_command timed out after {timeout_seconds}s",
+            output=_combine_review_verify_output(timeout_diagnostic, result.stdout, result.stderr),
         )
     elapsed = time.monotonic() - started_at
     if elapsed > (0.8 * timeout_seconds):
@@ -2878,6 +3157,7 @@ def _run_review_verify_commands_for_projects(
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=timeout_seconds,
+            timeout_grace_seconds=_resolve_review_verify_timeout_grace_seconds(config),
         )
         scope = _format_repo_project_scope(_project_boundary(config).scope_root)
         return CrossProjectReviewVerifyResult(
@@ -2942,6 +3222,7 @@ def _run_review_verify_commands_for_projects(
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=timeout_seconds,
+            timeout_grace_seconds=_resolve_review_verify_timeout_grace_seconds(config),
         )
         project_results.append(
             ProjectReviewVerifyResult(
@@ -3383,10 +3664,13 @@ def _build_context_from_chain(
                             "code-correctness fix.\n"
                         )
                         context_parts.append(
+                            "- Inspect the captured `## verify_command result`, trimmed output, and any referenced `verify_command_output` artifact before rerunning the full command. Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps."
+                        )
+                        context_parts.append(
                             "- Re-run the exact configured `verify_command` once from the current branch tip to confirm the timeout is still current."
                         )
                         context_parts.append(
-                            "- If it still times out, run a narrower pytest duration probe such as `uv run pytest tests/ --durations=20` or the configured pytest subset with `--durations=20`."
+                            "- If it still times out, run a narrower subset or diagnostic mode that can identify the slow or stuck phase without immediately rerunning the entire suite."
                         )
                         context_parts.append(
                             "- Compare against the baseline branch when practical to determine whether this branch introduced the slowdown."
@@ -3777,9 +4061,8 @@ def _capture_noop_improve_review_verify_result(
     if not _task_is_cross_project(task) and not verify_command.strip():
         return None
 
-    timeout_seconds = getattr(config, "review_verify_timeout_seconds", REVIEW_VERIFY_TIMEOUT_SECONDS)
-    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
-        timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
+    timeout_seconds = _resolve_review_verify_timeout_seconds(config)
+    timeout_grace_seconds = _resolve_review_verify_timeout_grace_seconds(config)
 
     provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(config))
     reviewed_base_sha: str | None = None
@@ -3828,6 +4111,7 @@ def _capture_noop_improve_review_verify_result(
                 reviewed_head_sha=reviewed_head_sha,
                 reviewed_base_sha=reviewed_base_sha,
                 timeout_seconds=timeout_seconds,
+                timeout_grace_seconds=timeout_grace_seconds,
             )
             markdown = _format_review_verify_result(result)
     except (GitError, OSError, RuntimeError, ValueError) as exc:
@@ -3915,10 +4199,10 @@ def _extract_required_fix_candidates(content: str) -> dict[str, str]:
         signals.extend(_extract_blocker_signal_lines(finding.body))
         signals.append(finding.title)
 
-        for signal in signals:
-            normalized = _normalize_repeated_blocker_text(signal)
+        for signal_text in signals:
+            normalized = _normalize_repeated_blocker_text(signal_text)
             if normalized:
-                candidates.setdefault(normalized, signal.strip())
+                candidates.setdefault(normalized, signal_text.strip())
 
     for match in re.finditer(r"(?im)^Required fix:\s*(.+)$", content):
         signal = match.group(1).strip()
@@ -5690,6 +5974,7 @@ def run(
         console.print("No pending tasks found")
         return 0
     requested_create_pr = bool(create_pr or task.create_pr)
+    ensure_task_log_path(config, store, task)
     if on_task_claimed is not None:
         on_task_claimed(task)
     if pr_retry_mode:
@@ -7496,13 +7781,8 @@ def _run_non_code_task(
                 _task_is_cross_project(task) or verify_command.strip()
             )
             if should_run_review_verify:
-                review_verify_timeout_seconds = getattr(
-                    config,
-                    "review_verify_timeout_seconds",
-                    REVIEW_VERIFY_TIMEOUT_SECONDS,
-                )
-                if not isinstance(review_verify_timeout_seconds, int) or review_verify_timeout_seconds < 1:
-                    review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
+                autonomous_verify_timeout_seconds = _resolve_review_verify_timeout_seconds(config)
+                review_verify_timeout_grace_seconds = _resolve_review_verify_timeout_grace_seconds(config)
                 reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
                 reviewed_base_sha = _resolve_review_verify_base_sha(git, default_branch)
                 if reviewed_head_sha is None:
@@ -7526,7 +7806,7 @@ def _run_non_code_task(
                             task=task,
                             worktree_git=worktree_git,
                             worktree_path=worktree_path,
-                            timeout_seconds=review_verify_timeout_seconds,
+                            timeout_seconds=autonomous_verify_timeout_seconds,
                             reviewed_branch=reviewed_branch,
                             reviewed_head_sha=reviewed_head_sha,
                             reviewed_base_sha=reviewed_base_sha,
@@ -7542,7 +7822,8 @@ def _run_non_code_task(
                             reviewed_branch=reviewed_branch,
                             reviewed_head_sha=reviewed_head_sha,
                             reviewed_base_sha=reviewed_base_sha,
-                            timeout_seconds=review_verify_timeout_seconds,
+                            timeout_seconds=autonomous_verify_timeout_seconds,
+                            timeout_grace_seconds=review_verify_timeout_grace_seconds,
                         )
                         review_verify_markdown = _format_review_verify_result(review_verify_result)
                 if review_verify_result is not None:

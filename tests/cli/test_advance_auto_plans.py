@@ -129,6 +129,29 @@ def test_advance_create_plan_review_inherits_tags_from_completed_plan(tmp_path: 
     assert plan_review_tasks[0].tags == plan.tags
 
 
+def test_advance_auto_implement_inherits_all_parent_tags(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "require_plan_review_before_implement: false\n")
+    store = make_store(tmp_path)
+    plan = _create_completed_plan(store, "Design recovery slice")
+    plan.tags = ("202606-recovery", "v0.5.0")
+    store.update(plan)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops._spawn_background_worker", return_value=0),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    assert rc == 0
+    assert "Created implement task" in capsys.readouterr().out
+    implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+    assert len(implement_tasks) == 1
+    assert implement_tasks[0].depends_on == plan.id
+    assert implement_tasks[0].tags == plan.tags
+
+
 def test_advance_create_plan_review_startup_failure_rolls_back_child_and_skips_spawn(
     tmp_path: Path,
     capsys,

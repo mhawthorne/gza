@@ -40,6 +40,23 @@ def walk_based_on_descendants(
         )
 
 
+def walk_lineage_descendants(store: SqliteTaskStore, task: Task) -> Iterator[Task]:
+    """Yield descendants reachable through based_on or depends_on links."""
+    if task.id is None:
+        return
+
+    visited: set[str] = {task.id}
+    queue: list[Task] = list(store.get_lineage_children(task.id))
+
+    while queue:
+        child = queue.pop(0)
+        if child.id is None or child.id in visited:
+            continue
+        visited.add(child.id)
+        yield child
+        queue.extend(store.get_lineage_children(child.id))
+
+
 def walk_ancestors(
     store: SqliteTaskStore,
     task: Task,

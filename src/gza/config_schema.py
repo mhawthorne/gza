@@ -106,7 +106,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_plan_review_cycles", "int", 2, "Cap for plan_review/plan_improve loops in lifecycle automation."),
-    ConfigKeySpec("max_noop_improve_cycles", "int", 2, "Cap for consecutive no-op improves before lifecycle automation stops for discussion."),
+    ConfigKeySpec("max_noop_improve_cycles", "int", 1, "Cap for consecutive no-op improves before lifecycle automation stops for discussion."),
     ConfigKeySpec("max_plan_slices", "int | null", None, "Optional cap on auto-materialized implementation slices from one approved plan review."),
     ConfigKeySpec(
         "plan_slice_target_timeout_minutes",
@@ -157,7 +157,8 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("code_task_diff_timeout_large_minutes", "int", 45, "Scaled timeout applied to code tasks at or above the large diff threshold."),
     ConfigKeySpec("code_task_diff_timeout_cap_minutes", "int", 45, "Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling."),
     ConfigKeySpec("review_context_file_limit", "int", 12, "Max changed files included in large review context excerpts."),
-    ConfigKeySpec("review_verify_timeout_seconds", "int", 120, "Timeout in seconds for autonomous review verify_command runs."),
+    ConfigKeySpec("autonomous_verify_timeout_seconds", "int", 120, "Timeout in seconds for lifecycle/automation-initiated verify_command runs."),
+    ConfigKeySpec("review_verify_timeout_grace_seconds", "int", 5, "Grace period in seconds after SIGTERM before lifecycle review verification escalates to SIGKILL."),
     ConfigKeySpec("recommend_rebase_behind_commits", "int", 1, "Deprecated compatibility key; accepted but ignored."),
     ConfigKeySpec("review_diff_medium_threshold", "int", 2000, "Medium diff threshold for review prompt shaping."),
     ConfigKeySpec("review_diff_small_threshold", "int", 500, "Small diff threshold for full inline review diffs."),
@@ -189,7 +190,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("watch.failure_halt_after", "int | null", 10, "Exit `gza watch` after this many consecutive non-auto-resumable failures."),
     ConfigKeySpec("watch.no_progress_cycles", "int", 3, "Repeated unchanged watch-action cycles before the subject is parked for manual attention."),
     ConfigKeySpec("watch.max_idle", "int | null", None, "Idle timeout seconds for `gza watch` loop exit."),
-    ConfigKeySpec("watch.no_activity_timeout", "int", 60, "Seconds before watch reconciliation marks a live-but-silent worker `NO_ACTIVITY`."),
+    ConfigKeySpec("watch.no_activity_timeout", "int", 60, "Seconds before watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`."),
     ConfigKeySpec("watch.max_iterations", "int", 10, "Default review/improve loop cap in `gza watch`."),
     ConfigKeySpec("watch.poll", "int", 300, "Polling interval seconds for `gza watch`."),
     ConfigKeySpec(
