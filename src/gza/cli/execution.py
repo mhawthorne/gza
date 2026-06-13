@@ -3412,7 +3412,7 @@ class _AdvanceEngineConfigAdapter:
     advance_create_reviews: bool
     max_review_cycles: int
     max_resume_attempts: int
-    max_noop_improve_cycles: int = 2
+    max_noop_improve_cycles: int = 1
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
 
 
@@ -3714,7 +3714,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
         max_resume_attempts=effective_max_resume_attempts,
         max_failed_closing_review_retries=_int_config(
             getattr(config, "max_failed_closing_review_retries", None),
@@ -4633,7 +4633,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
         max_resume_attempts=max_resume_attempts,
         max_failed_closing_review_retries=_int_config(
             getattr(config, "max_failed_closing_review_retries", None),
@@ -4808,7 +4808,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
         advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
         max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 2),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
         max_resume_attempts=max_resume_attempts,
         max_failed_closing_review_retries=_int_config(
             getattr(config, "max_failed_closing_review_retries", None),

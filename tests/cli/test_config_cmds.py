@@ -4591,7 +4591,8 @@ class TestWatchConfigValidation:
 
         self._write_config(tmp_path, "")
         config = Config.load(tmp_path)
-        assert config.review_verify_timeout_seconds == 120
+        assert config.autonomous_verify_timeout_seconds == 120
+        assert config.max_noop_improve_cycles == 1
         assert config.recommend_rebase_behind_commits == 1
 
     def test_review_verify_timeout_and_deprecated_recommend_rebase_custom_values_load(self, tmp_path: Path) -> None:
@@ -4600,10 +4601,10 @@ class TestWatchConfigValidation:
 
         self._write_config(
             tmp_path,
-            "review_verify_timeout_seconds: 240\nrecommend_rebase_behind_commits: 0\n",
+            "autonomous_verify_timeout_seconds: 240\nrecommend_rebase_behind_commits: 0\n",
         )
         config = Config.load(tmp_path)
-        assert config.review_verify_timeout_seconds == 240
+        assert config.autonomous_verify_timeout_seconds == 240
         assert config.recommend_rebase_behind_commits == 0
 
     @pytest.mark.parametrize(
@@ -4661,9 +4662,10 @@ class TestWatchConfigValidation:
     @pytest.mark.parametrize(
         ("field", "value", "message"),
         [
-            ("review_verify_timeout_seconds", "nope", "'review_verify_timeout_seconds' must be an integer"),
-            ("review_verify_timeout_seconds", "0", "'review_verify_timeout_seconds' must be positive"),
-            ("review_verify_timeout_seconds", "-1", "'review_verify_timeout_seconds' must be positive"),
+            ("autonomous_verify_timeout_seconds", "nope", "'autonomous_verify_timeout_seconds' must be an integer"),
+            ("autonomous_verify_timeout_seconds", "true", "'autonomous_verify_timeout_seconds' must be an integer"),
+            ("autonomous_verify_timeout_seconds", "0", "'autonomous_verify_timeout_seconds' must be positive"),
+            ("autonomous_verify_timeout_seconds", "-1", "'autonomous_verify_timeout_seconds' must be positive"),
             ("recommend_rebase_behind_commits", "nope", "'recommend_rebase_behind_commits' must be an integer"),
             ("recommend_rebase_behind_commits", "-1", "'recommend_rebase_behind_commits' must be non-negative"),
         ],
@@ -4683,6 +4685,20 @@ class TestWatchConfigValidation:
         assert is_valid is False
         assert message in errors
         with pytest.raises(ConfigError, match=re.escape(message)):
+            Config.load(tmp_path)
+
+    def test_legacy_review_verify_timeout_key_is_unknown(self, tmp_path: Path) -> None:
+        """The config rename is hard; the legacy key should fail as unknown."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "review_verify_timeout_seconds: 240\n")
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert any(
+            "Unknown configuration key: review_verify_timeout_seconds" in error
+            for error in errors
+        )
+        with pytest.raises(ConfigError, match="Unknown configuration key: review_verify_timeout_seconds"):
             Config.load(tmp_path)
 
     @pytest.mark.parametrize(

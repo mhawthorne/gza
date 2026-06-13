@@ -26,7 +26,7 @@ are *progress* (review, improve, merge). Reordering changes behavior.
 ### Action vocabulary
 
 - **Worker-spawning** (subject to batch limits): create/run a `review`, `improve`,
-  `rebase`, `implement`, resume, or retry task.
+  `rebase`, `implement`, `verify_noop_improve_then_review`, resume, or retry task.
 - **Direct** (not batch-limited): `merge`, `merge_with_followups`.
 - **Wait**: an expected task is in progress; do nothing and re-evaluate next pass.
 - **Stop-for-human**: `awaiting_human`, `needs_discussion`, `max_cycles_reached` (see the
@@ -62,7 +62,7 @@ as confidence grows.
 | `advance_create_reviews` | on | Whether the engine auto-creates needed reviews, vs parking for a manual review (§4, §8). |
 | `auto_implement` (per lineage) | — | Whether a completed plan auto-creates its implement, vs holding for a human (§1). |
 | `max_review_cycles` | 3 | Bound on review→improve cycles before escalation (§6). |
-| `max_noop_improve_cycles` | 2 | Bound on consecutive improves that change nothing (§6). |
+| `max_noop_improve_cycles` | 1 | Bound on consecutive improves that change nothing (§6). |
 | rebase-failure circuit breaker | 3 | Bound on repeated failed rebases with no progress (§5). |
 | duplicate-blocker bound | 3 | Bound on the same blocker repeating across reviews (§6). |
 | recovery attempts | bounded | Automatic resume/retry budget before escalation (§7). |
@@ -183,13 +183,20 @@ When a current review exists for the implementation lineage:
 
 - Review→improve cycles reach `max_review_cycles` → `max_cycles_reached`.
 - Consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
+  `allow-noop-improve`) and the latest review is blocked only by `verify_command`,
+  auto-review is still enabled, and lifecycle can still prove the current branch tip →
+  `verify_noop_improve_then_review` (autonomously re-run `verify_command` on the
+  current tip before parking or spawning another improve).
+- Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
   `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`).
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the
   compared reviews, any non-`CHANGES_REQUESTED` review, or a changed blocker.
-- Last reviews fail only on verify timeout (no code issues) → `needs_discussion` (reason
-  `verify-blocked-no-code-issues`); do not keep spawning improves that cannot help.
+- Last reviews fail only on verify timeout (no code issues) and no no-op reverify path is
+  available, or fresh autonomous verify evidence still cannot validate the branch →
+  `needs_discussion` (reason `verify-blocked-no-code-issues`); do not keep spawning
+  improves that cannot help.
 
 **Improve chain invariant (load-bearing; source of past bugs).** An (implementation,
 review) pair can spawn a *chain* of improves (the original plus retries/resumes). To find
@@ -328,8 +335,8 @@ is a spec change. The accompanying human message is free text.
 | `stale-review-needs-manual-refresh` | needs_discussion | §5 rebase invalidated review, `advance_create_reviews` off |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-blocked-no-code-issues` | needs_discussion | §6 reviews fail only on verify timeout |
-| `verify-noop-improve-branch-tip-unavailable` † | needs_discussion | §6 no-op-improve check: branch tip unavailable |
-| `verify-noop-improve-diff-probe-unavailable` † | needs_discussion | §6 no-op-improve check: diff probe unavailable |
+| `verify-noop-improve-branch-tip-unavailable` † | needs_discussion | §6 no-op-improve check: lifecycle could not prove the current implementation branch tip for safe autonomous reverify |
+| `verify-noop-improve-diff-probe-unavailable` † | needs_discussion | §6 no-op-improve check: lifecycle could not inspect the branch diff needed to decide whether autonomous reverify is available |
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
 | `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |

@@ -2912,9 +2912,9 @@ class TestReviewContextFromChain:
         review_task.output_content = (
             "## Summary\n\n- Verify timed out.\n\n"
             "## Blockers\n\n"
-            "### B1 verify_command failure: timed out during pytest\n"
-            "Evidence: verify_command timed out after 120s while running the configured suite.\n"
-            "Open-state citation: `src/gza/runner.py:903`\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: lifecycle verify timed out at `120s` while running `./bin/tests`.\n"
+            "Open-state citation: `bin/tests:150-155`\n"
             "Impact: the branch cannot be verified autonomously.\n"
             "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
             "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
@@ -10816,7 +10816,7 @@ class TestExtractedRunInnerHelpers:
         config.log_path = tmp_path / "logs"
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.verify_command = "uv run pytest tests/ -q"
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         worktree_git = Mock(spec=Git)
         worktree_git.repo_dir = tmp_path
@@ -14791,7 +14791,7 @@ class TestProviderPromptSanitization:
             f"tree_fingerprint={failed_fingerprint}\\n"
             "lint failed\\n' && exit 7"
         )
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -14898,7 +14898,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = "printf 'all good\\n'"
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -14972,7 +14972,7 @@ class TestProviderPromptSanitization:
         config.timeout_minutes = 10
         large_output = ("x" * 4500) + " ENDMARK"
         config.verify_command = f"printf '%s' '{large_output}' && exit 9"
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -15041,7 +15041,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15154,7 +15154,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -15333,7 +15333,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15441,7 +15441,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15565,7 +15565,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15705,7 +15705,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = ""
-        config.review_verify_timeout_seconds = 120
+        config.autonomous_verify_timeout_seconds = 120
 
         captured_prompts: list[str] = []
 
@@ -15841,7 +15841,7 @@ class TestProviderPromptSanitization:
         config.max_steps = 10
         config.timeout_minutes = 10
         config.verify_command = "uv run pytest tests/ -q"
-        config.review_verify_timeout_seconds = 240
+        config.autonomous_verify_timeout_seconds = 240
 
         captured_prompts: list[str] = []
 

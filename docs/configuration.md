@@ -51,7 +51,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_small_threshold` | Integer | `500` | Total changed-line cutoff (`added + removed`) below which review prompts include full inline diff |
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
-| `review_verify_timeout_seconds` | Integer | `120` | Timeout for autonomous review `verify_command` runs |
+| `autonomous_verify_timeout_seconds` | Integer | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
 | `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
 | `code_task_diff_timeout_medium_minutes` | Integer | `30` | Timeout budget used for medium-sized code diffs |
@@ -64,7 +64,7 @@ Gza reads configuration from three YAML layers:
 | `max_plan_slices` | Integer or null | `null` | Optional cap on how many implementation slices one approved plan review may materialize automatically |
 | `plan_slice_target_timeout_minutes` | Integer or null | `code_task_diff_timeout_cap_minutes` | Optional reviewer sizing budget for one implementation slice; when unset it derives from code-task timeout sizing |
 | `recommend_rebase_behind_commits` | Integer | `1` | Deprecated compatibility key; accepted but ignored by current lifecycle planning |
-| `max_noop_improve_cycles` | Integer | `2` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
+| `max_noop_improve_cycles` | Integer | `1` | Cap for consecutive no-op improves before lifecycle automation stops for discussion |
 | `max_failed_closing_review_retries` | Integer | `3` | Max consecutive failed closing-review attempts before a lineage is parked as `needs_attention`; set `0` to escalate immediately on first failure |
 | `max_concurrent` | Integer | explicit `watch.batch` or `5` | Hard global ceiling on concurrently running task-executing processes across `work`, `watch`, `advance`, iterate/recovery helpers, and internal task runners. Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5` |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
@@ -105,7 +105,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `review_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -492,7 +492,7 @@ inner_verify_command: ./bin/tests --quick
 - `verify_command` remains the required final gate before a code task reports success.
 - `inner_verify_command` is optional and is intended for fast edit-loop checks during implementation.
 - When `inner_verify_command` is unset, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
-- Autonomous review verification is separate and remains bounded by `review_verify_timeout_seconds`.
+- Autonomous review verification is separate and remains bounded by `autonomous_verify_timeout_seconds`.
 
 ---
 
@@ -960,7 +960,7 @@ providers.*.task_types.*.model
 providers.*.task_types.*.reasoning_effort
 providers.*.task_types.*.timeout_minutes
 review_context_file_limit
-review_verify_timeout_seconds
+autonomous_verify_timeout_seconds
 recommend_rebase_behind_commits
 review_diff_medium_threshold
 review_diff_small_threshold
@@ -2075,12 +2075,12 @@ use_docker: true
 docker_setup_command: "uv sync"
 timeout_minutes: 15
 max_turns: 80
-review_verify_timeout_seconds: 180
+autonomous_verify_timeout_seconds: 180
 verify_command: ./bin/tests
 inner_verify_command: ./bin/tests --quick
 code_task_diff_timeout_medium_threshold: 500
 code_task_diff_timeout_large_threshold: 1500
-max_noop_improve_cycles: 2
+max_noop_improve_cycles: 1
 work_count: 3
 
 # Custom volume mounts (optional)

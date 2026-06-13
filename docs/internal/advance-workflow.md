@@ -50,8 +50,8 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements when review gating still requires them; otherwise lifecycle parks for manual attention instead of creating reviews. |
 | `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
-| `max_noop_improve_cycles` | `2` | Max consecutive no-op improves before lifecycle automation stops for discussion |
-| `review_verify_timeout_seconds` | `120` | Timeout for autonomous review `verify_command` runs |
+| `max_noop_improve_cycles` | `1` | Max consecutive no-op improves before lifecycle automation stops for discussion |
+| `autonomous_verify_timeout_seconds` | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
 | `recommend_rebase_behind_commits` | `1` | Deprecated compatibility key; accepted but ignored by lifecycle planning |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 
