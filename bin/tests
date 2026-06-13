@@ -152,7 +152,7 @@ run_phase ty run_tool ty check src/gza/
 run_phase mypy run_tool mypy src/gza/
 run_phase checks run_python_module checks
 run_phase unit ./bin/test-latency --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-run_phase functional run_pytest tests_functional/ -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+run_phase functional run_pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 
 if [[ "$RUN_INTEGRATION" -eq 1 ]]; then
     run_phase integration run_pytest tests_integration -xv

@@ -29,14 +29,16 @@ def test_test_latency_script_emits_required_sections_and_json(tmp_path: Path) ->
     _write_sample_suite(suite_dir)
     repo_root = Path(__file__).resolve().parents[1]
     cmd = [sys.executable, "-m", "gza.test_latency"]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
 
     markdown_output = tmp_path / "latency.md"
     result = subprocess.run(
         [*cmd, "--output", str(markdown_output), "--", str(suite_dir), "-q"],
         capture_output=True,
         text=True,
-        cwd=repo_root,
-        env=os.environ.copy(),
+        cwd=tmp_path,
+        env=env,
         timeout=4,
     )
 
@@ -56,7 +58,8 @@ def test_test_latency_script_emits_required_sections_and_json(tmp_path: Path) ->
         [*cmd, "--json", "--output", str(json_output), "--", str(suite_dir), "-q"],
         capture_output=True,
         text=True,
-        cwd=repo_root,
+        cwd=tmp_path,
+        env=env,
         timeout=4,
     )
 
