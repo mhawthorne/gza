@@ -204,6 +204,24 @@ class TestRunWithResume:
 
 
 class TestDerivedTaskReviewScopePropagation:
+    def test_create_improve_task_inherits_parent_tags(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        review_task = store.add("Review scoped slice", task_type="review", depends_on=impl_task.id)
+
+        improve_task = _create_improve_task(
+            store,
+            impl_task,
+            review_task,
+            trigger_source="manual",
+        )
+
+        assert improve_task.tags == impl_task.tags
+
     def test_create_improve_task_inherits_resolved_scope_from_legacy_impl_prompt(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(
@@ -260,6 +278,25 @@ class TestDerivedTaskReviewScopePropagation:
             "1. Add the classifier.\n"
             "2. Persist the review boundary."
         )
+
+    def test_create_rebase_task_inherits_parent_tags(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add(
+            "Implement scoped slice",
+            task_type="implement",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        assert impl_task.id is not None
+
+        rebase_task = _create_rebase_task(
+            store,
+            impl_task.id,
+            "feature/test-slice",
+            "main",
+            trigger_source="manual",
+        )
+
+        assert rebase_task.tags == impl_task.tags
 
 
 def test_build_failure_diagnostics_extracts_interrupt_source(tmp_path):

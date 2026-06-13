@@ -659,6 +659,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup" in watch_section
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
     assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in watch_section
+    assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
+    assert "queue reports the blocker without starting it" in config_content
     assert "Only list recovery and pending lanes matching tag filters" in config_content
     assert "Only list pending tasks matching tag filters" not in config_content
 

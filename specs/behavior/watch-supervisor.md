@@ -208,6 +208,10 @@ When the installed `gza` package fingerprint changes while watch is running:
 - `watch --tag ...` MUST only act on work that matches the requested scope.
 - Out-of-scope work MUST NOT consume watch slots, be merged, be resumed/retried, or be
   selected from the pending queue by that watch process.
+- When a scoped watch can detect that an in-scope lineage owner is blocked by a pending,
+  runnable, or already-running derived child that does not match the active tag filter,
+  watch MUST surface that blocker in operator-facing attention output without starting,
+  resuming, retrying, merging, or reordering the out-of-scope child.
 - Scope banners, wake summaries, and attention output SHOULD make the active scope
   explicit so operators can tell when watch is intentionally ignoring other work.
 

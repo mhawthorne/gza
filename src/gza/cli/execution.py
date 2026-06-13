@@ -462,6 +462,13 @@ def _selected_tags_for_new_task(args: argparse.Namespace) -> tuple[str, ...]:
     return tags or ()
 
 
+def _selected_tag_override_for_derived_task(
+    args: argparse.Namespace,
+) -> tuple[str, ...] | None:
+    """Return explicit derived-task tag override, preserving omission as ``None``."""
+    return parse_cli_tag_filters(args)[0]
+
+
 def _extract_run_args(args: argparse.Namespace, task_ids: list[str]) -> argparse.Namespace:
     """Clone extract args and seed defaults expected by shared run helpers."""
     worker_args = argparse.Namespace(**vars(args))
@@ -1404,7 +1411,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         return phase1_error(args, f"Task {plan_task.id} is {plan_task.status}. Plan task must be completed.")
 
     try:
-        tags = _selected_tags_for_new_task(args)
+        tags = _selected_tag_override_for_derived_task(args)
     except ValueError as exc:
         return phase1_error(args, str(exc))
     create_review = args.review if hasattr(args, 'review') and args.review else False

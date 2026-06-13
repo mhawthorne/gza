@@ -33,6 +33,13 @@ are *progress* (review, improve, merge). Reordering changes behavior.
   escalation table in the overview).
 - **Skip**: nothing to do for this unit.
 
+**Derived-task tag inheritance invariant.** When the engine or a direct command creates a
+derived task (`implement`, `review`, `improve`, `rebase`, follow-up `implement`,
+resume, or retry), the new task MUST inherit all parent task tags by default. If the
+creation path provides explicit tags, those explicit tags replace the inherited set,
+including the explicit empty set. This rule is forward-only: creating or reusing a later
+derived task MUST NOT retroactively mutate tags on existing children.
+
 The engine MUST distinguish *task created/selected* from *worker failed to start* in its
 output: a creation success followed by a launch failure MUST NOT be reported as a plain
 failure to create.
