@@ -121,6 +121,33 @@ class TestAdvanceUnimplementedCommand:
         assert rc == 0
         assert "No plan/explore lineages without implementation tasks." in capsys.readouterr().out
 
+    def test_advance_unimplemented_create_inherits_source_tags(self, tmp_path: Path, capsys) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        explore = store.add(
+            "Explore recovery rollout",
+            task_type="explore",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 3, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 3, 2, tzinfo=UTC),
+            status="completed",
+        )
+
+        rc = _run_unimplemented(tmp_path, store, create=True, task_types=("explore",))
+
+        output = capsys.readouterr().out
+        assert rc == 0
+        assert f"Created implement task" in output
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        assert len(implement_tasks) == 1
+        assert implement_tasks[0].depends_on == explore.id
+        assert implement_tasks[0].tags == explore.tags
+
     def test_advance_unimplemented_skips_explore_lineage_handed_off_to_pending_plan_descendant(
         self, tmp_path: Path, capsys
     ) -> None:

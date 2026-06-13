@@ -70,7 +70,7 @@ def _make_noop_verify_fixture(tmp_path: Path) -> tuple[Any, Any, DbTask, DbTask]
         log_path=tmp_path / "logs",
         project_dir=tmp_path,
         verify_command="uv run pytest tests/ -q",
-        review_verify_timeout_seconds=120,
+        autonomous_verify_timeout_seconds=120,
         project_dir_raw=tmp_path,
     )
     config.worktree_path.mkdir(parents=True, exist_ok=True)

@@ -72,11 +72,13 @@ DEFAULT_REQUIRE_PLAN_REVIEW_BEFORE_IMPLEMENT = True
 DEFAULT_PR_INTEGRATION = True
 REMOVED_ADVANCE_REVIEW_KEY = "advance_requires_review"
 RENAMED_REQUIRE_REVIEW_KEY = "require_review_before_merge"
+REMOVED_REVIEW_VERIFY_TIMEOUT_KEY = "review_verify_timeout_seconds"
+RENAMED_AUTONOMOUS_VERIFY_TIMEOUT_KEY = "autonomous_verify_timeout_seconds"
 DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_MAX_PLAN_REVIEW_CYCLES = 2
-DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 2
+DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 1
 DEFAULT_MAX_PLAN_SLICES: int | None = None
 DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES: int | None = None
 DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
@@ -99,7 +101,7 @@ DEFAULT_CLEANUP_DAYS = 30
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
-DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS = 120
+DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = 120
 DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD = 400
 DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD = 1200
 DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES = 30
@@ -122,7 +124,7 @@ VALID_CONFIG_FIELDS = {
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
-    "review_diff_medium_threshold", "review_context_file_limit", "review_verify_timeout_seconds",
+    "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
     "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
     "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
     "code_task_diff_timeout_cap_minutes",
@@ -225,7 +227,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
-    "review_verify_timeout_seconds": None,
+    "autonomous_verify_timeout_seconds": None,
     "code_task_diff_timeout_medium_threshold": None,
     "code_task_diff_timeout_large_threshold": None,
     "code_task_diff_timeout_medium_minutes": None,
@@ -333,7 +335,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
-    "review_verify_timeout_seconds": None,
+    "autonomous_verify_timeout_seconds": None,
     "code_task_diff_timeout_medium_threshold": None,
     "code_task_diff_timeout_large_threshold": None,
     "code_task_diff_timeout_medium_minutes": None,
@@ -959,7 +961,7 @@ class Config:
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
-    review_verify_timeout_seconds: int = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
+    autonomous_verify_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
     code_task_diff_timeout_medium_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD
     code_task_diff_timeout_large_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD
     code_task_diff_timeout_medium_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES
@@ -1343,6 +1345,11 @@ class Config:
             raise ConfigError(
                 f"'{REMOVED_ADVANCE_REVIEW_KEY}' has been renamed to '{RENAMED_REQUIRE_REVIEW_KEY}'. "
                 "Update your config and try again."
+            )
+        if REMOVED_REVIEW_VERIFY_TIMEOUT_KEY in data:
+            raise ConfigError(
+                f"Unknown configuration key: {REMOVED_REVIEW_VERIFY_TIMEOUT_KEY} "
+                f"(renamed to '{RENAMED_AUTONOMOUS_VERIFY_TIMEOUT_KEY}')"
             )
 
         # Validate and warn about unknown keys
@@ -2065,13 +2072,13 @@ class Config:
         if review_context_file_limit < 1:
             raise ConfigError("review_context_file_limit must be a positive integer")
 
-        review_verify_timeout_seconds = _load_strict_int_field(
+        autonomous_verify_timeout_seconds = _load_strict_int_field(
             data,
-            "review_verify_timeout_seconds",
-            DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS,
+            "autonomous_verify_timeout_seconds",
+            DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
         )
-        if review_verify_timeout_seconds < 1:
-            raise ConfigError("'review_verify_timeout_seconds' must be positive")
+        if autonomous_verify_timeout_seconds < 1:
+            raise ConfigError("'autonomous_verify_timeout_seconds' must be positive")
 
         resolved_code_task_timeout_scaling = _resolve_code_task_timeout_scaling_fields(data)
         assert resolved_code_task_timeout_scaling is not None
@@ -2249,7 +2256,7 @@ class Config:
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
-            review_verify_timeout_seconds=review_verify_timeout_seconds,
+            autonomous_verify_timeout_seconds=autonomous_verify_timeout_seconds,
             code_task_diff_timeout_medium_threshold=code_task_diff_timeout_medium_threshold,
             code_task_diff_timeout_large_threshold=code_task_diff_timeout_large_threshold,
             code_task_diff_timeout_medium_minutes=code_task_diff_timeout_medium_minutes,
@@ -2351,6 +2358,11 @@ class Config:
                 errors.append(
                     f"Unknown configuration field: '{REMOVED_ADVANCE_REVIEW_KEY}' "
                     f"(renamed to '{RENAMED_REQUIRE_REVIEW_KEY}')"
+                )
+            elif key == REMOVED_REVIEW_VERIFY_TIMEOUT_KEY:
+                errors.append(
+                    f"Unknown configuration key: {REMOVED_REVIEW_VERIFY_TIMEOUT_KEY} "
+                    f"(renamed to '{RENAMED_AUTONOMOUS_VERIFY_TIMEOUT_KEY}')"
                 )
             elif key not in VALID_CONFIG_FIELDS:
                 warnings.append(f"Unknown configuration field: '{key}'")
@@ -2652,11 +2664,11 @@ class Config:
             elif data["review_context_file_limit"] <= 0:
                 errors.append("'review_context_file_limit' must be positive")
 
-        if "review_verify_timeout_seconds" in data:
-            if not isinstance(data["review_verify_timeout_seconds"], int):
-                errors.append("'review_verify_timeout_seconds' must be an integer")
-            elif data["review_verify_timeout_seconds"] <= 0:
-                errors.append("'review_verify_timeout_seconds' must be positive")
+        if "autonomous_verify_timeout_seconds" in data:
+            if not _is_strict_int(data["autonomous_verify_timeout_seconds"]):
+                errors.append("'autonomous_verify_timeout_seconds' must be an integer")
+            elif data["autonomous_verify_timeout_seconds"] <= 0:
+                errors.append("'autonomous_verify_timeout_seconds' must be positive")
 
         _resolve_code_task_timeout_scaling_fields(data, errors=errors)
 

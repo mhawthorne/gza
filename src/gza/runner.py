@@ -31,10 +31,10 @@ from .branch_resolution import resolve_rebase_target_branch
 from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
+    DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     DEFAULT_REVIEW_CONTEXT_FILE_LIMIT,
     DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD,
     DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD,
-    DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS,
     BranchStrategy,
     Config,
     is_model_compatible_with_provider,
@@ -1954,7 +1954,7 @@ REVIEW_CONTEXT_FILE_LIMIT = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
 REVIEW_IMPROVE_LINEAGE_LIMIT = 5
 REVIEW_IMPROVE_SUMMARY_MAX_CHARS = 320
 REVIEW_VERIFY_OUTPUT_MAX_CHARS = 4000
-REVIEW_VERIFY_TIMEOUT_SECONDS = DEFAULT_REVIEW_VERIFY_TIMEOUT_SECONDS
+AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
 COMMIT_SUBJECT_MAX_CHARS = 72
 
 
@@ -2715,7 +2715,7 @@ def _run_review_verify_command(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
-    timeout_seconds: int = REVIEW_VERIFY_TIMEOUT_SECONDS,
+    timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
 ) -> ReviewVerifyResult:
     """Run the configured verify command for an autonomous review iteration."""
     captured_at = datetime.now(UTC)
@@ -3777,9 +3777,13 @@ def _capture_noop_improve_review_verify_result(
     if not _task_is_cross_project(task) and not verify_command.strip():
         return None
 
-    timeout_seconds = getattr(config, "review_verify_timeout_seconds", REVIEW_VERIFY_TIMEOUT_SECONDS)
+    timeout_seconds = getattr(
+        config,
+        "autonomous_verify_timeout_seconds",
+        AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
+    )
     if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
-        timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
+        timeout_seconds = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
 
     provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(config))
     reviewed_base_sha: str | None = None
@@ -5690,6 +5694,7 @@ def run(
         console.print("No pending tasks found")
         return 0
     requested_create_pr = bool(create_pr or task.create_pr)
+    ensure_task_log_path(config, store, task)
     if on_task_claimed is not None:
         on_task_claimed(task)
     if pr_retry_mode:
@@ -7496,13 +7501,16 @@ def _run_non_code_task(
                 _task_is_cross_project(task) or verify_command.strip()
             )
             if should_run_review_verify:
-                review_verify_timeout_seconds = getattr(
+                autonomous_verify_timeout_seconds = getattr(
                     config,
-                    "review_verify_timeout_seconds",
-                    REVIEW_VERIFY_TIMEOUT_SECONDS,
+                    "autonomous_verify_timeout_seconds",
+                    AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
                 )
-                if not isinstance(review_verify_timeout_seconds, int) or review_verify_timeout_seconds < 1:
-                    review_verify_timeout_seconds = REVIEW_VERIFY_TIMEOUT_SECONDS
+                if (
+                    not isinstance(autonomous_verify_timeout_seconds, int)
+                    or autonomous_verify_timeout_seconds < 1
+                ):
+                    autonomous_verify_timeout_seconds = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
                 reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
                 reviewed_base_sha = _resolve_review_verify_base_sha(git, default_branch)
                 if reviewed_head_sha is None:
@@ -7526,7 +7534,7 @@ def _run_non_code_task(
                             task=task,
                             worktree_git=worktree_git,
                             worktree_path=worktree_path,
-                            timeout_seconds=review_verify_timeout_seconds,
+                            timeout_seconds=autonomous_verify_timeout_seconds,
                             reviewed_branch=reviewed_branch,
                             reviewed_head_sha=reviewed_head_sha,
                             reviewed_base_sha=reviewed_base_sha,
@@ -7542,7 +7550,7 @@ def _run_non_code_task(
                             reviewed_branch=reviewed_branch,
                             reviewed_head_sha=reviewed_head_sha,
                             reviewed_base_sha=reviewed_base_sha,
-                            timeout_seconds=review_verify_timeout_seconds,
+                            timeout_seconds=autonomous_verify_timeout_seconds,
                         )
                         review_verify_markdown = _format_review_verify_result(review_verify_result)
                 if review_verify_result is not None:

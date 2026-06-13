@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from typing import Literal
 
 from .db import SqliteTaskStore, Task
+from .derived_tags import resolve_derived_task_tags
 from .prompts import PromptBuilder
 from .review_scope import resolve_review_scope_for_impl
 from .review_verdict import ReviewFinding
@@ -128,14 +129,12 @@ def create_review_task(
         )
     else:
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
-    inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
-
     resolved_scope = resolve_review_scope_for_impl(store, impl_task)
     review_task = store.add(
         prompt=review_prompt,
         task_type="review",
         depends_on=impl_task.id,
-        tags=inherited_tags,
+        tags=resolve_derived_task_tags(impl_task),
         based_on=impl_task.id,
         review_scope=resolved_scope.summary if resolved_scope is not None else None,
         model=model,
@@ -242,14 +241,13 @@ def create_or_reuse_followup_task(
         finding,
     )
     resolved_scope = resolve_review_scope_for_impl(store, impl_task)
-    inherited_tags = impl_task.tags or (() if impl_task.group is None else (impl_task.group,))
     created = store.add(
         prompt=prompt,
         task_type="implement",
         based_on=review_task.id,
         depends_on=impl_task.id,
         review_scope=resolved_scope.summary if resolved_scope is not None else None,
-        tags=inherited_tags,
+        tags=resolve_derived_task_tags(impl_task),
         trigger_source=trigger_source,
     )
     return created, True

@@ -38,6 +38,7 @@ from gza.cli.watch import (
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
     _query_owner_rows,
+    _refresh_watch_no_progress_after_state_change,
     _resolve_watch_attention_display_task,
     _run_cycle,
     _should_reexec_watch,
@@ -50,6 +51,7 @@ from gza.cli.watch import (
     allocate_watch_slots,
     cmd_watch,
 )
+from gza.advance_engine import failed_recovery_decision_to_action
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
 import gza.colors as colors
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
@@ -1503,7 +1505,10 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
 def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before_next_bounded_attempt(
     tmp_path: Path,
 ) -> None:
-    """Restart-failed should fail a dead pending retry row and launch the remaining bounded retry."""
+    """Restart-failed should fail a stale dead pending retry row as NO_ACTIVITY before launching the next attempt."""
+    import os
+    from datetime import timedelta
+
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1525,20 +1530,23 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
     store.update(retry_child)
 
     config = Config.load(tmp_path)
+    config.watch.no_activity_timeout = 1
     registry = WorkerRegistry(config.workers_path)
     registry.register(
         WorkerMetadata(
             worker_id="w-dead-watch-retry",
             task_id=retry_child.id,
-            pid=999999,
+            pid=os.getpid(),
+            started_at=(datetime.now(UTC) - timedelta(seconds=90)).isoformat(),
+            status="running",
             startup_log_file=".gza/workers/dead-watch-retry.startup.log",
         )
     )
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
 
     with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.WorkerRegistry.is_running", return_value=False),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         result = _run_cycle(
@@ -1556,7 +1564,7 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
     refreshed_retry_child = store.get(retry_child.id)
     assert refreshed_retry_child is not None
     assert refreshed_retry_child.status == "failed"
-    assert refreshed_retry_child.failure_reason == "WORKER_DIED"
+    assert refreshed_retry_child.failure_reason == "NO_ACTIVITY"
 
     assert spawn_iterate.call_count == 1
     spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
@@ -1565,12 +1573,75 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
     spawned_task = spawn_iterate.call_args.args[2]
     assert spawned_task.id == spawned_child_id
 
-    pending_retry_children = [
-        child
-        for child in store.get_based_on_children_by_type(failed.id, failed.task_type)
-        if child.status == "pending"
-    ]
-    assert [child.id for child in pending_retry_children] == [spawned_child_id]
+
+def test_watch_cycle_parks_unchanged_recovery_already_pending_descendant_using_child_evidence(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-pending-child"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery_child = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    recovery_child.session_id = failed.session_id
+    recovery_child.started_at = datetime.now(UTC)
+    recovery_child.running_pid = 4343
+    store.update(recovery_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+        assert len(observations) == 1
+        assert observations[0].action_task_id == recovery_child.id
+        assert observations[0].action_task_status == "pending"
+        assert observations[0].action_task_started_at == recovery_child.started_at
+        assert observations[0].action_task_running_pid == 4343
+        assert observations[0].recovery_task_id == recovery_child.id
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
 
 
 def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
@@ -3002,9 +3073,10 @@ def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Pa
     assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
 
 
-def test_watch_cycle_recovery_only_in_progress_recovery_child_does_not_block_pending_queue(tmp_path: Path) -> None:
-    """An in-progress recovery child should not suppress pending pickup on its own."""
+def test_watch_cycle_recovery_only_parked_running_recovery_child_allows_pending_queue(tmp_path: Path) -> None:
+    """A running recovery child should stop blocking pending pickup once no-progress parking triggers."""
     setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
 
     failed = store.add("Failed review", task_type="review")
@@ -3030,10 +3102,11 @@ def test_watch_cycle_recovery_only_in_progress_recovery_child_does_not_block_pen
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
         patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0)),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
-        result = _run_cycle(
+        first = _run_cycle(
             config=config,
             store=store,
             batch=1,
@@ -3043,7 +3116,18 @@ def test_watch_cycle_recovery_only_in_progress_recovery_child_does_not_block_pen
             restart_failed=True,
             max_recovery_attempts=config.max_resume_attempts,
         )
+        result = _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
 
+    assert first.work_done is False
     assert result.work_done is True
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
@@ -3535,6 +3619,304 @@ def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
         )
 
     assert "INFO      scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
+
+
+def test_watch_cycle_reports_out_of_scope_runnable_child_without_starting_it(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add(
+        "Scoped recovery owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Out of scope implement child",
+        task_type="implement",
+        based_on=plan.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert plan.id in log_text
+    assert child.id in log_text
+    assert f"START     {child.id}" not in log_text
+
+
+def test_watch_cycle_reports_depends_on_only_out_of_scope_runnable_child_without_starting_it(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    explore = store.add(
+        "Scoped recovery owner",
+        task_type="explore",
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert explore.id is not None
+    explore.status = "completed"
+    explore.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(explore)
+
+    child = store.add(
+        "Out of scope implement child",
+        task_type="implement",
+        depends_on=explore.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert explore.id in log_text
+    assert child.id in log_text
+    assert f"START     {child.id}" not in log_text
+
+
+def test_watch_cycle_reports_blocked_out_of_scope_pending_child_without_starting_it(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    blocked_by = store.add("Blocking dependency")
+    assert blocked_by.id is not None
+
+    plan = store.add(
+        "Scoped recovery owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Blocked out of scope implement child",
+        task_type="implement",
+        based_on=plan.id,
+        depends_on=blocked_by.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert plan.id in log_text
+    assert child.id in log_text
+    assert "blocked implement" in log_text
+    assert f"START     {child.id}" not in log_text
+
+
+def test_watch_cycle_reports_failed_owner_with_out_of_scope_resume_child_without_starting_it(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add(
+        "Scoped failed implementation",
+        task_type="implement",
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert failed.id is not None
+    store.mark_failed(failed, "timed out")
+
+    resume_child = store.add(
+        "Pre-existing out of scope resume child",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="resume",
+        tags=("v0.5.0",),
+    )
+    assert resume_child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" in log_text
+    assert failed.id in log_text
+    assert resume_child.id in log_text
+    assert f"START     {resume_child.id}" not in log_text
+
+
+def test_watch_cycle_does_not_warn_when_depends_on_only_child_inherits_scope_tag(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    explore = store.add(
+        "Scoped recovery owner",
+        task_type="explore",
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert explore.id is not None
+    explore.status = "completed"
+    explore.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(explore)
+
+    child = store.add(
+        "Inherited scope implement child",
+        task_type="implement",
+        depends_on=explore.id,
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" not in log_text
+    assert f"START     {child.id}" in log_text
+
+
+def test_watch_cycle_does_not_warn_when_runnable_scoped_owner_has_out_of_scope_dependent_child(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add(
+        "Scoped runnable owner",
+        task_type="implement",
+        tags=("202606-recovery",),
+    )
+    assert owner.id is not None
+
+    child = store.add(
+        "Out of scope dependent child",
+        task_type="review",
+        depends_on=owner.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+        )
+
+    log_text = log_path.read_text()
+    assert "out-of-scope child" not in log_text
+    assert f"START     {owner.id}" in log_text
+    assert child.id not in log_text
 
 
 def test_watch_cycle_keeps_free_slot_when_iterate_child_task_shares_pid(tmp_path: Path) -> None:
@@ -8406,6 +8788,398 @@ def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_pa
     assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
     assert any("START_FAILED" in line and str(failed.id) in line for line in text.splitlines())
     assert any("RECOVR" in line and f"{failed.id} resume via iterate" in line for line in text.splitlines())
+
+
+def test_watch_cycle_parks_unchanged_recovery_already_running_descendant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-running-child"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery_child = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert recovery_child.id is not None
+    recovery_child.status = "in_progress"
+    recovery_child.session_id = failed.session_id
+    recovery_child.started_at = datetime.now(UTC)
+    recovery_child.running_pid = 4242
+    store.update(recovery_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not run")),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+    assert len(observations) == 1
+    assert observations[0].action_task_id == recovery_child.id
+    assert observations[0].action_task_status == "in_progress"
+    assert observations[0].action_task_started_at == recovery_child.started_at
+    assert observations[0].action_task_running_pid == 4242
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+
+
+def test_watch_cycle_parked_recovery_head_does_not_starve_later_candidate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    blocked = store.add("Blocked failed implement", task_type="implement")
+    assert blocked.id is not None
+    blocked.status = "failed"
+    blocked.failure_reason = "MAX_TURNS"
+    blocked.session_id = "sess-blocked"
+    blocked.completed_at = datetime.now(UTC)
+    store.update(blocked)
+
+    blocked_child = store.add(blocked.prompt, task_type="implement", based_on=blocked.id)
+    assert blocked_child.id is not None
+    blocked_child.status = "in_progress"
+    blocked_child.session_id = blocked.session_id
+    blocked_child.started_at = datetime.now(UTC)
+    blocked_child.running_pid = 5151
+    store.update(blocked_child)
+
+    actionable = store.add("Actionable failed implement", task_type="implement")
+    assert actionable.id is not None
+    actionable.status = "failed"
+    actionable.failure_reason = "MAX_TURNS"
+    actionable.session_id = "sess-actionable"
+    actionable.completed_at = datetime.now(UTC)
+    store.update(actionable)
+
+    blocked_decision = decide_failed_task_recovery(store, blocked, max_recovery_attempts=1)
+    blocked_action = failed_recovery_decision_to_action(blocked, blocked_decision)
+    blocked_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=blocked,
+        action=blocked_action,
+        action_task=blocked_child,
+        failed_task=blocked,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=blocked_candidate.subject_kind,
+            subject_id=blocked_candidate.subject_id,
+            action_type=blocked_candidate.action_type,
+            action_reason=blocked_candidate.action_reason,
+            subject_task_id=blocked_candidate.subject_task_id,
+            action_task_id=blocked_candidate.action_task_id,
+            action_task_status=blocked_candidate.action_task_status,
+            action_task_started_at=blocked_candidate.action_task_started_at,
+            action_task_running_pid=blocked_candidate.action_task_running_pid,
+            failed_task_id=blocked_candidate.failed_task_id,
+            recovery_task_id=blocked_candidate.recovery_task_id,
+            merge_unit_id=blocked_candidate.merge_unit_id,
+            merge_unit_state=blocked_candidate.merge_unit_state,
+            merge_unit_head_sha=blocked_candidate.merge_unit_head_sha,
+            evidence_fingerprint=blocked_candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert spawn_iterate.call_count == 1
+    assert len(store.get_based_on_children(actionable.id)) == 1
+    text = log_path.read_text()
+    assert f"{blocked.id}" in text
+    assert any("RECOVR" in line and actionable.id in line for line in text.splitlines())
+
+
+def test_watch_cycle_parked_pending_recovery_child_is_excluded_from_plain_pending_pickup(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Blocked failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-blocked-pending"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    parked_recovery_child = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert parked_recovery_child.id is not None
+    parked_recovery_child.status = "pending"
+    parked_recovery_child.session_id = failed.session_id
+    store.update(parked_recovery_child)
+
+    ordinary_pending = store.add("Ordinary pending implement", task_type="implement")
+    assert ordinary_pending.id is not None
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "recovery_already_pending"
+    assert decision.recovery_task_id == parked_recovery_child.id
+
+    action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=action,
+        action_task=parked_recovery_child,
+        failed_task=failed,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_task_ids: list[str] = []
+
+    def record_iterate_spawn(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        assert isinstance(task_id, str)
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=record_iterate_spawn),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            restart_failed_batch=1,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert started_task_ids == [ordinary_pending.id]
+    text = log_path.read_text()
+    assert any("ATTENTION" in line and failed.id in line for line in text.splitlines())
+    assert not any(parked_recovery_child.id in line and "START" in line for line in text.splitlines())
+
+
+def test_watch_cycle_reused_pending_recovery_liveness_transition_resets_no_progress_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-reuse-pending"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery_child = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    recovery_child.session_id = failed.session_id
+    store.update(recovery_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=1),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+        recovery_child = store.get(recovery_child.id)
+        assert recovery_child is not None
+        recovery_child.started_at = datetime.now(UTC)
+        recovery_child.running_pid = 6060
+        store.update(recovery_child)
+
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+    assert len(observations) == 1
+    assert observations[0].action_task_id == recovery_child.id
+    assert observations[0].action_task_status == "pending"
+    assert observations[0].action_task_started_at == recovery_child.started_at
+    assert observations[0].action_task_running_pid == 6060
+    assert observations[0].streak == 1
+    assert observations[0].parked_reason is None
+
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+
+
+def test_watch_cycle_unchanged_reused_pending_recovery_spawn_does_not_refresh_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-reuse-unchanged"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery_child = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    recovery_child.session_id = failed.session_id
+    store.update(recovery_child)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    real_refresh = _refresh_watch_no_progress_after_state_change
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._refresh_watch_no_progress_after_state_change", wraps=real_refresh) as refresh_spy,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert refresh_spy.call_count == 0
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+    assert len(observations) == 1
+    assert observations[0].action_task_id == recovery_child.id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
 
 
 def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_path: Path) -> None:

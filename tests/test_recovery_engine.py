@@ -1281,7 +1281,29 @@ def test_recovery_engine_pending_match_does_not_override_running_sibling(tmp_pat
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "recovery_already_running"
-    assert decision.recovery_task_id is None
+    assert decision.recovery_task_id == running_sibling.id
+    assert decision.reuse_existing is False
+
+
+def test_recovery_engine_single_pending_nonmatching_child_still_reports_recovery_task_id(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="MAX_TURNS", session_id="sess-pending-skip")
+
+    pending_retry = store.add(
+        task.prompt,
+        task_type=task.task_type,
+        based_on=task.id,
+        depends_on=task.depends_on,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+    pending_retry.status = "pending"
+    pending_retry.session_id = task.session_id
+    store.update(pending_retry)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "recovery_already_pending"
+    assert decision.recovery_task_id == pending_retry.id
     assert decision.reuse_existing is False
 
 
@@ -1302,7 +1324,7 @@ def test_recovery_engine_pending_match_does_not_override_completed_sibling(tmp_p
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "recovery_already_completed"
-    assert decision.recovery_task_id is None
+    assert decision.recovery_task_id == completed_sibling.id
     assert decision.reuse_existing is False
 
 
@@ -1869,7 +1891,7 @@ def test_recovery_engine_skips_failed_ancestor_when_deeper_descendant_supersedes
     decision = decide_failed_task_recovery(store, root, max_recovery_attempts=3)
     assert decision.action == "skip"
     assert decision.reason_code == expected_reason
-    assert decision.recovery_task_id is None
+    assert decision.recovery_task_id == grandchild.id
     assert decision.reuse_existing is False
 
 

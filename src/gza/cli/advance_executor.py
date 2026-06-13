@@ -270,7 +270,7 @@ def run_noop_improve_verify_then_review(
 
     worktree_label = task.slug or task.id or "review-verify"
     worktree_path = Path(context.config.worktree_path) / f"{worktree_label}-noop-review-verify"
-    timeout_seconds = getattr(context.config, "review_verify_timeout_seconds", 120)
+    timeout_seconds = getattr(context.config, "autonomous_verify_timeout_seconds", 120)
     if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
         timeout_seconds = 120
 
