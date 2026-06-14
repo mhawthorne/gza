@@ -71,6 +71,7 @@ def _make_noop_verify_fixture(tmp_path: Path) -> tuple[Any, Any, DbTask, DbTask]
         project_dir=tmp_path,
         verify_command="uv run pytest tests/ -q",
         autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=6.0,
         project_dir_raw=tmp_path,
     )
     config.worktree_path.mkdir(parents=True, exist_ok=True)
@@ -1809,6 +1810,7 @@ def test_run_noop_improve_verify_then_review_uses_cross_project_review_verifier(
     assert outcome.status == "create_review"
     assert outcome.review_task is fresh_review
     assert cross_project_verify.call_count == 1
+    assert cross_project_verify.call_args.kwargs["timeout_grace_seconds"] == 6.0
     assert "Fresh verify passed" in outcome.message
 
 

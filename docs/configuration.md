@@ -52,7 +52,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `autonomous_verify_timeout_seconds` | Integer | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
-| `review_verify_timeout_grace_seconds` | Integer | `5` | Grace period after SIGTERM before lifecycle review verification escalates to SIGKILL |
+| `review_verify_timeout_grace_seconds` | Float | `5` | Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; accepts values `>= 1` second |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
 | `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
 | `code_task_diff_timeout_medium_minutes` | Integer | `30` | Timeout budget used for medium-sized code diffs |
@@ -494,6 +494,7 @@ inner_verify_command: ./bin/tests --quick
 - `inner_verify_command` is optional and is intended for fast edit-loop checks during implementation.
 - When `inner_verify_command` is unset, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
 - Autonomous review verification is separate and remains bounded by `autonomous_verify_timeout_seconds`.
+- When autonomous review verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
 
 ---
 
@@ -962,6 +963,7 @@ providers.*.task_types.*.reasoning_effort
 providers.*.task_types.*.timeout_minutes
 review_context_file_limit
 autonomous_verify_timeout_seconds
+review_verify_timeout_grace_seconds
 recommend_rebase_behind_commits
 review_diff_medium_threshold
 review_diff_small_threshold

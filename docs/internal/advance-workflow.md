@@ -52,7 +52,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 | `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
 | `max_noop_improve_cycles` | `1` | Max consecutive no-op improves before lifecycle automation stops for discussion |
 | `autonomous_verify_timeout_seconds` | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
-| `review_verify_timeout_grace_seconds` | `5` | Grace period after SIGTERM before lifecycle review verification escalates to SIGKILL |
+| `review_verify_timeout_grace_seconds` | `5` | Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; accepts float values >= 1 second |
 | `recommend_rebase_behind_commits` | `1` | Deprecated compatibility key; accepted but ignored by lifecycle planning |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |
 

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
-from gza.test_harness import register_sigterm_faulthandler
+from gza.pytest_timeout_diagnostics import register_sigterm_faulthandler
 
 # NOTE: 2000ms is a short-term bridge. A 1s wall-clock per-test budget is
 # inherently flaky under xdist contention (wall time inflates when workers

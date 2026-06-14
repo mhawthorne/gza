@@ -232,7 +232,7 @@ def test_functional_suite_conftest_registers_sigterm_faulthandler(monkeypatch: p
         calls.append(True)
         return True
 
-    monkeypatch.setattr("gza.test_harness.register_sigterm_faulthandler", _fake_register)
+    monkeypatch.setattr("gza.pytest_timeout_diagnostics.register_sigterm_faulthandler", _fake_register)
 
     _load_module(conftest_path, "tests_functional_sigterm_conftest")
 

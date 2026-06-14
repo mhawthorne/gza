@@ -345,7 +345,7 @@ def test_merge_first_docs_and_fix_skill_schema_stay_in_sync() -> None:
     advance_workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
     fix_skill = (repo_root / "src" / "gza" / "skills" / "gza-task-fix" / "SKILL.md").read_text()
 
-    required_snippets = [
+    shared_required_snippets = [
         "autonomous_verify_timeout_seconds",
         "review_verify_timeout_grace_seconds",
         "recommend_rebase_behind_commits",
@@ -354,15 +354,25 @@ def test_merge_first_docs_and_fix_skill_schema_stay_in_sync() -> None:
         "Cleanly mergeable branches continue to the normal review or merge actions",
         "verify:",
         "autonomous_verify_timeout_seconds: <int>",
-        "review_verify_timeout_grace_seconds: <int>",
         "blockers:",
     ]
-    for snippet in required_snippets:
+    for snippet in shared_required_snippets:
         assert (
             snippet in config_content
             or snippet in advance_workflow
             or snippet in fix_skill
         )
+
+    assert "review_verify_timeout_grace_seconds: <number >= 1>" in fix_skill
+    assert (
+        "Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; "
+        "accepts float values >= 1 second"
+    ) in advance_workflow
+
+    stale_grace_schema = "review_verify_timeout_grace_seconds: <int>"
+    assert stale_grace_schema not in fix_skill
+    assert stale_grace_schema not in advance_workflow
+    assert stale_grace_schema not in config_content
 
     retired_snippets = [
         "recommend_rebase:",

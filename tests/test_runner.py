@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import stat
@@ -37,6 +38,7 @@ from gza.runner import (
     WIP_DIR,
     CrossProjectReviewVerifyResult,
     ProjectBoundary,
+    REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
     ReviewVerifyResult,
     RunInvocationContext,
     _apply_transcript_stats_fallback,
@@ -57,6 +59,7 @@ from gza.runner import (
     _format_review_verify_result,
     _get_task_output,
     _post_complete_code_task,
+    _resolve_review_verify_timeout_grace_seconds,
     _resolve_code_task_branch_name,
     _resolve_task_timeout_budget,
     _restore_wip_changes,
@@ -1299,6 +1302,19 @@ class TestReviewContextFromChain:
             in _format_review_verify_result(result)
         )
 
+    @pytest.mark.parametrize("grace_seconds", [float("nan"), float("inf"), -float("inf")])
+    def test_resolve_review_verify_timeout_grace_seconds_falls_back_for_non_finite_values(
+        self,
+        grace_seconds: float,
+    ) -> None:
+        """Defensive timeout-grace resolution should ignore non-finite values."""
+
+        config = Mock(spec=Config)
+        config.review_verify_timeout_grace_seconds = grace_seconds
+
+        assert math.isfinite(_resolve_review_verify_timeout_grace_seconds(config))
+        assert _resolve_review_verify_timeout_grace_seconds(config) == REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
+
     def test_run_review_verify_command_warns_when_near_timeout_budget(self, tmp_path: Path):
         """Completed review verify runs should warn operators before they start timing out."""
         helper_result = Mock(
@@ -1418,6 +1434,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -1438,6 +1455,8 @@ class TestReviewContextFromChain:
         assert len(verify_calls) == 2
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
         assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
+        assert verify_calls[0].kwargs["timeout_grace_seconds"] == 5.0
+        assert verify_calls[1].kwargs["timeout_grace_seconds"] == 5.0
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
@@ -1515,6 +1534,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -1577,6 +1597,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -1636,6 +1657,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -1698,6 +1720,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -1749,6 +1772,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -1832,6 +1856,7 @@ class TestReviewContextFromChain:
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
                 timeout_seconds=120,
+                timeout_grace_seconds=5.0,
             )
 
         assert outcome is not None
@@ -2395,7 +2420,12 @@ class TestReviewContextFromChain:
         assert "## Verify Timeout Guidance" in context
         assert "Treat this as a test-performance investigation first" in context
         assert "Inspect the captured `## verify_command result`, trimmed output, and any referenced `verify_command_output` artifact" in context
+        assert "run a narrower configured subset or harness-specific diagnostic mode" in context
+        assert "Use diagnostics that fit the configured harness for this project" in context
         assert "do not silently relax suite-wide guardrails or change `verify_timeout`" in context
+        assert "pytest" not in context
+        assert "--durations" not in context
+        assert "uv run pytest" not in context
 
     def test_improve_context_includes_verify_timeout_guidance_for_evidence_only_timeout_review(
         self, tmp_path: Path
@@ -2440,6 +2470,11 @@ class TestReviewContextFromChain:
         assert "## Verify Timeout Guidance" in context
         assert "Treat this as a test-performance investigation first" in context
         assert "Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps" in context
+        assert "Inspect the captured `## verify_command result`" in context
+        assert "run a narrower configured subset or harness-specific diagnostic mode" in context
+        assert "pytest" not in context
+        assert "--durations" not in context
+        assert "uv run pytest" not in context
 
     def test_improve_context_excludes_verify_timeout_guidance_for_code_blocker_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -10278,6 +10313,7 @@ class TestExtractedRunInnerHelpers:
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.verify_command = "uv run pytest tests/ -q"
         config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 9.0
 
         worktree_git = Mock(spec=Git)
         worktree_git.repo_dir = tmp_path
@@ -10301,7 +10337,7 @@ class TestExtractedRunInnerHelpers:
                     reviewed_head_sha="abc1234",
                     reviewed_base_sha="cafebabe",
                 ),
-            ),
+            ) as mock_review_verify,
             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
@@ -10318,6 +10354,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
+        assert mock_review_verify.call_args.kwargs["timeout_grace_seconds"] == 9.0
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -14503,6 +14540,7 @@ class TestProviderPromptSanitization:
         config.timeout_minutes = 10
         config.verify_command = ""
         config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 8.0
 
         captured_prompts: list[str] = []
 
@@ -14578,6 +14616,7 @@ class TestProviderPromptSanitization:
         assert "- Status: failed" in prompt
         assert "bar failed" in prompt
         mock_cross_project_verify.assert_called_once()
+        assert mock_cross_project_verify.call_args.kwargs["timeout_grace_seconds"] == 8.0
         assert mock_cross_project_verify.call_args.kwargs["reviewed_branch"] == impl.branch
         assert mock_cross_project_verify.call_args.kwargs["reviewed_head_sha"] == "deadbeef"
         assert mock_cross_project_verify.call_args.kwargs["reviewed_base_sha"] == "cafebabe"

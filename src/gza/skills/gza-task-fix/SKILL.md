@@ -146,7 +146,7 @@ verify:
   passed: true | false | null
   duration_seconds: <float or null>
   autonomous_verify_timeout_seconds: <int>
-  review_verify_timeout_grace_seconds: <int>
+  review_verify_timeout_grace_seconds: <number >= 1>
 blockers:
   - source_review_id: <review_task_id>
     blocker_key: <short_key>
