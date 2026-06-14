@@ -27,7 +27,7 @@ from .conftest import (
     get_latest_task,
     make_store,
     mark_orphaned,
-    run_gza,
+    invoke_gza,
     setup_config,
     setup_db_with_tasks,
 )
@@ -227,7 +227,7 @@ def test_background_phase1_validation_errors_write_to_stderr_only(
     del case_name
     argv, expected = setup_case(tmp_path)
 
-    result = run_gza(*argv)
+    result = invoke_gza(*argv)
 
     assert result.returncode == 1
     assert expected in result.stderr
@@ -291,25 +291,25 @@ class TestAddCommand:
     def test_add_with_inline_prompt(self, tmp_path: Path):
         """Add command with inline prompt creates a task."""
         setup_config(tmp_path)
-        result = run_gza("add", "Test inline task", "--project", str(tmp_path))
+        result = invoke_gza("add", "Test inline task", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task was added
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "Test inline task" in result.stdout
 
     def test_add_explore_task(self, tmp_path: Path):
         """Add command with --explore flag creates explore task."""
         setup_config(tmp_path)
-        result = run_gza("add", "--explore", "Explore the codebase", "--project", str(tmp_path))
+        result = invoke_gza("add", "--explore", "Explore the codebase", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task type is shown
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "[explore]" in result.stdout
 
     def test_add_with_prompt_file(self, tmp_path: Path):
@@ -320,20 +320,20 @@ class TestAddCommand:
         prompt_file = tmp_path / "task_prompt.txt"
         prompt_file.write_text("Task prompt from file")
 
-        result = run_gza("add", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+        result = invoke_gza("add", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
 
         # Verify task was added with correct prompt
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "Task prompt from file" in result.stdout
 
     def test_add_with_prompt_file_not_found(self, tmp_path: Path):
         """Add command handles missing file gracefully."""
         setup_config(tmp_path)
 
-        result = run_gza("add", "--prompt-file", "/nonexistent/file.txt", "--project", str(tmp_path))
+        result = invoke_gza("add", "--prompt-file", "/nonexistent/file.txt", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower()
@@ -345,7 +345,7 @@ class TestAddCommand:
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("File content")
 
-        result = run_gza("add", "inline prompt", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+        result = invoke_gza("add", "inline prompt", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Cannot use both" in result.stdout
@@ -357,7 +357,7 @@ class TestAddCommand:
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("File content")
 
-        result = run_gza("add", "--prompt-file", str(prompt_file), "--edit", "--project", str(tmp_path))
+        result = invoke_gza("add", "--prompt-file", str(prompt_file), "--edit", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Cannot use both" in result.stdout
@@ -372,7 +372,7 @@ class TestAddCommand:
         prompt_file = tmp_path / "task_prompt.txt"
         prompt_file.write_text("Implement feature X")
 
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--prompt-file",
             str(prompt_file),
@@ -400,7 +400,7 @@ class TestAddCommand:
 
         setup_config(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--type",
             "implement",
@@ -421,7 +421,7 @@ class TestAddCommand:
         """add --tag '' should fail with user-facing validation, not traceback."""
         setup_config(tmp_path)
 
-        result = run_gza("add", "Tag validation", "--tag", "", "--project", str(tmp_path))
+        result = invoke_gza("add", "Tag validation", "--tag", "", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: tag must not be empty" in result.stdout
@@ -441,7 +441,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.group is None
 
-        result = run_gza("edit", str(task.id), "--set-tags", "new-group", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--set-tags", "new-group", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -457,7 +457,7 @@ class TestEditCommand:
         task = store.add("Test task", tags=("release-1.2", "backend"))
         assert len(task.tags) == 2
 
-        result = run_gza("edit", str(task.id), "--clear-tags", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--clear-tags", "--project", str(tmp_path))
 
         assert result.returncode == 0
         updated = store.get(task.id)
@@ -472,7 +472,7 @@ class TestEditCommand:
 
         task = store.add("Test task", tags=("backend",))
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--add-tag",
@@ -498,7 +498,7 @@ class TestEditCommand:
 
         task = store.add("Test task", tags=("backend",))
 
-        result = run_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added tags for task" in result.stdout
@@ -513,7 +513,7 @@ class TestEditCommand:
         store = make_store(tmp_path)
         task = store.add("Test task")
 
-        result = run_gza("edit", str(task.id), "--add-tag", "", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--add-tag", "", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: tag must not be empty" in result.stdout
@@ -531,7 +531,7 @@ class TestEditCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("edit", str(task.id), "--set-tags", "release-1.2,ops", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--set-tags", "release-1.2,ops", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Set tags for task" in result.stdout
@@ -552,7 +552,7 @@ class TestEditCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added tags for task" in result.stdout
@@ -573,7 +573,7 @@ class TestEditCommand:
         task.started_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--add-tag",
@@ -604,7 +604,7 @@ class TestEditCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "automatic implementation follow-up" in result.stdout
@@ -621,7 +621,7 @@ class TestEditCommand:
 
         task = store.add("Pending plan", task_type="plan", auto_implement=True)
 
-        result = run_gza("edit", str(task.id), "--hold-for-review", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--hold-for-review", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Enabled hold-for-review" in result.stdout
@@ -639,7 +639,7 @@ class TestEditCommand:
 
         task = store.add("Held pending plan", task_type="plan", auto_implement=False)
 
-        result = run_gza("edit", str(task.id), "--no-hold-for-review", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--no-hold-for-review", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "automatic implementation follow-up" in result.stdout
@@ -660,7 +660,7 @@ class TestEditCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("edit", str(task.id), "--hold-for-review", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--hold-for-review", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "non-pending tasks only allow tag edits" in result.stdout
@@ -682,7 +682,7 @@ class TestEditCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--hold-for-review",
@@ -711,7 +711,7 @@ class TestEditCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("edit", str(task.id), "--no-hold-for-review", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--no-hold-for-review", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "automatic implementation follow-up" in result.stdout
@@ -734,7 +734,7 @@ class TestEditCommand:
         task.started_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             flag,
@@ -763,7 +763,7 @@ class TestEditCommand:
 
         task = store.add("Regular task", task_type="implement")
 
-        result = run_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--auto-implement", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "--auto-implement is only valid for plan tasks" in result.stdout
@@ -777,7 +777,7 @@ class TestEditCommand:
 
         task = store.add("Regular task", task_type="implement")
 
-        result = run_gza("edit", str(task.id), flag, "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), flag, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "hold-for-review flags are only valid for plan tasks" in result.stdout
@@ -800,7 +800,7 @@ class TestEditCommand:
 
         task = store.add("Regular task", task_type="implement")
 
-        result = run_gza("edit", str(task.id), *flags, "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), *flags, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "--auto-implement is only valid for plan tasks" in result.stdout
@@ -814,7 +814,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.create_review is False
 
-        result = run_gza("edit", str(task.id), "--review", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--review", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -831,7 +831,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.create_pr is False
 
-        result = run_gza("edit", str(task.id), "--pr", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--pr", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"Enabled PR creation/reuse request for successful completion of task {task.id}" in result.stdout
@@ -849,7 +849,7 @@ class TestEditCommand:
         assert task.create_review is False
         assert task.create_pr is False
 
-        result = run_gza("edit", str(task.id), "--review", "--pr", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--review", "--pr", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "automatic review task creation" in result.stdout
@@ -870,7 +870,7 @@ class TestEditCommand:
         assert task.create_pr is False
         assert task.model is None
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--pr",
@@ -899,7 +899,7 @@ class TestEditCommand:
         assert task.create_pr is False
         assert task.tags == ()
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--pr",
@@ -927,7 +927,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.create_pr is False
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--pr",
@@ -953,7 +953,7 @@ class TestEditCommand:
         task = store.add("Test task")
         assert task.create_review is False
 
-        result = run_gza(
+        result = invoke_gza(
             "edit",
             str(task.id),
             "--review",
@@ -981,7 +981,7 @@ class TestEditCommand:
         prompt_file = tmp_path / "new_prompt.txt"
         prompt_file.write_text("New prompt text from file")
 
-        result = run_gza("edit", str(task.id), "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--prompt-file", str(prompt_file), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Updated task" in result.stdout
@@ -998,7 +998,7 @@ class TestEditCommand:
 
         task = store.add("Original prompt text")
 
-        result = run_gza("edit", str(task.id), "--prompt-file", "/nonexistent/file.txt", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--prompt-file", "/nonexistent/file.txt", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower()
@@ -1011,7 +1011,7 @@ class TestEditCommand:
 
         task = store.add("Original prompt text")
 
-        result = run_gza("edit", str(task.id), "--prompt", "New prompt from command line", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--prompt", "New prompt from command line", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Updated task" in result.stdout
@@ -1029,7 +1029,7 @@ class TestEditCommand:
         task = store.add("Original prompt text")
 
         # Try to set a prompt that's too short
-        result = run_gza("edit", str(task.id), "--prompt", "short", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--prompt", "short", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Validation" in result.stdout or "too short" in result.stdout.lower()
@@ -1049,7 +1049,7 @@ class TestEditCommand:
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("File content")
 
-        result = run_gza("edit", str(task.id), "--prompt", "text", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--prompt", "text", "--prompt-file", str(prompt_file), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Cannot use both" in result.stdout
@@ -1063,7 +1063,7 @@ class TestEditCommand:
         task = store.add("Original prompt text")
 
         stdin_content = "New prompt from stdin input"
-        result = run_gza("edit", str(task.id), "--prompt", "-", "--project", str(tmp_path), stdin_input=stdin_content)
+        result = invoke_gza("edit", str(task.id), "--prompt", "-", "--project", str(tmp_path), stdin_input=stdin_content)
 
         assert result.returncode == 0
         assert "Updated task" in result.stdout
@@ -1081,7 +1081,7 @@ class TestEditCommand:
         parent_task = store.add("Parent task")
         task = store.add("Target task")
 
-        result = run_gza("edit", str(task.id), "--based-on", str(parent_task.id), "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--based-on", str(parent_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         updated = store.get(task.id)
@@ -1097,7 +1097,7 @@ class TestEditCommand:
         dep_task = store.add("Dependency task")
         task = store.add("Target task")
 
-        result = run_gza("edit", str(task.id), "--depends-on", str(dep_task.id), "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--depends-on", str(dep_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         updated = store.get(task.id)
@@ -1112,7 +1112,7 @@ class TestEditCommand:
 
         task = store.add("Target task")
 
-        result = run_gza("edit", str(task.id), "--based-on", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--based-on", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower()
@@ -1125,7 +1125,7 @@ class TestEditCommand:
 
         task = store.add("Target task")
 
-        result = run_gza("edit", str(task.id), "--depends-on", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--depends-on", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower()
@@ -1149,14 +1149,14 @@ class TestRetryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task " in result.stdout
         assert f"retry of {task.id}" in result.stdout
 
         # Verify new task was created with same prompt
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "Original task" in result.stdout
 
     def test_retry_failed_task(self, tmp_path: Path):
@@ -1168,7 +1168,7 @@ class TestRetryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created task " in result.stdout
@@ -1182,7 +1182,7 @@ class TestRetryCommand:
 
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        result = run_gza("retry", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Can only retry completed or failed" in result.stdout
@@ -1191,7 +1191,7 @@ class TestRetryCommand:
         """Retry command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("retry", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("retry", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -1227,7 +1227,7 @@ class TestRetryCommand:
         store.update(task)
 
         # Retry the task
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -1260,7 +1260,7 @@ class TestRetryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_task = get_latest_task(store, based_on=task.id, task_type="improve")
@@ -1419,7 +1419,7 @@ class TestRetryCommand:
         failed_rebase.completed_at = datetime.now(UTC)
         store.update(failed_rebase)
 
-        result = run_gza("retry", str(failed_rebase.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(failed_rebase.id), "--queue", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_task = get_latest_task(store, based_on=failed_rebase.id, task_type="rebase")
@@ -1619,7 +1619,7 @@ class TestRetryCommand:
                 automatic_recovery=True,
             )
         else:
-            result = run_gza("retry", str(failed_improve.id), "--queue", "--project", str(tmp_path))
+            result = invoke_gza("retry", str(failed_improve.id), "--queue", "--project", str(tmp_path))
             assert result.returncode == 0
             retry_task = get_latest_task(store, based_on=failed_improve.id, task_type="improve")
             assert retry_task is not None
@@ -1654,7 +1654,7 @@ class TestRetryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_task = get_latest_task(store, based_on=task.id, task_type="improve")
@@ -1677,7 +1677,7 @@ class TestRetryCommand:
         task.provider_is_explicit = False
         store.update(task)
 
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_task = get_latest_task(store, based_on=task.id, task_type=task.task_type)
@@ -1737,7 +1737,7 @@ class TestRetryCommand:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         # Run retry with background mode
-        result = run_gza("retry", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command completes successfully
         assert result.returncode == 0
@@ -1767,7 +1767,7 @@ class TestRetryCommand:
         store.update(task)
 
         with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
-            result = run_gza("retry", str(task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("retry", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the new task was created and run was attempted
         assert "Created task " in result.stdout
@@ -1794,7 +1794,7 @@ class TestRetryCommand:
         store.update(task)
 
         # Run retry with --queue flag
-        result = run_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(task.id), "--queue", "--project", str(tmp_path))
 
         # Verify the new task was created but not run
         assert result.returncode == 0
@@ -1822,7 +1822,7 @@ class TestRetryCommand:
         store.update(failed)
         assert failed.id is not None
 
-        retry_result = run_gza("retry", str(failed.id), "--queue", "--project", str(tmp_path))
+        retry_result = invoke_gza("retry", str(failed.id), "--queue", "--project", str(tmp_path))
         assert retry_result.returncode == 0
 
         retry_task = get_latest_task(store, based_on=failed.id, task_type="implement")
@@ -1893,7 +1893,7 @@ class TestRetryCommand:
         retry.completed_at = datetime.now(UTC)
         store.update(retry)
 
-        result = run_gza("retry", str(original.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", str(original.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert (
@@ -1918,7 +1918,7 @@ class TestRetryCommand:
         store.update(retry)
 
         task_arg = wrapped_id.format(id=original.id)
-        result = run_gza("retry", task_arg, "--queue", "--project", str(tmp_path))
+        result = invoke_gza("retry", task_arg, "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert f"Error: Task {original.id} already has a successful retry ({retry.id})." in result.stdout
@@ -1945,7 +1945,7 @@ class TestResumeCommand:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         # Run resume with background mode
-        result = run_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command completes successfully
         assert result.returncode == 0
@@ -1978,7 +1978,7 @@ class TestResumeCommand:
         store.update(task)
 
         with patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")):
-            result = run_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "creator boom" in result.stderr
@@ -2004,7 +2004,7 @@ class TestResumeCommand:
         store.update(task)
 
         # Try to resume
-        result = run_gza("resume", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
 
         # Verify it fails with helpful message
         assert result.returncode == 1
@@ -2021,7 +2021,7 @@ class TestResumeCommand:
 
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        result = run_gza("resume", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Can only resume failed or orphaned tasks" in result.stdout
@@ -2040,7 +2040,7 @@ class TestResumeCommand:
         store.update(task)
 
         with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
-            result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the command creates a new task
         assert "resume of " in result.stdout
@@ -2072,7 +2072,7 @@ class TestResumeCommand:
         store.update(task)
 
         # Run resume with --queue flag
-        result = run_gza("resume", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("resume", str(task.id), "--queue", "--project", str(tmp_path))
 
         # Verify the command creates a new task but does not run it
         assert result.returncode == 0
@@ -2102,7 +2102,7 @@ class TestResumeCommand:
         store.update(failed)
         assert failed.id is not None
 
-        resume_result = run_gza("resume", str(failed.id), "--queue", "--project", str(tmp_path))
+        resume_result = invoke_gza("resume", str(failed.id), "--queue", "--project", str(tmp_path))
         assert resume_result.returncode == 0
 
         resume_task = get_latest_task(store, based_on=failed.id, task_type="implement")
@@ -2458,7 +2458,7 @@ class TestResumeCommand:
         store.update(task)
 
         with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
-            result = run_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify output
         assert "resume of " in result.stdout
@@ -2505,7 +2505,7 @@ class TestResumeCommand:
 
         # No worker files exist — task is orphaned
 
-        result = run_gza("resume", str(task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("resume", str(task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout.lower()
@@ -2556,7 +2556,7 @@ class TestResumeCommand:
             )
             registry.register(worker)
 
-            result = run_gza("resume", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
         finally:
             sleeper.kill()
             sleeper.wait()
@@ -2585,7 +2585,7 @@ class TestWorkCommandMultiTask:
         task1 = store.add("Test task 1")
 
         # Verify the command accepts the argument
-        result = run_gza("work", str(task1.id), "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", str(task1.id), "--no-docker", "--project", str(tmp_path))
 
         # Note: Without actual Claude integration, this will fail,
         # but we're verifying that argparse accepts the input
@@ -2604,7 +2604,7 @@ class TestWorkCommandMultiTask:
         task3 = store.add("Test task 3")
 
         # Verify the command accepts multiple arguments
-        result = run_gza("work", str(task1.id), str(task2.id), str(task3.id),
+        result = invoke_gza("work", str(task1.id), str(task2.id), str(task3.id),
                         "--no-docker", "--project", str(tmp_path))
 
         # Verify argparse accepts the input
@@ -2625,7 +2625,7 @@ class TestWorkCommandMultiTask:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         # Run with background mode and multiple task IDs
-        result = run_gza("work", str(task1.id), str(task2.id),
+        result = invoke_gza("work", str(task1.id), str(task2.id),
                         "--background", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command completes without argument parsing errors
@@ -2673,7 +2673,7 @@ class TestWorkCommandMultiTask:
         store.add("Test task 1")
 
         # Run without task IDs
-        result = run_gza("work", "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", "--no-docker", "--project", str(tmp_path))
 
         # Verify no argument parsing errors
         assert "unrecognized arguments" not in result.stderr
@@ -2732,7 +2732,7 @@ class TestWorkCommandMultiTask:
         task1 = store.add("Test task 1")
 
         # Try to run with one valid and one invalid task ID
-        result = run_gza("work", str(task1.id), "test-project-zzz", "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", str(task1.id), "test-project-zzz", "--no-docker", "--project", str(tmp_path))
 
         # Should error about invalid task ID format
         assert result.returncode != 0
@@ -2743,7 +2743,7 @@ class TestWorkCommandMultiTask:
         setup_config(tmp_path)
         make_store(tmp_path).add("Test task 1")
 
-        result = run_gza("work", "42", "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", "42", "--no-docker", "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "Use a full prefixed task ID" in result.stderr or "Use a full prefixed task ID" in result.stdout
@@ -2762,7 +2762,7 @@ class TestWorkCommandMultiTask:
         store.update(task1)
 
         # Try to run the completed task
-        result = run_gza("work", str(task1.id), "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", str(task1.id), "--no-docker", "--project", str(tmp_path))
 
         # Should error about task status
         assert result.returncode != 0
@@ -2780,7 +2780,7 @@ class TestWorkCommandMultiTask:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("work", "--worker-mode", str(task.id), "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", "--worker-mode", str(task.id), "--no-docker", "--project", str(tmp_path))
         assert result.returncode != 0
         assert f"Task {task.id}" in (result.stdout + result.stderr)
 
@@ -2797,7 +2797,7 @@ class TestWorkCommandMultiTask:
         orphaned_task = store.add("Stuck task from yesterday")
         mark_orphaned(store, orphaned_task)
 
-        result = run_gza("work", "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("work", "--no-docker", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Warning about orphaned task should appear before the "No pending tasks" message
@@ -2946,7 +2946,7 @@ class TestWorkCommandMultiTask:
         """work --tag '' should reject empty values cleanly."""
         setup_config(tmp_path)
 
-        result = run_gza("work", "--tag", "", "--project", str(tmp_path))
+        result = invoke_gza("work", "--tag", "", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: tag must not be empty" in result.stdout
@@ -2963,7 +2963,7 @@ class TestWorkCommandMultiTask:
         assert prereq.id is not None
         assert blocked.id is not None
 
-        result = run_gza("work", "--tag", "release-1", "--project", str(tmp_path))
+        result = invoke_gza("work", "--tag", "release-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No runnable tasks found matching tags: release-1." in result.stdout
@@ -2980,7 +2980,7 @@ class TestWorkCommandMultiTask:
         assert prereq.id is not None
         assert blocked.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "work",
             "--background",
             "--no-docker",
@@ -3005,7 +3005,7 @@ class TestWorkCommandMultiTask:
         internal_task = store.add("Internal release maintenance", task_type="internal", tags=("release-1",))
         assert internal_task.id is not None
 
-        result = run_gza("work", "--tag", "release-1", "--project", str(tmp_path))
+        result = invoke_gza("work", "--tag", "release-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No runnable tasks found matching tags: release-1." in result.stdout
@@ -3022,7 +3022,7 @@ class TestWorkCommandMultiTask:
         internal_task = store.add("Internal release maintenance", task_type="internal", tags=("release-1",))
         assert internal_task.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "work",
             "--background",
             "--no-docker",
@@ -3765,7 +3765,7 @@ class TestBackgroundWorkerCommand:
                 side_effect=AssertionError("worker process should not spawn"),
             ),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "work",
                 str(task.id),
                 "--background",
@@ -3807,7 +3807,7 @@ class TestBackgroundWorkerCommand:
                 side_effect=AssertionError("worker process should not spawn"),
             ),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "work",
                 str(task.id),
                 "--background",
@@ -4766,7 +4766,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza(
+        result = invoke_gza(
             "implement",
             str(plan_task.id),
             "Implement auth rollout",
@@ -4793,7 +4793,7 @@ class TestImplementCommand:
         """Implement command validates referenced plan task exists."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("implement", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("implement", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -4809,7 +4809,7 @@ class TestImplementCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("implement", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("implement", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert f"Error: Task {task.id} is a implement task" in result.stdout
@@ -4822,7 +4822,7 @@ class TestImplementCommand:
 
         plan_task = store.add("Plan feature", task_type="plan")
 
-        result = run_gza("implement", str(plan_task.id), "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert f"Error: Task {plan_task.id} is pending. Plan task must be completed." in result.stdout
@@ -4839,7 +4839,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
@@ -4863,7 +4863,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created implement task " in result.stdout
@@ -4884,7 +4884,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         impl_task = get_latest_task(store, depends_on=plan_task.id, task_type="implement")
@@ -4900,7 +4900,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza(
+        result = invoke_gza(
             "implement",
             str(plan_task.id),
             "--tag",
@@ -4926,7 +4926,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         refreshed = store.get(plan_task.id)
@@ -4974,7 +4974,7 @@ class TestImplementCommand:
         )
         store.update(review)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         created = [task for task in store.get_all() if task.task_type == "implement"]
@@ -5006,7 +5006,7 @@ class TestImplementCommand:
         review.output_content = "## Verdict\nVerdict: APPROVED\n"
         store.update(review)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
@@ -5046,7 +5046,7 @@ class TestImplementCommand:
         store.update(review)
         _store_plan_review_override_artifact(tmp_path, store, review.id, output="[]")
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
@@ -5063,7 +5063,7 @@ class TestImplementCommand:
         plan_task.completed_at = datetime.now(UTC)
         store.update(plan_task)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         created = [task for task in store.get_all() if task.task_type == "implement"]
@@ -5088,7 +5088,7 @@ class TestImplementCommand:
         review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
         store.update(review)
 
-        result = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         created = [task for task in store.get_all() if task.task_type == "implement"]
@@ -5132,8 +5132,8 @@ class TestImplementCommand:
         )
         store.update(review)
 
-        first = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
-        second = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
 
         assert first.returncode == 0
         assert second.returncode == 0
@@ -5185,7 +5185,7 @@ class TestImplementCommand:
         )
         store.update(review)
 
-        first = run_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("implement", str(plan_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0
 
         created = [task for task in store.get_all() if task.task_type == "implement"]
@@ -5312,7 +5312,7 @@ class TestImplementCommand:
 
         dep_task = store.add("Independent dependency", task_type="implement")
 
-        result = run_gza(
+        result = invoke_gza(
             "implement",
             str(plan_task.id),
             "--depends-on",
@@ -5336,7 +5336,7 @@ class TestPlanReviewAndImproveCommands:
         plan.completed_at = datetime.now(UTC)
         store.update(plan)
 
-        result = run_gza("plan-review", str(plan.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("plan-review", str(plan.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         created = get_latest_task(store, task_type="plan_review", depends_on=plan.id)
@@ -5354,7 +5354,7 @@ class TestPlanReviewAndImproveCommands:
         store.update(plan)
 
         with patch("gza.cli.execution._spawn_background_worker", return_value=0) as spawn_background:
-            result = run_gza(
+            result = invoke_gza(
                 "plan-review",
                 str(plan.id),
                 "--background",
@@ -5543,7 +5543,7 @@ class TestPlanReviewAndImproveCommands:
         store.update(review)
         _store_plan_review_override_artifact(tmp_path, store, review.id, output="[]")
 
-        result = run_gza("plan-review", str(review.id), "--materialize", "--project", str(tmp_path))
+        result = invoke_gza("plan-review", str(review.id), "--materialize", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
@@ -5567,7 +5567,7 @@ class TestPlanReviewAndImproveCommands:
         review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
         store.update(review)
 
-        result = run_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         created = get_latest_task(store, task_type="plan_improve", depends_on=review.id, based_on=plan.id)
@@ -5591,7 +5591,7 @@ class TestPlanReviewAndImproveCommands:
         store.update(review)
 
         with patch("gza.cli.execution._spawn_background_worker", return_value=0) as spawn_background:
-            result = run_gza(
+            result = invoke_gza(
                 "plan-improve",
                 str(review.id),
                 "--background",
@@ -5639,7 +5639,7 @@ class TestPlanReviewAndImproveCommands:
         review.output_content = output_content
         store.update(review)
 
-        result = run_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert expected_fragment in result.stdout
@@ -5675,7 +5675,7 @@ class TestImproveCommand:
         store.update(review_task)
 
         # Run improve command with --queue to only create (not run)
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -5711,7 +5711,7 @@ class TestImproveCommand:
         store.update(review_task)
 
         # Run improve command with --review flag and --queue to only create (not run)
-        result = run_gza("improve", str(impl_task.id), "--review", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--review", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -5734,7 +5734,7 @@ class TestImproveCommand:
         store.update(impl_task)
 
         # Run improve command
-        result = run_gza("improve", str(impl_task.id), "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "has no review" in result.stdout
@@ -5753,7 +5753,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Please tighten validation edge cases.")
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "continuing from unresolved comments only" in result.stdout
@@ -5775,7 +5775,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Address form validation gaps.")
 
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         improves = [t for t in store.get_all() if t.task_type == "improve"]
@@ -5783,7 +5783,7 @@ class TestImproveCommand:
         first_improve = improves[0]
         assert first_improve.id is not None
 
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"Reusing pending improve task {first_improve.id}" in second.stdout
 
@@ -5804,14 +5804,14 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Address validation gaps.")
 
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         pending_improve = next(task for task in store.get_all() if task.task_type == "improve")
         assert pending_improve.id is not None
         assert pending_improve.create_pr is False
 
-        second = run_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"Reusing pending improve task {pending_improve.id}" in second.stdout
 
@@ -5831,7 +5831,7 @@ class TestImproveCommand:
         assert impl_task.id is not None
 
         store.add_comment(impl_task.id, "Round 1 comment.")
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         first_improve = next(task for task in store.get_all() if task.task_type == "improve")
@@ -5840,7 +5840,7 @@ class TestImproveCommand:
         store.update(first_improve)
 
         store.add_comment(impl_task.id, "Round 2 comment added after improve creation.")
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"Reusing pending improve task {first_improve.id}" not in second.stdout
         assert "Created improve task" in second.stdout
@@ -5865,7 +5865,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Handle edge-case parsing.")
 
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         improves = [t for t in store.get_all() if t.task_type == "improve"]
@@ -5877,7 +5877,7 @@ class TestImproveCommand:
         store.update(failed_improve)
         assert failed_improve.id is not None
 
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"(resume of {failed_improve.id})" in second.stdout
 
@@ -5902,7 +5902,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Handle edge-case parsing.")
 
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
@@ -5912,7 +5912,7 @@ class TestImproveCommand:
         failed_improve.session_id = "improve-session-1"
         store.update(failed_improve)
 
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 1
         assert "automatic recovery is disabled (max_resume_attempts=0)" in second.stdout
         assert str(failed_improve.id) in second.stdout
@@ -5932,7 +5932,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Handle edge-case parsing.")
 
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
@@ -5942,7 +5942,7 @@ class TestImproveCommand:
         failed_improve.session_id = "improve-session-1"
         store.update(failed_improve)
 
-        second = run_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--pr", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"(resume of {failed_improve.id})" in second.stdout
 
@@ -5966,7 +5966,7 @@ class TestImproveCommand:
         assert impl_task.id is not None
 
         store.add_comment(impl_task.id, "Round 1 comment.")
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         failed_improve = next(task for task in store.get_all() if task.task_type == "improve")
@@ -5978,7 +5978,7 @@ class TestImproveCommand:
         store.update(failed_improve)
 
         store.add_comment(impl_task.id, "Round 2 comment added after failed improve creation.")
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"(resume of {failed_improve.id})" not in second.stdout
         assert f"(retry of {failed_improve.id})" not in second.stdout
@@ -6004,7 +6004,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Retry comments-only improve after infra failure.")
 
-        first = run_gza(
+        first = invoke_gza(
             "improve",
             str(impl_task.id),
             "--queue",
@@ -6025,7 +6025,7 @@ class TestImproveCommand:
         failed_improve.session_id = None
         store.update(failed_improve)
 
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"(retry of {failed_improve.id})" in second.stdout
 
@@ -6056,7 +6056,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Retry comments-only improve with new flags.")
 
-        first = run_gza(
+        first = invoke_gza(
             "improve",
             str(impl_task.id),
             "--queue",
@@ -6076,7 +6076,7 @@ class TestImproveCommand:
         failed_improve.session_id = None
         store.update(failed_improve)
 
-        second = run_gza(
+        second = invoke_gza(
             "improve",
             str(impl_task.id),
             "--queue",
@@ -6115,7 +6115,7 @@ class TestImproveCommand:
         assert impl_task.id is not None
 
         store.add_comment(impl_task.id, "Round 1 comment.")
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         running_improve = next(task for task in store.get_all() if task.task_type == "improve")
@@ -6125,7 +6125,7 @@ class TestImproveCommand:
         store.update(running_improve)
 
         store.add_comment(impl_task.id, "Round 2 comment added while improve is running.")
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert f"Comments-only improve {running_improve.id} is already in progress" not in second.stdout
         assert "Created improve task" in second.stdout
@@ -6149,7 +6149,7 @@ class TestImproveCommand:
         assert impl_task.id is not None
 
         store.add_comment(impl_task.id, "Round 1: tighten API validation.")
-        first = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert first.returncode == 0, first.stdout
 
         improves = [t for t in store.get_all() if t.task_type == "improve"]
@@ -6165,7 +6165,7 @@ class TestImproveCommand:
         store.resolve_comments(impl_task.id, created_on_or_before=completed_improve.created_at)
 
         store.add_comment(impl_task.id, "Round 2: improve timeout handling.")
-        second = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert second.returncode == 0, second.stdout
         assert "Created improve task" in second.stdout
 
@@ -6189,7 +6189,7 @@ class TestImproveCommand:
         store.update(plan_task)
 
         # Run improve command
-        result = run_gza("improve", str(plan_task.id), "--project", str(tmp_path))
+        result = invoke_gza("improve", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is a plan task" in result.stdout
@@ -6212,7 +6212,7 @@ class TestImproveCommand:
         store.update(review_task)
 
         # Run improve command with review task ID — should resolve to impl task and succeed
-        result = run_gza("improve", str(review_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(review_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert "Created improve task" in result.stdout
@@ -6251,7 +6251,7 @@ class TestImproveCommand:
         store.update(review_task2)
 
         # Run improve command with improve task ID — should resolve to impl task
-        result = run_gza("improve", str(improve_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(improve_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert "Created improve task" in result.stdout
@@ -6286,7 +6286,7 @@ class TestImproveCommand:
         store.update(review_task2)
 
         # Run improve command with --queue to only create (not run)
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"Review: {review_task2.id}" in result.stdout  # Should use the second (most recent) review
@@ -6301,7 +6301,7 @@ class TestImproveCommand:
         """Improve command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("improve", "999", "--project", str(tmp_path))
+        result = invoke_gza("improve", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
@@ -6327,7 +6327,7 @@ class TestImproveCommand:
         # Only a pending review exists; no unresolved comments.
         pending_review = store.add("Review", task_type="review", depends_on=impl_task.id)
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no completed review" in result.stdout
@@ -6366,7 +6366,7 @@ class TestImproveCommand:
         )
 
         # Run improve command - should fail with duplicate error
-        result = run_gza("improve", str(impl_task.id), "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "improve task already exists" in result.stdout
@@ -6396,7 +6396,7 @@ class TestImproveCommand:
         store.update(review_task)
 
         # Run improve command without --queue (will attempt to run)
-        result = run_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the improve task was created and run was attempted
         assert "Created improve task " in result.stdout
@@ -6419,7 +6419,7 @@ class TestImproveCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        result = run_gza("improve", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -6444,7 +6444,7 @@ class TestImproveCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        result = run_gza("improve", str(impl_task.id), "--provider", "gemini", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--provider", "gemini", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -6486,7 +6486,7 @@ class TestImproveCommand:
         bad_review.completed_at = datetime.now(UTC)
         store.update(bad_review)
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert f"Review: {good_review.id}" in result.stdout
@@ -6523,7 +6523,7 @@ class TestImproveCommand:
         failed_review.completed_at = datetime.now(UTC)
         store.update(failed_review)
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert f"Review: {good_review.id}" in result.stdout
@@ -6546,7 +6546,7 @@ class TestImproveCommand:
         dropped_review.completed_at = datetime.now(UTC)
         store.update(dropped_review)
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no completed review" in result.stdout
@@ -6575,7 +6575,7 @@ class TestImproveCommand:
         # Leave status as default 'pending'.
         store.add_comment(impl_task.id, "Tighten validation edge cases.")
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert "no completed review" in result.stdout
@@ -6609,7 +6609,7 @@ class TestImproveCommand:
         store.update(in_progress_review)
         store.add_comment(impl_task.id, "Revisit error wording.")
 
-        result = run_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert "continuing from unresolved comments only" in result.stdout
@@ -6641,7 +6641,7 @@ class TestImproveCommand:
         failed_review.completed_at = datetime.now(UTC)
         store.update(failed_review)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve",
             str(impl_task.id),
             "--review-id",
@@ -6675,7 +6675,7 @@ class TestImproveCommand:
         dropped_review.completed_at = datetime.now(UTC)
         store.update(dropped_review)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve",
             str(impl_task.id),
             "--review-id",
@@ -6713,7 +6713,7 @@ class TestImproveCommand:
 
         store.add_comment(impl_task.id, "Please address this edge case.")
 
-        result = run_gza(
+        result = invoke_gza(
             "improve",
             str(impl_task.id),
             "--review-id",
@@ -6755,7 +6755,7 @@ class TestImproveCommand:
 
         # Without --review-id, auto-pick would choose the newer one.
         # With --review-id, we force the older one.
-        result = run_gza(
+        result = invoke_gza(
             "improve", str(impl_task.id),
             "--review-id", str(older_review.id),
             "--queue",
@@ -6792,7 +6792,7 @@ class TestImproveCommand:
         newer_review.completed_at = datetime.now(UTC)
         store.update(newer_review)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve", str(impl_task.id),
             "--review-id", f"  {selected_review.id}\t",
             "--queue",
@@ -6829,7 +6829,7 @@ class TestImproveCommand:
         review_of_b.completed_at = datetime.now(UTC)
         store.update(review_of_b)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve", str(impl_a.id),
             "--review-id", str(review_of_b.id),
             "--queue",
@@ -6854,7 +6854,7 @@ class TestImproveCommand:
         imported_review.completed_at = datetime.now(UTC)
         store.update(imported_review)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve", str(impl_task.id),
             "--review-id", str(imported_review.id),
             "--queue",
@@ -6876,7 +6876,7 @@ class TestImproveCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve", str(impl_task.id),
             "--review-id", str(impl_task.id),  # not a review
             "--queue",
@@ -6897,7 +6897,7 @@ class TestImproveCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        result = run_gza(
+        result = invoke_gza(
             "improve", str(impl_task.id),
             "--review-id", invalid_review_id,
             "--queue",
@@ -6932,7 +6932,7 @@ class TestFixCommand:
         review2.completed_at = datetime.now(UTC)
         store.update(review2)
 
-        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created fix task" in result.stdout
@@ -6961,7 +6961,7 @@ class TestFixCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         fix_tasks = [t for t in store.get_all() if t.task_type == "fix"]
@@ -7030,7 +7030,7 @@ class TestFixCommand:
         fix_task.completed_at = datetime.now(UTC)
         store.update(fix_task)
 
-        review_result = run_gza("review", str(fix_task.id), "--queue", "--project", str(tmp_path))
+        review_result = invoke_gza("review", str(fix_task.id), "--queue", "--project", str(tmp_path))
         assert review_result.returncode == 0
 
         fix_review = max(
@@ -7058,7 +7058,7 @@ class TestFixCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        result = run_gza("fix", str(review_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(review_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"Implementation: {impl_task.id}" in result.stdout
@@ -7081,7 +7081,7 @@ class TestFixCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        result = run_gza("fix", str(impl_task.id), "--review", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(impl_task.id), "--review", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         fix_task = [t for t in store.get_all() if t.task_type == "fix"][0]
@@ -7129,7 +7129,7 @@ class TestFixCommand:
         improve2.completed_at = datetime.now(UTC)
         store.update(improve2)
 
-        result = run_gza("fix", str(improve2.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(improve2.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"Implementation: {impl_task.id}" in result.stdout
@@ -7160,7 +7160,7 @@ class TestFixCommand:
         review_retry.completed_at = datetime.now(UTC)
         store.update(review_retry)
 
-        result = run_gza("fix", str(retry_impl.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(retry_impl.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"Implementation: {retry_impl.id}" in result.stdout
@@ -7178,7 +7178,7 @@ class TestFixCommand:
         impl_task.status = "in_progress"
         store.update(impl_task)
 
-        result = run_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
         assert result.returncode == 1
         assert f"Task {impl_task.id} is in_progress" in result.stdout
 
@@ -7236,7 +7236,7 @@ class TestCommentCommand:
         task = store.add("Task needing follow-up", task_type="implement")
         assert task.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "comment",
             str(task.id),
             "Please add regression coverage.",
@@ -7283,7 +7283,7 @@ class TestReviewCommand:
         store.update(impl_task)
 
         # Run review command with --queue to only create (not run)
-        result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created review task " in result.stdout
@@ -7311,7 +7311,7 @@ class TestReviewCommand:
         store.update(impl_task)
 
         with patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")):
-            result = run_gza("review", str(impl_task.id), "--background", "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("review", str(impl_task.id), "--background", "--no-docker", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "creator boom" in result.stderr
@@ -7337,7 +7337,7 @@ class TestReviewCommand:
         store.update(plan_task)
 
         # Run review command
-        result = run_gza("review", str(plan_task.id), "--project", str(tmp_path))
+        result = invoke_gza("review", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is a plan task, not an implementation, improve, review, or fix task" in result.stdout
@@ -7367,7 +7367,7 @@ class TestReviewCommand:
         improve_task.completed_at = datetime.now(UTC)
         store.update(improve_task)
 
-        result = run_gza("review", str(improve_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(improve_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -7403,7 +7403,7 @@ class TestReviewCommand:
         fix_task.completed_at = datetime.now(UTC)
         store.update(fix_task)
 
-        result = run_gza("review", str(fix_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(fix_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -7434,7 +7434,7 @@ class TestReviewCommand:
         store.update(existing_review)
 
         # Run review command with the existing review task ID
-        result = run_gza("review", str(existing_review.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(existing_review.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0, result.stdout
         assert "Created review task " in result.stdout
@@ -7457,7 +7457,7 @@ class TestReviewCommand:
         # Leave status as 'pending'
 
         # Run review command
-        result = run_gza("review", str(impl_task.id), "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is pending. Can only review completed tasks" in result.stdout
@@ -7466,7 +7466,7 @@ class TestReviewCommand:
         """Review command fails gracefully for nonexistent task."""
         setup_config(tmp_path)
 
-        result = run_gza("review", "999", "--project", str(tmp_path))
+        result = invoke_gza("review", "999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Use a full prefixed task ID" in result.stdout or "Use a full prefixed task ID" in result.stderr
@@ -7497,7 +7497,7 @@ class TestReviewCommand:
         store.update(retry_impl)
 
         # Run review command with --queue to only create (not run)
-        result = run_gza("review", str(retry_impl.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(retry_impl.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created review task " in result.stdout
@@ -7536,7 +7536,7 @@ class TestReviewCommand:
         store.update(impl_task)
 
         # Run review command without --queue (will attempt to run immediately)
-        result = run_gza("review", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the review task was created and run attempted
         assert "Created review task " in result.stdout
@@ -7562,7 +7562,7 @@ class TestReviewCommand:
         store.update(impl_task)
 
         # Run review command with --queue flag
-        result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         # Verify the review task was created but not run
         assert result.returncode == 0
@@ -7612,7 +7612,7 @@ class TestReviewCommand:
             review_dir.mkdir(parents=True, exist_ok=True)
 
             # Run review command with --open flag (runs by default)
-            result = run_gza("review", str(impl_task.id), "--open", "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("review", str(impl_task.id), "--open", "--no-docker", "--project", str(tmp_path))
 
             # Check that warning about missing EDITOR is shown
             # Note: This might not appear in output if the task doesn't complete successfully in test
@@ -7632,7 +7632,7 @@ class TestReviewCommand:
         store.update(impl_task)
 
         # Run review command with --open and --queue (should create task but not run)
-        result = run_gza("review", str(impl_task.id), "--open", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--open", "--queue", "--project", str(tmp_path))
 
         # Should succeed but not run the task
         assert result.returncode == 0
@@ -7657,7 +7657,7 @@ class TestReviewCommand:
         # Leave status as 'pending' (default)
 
         # Attempt to create another review
-        result = run_gza("review", str(impl_task.id), "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Warning: A review task already exists" in result.stdout
@@ -7687,7 +7687,7 @@ class TestReviewCommand:
         store.update(existing_review)
 
         # Attempt to create another review
-        result = run_gza("review", str(impl_task.id), "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Warning: A review task already exists" in result.stdout
@@ -7718,7 +7718,7 @@ class TestReviewCommand:
         store.update(existing_review)
 
         # Create another review with --queue (should succeed after improvements)
-        result = run_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Created review task" in result.stdout
@@ -7806,7 +7806,7 @@ class TestReviewCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        result = run_gza("review", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -7826,7 +7826,7 @@ class TestReviewCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        result = run_gza("review", str(impl_task.id), "--provider", "gemini", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--provider", "gemini", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
@@ -8151,7 +8151,7 @@ class TestIterateCommand:
 
         plan_task = store.add("A plan", task_type="plan")
 
-        result = run_gza("iterate", str(plan_task.id), "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(plan_task.id), "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "implement" in result.stdout.lower() or "implement" in result.stderr.lower()
@@ -8166,7 +8166,7 @@ class TestIterateCommand:
         impl.status = "in_progress"
         store.update(impl)
 
-        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "in_progress" in result.stdout or "in_progress" in result.stderr
@@ -8920,7 +8920,7 @@ class TestIterateCommand:
 
         impl = store.add("Implement feature", task_type="implement")  # status = 'pending'
 
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "pending" in result.stdout.lower()
@@ -9328,7 +9328,7 @@ class TestIterateCommand:
         impl.status = "failed"
         store.update(impl)
 
-        result = run_gza("iterate", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--project", str(tmp_path))
         assert result.returncode != 0
         assert "--resume" in result.stdout or "--resume" in result.stderr
         assert "--retry" in result.stdout or "--retry" in result.stderr
@@ -9339,7 +9339,7 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
-        result = run_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
         assert result.returncode != 0
         output = result.stdout + (result.stderr or "")
         assert "failed" in output.lower()
@@ -9350,7 +9350,7 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
-        result = run_gza("iterate", str(impl.id), "--retry", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--retry", "--dry-run", "--project", str(tmp_path))
         assert result.returncode != 0
         output = result.stdout + (result.stderr or "")
         assert "failed" in output.lower()
@@ -9358,7 +9358,7 @@ class TestIterateCommand:
     def test_resume_and_retry_mutually_exclusive(self, tmp_path: Path):
         """--resume and --retry cannot be used together."""
         setup_config(tmp_path)
-        result = run_gza("iterate", "testproject-1", "--resume", "--retry", "--project", str(tmp_path))
+        result = invoke_gza("iterate", "testproject-1", "--resume", "--retry", "--project", str(tmp_path))
         assert result.returncode != 0
 
     def test_failed_task_retry_dry_run(self, tmp_path: Path):
@@ -9369,7 +9369,7 @@ class TestIterateCommand:
         impl.status = "failed"
         store.update(impl)
 
-        result = run_gza("iterate", str(impl.id), "--retry", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--retry", "--dry-run", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "dry-run" in result.stdout.lower()
         assert "retry" in result.stdout.lower()
@@ -9383,7 +9383,7 @@ class TestIterateCommand:
         impl.session_id = "some-session"
         store.update(impl)
 
-        result = run_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--resume", "--dry-run", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "dry-run" in result.stdout.lower()
         assert "resume" in result.stdout.lower()
@@ -9396,7 +9396,7 @@ class TestIterateCommand:
         impl.status = "failed"
         store.update(impl)
 
-        result = run_gza("iterate", str(impl.id), "--resume", "--background", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--resume", "--background", "--project", str(tmp_path))
 
         assert result.returncode != 0
         output = result.stdout + (result.stderr or "")
@@ -9420,7 +9420,7 @@ class TestIterateCommand:
                 side_effect=AssertionError("background iterate should not spawn"),
             ),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "iterate",
                 str(impl.id),
                 "--background",
@@ -9471,7 +9471,7 @@ class TestIterateCommand:
                 side_effect=AssertionError("background iterate should not spawn"),
             ),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "iterate",
                 str(impl.id),
                 "--background",
@@ -9523,7 +9523,7 @@ class TestIterateCommand:
                 side_effect=AssertionError("background iterate should not spawn"),
             ),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "iterate",
                 str(impl.id),
                 start_flag,
@@ -10337,7 +10337,7 @@ class TestIterateCommand:
         failed_resume_descendant.session_id = root.session_id
         store.update(failed_resume_descendant)
 
-        result = run_gza(
+        result = invoke_gza(
             "iterate",
             str(failed_resume_descendant.id),
             "--resume",
@@ -10375,7 +10375,7 @@ class TestIterateCommand:
         failed_resume_child.session_id = root.session_id
         store.update(failed_resume_child)
 
-        result = run_gza("iterate", str(root.id), "--resume", "--auto-iterate", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(root.id), "--resume", "--auto-iterate", "--project", str(tmp_path))
 
         assert result.returncode == 3
         output = result.stdout + (result.stderr or "")
@@ -10464,13 +10464,13 @@ class TestIterateCommand:
 
     def test_iterate_continue_flag_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
-        result = run_gza("iterate", "testproject-1", "--continue", "--project", str(tmp_path))
+        result = invoke_gza("iterate", "testproject-1", "--continue", "--project", str(tmp_path))
         assert result.returncode != 0
         assert "unrecognized arguments: --continue" in (result.stderr or result.stdout)
 
     def test_cycle_command_is_rejected(self, tmp_path: Path):
         setup_config(tmp_path)
-        result = run_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))
         assert result.returncode == 2
         assert "invalid choice: 'cycle'" in result.stderr
         assert "iterate" in result.stderr
@@ -11064,7 +11064,7 @@ class TestIterateCommand:
         failed.completed_at = datetime.now(UTC)
         store.update(failed)
 
-        result = run_gza("iterate", str(failed.id), "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(failed.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         output = result.stdout + (result.stderr or "")
@@ -16079,7 +16079,7 @@ class TestMarkCompletedCommand:
         """mark-completed errors on a nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("mark-completed", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -16094,7 +16094,7 @@ class TestMarkCompletedCommand:
         store = make_store(tmp_path)
         task = store.get_all()[0]
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "status-only" in result.stdout
@@ -16113,7 +16113,7 @@ class TestMarkCompletedCommand:
 
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        result = run_gza("mark-completed", str(task.id), "--verify-git", "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--verify-git", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "no branch" in result.stdout
@@ -16127,7 +16127,7 @@ class TestMarkCompletedCommand:
         task.status = "in_progress"
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "mark-completed",
             str(task.id),
             "--force",
@@ -16155,7 +16155,7 @@ class TestMarkCompletedCommand:
         # No workers directory / no registry entry — should still succeed
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "status-only" in result.stdout
@@ -16177,7 +16177,7 @@ class TestMarkCompletedCommand:
             '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
         )
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
 
         updated = store.get(task.id)
@@ -16202,7 +16202,7 @@ class TestMarkCompletedCommand:
             '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
         )
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
 
         updated = store.get(task.id)
@@ -16226,7 +16226,7 @@ class TestMarkCompletedCommand:
             '{"type":"gza","subtype":"provenance","message":"Execution mode: inline skill","skill":"gza-task-run","inline":true}\n'
         )
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
 
         updated = store.get(task.id)
@@ -16247,7 +16247,7 @@ class TestMarkCompletedCommand:
         # Make log path unreadable as a file by creating a directory at the same location.
         (tmp_path / task.log_file).mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Could not read task log" in result.stdout
 
@@ -16273,7 +16273,7 @@ class TestMarkCompletedCommand:
             '{"type":"gza","subtype":"info","message":"hello"}\n'
         )
 
-        result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "malformed JSON line(s)" in result.stdout
 
@@ -16289,7 +16289,7 @@ class TestSetStatusCommand:
         """set-status errors when task does not exist."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("set-status", "testproject-999999", "failed", "--project", str(tmp_path))
+        result = invoke_gza("set-status", "testproject-999999", "failed", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -16298,7 +16298,7 @@ class TestSetStatusCommand:
         """set-status requires decimal task ID suffixes."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("set-status", "testproject-3f", "failed", "--project", str(tmp_path))
+        result = invoke_gza("set-status", "testproject-3f", "failed", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Invalid task ID" in result.stdout or "Invalid task ID" in result.stderr
@@ -16338,7 +16338,7 @@ class TestSetStatusCommand:
         all_tasks = store.get_all()
         task_id = all_tasks[0].id
 
-        result = run_gza("set-status", str(task_id), target_status, "--project", str(tmp_path))
+        result = invoke_gza("set-status", str(task_id), target_status, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert target_status in result.stdout
@@ -16359,7 +16359,7 @@ class TestSetStatusCommand:
         store = make_store(tmp_path)
         task = store.get_all()[0]
 
-        result = run_gza(
+        result = invoke_gza(
             "set-status", str(task.id), "failed", "--reason", "Process killed", "--project", str(tmp_path)
         )
 
@@ -16379,7 +16379,7 @@ class TestSetStatusCommand:
         store = make_store(tmp_path)
         task = store.get_all()[0]
 
-        result = run_gza(
+        result = invoke_gza(
             "set-status",
             str(task.id),
             "completed",
@@ -16419,7 +16419,7 @@ class TestSetStatusCommand:
             str(tmp_path),
         ]
 
-        result = run_gza(*args)
+        result = invoke_gza(*args)
         assert result.returncode == 0
 
         updated = make_store(tmp_path).get(task.id)
@@ -16444,7 +16444,7 @@ class TestSetStatusCommand:
         task.failure_reason = "Original failure"
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "set-status",
             str(task.id),
             "in_progress",
@@ -16475,7 +16475,7 @@ class TestSetStatusCommand:
         task.status = "in_progress"
         store.update(task)
 
-        fail_result = run_gza(
+        fail_result = invoke_gza(
             "set-status",
             str(task.id),
             "failed",
@@ -16486,7 +16486,7 @@ class TestSetStatusCommand:
         )
         assert fail_result.returncode == 0
 
-        shown = run_gza("show", str(task.id), "--project", str(tmp_path))
+        shown = invoke_gza("show", str(task.id), "--project", str(tmp_path))
         assert shown.returncode == 0
         assert "Execution Mode: skill_inline" in shown.stdout
 
@@ -16503,7 +16503,7 @@ class TestSetStatusCommand:
         store = make_store(tmp_path)
         task = store.get_all()[0]
 
-        result = run_gza(
+        result = invoke_gza(
             "set-status",
             str(task.id),
             "failed",
@@ -16524,7 +16524,7 @@ class TestSetStatusCommand:
 
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        result = run_gza(
+        result = invoke_gza(
             "set-status", str(task.id), "dropped", "--reason", "Ignored reason", "--project", str(tmp_path)
         )
 
@@ -16544,7 +16544,7 @@ class TestSetStatusCommand:
         ])
 
         task = make_store(tmp_path).get_all()[0]
-        result = run_gza(
+        result = invoke_gza(
             "set-status", str(task.id), "pending", "--reason", "Ignored reason", "--project", str(tmp_path)
         )
 
@@ -16565,7 +16565,7 @@ class TestSetStatusCommand:
 
         store = make_store(tmp_path)
         task = store.get_all()[0]
-        result = run_gza("set-status", str(task.id), "bogus", "--project", str(tmp_path))
+        result = invoke_gza("set-status", str(task.id), "bogus", "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "Valid statuses: pending, failed, dropped." in result.stdout
@@ -16574,7 +16574,7 @@ class TestSetStatusCommand:
         """set-status subcommand help should explain the restricted transition model."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("set-status", "--help", "--project", str(tmp_path))
+        result = invoke_gza("set-status", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Override a task's status for recovery or correction." in result.stdout
@@ -16589,7 +16589,7 @@ class TestSetStatusCommand:
         """mark-completed subcommand help should advertise the --reason flag."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("mark-completed", "--help", "--project", str(tmp_path))
+        result = invoke_gza("mark-completed", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "--reason REASON" in result.stdout
@@ -16599,7 +16599,7 @@ class TestSetStatusCommand:
         """Top-level help should advertise mark-completed as the completion path."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("--help", "--project", str(tmp_path))
+        result = invoke_gza("--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "mark-completed        Mark a task as completed (defaults by task type;" in result.stdout
@@ -16651,7 +16651,7 @@ class TestSetStatusCommand:
         store.update(task)
         original_completed_at = task.completed_at
 
-        result = run_gza("set-status", str(task.id), target_status, "--project", str(tmp_path))
+        result = invoke_gza("set-status", str(task.id), target_status, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert expected_message in result.stdout.lower()
@@ -16677,7 +16677,7 @@ class TestSetStatusCommand:
             task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "set-status",
             str(task.id),
             status,
@@ -16734,7 +16734,7 @@ class TestSetStatusCommand:
 
         store.add("Dependent task", depends_on=prereq.id)
 
-        result = run_gza("next", "--all", "--project", str(tmp_path))
+        result = invoke_gza("next", "--all", "--project", str(tmp_path))
         assert result.returncode == 0
         # The dependent task should appear with a blocked annotation
         assert "Dependent task" in result.stdout
@@ -16753,7 +16753,7 @@ class TestSetStatusCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Task to be dropped" in result.stdout
 
@@ -18647,7 +18647,7 @@ class TestForceCompleteRemoval:
             {"prompt": "Failed task", "status": "failed", "task_type": "implement"},
         ])
 
-        result = run_gza("force-complete", "1", "--project", str(tmp_path))
+        result = invoke_gza("force-complete", "1", "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "is not a gza command" in result.stderr
@@ -18660,7 +18660,7 @@ class TestAddCommandWithChaining:
     def test_add_with_type_plan(self, tmp_path: Path):
         """Add command can create plan tasks."""
         setup_config(tmp_path)
-        result = run_gza("add", "--type", "plan", "Create a plan", "--project", str(tmp_path))
+        result = invoke_gza("add", "--type", "plan", "Create a plan", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -18669,7 +18669,7 @@ class TestAddCommandWithChaining:
         """Add command stores held plan tasks as auto_implement=false."""
 
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--type",
             "plan",
@@ -18689,7 +18689,7 @@ class TestAddCommandWithChaining:
         """Hold-for-review is plan-only at creation time."""
 
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--hold-for-review",
             "Implement feature",
@@ -18703,14 +18703,14 @@ class TestAddCommandWithChaining:
     def test_add_with_type_implement(self, tmp_path: Path):
         """Add command can create implement tasks."""
         setup_config(tmp_path)
-        result = run_gza("add", "--type", "implement", "Implement feature", "--project", str(tmp_path))
+        result = invoke_gza("add", "--type", "implement", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
     def test_add_with_type_review(self, tmp_path: Path):
         """Add command can create review tasks."""
         setup_config(tmp_path)
-        result = run_gza("add", "--type", "review", "Review implementation", "--project", str(tmp_path))
+        result = invoke_gza("add", "--type", "review", "Review implementation", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -18722,7 +18722,7 @@ class TestAddCommandWithChaining:
 
         task1 = store.add("First task")
 
-        result = run_gza("add", "--based-on", str(task1.id), "Follow-up task", "--project", str(tmp_path))
+        result = invoke_gza("add", "--based-on", str(task1.id), "Follow-up task", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -18741,7 +18741,7 @@ class TestAddCommandWithChaining:
         spec_file.parent.mkdir(parents=True, exist_ok=True)
         spec_file.write_text("# Feature Spec\n\nThis is a test spec.")
 
-        result = run_gza("add", "--spec", "specs/feature.md", "Implement feature", "--project", str(tmp_path))
+        result = invoke_gza("add", "--spec", "specs/feature.md", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -18758,7 +18758,7 @@ class TestAddCommandWithChaining:
         """Add command with --spec fails if file doesn't exist."""
         setup_config(tmp_path)
 
-        result = run_gza("add", "--spec", "nonexistent.md", "Implement feature", "--project", str(tmp_path))
+        result = invoke_gza("add", "--spec", "nonexistent.md", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: Spec file not found: nonexistent.md" in result.stdout
@@ -18770,7 +18770,7 @@ class TestAddCommandWithChaining:
         store.add("Older urgent", urgent=True)
         store.add("Newer urgent", urgent=True)
 
-        result = run_gza("add", "--next", "Urgent follow-up", "--project", str(tmp_path))
+        result = invoke_gza("add", "--next", "Urgent follow-up", "--project", str(tmp_path))
 
         assert result.returncode == 0
         task = next((t for t in store.get_pending() if t.prompt == "Urgent follow-up"), None)
@@ -18788,7 +18788,7 @@ class TestAddCommandWithChaining:
         prompt_file = tmp_path / "urgent_prompt.txt"
         prompt_file.write_text("Urgent from file")
 
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--next",
             "--prompt-file",
@@ -18839,7 +18839,7 @@ class TestAddCommandWithChaining:
     def test_add_with_review_scope_persists_for_implement_tasks(self, tmp_path: Path):
         setup_config(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--type",
             "implement",
@@ -18863,7 +18863,7 @@ class TestAddCommandWithModelAndProvider:
         """Add command with --model flag stores model override."""
 
         setup_config(tmp_path)
-        result = run_gza("add", "--model", "claude-3-5-haiku-latest", "Test task with model", "--project", str(tmp_path))
+        result = invoke_gza("add", "--model", "claude-3-5-haiku-latest", "Test task with model", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -18881,7 +18881,7 @@ class TestAddCommandWithModelAndProvider:
         """Add command with --provider flag stores provider override."""
 
         setup_config(tmp_path)
-        result = run_gza("add", "--provider", "gemini", "Test task with provider", "--project", str(tmp_path))
+        result = invoke_gza("add", "--provider", "gemini", "Test task with provider", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -18899,7 +18899,7 @@ class TestAddCommandWithModelAndProvider:
         """Add command with both --model and --provider flags works."""
 
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--model", "claude-opus-4",
             "--provider", "claude",
@@ -18934,7 +18934,7 @@ class TestAddCommandWithModelAndProvider:
     ):
         """gza add must reject an incompatible provider/model pair before persisting."""
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--provider", provider,
             "--model", model,
@@ -18955,7 +18955,7 @@ class TestAddCommandWithModelAndProvider:
     def test_add_allows_unknown_model_name_with_any_provider(self, tmp_path: Path):
         """gza add must accept an unrecognized model name (fail-open for custom models)."""
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--provider", "claude",
             "--model", "my-custom-model-v2",
@@ -18974,7 +18974,7 @@ class TestAddCommandWithModelAndProvider:
     def test_add_allows_provider_without_model(self, tmp_path: Path):
         """gza add with only --provider (no --model) must not trigger the parity gate."""
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "add",
             "--provider", "claude",
             "Provider only task",
@@ -19105,7 +19105,7 @@ class TestAddCommandWithNoLearnings:
         """Add command with --no-learnings flag sets skip_learnings on task."""
 
         setup_config(tmp_path)
-        result = run_gza("add", "--no-learnings", "One-off experimental task", "--project", str(tmp_path))
+        result = invoke_gza("add", "--no-learnings", "One-off experimental task", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -19122,7 +19122,7 @@ class TestAddCommandWithNoLearnings:
         """Add command without --no-learnings flag defaults skip_learnings to False."""
 
         setup_config(tmp_path)
-        result = run_gza("add", "Normal task with learnings", "--project", str(tmp_path))
+        result = invoke_gza("add", "Normal task with learnings", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -19148,7 +19148,7 @@ class TestEditCommandWithModelAndProvider:
         assert task.model is None
 
         # Edit to add model
-        result = run_gza("edit", str(task.id), "--model", "claude-3-5-haiku-latest", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--model", "claude-3-5-haiku-latest", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Set model override" in result.stdout
@@ -19170,7 +19170,7 @@ class TestEditCommandWithModelAndProvider:
         assert task.provider is None
 
         # Edit to add provider
-        result = run_gza("edit", str(task.id), "--provider", "gemini", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--provider", "gemini", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Set provider override" in result.stdout
@@ -19194,7 +19194,7 @@ class TestEditCommandWithNoLearnings:
         task = store.add("Task without skip")
         assert task.skip_learnings is False
 
-        result = run_gza("edit", str(task.id), "--no-learnings", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--no-learnings", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "skip_learnings" in result.stdout

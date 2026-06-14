@@ -9,7 +9,7 @@ from gza.db import SqliteTaskStore
 from gza.failure_reasons import mark_task_failed_from_cause
 from gza.git import Git
 from gza.workers import WorkerMetadata, WorkerRegistry
-from tests.cli.conftest import make_store, run_gza, setup_config
+from tests.cli.conftest import make_store, invoke_gza, setup_config
 
 
 def _iterate_git_runtime():
@@ -133,7 +133,7 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
     store.update(improve)
 
     with _iterate_git_runtime():
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "would iterate implementation" in result.stdout.lower()
@@ -147,7 +147,7 @@ def test_cycle_dry_run(tmp_path) -> None:
     store = make_store(tmp_path)
     impl = _make_completed_impl(store)
 
-    result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+    result = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "dry-run" in result.stdout.lower()
@@ -159,7 +159,7 @@ def test_cycle_uses_default_iterations_when_flag_omitted(tmp_path) -> None:
     store = make_store(tmp_path)
     impl = _make_completed_impl(store)
 
-    result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+    result = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "max 3 iterations" in result.stdout
@@ -195,7 +195,7 @@ def test_dry_run_completed_improve_without_review_clear_starts_from_closing_revi
     store.update(improve)
 
     with _iterate_git_runtime():
-        result = run_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "would iterate implementation" in result.stdout.lower()
@@ -212,7 +212,7 @@ def test_mark_completed_default_verify_git_for_code_tasks(tmp_path) -> None:
     store.update(task)
 
     task = make_store(tmp_path).get_all()[0]
-    result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 1
     assert "no branch" in result.stdout
@@ -229,7 +229,7 @@ def test_mark_completed_warns_if_not_failed(tmp_path) -> None:
     task.branch = "gza/1-test-task"
     store.update(task)
 
-    result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "Warning" in result.stdout
@@ -245,7 +245,7 @@ def test_mark_completed_errors_if_branch_missing_in_git(tmp_path) -> None:
     task.branch = "gza/1-nonexistent-branch"
     store.update(task)
 
-    result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 1
     assert "does not exist" in result.stdout
@@ -266,7 +266,7 @@ def test_mark_completed_with_commits_sets_unmerged(tmp_path) -> None:
     task.branch = "gza/1-task-with-commits"
     store.update(task)
 
-    result = run_gza(
+    result = invoke_gza(
         "mark-completed",
         str(task.id),
         "--reason",
@@ -297,7 +297,7 @@ def test_mark_completed_without_commits_marks_completed(tmp_path) -> None:
     task.branch = "gza/1-empty-branch"
     store.update(task)
 
-    result = run_gza(
+    result = invoke_gza(
         "mark-completed",
         str(task.id),
         "--reason",
@@ -328,7 +328,7 @@ def test_mark_completed_failed_task_no_warning(tmp_path) -> None:
     task.branch = "gza/1-failed-branch"
     store.update(task)
 
-    result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "Warning" not in result.stdout
@@ -364,7 +364,7 @@ def test_mark_completed_cleans_up_running_worker(tmp_path) -> None:
     pid_path = workers_path / "w-20260301-120000.pid"
     assert pid_path.exists()
 
-    result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 0
     updated_worker = registry.get("w-20260301-120000")
@@ -403,7 +403,7 @@ def test_mark_completed_does_not_touch_already_completed_worker(tmp_path) -> Non
     registry.register(worker)
 
     task = make_store(tmp_path).get_all()[0]
-    result = run_gza("mark-completed", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("mark-completed", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 0
     updated_worker = registry.get("w-20260301-130000")
@@ -423,7 +423,7 @@ def test_advance_skips_dropped_tasks(tmp_path) -> None:
     task.completed_at = datetime.now(UTC)
     store.update(task)
 
-    result = run_gza("advance", "--project", str(tmp_path))
+    result = invoke_gza("advance", "--project", str(tmp_path))
     assert result.returncode == 0
     assert "No eligible tasks" in result.stdout
 
@@ -453,7 +453,7 @@ def test_advance_explicit_completed_descendant_in_dropped_owner_lineage_is_ineli
     store.update(descendant)
     assert descendant.id is not None
 
-    result = run_gza("advance", str(descendant.id), "--dry-run", "--project", str(tmp_path))
+    result = invoke_gza("advance", str(descendant.id), "--dry-run", "--project", str(tmp_path))
     assert result.returncode == 0
     assert "No eligible tasks to advance" in result.stdout
 
@@ -468,7 +468,7 @@ def test_background_phase1_validation_errors_write_to_stderr_only_rebase(tmp_pat
     store.update(task)
 
     expected = f"Error: Task {task.id} has no branch"
-    result = run_gza("rebase", str(task.id), "--background", "--project", str(tmp_path))
+    result = invoke_gza("rebase", str(task.id), "--background", "--project", str(tmp_path))
 
     assert result.returncode == 1
     assert expected in result.stderr

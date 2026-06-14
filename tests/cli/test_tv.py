@@ -12,7 +12,7 @@ import pytest
 from gza.cli import tv as tv_module
 from gza.db import Task
 
-from .conftest import make_store, run_gza, setup_config
+from .conftest import make_store, invoke_gza, setup_config
 
 
 class _FakeLive:
@@ -512,7 +512,7 @@ def test_tv_parser_path_renders_header_for_fixed_slot_flag(monkeypatch, tmp_path
     monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
     monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
 
-    result = run_gza("tv", "-n", "2", "--project", str(tmp_path))
+    result = invoke_gza("tv", "-n", "2", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert _FakeLive.instance is not None

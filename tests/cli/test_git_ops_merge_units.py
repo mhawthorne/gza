@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from gza.cli.git_ops import _collect_advance_completed_tasks
 from tests.cli.conftest import make_store, setup_config
-from tests.helpers.cli import run_gza
+from tests.helpers.cli import invoke_gza
 
 
 class _MergeGit:
@@ -115,7 +115,7 @@ def test_merge_all_deduplicates_same_branch_merge_unit(tmp_path: Path) -> None:
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert fake_git.merged == [("feature/shared", False)]
@@ -222,7 +222,7 @@ def test_advance_explicit_task_uses_default_target_merge_unit_over_stale_legacy_
         patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
         patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
     ):
-        result = run_gza("advance", task.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("advance", task.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert f"Task {task.id} is already merged" not in result.stdout
@@ -262,7 +262,7 @@ def test_advance_failed_task_recovery_planning_uses_merge_unit_over_stale_legacy
         patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
         patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
     ):
-        result = run_gza("advance", failed.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("advance", failed.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert f"Task {failed.id} is already merged" not in result.stdout
@@ -299,7 +299,7 @@ def test_advance_dry_run_uses_current_branch_for_merge_unit_target_collection(tm
         patch("gza.cli.git_ops.Git", lambda _project_dir: fake_git),
         patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
     ):
-        result = run_gza("advance", "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("advance", "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert release_task.id in result.stdout
@@ -350,7 +350,7 @@ def test_advance_dry_run_filters_owner_rows_by_target_branch_and_keeps_legacy_fa
         patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit(current_branch="main")),
         patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
     ):
-        result = run_gza("advance", "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("advance", "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert set(calls) == {main_task.id, legacy_task.id}
@@ -368,7 +368,7 @@ def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(
     store.mark_completed(impl, has_commits=True, branch="feature/shared")
     assert impl.id is not None
 
-    create_result = run_gza("review", str(impl.id), "--queue", "--project", str(tmp_path), cwd=tmp_path)
+    create_result = invoke_gza("review", str(impl.id), "--queue", "--project", str(tmp_path), cwd=tmp_path)
     assert create_result.returncode == 0
     review = next(task for task in store.get_all() if task.task_type == "review")
     review.status = "completed"
@@ -378,7 +378,7 @@ def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", str(review.id), "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", str(review.id), "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert fake_git.merged == [("feature/shared", False)]
@@ -398,7 +398,7 @@ def test_unmerged_lists_merge_unit_owner(tmp_path: Path) -> None:
         patch("gza.cli.query.Git", lambda project_dir: fake_git),
         patch("gza.github.GitHub.is_available", return_value=False),
     ):
-        result = run_gza("unmerged", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("unmerged", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert impl.id in result.stdout
@@ -421,7 +421,7 @@ def test_pr_blocks_when_task_merge_unit_is_merged_even_if_git_default_branch_dif
 
     fake_git = _MergeGit(tmp_path, default_branch="release")
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("pr", str(impl.id), "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("pr", str(impl.id), "--project", str(tmp_path), cwd=tmp_path)
 
     assert "already marked as merged" in result.stdout
 
@@ -432,7 +432,7 @@ def test_merge_missing_explicit_task_id_fails_closed(tmp_path: Path) -> None:
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", "testproject-9999", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", "testproject-9999", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 1
     assert "Error: Task testproject-9999 not found" in result.stdout
@@ -453,7 +453,7 @@ def test_merge_all_backfills_legacy_unmerged_owner_when_units_exist(tmp_path: Pa
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert "No unmerged done tasks found" not in result.stdout
@@ -483,7 +483,7 @@ def test_merge_all_uses_completed_retry_when_merge_unit_owner_failed(tmp_path: P
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", "--all", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert fake_git.merged == [("feature/merge-retry", False)]
@@ -508,7 +508,7 @@ def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(t
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", str(retry.id), "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", str(retry.id), "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert fake_git.merged == [("feature/explicit-retry", False)]
@@ -531,7 +531,7 @@ def test_merge_explicit_improve_task_uses_owner_for_provenance_and_squash_subjec
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza("merge", str(improve.id), "--squash", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("merge", str(improve.id), "--squash", "--project", str(tmp_path), cwd=tmp_path)
 
     assert result.returncode == 0
     assert fake_git.merged == [("feature/explicit-improve", True)]
@@ -553,7 +553,7 @@ def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partia
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
-        result = run_gza(
+        result = invoke_gza(
             "merge",
             str(impl.id),
             "testproject-9999",

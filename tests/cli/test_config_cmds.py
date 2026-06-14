@@ -23,7 +23,7 @@ from gza.cli.config_cmds import (
 from gza.config import Config, ProviderConfig, TaskTypeConfig
 from gza.providers.base import PreflightCheckResult, RunResult
 
-from .conftest import make_store, run_gza, setup_config
+from .conftest import make_store, invoke_gza, setup_config
 
 
 def write_user_config(home_dir: Path, content: str) -> Path:
@@ -39,7 +39,7 @@ class TestConfigRequirements:
 
     def test_missing_config_file(self, tmp_path: Path):
         """Commands fail when gza.yaml is missing."""
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Configuration file not found" in result.stderr
@@ -50,7 +50,7 @@ class TestConfigRequirements:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("timeout_minutes: 5\n")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_name" in result.stderr
@@ -61,7 +61,7 @@ class TestConfigRequirements:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_key: value\n")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         # Should succeed
         assert result.returncode == 0
@@ -76,14 +76,14 @@ class TestValidateCommand:
     def test_validate_valid_config(self, tmp_path: Path):
         """Validate command succeeds with valid config."""
         setup_config(tmp_path)
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "valid" in result.stdout.lower()
 
     def test_validate_missing_config(self, tmp_path: Path):
         """Validate command fails with missing config."""
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -93,7 +93,7 @@ class TestValidateCommand:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("timeout_minutes: 5\n")
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_name" in result.stdout
@@ -104,7 +104,7 @@ class TestValidateCommand:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_field: value\n")
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 0  # Unknown keys don't fail validation
         assert "unknown_field" in result.stdout
@@ -114,7 +114,7 @@ class TestValidateCommand:
         """Validate rejects docker_volumes that isn't a list."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\ndocker_volumes: /path:/mount\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "docker_volumes" in result.stdout
         assert "must be a list" in result.stdout
@@ -123,7 +123,7 @@ class TestValidateCommand:
         """Validate rejects non-string docker_volumes entries."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\ndocker_volumes:\n  - 123\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "docker_volumes[0]" in result.stdout
         assert "must be a string" in result.stdout
@@ -137,7 +137,7 @@ class TestValidateCommand:
             "  - /host/data:/data:ro\n"
             "  - /host/models:/models\n"
         )
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "valid" in result.stdout.lower()
 
@@ -149,7 +149,7 @@ class TestValidateCommand:
             "docker_volumes:\n"
             "  - /just/a/path\n"
         )
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 0  # Warning, not error
         assert "docker_volumes[0]" in result.stdout
         assert "missing colon separator" in result.stdout
@@ -162,7 +162,7 @@ class TestValidateCommand:
             "docker_volumes:\n"
             "  - /host:/container:xyz\n"
         )
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 0  # Warning, not error
         assert "docker_volumes[0]" in result.stdout
         assert "unknown mode 'xyz'" in result.stdout
@@ -184,7 +184,7 @@ class TestValidateCommand:
             "        timeout_minutes: 45\n"
         )
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "valid" in result.stdout.lower()
@@ -198,7 +198,7 @@ class TestValidateCommand:
             "code_task_diff_timeout_large_threshold: 500\n"
         )
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "code_task_diff_timeout_large_threshold" in result.stdout
@@ -241,7 +241,7 @@ class TestValidateCommand:
         """Validate rejects resolved timeout scaling inversions and strict-int violations."""
         (tmp_path / "gza.yaml").write_text(config_body)
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert expected_error in result.stdout
@@ -452,7 +452,7 @@ class TestProjectPrefixValidation:
         """Valid project_prefix is accepted without error."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: myproject\nproject_prefix: myproj\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 0
 
     def test_project_prefix_defaults_to_project_name(self, tmp_path: Path):
@@ -468,7 +468,7 @@ class TestProjectPrefixValidation:
         """project_prefix longer than 12 characters raises a config error."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: myproject\nproject_prefix: toolongprefix\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
 
@@ -476,7 +476,7 @@ class TestProjectPrefixValidation:
         """project_prefix with uppercase letters raises a config error."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: myproject\nproject_prefix: MyProj\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
 
@@ -484,7 +484,7 @@ class TestProjectPrefixValidation:
         """project_prefix starting with a hyphen raises a config error."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: myproject\nproject_prefix: -myproj\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
 
@@ -492,7 +492,7 @@ class TestProjectPrefixValidation:
         """project_prefix that is not a string raises a config error."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: myproject\nproject_prefix: 123\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         # YAML parses 123 as an integer, triggering type validation
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
@@ -501,7 +501,7 @@ class TestProjectPrefixValidation:
         """project_prefix with a trailing hyphen is rejected (M3)."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: myproject\nproject_prefix: myproj-\n")
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
 
@@ -583,7 +583,7 @@ class TestDockerSetupCommandValidation:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\ndocker_setup_command: 123\n")
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "docker_setup_command" in result.stdout
@@ -596,7 +596,7 @@ class TestDockerSetupCommandValidation:
             "docker_setup_command: 'uv sync --project /workspace'\n"
         )
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -768,7 +768,7 @@ class TestLocalConfigOverrides:
         (tmp_path / "gza.yaml").write_text("project_name: test\n")
         (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Invalid local override key 'project_name'" in result.stdout
@@ -856,7 +856,7 @@ class TestLocalConfigOverrides:
             "enforce_project_scope: nope\n"
         )
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "enforce_project_scope" in result.stdout
@@ -873,7 +873,7 @@ class TestLocalConfigOverrides:
             "use_docker: false\n"
         )
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -895,7 +895,7 @@ class TestLocalConfigOverrides:
             "code_task_diff_timeout_large_threshold: 1500\n"
         )
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -913,7 +913,7 @@ class TestLocalConfigOverrides:
             "branch_strategy: conventional\n"
         )
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -932,7 +932,7 @@ class TestLocalConfigOverrides:
             "  review: claude\n"
         )
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -959,7 +959,7 @@ class TestLocalConfigOverrides:
         )
 
         with pytest.warns(UserWarning, match="default reasoning_effort"):
-            result = run_gza("config", "--json", "--project", str(tmp_path))
+            result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -983,7 +983,7 @@ class TestLocalConfigOverrides:
             "db_path: .gza/override.db\n"
         )
 
-        result = run_gza(
+        result = invoke_gza(
             "config",
             "--json",
             "--project",
@@ -1004,7 +1004,7 @@ class TestLocalConfigOverrides:
             "main_checkout_isolate: true\n"
         )
 
-        result = run_gza(
+        result = invoke_gza(
             "config",
             "--json",
             "--project",
@@ -1025,7 +1025,7 @@ class TestLocalConfigOverrides:
             "  no_activity_timeout: 120\n"
         )
 
-        result = run_gza(
+        result = invoke_gza(
             "config",
             "--json",
             "--project",
@@ -1046,7 +1046,7 @@ class TestLocalConfigOverrides:
         )
         (tmp_path / "gza.local.yaml").write_text("main_checkout_isolate: false\n")
 
-        result = run_gza(
+        result = invoke_gza(
             "config",
             "--project",
             str(tmp_path),
@@ -1146,7 +1146,7 @@ class TestLocalConfigOverrides:
         )
         (tmp_path / "gza.local.yaml").write_text("db_path: .gza/local.db\n")
 
-        result = run_gza(
+        result = invoke_gza(
             "config",
             "--json",
             "--project",
@@ -1165,7 +1165,7 @@ class TestLocalConfigOverrides:
         write_user_config(home_dir, "use_docker: false\n")
         (tmp_path / "gza.yaml").write_text("project_name: test\n")
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -1193,7 +1193,7 @@ class TestLocalConfigOverrides:
             "reasoning_effort: medium\n"
         )
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -1216,7 +1216,7 @@ class TestLocalConfigOverrides:
         )
 
         with pytest.warns(DeprecationWarning, match="max_turns"):
-            result = run_gza("config", "--json", "--project", str(tmp_path))
+            result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -1231,7 +1231,7 @@ class TestLocalConfigOverrides:
         write_user_config(home_dir, "use_docker: false\n")
         (tmp_path / "gza.yaml").write_text("project_name: test\n")
 
-        result = run_gza("config", "--project", str(tmp_path))
+        result = invoke_gza("config", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "User config: active (~/.gza/config.yaml)" in result.stdout
@@ -1246,7 +1246,7 @@ class TestLocalConfigOverrides:
             "max_steps: 5\n"
         )
 
-        result = run_gza("config", "--project", str(tmp_path))
+        result = invoke_gza("config", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert re.search(r"^max_steps\s+5\s+\[base\]$", result.stdout, re.MULTILINE)
@@ -1269,7 +1269,7 @@ class TestLocalConfigOverrides:
             "reasoning_effort: medium\n"
         )
 
-        result = run_gza("config", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -1291,7 +1291,7 @@ class TestLocalConfigOverrides:
         )
         (tmp_path / "gza.local.yaml").write_text("max_steps: 5\n")
 
-        result = run_gza("config", "--project", str(tmp_path))
+        result = invoke_gza("config", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert re.search(r"^max_steps\s+5\s+\[local\]$", result.stdout, re.MULTILINE)
@@ -1346,7 +1346,7 @@ class TestLocalConfigOverrides:
         write_user_config(home_dir, "project_id: nope\n")
         (tmp_path / "gza.yaml").write_text("project_name: test\n")
 
-        result = run_gza("validate", "--project", str(tmp_path))
+        result = invoke_gza("validate", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Invalid user config key 'project_id' in ~/.gza/config.yaml" in result.stdout
@@ -1468,7 +1468,7 @@ class TestLocalConfigOverrides:
         from gza.config_schema import CONFIG_KEY_REGISTRY
         setup_config(tmp_path)
 
-        result = run_gza("config", "keys", "--project", str(tmp_path))
+        result = invoke_gza("config", "keys", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "KEY" in result.stdout
@@ -1491,7 +1491,7 @@ class TestLocalConfigOverrides:
         """`gza config keys` should expose watch recovery config with current descriptions."""
         setup_config(tmp_path)
 
-        result = run_gza("config", "keys", "--project", str(tmp_path))
+        result = invoke_gza("config", "keys", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "watch.recovery_slots" in result.stdout
@@ -1517,7 +1517,7 @@ class TestLocalConfigOverrides:
 
         setup_config(tmp_path)
 
-        result = run_gza("config", "keys", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "keys", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -1533,7 +1533,7 @@ class TestLocalConfigOverrides:
         """`gza config keys --json` should expose watch recovery config with current descriptions."""
         setup_config(tmp_path)
 
-        result = run_gza("config", "keys", "--json", "--project", str(tmp_path))
+        result = invoke_gza("config", "keys", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -1555,14 +1555,14 @@ class TestLocalConfigOverrides:
 
     def test_config_example_stdout_matches_committed_full_example(self, tmp_path: Path):
         """`gza config example` should render the committed full example artifact."""
-        result = run_gza("config", "example", "--project", str(tmp_path))
+        result = invoke_gza("config", "example", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout == Path("src/gza/gza.yaml.example").read_text(encoding="utf-8")
 
     def test_config_example_stdout_matches_committed_local_example(self, tmp_path: Path):
         """`gza config example --local` should render the committed local-override artifact."""
-        result = run_gza("config", "example", "--local", "--project", str(tmp_path))
+        result = invoke_gza("config", "example", "--local", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout == Path("src/gza/gza.local.yaml.example").read_text(encoding="utf-8")
@@ -1584,7 +1584,7 @@ class TestLocalConfigOverrides:
         """Generated config examples should document dynamic defaults without emitting an invalid sample value."""
         setup_config(tmp_path)
 
-        rendered = run_gza(
+        rendered = invoke_gza(
             "config",
             "example",
             *(["--local"] if local else []),
@@ -1610,7 +1610,7 @@ class TestLocalConfigOverrides:
         """`config example` should support explicit write targets and drift checks."""
         output_path = tmp_path / "rendered.yaml"
 
-        write_result = run_gza(
+        write_result = invoke_gza(
             "config",
             "example",
             "--output",
@@ -1621,7 +1621,7 @@ class TestLocalConfigOverrides:
         assert write_result.returncode == 0
         assert output_path.read_text(encoding="utf-8") == Path("src/gza/gza.yaml.example").read_text(encoding="utf-8")
 
-        check_result = run_gza(
+        check_result = invoke_gza(
             "config",
             "example",
             "--check",
@@ -1633,7 +1633,7 @@ class TestLocalConfigOverrides:
         assert check_result.returncode == 0
 
         output_path.write_text("# drifted\n", encoding="utf-8")
-        drift_result = run_gza(
+        drift_result = invoke_gza(
             "config",
             "example",
             "--check",
@@ -1665,7 +1665,7 @@ class TestInitCommand:
         """Non-interactive init must require an explicit DB mode."""
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza("init", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "--db is required when running gza init non-interactively" in result.stderr
@@ -1678,7 +1678,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "db_path: 123\n")
 
-        result = run_gza("init", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "--db is required when running gza init non-interactively" in result.stderr
@@ -1692,7 +1692,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "defaults:\n  model: [\n")
 
-        result = run_gza("init", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "--db is required when running gza init non-interactively" in result.stderr
@@ -1706,7 +1706,7 @@ class TestInitCommand:
         from gza.config import Config
 
         _home_dir, env = self._home_env(tmp_path)
-        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         config_path = tmp_path / "gza.yaml"
@@ -1737,7 +1737,7 @@ class TestInitCommand:
         project_dir.mkdir()
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza("init", "--db", "local", "--project", str(project_dir), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(project_dir), env=env)
 
         assert result.returncode == 0
         content = (project_dir / "gza.yaml").read_text(encoding="utf-8")
@@ -1751,7 +1751,7 @@ class TestInitCommand:
         project_dir.mkdir()
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza("init", "--db", "local", "--project", str(project_dir), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(project_dir), env=env)
 
         assert result.returncode == 1
         assert "cannot be converted into a valid 'project_id'" in result.stdout
@@ -1764,7 +1764,7 @@ class TestInitCommand:
         _home_dir, env = self._home_env(tmp_path)
         env["GZA_DB_PATH"] = str(shared_db)
 
-        result = run_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
         assert result.returncode == 0
 
         config_path = tmp_path / "gza.yaml"
@@ -1773,17 +1773,17 @@ class TestInitCommand:
         assert project_id_match is not None
         project_id = project_id_match.group(1)
 
-        add_original = run_gza("add", "task in original", "--project", str(tmp_path), env=env)
+        add_original = invoke_gza("add", "task in original", "--project", str(tmp_path), env=env)
         assert add_original.returncode == 0
 
         moved_dir = tmp_path.parent / f"{tmp_path.name}-moved"
         tmp_path.rename(moved_dir)
-        add_moved = run_gza("add", "task in moved", "--project", str(moved_dir), env=env)
+        add_moved = invoke_gza("add", "task in moved", "--project", str(moved_dir), env=env)
         assert add_moved.returncode == 0
 
         clone_dir = moved_dir.parent / f"{moved_dir.name}-clone"
         shutil.copytree(moved_dir, clone_dir)
-        add_clone = run_gza("add", "task in clone", "--project", str(clone_dir), env=env)
+        add_clone = invoke_gza("add", "task in clone", "--project", str(clone_dir), env=env)
         assert add_clone.returncode == 0
 
         moved_content = (moved_dir / "gza.yaml").read_text(encoding="utf-8")
@@ -1805,7 +1805,7 @@ class TestInitCommand:
         shared_db = home_dir / ".gza" / "gza.db"
         write_user_config(home_dir, f"db_path: {shared_db}\n")
 
-        result = run_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
@@ -1826,7 +1826,7 @@ class TestInitCommand:
         shared_db = home_dir / ".gza" / "shared.db"
         write_user_config(home_dir, f"db_path: {shared_db}\n")
 
-        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
@@ -1842,7 +1842,7 @@ class TestInitCommand:
 
         home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "shared", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
@@ -1859,7 +1859,7 @@ class TestInitCommand:
         _home_dir, env = self._home_env(tmp_path)
         shared_db = tmp_path / "custom-shared" / "tasks.db"
 
-        result = run_gza("init", "--db-path", str(shared_db), "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db-path", str(shared_db), "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
         content = (tmp_path / "gza.yaml").read_text(encoding="utf-8")
@@ -1873,7 +1873,7 @@ class TestInitCommand:
         """Conflicting local mode and explicit shared path should fail."""
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "local",
@@ -1893,7 +1893,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "db_path: 123\n")
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "local",
@@ -1916,7 +1916,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "defaults:\n  model: [\n")
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "local",
@@ -1940,7 +1940,7 @@ class TestInitCommand:
 
         home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "shared",
@@ -1965,7 +1965,7 @@ class TestInitCommand:
         from gza.config import Config
 
         home_dir, env = self._home_env(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--project",
             str(tmp_path),
@@ -1986,7 +1986,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "db_path: 123\n")
 
-        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "Invalid user config in ~/.gza/config.yaml" in result.stdout
@@ -2002,7 +2002,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "code_task_diff_timeout_medium_threshold: 1500\n")
 
-        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "Invalid user config in ~/.gza/config.yaml" in result.stdout
@@ -2018,7 +2018,7 @@ class TestInitCommand:
         home_dir, env = self._home_env(tmp_path)
         write_user_config(home_dir, "defaults:\n  model: [\n")
 
-        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "Invalid YAML syntax in ~/.gza/config.yaml" in result.stdout
@@ -2030,7 +2030,7 @@ class TestInitCommand:
         _home_dir, env = self._home_env(tmp_path)
         setup_config(tmp_path, project_name="original")
 
-        result = run_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 1
         assert "already exists" in result.stdout
@@ -2046,7 +2046,7 @@ class TestInitCommand:
         local_example_path = tmp_path / "gza.local.yaml.example"
         local_example_path.write_text("# stale local example\n")
 
-        result = run_gza("init", "--force", "--db", "local", "--project", str(tmp_path), env=env)
+        result = invoke_gza("init", "--force", "--db", "local", "--project", str(tmp_path), env=env)
 
         assert result.returncode == 0
 
@@ -2066,7 +2066,7 @@ class TestInitCommand:
         """Interactive init should load the default branch strategy advertised by option 1."""
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "local",
@@ -2094,7 +2094,7 @@ class TestInitCommand:
         """Interactive init should activate the chosen preset branch strategy."""
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "local",
@@ -2113,7 +2113,7 @@ class TestInitCommand:
         """Interactive init should render a custom branch_strategy block from the shared renderer."""
         _home_dir, env = self._home_env(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "init",
             "--db",
             "local",
@@ -2154,7 +2154,7 @@ class TestCleanCommand:
         old_time = time.time() - (60 * 24 * 60 * 60)
         os.utime(old_log, (old_time, old_time))
 
-        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs cleaned" in result.stdout
@@ -2193,7 +2193,7 @@ class TestCleanCommand:
         assert worker_file.exists()
         assert startup_log_file.exists()
 
-        result = run_gza("clean", "--workers", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--workers", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "worker files cleaned" in result.stdout.lower()
@@ -2222,7 +2222,7 @@ class TestCleanCommand:
         os.utime(transcript_log, (old_time, old_time))
         os.utime(ops_log, (old_time, old_time))
 
-        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert not transcript_log.exists()
@@ -2261,7 +2261,7 @@ class TestCleanCommand:
         old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
         os.utime(artifact_path, (old_time, old_time))
 
-        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Artifacts cleaned: 1" in result.stdout
@@ -2291,7 +2291,7 @@ class TestCleanCommand:
         os.utime(artifact_path, (old_time, old_time))
 
         with patch("gza.cli.config_cmds._collect_unmerged_cleanup_sets", return_value=({str(task.id)}, set())):
-            result = run_gza("clean", "--logs", "--keep-unmerged", "--days", "30", "--project", str(tmp_path))
+            result = invoke_gza("clean", "--logs", "--keep-unmerged", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Artifacts: nothing to clean" in result.stdout
@@ -2340,7 +2340,7 @@ class TestCleanCommand:
             patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
             patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "clean",
                 "--logs",
                 "--keep-unmerged",
@@ -2401,7 +2401,7 @@ class TestCleanCommand:
             patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=raise_merge_state),
             patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "clean",
                 "--logs",
                 "--keep-unmerged",
@@ -2466,7 +2466,7 @@ class TestCleanArchiveCommand:
         os.utime(recent_worker, (recent_time, recent_time))
 
         # Run clean --archive command
-        result = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Archived files older than 30 days" in result.stdout
@@ -2501,7 +2501,7 @@ class TestCleanArchiveCommand:
         os.utime(log_file, (old_time, old_time))
 
         # Run with --archive --days 7 (should archive 8-day-old file)
-        result = run_gza("clean", "--archive", "--days", "7", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Archived files older than 7 days" in result.stdout
@@ -2531,7 +2531,7 @@ class TestCleanArchiveCommand:
         old_time = (datetime.now(UTC) - timedelta(days=60)).timestamp()
         os.utime(artifact_path, (old_time, old_time))
 
-        result = run_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Artifacts: 1 files" in result.stdout
@@ -2584,13 +2584,13 @@ class TestCleanArchiveCommand:
             )
             conn.commit()
 
-        cleanup = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+        cleanup = invoke_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert cleanup.returncode == 0
         assert "Artifacts: nothing to clean" in cleanup.stdout
         assert archived_artifact.exists()
 
-        purge = run_gza("clean", "--purge", "--days", "30", "--project", str(tmp_path))
+        purge = invoke_gza("clean", "--purge", "--days", "30", "--project", str(tmp_path))
 
         assert purge.returncode == 0
         assert "Archived artifacts: 1 files" in purge.stdout
@@ -2638,7 +2638,7 @@ class TestCleanArchiveCommand:
             )
             conn.commit()
 
-        result = run_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Warning: Skipping artifact" in result.stdout
@@ -2687,7 +2687,7 @@ class TestCleanArchiveCommand:
             )
             conn.commit()
 
-        result = run_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Warning: Skipping artifact" in result.stdout
@@ -2746,7 +2746,7 @@ class TestCleanArchiveCommand:
             )
             conn.commit()
 
-        result = run_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--logs", "--days", "30", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Artifacts: 0 files" in result.stdout
@@ -2794,7 +2794,7 @@ class TestCleanArchiveCommand:
             patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
             patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "clean",
                 "--archive",
                 "--logs",
@@ -2842,7 +2842,7 @@ class TestCleanArchiveCommand:
             patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
             patch("gza.cli.config_cmds.Git.is_merged", return_value=False),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "clean",
                 "--archive",
                 "--logs",
@@ -2908,7 +2908,7 @@ class TestCleanArchiveCommand:
             patch("gza.cli.config_cmds.resolve_task_merge_state_for_target", side_effect=raise_merge_state),
             patch("gza.cli.config_cmds.Git.default_branch", return_value="main"),
         ):
-            result = run_gza(
+            result = invoke_gza(
                 "clean",
                 "--archive",
                 "--logs",
@@ -2943,7 +2943,7 @@ class TestCleanArchiveCommand:
         old_time = (datetime.now(UTC) - timedelta(days=400)).timestamp()
         os.utime(archived_artifact, (old_time, old_time))
 
-        result = run_gza("clean", "--purge", "--days", "365", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--purge", "--days", "365", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Archived artifacts: 1 files" in result.stdout
@@ -2966,7 +2966,7 @@ class TestCleanArchiveCommand:
         os.utime(old_log, (old_time, old_time))
 
         # Run with --archive --dry-run
-        result = run_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Dry run: would archive files older than 30 days" in result.stdout
@@ -2987,7 +2987,7 @@ class TestCleanArchiveCommand:
         logs_dir.mkdir(parents=True, exist_ok=True)
         workers_dir.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs: 0 files" in result.stdout
@@ -2998,7 +2998,7 @@ class TestCleanArchiveCommand:
         setup_config(tmp_path)
 
         # Don't create .gza directories
-        result = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs: 0 files" in result.stdout
@@ -3025,7 +3025,7 @@ class TestCleanArchiveCommand:
             new_time = (datetime.now(UTC) - timedelta(days=5 + i)).timestamp()
             os.utime(new_file, (new_time, new_time))
 
-        result = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Logs: 3 files" in result.stdout
@@ -3054,7 +3054,7 @@ class TestCleanArchiveCommand:
         old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
         os.utime(old_subdir, (old_time, old_time))
 
-        result = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
 
@@ -3077,12 +3077,12 @@ class TestCleanArchiveCommand:
         os.utime(old_log, (old_time, old_time))
 
         # First run - archives the file
-        result1 = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result1 = invoke_gza("clean", "--archive", "--project", str(tmp_path))
         assert result1.returncode == 0
         assert "Logs: 1 files" in result1.stdout
 
         # Second run - should find nothing to archive
-        result2 = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result2 = invoke_gza("clean", "--archive", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "Logs: 0 files" in result2.stdout
 
@@ -3115,7 +3115,7 @@ class TestCleanArchiveCommand:
         os.utime(recent_archived_log, (recent_time, recent_time))
 
         # Run purge with default days (365)
-        result = run_gza("clean", "--purge", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--purge", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Purged archived files older than 365 days" in result.stdout
@@ -3146,7 +3146,7 @@ class TestCleanArchiveCommand:
         os.utime(archived_log, (old_time, old_time))
 
         # Run purge with --days 180 (should delete 200-day-old file)
-        result = run_gza("clean", "--purge", "--days", "180", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--purge", "--days", "180", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Purged archived files older than 180 days" in result.stdout
@@ -3169,7 +3169,7 @@ class TestCleanArchiveCommand:
         os.utime(old_archived, (old_time, old_time))
 
         # Run purge with --dry-run
-        result = run_gza("clean", "--purge", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--purge", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Dry run: would purge archived files older than 365 days" in result.stdout
@@ -3195,12 +3195,12 @@ class TestCleanArchiveCommand:
         os.utime(old_archived, (old_time, old_time))
 
         # First purge run - deletes the file
-        result1 = run_gza("clean", "--purge", "--project", str(tmp_path))
+        result1 = invoke_gza("clean", "--purge", "--project", str(tmp_path))
         assert result1.returncode == 0
         assert "Archived logs: 1 files" in result1.stdout
 
         # Second purge run - should find nothing to delete
-        result2 = run_gza("clean", "--purge", "--project", str(tmp_path))
+        result2 = invoke_gza("clean", "--purge", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "Archived logs: 0 files" in result2.stdout
 
@@ -3225,7 +3225,7 @@ class TestCleanArchiveCommand:
         recent_time = (datetime.now(UTC) - timedelta(days=1)).timestamp()
         os.utime(recent_backup, (recent_time, recent_time))
 
-        result = run_gza("clean", "--archive", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Backups deleted: 1 files" in result.stdout
@@ -3249,7 +3249,7 @@ class TestCleanArchiveCommand:
         old_time = (datetime.now(UTC) - timedelta(days=40)).timestamp()
         os.utime(old_backup, (old_time, old_time))
 
-        result = run_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "gza-2026010100.db" in result.stdout
@@ -3349,7 +3349,7 @@ class TestStatsReviewsCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement tasks: 0" in result.stdout
@@ -3361,7 +3361,7 @@ class TestStatsReviewsCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Week" in result.stdout
@@ -3383,7 +3383,7 @@ class TestStatsReviewsCommand:
         assert review.id is not None
         store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement tasks: 1" in result.stdout
@@ -3401,7 +3401,7 @@ class TestStatsReviewsCommand:
         assert impl.id is not None
         store.mark_completed(impl, has_commits=False, stats=TaskStats(cost_usd=0.10))
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement tasks: 1" in result.stdout
@@ -3424,7 +3424,7 @@ class TestStatsReviewsCommand:
         failed_review.completed_at = datetime.now(UTC)
         store.update(failed_review)
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement tasks: 1" in result.stdout
@@ -3447,7 +3447,7 @@ class TestStatsReviewsCommand:
             assert review.id is not None
             store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Reviews per implementation" in result.stdout
@@ -3458,7 +3458,7 @@ class TestStatsReviewsCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("stats", "reviews", "--days", "7", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement tasks: 0" in result.stdout
@@ -3471,7 +3471,7 @@ class TestStatsReviewsCommand:
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         today = date.today()
@@ -3506,7 +3506,7 @@ class TestStatsReviewsCommand:
         store.update(review)
         store.mark_completed(review, has_commits=False, stats=TaskStats(cost_usd=0.02))
 
-        result = run_gza("stats", "reviews", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "ScN" in result.stdout
@@ -3562,7 +3562,7 @@ class TestStatsReviewsCommand:
         )
         store.mark_completed(null_score_review, has_commits=False, stats=TaskStats(cost_usd=0.02))
 
-        result = run_gza("stats", "reviews", "--json", "--all", "--project", str(tmp_path))
+        result = invoke_gza("stats", "reviews", "--json", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -3594,7 +3594,7 @@ class TestStatsIterationsCommand:
         """gza stats iterations with no tasks shows an empty summary."""
         setup_config(tmp_path)
 
-        result = run_gza("stats", "iterations", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task" in result.stdout
@@ -3632,7 +3632,7 @@ class TestStatsIterationsCommand:
             stats=TaskStats(cost_usd=0.04),
         )
 
-        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert impl.id in result.stdout
@@ -3677,7 +3677,7 @@ class TestStatsIterationsCommand:
             stats=TaskStats(cost_usd=0.01),
         )
 
-        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         label_match = re.search(rf"^{re.escape(impl.id)}\s+(?P<label>\S+)", result.stdout, re.MULTILINE)
@@ -3708,7 +3708,7 @@ class TestStatsIterationsCommand:
             stats=TaskStats(cost_usd=0.01),
         )
 
-        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         label_match = re.search(rf"^{re.escape(impl.id)}\s+(?P<label>\S+)", result.stdout, re.MULTILINE)
@@ -3744,7 +3744,7 @@ class TestStatsIterationsCommand:
             stats=TaskStats(cost_usd=0.02),
         )
 
-        result = run_gza("stats", "iterations", "--all", "--last", "1", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all", "--last", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert impl_2.id in result.stdout
@@ -3786,7 +3786,7 @@ class TestStatsIterationsCommand:
                 (old_activity_ts, old_activity_ts, impl_without_recent_activity.id),
             )
 
-        result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Last 12 hours" in result.stdout
@@ -3825,7 +3825,7 @@ class TestStatsIterationsCommand:
                 (recent_completed, recent_completed, review.id),
             )
 
-        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "2026-04-14" in result.stdout
@@ -3860,7 +3860,7 @@ class TestStatsIterationsCommand:
                 (old_created, recent_completed, review.id),
             )
 
-        result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert impl.id in result.stdout
@@ -3899,7 +3899,7 @@ class TestStatsIterationsCommand:
                 (old_created, recent_completed, improve.id),
             )
 
-        result = run_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--hours", "12", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert impl.id in result.stdout
@@ -3909,7 +3909,7 @@ class TestStatsIterationsCommand:
         """--hours and --all should reject incompatible combinations."""
         setup_config(tmp_path)
 
-        hours_result = run_gza(
+        hours_result = invoke_gza(
             "stats",
             "iterations",
             "--hours",
@@ -3922,7 +3922,7 @@ class TestStatsIterationsCommand:
         assert hours_result.returncode == 1
         assert "--hours cannot be combined" in hours_result.stderr
 
-        all_result = run_gza(
+        all_result = invoke_gza(
             "stats",
             "iterations",
             "--all",
@@ -3938,7 +3938,7 @@ class TestStatsIterationsCommand:
         """--days must be >= 1 for iterations stats."""
         setup_config(tmp_path)
 
-        zero_days_result = run_gza(
+        zero_days_result = invoke_gza(
             "stats",
             "iterations",
             "--days",
@@ -3949,7 +3949,7 @@ class TestStatsIterationsCommand:
         assert zero_days_result.returncode == 1
         assert "--days must be >= 1" in zero_days_result.stderr
 
-        negative_days_result = run_gza(
+        negative_days_result = invoke_gza(
             "stats",
             "iterations",
             "--days",
@@ -3986,7 +3986,7 @@ class TestStatsIterationsCommand:
         assert no_review_impl.id is not None
         store.mark_completed(no_review_impl, has_commits=False, stats=TaskStats(cost_usd=0.07))
 
-        result = run_gza("stats", "iterations", "--all", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert reviewed_impl.id in result.stdout
@@ -4014,7 +4014,7 @@ class TestStatsIterationsCommand:
             stats=TaskStats(cost_usd=0.02),
         )
 
-        result = run_gza("stats", "iterations", "--all-time", "--last", "1", "--project", str(tmp_path))
+        result = invoke_gza("stats", "iterations", "--all-time", "--last", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert impl.id in result.stdout
@@ -4027,7 +4027,7 @@ class TestStatsCommand:
         """gza stats with no subcommand exits 0 and prints help containing 'reviews'."""
         setup_config(tmp_path)
 
-        result = run_gza("stats", "--project", str(tmp_path))
+        result = invoke_gza("stats", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "reviews" in result.stdout
@@ -4037,7 +4037,7 @@ class TestStatsCommand:
         """gza stats cycles exits non-zero since the subcommand was removed."""
         setup_config(tmp_path)
 
-        result = run_gza("stats", "cycles", "--project", str(tmp_path))
+        result = invoke_gza("stats", "cycles", "--project", str(tmp_path))
 
         assert result.returncode != 0
 
@@ -4062,7 +4062,7 @@ class TestSyncReportCommand:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text("New plan content on disk")
 
-        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Synced" in result.stdout
 
@@ -4088,7 +4088,7 @@ class TestSyncReportCommand:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text("Updated review content on disk")
 
-        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Synced" in result.stdout
 
@@ -4114,7 +4114,7 @@ class TestSyncReportCommand:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text("New exploration findings on disk")
 
-        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Synced" in result.stdout
 
@@ -4140,7 +4140,7 @@ class TestSyncReportCommand:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text("Identical content")
 
-        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "already in sync" in result.stdout
 
@@ -4156,7 +4156,7 @@ class TestSyncReportCommand:
         store = make_store(tmp_path)
 
         task = store.add("Code task", task_type="implement")
-        result = run_gza("sync-report", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 1
         assert "no report file" in result.stdout
 
@@ -4165,7 +4165,7 @@ class TestSyncReportCommand:
         setup_config(tmp_path)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("sync-report", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("sync-report", "testproject-999999", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "not found" in result.stdout
 
@@ -4181,7 +4181,7 @@ class TestLearningsCommand:
         learnings_content = "# Project Learnings\n\n- Use pytest fixtures\n"
         (gza_dir / "learnings.md").write_text(learnings_content)
 
-        result = run_gza("learnings", "show", "--project", str(tmp_path))
+        result = invoke_gza("learnings", "show", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Project Learnings" in result.stdout
@@ -4191,7 +4191,7 @@ class TestLearningsCommand:
         """gza learnings show reports missing file gracefully."""
         setup_config(tmp_path)
 
-        result = run_gza("learnings", "show", "--project", str(tmp_path))
+        result = invoke_gza("learnings", "show", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No learnings file found" in result.stdout
@@ -4207,7 +4207,7 @@ class TestLearningsCommand:
         store.mark_completed(task, output_content="- Use dedicated fixtures for tests\n", has_commits=False)
 
         with patch("gza.learnings._run_learnings_task", return_value=None):
-            result = run_gza("learnings", "update", "--project", str(tmp_path))
+            result = invoke_gza("learnings", "update", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Updated learnings" in result.stdout

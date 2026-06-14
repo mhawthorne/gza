@@ -1,4 +1,8 @@
-"""Shared CLI test helpers."""
+"""Shared CLI test helpers.
+
+Unit tests must stay in-process here. Any test that needs real CLI subprocess
+coverage belongs in ``tests_functional/``.
+"""
 
 import io
 import os
@@ -20,7 +24,7 @@ class _PatchedStdin(io.StringIO):
         return self._isatty
 
 
-def run_gza(
+def invoke_gza(
     *args: str,
     cwd: Path | None = None,
     stdin_input: str | None = None,

@@ -67,7 +67,7 @@ from gza.watch_progress import (
 )
 from gza.workers import WorkerMetadata, WorkerRegistry
 
-from .conftest import make_store, run_gza, setup_config
+from .conftest import make_store, invoke_gza, setup_config
 
 
 def _task_count(store) -> int:
@@ -7319,7 +7319,7 @@ def test_watch_dry_run_command_does_not_reconcile_or_prune_dead_in_progress_task
     before_worker = registry.get("w-watch-dry-run-command")
     assert before_worker is not None
 
-    result = run_gza(
+    result = invoke_gza(
         "watch",
         "--dry-run",
         "--poll",

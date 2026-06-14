@@ -8,7 +8,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import Git
 from gza.workers import WorkerMetadata, WorkerRegistry
-from tests.cli.conftest import run_gza, setup_config
+from tests.cli.conftest import invoke_gza, setup_config
 
 
 def _init_git_repo(tmp_path) -> Git:
@@ -47,7 +47,7 @@ def test_clean_dry_run(tmp_path) -> None:
     old_time = time.time() - (60 * 24 * 60 * 60)
     os.utime(old_log, (old_time, old_time))
 
-    result = run_gza("clean", "--dry-run", "--project", str(tmp_path))
+    result = invoke_gza("clean", "--dry-run", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "Dry run" in result.stdout
@@ -92,7 +92,7 @@ def test_clean_keep_unmerged_logs(tmp_path) -> None:
     os.utime(unmerged_log, (old_time, old_time))
     os.utime(merged_log, (old_time, old_time))
 
-    result = run_gza("clean", "--logs", "--days", "30", "--keep-unmerged", "--project", str(tmp_path))
+    result = invoke_gza("clean", "--logs", "--days", "30", "--keep-unmerged", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert unmerged_log.exists()
@@ -121,7 +121,7 @@ def test_clean_lineage_aware_preserves_recent(tmp_path) -> None:
     wt_path.parent.mkdir(parents=True, exist_ok=True)
     git._run("worktree", "add", str(wt_path), "-b", "wt-recent")
 
-    result = run_gza("clean", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
+    result = invoke_gza("clean", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert wt_path.exists()
@@ -149,7 +149,7 @@ def test_clean_lineage_aware_removes_old(tmp_path) -> None:
     wt_path.parent.mkdir(parents=True, exist_ok=True)
     git._run("worktree", "add", str(wt_path), "-b", "wt-old")
 
-    result = run_gza("clean", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
+    result = invoke_gza("clean", "--worktrees", "--force", "--days", "7", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert not wt_path.exists()
@@ -166,7 +166,7 @@ def test_clean_force_skips_prompt(tmp_path) -> None:
     orphan.mkdir(parents=True)
     (orphan / "dummy.txt").write_text("dummy")
 
-    result = run_gza("clean", "--worktrees", "--force", "--project", str(tmp_path))
+    result = invoke_gza("clean", "--worktrees", "--force", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert not orphan.exists()
@@ -183,7 +183,7 @@ def test_clean_no_force_denies_removal(tmp_path) -> None:
     orphan.mkdir(parents=True)
     (orphan / "dummy.txt").write_text("dummy")
 
-    result = run_gza("clean", "--worktrees", "--project", str(tmp_path), stdin_input="n\n")
+    result = invoke_gza("clean", "--worktrees", "--project", str(tmp_path), stdin_input="n\n")
 
     assert result.returncode == 0
     assert orphan.exists()

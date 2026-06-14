@@ -9,7 +9,7 @@ from gza.providers.log_renderers import get_log_renderer
 from gza.providers.log_rendering import RenderStats
 
 from tests.cli.conftest import make_store, setup_config
-from tests.helpers.cli import run_gza
+from tests.helpers.cli import invoke_gza
 
 FIXTURES = Path(__file__).parent / "fixtures" / "log_renderer"
 
@@ -593,7 +593,7 @@ def test_gza_log_prints_suppressed_footer_and_verbose_unknown_payload(tmp_path: 
         + '\n{"type":"mystery","message":"surprise payload","alpha":1,"beta":2}\n'
     )
 
-    result = run_gza("log", str(task.id), "--verbose", "--project", str(tmp_path))
+    result = invoke_gza("log", str(task.id), "--verbose", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert "routine events suppressed" in result.stdout
@@ -614,7 +614,7 @@ def test_gza_log_unknown_provider_returns_clear_cli_error(tmp_path: Path) -> Non
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text('{"type":"assistant","message":{"id":"msg_1","content":"hello"}}\n')
 
-    result = run_gza("log", str(task.id), "--project", str(tmp_path))
+    result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 1
     assert "Error: unknown provider for log rendering: mistral" in result.stdout

@@ -17,6 +17,7 @@ from rich.text import Text
 import gza.colors as colors
 from gza.artifacts import store_command_output_artifact
 from gza import dependency_preconditions as dependency_preconditions_module
+from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_position_scoped
 from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
 from gza.console import truncate
@@ -29,7 +30,7 @@ from gza.sync_ops import BranchSyncResult
 from .conftest import (
     make_store,
     mark_orphaned,
-    run_gza,
+    invoke_gza,
     setup_config,
     setup_db_with_tasks,
 )
@@ -532,7 +533,7 @@ class TestHistoryCommand:
             {"prompt": "Test task 3", "status": "pending"},
         ])
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Test task 1" in result.stdout
@@ -542,7 +543,7 @@ class TestHistoryCommand:
     def test_history_with_no_tasks(self, tmp_path: Path):
         """History command handles missing database gracefully."""
         setup_config(tmp_path)
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
@@ -552,7 +553,7 @@ class TestHistoryCommand:
         # Create empty database
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks" in result.stdout
@@ -577,7 +578,7 @@ class TestHistoryCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("history", "--project", str(tmp_path))
+            result = invoke_gza("history", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -607,7 +608,7 @@ class TestHistoryCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("history", "--project", str(tmp_path))
+            result = invoke_gza("history", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -630,7 +631,7 @@ class TestHistoryCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("history", "--project", str(tmp_path))
+            result = invoke_gza("history", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -647,7 +648,7 @@ class TestHistoryCommand:
             {"prompt": "Unmerged task", "status": "unmerged"},
         ])
 
-        result = run_gza("history", "--status", "completed", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "completed", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Completed task 1" in result.stdout
@@ -664,7 +665,7 @@ class TestHistoryCommand:
             {"prompt": "Unmerged task", "status": "unmerged"},
         ])
 
-        result = run_gza("history", "--status", "failed", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "failed", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failed task 1" in result.stdout
@@ -681,7 +682,7 @@ class TestHistoryCommand:
             {"prompt": "Unmerged task 2", "status": "unmerged"},
         ])
 
-        result = run_gza("history", "--status", "unmerged", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Unmerged task 1" in result.stdout
@@ -695,7 +696,7 @@ class TestHistoryCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_gza("history", "--status", "failed", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "failed", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks with status 'failed'" in result.stdout
@@ -711,7 +712,7 @@ class TestHistoryCommand:
             {"prompt": "Improve task", "status": "completed", "task_type": "improve"},
         ])
 
-        result = run_gza("history", "--type", "implement", "--project", str(tmp_path))
+        result = invoke_gza("history", "--type", "implement", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement task" in result.stdout
@@ -730,7 +731,7 @@ class TestHistoryCommand:
             {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
         ])
 
-        result = run_gza("history", "--type", "explore", "--project", str(tmp_path))
+        result = invoke_gza("history", "--type", "explore", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Explore task 1" in result.stdout
@@ -746,7 +747,7 @@ class TestHistoryCommand:
             {"prompt": "Completed plan", "status": "completed", "task_type": "plan"},
         ])
 
-        result = run_gza("history", "--status", "completed", "--type", "implement", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "completed", "--type", "implement", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Completed implement" in result.stdout
@@ -759,7 +760,7 @@ class TestHistoryCommand:
             {"prompt": "Regular task", "status": "completed", "task_type": "implement"},
         ])
 
-        result = run_gza("history", "--type", "review", "--project", str(tmp_path))
+        result = invoke_gza("history", "--type", "review", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No completed or failed tasks with type 'review'" in result.stdout
@@ -771,7 +772,7 @@ class TestHistoryCommand:
             {"prompt": "Internal task", "status": "completed", "task_type": "internal"},
         ])
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Implement task" in result.stdout
@@ -784,7 +785,7 @@ class TestHistoryCommand:
             {"prompt": "Internal task", "status": "completed", "task_type": "internal"},
         ])
 
-        result = run_gza("history", "--type", "internal", "--project", str(tmp_path))
+        result = invoke_gza("history", "--type", "internal", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Internal task" in result.stdout
@@ -805,8 +806,8 @@ class TestHistoryCommand:
         internal_task.completed_at = datetime.now(UTC)
         store.update(internal_task)
 
-        text_result = run_gza("history", "--project", str(tmp_path))
-        json_result = run_gza("history", "--json", "--project", str(tmp_path))
+        text_result = invoke_gza("history", "--project", str(tmp_path))
+        json_result = invoke_gza("history", "--json", "--project", str(tmp_path))
 
         assert text_result.returncode == 0
         assert json_result.returncode == 0
@@ -833,7 +834,7 @@ class TestHistoryCommand:
         internal_task.completed_at = datetime.now(UTC)
         store.update(internal_task)
 
-        result = run_gza("history", "--type", "internal", "--json", "--project", str(tmp_path))
+        result = invoke_gza("history", "--type", "internal", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         payload = json.loads(result.stdout)
@@ -849,7 +850,7 @@ class TestHistoryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "history",
             "--fields",
             "id,prompt",
@@ -869,7 +870,7 @@ class TestHistoryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("history", "--fields", "id", "--project", str(tmp_path))
+        result = invoke_gza("history", "--fields", "id", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == task.id
@@ -882,7 +883,7 @@ class TestHistoryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "history",
             "--json",
             "--fields",
@@ -899,7 +900,7 @@ class TestHistoryCommand:
         setup_config(tmp_path)
         make_store(tmp_path).add("history unknown field", task_type="implement")
 
-        result = run_gza("history", "--fields", "id,nope", "--project", str(tmp_path))
+        result = invoke_gza("history", "--fields", "id,nope", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza history: nope" in result.stderr
@@ -910,7 +911,7 @@ class TestHistoryCommand:
     def test_history_list_fields_prints_valid_projection_choices(self, tmp_path: Path):
         setup_config(tmp_path)
 
-        result = run_gza("history", "--list-fields", "--project", str(tmp_path))
+        result = invoke_gza("history", "--list-fields", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("history")
@@ -925,7 +926,7 @@ class TestHistoryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("history", "--fields", "group", "--project", str(tmp_path))
+        result = invoke_gza("history", "--fields", "group", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza history: group" in result.stderr
@@ -939,7 +940,7 @@ class TestHistoryCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("history", "--fields", "next_action", "--project", str(tmp_path))
+        result = invoke_gza("history", "--fields", "next_action", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza history: next_action" in result.stderr
@@ -954,7 +955,7 @@ class TestHistoryCommand:
             {"prompt": "Plan task", "status": "completed", "task_type": "plan"},
         ])
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Type labels are now on a separate line
@@ -984,7 +985,7 @@ class TestHistoryCommand:
         stale_row.merge_status = "merged"
         store.update(stale_row)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -1012,7 +1013,7 @@ class TestHistoryCommand:
         stale_row.merge_status = "unmerged"
         store.update(stale_row)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -1033,7 +1034,7 @@ class TestHistoryCommand:
         assert unit is not None
         store.set_merge_unit_state(unit.id, "empty")
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -1061,7 +1062,7 @@ class TestHistoryCommand:
         completed_task.completed_at = datetime.now(UTC)
         store.update(completed_task)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout
@@ -1083,7 +1084,7 @@ class TestHistoryCommand:
         orphaned_task = store.add("Orphaned task")
         mark_orphaned(store, orphaned_task)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"gza work {orphaned_task.id}" in result.stdout
@@ -1104,7 +1105,7 @@ class TestHistoryCommand:
         completed_task.completed_at = datetime.now(UTC)
         store.update(completed_task)
 
-        result = run_gza("history", "--status", "completed", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "completed", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Orphaned should NOT appear when a status filter is specified
@@ -1129,7 +1130,7 @@ class TestHistoryCommand:
         recent.completed_at = now - timedelta(days=1)
         store.update(recent)
 
-        result = run_gza("history", "--days", "7", "--project", str(tmp_path))
+        result = invoke_gza("history", "--days", "7", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recent task" in result.stdout
@@ -1151,7 +1152,7 @@ class TestHistoryCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("history", "--lineage-depth", "1", "--project", str(tmp_path))
+        result = invoke_gza("history", "--lineage-depth", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Parent task" in result.stdout
@@ -1179,7 +1180,7 @@ class TestHistoryCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
+        result = invoke_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # All three levels of the chain must appear in the output
@@ -1203,7 +1204,7 @@ class TestHistoryCommand:
         assert child.id is not None
         assert grandchild.id is not None
 
-        result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
+        result = invoke_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         root_idx = result.stdout.index("Root done")
@@ -1262,7 +1263,7 @@ class TestHistoryCommand:
         store.update(improve)
         assert improve.id is not None
 
-        result = run_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
+        result = invoke_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert re.search(rf"completed\s+{re.escape(review.id)}", result.stdout)
@@ -1287,7 +1288,7 @@ class TestHistoryCommand:
             {"prompt": "Task 3", "status": "completed"},
         ])
 
-        result = run_gza("history", "--last", "2", "--project", str(tmp_path))
+        result = invoke_gza("history", "--last", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Exactly 2 tasks shown (the 2 most recent)
@@ -1301,7 +1302,7 @@ class TestHistoryCommand:
             {"prompt": "Task C", "status": "completed"},
         ])
 
-        result = run_gza("history", "-n", "1", "--project", str(tmp_path))
+        result = invoke_gza("history", "-n", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.count("Task ") == 1
@@ -1326,7 +1327,7 @@ class TestHistoryCommand:
 
         # Use a date 7 days ago as start date
         start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        result = run_gza("history", "--start-date", start, "--project", str(tmp_path))
+        result = invoke_gza("history", "--start-date", start, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recent task" in result.stdout
@@ -1352,7 +1353,7 @@ class TestHistoryCommand:
 
         # Use a date 7 days ago as end date — only old task should appear
         end = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        result = run_gza("history", "--end-date", end, "--project", str(tmp_path))
+        result = invoke_gza("history", "--end-date", end, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Old task" in result.stdout
@@ -1379,7 +1380,7 @@ class TestHistoryCommand:
         dropped.completed_at = datetime.now(UTC)
         store.update(dropped)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "completed" in result.stdout
@@ -1409,7 +1410,7 @@ class TestHistoryCommand:
         failed_none.completed_at = datetime.now(UTC)
         store.update(failed_none)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Failure reason is now on a separate line
@@ -1434,7 +1435,7 @@ class TestHistoryCommand:
         store.update(retry)
         assert retry.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ retried as {retry.id} ✓" in result.stdout
@@ -1457,7 +1458,7 @@ class TestHistoryCommand:
         store.update(retry)
         assert retry.id is not None
 
-        result = run_gza("history", "--status", "failed", "--project", str(tmp_path))
+        result = invoke_gza("history", "--status", "failed", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Original failed" in result.stdout
@@ -1487,7 +1488,7 @@ class TestHistoryCommand:
         store.update(resumed)
         assert resumed.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ resumed as {resumed.id} ✗" in result.stdout
@@ -1509,7 +1510,7 @@ class TestHistoryCommand:
         store.update(queued_retry)
         assert queued_retry.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ retried as {queued_retry.id}" in result.stdout
@@ -1537,7 +1538,7 @@ class TestHistoryCommand:
         store.update(queued_resumed)
         assert queued_resumed.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ resumed as {queued_resumed.id}" in result.stdout
@@ -1576,7 +1577,7 @@ class TestHistoryCommand:
         store.update(retry_2)
         assert retry_2.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ retried as {retry_2.id} ✓" in result.stdout
@@ -1612,7 +1613,7 @@ class TestHistoryCommand:
         store.update(final_attempt)
         assert final_attempt.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ retried as {final_attempt.id} ✓" in result.stdout
@@ -1660,7 +1661,7 @@ class TestHistoryCommand:
         store.update(resumed_terminal)
         assert resumed_terminal.id is not None
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"→ resumed as {resumed_terminal.id} ✓" in result.stdout
@@ -1683,7 +1684,7 @@ class TestHistoryCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"← {parent.id}" in result.stdout
@@ -1701,7 +1702,7 @@ class TestHistoryCommand:
         store.add_comment(task.id, "Follow-up 1")
         store.add_comment(task.id, "Follow-up 2")
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "comments: 2" in result.stdout
@@ -1730,7 +1731,7 @@ class TestHistoryCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"← {plan.id} (dep {blocker.id})" in result.stdout
@@ -1749,7 +1750,7 @@ class TestHistoryCommand:
         orphaned.running_pid = 999999999  # non-existent PID
         store.update(orphaned)
 
-        result = run_gza("history", "--project", str(tmp_path))
+        result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "orphaned" in result.stdout.lower()
@@ -1775,8 +1776,8 @@ class TestHistoryCommand:
         other.completed_at = datetime.now(UTC)
         store.update(other)
 
-        text_result = run_gza("history", "--tag", "Release-1.2", "--project", str(tmp_path))
-        json_result = run_gza("history", "--tag", "Release-1.2", "--json", "--project", str(tmp_path))
+        text_result = invoke_gza("history", "--tag", "Release-1.2", "--project", str(tmp_path))
+        json_result = invoke_gza("history", "--tag", "Release-1.2", "--json", "--project", str(tmp_path))
 
         assert text_result.returncode == 0
         assert "Tagged completed history" in text_result.stdout
@@ -1811,7 +1812,7 @@ class TestHistoryCommand:
         blocked.completed_at = datetime.now(UTC)
         store.update(blocked)
 
-        result = run_gza(
+        result = invoke_gza(
             "history",
             "--status",
             "completed",
@@ -1849,8 +1850,8 @@ class TestSearchCommand:
         completed.completed_at = datetime.now(UTC)
         store.update(completed)
 
-        search_result = run_gza("search", "needle", "--project", str(tmp_path))
-        history_result = run_gza("history", "--project", str(tmp_path))
+        search_result = invoke_gza("search", "needle", "--project", str(tmp_path))
+        history_result = invoke_gza("history", "--project", str(tmp_path))
 
         assert search_result.returncode == 0
         assert "needle pending task" in search_result.stdout
@@ -1868,7 +1869,7 @@ class TestSearchCommand:
         in_progress = store.add("label in progress needle")
         store.mark_in_progress(in_progress)
 
-        result = run_gza("search", "needle", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "pending" in result.stdout
@@ -1886,7 +1887,7 @@ class TestSearchCommand:
         assert in_progress.id is not None
         store.mark_in_progress(in_progress)
 
-        result = run_gza("search", "align", "--last", "0", "--project", str(tmp_path))
+        result = invoke_gza("search", "align", "--last", "0", "--project", str(tmp_path))
 
         assert result.returncode == 0
         pending_line = next(line for line in result.stdout.splitlines() if "align pending needle" in line)
@@ -1898,7 +1899,7 @@ class TestSearchCommand:
             {"prompt": "alpha task", "status": "completed"},
         ])
 
-        result = run_gza("search", "missing", "--project", str(tmp_path))
+        result = invoke_gza("search", "missing", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No tasks found matching 'missing'" in result.stdout
@@ -1909,7 +1910,7 @@ class TestSearchCommand:
             {"prompt": "alpha task", "status": "completed"},
         ])
 
-        result = run_gza("search", "missing", "--json", "--project", str(tmp_path))
+        result = invoke_gza("search", "missing", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert json.loads(result.stdout) == []
@@ -1922,7 +1923,7 @@ class TestSearchCommand:
         store.add("limit needle two")
         store.add("limit needle three")
 
-        result = run_gza("search", "needle", "--last", "2", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--last", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "limit needle three" in result.stdout
@@ -1937,7 +1938,7 @@ class TestSearchCommand:
         store.add("all needle two")
         store.add("all needle three")
 
-        result = run_gza("search", "needle", "--last", "0", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--last", "0", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "all needle three" in result.stdout
@@ -1950,7 +1951,7 @@ class TestSearchCommand:
         store = make_store(tmp_path)
         store.add("negative needle one")
 
-        result = run_gza("search", "needle", "--last", "-1", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--last", "-1", "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "--last must be >= 0 (use 0 for all matches)" in result.stderr
@@ -1963,7 +1964,7 @@ class TestSearchCommand:
         task.branch = "feat/search-style"
         store.update(task)
 
-        result = run_gza("search", "style needle", "--project", str(tmp_path))
+        result = invoke_gza("search", "style needle", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "style needle task" in result.stdout
@@ -1984,7 +1985,7 @@ class TestSearchCommand:
         second.completed_at = datetime.now(UTC)
         store.update(second)
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--json",
@@ -2005,7 +2006,7 @@ class TestSearchCommand:
         store = make_store(tmp_path)
         task = store.add("needle projection test", task_type="implement")
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--fields",
@@ -2023,7 +2024,7 @@ class TestSearchCommand:
         store = make_store(tmp_path)
         task = store.add("needle bare value", task_type="implement")
 
-        result = run_gza("search", "needle", "--fields", "id", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--fields", "id", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == task.id
@@ -2032,7 +2033,7 @@ class TestSearchCommand:
         setup_config(tmp_path)
         make_store(tmp_path).add("needle unknown field", task_type="implement")
 
-        result = run_gza("search", "needle", "--fields", "id,nope", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--fields", "id,nope", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza search: nope" in result.stderr
@@ -2043,7 +2044,7 @@ class TestSearchCommand:
     def test_search_list_fields_prints_valid_projection_choices(self, tmp_path: Path):
         setup_config(tmp_path)
 
-        result = run_gza("search", "needle", "--list-fields", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--list-fields", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("search")
@@ -2054,7 +2055,7 @@ class TestSearchCommand:
         setup_config(tmp_path)
         make_store(tmp_path).add("needle retired group field", task_type="implement", tags=("release",))
 
-        result = run_gza("search", "needle", "--fields", "group", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--fields", "group", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza search: group" in result.stderr
@@ -2064,7 +2065,7 @@ class TestSearchCommand:
         setup_config(tmp_path)
         make_store(tmp_path).add("needle next action unsupported", task_type="implement")
 
-        result = run_gza("search", "needle", "--fields", "next_action", "--project", str(tmp_path))
+        result = invoke_gza("search", "needle", "--fields", "next_action", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza search: next_action" in result.stderr
@@ -2080,8 +2081,8 @@ class TestSearchCommand:
         store.add("Tagged search task", tags=("release-1.2",))
         store.add("Backlog search task", tags=("backlog",))
 
-        text_result = run_gza("search", "search task", "--tag", "Release-1.2", "--project", str(tmp_path))
-        json_result = run_gza(
+        text_result = invoke_gza("search", "search task", "--tag", "Release-1.2", "--project", str(tmp_path))
+        json_result = invoke_gza(
             "search",
             "search task",
             "--tag",
@@ -2143,7 +2144,7 @@ class TestSearchCommand:
         store.update(child_excluded)
         assert child_excluded.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--status",
@@ -2183,7 +2184,7 @@ class TestSearchCommand:
         child = store.add("needle child", task_type="review", based_on=root.id, same_branch=True)
         store.add("needle other root", task_type="implement")
 
-        deprecated_result = run_gza(
+        deprecated_result = invoke_gza(
             "search",
             "needle",
             "--related-to",
@@ -2191,7 +2192,7 @@ class TestSearchCommand:
             "--project",
             str(tmp_path),
         )
-        canonical_result = run_gza(
+        canonical_result = invoke_gza(
             "search",
             "needle",
             "--lineage-of",
@@ -2218,7 +2219,7 @@ class TestSearchCommand:
         child = store.add("needle child", task_type="review", based_on=root.id, same_branch=True)
         store.add("needle keep", task_type="implement")
 
-        deprecated_result = run_gza(
+        deprecated_result = invoke_gza(
             "search",
             "needle",
             "--related-to-not",
@@ -2226,7 +2227,7 @@ class TestSearchCommand:
             "--project",
             str(tmp_path),
         )
-        canonical_result = run_gza(
+        canonical_result = invoke_gza(
             "search",
             "needle",
             "--lineage-of-not",
@@ -2261,7 +2262,7 @@ class TestSearchCommand:
         root_keep = store.add("needle keep", task_type="implement")
         assert root_keep.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--lineage-of-not",
@@ -2296,7 +2297,7 @@ class TestSearchCommand:
         root_keep = store.add("needle keep", task_type="implement")
         assert root_keep.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--lineage-of-not",
@@ -2319,7 +2320,7 @@ class TestSearchCommand:
 
         store.add("needle keep", task_type="implement")
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--lineage-of",
@@ -2337,7 +2338,7 @@ class TestSearchCommand:
 
         store.add("needle keep", task_type="implement")
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--related-to",
@@ -2361,7 +2362,7 @@ class TestSearchCommand:
         root_b = store.add("needle root b", task_type="implement")
         assert root_b.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--root",
@@ -2388,7 +2389,7 @@ class TestSearchCommand:
         root_b = store.add("needle root b", task_type="implement")
         assert root_b.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--root",
@@ -2413,7 +2414,7 @@ class TestSearchCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "search",
             "needle",
             "--status",
@@ -2448,7 +2449,7 @@ class TestNextCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "First pending task" in result.stdout
@@ -2461,7 +2462,7 @@ class TestNextCommand:
         failed = _create_failed_recovery_candidate(store, prompt="Resume me")
         pending = store.add("Pending work")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recovery lane:" in result.stdout
@@ -2477,7 +2478,7 @@ class TestNextCommand:
         store = make_store(tmp_path)
         store.add("Pending work")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Pending lane: `gza next` preview only. `gza work` / `watch` start from this lane." in result.stdout
@@ -2489,7 +2490,7 @@ class TestNextCommand:
             {"prompt": "Completed task", "status": "completed"},
         ])
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
@@ -2504,7 +2505,7 @@ class TestNextCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("next", "--project", str(tmp_path))
+            result = invoke_gza("next", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -2526,7 +2527,7 @@ class TestNextCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("next", "--project", str(tmp_path))
+            result = invoke_gza("next", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -2541,7 +2542,7 @@ class TestNextCommand:
         """next --tag '' should fail with user-facing validation, not traceback."""
         setup_config(tmp_path)
 
-        result = run_gza("next", "--tag", "", "--project", str(tmp_path))
+        result = invoke_gza("next", "--tag", "", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: tag must not be empty" in result.stdout
@@ -2561,7 +2562,7 @@ class TestNextCommand:
         orphaned_task = store.add("Orphaned task that needs attention")
         mark_orphaned(store, orphaned_task)
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Pending task" in result.stdout
@@ -2579,7 +2580,7 @@ class TestNextCommand:
         orphaned_task = store.add("Stuck orphaned task")
         mark_orphaned(store, orphaned_task)
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No pending tasks" in result.stdout
@@ -2594,7 +2595,7 @@ class TestNextCommand:
         orphaned_task = store.add("Orphaned task")
         mark_orphaned(store, orphaned_task)
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "gza work <full-task-id>" in result.stdout
@@ -2612,7 +2613,7 @@ class TestQueueCommand:
         for i in range(12):
             store.add(f"Task {i + 1}")
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task 1" in result.stdout
@@ -2627,7 +2628,7 @@ class TestQueueCommand:
         failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
         store.add("Pending queue task")
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recovery lane:" in result.stdout
@@ -2645,7 +2646,7 @@ class TestQueueCommand:
         assert urgent.id is not None
         store.set_urgent(urgent.id, True)
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         lines = result.stdout.splitlines()
@@ -2666,7 +2667,7 @@ class TestQueueCommand:
         for i in range(12):
             store.add(f"Task {i + 1}")
 
-        result = run_gza("queue", "-n", all_value, "--project", str(tmp_path))
+        result = invoke_gza("queue", "-n", all_value, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task 12" in result.stdout
@@ -2679,7 +2680,7 @@ class TestQueueCommand:
         for i in range(12):
             store.add(f"Task {i + 1}")
 
-        result = run_gza("queue", "--all", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task 12" in result.stdout
@@ -2692,7 +2693,7 @@ class TestQueueCommand:
         for i in range(5):
             store.add(f"Task {i + 1}")
 
-        result = run_gza("queue", "-n", "2", "--project", str(tmp_path))
+        result = invoke_gza("queue", "-n", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task 1" in result.stdout
@@ -2707,14 +2708,14 @@ class TestQueueCommand:
         assert task.id is not None
         assert task.urgent is False
 
-        bump = run_gza("queue", "bump", task.id, "--project", str(tmp_path))
+        bump = invoke_gza("queue", "bump", task.id, "--project", str(tmp_path))
         assert bump.returncode == 0
         assert "Bumped task" in bump.stdout
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.urgent is True
 
-        unbump = run_gza("queue", "unbump", task.id, "--project", str(tmp_path))
+        unbump = invoke_gza("queue", "unbump", task.id, "--project", str(tmp_path))
         assert unbump.returncode == 0
         assert "Removed task" in unbump.stdout
         refreshed = store.get(task.id)
@@ -2727,7 +2728,7 @@ class TestQueueCommand:
         internal = store.add("Internal pending", task_type="internal")
         assert internal.id is not None
 
-        result = run_gza("queue", "bump", internal.id, "--project", str(tmp_path))
+        result = invoke_gza("queue", "bump", internal.id, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "is internal and not part of the runnable queue" in result.stdout
@@ -2739,7 +2740,7 @@ class TestQueueCommand:
         blocked = store.add("Blocked pending", depends_on=blocker.id)
         assert blocked.id is not None
 
-        result = run_gza("queue", "bump", blocked.id, "--project", str(tmp_path))
+        result = invoke_gza("queue", "bump", blocked.id, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "not currently runnable" in result.stdout
@@ -2758,10 +2759,10 @@ class TestQueueCommand:
         assert newer_urgent.id is not None
         assert bumped.id is not None
 
-        bump = run_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
+        bump = invoke_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
         assert bump.returncode == 0
 
-        queue = run_gza("queue", "--project", str(tmp_path))
+        queue = invoke_gza("queue", "--project", str(tmp_path))
         assert queue.returncode == 0
         lines = queue.stdout.splitlines()
         bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
@@ -2791,7 +2792,7 @@ class TestQueueCommand:
         task = store.add("Release task", tags=("release-1.2",))
         assert task.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             action,
             task.id,
@@ -2816,11 +2817,11 @@ class TestQueueCommand:
         assert second.id is not None
         assert third.id is not None
 
-        move = run_gza("queue", "move", third.id, "1", "--project", str(tmp_path))
+        move = invoke_gza("queue", "move", third.id, "1", "--project", str(tmp_path))
         assert move.returncode == 0
         assert "queue position 1" in move.stdout
 
-        queue = run_gza("queue", "--project", str(tmp_path))
+        queue = invoke_gza("queue", "--project", str(tmp_path))
         assert queue.returncode == 0
         lines = queue.stdout.splitlines()
         third_line = next(i for i, line in enumerate(lines) if "Third" in line)
@@ -2838,18 +2839,18 @@ class TestQueueCommand:
         assert first.id is not None
         assert second.id is not None
 
-        move_next = run_gza("queue", "next", second.id, "--project", str(tmp_path))
+        move_next = invoke_gza("queue", "next", second.id, "--project", str(tmp_path))
         assert move_next.returncode == 0
         assert "queue position 1" in move_next.stdout
 
-        queue = run_gza("queue", "--tag", "release", "--project", str(tmp_path))
+        queue = invoke_gza("queue", "--tag", "release", "--project", str(tmp_path))
         assert queue.returncode == 0
         lines = queue.stdout.splitlines()
         second_line = next(i for i, line in enumerate(lines) if "Second" in line)
         assert "Second" in lines[second_line]
         assert lines[second_line + 1].strip() == "[#1]"
 
-        clear = run_gza("queue", "clear", second.id, "--project", str(tmp_path))
+        clear = invoke_gza("queue", "clear", second.id, "--project", str(tmp_path))
         assert clear.returncode == 0
         assert "Cleared explicit queue order" in clear.stdout
 
@@ -2884,55 +2885,19 @@ class TestQueueCommand:
         assert ops_first.id is not None
         assert ops_second.id is not None
 
-        init_release_plain = run_gza(
-            "queue",
-            "move",
-            release_plain.id,
-            "1",
-            "--tag",
-            "release",
-            "--project",
-            str(tmp_path),
-        )
-        init_release_backend = run_gza(
-            "queue",
-            "move",
-            release_backend.id,
-            "2",
-            "--tag",
-            "release",
-            "--project",
-            str(tmp_path),
-        )
-        init_release_docs = run_gza(
-            "queue",
-            "move",
-            release_docs.id,
-            "3",
-            "--tag",
-            "release",
-            "--project",
-            str(tmp_path),
-        )
-        init_ops_first = run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path))
-        init_ops_second = run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path))
-        assert init_release_plain.returncode == 0
-        assert init_release_backend.returncode == 0
-        assert init_release_docs.returncode == 0
-        assert init_ops_first.returncode == 0
-        assert init_ops_second.returncode == 0
+        # Direct in-process calls (no CLI bootstrap) — keeps this a fast unit test.
+        # `queue move <id> N --tag release` and `queue next <id> --tag release` both
+        # resolve to set_task_queue_position_scoped (next == position 1).
+        assert set_task_queue_position_scoped(store, release_plain.id, position=1, tags=("release",))
+        assert set_task_queue_position_scoped(store, release_backend.id, position=2, tags=("release",))
+        assert set_task_queue_position_scoped(store, release_docs.id, position=3, tags=("release",))
+        assert set_task_queue_position_scoped(store, ops_first.id, position=1)
+        assert set_task_queue_position_scoped(store, ops_second.id, position=2)
 
-        result = run_gza(
-            "queue",
-            action,
-            release_backend.id,
-            *extra_args,
-            "--tag",
-            "release",
-            "--project",
-            str(tmp_path),
+        action_position = 1 if action == "next" else int(extra_args[0])
+        assert set_task_queue_position_scoped(
+            store, release_backend.id, position=action_position, tags=("release",)
         )
-        assert result.returncode == 0
 
         refreshed_release_plain = store.get(release_plain.id)
         refreshed_release_backend = store.get(release_backend.id)
@@ -2977,12 +2942,14 @@ class TestQueueCommand:
         assert ops_first.id is not None
         assert ops_second.id is not None
 
-        assert run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path)).returncode == 0
+        # Setup via direct calls; the under-test action stays on the CLI because the
+        # fail-closed scope validation lives in the queue command handler.
+        assert set_task_queue_position_scoped(store, release_first.id, position=1)
+        assert set_task_queue_position_scoped(store, release_second.id, position=2)
+        assert set_task_queue_position_scoped(store, ops_first.id, position=1)
+        assert set_task_queue_position_scoped(store, ops_second.id, position=2)
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             action,
             ops_second.id,
@@ -3026,12 +2993,13 @@ class TestQueueCommand:
         assert ops_first.id is not None
         assert ops_second.id is not None
 
-        assert run_gza("queue", "move", release_first.id, "1", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", release_second.id, "2", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path)).returncode == 0
+        # Setup via direct calls; the under-test action stays on the CLI (handler-level fail-closed).
+        assert set_task_queue_position_scoped(store, release_first.id, position=1)
+        assert set_task_queue_position_scoped(store, release_second.id, position=2)
+        assert set_task_queue_position_scoped(store, ops_first.id, position=1)
+        assert set_task_queue_position_scoped(store, ops_second.id, position=2)
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "move",
             ops_second.id,
@@ -3088,7 +3056,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3128,7 +3096,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3175,7 +3143,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3224,7 +3192,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3269,7 +3237,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3319,7 +3287,7 @@ class TestQueueCommand:
         )
         assert out_of_scope_child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3358,7 +3326,7 @@ class TestQueueCommand:
         )
         assert retry_child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3400,7 +3368,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3445,7 +3413,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3482,7 +3450,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3516,7 +3484,7 @@ class TestQueueCommand:
         )
         assert child.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3556,7 +3524,7 @@ class TestQueueCommand:
         )
         assert matching_child.id is not None
 
-        matching_result = run_gza(
+        matching_result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3579,7 +3547,7 @@ class TestQueueCommand:
         )
         assert out_of_scope_child.id is not None
 
-        gap_result = run_gza(
+        gap_result = invoke_gza(
             "queue",
             "--tag",
             "202606-recovery",
@@ -3606,9 +3574,9 @@ class TestQueueCommand:
         store.add("Newer urgent", urgent=True)
         bumped = store.add("Bumped now")
         assert bumped.id is not None
-        run_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
+        invoke_gza("queue", "bump", bumped.id, "--project", str(tmp_path))
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert result.returncode == 0
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         bumped_line = next(i for i, line in enumerate(lines) if "Bumped now" in line)
@@ -3627,11 +3595,12 @@ class TestQueueCommand:
         assert release_backend.id is not None
         assert release_docs.id is not None
 
-        assert run_gza("queue", "move", release_plain.id, "1", "--tag", "release", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", release_backend.id, "2", "--tag", "release", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", release_docs.id, "3", "--tag", "release", "--project", str(tmp_path)).returncode == 0
+        # Setup ordering via direct calls; only the view itself goes through the CLI.
+        assert set_task_queue_position_scoped(store, release_plain.id, position=1, tags=("release",))
+        assert set_task_queue_position_scoped(store, release_backend.id, position=2, tags=("release",))
+        assert set_task_queue_position_scoped(store, release_docs.id, position=3, tags=("release",))
 
-        queue = run_gza("queue", "--tag", "release", "--project", str(tmp_path))
+        queue = invoke_gza("queue", "--tag", "release", "--project", str(tmp_path))
         assert queue.returncode == 0
 
         lines = queue.stdout.splitlines()
@@ -3658,23 +3627,14 @@ class TestQueueCommand:
         assert ops_first.id is not None
         assert ops_second.id is not None
 
-        assert run_gza("queue", "move", release_plain.id, "1", "--tag", "release", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", release_backend.id, "2", "--tag", "release", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", release_docs.id, "3", "--tag", "release", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", ops_first.id, "1", "--project", str(tmp_path)).returncode == 0
-        assert run_gza("queue", "move", ops_second.id, "2", "--project", str(tmp_path)).returncode == 0
+        # Direct in-process calls — keeps this a fast unit test.
+        assert set_task_queue_position_scoped(store, release_plain.id, position=1, tags=("release",))
+        assert set_task_queue_position_scoped(store, release_backend.id, position=2, tags=("release",))
+        assert set_task_queue_position_scoped(store, release_docs.id, position=3, tags=("release",))
+        assert set_task_queue_position_scoped(store, ops_first.id, position=1)
+        assert set_task_queue_position_scoped(store, ops_second.id, position=2)
 
-        clear = run_gza(
-            "queue",
-            "clear",
-            release_backend.id,
-            "--tag",
-            "release",
-            "--project",
-            str(tmp_path),
-        )
-        assert clear.returncode == 0
-        assert "Cleared explicit queue order" in clear.stdout
+        assert clear_task_queue_position_scoped(store, release_backend.id, tags=("release",))
 
         refreshed_release_plain = store.get(release_plain.id)
         refreshed_release_backend = store.get(release_backend.id)
@@ -3700,9 +3660,9 @@ class TestQueueCommand:
         store.add("Older urgent", urgent=True)
         ordered = store.add("Ordered")
         assert ordered.id is not None
-        run_gza("queue", "move", ordered.id, "1", "--project", str(tmp_path))
+        invoke_gza("queue", "move", ordered.id, "1", "--project", str(tmp_path))
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert result.returncode == 0
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         ordered_line = next(i for i, line in enumerate(lines) if "Ordered" in line)
@@ -3722,7 +3682,7 @@ class TestQueueCommand:
         assert blocker.id is not None
         assert blocked.id is not None
 
-        result = run_gza("queue", "--all", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Runnable" in result.stdout
@@ -3747,7 +3707,7 @@ class TestQueueCommand:
         assert release_task.id is not None
         assert other_task.id is not None
 
-        result = run_gza("queue", "--tag", "release-1", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--tag", "release-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Release task" in result.stdout
@@ -3764,7 +3724,7 @@ class TestQueueCommand:
         assert blocker.id is not None
         assert blocked.id is not None
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "No pending tasks" not in result.stdout
@@ -3796,7 +3756,7 @@ class TestQueueCommand:
         downstream = store.add("Held downstream", depends_on=dep.id)
         assert downstream.id is not None
 
-        result = run_gza("queue", "--all", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -3827,7 +3787,7 @@ class TestQueueCommand:
         downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
         assert downstream.id is not None
 
-        result = run_gza("queue", "--all", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -3848,7 +3808,7 @@ class TestQueueCommand:
         assert blocker.id is not None
         assert blocked.id is not None
 
-        result = run_gza("queue", "--all", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         lines = result.stdout.splitlines()
@@ -3878,7 +3838,7 @@ class TestQueueCommand:
         task = store.add("Vanilla task")
         assert task.id is not None
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         lines = result.stdout.splitlines()
@@ -3894,7 +3854,7 @@ class TestQueueCommand:
         assert blocker.id is not None
         assert blocked_urgent.id is not None
 
-        result = run_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         lines = result.stdout.splitlines()
@@ -3964,7 +3924,7 @@ class TestQueueCommand:
         store.add("Release blocked", group="release-1", depends_on=blocker.id)
         store.add("Backlog runnable", group="backlog")
 
-        result = run_gza("next", "--tag", "release-1", "--project", str(tmp_path))
+        result = invoke_gza("next", "--tag", "release-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Release runnable" in result.stdout
@@ -4036,8 +3996,8 @@ class TestQueueCommand:
         store.add("Release runnable", tags=("release-1.2",))
         store.add("Backlog runnable", tags=("backlog",))
 
-        queue_result = run_gza("queue", "--tag", "Release-1.2", "--project", str(tmp_path))
-        next_result = run_gza("next", "--tag", "Release-1.2", "--project", str(tmp_path))
+        queue_result = invoke_gza("queue", "--tag", "Release-1.2", "--project", str(tmp_path))
+        next_result = invoke_gza("next", "--tag", "Release-1.2", "--project", str(tmp_path))
 
         assert queue_result.returncode == 0
         assert "Release runnable" in queue_result.stdout
@@ -4057,7 +4017,7 @@ class TestShowCommand:
             {"prompt": "A detailed task prompt", "status": "pending"},
         ])
 
-        result = run_gza("show", "testproject-1", "--project", str(tmp_path))
+        result = invoke_gza("show", "testproject-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task " in result.stdout
@@ -4080,7 +4040,7 @@ class TestShowCommand:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text("- Restored legacy fix output\n")
 
-        result = run_gza("show", str(task.id), "--output", "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--output", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "- Restored legacy fix output" in result.stdout
@@ -4092,7 +4052,7 @@ class TestShowCommand:
         task = store.add("Prompt only task")
         assert task.id is not None
 
-        result = run_gza("show", str(task.id), "--prompt", "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--prompt", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Prompt only task" in result.stdout
@@ -4111,7 +4071,7 @@ class TestShowCommand:
         store.update(task)
         store.add_comment(task.id, "Operator note", source="direct")
 
-        result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task " in result.stdout
@@ -4131,7 +4091,7 @@ class TestShowCommand:
         task = store.add("Task for metadata-only conflict")
         assert task.id is not None
 
-        result = run_gza("show", str(task.id), "--metadata-only", flag, "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--metadata-only", flag, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert f"Error: --metadata-only cannot be used with {flag}." in result.stdout
@@ -4143,7 +4103,7 @@ class TestShowCommand:
         task = store.add("Task for multi-flag metadata-only conflict")
         assert task.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "show",
             str(task.id),
             "--metadata-only",
@@ -4170,7 +4130,7 @@ class TestShowCommand:
         task.execution_mode = "skill_inline"
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Execution Mode: skill_inline" in result.stdout
@@ -4185,8 +4145,8 @@ class TestShowCommand:
         assert manual.id is not None
         assert legacy.id is not None
 
-        manual_result = run_gza("show", str(manual.id), "--project", str(tmp_path))
-        legacy_result = run_gza("show", str(legacy.id), "--project", str(tmp_path))
+        manual_result = invoke_gza("show", str(manual.id), "--project", str(tmp_path))
+        legacy_result = invoke_gza("show", str(legacy.id), "--project", str(tmp_path))
 
         assert manual_result.returncode == 0
         assert "Trigger Source: manual" in manual_result.stdout
@@ -4204,7 +4164,7 @@ class TestShowCommand:
         review.review_score = 34
         store.update(review)
 
-        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Verdict: CHANGES_REQUESTED" in result.stdout
@@ -4234,7 +4194,7 @@ class TestShowCommand:
         review.review_score = 67
         store.update(review)
 
-        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Verdict: CHANGES_REQUESTED" in result.stdout
@@ -4252,7 +4212,7 @@ class TestShowCommand:
         review.review_score = None
         store.update(review)
 
-        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Score:" not in result.stdout
@@ -4269,7 +4229,7 @@ class TestShowCommand:
         review.review_score = None
         store.update(review)
 
-        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Score: 0/100" in result.stdout
@@ -4295,7 +4255,7 @@ class TestShowCommand:
         resolved_at = f"{resolved_comment.resolved_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC"
         open_created = f"{open_comment.created_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Comments:" in result.stdout
@@ -4363,7 +4323,7 @@ class TestShowCommand:
         task.review_verify_artifact_file = stored.path
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Review Verify Status:" in result.stdout
@@ -4400,7 +4360,7 @@ class TestShowCommand:
         )
         (tmp_path / stored.path).unlink()
 
-        result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Artifacts:" in result.stdout
@@ -4434,8 +4394,8 @@ class TestShowCommand:
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
 
-        content_result = run_gza("artifact", str(task.id), "--project", str(tmp_path))
-        path_result = run_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
+        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
+        path_result = invoke_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
 
         assert content_result.returncode == 0
         assert content_result.stdout == "newer output\n\n"
@@ -4477,9 +4437,9 @@ class TestShowCommand:
         task.review_verify_artifact_file = newer.path
         store.update(task)
 
-        content_result = run_gza("artifact", str(task.id), "--project", str(tmp_path))
-        path_result = run_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
-        show_result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
+        path_result = invoke_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
+        show_result = invoke_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
 
         assert content_result.returncode == 1
         assert "has no content file" in content_result.stdout
@@ -4512,8 +4472,8 @@ class TestShowCommand:
         )
         (tmp_path / stored.path).unlink()
 
-        content_result = run_gza("artifact", str(task.id), "--project", str(tmp_path))
-        path_result = run_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
+        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
+        path_result = invoke_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
 
         assert content_result.returncode == 1
         assert f"missing on disk: {stored.path}" in content_result.stdout
@@ -4567,7 +4527,7 @@ class TestShowCommand:
         task.review_verify_artifact_file = older.path
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--metadata-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Artifacts:" in result.stdout
@@ -4596,7 +4556,7 @@ class TestShowCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -4617,7 +4577,7 @@ class TestShowCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -4649,7 +4609,7 @@ class TestShowCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -4741,7 +4701,7 @@ class TestShowCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -4771,7 +4731,7 @@ class TestShowCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -4784,7 +4744,7 @@ class TestShowCommand:
         """Show command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("show", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("show", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -4800,7 +4760,7 @@ class TestShowCommand:
         review = store.add("Review feature", task_type="review", depends_on=impl.id)
         assert review.id is not None
 
-        result = run_gza("show", str(review.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -4825,7 +4785,7 @@ class TestShowCommand:
                 "prunable": False,
             }
         ]):
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Branch: feature/show-worktree" in result.stdout
@@ -4844,7 +4804,7 @@ class TestShowCommand:
         assert worktree_path is None
 
         with patch("gza.cli.query.Git.worktree_list", return_value=[]):
-            result = run_gza("show", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Branch: feature/no-worktree" in result.stdout
@@ -5794,7 +5754,7 @@ class TestShowCommand:
         child = store.add("Follow-up lineage child", task_type="review", based_on=failed.id, depends_on=failed.id)
         assert child.id is not None
 
-        result = run_gza("show", str(failed.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(failed.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -6397,7 +6357,7 @@ class TestShowCommand:
         ]
         (log_dir / "fail.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason: MAX_TURNS" in result.stdout
@@ -6442,7 +6402,7 @@ class TestShowCommand:
         ]
         (log_dir / "interrupted.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason: TERMINATED" in result.stdout
@@ -6487,7 +6447,7 @@ class TestShowCommand:
         ]
         (log_dir / "non-claude.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Last Verify Failure:" in result.stdout
@@ -6506,7 +6466,7 @@ class TestShowCommand:
         task.session_id = "sess-test-failure"
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"gza retry {task.id}" in result.stdout
@@ -6524,7 +6484,7 @@ class TestShowCommand:
         task.failure_reason = "PREREQUISITE_UNMERGED"
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
@@ -6554,7 +6514,7 @@ class TestShowCommand:
         )
         store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
@@ -6593,7 +6553,7 @@ class TestShowCommand:
             + "\n"
         )
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"gza merge {retry_dep.id}" in result.stdout
@@ -6628,7 +6588,7 @@ class TestShowCommand:
             )
         )
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Worker Failure: failed during startup" in result.stdout
@@ -6643,7 +6603,7 @@ class TestShowCommand:
         task.status = "completed"
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason:" not in result.stdout
@@ -6660,7 +6620,7 @@ class TestShowCommand:
         impl = store.add("Implement the feature", task_type="implement", based_on=plan.id)
         assert impl.id is not None
 
-        result = run_gza("show", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -6682,7 +6642,7 @@ class TestShowCommand:
         improve = store.add("Fix review issues", task_type="improve", based_on=impl.id)
         assert improve.id is not None
 
-        result = run_gza("show", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -6704,7 +6664,7 @@ class TestShowCommand:
         impl2 = store.add("Second implement based on first", task_type="implement", based_on=impl1.id)
         assert impl2.id is not None
 
-        result = run_gza("show", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -6726,7 +6686,7 @@ class TestShowCommand:
         child = store.add("Child task", task_type="implement", based_on=root.id)
         grandchild = store.add("Grandchild task", task_type="implement", based_on=child.id)
 
-        result = run_gza("show", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -6749,13 +6709,13 @@ class TestShowCommand:
         assert review.id is not None
 
         # Show the plan: it should list impl as "Depended on by"
-        result_plan = run_gza("show", str(plan.id), "--project", str(tmp_path))
+        result_plan = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
         assert result_plan.returncode == 0
         assert "Depended on by:" in result_plan.stdout
         assert f"{impl.id}[implement]" in result_plan.stdout
 
         # Show the impl: it should list review as "Depended on by"
-        result_impl = run_gza("show", str(impl.id), "--project", str(tmp_path))
+        result_impl = invoke_gza("show", str(impl.id), "--project", str(tmp_path))
         assert result_impl.returncode == 0
         assert "Depended on by:" in result_impl.stdout
         assert f"{review.id}[review]" in result_impl.stdout
@@ -6773,7 +6733,7 @@ class TestShowCommand:
         task.output_content = long_content
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "line 20" in result.stdout
@@ -6795,7 +6755,7 @@ class TestShowCommand:
         task.output_content = long_content
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--full", "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--full", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "line 51" in result.stdout
@@ -6814,7 +6774,7 @@ class TestShowCommand:
         task.output_content = content_30_lines
         store.update(task)
 
-        result = run_gza("show", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "line 30" in result.stdout
@@ -6853,7 +6813,7 @@ class TestPsCommand:
         registry.register(worker)
 
         # Run ps command
-        result = run_gza("ps", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--project", str(tmp_path))
 
         # Verify task ID is in output
         assert result.returncode == 0
@@ -6957,7 +6917,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -7002,7 +6962,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--all", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "No in-progress tasks" in result.stdout
         assert registry.get("w-prune-on-ps") is None
@@ -7240,7 +7200,7 @@ class TestPsCommand:
         task = store.add("Foreground rebase task", task_type="rebase")
         store.mark_in_progress(task)  # sets running_pid to the live test process
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -7258,7 +7218,7 @@ class TestPsCommand:
         task = store.add("DB-only in-progress task")
         mark_orphaned(store, task)
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -7300,7 +7260,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "2026-01-08 00:01:00 UTC" in result.stdout
         assert "2026-01-08 00:00:00 UTC" not in result.stdout
@@ -7334,7 +7294,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--quiet", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--quiet", "--project", str(tmp_path))
         assert result.returncode == 0
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         assert lines == [str(task.id)]
@@ -7368,7 +7328,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -7404,11 +7364,11 @@ class TestPsCommand:
             )
         )
 
-        table_result = run_gza("ps", "--project", str(tmp_path))
+        table_result = invoke_gza("ps", "--project", str(tmp_path))
         assert table_result.returncode == 0
         assert "failed(startup)" in table_result.stdout
 
-        json_result = run_gza("ps", "--json", "--project", str(tmp_path))
+        json_result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert json_result.returncode == 0
         rows = json.loads(json_result.stdout)
         assert len(rows) == 1
@@ -7478,7 +7438,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
         # Stale running worker (dead PID, no task_id) is pruned automatically
         assert "running-worker" not in result.stdout
@@ -7540,14 +7500,14 @@ class TestPsCommand:
 
         # Default ps: stale running worker (dead PID, no task_id) is pruned;
         # ordinary completed/failed are filtered out
-        result = run_gza("ps", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "running-worker" not in result.stdout
         assert "ordinary-failed-worker" not in result.stdout
         assert "completed-worker" not in result.stdout
 
         # ps --all: includes completed/failed (running was already pruned)
-        result_all = run_gza("ps", "--all", "--project", str(tmp_path))
+        result_all = invoke_gza("ps", "--all", "--project", str(tmp_path))
         assert result_all.returncode == 0
         assert "ordinary-failed-worker" in result_all.stdout
         assert "completed-worker" in result_all.stdout
@@ -7581,7 +7541,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--all", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--all", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         data = json_lib.loads(result.stdout)
         slugs = [r["task"] for r in data]
@@ -7806,12 +7766,12 @@ class TestPsCommand:
             )
         )
 
-        table_result = run_gza("ps", "--project", str(tmp_path))
+        table_result = invoke_gza("ps", "--project", str(tmp_path))
         assert table_result.returncode == 0
         assert "standalone-worker" in table_result.stdout
         assert " - " in table_result.stdout
 
-        json_result = run_gza("ps", "--json", "--project", str(tmp_path))
+        json_result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert json_result.returncode == 0
         rows = json.loads(json_result.stdout)
         assert len(rows) == 1
@@ -7848,7 +7808,7 @@ class TestPsCommand:
                 )
             )
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert [row["worker_id"] for row in rows] == ["w-test-order-a", "w-test-order-b"]
@@ -8055,7 +8015,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", "--recent-minutes", "10", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--recent-minutes", "10", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "No in-progress tasks (use --poll to monitor)" in result.stdout
         assert "w-test-non-poll-recent" not in result.stdout
@@ -8555,7 +8515,7 @@ class TestPsCommand:
             )
         )
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         assert result.returncode == 0
         rows = json.loads(result.stdout)
         assert len(rows) == 1
@@ -8626,7 +8586,7 @@ class TestPsCommand:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("ps", "--json", "--project", str(tmp_path))
+            result = invoke_gza("ps", "--json", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
             registry.remove("w-test-steps-damaged")
@@ -8649,20 +8609,20 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "testproject-1", "--force", "--project", str(tmp_path))
+        result = invoke_gza("delete", "testproject-1", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
 
         # Verify task was deleted
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "No pending tasks" in result.stdout
 
     def test_delete_nonexistent_task(self, tmp_path: Path):
         """Delete command handles nonexistent task."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("delete", "testproject-999999", "--force", "--project", str(tmp_path))
+        result = invoke_gza("delete", "testproject-999999", "--force", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -8673,13 +8633,13 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "testproject-1", "--yes", "--project", str(tmp_path))
+        result = invoke_gza("delete", "testproject-1", "--yes", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
 
         # Verify task was deleted
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "No pending tasks" in result.stdout
 
     def test_delete_with_y_flag(self, tmp_path: Path):
@@ -8688,13 +8648,13 @@ class TestDeleteCommand:
             {"prompt": "Task to delete", "status": "pending"},
         ])
 
-        result = run_gza("delete", "testproject-1", "-y", "--project", str(tmp_path))
+        result = invoke_gza("delete", "testproject-1", "-y", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted task" in result.stdout
 
         # Verify task was deleted
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert "No pending tasks" in result.stdout
 
 
@@ -8751,7 +8711,7 @@ class TestUnmergedReviewStatus:
         review.output_content = review_output
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert expected_text in result.stdout
 
@@ -8767,7 +8727,7 @@ class TestUnmergedReviewStatus:
         review.review_score = 34
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested (34)" in result.stdout
 
@@ -8796,7 +8756,7 @@ class TestUnmergedReviewStatus:
         review.review_score = 67
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested (67)" in result.stdout
 
@@ -8804,7 +8764,7 @@ class TestUnmergedReviewStatus:
         """Unmerged output shows no review status when no review exists."""
         store, task, git = setup_unmerged_env(tmp_path)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review: no review" in result.stdout
         assert "approved" not in result.stdout
@@ -8829,7 +8789,7 @@ class TestUnmergedReviewStatus:
         failed_review_2.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(failed_review_2)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review: no review" in result.stdout
         assert "review: reviewed" not in result.stdout
@@ -8854,7 +8814,7 @@ class TestUnmergedReviewStatus:
         failed_review.output_content = "Verdict: APPROVED"
         store.update(failed_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review: reviewed" in result.stdout
         assert "⚠ changes requested" in result.stdout
@@ -8889,7 +8849,7 @@ class TestUnmergedReviewStatus:
 
         # Run unmerged command - should show approved (most recent)
         with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
 
@@ -8918,7 +8878,7 @@ class TestUnmergedReviewStatus:
         latest_review.report_file = None
         store.update(latest_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" in result.stdout
 
@@ -8950,7 +8910,7 @@ class TestUnmergedReviewStatus:
         latest_review.report_file = None
         store.update(latest_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" not in result.stdout
         assert "review: reviewed" in result.stdout
@@ -8971,7 +8931,7 @@ class TestUnmergedReviewStatus:
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" in result.stdout
 
@@ -8992,7 +8952,7 @@ class TestUnmergedReviewStatus:
 
         # Before improve: should show changes requested
         with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" in result.stdout
 
@@ -9003,7 +8963,7 @@ class TestUnmergedReviewStatus:
 
         # After improve: status should explicitly show stale review
         with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review stale" in result.stdout
         assert "last review" in result.stdout
@@ -9028,7 +8988,7 @@ class TestUnmergedReviewStatus:
         fix_task.same_branch = True
         store.update(fix_task)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
         assert "review: review stale" in normalized
@@ -9065,7 +9025,7 @@ class TestUnmergedReviewStatus:
         current_review.output_content = "Verdict: APPROVED"
         store.update(current_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9091,7 +9051,7 @@ class TestUnmergedReviewStatus:
         review.output_content = "Verdict: APPROVED"
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9119,7 +9079,7 @@ class TestUnmergedReviewStatus:
         review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9142,7 +9102,7 @@ class TestUnmergedReviewStatus:
         assert task.id is not None
         store.clear_review_state(task.id)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
         assert "review: review stale" in normalized
@@ -9179,7 +9139,7 @@ class TestUnmergedReviewStatus:
         store.update(review2)
 
         # The new review's verdict should be shown (it's newer than review_cleared_at)
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "reviewed" in result.stdout
         assert "✓ approved" in result.stdout
@@ -9212,7 +9172,7 @@ class TestUnmergedReviewStatus:
         assert impl.id is not None
         store.clear_review_state(impl.id)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "lineage:" in result.stdout
         assert f"{impl.id}" in result.stdout
@@ -9251,7 +9211,7 @@ class TestUnmergedReviewStatus:
         downstream_impl.same_branch = True
         store.update(downstream_impl)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "lineage:" in result.stdout
         assert f"{impl.id}" in result.stdout
@@ -9310,7 +9270,7 @@ class TestUnmergedReviewStatus:
         sibling_review.output_content = "Verdict: APPROVED"
         store.update(sibling_review)
 
-        unmerged_result = run_gza("unmerged", "--project", str(tmp_path))
+        unmerged_result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert unmerged_result.returncode == 0
 
         unmerged_output = " ".join(unmerged_result.stdout.split())
@@ -9359,10 +9319,10 @@ class TestUnmergedReviewStatus:
         sibling_impl.same_branch = True
         store.update(sibling_impl)
 
-        lineage_result = run_gza("lineage", retry_impl.id, "--project", str(tmp_path))
+        lineage_result = invoke_gza("lineage", retry_impl.id, "--project", str(tmp_path))
         assert lineage_result.returncode == 0
 
-        unmerged_result = run_gza("unmerged", "--project", str(tmp_path))
+        unmerged_result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert unmerged_result.returncode == 0
 
         lineage_output = " ".join(lineage_result.stdout.split())
@@ -9414,7 +9374,7 @@ class TestUnmergedReviewStatus:
         resumed_review.output_content = "Verdict: APPROVED"
         store.update(resumed_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9449,7 +9409,7 @@ class TestUnmergedReviewStatus:
         impl_retry.merge_status = "unmerged"
         store.update(impl_retry)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9488,7 +9448,7 @@ class TestUnmergedReviewStatus:
         newer_review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(newer_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9534,7 +9494,7 @@ class TestUnmergedReviewStatus:
         resumed_impl.session_id = "sess-retry"
         store.update(resumed_impl)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9571,7 +9531,7 @@ class TestUnmergedReviewStatus:
         retry_impl.merge_status = "unmerged"
         store.update(retry_impl)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
@@ -9614,7 +9574,7 @@ class TestUnmergedReviewStatus:
         root_review.output_content = "Verdict: APPROVED"
         store.update(root_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
@@ -9660,7 +9620,7 @@ class TestUnmergedReviewStatus:
         assert root_impl.id is not None
         store.clear_review_state(root_impl.id)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         retry_block = _unmerged_branch_block(result.stdout, "feature/retry")
@@ -9687,7 +9647,7 @@ class TestUnmergedReviewStatus:
         latest_review.output_content = "Verdict: CHANGES_REQUESTED"
         store.update(latest_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Normalize output since "← latest" may wrap across lines at narrow terminal widths
         normalized = " ".join(result.stdout.split())
@@ -9716,7 +9676,7 @@ class TestUnmergedReviewStatus:
         latest_review.output_content = "Verdict: APPROVED_WITH_FOLLOWUPS"
         store.update(latest_review)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
@@ -9759,7 +9719,7 @@ class TestUnmergedSelectionBehavior:
         )
 
         # Failed task is excluded from unmerged output
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Failed but useful task" not in result.stdout
         assert "No unmerged tasks" in result.stdout
@@ -9784,7 +9744,7 @@ class TestUnmergedSelectionBehavior:
         store.update(task2)
 
         # Without --all
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Unmerged task" in result.stdout
         assert "Merged task" not in result.stdout
@@ -9800,7 +9760,7 @@ class TestUnmergedSelectionBehavior:
             merge_status=None,
         )
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "No commits task" not in result.stdout
 
@@ -9819,7 +9779,7 @@ class TestUnmergedSelectionBehavior:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Deleted branch task" in result.stdout
         assert "branch deleted" in result.stdout
@@ -9838,7 +9798,7 @@ class TestUnmergedSelectionBehavior:
 
         git._branches.discard("feature/deleted-local-remote-survivor")
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Deleted local remote survivor task" in result.stdout
@@ -9858,7 +9818,7 @@ class TestUnmergedSelectionBehavior:
 
         git._branches.discard("feature/legacy-deleted-local-remote-survivor")
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
@@ -9880,7 +9840,7 @@ class TestUnmergedSelectionBehavior:
             merge_status=None,
         )
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
         assert "Old task needing migration" in result.stdout
@@ -9888,7 +9848,7 @@ class TestUnmergedSelectionBehavior:
         migrated_task = store.get(task.id)
         assert migrated_task.merge_status == "unmerged"
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
 
@@ -9903,7 +9863,7 @@ class TestUnmergedSelectionBehavior:
 
         git._merged[("feature/stale-unmerged", "main")] = True
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Stale unmerged task" not in result.stdout
         assert "No unmerged tasks" in result.stdout
@@ -9931,7 +9891,7 @@ class TestUnmergedSelectionBehavior:
         )
         store.mark_completed(improve_task, has_commits=True, branch="feature/same-branch-improve")
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Migrating merge status" not in result.stdout
@@ -10118,7 +10078,7 @@ class TestUnmergedSelectionBehavior:
         git._refs.add("origin/main")
         git._merged[("feature/remote-only-merged-task", "origin/main")] = True
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
 
         assert git.fetch_calls == []
         assert result.returncode == 0
@@ -10140,7 +10100,7 @@ class TestUnmergedSelectionBehavior:
         git._refs.add("origin/main")
         git._merged[("feature/remote-only-merged-task", "origin/main")] = True
 
-        result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Remote-only merged task" not in result.stdout
@@ -10165,7 +10125,7 @@ class TestUnmergedSelectionBehavior:
         store.update(task)
 
         git._fetch_error = GitError("network down")
-        result = run_gza("unmerged", "--fetch", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "failed to refresh canonical merge truth" in result.stdout
@@ -10196,7 +10156,7 @@ class TestUnmergedSelectionBehavior:
 
         git._numstat = "2\t0\tfeature.txt\n"
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "+2/-0 LOC, 1 files" in result.stdout
 
@@ -10219,11 +10179,11 @@ class TestUnmergedSelectionBehavior:
         git._branches.add("integration")
         git._merged[("feature/branch-local-task", "integration")] = True
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Branch local task" in result.stdout
 
-        result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
         assert result.returncode == 0
         assert "Showing tasks unmerged relative to integration" in result.stdout
         assert "No unmerged tasks" in result.stdout
@@ -10244,7 +10204,7 @@ class TestUnmergedSelectionBehavior:
         git._branches.add("integration")
         git._branches.discard("feature/deleted-current-target-task")
 
-        result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
 
         assert result.returncode == 0
         assert "Showing tasks unmerged relative to integration" in result.stdout
@@ -10266,7 +10226,7 @@ class TestUnmergedSelectionBehavior:
         git._branches.add("integration")
         git._merged[("feature/target-branch-task", "integration")] = True
 
-        result = run_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Showing tasks unmerged relative to integration" in result.stdout
         assert "No unmerged tasks" in result.stdout
@@ -10287,7 +10247,7 @@ class TestUnmergedSelectionBehavior:
         git._branches.add("integration")
         git._branches.discard("feature/deleted-explicit-target-task")
 
-        result = run_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--target", "integration", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Showing tasks unmerged relative to integration" in result.stdout
@@ -10310,7 +10270,7 @@ class TestUnmergedSelectionBehavior:
         git._branches.add("integration")
         git._merged[("feature/live-target-noop", "integration")] = True
 
-        result = run_gza(
+        result = invoke_gza(
             "unmerged",
             "--target",
             "integration",
@@ -10352,7 +10312,7 @@ class TestUnmergedSelectionBehavior:
         fix_task.same_branch = True
         store.update(fix_task)
 
-        result = run_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
+        result = invoke_gza("unmerged", "--into-current", "--project", str(tmp_path), cwd=tmp_path)
         assert result.returncode == 0
         assert "Implement widget" in result.stdout
         # The fix must not appear as its own branch row — the impl row already represents the branch.
@@ -10387,7 +10347,7 @@ class TestUnmergedImprovedDisplay:
         failed_task.completed_at = datetime.now(UTC)
         store.update(failed_task)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Completed task" in result.stdout
         assert "Failed task" not in result.stdout
@@ -10409,7 +10369,7 @@ class TestUnmergedImprovedDisplay:
         original_mode = db_path.stat().st_mode
         os.chmod(db_path, 0o444)
         try:
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = invoke_gza("unmerged", "--project", str(tmp_path))
         finally:
             os.chmod(db_path, original_mode)
 
@@ -10584,7 +10544,7 @@ class TestUnmergedImprovedDisplay:
         store.update(task)
         assert task.id is not None
 
-        read_only_view = run_gza("unmerged", "--project", str(tmp_path))
+        read_only_view = invoke_gza("unmerged", "--project", str(tmp_path))
         assert read_only_view.returncode == 0
         assert "Migrating merge status" not in read_only_view.stdout
         migrated = store.get(task.id)
@@ -10671,7 +10631,7 @@ class TestUnmergedImprovedDisplay:
         """Unmerged output shows diff stats (files, LOC added/removed)."""
         store, task, git = setup_unmerged_env(tmp_path)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Diff stats should be shown in branch line
         assert "LOC" in result.stdout
@@ -10691,7 +10651,7 @@ class TestUnmergedImprovedDisplay:
         task.diff_lines_removed = 7
         store.update(task)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "+42/-7 LOC, 5 files" not in result.stdout
         assert "+1/-0 LOC, 1 files" in result.stdout
@@ -10716,12 +10676,12 @@ class TestUnmergedImprovedDisplay:
         task.diff_lines_removed = 999
         store.update(task)
 
-        default_result = run_gza("unmerged", "--project", str(tmp_path))
+        default_result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert default_result.returncode == 0
         assert "+999/-999 LOC, 999 files" not in default_result.stdout
         assert "+1/-0 LOC, 1 files" in default_result.stdout
 
-        target_result = run_gza("unmerged", "--target", "target/base", "--project", str(tmp_path))
+        target_result = invoke_gza("unmerged", "--target", "target/base", "--project", str(tmp_path))
         assert target_result.returncode == 0
         assert "+999/-999 LOC, 999 files" not in target_result.stdout
 
@@ -10737,7 +10697,7 @@ class TestUnmergedImprovedDisplay:
         store.update(review)
 
         with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Review should be on its own line starting with "review:"
         assert "review:" in result.stdout
@@ -10755,7 +10715,7 @@ class TestUnmergedImprovedDisplay:
                 pr_url="https://github.com/o/r/pull/123",
             ),
         ):
-            result = run_gza("unmerged", "--project", str(tmp_path))
+            result = invoke_gza("unmerged", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "pr:" in result.stdout
@@ -10765,7 +10725,7 @@ class TestUnmergedImprovedDisplay:
         """Unmerged output shows 'no review' when no review exists."""
         store, task, git = setup_unmerged_env(tmp_path)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review:" in result.stdout
         assert "no review" in result.stdout
@@ -10789,7 +10749,7 @@ class TestUnmergedImprovedDisplay:
         improve.merge_status = "unmerged"
         store.update(improve)
 
-        result = run_gza("unmerged", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Completion date should appear
         assert "2026-02-12" in result.stdout
@@ -11306,7 +11266,7 @@ class TestUnmergedUnifiedQueryOutput:
     def test_unmerged_list_fields_prints_valid_projection_choices(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
 
-        result = run_gza("unmerged", "--list-fields", "--project", str(tmp_path))
+        result = invoke_gza("unmerged", "--list-fields", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("unmerged")
@@ -11320,7 +11280,7 @@ class TestUnmergedUnifiedQueryOutput:
         ("--update",),
     ])
     def test_unmerged_removed_compatibility_flags_error(self, tmp_path: Path, flag_args: tuple[str, ...]) -> None:
-        result = run_gza("unmerged", *flag_args, "--project", str(tmp_path))
+        result = invoke_gza("unmerged", *flag_args, "--project", str(tmp_path))
 
         assert result.returncode != 0
         assert "unrecognized arguments" in result.stderr
@@ -11944,7 +11904,7 @@ class TestNextCommandWithDependencies:
         store.add("Blocked task", depends_on=task1.id)
         store.add("Independent task")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Should show task1 or task3, but not task2
@@ -11960,7 +11920,7 @@ class TestNextCommandWithDependencies:
         task1 = store.add("First task")
         store.add("Blocked task", depends_on=task1.id)
 
-        result = run_gza("next", "--all", "--project", str(tmp_path))
+        result = invoke_gza("next", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "First task" in result.stdout
@@ -11980,7 +11940,7 @@ class TestNextCommandWithDependencies:
         dependent = store.add("Blocked by dropped prereq", depends_on=prereq.id)
         assert dependent.id is not None
 
-        result = run_gza("next", "--all", "--project", str(tmp_path))
+        result = invoke_gza("next", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -11999,7 +11959,7 @@ class TestNextCommandWithDependencies:
         store.add("Blocked task 2", depends_on=task1.id)
         store.add("Independent task")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Should mention 2 blocked tasks
@@ -12015,14 +11975,14 @@ class TestNextCommandWithDependencies:
         store.add("Internal pending", task_type="internal")
         store.add("Runnable task")
 
-        result = run_gza("next", "--project", str(tmp_path))
+        result = invoke_gza("next", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "Runnable task" in result.stdout
         assert "Internal pending" not in result.stdout
         assert "Blocked task" not in result.stdout
         assert "blocked by dependencies" in result.stdout
 
-        result_all = run_gza("next", "--all", "--project", str(tmp_path))
+        result_all = invoke_gza("next", "--all", "--project", str(tmp_path))
         assert result_all.returncode == 0
         assert "Runnable task" in result_all.stdout
         assert "Blocked task" in result_all.stdout
@@ -12298,7 +12258,7 @@ class TestLineageCommand:
             {"prompt": "Design auth system", "status": "completed", "task_type": "plan"},
         ])
 
-        result = run_gza("lineage", "testproject-1", "--project", str(tmp_path))
+        result = invoke_gza("lineage", "testproject-1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Design auth system" in result.stdout
@@ -12339,7 +12299,7 @@ class TestLineageCommand:
         grandchild.completed_at = completed_at
         store.update(grandchild)
 
-        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "2026-01-02 03:04:05 UTC" in result.stdout
@@ -12350,7 +12310,7 @@ class TestLineageCommand:
         """Lineage command returns error for missing task ID."""
         setup_db_with_tasks(tmp_path, [])
 
-        result = run_gza("lineage", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("lineage", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout.lower() or "not found" in result.stderr.lower()
@@ -12374,7 +12334,7 @@ class TestLineageCommand:
         child.completed_at = now
         store.update(child)
 
-        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(child.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         # Arrow marker for the target task
@@ -12399,7 +12359,7 @@ class TestLineageCommand:
         task.completed_at = now
         store.update(task)
 
-        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "MAX_STEPS" in result.stdout
@@ -12419,7 +12379,7 @@ class TestLineageCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "EXTRACTION_ALREADY_MERGED" in result.stdout
@@ -12482,7 +12442,7 @@ class TestLineageCommand:
         review.completed_at = now
         store.update(review)
 
-        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12515,7 +12475,7 @@ class TestLineageCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(child.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12547,7 +12507,7 @@ class TestLineageCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(child.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12579,7 +12539,7 @@ class TestLineageCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        result = run_gza("lineage", str(child.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(child.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12619,7 +12579,7 @@ class TestLineageCommand:
         review.completed_at = datetime.now(UTC)
         store.update(review)
 
-        result = run_gza("lineage", str(child.id), "--children-only", "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(child.id), "--children-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12650,7 +12610,7 @@ class TestLineageCommand:
         review.completed_at = datetime.now(UTC)
         store.update(review)
 
-        result = run_gza("lineage", str(review.id), "--parents-only", "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(review.id), "--parents-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12681,12 +12641,12 @@ class TestLineageCommand:
         child.completed_at = datetime.now(UTC)
         store.update(child)
 
-        parents_only = run_gza("lineage", str(child.id), "--parents-only", "--project", str(tmp_path))
+        parents_only = invoke_gza("lineage", str(child.id), "--parents-only", "--project", str(tmp_path))
 
         assert parents_only.returncode == 0
         assert parents_only.stdout.count(child.id) == 1
 
-        full = run_gza("lineage", str(child.id), "--full", "--project", str(tmp_path))
+        full = invoke_gza("lineage", str(child.id), "--full", "--project", str(tmp_path))
 
         assert full.returncode == 0
         parents_section = full.stdout.split("Children:", 1)[0]
@@ -12714,7 +12674,7 @@ class TestLineageCommand:
         review.completed_at = datetime.now(UTC)
         store.update(review)
 
-        result = run_gza("lineage", str(impl.id), "--full", "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(impl.id), "--full", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12740,7 +12700,7 @@ class TestLineageCommand:
         review.completed_at = datetime.now(UTC)
         store.update(review)
 
-        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12755,7 +12715,7 @@ class TestLineageCommand:
         task = store.add("Exclusive modes", task_type="implement")
         assert task.id is not None
 
-        result = run_gza(
+        result = invoke_gza(
             "lineage",
             str(task.id),
             "--full",
@@ -12785,7 +12745,7 @@ class TestLineageCommand:
         task.num_steps_reported = 5
         store.update(task)
 
-        result = run_gza("lineage", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "UTC" in result.stdout
@@ -12823,7 +12783,7 @@ class TestLineageCommand:
         dep.status = "pending"
         store.update(dep)
 
-        result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(impl.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12850,7 +12810,7 @@ class TestLineageCommand:
         child.completed_at = now
         store.update(child)
 
-        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -12877,7 +12837,7 @@ class TestLineageCommand:
         child.status = "pending"
         store.update(child)
 
-        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
 
         # returncode == 0 catches MarkupError crashes
         assert result.returncode == 0
@@ -12928,7 +12888,7 @@ class TestLineageCommand:
         review.completed_at = now
         store.update(review)
 
-        result = run_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(plan.id), "--project", str(tmp_path))
         assert result.returncode == 0
         output = result.stdout
 
@@ -12977,7 +12937,7 @@ class TestLineageCommand:
         rebase.completed_at = now
         store.update(rebase)
 
-        result = run_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(plan.id), "--project", str(tmp_path))
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
 
@@ -13000,7 +12960,7 @@ class TestLineageCommand:
         impl.slug = "20260212-feature-improve-lineage"
         store.update(impl)
 
-        result = run_gza("lineage", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(impl.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "feature-improve-lineage" in result.stdout
         assert "20260212-feature-improve-lineage" not in result.stdout
@@ -13034,7 +12994,7 @@ class TestLineageCommand:
         review.completed_at = now
         store.update(review)
 
-        result = run_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(plan.id), "--project", str(tmp_path))
         assert result.returncode == 0
 
         lines = [line for line in result.stdout.splitlines() if line.strip()]
@@ -13106,7 +13066,7 @@ class TestLineageCommand:
         great_grandchild.completed_at = now
         store.update(great_grandchild)
 
-        result = run_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
         assert result.returncode == 0
 
         by_id = {
@@ -13369,7 +13329,7 @@ class TestIncompleteCommand:
         task.failure_reason = "TEST_FAILURE"
         store.update(task)
 
-        result = run_gza("incomplete", "--fields", "id", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--fields", "id", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == task.id
@@ -13384,7 +13344,7 @@ class TestIncompleteCommand:
         task.failure_reason = "TEST_FAILURE"
         store.update(task)
 
-        result = run_gza("incomplete", "--fields", "id,prompt", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--fields", "id,prompt", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert f"id: {task.id}" in result.stdout
@@ -13400,7 +13360,7 @@ class TestIncompleteCommand:
         task.failure_reason = "TEST_FAILURE"
         store.update(task)
 
-        result = run_gza("incomplete", "--json", "--fields", "id,status", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--json", "--fields", "id,status", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert json.loads(result.stdout) == [{"id": task.id, "status": "failed"}]
@@ -13415,7 +13375,7 @@ class TestIncompleteCommand:
         task.failure_reason = "TEST_FAILURE"
         store.update(task)
 
-        result = run_gza(
+        result = invoke_gza(
             "incomplete",
             "--json",
             "--fields",
@@ -13453,7 +13413,7 @@ class TestIncompleteCommand:
         orphan.merge_status = "unmerged"
         store.update(orphan)
 
-        result = run_gza("incomplete", "--json", "--last", "0", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--json", "--last", "0", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert json.loads(result.stdout) == []
@@ -13518,7 +13478,7 @@ class TestIncompleteCommand:
         store.update(plan)
 
         with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
-            result = run_gza(
+            result = invoke_gza(
                 "incomplete",
                 "--json",
                 "--fields",
@@ -13643,7 +13603,7 @@ class TestIncompleteCommand:
         store.update(plan)
 
         with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
-            result = run_gza(
+            result = invoke_gza(
                 "incomplete",
                 "--json",
                 "--fields",
@@ -13674,7 +13634,7 @@ class TestIncompleteCommand:
         store.update(explore)
 
         with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
-            result = run_gza(
+            result = invoke_gza(
                 "incomplete",
                 "--json",
                 "--fields",
@@ -13701,7 +13661,7 @@ class TestIncompleteCommand:
         setup_config(tmp_path)
         make_store(tmp_path).add("cli unknown incomplete field", task_type="implement")
 
-        result = run_gza("incomplete", "--fields", "id,nope", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--fields", "id,nope", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "unknown field for gza incomplete: nope" in result.stderr
@@ -13712,7 +13672,7 @@ class TestIncompleteCommand:
     def test_incomplete_cli_list_fields_prints_unresolved_projection_choices(self, tmp_path: Path):
         setup_config(tmp_path)
 
-        result = run_gza("incomplete", "--list-fields", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--list-fields", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("incomplete")
@@ -13722,7 +13682,7 @@ class TestIncompleteCommand:
     def test_incomplete_cli_blocked_by_dropped_list_fields_prints_blocked_projection_choices(self, tmp_path: Path):
         setup_config(tmp_path)
 
-        result = run_gza("incomplete", "--blocked-by-dropped", "--list-fields", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--blocked-by-dropped", "--list-fields", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert result.stdout.strip() == _projection_list_stdout("incomplete", blocked_by_dropped=True)
@@ -13732,7 +13692,7 @@ class TestIncompleteCommand:
         setup_config(tmp_path)
         make_store(tmp_path).add("cli blocked-by-dropped unknown incomplete field", task_type="implement")
 
-        result = run_gza(
+        result = invoke_gza(
             "incomplete",
             "--blocked-by-dropped",
             "--fields",
@@ -13769,7 +13729,7 @@ class TestIncompleteCommand:
         failed.failure_reason = "PREREQUISITE_UNMERGED"
         store.update(failed)
 
-        result = run_gza("incomplete", "-n", "0", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "-n", "0", "--project", str(tmp_path))
 
         assert result.returncode == 0
         lines = [line for line in result.stdout.splitlines() if line.strip()]
@@ -13969,7 +13929,7 @@ class TestIncompleteCommand:
         dependent = store.add("Blocked downstream", task_type="implement", depends_on=plan.id)
         assert dependent.id is not None
 
-        result = run_gza("queue", "--all", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--all", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -13994,7 +13954,7 @@ class TestIncompleteCommand:
         dependent = store.add("Blocked downstream", task_type="implement", depends_on=plan.id)
         assert dependent.id is not None
 
-        blocked_result = run_gza("incomplete", "--project", str(tmp_path))
+        blocked_result = invoke_gza("incomplete", "--project", str(tmp_path))
 
         assert blocked_result.returncode == 0
         blocked_output = " ".join(blocked_result.stdout.split())
@@ -14009,7 +13969,7 @@ class TestIncompleteCommand:
         plan.auto_implement = True
         store.update(plan)
 
-        released_result = run_gza("incomplete", "--project", str(tmp_path))
+        released_result = invoke_gza("incomplete", "--project", str(tmp_path))
 
         assert released_result.returncode == 0
         assert "No unresolved task lineages" in released_result.stdout
@@ -14213,7 +14173,7 @@ class TestLineageOwnerParity:
         assert lineage_result == 0
         assert _lineage_root_id(lineage_captured.out) == impl.id
 
-        history_result = run_gza(
+        history_result = invoke_gza(
             "history",
             "--status",
             "completed",
@@ -14227,7 +14187,7 @@ class TestLineageOwnerParity:
         history_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(history_result.stdout)}
         assert history_rows[rebase.id] == impl.id
 
-        search_result = run_gza(
+        search_result = invoke_gza(
             "search",
             "Branchless rebase",
             "--json",
@@ -14256,7 +14216,7 @@ class TestLineageOwnerParity:
         assert lineage_result == 0
         assert _lineage_root_id(lineage_captured.out) == root.id
 
-        history_result = run_gza(
+        history_result = invoke_gza(
             "history",
             "--status",
             "completed",
@@ -14270,7 +14230,7 @@ class TestLineageOwnerParity:
         history_rows = {row["id"]: row["branch_owner_id"] for row in json.loads(history_result.stdout)}
         assert history_rows[review.id] == root.id
 
-        search_result = run_gza(
+        search_result = invoke_gza(
             "search",
             "same-branch retry",
             "--json",
@@ -14312,7 +14272,7 @@ class TestLineageOwnerParity:
         impl_a = tasks["impl_a"]
         impl_b = tasks["impl_b"]
 
-        history_result = run_gza(
+        history_result = invoke_gza(
             "history",
             "--status",
             "completed",
@@ -14334,7 +14294,7 @@ class TestLineageOwnerParity:
             impl_b.id: impl_b.id,
         }
 
-        search_result = run_gza(
+        search_result = invoke_gza(
             "search",
             "Fanout",
             "--json",
@@ -14412,7 +14372,7 @@ class TestLineageOwnerParity:
         assert lineage_result == 0
         assert _lineage_root_id(lineage_captured.out) == impl.id
 
-        history_result = run_gza(
+        history_result = invoke_gza(
             "history",
             "--json",
             "--fields",
@@ -14433,7 +14393,7 @@ class TestLineageOwnerParity:
             dropped_two.id: impl.id,
         }
 
-        search_result = run_gza(
+        search_result = invoke_gza(
             "search",
             "Parity",
             "--json",
@@ -14460,7 +14420,7 @@ class TestLineageOwnerParity:
         tasks = _setup_lineage_owner_parity_fixture(tmp_path)
         improve = tasks["improve"]
 
-        result = run_gza("ps", "--json", "--project", str(tmp_path))
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
 
         assert result.returncode == 0
         rows = json.loads(result.stdout)

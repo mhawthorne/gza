@@ -14,7 +14,7 @@ import pytest
 from gza.config import Config
 from gza.db import SqliteTaskStore
 
-from .conftest import run_gza, setup_config
+from .conftest import invoke_gza, setup_config
 
 
 def _normalized_markdown_section(path: Path, heading: str) -> str:
@@ -43,7 +43,7 @@ class TestHelpOutput:
         legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
         legacy_store.add("legacy task")
 
-        result = run_gza("migrate", "--import-local-db", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("migrate", "--import-local-db", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "would persist missing project_id in gza.yaml" in result.stdout
@@ -66,7 +66,7 @@ class TestHelpOutput:
         legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
         legacy_store.add("legacy task")
 
-        result = run_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
+        result = invoke_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Persisted project_id" in result.stdout
@@ -98,7 +98,7 @@ class TestHelpOutput:
         cli_main_module = importlib.import_module("gza.cli.main")
         monkeypatch.setattr(cli_main_module, "bootstrap_missing_shared_project_id", _raise_persist_error)
 
-        result = run_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
+        result = invoke_gza("migrate", "--import-local-db", "--yes", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "project_id could not be persisted to" in result.stderr
@@ -120,7 +120,7 @@ class TestHelpOutput:
         legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
         legacy_store.add("legacy task")
 
-        result = run_gza("migrate", "--import-local-db", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("migrate", "--import-local-db", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "would persist missing project_id in gza.yaml" in result.stdout
@@ -132,7 +132,7 @@ class TestHelpOutput:
         """history --help should describe tree/root lineage semantics."""
         setup_config(tmp_path)
 
-        result = run_gza("history", "--help", "--project", str(tmp_path))
+        result = invoke_gza("history", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Render root-deduplicated lineage trees up to N levels" in result.stdout
@@ -142,11 +142,11 @@ class TestHelpOutput:
     def test_queue_and_lifecycle_help_make_command_scope_explicit(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
 
-        next_help = run_gza("next", "--help", "--project", str(tmp_path))
-        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
-        work_help = run_gza("work", "--help", "--project", str(tmp_path))
-        advance_help = run_gza("advance", "--help", "--project", str(tmp_path))
-        watch_help = run_gza("watch", "--help", "--project", str(tmp_path))
+        next_help = invoke_gza("next", "--help", "--project", str(tmp_path))
+        queue_help = invoke_gza("queue", "--help", "--project", str(tmp_path))
+        work_help = invoke_gza("work", "--help", "--project", str(tmp_path))
+        advance_help = invoke_gza("advance", "--help", "--project", str(tmp_path))
+        watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
 
         assert next_help.returncode == 0
         assert "recovery lane and pending lane separately" in next_help.stdout
@@ -163,8 +163,8 @@ class TestHelpOutput:
         """Query help should advertise the explicit negative filter flags."""
         setup_config(tmp_path)
 
-        history_help = run_gza("history", "--help", "--project", str(tmp_path))
-        search_help = run_gza("search", "--help", "--project", str(tmp_path))
+        history_help = invoke_gza("history", "--help", "--project", str(tmp_path))
+        search_help = invoke_gza("search", "--help", "--project", str(tmp_path))
         docs_text = Path("docs/configuration.md").read_text()
 
         assert history_help.returncode == 0
@@ -192,8 +192,8 @@ class TestHelpOutput:
     def test_history_and_search_reject_removed_preset_flag(self, tmp_path):
         setup_config(tmp_path)
 
-        history_result = run_gza("history", "--preset", "json_minimal", "--project", str(tmp_path))
-        search_result = run_gza("search", "needle", "--preset", "json_minimal", "--project", str(tmp_path))
+        history_result = invoke_gza("history", "--preset", "json_minimal", "--project", str(tmp_path))
+        search_result = invoke_gza("search", "needle", "--preset", "json_minimal", "--project", str(tmp_path))
 
         assert history_result.returncode == 2
         assert "unrecognized arguments: --preset json_minimal" in history_result.stderr
@@ -205,7 +205,7 @@ class TestHelpOutput:
         setup_config(tmp_path)
         legacy_flag = "--" + "incomplete"
 
-        result = run_gza("history", legacy_flag, "--project", str(tmp_path))
+        result = invoke_gza("history", legacy_flag, "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert f"unrecognized arguments: {legacy_flag}" in result.stderr
@@ -225,7 +225,7 @@ class TestHelpOutput:
         """Valid flags with invalid values should keep argparse's native invalid-choice wording."""
         setup_config(tmp_path)
 
-        result = run_gza(*argv, "--project", str(tmp_path))
+        result = invoke_gza(*argv, "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert f"invalid choice: '{expected_value}'" in result.stderr
@@ -236,7 +236,7 @@ class TestHelpOutput:
         """Top-level help should advertise `gza incomplete`."""
         setup_config(tmp_path)
 
-        result = run_gza("--help", "--project", str(tmp_path))
+        result = invoke_gza("--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "incomplete" in result.stdout
@@ -289,7 +289,7 @@ class TestHelpOutput:
         """`gza incomplete --help` should show the live projection options."""
         setup_config(tmp_path)
 
-        result = run_gza("incomplete", "--help", "--project", str(tmp_path))
+        result = invoke_gza("incomplete", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Show unresolved task lineages that still need attention" in result.stdout
@@ -334,7 +334,7 @@ class TestHelpOutput:
 
         setup_config(tmp_path)
 
-        help_result = run_gza("advance", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("advance", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
         help_text = " ".join(help_result.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
@@ -348,7 +348,7 @@ class TestHelpOutput:
         assert "Override `max_resume_attempts`: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared resume/retry policy" in docs_text
         assert "Skip auto-resume of failed tasks" not in docs_text
 
-        config_keys = run_gza("config", "keys", "--json", "--project", str(tmp_path))
+        config_keys = invoke_gza("config", "keys", "--json", "--project", str(tmp_path))
         assert config_keys.returncode == 0
         payload = json.loads(config_keys.stdout)
         keyed_entries = {entry["key"]: entry for entry in payload["keys"]}
@@ -361,7 +361,7 @@ class TestHelpOutput:
         """iterate --help should keep lifecycle wording and describe config-backed max-iterations default."""
         setup_config(tmp_path)
 
-        result = run_gza("iterate", "--help", "--project", str(tmp_path))
+        result = invoke_gza("iterate", "--help", "--project", str(tmp_path))
         normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
@@ -381,7 +381,7 @@ class TestHelpOutput:
         """Background iterate workers pass hidden flags; parser must accept them."""
         setup_config(tmp_path)
 
-        result = run_gza(
+        result = invoke_gza(
             "iterate",
             "gza-999999",
             "--worker-id",
@@ -400,7 +400,7 @@ class TestHelpOutput:
         """Attach help/docs should reflect Claude interactive + Codex/Gemini observe-only semantics."""
         setup_config(tmp_path)
 
-        result = run_gza("attach", "--help", "--project", str(tmp_path))
+        result = invoke_gza("attach", "--help", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "interactive for Claude" in result.stdout
         assert "observe-only for Codex/Gemini" in result.stdout
@@ -415,7 +415,7 @@ class TestHelpOutput:
         """Help output should not imply `stats` only supports `reviews`."""
         setup_config(tmp_path)
 
-        result = run_gza("--help", "--project", str(tmp_path))
+        result = invoke_gza("--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Review and iteration analytics" in result.stdout
@@ -436,7 +436,7 @@ class TestHelpOutput:
         """`add --next` contract should explicitly mention bump-to-front urgent-lane behavior."""
         setup_config(tmp_path)
 
-        help_result = run_gza("add", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("add", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
         normalized_help = " ".join(help_result.stdout.split())
         assert "front of the urgent lane" in normalized_help
@@ -463,7 +463,7 @@ class TestHelpOutput:
             ("implement", "implement"),
             ("extract", "extract"),
         ):
-            help_result = run_gza(command, "--help", "--project", str(tmp_path))
+            help_result = invoke_gza(command, "--help", "--project", str(tmp_path))
             assert help_result.returncode == 0
             normalized_help = " ".join(help_result.stdout.split())
             docs_text = _normalized_markdown_section(Path("docs/configuration.md"), section)
@@ -483,7 +483,7 @@ class TestHelpOutput:
         """`edit --help` and docs should both explain the non-pending tag-only contract."""
         setup_config(tmp_path)
 
-        help_result = run_gza("edit", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("edit", "--help", "--project", str(tmp_path))
 
         assert help_result.returncode == 0
         normalized_help = " ".join(help_result.stdout.split())
@@ -526,7 +526,7 @@ class TestHelpOutput:
         expected = "authoritative gradeable review"
 
         for command, section in (("add", "add"), ("implement", "implement")):
-            help_result = run_gza(command, "--help", "--project", str(tmp_path))
+            help_result = invoke_gza(command, "--help", "--project", str(tmp_path))
             assert help_result.returncode == 0
 
             normalized_help = " ".join(help_result.stdout.split()).lower()
@@ -541,7 +541,7 @@ class TestHelpOutput:
         """`sync --help` and docs should keep sync as the broader explicit maintenance surface."""
         setup_config(tmp_path)
 
-        sync_help = run_gza("sync", "--help", "--project", str(tmp_path))
+        sync_help = invoke_gza("sync", "--help", "--project", str(tmp_path))
         assert sync_help.returncode == 0
 
         help_text = " ".join(sync_help.stdout.split())
@@ -566,7 +566,7 @@ class TestHelpOutput:
         """`improve --help` and docs should explain the same-branch push-before-review exception."""
         setup_config(tmp_path)
 
-        improve_help = run_gza("improve", "--help", "--project", str(tmp_path))
+        improve_help = invoke_gza("improve", "--help", "--project", str(tmp_path))
         assert improve_help.returncode == 0
 
         help_text = " ".join(improve_help.stdout.split())
@@ -581,7 +581,7 @@ class TestHelpOutput:
         """`fix --help` and docs should explain the same-branch push-before-review exception."""
         setup_config(tmp_path)
 
-        fix_help = run_gza("fix", "--help", "--project", str(tmp_path))
+        fix_help = invoke_gza("fix", "--help", "--project", str(tmp_path))
         assert fix_help.returncode == 0
 
         help_text = " ".join(fix_help.stdout.split())
@@ -596,8 +596,8 @@ class TestHelpOutput:
         """Help/docs should describe queue tag scope as two lanes, with pending as watch's pickup order."""
         setup_config(tmp_path)
 
-        watch_help = run_gza("watch", "--help", "--project", str(tmp_path))
-        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
+        queue_help = invoke_gza("queue", "--help", "--project", str(tmp_path))
         assert watch_help.returncode == 0
         assert queue_help.returncode == 0
 
@@ -619,7 +619,7 @@ class TestHelpOutput:
     def test_watch_help_mentions_recovery_lane_flags(self, tmp_path):
         """watch --help should advertise the recovery lane controls."""
         setup_config(tmp_path)
-        result = run_gza("watch", "--help", "--project", str(tmp_path))
+        result = invoke_gza("watch", "--help", "--project", str(tmp_path))
         assert result.returncode == 0
         text = " ".join(result.stdout.split())
         assert "default: watch.batch or 2" in text
@@ -635,7 +635,7 @@ class TestHelpOutput:
     def test_watch_help_and_docs_describe_recovery_dry_run_and_attempt_scope(self, tmp_path):
         """watch help/docs should document the recovery dry-run surface and true attempt-cap scope."""
         setup_config(tmp_path)
-        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("watch", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
@@ -669,7 +669,7 @@ class TestHelpOutput:
     def test_watch_help_and_docs_describe_next_pass_drift_restart(self, tmp_path):
         """watch help/docs should describe next-pass drift restart without drain gating."""
         setup_config(tmp_path)
-        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("watch", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
@@ -691,7 +691,7 @@ class TestHelpOutput:
         """watch help/docs should distinguish loop idle exit from silent-worker reconciliation."""
         setup_config(tmp_path)
 
-        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("watch", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
@@ -717,7 +717,7 @@ class TestHelpOutput:
         """Help/docs should keep the two-lane recovery split wording aligned."""
         setup_config(tmp_path)
 
-        help_result = run_gza("watch", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("watch", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
@@ -734,7 +734,7 @@ class TestHelpOutput:
         """`queue --help` and docs should describe capped default output and all-task overrides."""
         setup_config(tmp_path)
 
-        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        queue_help = invoke_gza("queue", "--help", "--project", str(tmp_path))
         assert queue_help.returncode == 0
 
         help_text = " ".join(queue_help.stdout.split())
@@ -749,7 +749,7 @@ class TestHelpOutput:
         """Queue docs/help should consistently describe tag-scoped explicit ordering semantics."""
         setup_config(tmp_path)
 
-        queue_help = run_gza("queue", "--help", "--project", str(tmp_path))
+        queue_help = invoke_gza("queue", "--help", "--project", str(tmp_path))
         assert queue_help.returncode == 0
 
         queue_help_text = " ".join(queue_help.stdout.split())
@@ -764,7 +764,7 @@ class TestHelpOutput:
         """unmerged help/docs should expose the no-fetch default, opt-in fetch, and `--fields` projection."""
         setup_config(tmp_path)
 
-        unmerged_help = run_gza("unmerged", "--help", "--project", str(tmp_path))
+        unmerged_help = invoke_gza("unmerged", "--help", "--project", str(tmp_path))
         assert unmerged_help.returncode == 0
 
         help_text = " ".join(unmerged_help.stdout.split())
@@ -804,7 +804,7 @@ class TestHelpOutput:
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)
 
-        show_help = run_gza("show", "--help", "--project", str(tmp_path))
+        show_help = invoke_gza("show", "--help", "--project", str(tmp_path))
         assert show_help.returncode == 0
 
         help_text = " ".join(show_help.stdout.split())
@@ -818,8 +818,8 @@ class TestHelpOutput:
         """Artifact retrieval and cleanup docs should match parser help for artifact-aware behavior."""
         setup_config(tmp_path)
 
-        artifact_help = run_gza("artifact", "--help", "--project", str(tmp_path))
-        clean_help = run_gza("clean", "--help", "--project", str(tmp_path))
+        artifact_help = invoke_gza("artifact", "--help", "--project", str(tmp_path))
+        clean_help = invoke_gza("clean", "--help", "--project", str(tmp_path))
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert artifact_help.returncode == 0
@@ -871,7 +871,7 @@ class TestHelpOutput:
             ("groups", "rename", "old", "new"),
             ("group", "release"),
         ):
-            result = run_gza(*argv, "--project", str(tmp_path))
+            result = invoke_gza(*argv, "--project", str(tmp_path))
             assert result.returncode == 2
             assert "invalid choice" in result.stderr
             assert "is not a gza command" not in result.stderr
@@ -894,7 +894,7 @@ class TestHelpOutput:
         )
 
         for argv in cases:
-            result = run_gza(*argv, "--project", str(tmp_path))
+            result = invoke_gza(*argv, "--project", str(tmp_path))
             assert result.returncode == 2
             assert f"unrecognized arguments: {legacy_flag}" in result.stderr
             assert "invalid choice" not in result.stderr
@@ -903,7 +903,7 @@ class TestHelpOutput:
         """`search --help` should describe prompt-only substring matching."""
         setup_config(tmp_path)
 
-        result = run_gza("search", "--help", "--project", str(tmp_path))
+        result = invoke_gza("search", "--help", "--project", str(tmp_path))
         normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
@@ -914,7 +914,7 @@ class TestHelpOutput:
         """`improve --help` should advertise fix-task ID resolution support."""
         setup_config(tmp_path)
 
-        result = run_gza("improve", "--help", "--project", str(tmp_path))
+        result = invoke_gza("improve", "--help", "--project", str(tmp_path))
         normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
@@ -924,7 +924,7 @@ class TestHelpOutput:
         """`review --help` should advertise fix-task ID resolution support."""
         setup_config(tmp_path)
 
-        result = run_gza("review", "--help", "--project", str(tmp_path))
+        result = invoke_gza("review", "--help", "--project", str(tmp_path))
         normalized_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
@@ -934,7 +934,7 @@ class TestHelpOutput:
         """`implement --help` should match parser behavior and omit removed --depends-on."""
         setup_config(tmp_path)
 
-        result = run_gza("implement", "--help", "--project", str(tmp_path))
+        result = invoke_gza("implement", "--help", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "--depends-on" not in result.stdout
@@ -944,8 +944,8 @@ class TestHelpOutput:
         """Direct plan-review commands should be documented in parser help."""
         setup_config(tmp_path)
 
-        review_help = run_gza("plan-review", "--help", "--project", str(tmp_path))
-        improve_help = run_gza("plan-improve", "--help", "--project", str(tmp_path))
+        review_help = invoke_gza("plan-review", "--help", "--project", str(tmp_path))
+        improve_help = invoke_gza("plan-improve", "--help", "--project", str(tmp_path))
 
         assert review_help.returncode == 0
         assert improve_help.returncode == 0
@@ -962,7 +962,7 @@ class TestHelpOutput:
         """`extract --help` and docs should document commit-based extraction and background ordering semantics."""
         setup_config(tmp_path)
 
-        help_result = run_gza("extract", "--help", "--project", str(tmp_path))
+        help_result = invoke_gza("extract", "--help", "--project", str(tmp_path))
 
         assert help_result.returncode == 0
         help_text = " ".join(help_result.stdout.split())
@@ -1056,7 +1056,7 @@ class TestCommandAliases:
         setup_config(tmp_path)
         retired = "sta" "tus"
 
-        result = run_gza(retired, "--all", "--project", str(tmp_path))
+        result = invoke_gza(retired, "--all", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert f"invalid choice: '{retired}'" in result.stderr
@@ -1066,7 +1066,7 @@ class TestCommandAliases:
         """Removed `cycle` command should now fail at parser validation."""
         setup_config(tmp_path)
 
-        result = run_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))
+        result = invoke_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "invalid choice: 'cycle'" in result.stderr
@@ -1076,7 +1076,7 @@ class TestCommandAliases:
         """Removed `import` command should now fail at parser validation."""
         setup_config(tmp_path)
 
-        result = run_gza("import", "tasks.yaml", "--project", str(tmp_path))
+        result = invoke_gza("import", "tasks.yaml", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "invalid choice: 'import'" in result.stderr
@@ -1086,7 +1086,7 @@ class TestCommandAliases:
         """Removed `refresh` command should now fail at parser validation."""
         setup_config(tmp_path)
 
-        result = run_gza("refresh", "--project", str(tmp_path))
+        result = invoke_gza("refresh", "--project", str(tmp_path))
 
         assert result.returncode == 2
         assert "invalid choice: 'refresh'" in result.stderr
@@ -1623,7 +1623,7 @@ class TestIterateMaxIterationsValidation:
     @pytest.mark.parametrize("value", ["0", "-1"])
     def test_iterate_rejects_non_positive_max_iterations(self, tmp_path, value):
         setup_config(tmp_path)
-        result = run_gza("iterate", "testproject-1", "--max-iterations", value, "--project", str(tmp_path))
+        result = invoke_gza("iterate", "testproject-1", "--max-iterations", value, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "--max-iterations must be a positive integer" in result.stdout

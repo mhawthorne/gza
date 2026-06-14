@@ -14,7 +14,7 @@ import pytest
 from gza.cli import _build_step_timeline, _format_log_entry, _LiveLogPrinter, _load_log_file_entries
 from gza.db import SqliteTaskStore
 
-from .conftest import LOG_FIXTURES_DIR, make_store, run_gza, setup_config
+from .conftest import LOG_FIXTURES_DIR, make_store, invoke_gza, setup_config
 
 
 class TestLogCommand:
@@ -24,7 +24,7 @@ class TestLogCommand:
         """Help text should describe exact requested target behavior for --follow."""
         setup_config(tmp_path)
 
-        result = run_gza("log", "--help", "--project", str(tmp_path))
+        result = invoke_gza("log", "--help", "--project", str(tmp_path))
         help_output = " ".join(result.stdout.split())
 
         assert result.returncode == 0
@@ -63,7 +63,7 @@ class TestLogCommand:
         }
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Task completed successfully!" in result.stdout
@@ -90,7 +90,7 @@ class TestLogCommand:
         log_file = log_dir / "test.log"
         log_file.write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Finished." in result.stdout
@@ -116,7 +116,7 @@ class TestLogCommand:
             json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "runner info"})
         )
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "assistant says hi" in result.stdout
@@ -157,7 +157,7 @@ class TestLogCommand:
             )
         )
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "conversation without timestamp" in result.stdout
@@ -181,7 +181,7 @@ class TestLogCommand:
             json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "ops only"})
         )
 
-        result = run_gza("log", str(task.id), "--conversation-only", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--conversation-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "transcript only" in result.stdout
@@ -205,7 +205,7 @@ class TestLogCommand:
             json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "ops visible"})
         )
 
-        result = run_gza("log", str(task.id), "--ops-only", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--ops-only", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "ops visible" in result.stdout
@@ -254,7 +254,7 @@ class TestLogCommand:
         if flag is not None:
             args.append(flag)
         args.extend(["--project", str(tmp_path)])
-        result = run_gza(*args)
+        result = invoke_gza(*args)
 
         assert result.returncode == 0
         assert "provider credentials missing" in result.stdout
@@ -278,7 +278,7 @@ class TestLogCommand:
             json.dumps({"type": "gza", "subtype": "info", "timestamp": "2026-05-08T10:00:01Z", "message": "raw ops"})
         )
 
-        result = run_gza("log", str(task.id), "--raw", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--raw", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert '"stream": "conversation"' in result.stdout
@@ -315,7 +315,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "error_max_turns" in result.stdout
@@ -382,7 +382,7 @@ class TestLogCommand:
             )
         )
 
-        result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason: MAX_TURNS" in result.stdout
@@ -454,8 +454,8 @@ class TestLogCommand:
             )
         )
 
-        show_result = run_gza("show", str(task.id), "--project", str(tmp_path))
-        log_result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+        show_result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+        log_result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
 
         assert show_result.returncode == 0
         assert log_result.returncode == 0
@@ -556,8 +556,8 @@ class TestLogCommand:
             )
         )
 
-        show_result = run_gza("show", str(task.id), "--project", str(tmp_path))
-        log_result = run_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+        show_result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+        log_result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
 
         assert show_result.returncode == 0
         assert log_result.returncode == 0
@@ -579,7 +579,7 @@ class TestLogCommand:
         task.log_file = ".gza/logs/nonexistent.log"
         store.update(task)
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
@@ -607,7 +607,7 @@ class TestLogCommand:
         ]
         log_file.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         # Should show formatted entries instead of failing
         assert result.returncode == 0
@@ -634,7 +634,7 @@ class TestLogCommand:
         ]
         inferred_log.write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recovered via inferred path" in result.stdout
@@ -653,7 +653,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "explicit.log").write_text(json.dumps({"type": "result", "result": "explicit"}))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 0
         assert "explicit" in result.stdout
 
@@ -702,7 +702,7 @@ class TestLogCommand:
             json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
         ]))
 
-        result = run_gza("log", str(original.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(original.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Resolved to latest run attempt" not in result.stdout
@@ -747,7 +747,7 @@ class TestLogCommand:
             json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
         ]))
 
-        result = run_gza("log", str(retry_a.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(retry_a.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Resolved to latest run attempt" not in result.stdout
@@ -794,7 +794,7 @@ class TestLogCommand:
             json.dumps({"type": "result", "subtype": "success", "result": "done", "num_steps": 1, "duration_ms": 1000, "total_cost_usd": 0.01}),
         ]))
 
-        result = run_gza("log", "--slug", "20260227-chain-a", "--project", str(tmp_path))
+        result = invoke_gza("log", "--slug", "20260227-chain-a", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Resolved to latest run attempt" not in result.stdout
@@ -843,7 +843,7 @@ class TestLogCommand:
         (log_dir / "review.log").write_text(json.dumps({"type": "result", "result": "review output"}))
         (log_dir / "improve.log").write_text(json.dumps({"type": "result", "result": "improve output"}))
 
-        result = run_gza("log", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Resolved to latest run attempt" not in result.stdout
@@ -873,7 +873,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "retry-existing.log").write_text(json.dumps({"type": "result", "result": "retry output"}))
 
-        result = run_gza("log", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(root.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Log file not found" in result.stdout
@@ -898,7 +898,7 @@ class TestLogCommand:
         ]
         (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Entry text should render" in result.stdout
@@ -1253,7 +1253,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
-        result = run_gza("log", str(task.id), "--steps", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--steps", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1]" in result.stdout
@@ -1274,7 +1274,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "step_schema_v2_like.jsonl").read_text())
 
-        result = run_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1]" in result.stdout
@@ -1295,7 +1295,7 @@ class TestLogCommand:
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "test.log").write_text((LOG_FIXTURES_DIR / "legacy_turn_only_codex.jsonl").read_text())
 
-        result = run_gza("log", str(task.id), "--turns", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--turns", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1] Pre-message tool activity" in result.stdout
@@ -1333,7 +1333,7 @@ class TestLogCommand:
             )
         )
 
-        result = run_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--steps-verbose", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1] Investigating" in result.stdout
@@ -1371,7 +1371,7 @@ class TestLogCommand:
             )
         )
 
-        result = run_gza("log", str(task.id), flag, "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), flag, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "[Step S1] Visible step" in result.stdout
@@ -1408,7 +1408,7 @@ class TestLogCommand:
             )
         )
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "| Step 1 |" in result.stdout
@@ -1425,7 +1425,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("log", "testproject-zzz", "--project", str(tmp_path))
+        result = invoke_gza("log", "testproject-zzz", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Invalid task ID" in result.stdout or "Invalid task ID" in result.stderr
@@ -1438,7 +1438,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("log", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("log", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -1462,7 +1462,7 @@ class TestLogCommand:
         log_data = {"type": "result", "result": "Slug lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--slug", "20260108-test-slug", "--project", str(tmp_path))
+        result = invoke_gza("log", "--slug", "20260108-test-slug", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Slug lookup works!" in result.stdout
@@ -1486,7 +1486,7 @@ class TestLogCommand:
         log_data = {"type": "result", "result": "Partial match works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--slug", "partial-slug", "--project", str(tmp_path))
+        result = invoke_gza("log", "--slug", "partial-slug", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Partial match works!" in result.stdout
@@ -1499,7 +1499,7 @@ class TestLogCommand:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         make_store(tmp_path)
 
-        result = run_gza("log", "--slug", "nonexistent-slug", "--project", str(tmp_path))
+        result = invoke_gza("log", "--slug", "nonexistent-slug", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "No task found matching slug" in result.stdout
@@ -1543,7 +1543,7 @@ class TestLogCommand:
         log_data = {"type": "result", "result": "Worker lookup works!", "duration_ms": 1000, "num_turns": 1, "total_cost_usd": 0.01}
         log_file.write_text(json.dumps(log_data))
 
-        result = run_gza("log", "--worker", worker_id, "--project", str(tmp_path))
+        result = invoke_gza("log", "--worker", worker_id, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Worker lookup works!" in result.stdout
@@ -1560,7 +1560,7 @@ class TestLogCommand:
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
 
-        result = run_gza("log", "--worker", "w-nonexistent", "--project", str(tmp_path))
+        result = invoke_gza("log", "--worker", "w-nonexistent", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Worker 'w-nonexistent' not found" in result.stdout
@@ -1595,7 +1595,7 @@ class TestLogCommand:
         startup_log = tmp_path / ".gza" / "workers" / "w-test-startup-failure-startup.log"
         startup_log.write_text("Docker daemon is not running")
 
-        result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
+        result = invoke_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "startup log" in result.stdout
@@ -1629,7 +1629,7 @@ class TestLogCommand:
         startup_log = tmp_path / ".gza" / "workers" / "w-test-worker-only-failed-startup.log"
         startup_log.write_text(json.dumps({"type": "result", "result": "startup-log-result"}))
 
-        result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
+        result = invoke_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Status: failed" in result.stdout
@@ -1671,7 +1671,7 @@ class TestLogCommand:
         startup_log = tmp_path / ".gza" / "workers" / "w-test-main-wins-startup.log"
         startup_log.write_text("startup-log-output")
 
-        result = run_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
+        result = invoke_gza("log", "--worker", worker.worker_id, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "main-log-output" in result.stdout
@@ -1713,9 +1713,9 @@ class TestLogCommand:
         startup_log.write_text("startup-output-from-worker")
 
         if query_mode == "task_id":
-            result = run_gza("log", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
         else:
-            result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
+            result = invoke_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "startup log" in result.stdout
@@ -1760,9 +1760,9 @@ class TestLogCommand:
         startup_log.write_text("startup-output-should-not-be-used")
 
         if query_mode == "task_id":
-            result = run_gza("log", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
         else:
-            result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
+            result = invoke_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "task-main-output" in result.stdout
@@ -1801,9 +1801,9 @@ class TestLogCommand:
         registry.register(worker)
 
         if query_mode == "task_id":
-            result = run_gza("log", str(task.id), "--project", str(tmp_path))
+            result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
         else:
-            result = run_gza("log", "--slug", task.slug, "--project", str(tmp_path))
+            result = invoke_gza("log", "--slug", task.slug, "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "Error: Log file not found at" in result.stdout
@@ -1826,7 +1826,7 @@ class TestLogCommand:
         log_file = log_dir / "test-startup-error.log"
         log_file.write_text("exec /usr/local/bin/docker-entrypoint.sh: argument list too long")
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "exec /usr/local/bin/docker-entrypoint.sh: argument list too long" in result.stdout
@@ -1835,7 +1835,7 @@ class TestLogCommand:
         """Log command defaults to task ID lookup without any flag."""
         setup_config(tmp_path)
 
-        result = run_gza("log", "testproject-999999", "--project", str(tmp_path))
+        result = invoke_gza("log", "testproject-999999", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "not found" in result.stdout
@@ -1923,7 +1923,7 @@ class TestFormatLogEntry:
         ]
         (log_dir / "test.log").write_text("\n".join(json.dumps(line) for line in lines))
 
-        result = run_gza("log", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("log", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Branch: feat/test" in result.stdout

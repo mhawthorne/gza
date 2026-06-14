@@ -30,7 +30,7 @@ from gza.lineage_query import LineageOwnerRow
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
 from gza.worktree_roots import managed_worktree_root_paths
 
-from .conftest import make_store, run_gza, setup_config
+from .conftest import make_store, invoke_gza, setup_config
 
 
 def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
@@ -637,7 +637,7 @@ def test_checkout_passes_managed_roots_to_cleanup(tmp_path: Path) -> None:
         patch("gza.cli.git_ops.Git", return_value=git),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None) as mock_cleanup,
     ):
-        result = run_gza("checkout", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("checkout", str(task.id), "--project", str(tmp_path))
 
     assert result.returncode == 0
     config = Config.load(tmp_path)
@@ -2688,7 +2688,7 @@ def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_arti
             side_effect=AssertionError("background worker should not spawn"),
         ),
     ):
-        result = run_gza("rebase", str(impl_task.id), "--background", "--project", str(tmp_path))
+        result = invoke_gza("rebase", str(impl_task.id), "--background", "--project", str(tmp_path))
 
     assert result.returncode == 1
     assert "creator boom" in result.stderr
@@ -2740,7 +2740,7 @@ def test_rebase_background_reuses_prepared_child_without_second_startup_pass(tmp
         patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=prepare_once) as prepare_task,
         patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
     ):
-        result = run_gza("rebase", str(impl_task.id), "--background", "--project", str(tmp_path))
+        result = invoke_gza("rebase", str(impl_task.id), "--background", "--project", str(tmp_path))
 
     assert result.returncode == 0
     assert prepare_task.call_count == 1

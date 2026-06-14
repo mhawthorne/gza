@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import yaml
-from tests.helpers.cli import run_gza
+from tests.helpers.cli import invoke_gza
 
 
 def setup_config(tmp_path: Path) -> None:
@@ -176,7 +176,7 @@ class TestSkillsInstallClaudeTarget:
     def test_list_available_skills(self, tmp_path: Path):
         """List command shows all available skills."""
         setup_config(tmp_path)
-        result = run_gza("skills-install", "--target", "claude", "--list", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--target", "claude", "--list", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Available skills:" in result.stdout
@@ -188,7 +188,7 @@ class TestSkillsInstallClaudeTarget:
     def test_install_all_skills(self, tmp_path: Path):
         """Install all skills to a project."""
         setup_config(tmp_path)
-        result = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Installing" in result.stdout
@@ -205,7 +205,7 @@ class TestSkillsInstallClaudeTarget:
     def test_install_dev_skills(self, tmp_path: Path):
         """Install with --dev includes non-public skills."""
         setup_config(tmp_path)
-        result = run_gza("skills-install", "--target", "claude", "--dev", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--target", "claude", "--dev", "--project", str(tmp_path))
 
         assert result.returncode == 0
         skills_dir = tmp_path / ".claude" / "skills"
@@ -214,7 +214,7 @@ class TestSkillsInstallClaudeTarget:
     def test_dev_skills_excluded_by_default(self, tmp_path: Path):
         """Non-public skills are not installed without --dev."""
         setup_config(tmp_path)
-        result = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
 
         assert result.returncode == 0
         skills_dir = tmp_path / ".claude" / "skills"
@@ -224,7 +224,7 @@ class TestSkillsInstallClaudeTarget:
     def test_install_specific_skills(self, tmp_path: Path):
         """Install only specific skills."""
         setup_config(tmp_path)
-        result = run_gza("skills-install", "--target", "claude", "gza-task-add", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--target", "claude", "gza-task-add", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Installing 1 skill(s)" in result.stdout
@@ -240,11 +240,11 @@ class TestSkillsInstallClaudeTarget:
         setup_config(tmp_path)
 
         # Install skills first time
-        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         # Try to install again without --force
-        result2 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result2 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "skipped" in result2.stdout
         assert "up to date" in result2.stdout
@@ -253,14 +253,14 @@ class TestSkillsInstallClaudeTarget:
         """Outdated skills are reported with an update hint when --update is not used."""
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-task-add" / "SKILL.md"
         original_content = skill_file.read_text()
         skill_file.write_text(f"{original_content}\n# local edit\n")
 
-        result2 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result2 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "update available" in result2.stdout
         assert "use --update" in result2.stdout
@@ -269,14 +269,14 @@ class TestSkillsInstallClaudeTarget:
         """--update refreshes outdated installed skills to bundled content."""
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-task-add" / "SKILL.md"
         original_content = skill_file.read_text()
         skill_file.write_text(f"{original_content}\n# local edit\n")
 
-        result2 = run_gza("skills-install", "--target", "claude", "--update", "--project", str(tmp_path))
+        result2 = invoke_gza("skills-install", "--target", "claude", "--update", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "updated 1" in result2.stdout
         assert "(updated)" in result2.stdout
@@ -288,7 +288,7 @@ class TestSkillsInstallClaudeTarget:
 
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "gza-task-review", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "gza-task-review", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-task-review" / "SKILL.md"
@@ -304,7 +304,7 @@ class TestSkillsInstallClaudeTarget:
             "git diff main...<impl_branch>\n"
         )
 
-        result2 = run_gza(
+        result2 = invoke_gza(
             "skills-install",
             "--target",
             "claude",
@@ -330,7 +330,7 @@ class TestSkillsInstallClaudeTarget:
 
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "gza-rebase", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "gza-rebase", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-rebase" / "SKILL.md"
@@ -346,7 +346,7 @@ class TestSkillsInstallClaudeTarget:
             "Use `origin/main` (default) and fetch when needed.\n"
         )
 
-        result2 = run_gza(
+        result2 = invoke_gza(
             "skills-install",
             "--target",
             "claude",
@@ -373,7 +373,7 @@ class TestSkillsInstallClaudeTarget:
 
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "gza-test-and-fix", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "gza-test-and-fix", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-test-and-fix" / "SKILL.md"
@@ -389,7 +389,7 @@ class TestSkillsInstallClaudeTarget:
             "If that fails, fall back to `gza.yaml`.\n"
         )
 
-        result2 = run_gza(
+        result2 = invoke_gza(
             "skills-install",
             "--target",
             "claude",
@@ -415,7 +415,7 @@ class TestSkillsInstallClaudeTarget:
 
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "gza-code-review-full", "--dev", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "gza-code-review-full", "--dev", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-code-review-full" / "SKILL.md"
@@ -434,7 +434,7 @@ class TestSkillsInstallClaudeTarget:
             f"| file | {stale_location} | open() without context manager |\n"
         )
 
-        result2 = run_gza(
+        result2 = invoke_gza(
             "skills-install",
             "--target",
             "claude",
@@ -460,7 +460,7 @@ class TestSkillsInstallClaudeTarget:
 
         setup_config(tmp_path)
 
-        result1 = run_gza("skills-install", "--target", "claude", "gza-task-fix", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "gza-task-fix", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         skill_file = tmp_path / ".claude" / "skills" / "gza-task-fix" / "SKILL.md"
@@ -479,7 +479,7 @@ class TestSkillsInstallClaudeTarget:
             "- No automatic rebase. If the stale-branch recommendation fires, report it in the ledger and final handoff.\n"
         )
 
-        result2 = run_gza(
+        result2 = invoke_gza(
             "skills-install",
             "--target",
             "claude",
@@ -507,7 +507,7 @@ class TestSkillsInstallClaudeTarget:
         setup_config(tmp_path)
 
         skill_names = ["gza-task-fix", "gza-task-improve", "gza-task-review"]
-        result1 = run_gza("skills-install", "--target", "claude", *skill_names, "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", *skill_names, "--project", str(tmp_path))
         assert result1.returncode == 0
 
         stale_contents = {
@@ -548,7 +548,7 @@ class TestSkillsInstallClaudeTarget:
             skill_file = tmp_path / ".claude" / "skills" / skill_name / "SKILL.md"
             skill_file.write_text(stale_content)
 
-        result2 = run_gza(
+        result2 = invoke_gza(
             "skills-install",
             "--target",
             "claude",
@@ -574,7 +574,7 @@ class TestSkillsInstallClaudeTarget:
         setup_config(tmp_path)
 
         # Install skills first time
-        result1 = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result1 = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result1.returncode == 0
 
         # Modify one of the skills
@@ -583,7 +583,7 @@ class TestSkillsInstallClaudeTarget:
         skill_file.write_text("Modified content")
 
         # Install again with --force
-        result2 = run_gza("skills-install", "--target", "claude", "--force", "--project", str(tmp_path))
+        result2 = invoke_gza("skills-install", "--target", "claude", "--force", "--project", str(tmp_path))
         assert result2.returncode == 0
         assert "skipped" not in result2.stdout
 
@@ -593,7 +593,7 @@ class TestSkillsInstallClaudeTarget:
     def test_install_nonexistent_skill(self, tmp_path: Path):
         """Error when requesting a skill that doesn't exist."""
         setup_config(tmp_path)
-        result = run_gza(
+        result = invoke_gza(
             "skills-install", "--target", "claude", "nonexistent-skill", "--project", str(tmp_path)
         )
 
@@ -609,7 +609,7 @@ class TestSkillsInstallClaudeTarget:
         skills_dir = tmp_path / ".claude" / "skills"
         assert not skills_dir.exists()
 
-        result = run_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--target", "claude", "--project", str(tmp_path))
         assert result.returncode == 0
         assert skills_dir.exists()
 
@@ -620,7 +620,7 @@ class TestSkillsInstallClaudeTarget:
         setup_config(project_dir)
 
         # Run from tmp_path but target project_dir
-        result = run_gza("skills-install", "--target", "claude", "--project", str(project_dir))
+        result = invoke_gza("skills-install", "--target", "claude", "--project", str(project_dir))
         assert result.returncode == 0
 
         # Verify skills were created in project_dir
@@ -635,7 +635,7 @@ class TestSkillsInstallCommand:
     def test_list_available_skills(self, tmp_path: Path):
         """List command works via flat skills-install command."""
         setup_config(tmp_path)
-        result = run_gza("skills-install", "--list", "--project", str(tmp_path))
+        result = invoke_gza("skills-install", "--list", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Available skills:" in result.stdout
@@ -647,7 +647,7 @@ class TestSkillsInstallCommand:
         """skills-install defaults to both claude and codex targets."""
         setup_config(tmp_path)
         codex_home = tmp_path / "codex-home"
-        result = run_gza("skills-install", "--project", str(tmp_path), env={"CODEX_HOME": str(codex_home)})
+        result = invoke_gza("skills-install", "--project", str(tmp_path), env={"CODEX_HOME": str(codex_home)})
 
         assert result.returncode == 0
         assert "[claude]" in result.stdout
@@ -664,7 +664,7 @@ class TestSkillsInstallCommand:
         """Target filter installs only to the requested runtime directory."""
         setup_config(tmp_path)
         codex_home = tmp_path / "codex-home"
-        result = run_gza(
+        result = invoke_gza(
             "skills-install",
             "--target",
             "codex",
@@ -684,7 +684,7 @@ class TestSkillsInstallCommand:
         """Gemini target installs skills into GEMINI_HOME runtime directory."""
         setup_config(tmp_path)
         gemini_home = tmp_path / "gemini-home"
-        result = run_gza(
+        result = invoke_gza(
             "skills-install",
             "--target",
             "gemini",

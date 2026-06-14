@@ -7,12 +7,35 @@ from pathlib import Path
 
 import pytest
 
+from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
 from gza.test_harness import register_sigterm_faulthandler
 
-UNIT_TEST_TIMEOUT_MS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_MS", "1000"))
+# NOTE: 2000ms is a short-term bridge. A 1s wall-clock per-test budget is
+# inherently flaky under xdist contention (wall time inflates when workers
+# compete for CPU). The durable fix is a CPU-time latency guard
+# (time.process_time delta) plus a generous wall-clock hang-guard; see the
+# follow-up task. Until then, 2s gives the heaviest in-process lifecycle tests
+# (~0.8s solo) enough headroom to stop intermittently timing out.
+UNIT_TEST_TIMEOUT_MS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_MS", "2000"))
 UNIT_TEST_TIMEOUT_SECONDS = UNIT_TEST_TIMEOUT_MS / 1000
 
 register_sigterm_faulthandler()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Fail fast if shell-backed CLI coverage drifts into the unit suite."""
+    del session
+    tests_root = DEFAULT_PATHS[0]
+    violations = find_unit_suite_boundary_violations(tests_root)
+    if not violations:
+        return
+
+    formatted = "\n".join(f"  - {violation.format()}" for violation in violations)
+    raise pytest.UsageError(
+        "Unit-suite boundary violation(s) detected. Use invoke_gza for in-process CLI coverage and "
+        "move any subprocess-backed test to tests_functional/.\n"
+        f"{formatted}"
+    )
 
 
 def pytest_collection_modifyitems(items):
