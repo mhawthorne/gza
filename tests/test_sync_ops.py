@@ -1,6 +1,4 @@
 """Tests for branch-scoped sync operations."""
-
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -1897,49 +1895,3 @@ def test_reconcile_branch_merge_truth_warns_and_fails_closed_when_commit_count_u
     # Fail-closed: preserves "unmerged" (from task.merge_status) rather than guessing "empty".
     assert results[0].merge_status == "unmerged"
     assert any("could not determine unique commit count" in w for w in results[0].warnings)
-
-
-def _init_git_repo(repo_dir: Path) -> None:
-    """Set up a minimal real git repo for functional tests."""
-    for cmd in (
-        ["git", "init", "-b", "main"],
-        ["git", "config", "user.name", "Test"],
-        ["git", "config", "user.email", "test@example.com"],
-    ):
-        subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
-    (repo_dir / "readme.txt").write_text("initial\n")
-    subprocess.run(["git", "add", "readme.txt"], cwd=repo_dir, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_dir, check=True, capture_output=True)
-
-
-def test_reconcile_branch_merge_truth_functional_never_diverged_branch_classifies_as_empty(tmp_path):
-    """Functional test: a branch created at main HEAD with no commits reconciles to 'empty'."""
-    repo_dir = tmp_path / "repo"
-    repo_dir.mkdir()
-    _init_git_repo(repo_dir)
-
-    # Create a branch at the same commit as main — no commits ever added to it.
-    subprocess.run(
-        ["git", "checkout", "-b", "feature/never-diverged"],
-        cwd=repo_dir,
-        check=True,
-        capture_output=True,
-    )
-    # Switch back to main so HEAD is on main during reconciliation.
-    subprocess.run(["git", "checkout", "main"], cwd=repo_dir, check=True, capture_output=True)
-
-    store = SqliteTaskStore(tmp_path / "test.db")
-    task = _completed_branch_task(store, "Task", "feature/never-diverged")
-    cohort = BranchCohort(branch=task.branch, tasks=(task,))
-
-    git = Git(repo_dir)
-    results = reconcile_branch_merge_truth(
-        git,
-        [cohort],
-        target_branch="main",
-        include_diff_stats=False,
-    )
-
-    # A branch that carries no unique work should classify as 'empty', not 'merged'.
-    assert results[0].merge_status == "empty"
-    assert "marked merged" not in results[0].actions

@@ -11,6 +11,7 @@ import pytest
 
 _DIRECT_GIT_RUN_CALL = re.compile(r"\.\s*_run\s*\(")
 _CLI_SUBPROCESS_RUN_CALL = re.compile(r"\bsubprocess\s*\.\s*run\s*\(")
+_GIT_SUBPROCESS_CALL = re.compile(r"\bsubprocess\s*\.\s*(?:run|Popen|check_call|check_output)\s*\(")
 
 
 def _has_direct_git_run_candidate(source: str) -> bool:
@@ -24,6 +25,13 @@ def _has_cli_subprocess_candidate(source: str) -> bool:
         or '"gza"' in source
         or "'uv'" in source
         or '"uv"' in source
+    )
+
+
+def _has_git_subprocess_candidate(source: str) -> bool:
+    return _GIT_SUBPROCESS_CALL.search(source) is not None and (
+        "'git'" in source
+        or '"git"' in source
     )
 
 
@@ -55,11 +63,13 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
         source = test_file.read_text()
         has_direct_git_run_call = _has_direct_git_run_candidate(source)
         has_cli_subprocess_call = _has_cli_subprocess_candidate(source)
+        has_git_subprocess_call = _has_git_subprocess_candidate(source)
         has_cli_subprocess_helper = "run_gza_subprocess" in source
         has_tests_functional_import = "tests_functional" in source
         if not (
             has_direct_git_run_call
             or has_cli_subprocess_call
+            or has_git_subprocess_call
             or has_cli_subprocess_helper
             or has_tests_functional_import
         ):
@@ -68,7 +78,7 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
         module = ast.parse(source, filename=str(test_file))
         parent_map = (
             {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
-            if has_direct_git_run_call
+            if has_direct_git_run_call or has_git_subprocess_call
             else {}
         )
 
@@ -77,25 +87,63 @@ def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
                 continue
             if (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run"
+                and node.func.attr in {"run", "Popen", "check_call", "check_output"}
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "subprocess"
                 and node.args
-                and isinstance(node.args[0], ast.List)
             ):
-                parts: list[str | None] = []
-                for elt in node.args[0].elts:
-                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                        parts.append(elt.value)
-                    elif isinstance(elt, ast.Attribute) and isinstance(elt.value, ast.Name) and elt.value.id == "sys":
-                        parts.append(f"sys.{elt.attr}")
-                    else:
-                        parts.append(None)
+                command_arg = node.args[0]
+                parts: list[str | None] | None = None
+                if isinstance(command_arg, ast.List):
+                    parts = []
+                    for elt in command_arg.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            parts.append(elt.value)
+                        elif (
+                            isinstance(elt, ast.Attribute)
+                            and isinstance(elt.value, ast.Name)
+                            and elt.value.id == "sys"
+                        ):
+                            parts.append(f"sys.{elt.attr}")
+                        else:
+                            parts.append(None)
 
-                if parts[:3] == ["uv", "run", "gza"] or parts[:3] == ["sys.executable", "-m", "gza"]:
+                if parts is not None and (
+                    parts[:3] == ["uv", "run", "gza"] or parts[:3] == ["sys.executable", "-m", "gza"]
+                ):
                     violations.append(
                         f"{test_file}:{node.lineno} CLI subprocess invocation belongs in tests_functional/"
                     )
+                    continue
+
+                if parts is not None and parts[:1] == ["git"]:
+                    violations.append(
+                        f"{test_file}:{node.lineno} direct git subprocess belongs in tests_functional/"
+                    )
+                    continue
+
+                if isinstance(command_arg, ast.Name):
+                    current = parent_map.get(node)
+                    while current is not None:
+                        if (
+                            isinstance(current, ast.For)
+                            and isinstance(current.target, ast.Name)
+                            and current.target.id == command_arg.id
+                            and isinstance(current.iter, (ast.Tuple, ast.List))
+                        ):
+                            for candidate in current.iter.elts:
+                                if (
+                                    isinstance(candidate, ast.List)
+                                    and candidate.elts
+                                    and isinstance(candidate.elts[0], ast.Constant)
+                                    and candidate.elts[0].value == "git"
+                                ):
+                                    violations.append(
+                                        f"{test_file}:{node.lineno} direct git subprocess belongs in tests_functional/"
+                                    )
+                                    break
+                            break
+                        current = parent_map.get(current)
                 continue
 
             if isinstance(node.func, ast.Name) and node.func.id == "run_gza_subprocess":
@@ -494,6 +542,43 @@ def test_unit_suite_boundary_flags_whitespace_formatted_cli_subprocess(tmp_path:
 
     assert violations == [
         f"{nested_test}:5 CLI subprocess invocation belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_direct_git_subprocess(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_git_subprocess.py"
+    nested_test.write_text(
+        "import subprocess\n\n"
+        "def test_git_subprocess(tmp_path):\n"
+        "    subprocess.run(['git', 'status'], cwd=tmp_path)\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:4 direct git subprocess belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_looped_git_subprocess(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_git_loop.py"
+    nested_test.write_text(
+        "import subprocess\n\n"
+        "def test_git_subprocess(tmp_path):\n"
+        "    for cmd in (['git', 'status'], ['git', 'branch']):\n"
+        "        subprocess.run(cmd, cwd=tmp_path)\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:5 direct git subprocess belongs in tests_functional/"
     ]
 
 
