@@ -1,14 +1,24 @@
 #!/bin/sh
 
-# verify hunk is installed
-if ! command -v hunk >/dev/null 2>&1; then
-  echo "ERROR - hunk not installed" >&2
-  exit 1
-fi
+summary=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--summary) summary=1; shift ;;
+    --) shift; break ;;
+    -*) echo "ERROR - unknown option: $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
 
 if [ $# -ne 1 ]; then
-  echo "ERROR - expected <task_id>" >&2
+  echo "ERROR - expected [-s|--summary] <task_id>" >&2
   exit 2
+fi
+
+# verify hunk is installed (only the full diff needs it; --summary uses git alone)
+if [ "$summary" -eq 0 ] && ! command -v hunk >/dev/null 2>&1; then
+  echo "ERROR - hunk not installed" >&2
+  exit 1
 fi
 
 task_branch=$(gza show --metadata-only "$1" | grep '^Branch:' | awk '{print $2}')
@@ -29,6 +39,48 @@ if [ "${merge_base}" = "$(git rev-parse "${task_branch}")" ]; then
   revspec="${task_branch}^..${task_branch}"
 else
   revspec="main...${task_branch}"
+fi
+
+if [ "$summary" -eq 1 ]; then
+  # Per-file summary: total lines changed (added + removed), plus the added and
+  # removed breakdown, with a totals footer. Built from `git diff --numstat`.
+  git diff --numstat "${revspec}" | awk '
+    {
+      added = $1; deleted = $2;
+      # numstat reports the path from field 3 onward (renames/spaces span fields)
+      file = $3
+      for (i = 4; i <= NF; i++) file = file " " $i
+      n++; files[n] = file
+      if (added == "-") { tot[n] = "binary"; ad[n] = ""; tval[n] = -1; next }
+      total = added + deleted
+      tval[n] = total
+      tot[n] = "+-" total
+      ad[n] = "(+" added "/-" deleted ")"
+      tadd += added; tdel += deleted; tfiles += 1
+      if (length(tot[n]) > w1) w1 = length(tot[n])
+      if (length(ad[n])  > w2) w2 = length(ad[n])
+    }
+    END {
+      # Two-pass: buffer rows, then pad the numeric columns so the file names
+      # line up vertically. Numbers sit left of the file names.
+      # Sort by total lines changed, descending (stable insertion sort, so equal
+      # totals keep git path order; binary files have tval -1 and sink last).
+      for (i = 1; i <= n; i++) idx[i] = i
+      for (i = 2; i <= n; i++) {
+        k = idx[i]; j = i - 1
+        while (j >= 1 && tval[idx[j]] < tval[k]) { idx[j+1] = idx[j]; j-- }
+        idx[j+1] = k
+      }
+      for (i = 1; i <= n; i++) {
+        r = idx[i]
+        printf "%-*s  %-*s  %s\n", w1, tot[r], w2, ad[r], files[r]
+      }
+      ttot = tadd + tdel
+      printf "\n%d file%s changed, +-%d total (+%d/-%d)\n", \
+        tfiles, (tfiles == 1 ? "" : "s"), ttot, tadd, tdel
+    }
+  '
+  exit 0
 fi
 
 hunk diff --watch --line-numbers --hunk-headers "${revspec}"
