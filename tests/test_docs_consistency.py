@@ -151,6 +151,25 @@ def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() 
             assert snippet not in content
 
 
+def test_advance_workflow_has_single_noop_improve_limit_row() -> None:
+    """Advance workflow doc should describe the no-op improve limit once, with the exception inline."""
+    repo_root = Path(__file__).resolve().parents[1]
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+
+    condition = (
+        "| Consecutive completed no-op improves for the latest `(impl, review)` pair >= "
+        "`max_noop_improve_cycles`, lineage is not tagged `allow-noop-improve` |"
+    )
+    action = (
+        "`needs_discussion` — reason=`improve-no-op`; stop repeated no-op improve loops "
+        "unless runner-owned current passing verify evidence already cleared the review "
+        "before lifecycle evaluation"
+    )
+
+    assert workflow.count(condition) == 1
+    assert action in workflow
+
+
 def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:
     """Integration test module docstrings should not point at the removed tests/test_integration.py path."""
     repo_root = Path(__file__).resolve().parents[1]
