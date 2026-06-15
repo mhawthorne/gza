@@ -3202,7 +3202,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "review_task": ctx.latest_completed_review,
             },
             reason="review-verdict-needs-manual-attention",
-            subject_task_id=ctx.task.id,
+            subject_task_id=_needs_attention_subject_id(ctx),
         ),
     ),
     AdvanceRule(

@@ -6029,6 +6029,54 @@ def test_review_unknown_verdict_uses_reviewed_task_as_subject(tmp_path: Path, mo
     assert action["review_task"].id == review.id
 
 
+def test_review_unknown_verdict_subject_is_implement_when_evaluated_from_improve_leaf(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When evaluate_advance_rules is called with an improve leaf as the task,
+    review_unknown_verdict must surface the implement owner, not the improve leaf."""
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/review-unknown-verdict-leaf",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 15, 10, 0, tzinfo=UTC))
+    improve_leaf = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 15, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    assert improve_leaf.id is not None
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="SOMETHING_ELSE",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    # Simulate watch.py passing the improve leaf (lifecycle_action_task) to evaluate_advance_rules.
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve_leaf, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-verdict-needs-manual-attention"
+    # Subject must be the implement owner, not the improve leaf.
+    assert get_action_subject_task_id(action) == impl.id
+    assert get_action_subject_task_id(action) != improve_leaf.id
+    # resolve_subject_task must resolve to the implement task.
+    resolved = resolve_subject_task(store, action)
+    assert resolved.id == impl.id
+
+
 def test_require_needs_attention_subject_rejects_missing_subject() -> None:
     with pytest.raises(AssertionError, match="missing subject_task_id"):
         require_needs_attention_subject(
