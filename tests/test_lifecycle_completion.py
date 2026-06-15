@@ -1,6 +1,7 @@
 from gza.db import Task
 from gza.lifecycle_completion import (
     auto_review_skip_message_for_completed_code_task,
+    merge_state_is_terminal_for_lifecycle,
     should_auto_create_review_for_completed_code_task,
     task_is_complete_for_lifecycle,
 )
@@ -16,6 +17,19 @@ def test_completed_task_with_empty_merge_state_is_complete() -> None:
     )
 
     assert task_is_complete_for_lifecycle(task, merge_state="empty") is True
+
+
+def test_completed_task_with_redundant_merge_state_is_complete() -> None:
+    task = Task(
+        id="gza-1r",
+        prompt="Implement already-present outcome",
+        status="completed",
+        task_type="implement",
+        has_commits=True,
+    )
+
+    assert merge_state_is_terminal_for_lifecycle("redundant") is True
+    assert task_is_complete_for_lifecycle(task, merge_state="redundant") is True
 
 
 def test_completed_implement_without_task_commits_skips_auto_review() -> None:

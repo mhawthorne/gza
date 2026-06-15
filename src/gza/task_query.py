@@ -10,7 +10,7 @@ from typing import Any, Literal, TypeVar
 from . import lineage
 from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows
-from .operator_state import blocked_by_empty_prereq_label
+from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -980,7 +980,7 @@ class TaskQueryService:
         if owner_task.id is not None:
             unit = self._store.resolve_merge_unit_for_task(owner_task.id)
             if unit is not None:
-                return unit.state
+                return effective_no_work_merge_state(owner_task, unit.state) or "n/a"
         if owner_task.merge_status == "merged":
             return "merged"
         if owner_task.merge_status == "unmerged":
@@ -1052,6 +1052,8 @@ class TaskQueryService:
         if "needs_merge" in merge_states and owner_state == "needs_merge":
             return True
         if "empty" in merge_states and owner_state == "empty":
+            return True
+        if "redundant" in merge_states and owner_state == "redundant":
             return True
 
         root = _resolve_lineage_root(self._store, task)

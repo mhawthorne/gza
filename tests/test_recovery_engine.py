@@ -10,6 +10,7 @@ from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
 from gza.git import GitError
 from gza.lineage_query import _load_indexes
+from gza.operator_state import MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import (
     _MergeContext,
@@ -29,6 +30,7 @@ from gza.recovery_engine import (
     list_failed_tasks_for_recovery,
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
+    should_hide_failed_recovery_decision,
 )
 from tests.cli.conftest import make_store, setup_config
 
@@ -77,6 +79,17 @@ def _attach_empty_merge_unit(store, task) -> None:
         target_branch="main",
         owner_task_id=task.id,
         state="empty",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+
+def _attach_redundant_merge_unit(store, task) -> None:
+    assert task.id is not None
+    unit = store.create_merge_unit(
+        source_branch=task.branch or f"feature/{task.id}",
+        target_branch="main",
+        owner_task_id=task.id,
+        state="redundant",
     )
     store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
@@ -462,8 +475,8 @@ def test_empty_task_requires_recovery_false_when_landed_representative_exists(tm
 
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "empty_recovery_already_resolved"
-    assert decision.reason_text == "empty failed task already resolved by landed lineage or completed recovery work"
+    assert decision.reason_code == "terminal_no_work_recovery_already_resolved"
+    assert decision.reason_text == "terminal no-work failed task already resolved by landed lineage or completed recovery work"
     assert list_failed_tasks_for_recovery(store) == []
 
 
@@ -490,6 +503,93 @@ def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_empty"
     assert decision.reason_text == "moot (empty branch with no recorded provider execution)"
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Never-ran redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-redundant-zero"
+    failed.branch = "feature/moot-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == "moot (commits already present on target)"
+    assert should_hide_failed_recovery_decision(decision) is True
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_failed_redundant_branch_with_provider_execution_remains_recoverable(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Executed redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-redundant-executed"
+    failed.branch = "feature/recoverable-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 2
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action != "skip"
+    assert decision.reason_code != "merge_unit_redundant"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+def test_failed_redundant_branch_with_completed_recovery_descendant_is_already_resolved(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Executed redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-redundant-resolved"
+    failed.branch = "feature/resolved-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 2
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    recovered = store.add(
+        "Completed recovery descendant",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert recovered.id is not None
+    recovered.status = "completed"
+    recovered.branch = failed.branch
+    recovered.has_commits = True
+    recovered.completed_at = datetime.now(UTC)
+    store.update(recovered)
+    _attach_redundant_merge_unit(store, recovered)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code in {
+        "recovery_already_completed",
+        "terminal_no_work_recovery_already_resolved",
+    }
     assert list_failed_tasks_for_recovery(store) == []
 
 
@@ -914,7 +1014,7 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
     assert git.count_commits_ahead_checked_calls == 1
 
 
-def test_is_resolved_by_landed_lineage_treats_reachable_merged_branch_with_zero_ahead_commits_as_landed(
+def test_is_resolved_by_landed_lineage_does_not_treat_redundant_branch_as_landed(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -936,7 +1036,7 @@ def test_is_resolved_by_landed_lineage_treats_reachable_merged_branch_with_zero_
         existing_branches=frozenset({failed.branch}),
     )
 
-    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
 
 
 def test_is_resolved_by_landed_lineage_does_not_treat_reachable_empty_branch_as_landed(tmp_path: Path) -> None:
@@ -959,6 +1059,33 @@ def test_is_resolved_by_landed_lineage_does_not_treat_reachable_empty_branch_as_
     )
 
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
+
+
+def test_empty_task_with_provider_output_remains_visible_when_branch_has_no_unique_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/recoverable-empty-provider-output"
+    _stub_merge_context(monkeypatch, empty_merged_branches={branch})
+
+    failed = store.add("Recoverable empty failed work", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED"
+    failed.branch = branch
+    failed.session_id = "sess-recoverable-empty-provider-output"
+    failed.output_content = "provider output proves the task executed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    merge_context = recovery_engine._load_merge_context(tmp_path)
+
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
+    assert empty_task_requires_recovery(store, failed, merge_state="empty", merge_context=merge_context) is True
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
 @pytest.mark.parametrize("landed_created_first", [True, False])
@@ -2169,6 +2296,103 @@ def test_recovery_engine_prerequisite_unmerged_branchless_no_output_row_is_moot_
     assert list_failed_tasks_for_recovery(store) == []
 
 
+def test_recovery_engine_prerequisite_unmerged_stored_redundant_row_is_moot_after_dependency_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-redundant"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == "moot (commits already present on target)"
+    assert list_failed_tasks_for_recovery(store) == []
+
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "redundant"
+
+
+def test_recovery_engine_legacy_empty_with_task_commits_uses_redundant_reason_text(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Legacy empty row with task commits", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/legacy-empty-redundant"
+    failed.has_commits = True
+    failed.session_id = "sess-legacy-empty"
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
+
+
+def test_recovery_engine_prerequisite_unmerged_legacy_empty_with_task_commits_reconciles_to_moot_redundant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Legacy prereq empty row with task commits", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-legacy-empty-redundant"
+    failed.has_commits = True
+    failed.session_id = "sess-prereq-legacy-empty"
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
+
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "empty"
+
+
 def test_recovery_engine_prerequisite_unmerged_stays_dependency_not_ready_when_dependency_is_empty(
     tmp_path: Path,
 ) -> None:
@@ -2250,6 +2474,41 @@ def test_recovery_engine_prerequisite_unmerged_empty_session_backed_failure_stay
     assert unit.state == "empty"
 
 
+def test_recovery_engine_prerequisite_unmerged_live_redundant_branch_persists_redundant_after_dependency_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-redundant"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    _stub_merge_context(monkeypatch, empty_merged_branches={"feature/prereq-redundant"})
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == "moot (commits already present on target)"
+
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "redundant"
+
+
 def test_recovery_engine_prerequisite_unmerged_with_commits_retries_after_dependency_merge(
     tmp_path: Path,
 ) -> None:
@@ -2318,6 +2577,45 @@ def test_recovery_engine_prerequisite_unmerged_with_live_non_empty_branch_retrie
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
     unit = store.resolve_merge_unit_for_task(failed.id)
     assert unit is None or unit.state != "empty"
+
+
+def test_recovery_engine_prerequisite_unmerged_redundant_session_backed_failure_stays_visible_after_dependency_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.session_id = "sess-prereq-redundant"
+    failed.branch = "feature/prereq-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 1
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_redundant_merge_unit(store, failed)
+
+    assert empty_task_requires_recovery(store, failed, merge_state="redundant") is True
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "legacy_prerequisite_unmerged_parked"
+    assert "redundant merge unit is recoverable" in decision.reason_text
+    assert decision.reason_code != "merge_unit_redundant"
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "redundant"
 
 
 def test_recovery_engine_prerequisite_unmerged_with_provider_output_and_session_resumes_after_dependency_merge(

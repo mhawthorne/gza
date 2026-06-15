@@ -9,6 +9,7 @@ from .lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from .recovery_read_context import RecoveryReadContext
 
 MERGE_REQUIRED_DEPENDENCY_TASK_TYPES = frozenset({"task", "implement", "improve", "fix", "rebase"})
+TERMINAL_NO_WORK_MERGE_STATES = frozenset({"empty", "redundant"})
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,7 @@ def task_satisfies_merge_dependency(
 
     if merge_state == "merged":
         return True
-    if merge_state == "empty":
+    if merge_state in TERMINAL_NO_WORK_MERGE_STATES:
         return empty_prereq_satisfies_dependency(store, prereq, dependent)
     return False
 
@@ -202,7 +203,7 @@ def dependency_readiness(
         return held_plan_block
 
     if resolved_dep is None:
-        if _resolved_merge_state(store, direct_dep, read_context=read_context) == "empty" and resolved_dependency_satisfies_task_readiness(
+        if _resolved_merge_state(store, direct_dep, read_context=read_context) in TERMINAL_NO_WORK_MERGE_STATES and resolved_dependency_satisfies_task_readiness(
             store,
             direct_dep,
             task,
@@ -291,7 +292,7 @@ def _resolved_dependency_lineage_satisfies_task_readiness(
         return task_satisfies_merge_dependency(store, resolved_dep, dependent, read_context=read_context)
     if merge_unit.state == "merged":
         return True
-    if merge_unit.state == "empty":
+    if merge_unit.state in TERMINAL_NO_WORK_MERGE_STATES:
         prereq = merge_resolution.attached_task or direct_dep
         return empty_prereq_satisfies_dependency(store, prereq, dependent)
     return False

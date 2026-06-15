@@ -1027,12 +1027,16 @@ class TestHistoryCommand:
         store = query_cli.get_store(config, open_mode="readwrite")
 
         task = store.add("Historical empty row", task_type="implement")
-        store.mark_completed(task, has_commits=True, branch="feature/history-empty")
+        store.mark_completed(task, has_commits=False, branch="feature/history-empty")
         assert task.id is not None
 
-        unit = store.resolve_merge_unit_for_task(task.id)
-        assert unit is not None
-        store.set_merge_unit_state(unit.id, "empty")
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch=store.default_merge_target(),
+            owner_task_id=task.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
         result = invoke_gza("history", "--project", str(tmp_path))
 
@@ -3743,11 +3747,11 @@ class TestQueueCommand:
         dep.status = "completed"
         dep.completed_at = datetime.now(UTC)
         dep.branch = "feature/queue-empty-prereq"
-        dep.has_commits = True
+        dep.has_commits = False
         store.update(dep)
         unit = store.create_merge_unit(
             source_branch=dep.branch,
-            target_branch="main",
+            target_branch=store.default_merge_target(),
             owner_task_id=dep.id,
             state="empty",
         )
@@ -10559,7 +10563,7 @@ class TestUnmergedImprovedDisplay:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Default unmerged refresh should persist zero-commit merged branches as empty."""
+        """Default unmerged refresh should persist zero-commit merged branches as redundant."""
         store, task, git = _setup_unmerged_env_fast(
             tmp_path,
             task_prompt="Empty merge-unit task",
@@ -10592,7 +10596,7 @@ class TestUnmergedImprovedDisplay:
         assert refreshed.merge_status is None
         unit = store.resolve_merge_unit_for_task(task.id)
         assert unit is not None
-        assert unit.state == "empty"
+        assert unit.state == "redundant"
 
     def test_unmerged_live_target_hides_zero_commit_empty_branch(
         self,
@@ -13922,11 +13926,15 @@ class TestIncompleteCommand:
         store = make_store(tmp_path)
 
         dep = store.add("Empty prerequisite", task_type="implement")
-        store.mark_completed(dep, has_commits=True, branch="feature/incomplete-empty-prereq")
+        store.mark_completed(dep, has_commits=False, branch="feature/incomplete-empty-prereq")
         assert dep.id is not None
-        unit = store.resolve_merge_unit_for_task(dep.id)
-        assert unit is not None
-        store.set_merge_unit_state(unit.id, "empty")
+        unit = store.create_merge_unit(
+            source_branch=dep.branch,
+            target_branch=store.default_merge_target(),
+            owner_task_id=dep.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(dep.id, unit.id, "owner")
 
         downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
         assert downstream.id is not None

@@ -18,8 +18,8 @@ def _completed_branch_task(store: SqliteTaskStore, prompt: str, branch: str):
     return task
 
 
-def test_reconcile_branch_merge_truth_never_diverged_branch_classifies_as_empty(tmp_path) -> None:
-    """A branch created at main HEAD with no commits reconciles to 'empty'."""
+def test_reconcile_branch_merge_truth_never_diverged_branch_classifies_as_redundant(tmp_path) -> None:
+    """A never-diverged branch with task commits recorded reconciles to 'redundant'."""
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     git = init_basic_repo(repo_dir)
@@ -38,5 +38,5 @@ def test_reconcile_branch_merge_truth_never_diverged_branch_classifies_as_empty(
         include_diff_stats=False,
     )
 
-    assert results[0].merge_status == "empty"
+    assert results[0].merge_status == "redundant"
     assert "marked merged" not in results[0].actions

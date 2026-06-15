@@ -2,6 +2,7 @@ from pathlib import Path
 
 from gza import dependency_preconditions as dependency_preconditions_module
 from gza.dependency_preconditions import (
+    dependency_readiness,
     empty_prereq_satisfies_dependency,
     get_unmerged_dependency_precondition,
 )
@@ -77,6 +78,65 @@ def test_dependency_precondition_empty_policy_can_unblock_dependency(
         lambda _store, _prereq, _dependent: True,
     )
 
+    assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
+def test_dependency_precondition_redundant_unit_uses_empty_release_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-redundant")
+    assert dependency.id is not None
+    unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
+def test_dependency_readiness_redundant_direct_dependency_without_resolved_descendant_uses_empty_release_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-redundant-failed")
+    assert dependency.id is not None
+    unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    dependency = store.get(dependency.id)
+    assert dependency is not None
+    store.mark_failed(dependency, failure_reason="UNKNOWN")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    monkeypatch.setattr(
+        dependency_preconditions_module,
+        "empty_prereq_satisfies_dependency",
+        lambda _store, _prereq, _dependent: True,
+    )
+
+    readiness = dependency_readiness(store, downstream)
+
+    assert readiness.ready is True
+    assert readiness.direct_dependency is not None
+    assert readiness.direct_dependency.id == dependency.id
+    assert readiness.resolved_dependency is not None
+    assert readiness.resolved_dependency.id == dependency.id
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 

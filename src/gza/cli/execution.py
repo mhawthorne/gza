@@ -149,6 +149,8 @@ from .advance_executor import (
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
+_ITERATE_TERMINAL_NO_WORK_REASON_CODES = frozenset({"merge_unit_empty", "merge_unit_redundant"})
+
 
 def _foreground_command_invocation(command: str) -> RunInvocationContext:
     """Build command-specific invocation metadata for foreground runner calls."""
@@ -272,7 +274,7 @@ def _format_iterate_terminal_merge_state_message(
     if not merge_state_is_terminal_for_lifecycle(merge_state):
         return None
 
-    if merge_state == "empty":
+    if merge_state in {"empty", "redundant"}:
         if resolve_pending_recovery_execution_mode(iterate_task) is not None:
             return None
         empty_recovery_state = _classify_empty_task_recovery_state(store, iterate_task, merge_state=merge_state)
@@ -283,6 +285,17 @@ def _format_iterate_terminal_merge_state_message(
                 "No remaining iterate action: "
                 f"failed implementation {iterate_task.id} was already resolved by landed lineage or completed "
                 "recovery work."
+            )
+        if merge_state == "redundant":
+            if resolved_from_failed_ancestor:
+                return (
+                    "No remaining iterate action: "
+                    f"failed implementation {requested_impl_task.id} was fully recovered by descendant "
+                    f"{iterate_task.id}; commits are already present on target."
+                )
+            return (
+                "No remaining iterate action: "
+                f"implementation {iterate_task.id}'s commits are already present on target."
             )
         if resolved_from_failed_ancestor:
             return (
@@ -3530,7 +3543,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     failed_task_is_lifecycle_moot = failed_task_is_lifecycle_moot or bool(
         failed_start_decision is not None
         and failed_start_decision.action == "skip"
-        and failed_start_decision.reason_code == "merge_unit_empty"
+        and failed_start_decision.reason_code in _ITERATE_TERMINAL_NO_WORK_REASON_CODES
     )
 
     if (
@@ -3568,14 +3581,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         and not use_retry
         and failed_start_decision is not None
         and failed_start_decision.action == "skip"
-        and failed_start_decision.reason_code == "merge_unit_empty"
+        and failed_start_decision.reason_code in _ITERATE_TERMINAL_NO_WORK_REASON_CODES
     ):
         terminal_message = _format_iterate_terminal_merge_state_message(
             store=store,
             requested_impl_task=requested_impl_task,
             iterate_task=impl_task,
             resolved_from_failed_ancestor=resolved_from_failed_ancestor,
-            merge_state="empty",
+            merge_state="redundant" if failed_start_decision.reason_code == "merge_unit_redundant" else "empty",
         )
         if terminal_message is not None:
             print(terminal_message)

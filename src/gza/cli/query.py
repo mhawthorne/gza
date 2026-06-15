@@ -49,7 +49,12 @@ from ..github import GitHub
 from ..lifecycle_completion import TERMINAL_MERGE_STATES
 from ..lineage import walk_based_on_descendants
 from ..lineage_query import filter_display_unresolved_tasks_for_incomplete
-from ..operator_state import blocked_by_empty_prereq_label, blocked_dependency_label, moot_empty_lifecycle_detail
+from ..operator_state import (
+    blocked_by_empty_prereq_label,
+    blocked_dependency_label,
+    effective_no_work_merge_state,
+    moot_empty_lifecycle_detail,
+)
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -667,7 +672,7 @@ def _task_show_merge_status(store: SqliteTaskStore, task: DbTask) -> str | None:
     if task.id is not None:
         unit = store.resolve_merge_unit_for_task(task.id)
         if unit is not None and unit.owner_task_id == task.id:
-            return unit.state
+            return effective_no_work_merge_state(task, unit.state)
     if task_owns_merge_status(task):
         return task.merge_status
     return None
@@ -937,7 +942,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         if task.id is not None:
             unit = store.resolve_merge_unit_for_task(task.id)
             if unit is not None and unit.target_branch == default_merge_target:
-                return unit.state
+                return effective_no_work_merge_state(task, unit.state)
         return task.merge_status
 
     def _task_shares_parent_branch(task: DbTask, parent_task: DbTask | None) -> bool:
@@ -1067,7 +1072,7 @@ def cmd_history(args: argparse.Namespace) -> int:
 
         type_label = f"\\[{task.task_type}]"
         merge_label = ""
-        if merge_state in {"merged", "empty"} and task_owns_merge_status(task):
+        if merge_state in {"merged", "empty", "redundant"} and task_owns_merge_status(task):
             merge_label = f" \\[{merge_state}]"
         tid = c['task_id']
         if task.based_on and task.depends_on:

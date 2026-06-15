@@ -17,6 +17,7 @@ import pytest
 
 from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
+from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
@@ -59,6 +60,91 @@ def _background_work_status_error(tmp_path: Path) -> tuple[list[str], str]:
     return (
         ["work", str(task.id), "--background", "--no-docker", "--project", str(tmp_path)],
         f"Error: Task {task.id} is not pending (status: completed)",
+    )
+
+
+def test_format_iterate_terminal_merge_state_message_distinguishes_redundant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    requested = store.add("Requested implementation", task_type="implement")
+    requested.status = "failed"
+    store.update(requested)
+    iterate = store.add("Recovered implementation", task_type="implement", based_on=requested.id)
+    iterate.status = "completed"
+    iterate.has_commits = True
+    store.update(iterate)
+
+    assert _format_iterate_terminal_merge_state_message(
+        store=store,
+        requested_impl_task=iterate,
+        iterate_task=iterate,
+        resolved_from_failed_ancestor=False,
+        merge_state="redundant",
+    ) == (
+        "No remaining iterate action: "
+        f"implementation {iterate.id}'s commits are already present on target."
+    )
+    assert _format_iterate_terminal_merge_state_message(
+        store=store,
+        requested_impl_task=requested,
+        iterate_task=iterate,
+        resolved_from_failed_ancestor=True,
+        merge_state="redundant",
+    ) == (
+        "No remaining iterate action: "
+        f"failed implementation {requested.id} was fully recovered by descendant {iterate.id}; "
+        "commits are already present on target."
+    )
+
+
+def test_format_iterate_terminal_merge_state_message_hides_recoverable_failed_redundant_task(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    failed = store.add("Failed redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-recoverable-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 1
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    assert (
+        _format_iterate_terminal_merge_state_message(
+            store=store,
+            requested_impl_task=failed,
+            iterate_task=failed,
+            resolved_from_failed_ancestor=False,
+            merge_state="redundant",
+        )
+        is None
+    )
+
+
+def test_format_iterate_terminal_merge_state_message_hides_pending_redundant_resume_task(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending redundant resume", task_type="implement", recovery_origin="resume")
+    assert pending.id is not None
+    pending.status = "pending"
+    pending.session_id = "sess-pending-redundant"
+    pending.has_commits = True
+    store.update(pending)
+
+    assert (
+        _format_iterate_terminal_merge_state_message(
+            store=store,
+            requested_impl_task=pending,
+            iterate_task=pending,
+            resolved_from_failed_ancestor=False,
+            merge_state="redundant",
+        )
+        is None
     )
 
 
@@ -10996,7 +11082,7 @@ class TestIterateCommand:
         assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
         assert f"[dry-run] Would iterate implementation {impl.id}" not in output
 
-    def test_iterate_suppresses_pending_impl_when_merge_unit_is_empty_for_current_target(
+    def test_iterate_suppresses_pending_impl_when_legacy_empty_merge_unit_is_redundant_for_current_target(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -11038,7 +11124,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.execution._run_foreground",
-                side_effect=AssertionError("iterate should not start foreground work for empty merge state"),
+                side_effect=AssertionError("iterate should not start foreground work for redundant merge state"),
             ) as run_foreground,
         ):
             result = cmd_iterate(args)
@@ -11046,7 +11132,8 @@ class TestIterateCommand:
         output = capsys.readouterr().out
         assert result == 0
         run_foreground.assert_not_called()
-        assert f"No remaining iterate action: implementation {impl.id} has no remaining commits to land." in output
+        assert f"implementation {impl.id}'s commits are already present on target." in output
+        assert "has no remaining commits to land" not in output
 
     def test_iterate_suppresses_historical_prerequisite_unmerged_failure_once_reconciled_empty(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -11158,6 +11245,144 @@ class TestIterateCommand:
         assert "no remaining commits to land" in output
         assert "--resume" not in output
         assert "--retry" not in output
+
+    def test_iterate_suppresses_failed_redundant_branch_with_terminal_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Redundant implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.session_id = "sess-redundant-zero"
+        failed.branch = "test-project/20260613-redundant"
+        failed.has_commits = True
+        failed.num_steps_computed = 0
+        failed.num_steps_reported = 0
+        failed.output_tokens = 0
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="redundant",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+        args = argparse.Namespace(
+            impl_task_id=failed.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._run_foreground",
+                side_effect=AssertionError("iterate should not start foreground work for moot redundant failures"),
+            ) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 0
+        run_foreground.assert_not_called()
+        assert f"implementation {failed.id}'s commits are already present on target." in output
+        assert "--resume" not in output
+        assert "--retry" not in output
+
+    def test_iterate_relabels_legacy_empty_branch_with_task_commits_to_redundant_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Legacy empty implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.session_id = "sess-legacy-empty-redundant"
+        failed.branch = "test-project/20260613-legacy-empty"
+        failed.has_commits = True
+        failed.num_steps_computed = 0
+        failed.num_steps_reported = 0
+        failed.output_tokens = 0
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="empty",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+        args = argparse.Namespace(
+            impl_task_id=failed.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        mock_git.resolve_fresh_merge_source.return_value = (failed.branch, None)
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            failed.branch: "old-main-sha",
+            "main": "advanced-main-sha",
+        }.get(ref)
+        mock_git.count_commits_ahead.return_value = 0
+        mock_git.count_commits_ahead_checked.return_value = 0
+        mock_git.is_merged.return_value = True
+        mock_git.is_on_first_parent_history.return_value = True
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._run_foreground",
+                side_effect=AssertionError("iterate should not start foreground work for legacy empty redundant failures"),
+            ) as run_foreground,
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 0
+        run_foreground.assert_not_called()
+        assert f"implementation {failed.id}'s commits are already present on target." in output
+        assert "has no remaining commits to land" not in output
 
     def test_iterate_resume_on_empty_failed_branch_with_recorded_session_work(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -12371,7 +12596,7 @@ class TestIterateCommand:
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
 
-    def test_background_iterate_completed_descendant_empty_noops_before_spawn(
+    def test_background_iterate_completed_descendant_legacy_empty_noops_with_redundant_message_before_spawn(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -12437,7 +12662,7 @@ class TestIterateCommand:
             patch("gza.cli.execution.Git", return_value=mock_git),
             patch(
                 "gza.cli.execution._spawn_background_iterate",
-                side_effect=AssertionError("background iterate should not spawn for empty merge state"),
+                side_effect=AssertionError("background iterate should not spawn for redundant merge state"),
             ) as spawn_background,
         ):
             result = cmd_iterate(args)
@@ -12448,7 +12673,7 @@ class TestIterateCommand:
         assert (
             "No remaining iterate action: "
             f"failed implementation {failed_impl.id} was fully recovered by descendant "
-            f"{recovered_impl.id} with no remaining commits to land."
+            f"{recovered_impl.id}; commits are already present on target."
         ) in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 

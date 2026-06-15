@@ -221,7 +221,7 @@ def merge_unit_legacy_state(state: str | None) -> str | None:
         return "merged"
     if state in {"unmerged", "blocked"}:
         return "unmerged"
-    if state in {"stale", "empty"}:
+    if state in {"stale", "empty", "redundant"}:
         return None
     return None
 

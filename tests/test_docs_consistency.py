@@ -483,6 +483,19 @@ def test_task_triage_skill_defaults_no_id_sweeps_to_recent_effective_window() ->
     for snippet in required_snippets:
         assert snippet in skill_content
 
+
+def test_redundant_no_work_operator_docs_and_skill_stay_in_sync() -> None:
+    """Tracked triage/docs guidance should not strand redundant no-work rows as unknown."""
+    repo_root = Path(__file__).resolve().parents[1]
+    skill_content = (repo_root / "src" / "gza" / "skills" / "gza-task-triage" / "SKILL.md").read_text()
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
+
+    assert "merge-unit-empty" in skill_content
+    assert "merge-unit-redundant" in skill_content
+    assert "merge-unit-empty\") |" not in skill_content
+    assert 'lifecycle "target merged", "merge-unit-merged", or "merge-unit-empty"' not in skill_content
+    assert "already present on target (`redundant` merge state)" in config_content
+
     assert "- **Without ID:** sweep the whole list. Run `uv run gza incomplete --json --last 0` and process every row." not in skill_content
 
 

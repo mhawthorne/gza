@@ -361,6 +361,8 @@ def reconcile_branch_merge_truth(
             continue
 
         owner_tasks = cohort.merge_status_owner_tasks
+        source_owner_task = owner_tasks[0] if owner_tasks else code_tasks[0]
+        source_has_commits = source_owner_task.has_commits
         desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
         proof_target_ref = remote_target_ref or target_branch
         try:
@@ -405,6 +407,7 @@ def reconcile_branch_merge_truth(
                 git=git,
                 source_ref=reconcile_ref,
                 target_branch=proof_target_ref,
+                source_has_commits=source_has_commits,
                 on_warning=result.warnings.append,
             )
             if desired_merge_status == "merged":
@@ -415,10 +418,11 @@ def reconcile_branch_merge_truth(
             # Fail-closed: preserve a previously-proven "empty" state rather than
             # overwriting it with "unmerged". Emit a warning so operators know
             # reconciliation was incomplete.
-            if cohort.merge_unit_state == "empty":
-                desired_merge_status = "empty"
+            if cohort.merge_unit_state in {"empty", "redundant"}:
+                desired_merge_status = cohort.merge_unit_state
                 result.warnings.append(
-                    f"branch '{cohort.branch}': ref unavailable; preserved prior 'empty' state "
+                    f"branch '{cohort.branch}': ref unavailable; preserved prior "
+                    f"'{cohort.merge_unit_state}' state "
                     "(branch previously confirmed to have no unique commits)"
                 )
             else:
@@ -434,12 +438,14 @@ def reconcile_branch_merge_truth(
                     target_branch=proof_target_ref,
                     persisted_state=cohort.merge_unit_state,
                     merged_proof=False,
+                    source_has_commits=source_has_commits,
+                    on_warning=result.warnings.append,
                 )
                 classify_state = classification.state
             except Exception:
                 classify_state = "unknown"
-            if classify_state == "empty":
-                desired_merge_status = "empty"
+            if classify_state in {"empty", "redundant"}:
+                desired_merge_status = classify_state
             elif classify_state == "unknown":
                 result.warnings.append(
                     f"branch '{cohort.branch}': could not determine unique commit count "
@@ -449,7 +455,7 @@ def reconcile_branch_merge_truth(
             else:
                 if not preserve_recorded_merged or desired_merge_status != "merged":
                     desired_merge_status = "unmerged"
-            if include_diff_stats and desired_merge_status != "empty":
+            if include_diff_stats and desired_merge_status not in {"empty", "redundant"}:
                 try:
                     diff_output = git.get_diff_numstat(f"{target_branch}...{reconcile_ref}")
                 except GitError as exc:

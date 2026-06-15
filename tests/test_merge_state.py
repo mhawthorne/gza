@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from gza.db import SqliteTaskStore
-from gza.merge_state import classify_branch_merge_state_for_target, resolve_task_merge_state_for_target
+from gza.merge_state import (
+    classify_branch_merge_state_for_target,
+    classify_proven_merged_state,
+    resolve_task_merge_state_for_target,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class _FakeGit:
@@ -21,6 +29,7 @@ class _FakeGit:
         ahead_count: int | None = None,
         merged: bool = False,
         on_first_parent: bool = True,
+        first_parent_error: Exception | None = None,
     ) -> None:
         self._source_ref = source_ref
         self._merge_source_warning = merge_source_warning
@@ -28,6 +37,7 @@ class _FakeGit:
         self._ahead_count = ahead_count
         self._merged = merged
         self._on_first_parent = on_first_parent
+        self._first_parent_error = first_parent_error
 
     def resolve_fresh_merge_source(self, _branch: str):
         from gza.git import ResolvedMergeSourceRef
@@ -49,10 +59,14 @@ class _FakeGit:
         return self._merged
 
     def is_on_first_parent_history(self, _commit: str, _target: str) -> bool:
+        if self._first_parent_error is not None:
+            raise self._first_parent_error
         return self._on_first_parent
 
 
-def test_resolve_task_merge_state_classifies_zero_commit_branch_as_empty(tmp_path: Path) -> None:
+def test_resolve_task_merge_state_classifies_zero_commit_branch_with_commits_as_redundant(
+    tmp_path: Path,
+) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     task = store.add("Implement empty branch", task_type="implement")
     store.mark_completed(task, has_commits=True, branch="feature/empty-branch")
@@ -77,7 +91,7 @@ def test_resolve_task_merge_state_classifies_zero_commit_branch_as_empty(tmp_pat
         target_branch="main",
     )
 
-    assert result == "empty"
+    assert result == "redundant"
 
 
 def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate(
@@ -112,7 +126,7 @@ def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate
     assert "keeping merge state at 'merged' instead of classifying 'empty'" in caplog.text
 
 
-def test_resolve_task_merge_state_prefers_empty_over_merged_when_branch_has_no_unique_commits(
+def test_resolve_task_merge_state_prefers_redundant_over_merged_when_task_commits_have_no_unique_commits(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -136,7 +150,7 @@ def test_resolve_task_merge_state_prefers_empty_over_merged_when_branch_has_no_u
         target_branch="main",
     )
 
-    assert state == "empty"
+    assert state == "redundant"
 
 
 def test_classify_stale_empty_branch_on_mainline_is_empty_not_merged() -> None:
@@ -153,10 +167,29 @@ def test_classify_stale_empty_branch_on_mainline_is_empty_not_merged() -> None:
         ),
         source_branch="feature/empty",
         target_branch="main",
+        source_has_commits=False,
     )
 
     assert result.state == "empty"
-    assert result.reason == "no-unique-commits"
+    assert result.reason == "no-task-commits"
+
+
+def test_classify_zero_unique_commits_with_task_commits_is_redundant() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="feature/redundant",
+            ref_shas={"feature/redundant": "old-main-sha", "main": "advanced-main-sha"},
+            ahead_count=0,
+            merged=True,
+            on_first_parent=True,
+        ),
+        source_branch="feature/redundant",
+        target_branch="main",
+        source_has_commits=True,
+    )
+
+    assert result.state == "redundant"
+    assert result.reason == "no-unique-commits-with-task-commits"
 
 
 def test_classify_no_ff_merged_side_branch_is_merged() -> None:
@@ -174,10 +207,230 @@ def test_classify_no_ff_merged_side_branch_is_merged() -> None:
         ),
         source_branch="feature/merged",
         target_branch="main",
+        source_has_commits=True,
     )
 
     assert result.state == "merged"
     assert result.reason == "merged-side-branch-no-unique-commits"
+
+
+def test_classify_proven_merged_state_preserves_no_ff_side_branch_as_merged() -> None:
+    result = classify_proven_merged_state(
+        git=_FakeGit(
+            ref_shas={"feature/merged": "branch-tip-sha", "main": "merge-commit-sha"},
+            ahead_count=0,
+            on_first_parent=False,
+        ),
+        source_ref="feature/merged",
+        target_branch="main",
+        source_has_commits=True,
+    )
+
+    assert result == "merged"
+
+
+def test_classify_proven_merged_state_returns_redundant_for_task_commits_when_side_branch_probe_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        result = classify_proven_merged_state(
+            git=_FakeGit(
+                ref_shas={"feature/merged": "branch-tip-sha", "main": "merge-commit-sha"},
+                ahead_count=0,
+                first_parent_error=RuntimeError("probe exploded"),
+            ),
+            source_ref="feature/merged",
+            target_branch="main",
+            source_has_commits=True,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result == "redundant"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_proven_merged_state_returns_empty_for_no_commit_branch_when_probe_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        result = classify_proven_merged_state(
+            git=_FakeGit(
+                ref_shas={"feature/empty": "branch-tip-sha", "main": "merge-commit-sha"},
+                ahead_count=0,
+                first_parent_error=RuntimeError("probe exploded"),
+            ),
+            source_ref="feature/empty",
+            target_branch="main",
+            source_has_commits=False,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result == "empty"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_proven_merged_state_returns_empty_for_no_commit_branch_when_probe_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _GitWithoutFirstParentProbe:
+        def __init__(self) -> None:
+            self._delegate = _FakeGit(
+                ref_shas={"feature/empty": "branch-tip-sha", "main": "advanced-main-sha"},
+                ahead_count=0,
+            )
+
+        def __getattr__(self, name: str):
+            if name == "is_on_first_parent_history":
+                raise AttributeError(name)
+            return getattr(self._delegate, name)
+
+    with caplog.at_level("WARNING"):
+        result = classify_proven_merged_state(
+            git=_GitWithoutFirstParentProbe(),
+            source_ref="feature/empty",
+            target_branch="main",
+            source_has_commits=False,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result == "empty"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_proven_merged_state_returns_redundant_for_task_commits_when_probe_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _GitWithoutFirstParentProbe:
+        def __init__(self) -> None:
+            self._delegate = _FakeGit(
+                ref_shas={"feature/redundant": "branch-tip-sha", "main": "advanced-main-sha"},
+                ahead_count=0,
+            )
+
+        def __getattr__(self, name: str):
+            if name == "is_on_first_parent_history":
+                raise AttributeError(name)
+            return getattr(self._delegate, name)
+
+    with caplog.at_level("WARNING"):
+        result = classify_proven_merged_state(
+            git=_GitWithoutFirstParentProbe(),
+            source_ref="feature/redundant",
+            target_branch="main",
+            source_has_commits=True,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result == "redundant"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_zero_unique_commits_returns_redundant_when_side_branch_probe_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        result = classify_branch_merge_state_for_target(
+            git=_FakeGit(
+                source_ref="feature/redundant",
+                ref_shas={"feature/redundant": "old-main-sha", "main": "advanced-main-sha"},
+                ahead_count=0,
+                merged=True,
+                first_parent_error=RuntimeError("probe exploded"),
+            ),
+            source_branch="feature/redundant",
+            target_branch="main",
+            source_has_commits=True,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result.state == "redundant"
+    assert result.reason == "no-unique-commits-with-task-commits"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_zero_unique_commits_returns_empty_for_no_commit_branch_when_probe_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        result = classify_branch_merge_state_for_target(
+            git=_FakeGit(
+                source_ref="feature/empty",
+                ref_shas={"feature/empty": "old-main-sha", "main": "advanced-main-sha"},
+                ahead_count=0,
+                merged=True,
+                first_parent_error=RuntimeError("probe exploded"),
+            ),
+            source_branch="feature/empty",
+            target_branch="main",
+            source_has_commits=False,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result.state == "empty"
+    assert result.reason == "no-task-commits"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_zero_unique_commits_returns_empty_for_no_commit_branch_when_probe_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _GitWithoutFirstParentProbe:
+        def __init__(self) -> None:
+            self._delegate = _FakeGit(
+                source_ref="feature/empty",
+                ref_shas={"feature/empty": "old-main-sha", "main": "advanced-main-sha"},
+                ahead_count=0,
+                merged=True,
+            )
+
+        def __getattr__(self, name: str):
+            if name == "is_on_first_parent_history":
+                raise AttributeError(name)
+            return getattr(self._delegate, name)
+
+    with caplog.at_level("WARNING"):
+        result = classify_branch_merge_state_for_target(
+            git=_GitWithoutFirstParentProbe(),
+            source_branch="feature/empty",
+            target_branch="main",
+            source_has_commits=False,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result.state == "empty"
+    assert result.reason == "no-task-commits"
+    assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_zero_unique_commits_returns_redundant_when_side_branch_probe_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _GitWithoutFirstParentProbe:
+        def __init__(self) -> None:
+            self._delegate = _FakeGit(
+                source_ref="feature/redundant",
+                ref_shas={"feature/redundant": "old-main-sha", "main": "advanced-main-sha"},
+                ahead_count=0,
+                merged=True,
+            )
+
+        def __getattr__(self, name: str):
+            if name == "is_on_first_parent_history":
+                raise AttributeError(name)
+            return getattr(self._delegate, name)
+
+    with caplog.at_level("WARNING"):
+        result = classify_branch_merge_state_for_target(
+            git=_GitWithoutFirstParentProbe(),
+            source_branch="feature/redundant",
+            target_branch="main",
+            source_has_commits=True,
+            on_warning=lambda message: logger.warning(message),
+        )
+
+    assert result.state == "redundant"
+    assert result.reason == "no-unique-commits-with-task-commits"
+    assert "Could not probe first-parent membership" in caplog.text
 
 
 def test_resolve_task_merge_state_stale_empty_branch_is_empty_not_merged(
@@ -188,7 +441,7 @@ def test_resolve_task_merge_state_stale_empty_branch_is_empty_not_merged(
     task = store.add("Never-worked branch", task_type="implement")
     task.status = "completed"
     task.completed_at = datetime.now(UTC)
-    task.has_commits = True
+    task.has_commits = False
     task.branch = "feature/empty"
     task.merge_status = "merged"
     store.update(task)
@@ -240,6 +493,45 @@ def test_resolve_task_merge_state_falls_back_to_persisted_empty_when_source_ref_
     )
 
     assert state == "empty"
+
+
+def test_resolve_task_merge_state_relabels_legacy_empty_with_task_commits_when_source_is_inspectable(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Legacy empty branch with commits", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.has_commits = True
+    task.branch = "feature/legacy-empty"
+    store.update(task)
+    assert task.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+    store.set_merge_unit_state(unit.id, "empty")
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    state = resolve_task_merge_state_for_target(
+        store=store,
+        task=refreshed,
+        git=_FakeGit(
+            source_ref=task.branch,
+            ref_shas={task.branch: "old-main-sha", "main": "advanced-main-sha"},
+            ahead_count=0,
+            merged=True,
+            on_first_parent=True,
+        ),
+        target_branch="main",
+    )
+
+    assert state == "redundant"
 
 
 def test_resolve_task_merge_state_does_not_log_merge_source_warning_side_effect(

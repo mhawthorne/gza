@@ -14,6 +14,7 @@ from gza.advance_engine import (
     ADVANCE_RULES,
     WORKER_CONSUMING_ACTIONS,
     _count_consecutive_plan_review_cycles,
+    _empty_merge_state_description,
     _resolve_and_persist_post_merge_rebase_state,
     classify_advance_action,
     evaluate_advance_rules,
@@ -4474,10 +4475,10 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (no unique commits vs target)"
+    assert action["description"] == "SKIP: moot (commits already present on target)"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
-    assert refreshed_unit.state == "empty"
+    assert refreshed_unit.state == "redundant"
 
     rows = query_lineage_owner_rows(
         store,
@@ -4487,6 +4488,15 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
         target_branch="main",
     )
     assert all(row.owner_task.id != impl.id for row in rows)
+
+
+def test_empty_and_redundant_advance_skip_descriptions_are_distinct() -> None:
+    empty_description = _empty_merge_state_description(SimpleNamespace(merge_state="empty"))
+    redundant_description = _empty_merge_state_description(SimpleNamespace(merge_state="redundant"))
+
+    assert empty_description == "SKIP: moot (no unique commits vs target)"
+    assert redundant_description == "SKIP: moot (commits already present on target)"
+    assert empty_description != redundant_description
 
 
 def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_target_tip(
@@ -4550,10 +4560,10 @@ def test_empty_branch_persists_empty_and_skips_merge_actions(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (no unique commits vs target)"
+    assert action["description"] == "SKIP: moot (commits already present on target)"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
-    assert refreshed_unit.state == "empty"
+    assert refreshed_unit.state == "redundant"
     assert refreshed_unit.merged_at is None
     assert refreshed_unit.merged_by_task_id is None
 
@@ -5202,7 +5212,7 @@ def test_already_merged_branch_prefers_fresh_remote_over_stale_legacy_local_ref(
     assert action["description"] == "SKIP: already merged into target branch"
 
 
-def test_empty_branch_skips_with_moot_no_work_text(tmp_path: Path) -> None:
+def test_redundant_branch_skips_with_commits_already_present_text(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -5230,7 +5240,7 @@ def test_empty_branch_skips_with_moot_no_work_text(tmp_path: Path) -> None:
     )
 
     assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (no unique commits vs target)"
+    assert action["description"] == "SKIP: moot (commits already present on target)"
 
 
 def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(

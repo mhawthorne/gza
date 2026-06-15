@@ -1,10 +1,10 @@
 """Tests for branch-scoped sync operations."""
+
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
-from gza.git import Git, GitError
+from gza.git import GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.sync_ops import (
     BranchSyncResult,
@@ -110,6 +110,156 @@ def test_reconcile_branch_merge_truth_marks_merged_without_persisting(tmp_path):
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
+
+
+def test_reconcile_branch_merge_truth_marks_proven_merged_zero_ahead_task_branch_redundant(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/already-present")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.is_on_first_parent_history.return_value = True
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/already-present": "old-main-sha",
+        "main": "advanced-main-sha",
+    }.get(ref)
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "redundant"
+    assert "marked merged" not in results[0].actions
+
+
+def test_reconcile_branch_merge_truth_marks_redundant_when_side_branch_probe_fails(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/probe-failure")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.is_on_first_parent_history.side_effect = RuntimeError("probe exploded")
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/probe-failure": "branch-tip-sha",
+        "main": "merge-commit-sha",
+    }.get(ref)
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "redundant"
+    assert "marked merged" not in results[0].actions
+    assert any("Could not probe first-parent membership" in warning for warning in results[0].warnings)
+
+
+def test_reconcile_branch_merge_truth_marks_redundant_when_first_parent_probe_missing(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/probe-missing")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    class _GitWithoutFirstParentProbe:
+        def branch_exists(self, branch: str) -> bool:
+            return branch == "feature/probe-missing"
+
+        def is_merged(self, source: str, into: str = "main") -> bool:
+            return source == "feature/probe-missing" and into == "main"
+
+        def count_commits_ahead_checked(self, source: str, target: str) -> int:
+            assert (source, target) == ("feature/probe-missing", "main")
+            return 0
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                "feature/probe-missing": "branch-tip-sha",
+                "main": "merge-commit-sha",
+            }.get(ref)
+
+    results = reconcile_branch_merge_truth(
+        _GitWithoutFirstParentProbe(),
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "redundant"
+    assert "marked merged" not in results[0].actions
+    assert any("Could not probe first-parent membership" in warning for warning in results[0].warnings)
+
+
+def test_reconcile_task_branch_merge_truth_skips_no_commit_task_before_merged_persistence(
+    tmp_path,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/no-commit-probe-failure")
+    task.has_commits = False
+    store.update(task)
+
+    git = Mock()
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.skipped_reason == "no commits"
+    assert result.merge_status is None
+    assert "marked merged" not in result.actions
+    assert store.resolve_merge_unit_for_task(task.id) is None
+    git.is_merged.assert_not_called()
+
+
+def test_reconcile_task_branch_merge_truth_persists_no_ff_side_branch_as_merged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/no-ff-merged")
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.is_on_first_parent_history.return_value = False
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/no-ff-merged": "branch-tip-sha",
+        "main": "merge-commit-sha",
+    }.get(ref)
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        task.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.merge_status == "merged"
+    assert "marked merged" in result.actions
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+    assert refreshed.merged_at is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.state == "merged"
+    assert unit.merged_at == refreshed.merged_at
+    assert unit.merged_by_task_id == task.id
+    assert unit.merge_source == "external"
 
 
 def test_reconcile_branch_merge_truth_missing_local_branch_without_remote_proof_stays_unmerged(tmp_path):
@@ -271,7 +421,7 @@ def test_sync_branch_cohorts_records_github_pr_merge_source(tmp_path):
     assert unit.merge_source == "github_pr"
 
 
-def test_reconcile_task_branch_merge_truth_persists_empty_for_zero_commit_merged_branch(tmp_path):
+def test_reconcile_task_branch_merge_truth_persists_redundant_for_zero_commit_task_branch(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task", "feature/scoped-empty")
 
@@ -279,6 +429,7 @@ def test_reconcile_task_branch_merge_truth_persists_empty_for_zero_commit_merged
     git.branch_exists.return_value = True
     git.is_merged.return_value = True
     git.count_commits_ahead_checked.return_value = 0
+    git.is_on_first_parent_history.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/scoped-empty": "head-sync-empty",
         "main": "base-sync-empty",
@@ -293,7 +444,7 @@ def test_reconcile_task_branch_merge_truth_persists_empty_for_zero_commit_merged
         persist=True,
     )
 
-    assert result.merge_status == "empty"
+    assert result.merge_status == "redundant"
     assert "marked merged" not in result.actions
     refreshed = store.get(task.id)
     assert refreshed is not None
@@ -301,7 +452,7 @@ def test_reconcile_task_branch_merge_truth_persists_empty_for_zero_commit_merged
     assert refreshed.merged_at is None
     unit = store.resolve_merge_unit_for_task(task.id)
     assert unit is not None
-    assert unit.state == "empty"
+    assert unit.state == "redundant"
     assert unit.merged_at is None
     assert unit.head_sha == "head-sync-empty"
     assert unit.base_sha == "base-sync-empty"
@@ -1673,8 +1824,8 @@ def test_sync_branch_cohorts_preserves_existing_merged_by_task_id_on_routine_per
 # ---------------------------------------------------------------------------
 
 
-def test_reconcile_branch_merge_truth_emits_empty_for_zero_commit_unmerged_branch(tmp_path):
-    """Classifier detects zero unique commits on an inspectable branch and emits 'empty'."""
+def test_reconcile_branch_merge_truth_emits_redundant_for_zero_commit_task_branch(tmp_path):
+    """Classifier detects task commits with zero unique commits and emits 'redundant'."""
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task", "feature/zero-commit")
     cohort = BranchCohort(branch=task.branch, tasks=(task,))
@@ -1697,7 +1848,7 @@ def test_reconcile_branch_merge_truth_emits_empty_for_zero_commit_unmerged_branc
         include_diff_stats=False,
     )
 
-    assert results[0].merge_status == "empty"
+    assert results[0].merge_status == "redundant"
     assert "marked merged" not in results[0].actions
 
 
@@ -1730,6 +1881,37 @@ def test_reconcile_branch_merge_truth_preserves_empty_state_when_ref_becomes_una
     assert results[0].merge_status == "empty"
     assert results[0].warnings  # warning about unavailable ref should be present
     assert "empty" in results[0].warnings[0]
+    git.is_merged.assert_not_called()
+
+
+def test_reconcile_branch_merge_truth_preserves_redundant_state_when_ref_becomes_unavailable(tmp_path):
+    """Previously-proven redundant merge unit stays 'redundant' when the branch ref disappears."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/was-redundant")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = False
+
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id=unit.id,
+        merge_unit_state="redundant",
+    )
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+    )
+
+    assert results[0].merge_status == "redundant"
+    assert results[0].warnings
+    assert "redundant" in results[0].warnings[0]
     git.is_merged.assert_not_called()
 
 
@@ -1773,6 +1955,20 @@ def test_git_reconcile_update_drops_merge_source_for_empty_result() -> None:
     )
 
     assert update.merge_status == "empty"
+    assert update.merge_source is _UNSET
+
+
+def test_git_reconcile_update_drops_merge_source_for_redundant_result() -> None:
+    update = _git_reconcile_update(
+        BranchSyncResult(
+            branch="feature/redundant-source",
+            task_ids=("task-1",),
+            merge_status="redundant",
+            merge_source="github_pr",
+        )
+    )
+
+    assert update.merge_status == "redundant"
     assert update.merge_source is _UNSET
 
 
@@ -1828,6 +2024,45 @@ def test_persist_branch_updates_drops_merge_source_for_empty_unit_and_advances_s
     assert refreshed_task.sync_last_synced_at == sync_completed_at
     assert result.errors == []
     assert build_default_branch_cohorts(store, recent_days=30, cooldown_seconds=300) == []
+
+
+def test_persist_branch_updates_persists_redundant_without_merged_provenance(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/persist-redundant")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id=unit.id,
+        merge_unit_state="unmerged",
+    )
+    result = BranchSyncResult(
+        branch=task.branch,
+        task_ids=(task.id,),
+        merge_status="redundant",
+    )
+
+    _persist_branch_updates(
+        store,
+        [cohort],
+        [result],
+        [_BranchPersistenceUpdate(merge_status="redundant", merge_source="github_pr")],
+        "main",
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    refreshed_task = store.get(task.id)
+    assert refreshed_unit is not None
+    assert refreshed_task is not None
+    assert refreshed_unit.state == "redundant"
+    assert refreshed_unit.merged_at is None
+    assert refreshed_unit.merged_by_task_id is None
+    assert refreshed_unit.merge_source is None
+    assert refreshed_task.merge_status is None
 
 
 def test_sync_branch_cohorts_persist_failure_marks_only_that_cohort_as_error(tmp_path):

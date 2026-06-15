@@ -759,11 +759,15 @@ def test_merge_chain_unmerged_hides_legacy_unmerged_status_when_unit_is_merged(t
 def test_branch_merge_state_projects_empty_for_moot_merge_unit(tmp_path: Path) -> None:
     store = _store(tmp_path)
     task = store.add("empty merge unit", task_type="implement")
-    store.mark_completed(task, has_commits=True, branch="feature/empty-projection")
+    store.mark_completed(task, has_commits=False, branch="feature/empty-projection")
     assert task.id is not None
-    unit = store.resolve_merge_unit_for_task(task.id)
-    assert unit is not None
-    store.set_merge_unit_state(unit.id, "empty")
+    unit = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch=store.default_merge_target(),
+        owner_task_id=task.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
     service = TaskQueryService(store)
     result = service.run(TaskQueryPresets.search("empty merge unit", limit=None))

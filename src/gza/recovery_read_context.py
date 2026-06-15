@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .db import DependencyMergeUnitResolution, MergeUnit, Task as DbTask
 
@@ -22,7 +23,10 @@ class RecoveryReadContext:
     recovery_snapshots: dict[str, object] = field(default_factory=dict)
     lineage_by_root_task_id: dict[str, tuple[DbTask, ...]] = field(default_factory=dict)
     dependency_completion_by_task_id: dict[str, DbTask | None] = field(default_factory=dict)
-    pending_empty_prerequisite_reconciliations: dict[str, DbTask] = field(default_factory=dict)
+    pending_prerequisite_no_work_reconciliations: dict[
+        str,
+        tuple[DbTask, Literal["empty", "redundant"]],
+    ] = field(default_factory=dict)
     allow_reconcile_mutation: bool = True
 
     def get_task(self, task_id: str | None) -> DbTask | None:
@@ -183,7 +187,11 @@ class RecoveryReadContext:
 
         return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
 
-    def record_empty_prerequisite_reconciliation(self, task: DbTask) -> None:
+    def record_prerequisite_no_work_reconciliation(
+        self,
+        task: DbTask,
+        merge_state: Literal["empty", "redundant"],
+    ) -> None:
         if task.id is None:
             return
-        self.pending_empty_prerequisite_reconciliations[task.id] = task
+        self.pending_prerequisite_no_work_reconciliations[task.id] = (task, merge_state)

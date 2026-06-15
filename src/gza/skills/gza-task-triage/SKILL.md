@@ -73,7 +73,7 @@ Map `next_action` (the `type` field) and `next_action_reason` to a classificatio
 
 | `next_action` | Typical `next_action_reason` | Classification |
 |---|---|---|
-| `skip` (with reason `merge-unit-merged` or `merge-unit-empty`) | merge unit already landed or has no remaining commits | **moot — propose drop of failed leaves** |
+| `skip` (with reason `merge-unit-merged`, `merge-unit-empty`, or `merge-unit-redundant`) | merge unit already landed, has no task work, or has commits already present on target | **moot — propose drop of failed leaves** |
 | `needs_rebase` | `rebase --resolve (conflicts detected)` | **manual rebase resolution** |
 | `needs_discussion` | `rebase-failed-needs-manual-resolution` | **failed rebase — check if target merged** |
 | `needs_discussion` | `merge-source-needs-manual-resolution` | **manual merge-source conflict** |
@@ -101,11 +101,11 @@ uv run gza show <leaf-id>
 ```
 
 and look at:
-- `Lifecycle:` — does it say "target implementation already merged", "merge-unit-merged", or "merge-unit-empty"? Those leaves are dead work.
+- `Lifecycle:` — does it say "target implementation already merged", "merge-unit-merged", "merge-unit-empty", or "merge-unit-redundant"? Those leaves are dead work.
 - `Status:` and `Failure Reason:` — TIMEOUT / WORKER_DIED / INFRASTRUCTURE_ERROR signal infra failures (resume-class); semantic failures (failed verify, max turns with real loop) are different.
 - `Merge Status:` — `merged` confirms the work shipped.
 
-If every unresolved leaf has lifecycle "target merged", "merge-unit-merged", or "merge-unit-empty", the owner is surfacing only because of stale failed leaves. The correct action is to drop those leaves.
+If every unresolved leaf has lifecycle "target merged", "merge-unit-merged", "merge-unit-empty", or "merge-unit-redundant", the owner is surfacing only because of stale failed leaves. The correct action is to drop those leaves.
 
 ### Step 4: Recommend an action per row
 
