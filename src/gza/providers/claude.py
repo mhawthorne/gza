@@ -505,8 +505,7 @@ class ClaudeLogRenderer:
         if not rendered:
             return [], []
         if tv:
-            prefix = "tool_error" if is_error else "tool_output"
-            return [], [f"{prefix} {rendered}"]
+            return [], [rendered]
         if is_error:
             return [f"[red]{rich_escape(rendered)}[/red]"], []
         return [rich_escape(rendered)], []

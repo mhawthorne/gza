@@ -282,6 +282,30 @@ def test_claude_renderer_keeps_unknown_blocks_when_mixed_with_text() -> None:
     assert tv_rendered.tv_lines[-1].startswith("... (+")
 
 
+def test_claude_renderer_tool_result_tv_has_no_prefix() -> None:
+    renderer = get_log_renderer("claude")
+    success_entry = {
+        "type": "user",
+        "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "x", "content": "output text"}]
+        },
+    }
+    error_entry = {
+        "type": "user",
+        "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "y", "content": "error text", "is_error": True}]
+        },
+    }
+
+    tv_success = renderer.handle_tv(success_entry)
+    tv_error = renderer.handle_tv(error_entry)
+
+    assert tv_success.tv_lines == ["output text"]
+    assert all("tool_output" not in line for line in tv_success.tv_lines)
+    assert tv_error.tv_lines == ["error text"]
+    assert all("tool_error" not in line for line in tv_error.tv_lines)
+
+
 def test_claude_renderer_keeps_non_init_system_errors_visible() -> None:
     renderer = get_log_renderer("claude")
     entry = {
