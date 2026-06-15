@@ -1237,6 +1237,34 @@ class TestReviewContextFromChain:
         assert "Failing output (trimmed):" in rendered
         assert "lint failed" in rendered
 
+    def test_format_review_verify_result_keeps_failure_tail_and_pytest_summary(self):
+        """Trimmed failed verify output should preserve the failing pytest tail with line breaks."""
+        long_output = (
+            ("collected setup noise\n" * 350)
+            + "gza-verify phase=failed name=unit duration_seconds=31.25\n"
+            + "FAILED tests/test_runner.py::test_x\n"
+            + "E       assert 1 == 2\n"
+            + "=========================== short test summary info ============================\n"
+            + "FAILED tests/test_runner.py::test_x\n"
+            + "============================== 1 failed in 31.25s ==============================\n"
+        )
+        result = ReviewVerifyResult(
+            command="./bin/tests -x",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime.now(UTC),
+            failure="pytest failed",
+            output=long_output,
+        )
+
+        rendered = _format_review_verify_result(result)
+
+        assert "Failing output (trimmed):" in rendered
+        assert "FAILED tests/test_runner.py::test_x" in rendered
+        assert "============================== 1 failed in 31.25s ==============================" in rendered
+        assert "collected setup noise" not in rendered
+        assert "...\ngza-verify phase=failed name=unit duration_seconds=31.25" in rendered
+
     def test_format_review_verify_failure_labels_timeout(self):
         """Timeout formatter should preserve failure status and timeout evidence."""
         result = _format_review_verify_failure(

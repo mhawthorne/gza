@@ -50,6 +50,88 @@ def _pytest_timeout_plugin_failure_review_report() -> str:
     )
 
 
+def _gza_5013_review_report() -> str:
+    return (
+        "## Summary\n\n- Review found no product-code defect; autonomous verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 - verify_command failure: unit phase failed under `./bin/tests -x`\n"
+        "Evidence: ## verify_command result\n"
+        "- Command: `./bin/tests -x -o faulthandler_timeout=120`\n"
+        "- Status: failed\n"
+        "- Exit status: 1\n"
+        "- Failure: verify_command failed during autonomous review\n"
+        "\n"
+        "Failing output (trimmed):\n"
+        "```text\n"
+        "gza-verify phase=failed name=unit duration_seconds=38.10\n"
+        "FAILED tests/cli/test_watch.py::test_review_verify_reclassifies_flaky_failure\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/cli/test_watch.py::test_review_verify_reclassifies_flaky_failure\n"
+        "============================== 1 failed in 38.10s ==============================\n"
+        "```\n"
+        "Impact: the branch cannot pass autonomous verification from the current tip.\n"
+        "Required fix: rerun `./bin/tests -x -o faulthandler_timeout=120` from the current tip and only keep a blocker if it still fails.\n"
+        "Required tests: rerun `./bin/tests -x -o faulthandler_timeout=120`.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _gza_4983_review_report() -> str:
+    return (
+        "## Summary\n\n- Product review passed; verify gate failed once under pytest fail-fast.\n\n"
+        "## Blockers\n\n"
+        "### B1 1. verify_command failure: targeted pytest failed in review\n"
+        "Evidence: ## verify_command result\n"
+        "- Command: `./bin/tests -x -o faulthandler_timeout=120`\n"
+        "- Status: failed\n"
+        "- Exit status: 1\n"
+        "\n"
+        "Failing output (trimmed):\n"
+        "```text\n"
+        "gza-verify phase=failed name=unit duration_seconds=44.72\n"
+        "FAILED tests/test_runner.py::test_noop_improve_verify_only_auto_clear\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_runner.py::test_noop_improve_verify_only_auto_clear\n"
+        "============================== 1 failed in 44.72s ==============================\n"
+        "```\n"
+        "Impact: the branch cannot clear review while autonomous verification reports a failure.\n"
+        "Required fix: rerun the same verify command from the current tip and keep the blocker only if it reproduces.\n"
+        "Required tests: rerun `./bin/tests -x -o faulthandler_timeout=120`.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _gza_4668_review_report() -> str:
+    return (
+        "## Summary\n\n- Review only found a failed verify gate.\n\n"
+        "## Blockers\n\n"
+        "### B1 - ./bin/tests failure: autonomous verify failed once in review\n"
+        "Evidence: ## verify_command result\n"
+        "- Command: `./bin/tests -x -o faulthandler_timeout=120`\n"
+        "- Status: failed\n"
+        "- Exit status: 1\n"
+        "\n"
+        "Failing output (trimmed):\n"
+        "```text\n"
+        "gza-verify phase=failed name=unit duration_seconds=17.43\n"
+        "FAILED tests/test_review_verdict.py::test_verify_failure_is_reclassified\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_review_verdict.py::test_verify_failure_is_reclassified\n"
+        "============================== 1 failed in 17.43s ==============================\n"
+        "```\n"
+        "Impact: `./bin/tests` did not pass in the autonomous review worktree.\n"
+        "Required fix: rerun `./bin/tests -x -o faulthandler_timeout=120` from the current tip and only escalate to code if a concrete defect reproduces.\n"
+        "Required tests: rerun `./bin/tests -x -o faulthandler_timeout=120`.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
 class TestParseReviewVerdict:
     def test_inline_bold_wrapped(self) -> None:
         assert parse_review_verdict("**Verdict: APPROVED**") == "APPROVED"
@@ -398,7 +480,7 @@ class TestVerifyBlockedReviewClassification:
         assert is_verify_timeout_only_review(content) is False
         assert is_verify_blocked_only_review(content) is False
 
-    def test_does_not_classify_non_timeout_verify_failure_as_timeout_only(self) -> None:
+    def test_keeps_non_timeout_verify_failure_with_concrete_src_defect_as_code(self) -> None:
         content = (
             "## Summary\n\n- Verify failed.\n\n"
             "## Blockers\n\n"
@@ -416,10 +498,10 @@ class TestVerifyBlockedReviewClassification:
 
         assert summary.blocker_count == 1
         assert summary.verify_timeout_count == 0
-        assert summary.verify_failure_count == 1
-        assert summary.unknown_or_code_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 1
         assert is_verify_timeout_only_review(content) is False
-        assert is_verify_blocked_only_review(content) is True
+        assert is_verify_blocked_only_review(content) is False
 
     def test_classifies_gza_4927_verify_failure_report_as_verify_blocked_not_timeout(self) -> None:
         content = _gza_4927_review_report()
@@ -432,6 +514,21 @@ class TestVerifyBlockedReviewClassification:
         assert summary.unknown_or_code_count == 0
         assert is_verify_blocked_only_review(content) is True
         assert is_verify_timeout_only_review(content) is False
+
+    def test_classifies_real_verify_failure_only_reports_as_verify_blocked_only(self) -> None:
+        for content in (
+            _gza_5013_review_report(),
+            _gza_4983_review_report(),
+            _gza_4668_review_report(),
+        ):
+            summary = summarize_review_blockers(content)
+
+            assert summary.blocker_count == 1
+            assert summary.verify_failure_count == 1
+            assert summary.verify_timeout_count == 0
+            assert summary.unknown_or_code_count == 0
+            assert is_verify_blocked_only_review(content) is True
+            assert is_verify_timeout_only_review(content) is False
 
     def test_does_not_treat_timeout_identifiers_or_flags_as_verify_timeout_markers(self) -> None:
         content = (
@@ -456,6 +553,38 @@ class TestVerifyBlockedReviewClassification:
         assert summary.verify_timeout_count == 0
         assert summary.unknown_or_code_count == 0
         assert is_verify_blocked_only_review(content) is True
+        assert is_verify_timeout_only_review(content) is False
+
+    def test_keeps_verify_failure_plus_concrete_product_defect_as_code(self) -> None:
+        content = (
+            "## Summary\n\n- Verify failed because of a concrete defect.\n\n"
+            "## Blockers\n\n"
+            "### B1 - verify_command failure: NameError in review verdict classifier\n"
+            "Evidence: ## verify_command result\n"
+            "- Command: `./bin/tests -x`\n"
+            "- Status: failed\n"
+            "- Exit status: 1\n"
+            "```text\n"
+            "FAILED tests/test_review_verdict.py::test_classifier_handles_product_bug\n"
+            "src/gza/review_verdict.py:663: NameError: name 'subject' is not defined\n"
+            "============================== 1 failed in 3.21s ==============================\n"
+            "```\n"
+            "Open-state citation: `src/gza/review_verdict.py:663`\n"
+            "Impact: the classifier crashes before autonomous verification can finish.\n"
+            "Required fix: define the missing name in `src/gza/review_verdict.py:663` before rerunning verify_command.\n"
+            "Required tests: add a regression for the crashing classifier path and rerun `./bin/tests -x`.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_failure_count == 0
+        assert summary.verify_timeout_count == 0
+        assert summary.unknown_or_code_count == 1
+        assert is_verify_blocked_only_review(content) is False
         assert is_verify_timeout_only_review(content) is False
 
     def test_does_not_treat_pytest_timeout_plugin_version_as_verify_timeout_marker(self) -> None:

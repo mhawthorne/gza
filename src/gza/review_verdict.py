@@ -45,6 +45,7 @@ _CHECKLIST_LINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _VERIFY_COMMAND_PATTERN = re.compile(r"\bverify_command\b", re.IGNORECASE)
+_VERIFY_COMMAND_SUBJECT_PATTERN = re.compile(r"(?:verify_command|(?:\./)?bin/tests)\b", re.IGNORECASE)
 _VERIFY_TIMEOUT_PATTERNS = (
     re.compile(r"\btimed\s+out\b", re.IGNORECASE),
     re.compile(r"\bexit\s+status:\s*timed\s+out\b", re.IGNORECASE),
@@ -64,6 +65,10 @@ _VERIFY_FAILURE_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_VERIFY_FAILED_PHASE_PATTERN = re.compile(r"\bgza-verify\s+phase=failed\b", re.IGNORECASE)
+_VERIFY_FAILED_STATUS_PATTERN = re.compile(r"(^|\n)\s*[-*]?\s*status:\s*failed\b", re.IGNORECASE)
+_VERIFY_EXIT_STATUS_PATTERN = re.compile(r"(^|\n)\s*[-*]?\s*exit\s+status:\s*(?!timed\s+out\b).+", re.IGNORECASE)
+_TITLE_LEADING_MARKER_PATTERN = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|[A-Z]\d+[:.)-]?\s+)+", re.IGNORECASE)
 _BLOCKER_SECTION_PATTERN = re.compile(
     r"^##\s+(Blockers|Must-Fix)\s*$\n?(.*?)(?=^##\s+|\Z)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
@@ -526,7 +531,9 @@ def _contains_verify_timeout_marker(text: str) -> bool:
 def _contains_verify_failure_marker(text: str) -> bool:
     if not text:
         return False
-    return any(pattern.search(text) for pattern in _VERIFY_FAILURE_PATTERNS)
+    return any(pattern.search(text) for pattern in _VERIFY_FAILURE_PATTERNS) or _contains_structured_verify_failure_marker(
+        text
+    )
 
 
 def _contains_explicit_verify_timeout_subject(text: str) -> bool:
@@ -561,6 +568,16 @@ def _timeout_token_is_flag_or_assignment(text: str, start: int, end: int) -> boo
     return next_index < len(text) and text[next_index] == "-" and (next_index + 1) < len(text) and text[
         next_index + 1
     ].isalnum()
+
+
+def _contains_structured_verify_failure_marker(text: str) -> bool:
+    if _VERIFY_FAILED_PHASE_PATTERN.search(text):
+        return True
+    return bool(
+        _VERIFY_FAILED_STATUS_PATTERN.search(text)
+        and _VERIFY_EXIT_STATUS_PATTERN.search(text)
+        and _VERIFY_COMMAND_SUBJECT_PATTERN.search(text)
+    )
 
 
 def _extract_open_state_like_citation_tokens(text: str) -> tuple[str, ...]:
@@ -630,10 +647,19 @@ def _has_explicit_verify_timeout_subject_in_structured_fields(finding: ReviewFin
     return any(_contains_explicit_verify_timeout_subject(field or "") for field in subject_fields)
 
 
+def _strip_leading_title_markers(title: str) -> str:
+    normalized = title.strip()
+    while True:
+        stripped = _TITLE_LEADING_MARKER_PATTERN.sub("", normalized, count=1)
+        if stripped == normalized:
+            return normalized
+        normalized = stripped.strip()
+
+
 def _title_names_verify_command_as_subject(title: str | None) -> bool:
     if not title:
         return False
-    return bool(re.match(r"\s*verify_command\b", title, re.IGNORECASE))
+    return bool(_VERIFY_COMMAND_SUBJECT_PATTERN.match(_strip_leading_title_markers(title)))
 
 
 def _classify_blocker_finding(finding: ReviewFinding) -> str:
@@ -661,6 +687,8 @@ def _classify_blocker_finding(finding: ReviewFinding) -> str:
                 return "code"
             return "verify_timeout"
     if _contains_verify_failure_marker(text):
+        if _structured_fields_have_product_code_citation(finding):
+            return "code"
         return "verify_failure"
     return "code"
 

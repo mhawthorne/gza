@@ -2362,6 +2362,29 @@ def _truncate_to_word_boundary(text: str, max_chars: int) -> str:
     return f"{candidate}..."
 
 
+def _truncate_tail_preserving_lines(text: str, max_chars: int) -> str:
+    """Keep the end of multiline output intact so failure diagnostics survive trimming."""
+    normalized = text.strip()
+    if len(normalized) <= max_chars:
+        return normalized
+
+    if max_chars <= 4:
+        return "." * max_chars
+
+    tail_budget = max_chars - 4
+    tail = normalized[-tail_budget:].lstrip()
+    newline_index = tail.find("\n")
+    if newline_index > 0:
+        tail = tail[newline_index + 1 :]
+    marker = re.search(
+        r"(?m)^(?:gza-verify phase=failed\b|FAILED\b|E\s+|={5,}\s*short test summary info\s*={5,}|Traceback \(most recent call last\):)",
+        tail,
+    )
+    if marker is not None and marker.start() > 0:
+        tail = tail[marker.start() :].lstrip()
+    return f"...\n{tail}"
+
+
 def _decode_subprocess_output(output: str | bytes | None) -> str:
     """Normalize subprocess output payloads to text."""
     if output is None:
@@ -2697,7 +2720,7 @@ def _format_review_verify_result(
     if result.failure:
         lines.append(f"- Failure: {result.failure}")
     if result.status != "passed":
-        trimmed_output = _truncate_to_word_boundary(
+        trimmed_output = _truncate_tail_preserving_lines(
             result.output or result.failure or "(no failing output captured)",
             REVIEW_VERIFY_OUTPUT_MAX_CHARS,
         )
