@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -591,6 +592,91 @@ def test_failed_redundant_branch_with_completed_recovery_descendant_is_already_r
         "terminal_no_work_recovery_already_resolved",
     }
     assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_decide_failed_task_recovery_live_resolution_for_unitless_redundant_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unit-less task whose live branch resolves redundant is moot for both decide and list.
+
+    No git instance is passed manually — the function auto-loads merge context so that
+    every production caller (advance, watch, iterate) agrees with list_failed_tasks_for_recovery.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Unitless redundant implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/unitless-redundant"
+    failed.has_commits = True
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    # No merge unit attached — unit-less task
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "resolve_task_merge_state_for_target",
+        lambda **kwargs: "redundant",
+    )
+    # _stub_merge_context patches _load_merge_context so the auto-load path inside
+    # decide_failed_task_recovery returns a working stub — no git injected by hand.
+    _stub_merge_context(monkeypatch)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_decide_failed_task_recovery_live_probe_failure_logs_warning_and_does_not_silently_moot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the live merge-state probe raises, a warning is logged and the task is NOT silently mooted.
+
+    Mirrors test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachability_probe_fails
+    for the decide path: probe failure must be observable, not a silent recovery-action change.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Unitless implementation with probe failure", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/probe-failure"
+    failed.has_commits = True
+    failed.session_id = "sess-probe-failure"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    # No merge unit attached — unit-less task
+
+    def _raise_git_error(**kwargs: object) -> None:
+        raise GitError("simulated probe failure")
+
+    monkeypatch.setattr(recovery_engine, "resolve_task_merge_state_for_target", _raise_git_error)
+    _stub_merge_context(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="gza.recovery_engine"):
+        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("live merge-state probe failed" in m for m in warning_messages), (
+        f"Expected probe-failure warning in: {warning_messages}"
+    )
+    assert any("feature/probe-failure" in m for m in warning_messages), (
+        f"Expected branch name in warning: {warning_messages}"
+    )
+
+    # Decision must not be silently mooted — task has session so should resume, not skip
+    assert decision.action == "resume", (
+        f"Expected resume after probe failure, got action={decision.action} reason={decision.reason_code}"
+    )
 
 
 def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachability_probe_fails(

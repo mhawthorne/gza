@@ -1274,6 +1274,7 @@ def decide_failed_task_recovery(
     task: DbTask,
     *,
     max_recovery_attempts: int,
+    merge_context: _MergeContext | None = None,
     read_context: RecoveryReadContext | None = None,
 ) -> FailedRecoveryDecision:
     assert task.id is not None
@@ -1397,6 +1398,34 @@ def decide_failed_task_recovery(
                 attempt_limit=attempt_limit,
             )
     merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
+    if merge_state is None and task.branch:
+        _mc = merge_context if merge_context is not None else _load_merge_context(_project_dir_for_store(store))
+        if _mc.git is not None:
+            try:
+                target_branch: str | None = _resolve_merge_context_target_branch(store, _mc)
+            except MergeTargetResolutionError as exc:
+                logger.warning(
+                    "recovery: could not determine merge target for live branch probe of %s: %s",
+                    task.branch,
+                    exc,
+                )
+                target_branch = None
+            if target_branch:
+                try:
+                    live_state = resolve_task_merge_state_for_target(
+                        store=store,
+                        task=task,
+                        git=_mc.git,
+                        target_branch=target_branch,
+                    )
+                    if live_state is not None:
+                        merge_state = live_state
+                except (GitError, MergeTargetResolutionError) as exc:
+                    logger.warning(
+                        "recovery: live merge-state probe failed for branch %s: %s",
+                        task.branch,
+                        exc,
+                    )
     if merge_state in {"empty", "redundant"}:
         empty_recovery_state = _classify_empty_task_recovery_state(
             store,
