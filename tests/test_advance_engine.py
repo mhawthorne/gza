@@ -18,6 +18,7 @@ from gza.advance_engine import (
     classify_advance_action,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
+    get_action_subject_task_id,
     require_needs_attention_subject,
     resolve_advance_context,
     resolve_closing_review_action,
@@ -3084,6 +3085,124 @@ def test_two_consecutive_noop_improves_return_needs_discussion(tmp_path: Path, m
     assert action["needs_attention_reason"] == "improve-no-op"
     assert action["subject_task_id"] == impl.id
     assert "2 consecutive no-op improves" in action["description"]
+
+
+def test_noop_improve_subject_is_implement_when_evaluated_from_improve_leaf(tmp_path: Path, monkeypatch) -> None:
+    """When watch.py calls evaluate_advance_rules with the improve leaf as the task,
+    the needs-attention subject_task_id must still point to the implement owner."""
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-leaf-subject",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.report_file = "reviews/fake.md"
+    store.update(review)
+
+    improve: DbTask | None = None
+    for hour in (11, 12):
+        improve = _add_completed_improve_for_review(
+            store,
+            impl,
+            review,
+            when=datetime(2026, 5, 14, hour, 0, tzinfo=UTC),
+            changed_diff=False,
+        )
+    assert improve is not None
+    assert improve.id is not None
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    # Simulate watch.py passing the improve leaf (lifecycle_action_task) to evaluate_advance_rules.
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    # Subject must be the implement owner, not the improve leaf.
+    assert get_action_subject_task_id(action) == impl.id
+    assert get_action_subject_task_id(action) != improve.id
+    # Description must still name the specific improve for context.
+    assert improve.id in action["description"]
+    # resolve_subject_task must resolve to the implement task.
+    resolved = resolve_subject_task(store, action)
+    assert resolved.id == impl.id
+
+
+def test_verify_blocked_subject_is_implement_when_evaluated_from_improve_leaf(tmp_path: Path) -> None:
+    """When watch.py calls evaluate_advance_rules with the improve leaf as the task,
+    the verify-blocked-no-code-issues needs-attention subject_task_id must point to the implement owner."""
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/verify-blocked-leaf-subject",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review1 = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review1.id is not None
+    review1.status = "completed"
+    review1.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review1.output_content = _timeout_only_review_report()
+    store.update(review1)
+
+    improve_between = store.add(
+        "Improve between reviews", task_type="improve", based_on=impl.id, depends_on=review1.id, same_branch=True
+    )
+    assert improve_between.id is not None
+    improve_between.status = "completed"
+    improve_between.completed_at = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    improve_between.branch = impl.branch
+    improve_between.has_commits = True
+    store.update(improve_between)
+
+    review2 = store.add("Review round 2", task_type="review", depends_on=impl.id)
+    assert review2.id is not None
+    review2.status = "completed"
+    review2.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    review2.output_content = _timeout_only_review_report()
+    store.update(review2)
+
+    # Improve leaf after the second timeout review — simulates watch.py passing lifecycle_action_task.
+    improve_leaf = _add_completed_improve_for_review(
+        store,
+        impl,
+        review2,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    assert improve_leaf.id is not None
+
+    # Simulate watch.py passing the improve leaf (lifecycle_action_task) to evaluate_advance_rules.
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve_leaf, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+    # Subject must be the implement owner, not the improve leaf.
+    assert get_action_subject_task_id(action) == impl.id
+    assert get_action_subject_task_id(action) != improve_leaf.id
+    # resolve_subject_task must resolve to the implement task.
+    resolved = resolve_subject_task(store, action)
+    assert resolved.id == impl.id
 
 
 def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path: Path) -> None:

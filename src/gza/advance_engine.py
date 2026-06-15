@@ -786,6 +786,14 @@ def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
     return suffix
 
 
+def _needs_attention_subject_id(ctx: AdvanceContext) -> str | None:
+    """Prefer the owning implement (merge-unit owner) over a leaf sub-task."""
+    owner = _resolve_owning_implementation_task(ctx.store, ctx.task)
+    if owner is not None and owner.id:
+        return owner.id
+    return ctx.task.id
+
+
 def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
     latest_noop_id = _task_id(ctx.latest_noop_improve)
     source = "unresolved comments remain open after" if ctx.noop_improve_trigger == "comments" else "review feedback remains unresolved after"
@@ -799,7 +807,7 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
             ),
         },
         reason="improve-no-op",
-        subject_task_id=ctx.task.id,
+        subject_task_id=_needs_attention_subject_id(ctx),
     )
 
 
@@ -815,7 +823,7 @@ def _verify_blocked_no_code_issues_action(ctx: AdvanceContext) -> dict[str, Any]
             "review_task": ctx.latest_completed_review,
         },
         reason="verify-blocked-no-code-issues",
-        subject_task_id=ctx.task.id,
+        subject_task_id=_needs_attention_subject_id(ctx),
     )
 
 
