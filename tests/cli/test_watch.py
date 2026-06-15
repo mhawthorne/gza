@@ -38,6 +38,7 @@ from gza.cli.watch import (
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
     _query_owner_rows,
+    _query_owner_rows_with_context,
     _refresh_watch_no_progress_after_state_change,
     _resolve_watch_attention_display_task,
     _run_cycle,
@@ -51,6 +52,7 @@ from gza.cli.watch import (
     allocate_watch_slots,
     cmd_watch,
 )
+from gza.recovery_read_context import RecoveryReadContext
 from gza.advance_engine import failed_recovery_decision_to_action
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
 import gza.colors as colors
@@ -4774,7 +4776,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
 
     rebase_task = SimpleNamespace(id="gza-rebase-1")
 
-    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids):  # noqa: ARG001
+    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
         if task.id == task_a.id:
             return {"type": "merge"}
         if task.id == task_b.id:
@@ -4931,7 +4933,7 @@ def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_b
     isolated_git.is_merged.return_value = False
     isolated_git.can_merge.side_effect = [False]
 
-    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids):  # noqa: ARG001
+    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
         if task.id == merge_task.id:
             return {"type": "merge"}
         if task.id == plan_task.id:
@@ -8100,7 +8102,7 @@ def test_watch_cycle_noop_improve_limit_emits_attention_without_iterate(tmp_path
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._query_owner_rows", return_value=[row]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
         patch(
             "gza.cli.watch.determine_next_action",
             return_value={
@@ -8388,7 +8390,7 @@ def test_watch_cycle_run_review_allows_later_same_lineage_anchor(tmp_path: Path,
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch._query_owner_rows", return_value=[row]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,

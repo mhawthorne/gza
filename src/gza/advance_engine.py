@@ -2266,6 +2266,7 @@ def resolve_advance_context(
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
     persist_post_merge_rebase_state: bool = True,
+    read_context: RecoveryReadContext | None = None,
 ) -> AdvanceContext:
     """Resolve state once, then let rules evaluate pure context."""
     assert task.id is not None
@@ -2281,12 +2282,14 @@ def resolve_advance_context(
             store,
             task,
             max_recovery_attempts=effective_max_resume,
+            read_context=read_context,
         )
         failed_recovery_attention_reason = get_failed_recovery_needs_attention_reason(
             store,
             task,
             decision=failed_recovery_decision,
             max_recovery_attempts=effective_max_resume,
+            read_context=read_context,
         )
     is_resumable_failed = (
         failed_recovery_decision is not None
@@ -3257,6 +3260,7 @@ def evaluate_advance_rules(
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
     persist_post_merge_rebase_state: bool = True,
+    read_context: RecoveryReadContext | None = None,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
     context = resolve_advance_context(
@@ -3268,6 +3272,7 @@ def evaluate_advance_rules(
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        read_context=read_context,
     )
 
     for rule in ADVANCE_RULES:

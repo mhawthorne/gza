@@ -29,6 +29,7 @@ from gza.advance_engine import (
     with_needs_attention,
 )
 from gza.db import SqliteTaskStore, Task as DbTask
+from gza.recovery_read_context import RecoveryReadContext
 
 
 def determine_next_action(
@@ -41,6 +42,7 @@ def determine_next_action(
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
     persist_post_merge_rebase_state: bool = True,
+    read_context: RecoveryReadContext | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible entrypoint for advance action selection."""
     return evaluate_advance_rules(
@@ -52,6 +54,7 @@ def determine_next_action(
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        read_context=read_context,
     )
 
 

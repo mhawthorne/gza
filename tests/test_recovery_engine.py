@@ -3350,3 +3350,98 @@ def test_list_failed_tasks_for_recovery_uses_indexed_lineage_without_store_walks
     monkeypatch.setattr(store, "get_lineage_children", _unexpected_store_lineage_read)
 
     assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
+
+
+def test_decide_failed_task_recovery_uses_injected_merge_context_not_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When merge_context is passed explicitly, _load_merge_context must not be called.
+
+    Guards the performance/nondeterminism fix: batch callers thread the already-loaded
+    context so each task in the loop does not re-run Config.load + Git + branch listing.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Unitless implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/mc-injection-test"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    # _load_merge_context raises: if it's called despite the injected context, the test fails.
+    def _must_not_be_called(_project_dir=None) -> _MergeContext:
+        raise AssertionError("_load_merge_context must not be called when merge_context is injected")
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _must_not_be_called)
+    monkeypatch.setattr(
+        recovery_engine,
+        "resolve_task_merge_state_for_target",
+        lambda **kwargs: "redundant",
+    )
+
+    git = _StubMergeGit(default_branch="main")
+    injected_mc = _MergeContext(git=git, default_branch="main")
+
+    # Must not raise (i.e., _load_merge_context is never called)
+    decision = decide_failed_task_recovery(
+        store, failed, max_recovery_attempts=1, merge_context=injected_mc
+    )
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"
+
+
+def test_decide_failed_task_recovery_uses_read_context_merge_context_not_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When read_context.merge_context is pre-populated, _load_merge_context must not be called.
+
+    Guards the batch-sharing fix: the first decide call in a loop caches the context in
+    read_context.merge_context; subsequent calls reuse it without re-running the ambient load.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Unitless implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/rc-mc-injection-test"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    def _must_not_be_called(_project_dir=None) -> _MergeContext:
+        raise AssertionError("_load_merge_context must not be called when read_context.merge_context is set")
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _must_not_be_called)
+    monkeypatch.setattr(
+        recovery_engine,
+        "resolve_task_merge_state_for_target",
+        lambda **kwargs: "redundant",
+    )
+
+    git = _StubMergeGit(default_branch="main")
+    pre_loaded_mc = _MergeContext(git=git, default_branch="main")
+
+    indexes = _load_indexes(store)
+    read_context = RecoveryReadContext(
+        tasks=indexes.tasks,
+        task_by_id=indexes.task_by_id,
+        based_on_children=indexes.based_on_children,
+        depends_on_children=indexes.depends_on_children,
+        root_by_task_id=indexes.root_by_task_id,
+        merge_units_by_task_id=indexes.merge_units_by_task_id,
+        allow_reconcile_mutation=False,
+    )
+    read_context.merge_context = pre_loaded_mc  # pre-populate as a batch caller would
+
+    # Must not raise (i.e., _load_merge_context is never called)
+    decision = decide_failed_task_recovery(
+        store, failed, max_recovery_attempts=1, read_context=read_context
+    )
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_redundant"

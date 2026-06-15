@@ -68,7 +68,7 @@ def collect_recovery_lane_entries(
         task = row.recovery_leaf_task
         if task is None or task.id is None:
             continue
-        decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
+        decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts, read_context=read_context)
         if decision.action in {"resume", "retry"}:
             entries.append(RecoveryLaneEntry(owner_task=row.owner_task, task=task, decision=decision))
             continue
@@ -77,6 +77,7 @@ def collect_recovery_lane_entries(
             task,
             decision,
             max_recovery_attempts=max_recovery_attempts,
+            read_context=read_context,
         )
         if attention_action is None:
             continue

@@ -1399,7 +1399,17 @@ def decide_failed_task_recovery(
             )
     merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
     if merge_state is None and task.branch:
-        _mc = merge_context if merge_context is not None else _load_merge_context(_project_dir_for_store(store))
+        _mc = (
+            merge_context
+            if merge_context is not None
+            else (
+                read_context.merge_context
+                if read_context is not None and isinstance(read_context.merge_context, _MergeContext)
+                else _load_merge_context(_project_dir_for_store(store))
+            )
+        )
+        if read_context is not None and read_context.merge_context is None:
+            read_context.merge_context = _mc
         if _mc.git is not None:
             try:
                 target_branch: str | None = _resolve_merge_context_target_branch(store, _mc)

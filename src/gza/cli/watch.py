@@ -31,7 +31,12 @@ from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git, GitError
-from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
+from ..lineage_query import (
+    LineageOwnerQuery,
+    LineageOwnerRow,
+    _query_lineage_owner_rows_with_context,
+    query_lineage_owner_rows,
+)
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
@@ -41,6 +46,7 @@ from ..recovery_engine import (
     resolve_pending_recovery_execution_mode,
     should_hide_failed_recovery_decision,
 )
+from ..recovery_read_context import RecoveryReadContext
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
@@ -361,6 +367,34 @@ def _query_owner_rows(
             target_branch=target_branch,
         )
     )
+
+
+def _query_owner_rows_with_context(
+    *,
+    store: SqliteTaskStore,
+    config: Config | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+    max_recovery_attempts: int,
+    include_skipped: bool,
+) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
+    rows, read_context = _query_lineage_owner_rows_with_context(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            tags=tags,
+            any_tag=any_tag,
+            include_skipped=include_skipped,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=max_recovery_attempts,
+        ),
+        config=config,
+        git=git,
+        target_branch=target_branch,
+    )
+    return list(rows), read_context
 
 
 def _watch_iterate_result(
@@ -1300,15 +1334,16 @@ def _emit_recovery_dry_run_report(
     skipped = 0
     hidden_skipped = 0
     visible_task_ids = {entry.task.id for entry in entries if entry.task.id is not None}
+    all_owner_rows, report_read_context = _query_owner_rows_with_context(
+        store=store,
+        tags=tags,
+        any_tag=any_tag,
+        max_recovery_attempts=max_recovery_attempts,
+        include_skipped=True,
+    )
     failed_rows = [
         row
-        for row in _query_owner_rows(
-            store=store,
-            tags=tags,
-            any_tag=any_tag,
-            max_recovery_attempts=max_recovery_attempts,
-            include_skipped=True,
-        )
+        for row in all_owner_rows
         if (
             row.recovery_leaf_task is not None
             and row.recovery_action_task is not None
@@ -1335,7 +1370,7 @@ def _emit_recovery_dry_run_report(
                 attention_rows.append((task, visible_entry.attention_action))
                 continue
         else:
-            decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts)
+            decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts, read_context=report_read_context)
         if decision.action in {"resume", "retry", "reconcile"}:
             launch = decision.launch_mode
             print(
@@ -1518,7 +1553,7 @@ def _run_cycle(
             message=_format_scope_gap_message(gap, tags=tags, any_tag=any_tag),
         )
     impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
-    owner_rows = _query_owner_rows(
+    owner_rows, watch_read_context = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=git,
@@ -1778,6 +1813,7 @@ def _run_cycle(
                         task,
                         target_branch,
                         impl_based_on_ids=impl_based_on_ids,
+                        read_context=watch_read_context,
                     ),
                 )
             )
@@ -2159,7 +2195,7 @@ def _run_cycle(
         assert failed is not None
         if failed.id is None:
             continue
-        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts)
+        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts, read_context=watch_read_context)
         if decision.action != "skip" and decision.recovery_task_id is not None:
             pending_recovery_task_ids.add(decision.recovery_task_id)
         if decision.action == "skip" and not _is_watch_observable_recovery_skip(decision):
