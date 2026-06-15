@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
-from .git import prime_advance_planning_refs
+from .git import Git, prime_advance_planning_refs
 from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
     task_is_complete_for_lifecycle,
@@ -31,7 +31,6 @@ from .watch_progress import (
 
 if TYPE_CHECKING:
     from .config import Config
-    from .git import Git
     from .task_query import DateFilter
 
 
@@ -791,6 +790,7 @@ def _query_lineage_owner_rows_with_context(
     from .query import is_lineage_complete
     from .recovery_engine import (
         apply_pending_recovery_reconciliations,
+        build_merge_context_from_git,
         decide_failed_task_recovery,
         get_completed_recovery_descendant,
         get_completed_sibling_recovery,
@@ -808,6 +808,8 @@ def _query_lineage_owner_rows_with_context(
         merge_units_by_task_id=indexes.merge_units_by_task_id,
         allow_reconcile_mutation=store._read_session_depth == 0,
     )
+    if isinstance(git, Git) and target_branch is not None:
+        read_context.merge_context = build_merge_context_from_git(git, target_branch)
     owner_ids_filter = set(query.owner_task_ids) if query.owner_task_ids is not None else None
     task_ids_filter = set(query.task_ids) if query.task_ids is not None else None
     candidate_owner_rows = _candidate_owner_rows(

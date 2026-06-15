@@ -702,6 +702,29 @@ def is_resolved_by_merged_target(
     return task_is_merged(store, target_task, read_context=read_context)
 
 
+def build_merge_context_from_git(git: Git, target_branch: str | None) -> _MergeContext:
+    """Construct a _MergeContext from an already-live Git instance.
+
+    Callers that already hold a constructed Git object and know the target branch
+    should use this instead of _load_merge_context so no ambient Config.load(discover=True)
+    or Git() construction occurs.
+    """
+    merge_context = _MergeContext(git=git, default_branch=target_branch)
+    try:
+        merge_context.existing_branches = frozenset(git.local_branch_names())
+    except (GitError, OSError, ValueError, AttributeError, TypeError) as exc:
+        _record_repository_inspection_warning(
+            merge_context,
+            key="local-branch-list",
+            message=_branch_reachability_warning(
+                "failed to list local branches for recovery-lane batch inspection: "
+                f"{exc}"
+            ),
+        )
+        merge_context.existing_branches = None
+    return merge_context
+
+
 def _load_merge_context(project_dir: Path | None = None) -> _MergeContext:
     try:
         config = Config.load(project_dir or Path.cwd(), discover=True)
@@ -832,7 +855,7 @@ def _is_resolved_by_landed_lineage(
             branch_merged = branch_merge_state == "merged"
             if branch_merged:
                 return True
-        except GitError as exc:
+        except (GitError, AttributeError) as exc:
             _record_repository_inspection_warning(
                 merge_context,
                 key="branch-reachability-check",

@@ -11,7 +11,8 @@ import gza.recovery_engine as recovery_engine
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows
+from gza.git import Git
+from gza.lineage_query import LineageOwnerQuery, _load_indexes, _query_lineage_owner_rows_with_context, query_lineage_owner_rows
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import list_failed_tasks_for_recovery
@@ -2467,3 +2468,114 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
         max_recovery_attempts=1,
     )
     assert [entry.decision.task_id for entry in entries] == []
+
+
+class _MinimalGit(Git):
+    """Minimal Git subclass that satisfies isinstance checks and build_merge_context_from_git."""
+
+    def __init__(self, *, branches: frozenset[str] = frozenset()) -> None:
+        self.repo_dir = Path("/dev/null")
+        self._cache = None
+        self._branches = branches
+
+    def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
+        return self._branches
+
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+        return False
+
+    def branch_exists(self, branch: str) -> bool:
+        return branch in self._branches
+
+
+def test_query_lineage_owner_rows_does_not_call_load_merge_context_when_git_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When git is passed to _query_lineage_owner_rows_with_context, _load_merge_context must
+    not be invoked — the caller's git/target_branch seed the merge context instead."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Test implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
+    impl.branch = "feature/test-preseed"
+    impl.has_commits = True
+    store.update(impl)
+
+    def _raise_if_called(_project_dir=None):
+        raise AssertionError(
+            "_load_merge_context was called even though git was pre-seeded; "
+            "the ambient discover=True path was not eliminated"
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _raise_if_called)
+
+    git = _MinimalGit(branches=frozenset({impl.branch}))
+    rows, _read_context = _query_lineage_owner_rows_with_context(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        git=git,
+        target_branch="main",
+    )
+    assert rows is not None
+
+
+def test_query_lineage_owner_rows_calls_load_merge_context_when_git_not_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without git, _load_merge_context IS invoked as the fallback ambient path."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    call_count: list[int] = []
+
+    original_load = recovery_engine._load_merge_context
+
+    def _record_load(_project_dir=None):
+        call_count.append(1)
+        return original_load(_project_dir)
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _record_load)
+
+    rows, _read_context = _query_lineage_owner_rows_with_context(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        git=None,
+        target_branch=None,
+    )
+    assert rows is not None
+    assert call_count, "_load_merge_context should have been called when git is None"
+
+
+def test_query_lineage_owner_rows_calls_load_merge_context_when_target_branch_not_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without target_branch, _load_merge_context is still invoked even when git is provided,
+    because we cannot seed a deterministic default_branch without it."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    call_count: list[int] = []
+
+    original_load = recovery_engine._load_merge_context
+
+    def _record_load(_project_dir=None):
+        call_count.append(1)
+        return original_load(_project_dir)
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _record_load)
+
+    git = _MinimalGit(branches=frozenset())
+    rows, _read_context = _query_lineage_owner_rows_with_context(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        git=git,
+        target_branch=None,
+    )
+    assert rows is not None
+    assert call_count, "_load_merge_context should have been called when target_branch is None"
