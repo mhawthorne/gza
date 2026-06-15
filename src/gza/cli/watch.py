@@ -35,7 +35,6 @@ from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
     _query_lineage_owner_rows_with_context,
-    query_lineage_owner_rows,
 )
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
@@ -351,22 +350,17 @@ def _query_owner_rows(
     max_recovery_attempts: int,
     include_skipped: bool,
 ) -> list[LineageOwnerRow]:
-    return list(
-        query_lineage_owner_rows(
-            store,
-            LineageOwnerQuery(
-                limit=None,
-                tags=tags,
-                any_tag=any_tag,
-                include_skipped=include_skipped,
-                exclude_dropped_from_planning=True,
-                max_recovery_attempts=max_recovery_attempts,
-            ),
-            config=config,
-            git=git,
-            target_branch=target_branch,
-        )
+    rows, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        tags=tags,
+        any_tag=any_tag,
+        max_recovery_attempts=max_recovery_attempts,
+        include_skipped=include_skipped,
     )
+    return rows
 
 
 def _query_owner_rows_with_context(
