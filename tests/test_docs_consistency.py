@@ -199,6 +199,7 @@ def test_configuration_docs_require_full_prefixed_ids_for_strict_commands() -> N
         "| `task_id` | Full prefixed task ID to edit",
         "| `--based-on ID` | Set lineage/parent relationship using a full prefixed task ID",
         "| `--depends-on ID` | Set execution dependency using a full prefixed task ID",
+        "| `--clear-depends-on` | Remove the execution dependency",
         "| `task_id` | Full prefixed task ID to kill",
         "| `task_id` | Full prefixed task ID to mark as completed",
         "| `task_id` | Full prefixed task ID(s) to merge",

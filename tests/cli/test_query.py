@@ -11965,6 +11965,35 @@ class TestNextCommandWithDependencies:
         # Should mention 2 blocked tasks
         assert "2" in result.stdout and "blocked" in result.stdout.lower()
 
+    def test_next_picks_up_task_after_clearing_dependency(self, tmp_path: Path):
+        """A blocked pending task becomes runnable after its dependency is cleared."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        blocker = store.add("Dependency blocker")
+        downstream = store.add("Blocked task", depends_on=blocker.id)
+        assert downstream.id is not None
+        assert store.is_task_blocked(downstream) == (True, blocker.id, "pending")
+
+        before = invoke_gza("next", "--project", str(tmp_path))
+        assert before.returncode == 0
+        assert "Blocked task" not in before.stdout
+        assert "blocked by dependencies" in before.stdout
+
+        edit_result = invoke_gza("edit", downstream.id, "--clear-depends-on", "--project", str(tmp_path))
+        assert edit_result.returncode == 0
+
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.depends_on is None
+        assert store.is_task_blocked(refreshed) == (False, None, None)
+
+        after = invoke_gza("next", "--project", str(tmp_path))
+        assert after.returncode == 0
+        assert "Blocked task" in after.stdout
+        assert "blocked by dependencies" not in after.stdout
+
     def test_next_excludes_internal_and_only_shows_blocked_via_blocked_path(self, tmp_path: Path):
         """Internal pending tasks should not appear in runnable or blocked output."""
         setup_config(tmp_path)
