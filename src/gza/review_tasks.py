@@ -240,13 +240,12 @@ def create_or_reuse_followup_task(
         impl_task.id,
         finding,
     )
-    resolved_scope = resolve_review_scope_for_impl(store, impl_task)
     created = store.add(
         prompt=prompt,
         task_type="implement",
         based_on=review_task.id,
         depends_on=impl_task.id,
-        review_scope=resolved_scope.summary if resolved_scope is not None else None,
+        review_scope=format_followup_finding_context(finding),
         tags=resolve_derived_task_tags(impl_task),
         trigger_source=trigger_source,
     )

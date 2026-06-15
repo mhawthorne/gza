@@ -533,10 +533,10 @@ class TestFollowupTasks:
         assert kwargs["task_type"] == "implement"
         assert kwargs["based_on"] == "gza-200"
         assert kwargs["depends_on"] == "gza-101"
-        assert kwargs["review_scope"] == impl_task.review_scope
+        assert kwargs["review_scope"] == format_followup_finding_context(finding)
         assert kwargs["tags"] == impl_task.tags
 
-    def test_create_or_reuse_followup_task_resolves_legacy_prompt_scope_when_field_missing(self):
+    def test_create_or_reuse_followup_task_sets_review_scope_to_finding_text(self):
         store = MagicMock()
         review_task = _task(id="gza-200", task_type="review")
         impl_task = _task(
@@ -575,9 +575,4 @@ class TestFollowupTasks:
 
         assert created is created_task
         assert created_now is True
-        assert (
-            store.add.call_args.kwargs["review_scope"]
-            == "Slice F-A1 + F-A2: introduce the scoped classifier path.\n\n"
-            "1. Add the classifier.\n"
-            "2. Persist the review boundary."
-        )
+        assert store.add.call_args.kwargs["review_scope"] == format_followup_finding_context(finding)

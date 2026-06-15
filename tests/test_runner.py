@@ -945,7 +945,7 @@ class TestReviewContextFromChain:
         assert "- F-A3" in context
         assert "- F-B1" in context
 
-    def test_review_context_preserves_slice_scope_for_followup_implementation_reviews(self, tmp_path: Path):
+    def test_review_context_scopes_followup_review_to_finding_text(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -1009,8 +1009,68 @@ class TestReviewContextFromChain:
         context = _build_context_from_chain(followup_review, store, tmp_path, git=None)
 
         assert "## Review scope:" in context
-        assert "Slice F-A1 + F-A2" in context
-        assert "Add the shared classifier." in context
+        assert "F1 Keep slice boundary" in context
+        assert "Preserve the scoped review boundary across improve loops." in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
+        assert "## Original request:" not in context
+
+    def test_review_context_scopes_followup_review_to_finding_text_for_non_sliced_parent(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan the doc cleanup", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Full feature implementation."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement the full feature",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        store.update(review_task)
+
+        followup_finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="Update module docstring",
+            body="The module docstring is outdated; update it to reflect the new API.",
+            evidence=None,
+            impact=None,
+            fix_or_followup="update the module docstring",
+            tests=None,
+        )
+        followup_task, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=followup_finding,
+            trigger_source="manual",
+        )
+        assert created_now is True
+        followup_task.status = "completed"
+        store.update(followup_task)
+
+        followup_review = store.add(
+            prompt="Review follow-up doc fix",
+            task_type="review",
+            depends_on=followup_task.id,
+        )
+
+        context = _build_context_from_chain(followup_review, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert "F1 Update module docstring" in context
+        assert "The module docstring is outdated" in context
         assert "## Original plan context (out of scope except for the review scope):" in context
         assert "## Original plan:\n" not in context
         assert "## Original request:" not in context
