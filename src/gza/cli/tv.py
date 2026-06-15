@@ -35,6 +35,10 @@ MAX_SLOTS = 8
 DEFAULT_MIN_SLOTS = 1
 DEFAULT_MAX_SLOTS = 4
 SHRINK_TICKS = 5
+# Number of ticks a just-completed task stays on screen after transitioning from
+# in_progress.  At 0.5 s/tick this gives ~1.5 s of post-completion visibility so
+# closing log lines can render before the panel falls off.
+LINGER_TICKS = 3
 # Render into this percentage of the terminal so a tmux status bar / shell
 # cursor can never clip the bottom panel. The leftover margin is intentional
 # headroom. Integer percent (not a float) to keep the budget math exact.
@@ -299,17 +303,44 @@ def _render_all(
 def _auto_select_tasks(
     store: SqliteTaskStore,
     max_slots: int,
+    linger_ids: set[str] | None = None,
 ) -> list[DbTask]:
-    """Pick tasks for auto mode, filling slots with live tasks first and recent finished tasks second."""
+    """Pick tasks for auto mode, filling slots with live tasks first and recent finished tasks second.
+
+    ``linger_ids`` names tasks that just transitioned to a terminal status while
+    on-screen.  They are injected into the selected set (displacing the
+    lowest-priority in-progress tasks if necessary) so their final log lines
+    render before the panel falls off.
+    """
+    linger_ids = linger_ids or set()
+
     in_progress = store.get_in_progress()
     # get_in_progress returns oldest-first; we want newest-first for TV
     in_progress.reverse()
-    selected = in_progress[:max_slots]
+
+    in_progress_ids = {t.id for t in in_progress if t.id is not None}
+
+    # Fetch linger tasks that are no longer in in_progress
+    linger_tasks: list[DbTask] = []
+    for linger_id in linger_ids:
+        if linger_id not in in_progress_ids:
+            task = store.get(linger_id)
+            if task is not None:
+                linger_tasks.append(task)
+
+    # Reserve slots for linger tasks; in-progress fills the remainder.
+    ip_limit = max(max_slots - len(linger_tasks), 0)
+    selected = list(in_progress[:ip_limit])
+    seen_ids = {task.id for task in selected if task.id is not None}
+
+    for task in linger_tasks:
+        if task.id is not None and task.id not in seen_ids:
+            selected.append(task)
+            seen_ids.add(task.id)
 
     if len(selected) >= max_slots:
         return selected
 
-    seen_ids = {task.id for task in selected if task.id is not None}
     for task in store.get_history(limit=max_slots * 3):
         if task.id is not None and task.id in seen_ids:
             continue
@@ -448,7 +479,10 @@ def cmd_tv(args: argparse.Namespace) -> int:
         ticks_below = 0
         running_count = len(store.get_in_progress())
     else:
-        running_count = len(store.get_in_progress())
+        _ip_init = store.get_in_progress()
+        running_count = len(_ip_init)
+        prev_in_progress_ids: set[str] = {t.id for t in _ip_init if t.id is not None}
+        linger_remaining: dict[str, int] = {}
         can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
         rendered_slots = _desired_slot_count(running_count, min_slots, max_slots, can_pad_to_min)
         ticks_below = 0
@@ -489,7 +523,22 @@ def cmd_tv(args: argparse.Namespace) -> int:
                             tasks[i] = refreshed
                     running_count = len(store.get_in_progress())
                 else:
-                    running_count = len(store.get_in_progress())
+                    in_progress_tasks = store.get_in_progress()
+                    running_count = len(in_progress_tasks)
+                    in_progress_ids = {t.id for t in in_progress_tasks if t.id is not None}
+
+                    # Detect tasks that left in_progress while on-screen and add
+                    # them to the linger set so their final log lines can render.
+                    for tid in prev_in_progress_ids:
+                        if tid not in in_progress_ids and tid not in linger_remaining:
+                            refreshed = store.get(tid)
+                            if refreshed is not None and refreshed.status not in {"in_progress", "pending"}:
+                                linger_remaining[tid] = LINGER_TICKS
+
+                    # Capture linger set before decrement so freshly-added tasks
+                    # are included on the tick they transitioned.
+                    linger_ids = set(linger_remaining.keys())
+
                     can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
                     rendered_slots, ticks_below = _next_slot_count(
                         running_count,
@@ -501,8 +550,18 @@ def cmd_tv(args: argparse.Namespace) -> int:
                     )
                     # In auto-select mode, repoll the live task set so finished
                     # tasks fall off the screen and newly running tasks replace them.
-                    tasks = _auto_select_tasks(store, rendered_slots)
+                    # Linger tasks (just completed) stay visible for LINGER_TICKS
+                    # extra ticks so closing log lines have time to render.
+                    tasks = _auto_select_tasks(store, rendered_slots, linger_ids=linger_ids)
                     log_paths = _resolve_log_paths(config, registry, tasks)
+
+                    # Advance linger countdown; expire entries that hit zero.
+                    prev_in_progress_ids = in_progress_ids
+                    linger_remaining = {
+                        tid: count - 1
+                        for tid, count in linger_remaining.items()
+                        if count > 1
+                    }
 
                 # Recalculate lines (terminal may have resized)
                 n_lines = _lines_per_panel(len(tasks))

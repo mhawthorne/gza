@@ -116,7 +116,11 @@ def test_next_slot_count_hysteresis_grow_immediately_shrink_after_threshold():
 
 
 def test_tv_auto_mode_repolls_live_tasks(monkeypatch, tmp_path: Path):
-    """Auto-select mode should keep slots full as tasks finish and new ones start."""
+    """Auto-select mode keeps slots full; a just-completed task lingers before falling off.
+
+    When task_1 finishes and task_4 starts, task_1 stays visible for LINGER_TICKS
+    ticks (displacing task_2 temporarily), then falls off once the window expires.
+    """
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -151,7 +155,7 @@ def test_tv_auto_mode_repolls_live_tasks(monkeypatch, tmp_path: Path):
             _set_in_progress(refreshed_4, base + timedelta(minutes=3))
             store.update(refreshed_1)
             store.update(refreshed_4)
-        else:
+        elif sleep_calls > tv_module.LINGER_TICKS + 1:
             raise KeyboardInterrupt
 
     monkeypatch.setattr(tv_module, "Live", _FakeLive)
@@ -165,7 +169,10 @@ def test_tv_auto_mode_repolls_live_tasks(monkeypatch, tmp_path: Path):
     assert rc == 0
     assert _FakeLive.instance is not None
     assert _FakeLive.instance.updates[0] == [task_2.id, task_1.id]
-    assert _FakeLive.instance.updates[1] == [task_4.id, task_2.id]
+    # task_1 just completed: it lingers (displacing task_2) for LINGER_TICKS ticks
+    assert _FakeLive.instance.updates[1] == [task_4.id, task_1.id]
+    # After the linger window expires, task_2 reclaims its slot
+    assert _FakeLive.instance.updates[-1] == [task_4.id, task_2.id]
 
 
 def test_tv_auto_mode_backfills_finished_tasks_when_live_count_drops(monkeypatch, tmp_path: Path):
@@ -367,6 +374,69 @@ def test_tv_auto_mode_promotes_live_tasks_over_finished_fallback(monkeypatch, tm
     assert _FakeLive.instance is not None
     assert _FakeLive.instance.updates[0] == [finished_task.id]
     assert _FakeLive.instance.updates[1] == [live_task.id]
+
+
+def test_tv_auto_mode_linger_keeps_just_completed_task_visible_when_slots_full(monkeypatch, tmp_path: Path):
+    """A task that completes while all slots are in_progress lingers for LINGER_TICKS ticks.
+
+    Scenario: 2 slots, both filled with in_progress tasks.  task_1 completes while
+    task_3 starts (keeping in_progress count at 2).  Without linger, task_1 would
+    be dropped immediately.  With linger, task_1 stays visible for LINGER_TICKS
+    ticks (displacing task_2), then falls off.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task_1 = store.add("Short review", task_type="implement")
+    task_2 = store.add("Long running", task_type="implement")
+    task_3 = store.add("New work", task_type="implement")
+    assert task_1.id and task_2.id and task_3.id
+
+    _set_in_progress(task_1, base)
+    _set_in_progress(task_2, base + timedelta(minutes=1))
+    task_3.status = "pending"
+    store.update(task_1)
+    store.update(task_2)
+    store.update(task_3)
+
+    sleep_calls = 0
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            # task_1 completes; task_3 starts — slots remain full
+            refreshed_1 = store.get(task_1.id)
+            refreshed_3 = store.get(task_3.id)
+            assert refreshed_1 is not None and refreshed_3 is not None
+            refreshed_1.status = "completed"
+            refreshed_1.completed_at = base + timedelta(minutes=2)
+            _set_in_progress(refreshed_3, base + timedelta(minutes=3))
+            store.update(refreshed_1)
+            store.update(refreshed_3)
+        elif sleep_calls > tv_module.LINGER_TICKS + 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
+
+    args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=2)
+    rc = tv_module.cmd_tv(args)
+
+    assert rc == 0
+    assert _FakeLive.instance is not None
+    # Before completion: both in_progress, newest first
+    assert _FakeLive.instance.updates[0] == [task_2.id, task_1.id]
+    # Immediately after completion: task_1 lingers even though in_progress fills slots
+    assert _FakeLive.instance.updates[1] == [task_3.id, task_1.id]
+    # All linger ticks retain task_1
+    for update in _FakeLive.instance.updates[1 : tv_module.LINGER_TICKS + 1]:
+        assert task_1.id in update, f"task_1 should linger but was absent from {update}"
+    # After linger expires, task_2 reclaims its slot
+    assert _FakeLive.instance.updates[-1] == [task_3.id, task_2.id]
 
 
 def test_tv_auto_mode_does_not_exit_on_finished_fallback(monkeypatch, tmp_path: Path):
