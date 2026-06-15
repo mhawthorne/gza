@@ -400,7 +400,7 @@ def _watch_iterate_impl_target(
         impl_task = _resolve_watch_iterate_impl_for_task(store, task)
         if impl_task is None or impl_task.id is None:
             return None
-    elif action_type in {"run_review", "verify_noop_improve_then_review"}:
+    elif action_type == "run_review":
         review_task = action.get("review_task")
         if not isinstance(review_task, DbTask) or review_task.id is None:
             return _watch_iterate_result(

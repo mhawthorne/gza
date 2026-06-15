@@ -13,9 +13,10 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 
+from gza.advance_engine import evaluate_advance_rules
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
-from gza.git import Git, GitError
+from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.improve_diff import ImproveDiffResult
 from gza.lineage import get_plan_for_task
@@ -48,6 +49,7 @@ from gza.runner import (
     _build_timeout_resume_context,
     _check_dependency_merge_precondition,
     _complete_code_task,
+    _capture_noop_improve_review_verify_result,
     _compute_slug_override,
     _compute_tree_fingerprint,
     _copy_learnings_to_worktree,
@@ -10260,7 +10262,7 @@ class TestExtractedRunInnerHelpers:
         output = capsys.readouterr().out
         assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" in output
 
-    def test_post_complete_noop_improve_persists_and_uses_fresh_verify_evidence_for_verify_only_review(
+    def test_post_complete_noop_improve_captures_passing_verify_evidence_clears_review_and_becomes_mergeable(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -10308,8 +10310,12 @@ class TestExtractedRunInnerHelpers:
         improve.slug = "20260605-noop-improve-fresh-verify"
         store.update(improve)
 
-        config = self._make_config(tmp_path)
-        config.log_path = tmp_path / "logs"
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "verify_command: uv run pytest tests/ -q\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.verify_command = "uv run pytest tests/ -q"
         config.autonomous_verify_timeout_seconds = 120
@@ -10326,6 +10332,10 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner.compute_improve_changed_diff",
                 return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
             ),
+            patch(
+                "gza.runner._capture_noop_improve_review_verify_result",
+                wraps=_capture_noop_improve_review_verify_result,
+            ) as capture_verify,
             patch(
                 "gza.runner._run_review_verify_command",
                 return_value=ReviewVerifyResult(
@@ -10355,6 +10365,7 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 0
         assert mock_review_verify.call_args.kwargs["timeout_grace_seconds"] == 9.0
+        capture_verify.assert_called_once()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -10380,11 +10391,28 @@ class TestExtractedRunInnerHelpers:
             "working_directory": None,
         }
         assert (tmp_path / artifacts[0].path).exists() is False
+        reviews = [task for task in store.get_all() if task.task_type == "review" and task.depends_on == impl.id]
+        assert len(reviews) == 1
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_impl, "main")
+        assert action["type"] == "merge"
 
         output = capsys.readouterr().out
         assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" in output
 
-    def test_post_complete_noop_improve_does_not_clear_verify_only_review_block_with_failed_verify_evidence(
+    def test_post_complete_noop_improve_persists_fresh_failed_verify_evidence_without_clearing_review(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -10429,21 +10457,45 @@ class TestExtractedRunInnerHelpers:
         )
         improve.status = "completed"
         improve.branch = impl.branch
-        improve.review_verify_status = "failed"
-        improve.review_verify_branch = impl.branch
-        improve.review_verify_head_sha = "abc1234"
-        improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
         store.update(improve)
 
-        config = self._make_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "verify_command: uv run pytest tests/ -q\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        config.log_path.mkdir(parents=True, exist_ok=True)
         worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = tmp_path
+        worktree_git.default_branch.return_value = "main"
         worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        captured_at = review.completed_at + timedelta(seconds=2)
 
         with (
             patch(
                 "gza.runner.compute_improve_changed_diff",
                 return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
             ),
+            patch(
+                "gza.runner._capture_noop_improve_review_verify_result",
+                wraps=_capture_noop_improve_review_verify_result,
+            ) as capture_verify,
+            patch(
+                "gza.runner._run_review_verify_command",
+                return_value=ReviewVerifyResult(
+                    command=config.verify_command,
+                    status="failed",
+                    exit_status="1",
+                    captured_at=captured_at,
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="abc1234",
+                    reviewed_base_sha="cafebabe",
+                    failure="pytest failed",
+                ),
+            ),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
             patch("gza.runner.task_footer"),
@@ -10459,14 +10511,136 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
+        capture_verify.assert_called_once()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at is None
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status == "failed"
+        assert refreshed_improve.review_verify_branch == impl.branch
+        assert refreshed_improve.review_verify_head_sha == "abc1234"
+        assert refreshed_improve.review_verify_captured_at == captured_at
         output = capsys.readouterr().out
         assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" not in output
+
+    @pytest.mark.parametrize(
+        ("label", "seed_evidence"),
+        [
+            ("absent", lambda improve, review, impl: None),
+            (
+                "captured_before_review_completed",
+                lambda improve, review, impl: (
+                    setattr(improve, "review_verify_status", "passed"),
+                    setattr(improve, "review_verify_branch", impl.branch),
+                    setattr(improve, "review_verify_head_sha", "abc1234"),
+                    setattr(improve, "review_verify_captured_at", review.completed_at - timedelta(seconds=1)),
+                ),
+            ),
+            (
+                "branch_mismatch",
+                lambda improve, review, impl: (
+                    setattr(improve, "review_verify_status", "passed"),
+                    setattr(improve, "review_verify_branch", "feature/other-branch"),
+                    setattr(improve, "review_verify_head_sha", "abc1234"),
+                    setattr(improve, "review_verify_captured_at", review.completed_at + timedelta(seconds=1)),
+                ),
+            ),
+            (
+                "head_sha_mismatch",
+                lambda improve, review, impl: (
+                    setattr(improve, "review_verify_status", "passed"),
+                    setattr(improve, "review_verify_branch", impl.branch),
+                    setattr(improve, "review_verify_head_sha", "deadbeef"),
+                    setattr(improve, "review_verify_captured_at", review.completed_at + timedelta(seconds=1)),
+                ),
+            ),
+        ],
+    )
+    def test_post_complete_noop_improve_recaptures_when_passing_verify_evidence_is_not_current(
+        self,
+        tmp_path: Path,
+        label: str,
+        seed_evidence,
+    ) -> None:
+        db_path = tmp_path / f"{label}.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with verify-only review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = f"feature/noop-verify-only-{label}"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before no-op improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
+        review.output_content = (
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review)
+
+        improve = store.add(
+            prompt="No-op improve after verify-only review",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        seed_evidence(improve, review, impl)
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch("gza.runner._capture_noop_improve_review_verify_result", return_value=None) as capture_verify,
+            patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        capture_verify.assert_called_once()
+        sync_branch.assert_not_called()
+        run_review.assert_not_called()
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is None
 
     def test_post_complete_noop_improve_does_not_clear_substantive_review_block(
         self,

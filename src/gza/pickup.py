@@ -8,7 +8,6 @@ WORKER_CONSUMING_ADVANCE_ACTION_TYPES: frozenset[str] = frozenset(
         "run_plan_review",
         "run_plan_improve",
         "run_review",
-        "verify_noop_improve_then_review",
         "run_improve",
         "create_plan_review",
         "create_plan_improve",

@@ -122,6 +122,35 @@ def test_practices_document_gitignored_derived_artifacts_as_non_blockers() -> No
         assert snippet in practices_content
 
 
+def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() -> None:
+    """Tracked lifecycle docs/spec should not describe the removed detached no-op reverify path."""
+    repo_root = Path(__file__).resolve().parents[1]
+    tracked_docs = {
+        "advance_workflow": (repo_root / "docs" / "internal" / "advance-workflow.md").read_text(),
+        "overview": (repo_root / "specs" / "behavior" / "00-overview.md").read_text(),
+        "lifecycle_engine": (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text(),
+    }
+
+    required_snippets = [
+        "lifecycle no longer launches a detached fallback verify pass",
+        "The engine MUST NOT run a separate isolated detached-worktree verify solely to clear",
+        "runner-owned passing verify evidence has already cleared the review",
+    ]
+    for snippet in required_snippets:
+        assert any(snippet in content for content in tracked_docs.values())
+
+    retired_snippets = [
+        "safe reverify",
+        "no-op reverify path",
+        "fresh autonomous verify evidence still cannot validate the branch",
+        "autonomous current-tip reverify",
+        "current-tip reverify",
+    ]
+    for snippet in retired_snippets:
+        for content in tracked_docs.values():
+            assert snippet not in content
+
+
 def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:
     """Integration test module docstrings should not point at the removed tests/test_integration.py path."""
     repo_root = Path(__file__).resolve().parents[1]

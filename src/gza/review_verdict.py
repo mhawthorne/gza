@@ -46,9 +46,9 @@ _CHECKLIST_LINE_PATTERN = re.compile(
 )
 _VERIFY_COMMAND_PATTERN = re.compile(r"\bverify_command\b", re.IGNORECASE)
 _VERIFY_TIMEOUT_PATTERNS = (
-    re.compile(r"verify_command\s+timed\s+out", re.IGNORECASE),
-    re.compile(r"exit\s+status:\s*timed\s+out", re.IGNORECASE),
-    re.compile(r"timed\s+out\s+after\b", re.IGNORECASE),
+    re.compile(r"\btimed\s+out\b", re.IGNORECASE),
+    re.compile(r"\bexit\s+status:\s*timed\s+out\b", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9_])timeout(?![A-Za-z0-9_])", re.IGNORECASE),
 )
 _VERIFY_FAILURE_PATTERNS = (
     re.compile(
@@ -520,10 +520,7 @@ def _contains_verify_timeout_marker(text: str) -> bool:
         return False
     if _VERIFY_TIMEOUT_PATTERNS[0].search(text) or _VERIFY_TIMEOUT_PATTERNS[1].search(text):
         return True
-    lowered = text.lower()
-    if "verify_command" in lowered and ("timed out" in lowered or "timeout" in lowered):
-        return True
-    return bool(_VERIFY_COMMAND_PATTERN.search(text) and _VERIFY_TIMEOUT_PATTERNS[2].search(text))
+    return _contains_standalone_timeout_token(text)
 
 
 def _contains_verify_failure_marker(text: str) -> bool:
@@ -535,10 +532,35 @@ def _contains_verify_failure_marker(text: str) -> bool:
 def _contains_explicit_verify_timeout_subject(text: str) -> bool:
     if not text:
         return False
-    if _VERIFY_TIMEOUT_PATTERNS[1].search(text):
+    return bool(
+        _VERIFY_TIMEOUT_PATTERNS[0].search(text)
+        or _VERIFY_TIMEOUT_PATTERNS[1].search(text)
+        or _contains_standalone_timeout_token(text)
+    )
+
+
+def _contains_standalone_timeout_token(text: str) -> bool:
+    for match in _VERIFY_TIMEOUT_PATTERNS[2].finditer(text):
+        if _timeout_token_is_flag_or_assignment(text, match.start(), match.end()):
+            continue
         return True
-    lowered = text.lower()
-    return "verify_command" in lowered and ("timed out" in lowered or "timeout" in lowered)
+    return False
+
+
+def _timeout_token_is_flag_or_assignment(text: str, start: int, end: int) -> bool:
+    if start > 0 and text[start - 1] == "-":
+        return True
+
+    next_index = end
+    while next_index < len(text) and text[next_index].isspace():
+        next_index += 1
+    if next_index < len(text) and text[next_index] == "=":
+        return True
+
+    # Ignore diagnostic/package labels such as `timeout-2.4.0`.
+    return next_index < len(text) and text[next_index] == "-" and (next_index + 1) < len(text) and text[
+        next_index + 1
+    ].isalnum()
 
 
 def _extract_open_state_like_citation_tokens(text: str) -> tuple[str, ...]:
@@ -632,14 +654,12 @@ def _classify_blocker_finding(finding: ReviewFinding) -> str:
         # the subject. A code-focused title with body-only mentions of a timeout
         # symptom (e.g. "Worker loop ... until verify_command timeout") describes a
         # code defect with a timeout symptom, not a verify_command failure.
-        if not _title_names_verify_command_as_subject(finding.title):
-            return "code"
-        if not _has_explicit_verify_timeout_subject_in_structured_fields(finding):
-            return "code"
-
-        if _structured_fields_have_product_code_citation(finding):
-            return "code"
-        return "verify_timeout"
+        if _title_names_verify_command_as_subject(finding.title) and _has_explicit_verify_timeout_subject_in_structured_fields(
+            finding
+        ):
+            if _structured_fields_have_product_code_citation(finding):
+                return "code"
+            return "verify_timeout"
     if _contains_verify_failure_marker(text):
         return "verify_failure"
     return "code"
@@ -670,6 +690,8 @@ def _raw_verify_timeout_only_blocker(content: str, report: ParsedReviewReport) -
         return False
     blocker_body = match.group(2).strip()
     if not blocker_body:
+        return False
+    if not _VERIFY_COMMAND_PATTERN.search(blocker_body):
         return False
     if not _contains_verify_timeout_marker(blocker_body):
         return False

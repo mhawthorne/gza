@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import logging
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..concurrency import (
@@ -17,25 +14,8 @@ from ..concurrency import (
     reserve_task_launch_permit,
 )
 from ..db import SqliteTaskStore, Task as DbTask
-from ..git import Git, GitError
 from ..plan_review_verdict import PlanReviewManifest
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
-from ..review_verdict import is_verify_blocked_only_review
-from ..runner import (
-    ProjectReviewVerifyResult,
-    _capture_review_verify_result,
-    _create_detached_review_worktree,
-    _format_review_verify_result,
-    _get_task_output,
-    _project_boundary,
-    _resolve_review_verify_base_sha,
-    _resolve_review_verify_timeout_settings,
-    _run_review_verify_command,
-    _run_review_verify_commands_for_projects,
-    _task_has_current_passing_review_verify_evidence,
-    _task_is_cross_project,
-    _worktree_execution_dir,
-)
 from ._common import (
     PlanReviewMaterializationResult,
     _create_improve_task,
@@ -48,20 +28,9 @@ from .advance_engine import (
     failed_recovery_decision_to_attention_action,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class CreateReviewActionResult(Protocol):
     """Duck type returned by create-review preparation helpers."""
-
-    status: str
-    review_task: DbTask | None
-    message: str
-
-
-@dataclass
-class PreparedCreateReviewActionResult:
-    """Concrete create-review preparation result for typed wrappers."""
 
     status: str
     review_task: DbTask | None
@@ -150,43 +119,6 @@ class AdvanceExecutionNeedsAttention:
     action: dict[str, Any]
 
 
-@dataclass(frozen=True)
-class NoopVerifyThenReviewOutcome:
-    """Shared execution outcome for verify-then-rereview no-op recovery."""
-
-    status: Literal["create_review", "review_cleared", "needs_attention", "skip", "error"]
-    message: str
-    verify_markdown: str | None = None
-    review_task: DbTask | None = None
-
-
-_NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS = (GitError, OSError, RuntimeError, ValueError)
-
-
-def _fresh_verify_resolves_verify_only_review(
-    *,
-    task: DbTask,
-    review_task: DbTask,
-    current_branch: str | None,
-    current_head_sha: str | None,
-    context: AdvanceActionExecutionContext,
-) -> bool:
-    if context.config is None or task.id is None:
-        return False
-    review_content = _get_task_output(review_task, Path(context.config.project_dir))
-    if not is_verify_blocked_only_review(review_content):
-        return False
-    if not _task_has_current_passing_review_verify_evidence(
-        task=task,
-        review_task=review_task,
-        current_branch=current_branch,
-        current_head_sha=current_head_sha,
-    ):
-        return False
-    context.store.clear_review_state(task.id)
-    return True
-
-
 _WORKER_ACTIONS = frozenset(
     {
         "create_plan_review",
@@ -196,7 +128,6 @@ _WORKER_ACTIONS = frozenset(
         "materialize_plan_slices",
         "create_review",
         "run_review",
-        "verify_noop_improve_then_review",
         "improve",
         "run_improve",
         "resume",
@@ -220,238 +151,6 @@ def _should_continue_branch_publication_after_reconcile(
     if decision.action != "reconcile":
         return False
     return task.status == "failed" and task.failure_reason in {"BRANCH_UNPUSHABLE", "PR_REQUIRED"}
-
-
-def _build_noop_verify_attention_result(
-    *,
-    action_type: str,
-    description: str,
-    verify_result: Any,
-) -> AdvanceActionExecutionResult:
-    detail = verify_result.failure or verify_result.exit_status
-    return AdvanceActionExecutionResult(
-        action_type=action_type,
-        status="skip",
-        message=f"SKIP: {description}. Fresh verify_command {verify_result.status} ({detail}).",
-        attention_type="needs_discussion",
-        attention_reason="improve-no-op",
-    )
-
-
-def run_noop_improve_verify_then_review(
-    *,
-    task: DbTask,
-    action: dict[str, Any],
-    context: AdvanceActionExecutionContext,
-) -> NoopVerifyThenReviewOutcome:
-    """Shared no-op improve escape hatch: fresh verify on tip, then create a new review."""
-    description = str(action.get("description", "Re-run verify_command before re-review"))
-
-    review_task = action.get("review_task")
-    if not isinstance(review_task, DbTask) or review_task.id is None or task.id is None:
-        return NoopVerifyThenReviewOutcome(status="skip", message="missing verify/review inputs")
-    if context.config is None or context.git is None:
-        return NoopVerifyThenReviewOutcome(status="error", message="missing verify execution context")
-    verify_git = context.git
-
-    verify_command = getattr(context.config, "verify_command", None)
-    if (
-        not _task_is_cross_project(task)
-        and (not isinstance(verify_command, str) or not verify_command.strip())
-    ):
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=f"SKIP: {description}. verify_command is unavailable.",
-        )
-    if not task.branch:
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=f"SKIP: {description}. implementation branch is unavailable.",
-        )
-
-    worktree_label = task.slug or task.id or "review-verify"
-    worktree_path = Path(context.config.worktree_path) / f"{worktree_label}-noop-review-verify"
-    timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
-
-    def _append_cleanup_failure(message: str, cleanup_failure: str | None) -> str:
-        if cleanup_failure is None:
-            return message
-        return f"{message} Cleanup also failed: {cleanup_failure}."
-
-    def _cleanup_worktree() -> str | None:
-        try:
-            remove_result = verify_git.worktree_remove(worktree_path, force=True)
-        except _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS as exc:
-            logger.warning("Failed to remove noop review verify worktree %s", worktree_path, exc_info=True)
-            if worktree_path.exists():
-                shutil.rmtree(worktree_path, ignore_errors=True)
-            return str(exc)
-        if getattr(remove_result, "returncode", 0) not in (0, None):
-            logger.warning(
-                "git worktree remove failed for noop review verify worktree %s: %s",
-                worktree_path,
-                getattr(remove_result, "stderr", "") or getattr(remove_result, "stdout", "") or remove_result.returncode,
-            )
-            if worktree_path.exists():
-                shutil.rmtree(worktree_path, ignore_errors=True)
-            if worktree_path.exists():
-                return (
-                    getattr(remove_result, "stderr", "") or getattr(remove_result, "stdout", "") or f"return code {remove_result.returncode}"
-                ).strip()
-            return None
-        if worktree_path.exists():
-            shutil.rmtree(worktree_path, ignore_errors=True)
-        if worktree_path.exists():
-            return f"{worktree_path} still exists after cleanup"
-        return None
-
-    verify_result = None
-    verify_markdown = None
-    reviewed_head_sha: str | None = None
-    reviewed_base_sha: str | None = None
-    project_results: tuple[ProjectReviewVerifyResult, ...] = ()
-    lifecycle_failure: Exception | None = None
-    try:
-        default_branch = verify_git.default_branch()
-        reviewed_base_sha = _resolve_review_verify_base_sha(verify_git, default_branch)
-        _create_detached_review_worktree(verify_git, worktree_path, task.branch)
-        worktree_git = Git(worktree_path)
-        reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
-        if reviewed_head_sha is not None:
-            if _task_is_cross_project(task):
-                cross_project_verify = _run_review_verify_commands_for_projects(
-                    config=context.config,
-                    task=task,
-                    worktree_git=worktree_git,
-                    worktree_path=worktree_path,
-                    timeout_seconds=timeout_seconds,
-                    timeout_grace_seconds=timeout_grace_seconds,
-                    reviewed_branch=task.branch,
-                    reviewed_head_sha=reviewed_head_sha,
-                    reviewed_base_sha=reviewed_base_sha,
-                )
-                if cross_project_verify is not None:
-                    verify_result = cross_project_verify.aggregate_result
-                    verify_markdown = cross_project_verify.markdown
-                    project_results = cross_project_verify.project_results
-            elif isinstance(verify_command, str) and verify_command.strip():
-                provider_cwd = _worktree_execution_dir(
-                    worktree_path,
-                    _project_boundary(context.config),
-                )
-                verify_result = _run_review_verify_command(
-                    verify_command,
-                    cwd=provider_cwd,
-                    reviewed_branch=task.branch,
-                    reviewed_head_sha=reviewed_head_sha,
-                    reviewed_base_sha=reviewed_base_sha,
-                    timeout_seconds=timeout_seconds,
-                    timeout_grace_seconds=timeout_grace_seconds,
-                )
-                verify_markdown = _format_review_verify_result(verify_result)
-    except _NOOP_REVERIFY_RECOVERABLE_EXCEPTIONS as exc:
-        lifecycle_failure = exc
-    cleanup_failure = _cleanup_worktree()
-
-    if lifecycle_failure is not None:
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=_append_cleanup_failure(
-                f"SKIP: {description}. unable to prepare or run fresh verify_command: {lifecycle_failure}.",
-                cleanup_failure,
-            ),
-        )
-    if reviewed_head_sha is None:
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=_append_cleanup_failure(
-                f"SKIP: {description}. unable to resolve review worktree HEAD before verify_command ran.",
-                cleanup_failure,
-            ),
-        )
-    if verify_result is None or verify_markdown is None:
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=_append_cleanup_failure(
-                f"SKIP: {description}. verify_command is unavailable.",
-                cleanup_failure,
-            ),
-        )
-    _capture_review_verify_result(
-        context.config,
-        context.store,
-        task,
-        verify_result,
-        markdown=verify_markdown,
-        project_results=project_results,
-        producer="noop_review_verify",
-        metadata={"triggering_review_task_id": review_task.id},
-    )
-    if cleanup_failure is not None:
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=(
-                f"SKIP: {description}. fresh verify_command completed but temporary review worktree cleanup failed: "
-                f"{cleanup_failure}."
-            ),
-            verify_markdown=verify_markdown,
-        )
-
-    if verify_result.status != "passed":
-        detail = verify_result.failure or verify_result.exit_status
-        return NoopVerifyThenReviewOutcome(
-            status="needs_attention",
-            message=f"SKIP: {description}. Fresh verify_command {verify_result.status} ({detail}).",
-            verify_markdown=verify_markdown,
-        )
-
-    expected_head_sha = action.get("current_branch_head_sha")
-    current_head_sha = expected_head_sha if isinstance(expected_head_sha, str) and expected_head_sha else None
-    persisted_task = context.store.get(task.id) if task.id is not None else None
-    task_with_evidence = persisted_task if persisted_task is not None else task
-    if _fresh_verify_resolves_verify_only_review(
-        task=task_with_evidence,
-        review_task=review_task,
-        current_branch=task.branch,
-        current_head_sha=current_head_sha or reviewed_head_sha,
-        context=context,
-    ):
-        return NoopVerifyThenReviewOutcome(
-            status="review_cleared",
-            message=(
-                f"Fresh verify passed for {task.branch} at {verify_result.reviewed_head_sha}; "
-                f"cleared verify-only review block on {task.id}"
-            ),
-            verify_markdown=verify_markdown,
-        )
-
-    create_result = context.prepare_create_review(task)
-    if create_result.status == "skip":
-        return NoopVerifyThenReviewOutcome(status="skip", message=create_result.message, verify_markdown=verify_markdown)
-    if create_result.status != "created":
-        return NoopVerifyThenReviewOutcome(
-            status="error",
-            message=create_result.message,
-            verify_markdown=verify_markdown,
-        )
-    new_review = create_result.review_task
-    if new_review is None or new_review.id is None:
-        return NoopVerifyThenReviewOutcome(
-            status="error",
-            message="review creation returned no task after fresh verify",
-            verify_markdown=verify_markdown,
-        )
-    return NoopVerifyThenReviewOutcome(
-        status="create_review",
-        message=(
-            f"Fresh verify passed for {task.branch} at {verify_result.reviewed_head_sha}; "
-            f"created review {new_review.id} to re-grade current tip"
-        ),
-        verify_markdown=verify_markdown,
-        review_task=new_review,
-    )
-
-
 def build_improve_needs_attention_result(
     *,
     store: SqliteTaskStore,
@@ -595,9 +294,7 @@ def _spawn_result(
     )
 
 
-ITERATE_ROUTABLE_ACTIONS = frozenset(
-    {"create_review", "run_review", "verify_noop_improve_then_review", "improve", "run_improve"}
-)
+ITERATE_ROUTABLE_ACTIONS = frozenset({"create_review", "run_review", "improve", "run_improve"})
 
 
 def _startup_preparation_failed_result(
@@ -1125,132 +822,6 @@ def execute_advance_action(
             worker_label="review",
             created_task=prepared_review_task,
         )
-
-    if action_type == "verify_noop_improve_then_review":
-        if context.dry_run:
-            return AdvanceActionExecutionResult(
-                action_type=action_type,
-                status="dry_run",
-                message=str(action.get("description", "Re-run verify_command before re-review")),
-                worker_consuming=True,
-                work_done=True,
-            )
-        reserved_verify_permit: LaunchPermit | None = None
-
-        def _prepare_review_after_verify(parent_task: DbTask) -> CreateReviewActionResult:
-            nonlocal reserved_verify_permit
-            permit, blocked = _reserve_background_launch(
-                action_type=action_type,
-                context=context,
-                worker_label="review",
-            )
-            if blocked is not None:
-                return PreparedCreateReviewActionResult(
-                    status="error",
-                    review_task=None,
-                    message=blocked.message,
-                )
-            reserved_verify_permit = permit
-            create_result = context.prepare_create_review(parent_task)
-            if create_result.status != "created":
-                if reserved_verify_permit is not None:
-                    reserved_verify_permit.release()
-                    reserved_verify_permit = None
-                return create_result
-            review_task = create_result.review_task
-            if review_task is None or review_task.id is None:
-                if reserved_verify_permit is not None:
-                    reserved_verify_permit.release()
-                    reserved_verify_permit = None
-                return PreparedCreateReviewActionResult(
-                    status="error",
-                    review_task=None,
-                    message="review creation returned no task",
-                )
-            prepared_review_task, prepare_error = _prepare_background_start(
-                context=context,
-                action_type=action_type,
-                task=review_task,
-                worker_label="review",
-                rollback_on_failure=True,
-                permit=reserved_verify_permit,
-            )
-            reserved_verify_permit = None
-            if prepared_review_task is None:
-                assert prepare_error is not None
-                return PreparedCreateReviewActionResult(
-                    status="error",
-                    review_task=None,
-                    message=prepare_error.message or "startup preparation failed for review",
-                )
-            return PreparedCreateReviewActionResult(
-                status="created",
-                review_task=prepared_review_task,
-                message=create_result.message,
-            )
-
-        verify_context = AdvanceActionExecutionContext(
-            store=context.store,
-            trigger_source=context.trigger_source,
-            dry_run=context.dry_run,
-            max_resume_attempts=context.max_resume_attempts,
-            use_iterate_for_create_implement=context.use_iterate_for_create_implement,
-            use_iterate_for_needs_rebase=context.use_iterate_for_needs_rebase,
-            prepare_task_for_background_start=context.prepare_task_for_background_start,
-            prepare_create_review=_prepare_review_after_verify,
-            create_resume_task=context.create_resume_task,
-            create_rebase_task=context.create_rebase_task,
-            create_implement_task=context.create_implement_task,
-            spawn_worker=context.spawn_worker,
-            spawn_resume_worker=context.spawn_resume_worker,
-            spawn_iterate_worker=context.spawn_iterate_worker,
-            can_spawn_worker=context.can_spawn_worker,
-            no_worker_capacity_message=context.no_worker_capacity_message,
-            is_rebase_target_already_merged=context.is_rebase_target_already_merged,
-            prefer_iterate_for_action=context.prefer_iterate_for_action,
-            spawn_iterate_recovery=context.spawn_iterate_recovery,
-            create_retry_task=context.create_retry_task,
-            create_targeted_rebase_task=context.create_targeted_rebase_task,
-            reconcile_diverged_branch=context.reconcile_diverged_branch,
-            config=context.config,
-            git=context.git,
-        )
-        outcome = run_noop_improve_verify_then_review(task=task, action=action, context=verify_context)
-        if outcome.status == "needs_attention":
-            return AdvanceActionExecutionResult(
-                action_type=action_type,
-                status="skip",
-                message=outcome.message,
-                attention_type="needs_discussion",
-                attention_reason="improve-no-op",
-            )
-        if outcome.status == "skip":
-            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message=outcome.message)
-        if outcome.status == "error":
-            return AdvanceActionExecutionResult(action_type=action_type, status="error", message=outcome.message)
-        if outcome.status == "review_cleared":
-            return AdvanceActionExecutionResult(
-                action_type=action_type,
-                status="success",
-                message=outcome.verify_markdown or outcome.message,
-                success_message=outcome.message,
-                work_done=True,
-                handled_task_id=task.id,
-            )
-        new_review = outcome.review_task
-        assert new_review is not None and new_review.id is not None
-        rc = context.spawn_worker(new_review, "review")
-        _release_reserved_launch_if_left(new_review)
-        result = _spawn_result(
-            action_type=action_type,
-            rc=rc,
-            handled_task_id=new_review.id,
-            worker_label="review",
-            created_task=new_review,
-        )
-        result.success_message = outcome.message
-        result.message = outcome.verify_markdown or outcome.message
-        return result
 
     if action_type == "improve":
         review_task = action.get("review_task")

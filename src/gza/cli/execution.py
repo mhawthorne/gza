@@ -142,11 +142,9 @@ from .advance_engine import (
     resolve_subject_task,
 )
 from .advance_executor import (
-    AdvanceActionExecutionContext,
     build_failed_recovery_needs_attention_result,
     build_improve_needs_attention_result,
     resolve_execution_needs_attention,
-    run_noop_improve_verify_then_review,
 )
 from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
@@ -4656,7 +4654,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     if not isinstance(initial_action_description, str) or not initial_action_description:
         initial_action_description = initial_action_type
 
-    iteration_actions = {"create_review", "run_review", "verify_noop_improve_then_review", "improve", "run_improve"}
+    iteration_actions = {"create_review", "run_review", "improve", "run_improve"}
 
     if dry_run:
         print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
@@ -5256,147 +5254,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 action_task = maybe_action_task
             assert action_task.id is not None
             print(f"  Running pending review {action_task.id}...")
-        elif action_type == "verify_noop_improve_then_review":
-            maybe_review_task = action.get("review_task")
-            assert isinstance(maybe_review_task, DbTask)
-            review_row_task = maybe_review_task
-            review_row_verdict = get_review_verdict(config, maybe_review_task)
-
-            def _prepare_iterate_review(review_parent: DbTask):
-                permit_candidate = _reserve_iterate_launch(emit_error=False)
-                if permit_candidate is False:
-                    return type(
-                        "_CreateReviewResult",
-                        (),
-                        {
-                            "status": "error",
-                            "review_task": None,
-                            "message": "already at max concurrent tasks: capacity check failed before creating review",
-                        },
-                    )()
-                permit_for_iterate_review: LaunchPermit | None = permit_candidate
-                try:
-                    review = _create_review_task(store, review_parent, trigger_source="manual")
-                    prepared_review = review
-                    if isinstance(permit_for_iterate_review, LaunchPermit):
-                        maybe_prepared_review = _prepare_reserved_iterate_task(
-                            review,
-                            permit=permit_for_iterate_review,
-                            rollback_on_failure=True,
-                        )
-                        if maybe_prepared_review is None:
-                            return type(
-                                "_CreateReviewResult",
-                                (),
-                                {
-                                    "status": "error",
-                                    "review_task": None,
-                                    "message": "startup preparation failed for fresh review",
-                                },
-                            )()
-                        prepared_review = maybe_prepared_review
-                    return type(
-                        "_CreateReviewResult",
-                        (),
-                        {
-                            "status": "created",
-                            "review_task": prepared_review,
-                            "message": f"Created review {prepared_review.id}",
-                        },
-                    )()
-                except DuplicateReviewError as exc:
-                    if isinstance(permit_for_iterate_review, LaunchPermit):
-                        permit_for_iterate_review.release()
-                    return type(
-                        "_CreateReviewResult",
-                        (),
-                        {
-                            "status": "skip",
-                            "review_task": exc.active_review,
-                            "message": f"SKIP: review already pending ({exc.active_review.id})",
-                        },
-                    )()
-                except ValueError as exc:
-                    if isinstance(permit_for_iterate_review, LaunchPermit):
-                        permit_for_iterate_review.release()
-                    return type(
-                        "_CreateReviewResult",
-                        (),
-                        {
-                            "status": "error",
-                            "review_task": None,
-                            "message": str(exc),
-                        },
-                    )()
-
-            def _unused_iterate_rebase_task(parent_task: DbTask) -> DbTask:
-                assert parent_task.id is not None
-                assert parent_task.branch is not None
-                return _create_rebase_task(
-                    store,
-                    parent_task.id,
-                    parent_task.branch,
-                    target_branch,
-                    trigger_source="manual",
-                )
-
-            def _unused_iterate_implement_task(_parent_task: DbTask) -> DbTask:
-                assert impl_task is not None
-                return impl_task
-
-            verify_context = AdvanceActionExecutionContext(
-                store=store,
-                trigger_source="manual",
-                dry_run=False,
-                max_resume_attempts=effective_max_resume_attempts,
-                use_iterate_for_create_implement=False,
-                use_iterate_for_needs_rebase=False,
-                prepare_task_for_background_start=lambda prepared_task, _rollback: prepared_task,
-                prepare_create_review=_prepare_iterate_review,
-                create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="manual"),
-                create_rebase_task=_unused_iterate_rebase_task,
-                create_implement_task=_unused_iterate_implement_task,
-                spawn_worker=lambda _task, _kind: 0,
-                spawn_resume_worker=lambda _task, _kind: 0,
-                spawn_iterate_worker=lambda *_args, **_kwargs: 0,
-                config=config,
-                git=git_runtime,
-            )
-            outcome = run_noop_improve_verify_then_review(
-                task=impl_task,
-                action=action,
-                context=verify_context,
-            )
-            if outcome.status == "needs_attention":
-                final_status = "blocked"
-                final_stop_reason = "needs_discussion"
-                final_attention_action = {
-                    "type": "needs_discussion",
-                    "description": outcome.message,
-                    "needs_attention_reason": "improve-no-op",
-                    "subject_task_id": impl_task.id,
-                }
-                final_attention_task = impl_task
-                print(f"  {outcome.message.removeprefix('SKIP: ')}")
-                break
-            if outcome.status == "skip":
-                final_status = "blocked"
-                final_stop_reason = "review_in_progress" if "already pending" in outcome.message else "needs_discussion"
-                print(f"  {outcome.message.removeprefix('SKIP: ')}")
-                break
-            if outcome.status == "review_cleared":
-                final_status = "merge_ready"
-                final_stop_reason = "verify_only_review_cleared"
-                print(f"  {outcome.message}")
-                break
-            if outcome.status == "error" or outcome.review_task is None:
-                final_status = "blocked"
-                final_stop_reason = "review_failed"
-                print(f"  Error creating fresh review after verify: {outcome.message}")
-                break
-            action_task = outcome.review_task
-            assert action_task.id is not None
-            print(f"  Fresh verify passed; running review {action_task.id}...")
         elif action_type == "improve":
             if isinstance(prepared_action_task, DbTask):
                 action_task = prepared_action_task
@@ -5599,7 +5456,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             final_status = "blocked"
             task_type = (
                 "review"
-                if action_type in {"create_review", "run_review", "verify_noop_improve_then_review"}
+                if action_type in {"create_review", "run_review"}
                 else "improve" if action_type in {"improve", "run_improve"} else action_type
             )
             attention_result = None
@@ -5635,7 +5492,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if action_task.id is not None:
             action_task = store.get(action_task.id) or action_task
 
-        if action_type in {"create_review", "run_review", "verify_noop_improve_then_review"}:
+        if action_type in {"create_review", "run_review"}:
             verdict = get_review_verdict(config, action_task)
             print(
                 f"  Review {action_task.id}: "
@@ -5674,7 +5531,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 task=action_task,
                 verdict=verdict,
             )
-        if action_type in {"create_review", "run_review", "verify_noop_improve_then_review"}:
+        if action_type in {"create_review", "run_review"}:
             # Count full change+review cycles by completed review actions.
             iteration += 1
         impl_task = store.get(impl_task.id) or impl_task

@@ -8059,7 +8059,7 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
     )
 
 
-def test_watch_cycle_verify_noop_improve_then_review_routes_impl_chain_through_iterate(tmp_path: Path) -> None:
+def test_watch_cycle_noop_improve_limit_emits_attention_without_iterate(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -8104,14 +8104,11 @@ def test_watch_cycle_verify_noop_improve_then_review_routes_impl_chain_through_i
         patch(
             "gza.cli.watch.determine_next_action",
             return_value={
-                "type": "verify_noop_improve_then_review",
-                "description": "Re-run verify_command before re-review",
-                "review_task": review,
+                "type": "needs_discussion",
+                "description": "SKIP: no-op improve limit reached; needs manual discussion",
+                "needs_attention_reason": "improve-no-op",
+                "subject_task_id": impl.id,
             },
-        ),
-        patch(
-            "gza.cli.advance_executor.run_noop_improve_verify_then_review",
-            side_effect=AssertionError("watch parent should not run reverify directly"),
         ),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
@@ -8126,13 +8123,9 @@ def test_watch_cycle_verify_noop_improve_then_review_routes_impl_chain_through_i
             log=log,
         )
 
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == impl.id
-    assert any(
-        line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
-        for line in log_path.read_text().splitlines()
-    )
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
+    assert "verify_" + "noop_improve_then_review" not in log_path.read_text()
 
 
 def test_watch_cycle_completed_rebase_without_owner_review_routes_to_iterate_before_merge(

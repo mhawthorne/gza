@@ -35,6 +35,7 @@ from gza.plan_review_materialization import (
 )
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
+from gza.runner import CROSS_PROJECT_TAG
 
 
 class _FakeGit:
@@ -624,10 +625,12 @@ def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
 
 
 def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
+    removed_action = "verify_" + "noop_improve_then_review"
     assert "needs_rebase" in WORKER_CONSUMING_ACTIONS
     assert "create_implement" in WORKER_CONSUMING_ACTIONS
     assert "create_plan_review" in WORKER_CONSUMING_ACTIONS
     assert "run_plan_improve" in WORKER_CONSUMING_ACTIONS
+    assert removed_action not in WORKER_CONSUMING_ACTIONS
 
 
 def test_completed_explore_without_followup_needs_discussion(tmp_path: Path) -> None:
@@ -3174,8 +3177,63 @@ def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tm
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_noop_improve_then_review"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
     assert action["type"] != "merge"
+
+
+def test_noop_improve_limit_ignores_branch_tip_errors_and_skips_verify_availability_probe(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+    config.enforce_project_scope = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-probe-cleanup",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = (CROSS_PROJECT_TAG,)
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: mypy error\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    for hour in (11, 12):
+        improve = _add_completed_improve_for_review(
+            store,
+            impl,
+            review,
+            when=datetime(2026, 5, 14, hour, 0, tzinfo=UTC),
+            changed_diff=False,
+        )
+        assert improve.id is not None
+
+    git = _FakeGit(
+        can_merge=True,
+        rev_parse_errors={impl.branch: GitError("should not resolve branch tip")},
+        name_status_error_by_range={f"main...{impl.branch}": GitError("should not inspect verify availability")},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert git.name_status_calls == []
 
 
 def test_substantive_noop_improves_still_park_without_auto_clear(tmp_path: Path) -> None:
@@ -3221,12 +3279,7 @@ def test_substantive_noop_improves_still_park_without_auto_clear(tmp_path: Path)
     assert action["needs_attention_reason"] == "improve-no-op"
 
 
-def test_verify_blocked_noop_improves_return_reverify_action_when_review_sha_is_stale(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
+def test_verify_blocked_noop_improves_park_when_review_sha_is_stale(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "uv run pytest tests/ -q"
@@ -3267,16 +3320,6 @@ def test_verify_blocked_noop_improves_return_reverify_action_when_review_sha_is_
         improve.changed_diff = False
         store.update(improve)
 
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
     git = _FakeGit(
         can_merge=True,
         existing_branches={impl.branch},
@@ -3284,12 +3327,11 @@ def test_verify_blocked_noop_improves_return_reverify_action_when_review_sha_is_
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_noop_improve_then_review"
-    assert action["verify_provenance_state"] == "stale"
-    assert action["current_branch_head_sha"] == "newsha"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
-def test_verify_timeout_only_reviews_reverify_instead_of_parking_when_noop_limit_is_reached(
+def test_verify_timeout_only_reviews_park_with_verify_blocked_reason_when_noop_limit_is_reached(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -3347,10 +3389,8 @@ def test_verify_timeout_only_reviews_reverify_instead_of_parking_when_noop_limit
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_noop_improve_then_review"
-    assert action["current_branch_head_sha"] == "fresh-sha"
-    assert action["verify_provenance_state"] == "stale"
-    assert action.get("needs_attention_reason") != "verify-blocked-no-code-issues"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
 
 
 def test_verify_timeout_only_review_hits_threshold_one_with_single_noop_improve(tmp_path: Path) -> None:
@@ -3387,8 +3427,8 @@ def test_verify_timeout_only_review_hits_threshold_one_with_single_noop_improve(
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_noop_improve_then_review"
-    assert action["current_branch_head_sha"] == "fresh-sha"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_verify_timeout_only_reviews_still_park_without_noop_limit_trigger(tmp_path: Path) -> None:
@@ -3502,299 +3542,6 @@ def test_product_code_open_state_citation_prevents_verify_noop_reverify(tmp_path
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
-
-
-@pytest.mark.parametrize(
-    ("git_kwargs", "expected_fragment"),
-    [
-        (
-            {"resolve_fresh_merge_source_ref_error": RuntimeError("fresh ref lookup blew up")},
-            "unable to resolve freshest branch ref",
-        ),
-        (
-            {
-                "existing_refs": {"origin/feat/noop-branch-tip-proof-failure"},
-                "ref_shas": {},
-                "rev_parse_errors": {
-                    "origin/feat/noop-branch-tip-proof-failure": RuntimeError("rev-parse blew up")
-                },
-            },
-            "unable to resolve branch tip SHA from 'origin/feat/noop-branch-tip-proof-failure'",
-        ),
-    ],
-)
-def test_verify_blocked_noop_improves_surface_branch_tip_probe_failures(
-    tmp_path: Path,
-    git_kwargs: dict[str, object],
-    expected_fragment: str,
-) -> None:
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    config.verify_command = "uv run pytest tests/ -q"
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feat/noop-branch-tip-proof-failure",
-        when=datetime(2026, 5, 19, 9, 0, tzinfo=UTC),
-    )
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime(2026, 5, 19, 10, 0, tzinfo=UTC)
-    review.output_content = (
-        "## Summary\n\n- Verify timed out.\n\n"
-        "## Blockers\n\n"
-        "### B1 verify_command timeout\n"
-        "Evidence: verify_command timed out after 120s.\n"
-        "Impact: autonomous verify could not confirm the current branch tip.\n"
-        "Required fix: rerun verify_command against the current tip.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "## Follow-Ups\n\nNone.\n\n"
-        "## Questions / Assumptions\n\nNone.\n\n"
-        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    )
-    review.review_verify_head_sha = "oldsha"
-    store.update(review)
-
-    for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 5, 19, hour, 0, tzinfo=UTC)
-        improve.branch = impl.branch
-        improve.changed_diff = False
-        store.update(improve)
-
-    git = _FakeGit(can_merge=True, **git_kwargs)
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "verify-noop-improve-branch-tip-unavailable"
-    assert expected_fragment in action["description"]
-    assert "improve-no-op" not in action["description"]
-
-def test_cross_project_verify_blocked_noop_improves_return_reverify_action_without_root_verify_command(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    _set_subdir_project_boundary(config, tmp_path)
-    config.enforce_project_scope = False
-    config.verify_command = ""
-
-    sibling_project_dir = tmp_path / "dre" / "web"
-    sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feat/cross-project-noop-reverify",
-        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
-    )
-    impl.tags = ("cross-project",)
-    store.update(impl)
-
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime(2026, 5, 16, 10, 0, tzinfo=UTC)
-    review.output_content = (
-        "## Summary\n\n- Verify failed.\n\n"
-        "## Blockers\n\n"
-        "### B1 verify_command failure: web verify error\n"
-        "Evidence: dre/web/src/app.tsx:1: error: boom.\n"
-        "Impact: autonomous verify fails.\n"
-        "Required fix: fix the verify failure.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "## Follow-Ups\n\nNone.\n\n"
-        "## Questions / Assumptions\n\nNone.\n\n"
-        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    )
-    review.review_verify_head_sha = "oldsha"
-    store.update(review)
-
-    for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 5, 16, hour, 0, tzinfo=UTC)
-        improve.branch = impl.branch
-        improve.changed_diff = False
-        store.update(improve)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "newsha"},
-        name_status_by_range={
-            "main...feat/cross-project-noop-reverify": "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n",
-        },
-    )
-
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert action["type"] == "verify_noop_improve_then_review"
-    assert action["current_branch_head_sha"] == "newsha"
-
-
-def test_cross_project_verify_blocked_noop_improves_return_reverify_action_for_branch_local_project_root(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    _set_subdir_project_boundary(config, tmp_path)
-    config.enforce_project_scope = False
-    config.verify_command = ""
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feat/cross-project-branch-local-root",
-        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
-    )
-    impl.tags = ("cross-project",)
-    store.update(impl)
-
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime(2026, 5, 16, 10, 0, tzinfo=UTC)
-    review.output_content = (
-        "## Summary\n\n- Verify failed.\n\n"
-        "## Blockers\n\n"
-        "### B1 verify_command failure: web verify error\n"
-        "Evidence: dre/web/src/app.tsx:1: error: boom.\n"
-        "Impact: autonomous verify fails.\n"
-        "Required fix: fix the verify failure.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "## Follow-Ups\n\nNone.\n\n"
-        "## Questions / Assumptions\n\nNone.\n\n"
-        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    )
-    review.review_verify_head_sha = "oldsha"
-    store.update(review)
-
-    for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 5, 16, hour, 0, tzinfo=UTC)
-        improve.branch = impl.branch
-        improve.changed_diff = False
-        store.update(improve)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "newsha"},
-        name_status_by_range={
-            "main...feat/cross-project-branch-local-root": "A\tdre/web/gza.yaml\nM\tdre/web/src/app.tsx\n",
-        },
-    )
-
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert action["type"] == "verify_noop_improve_then_review"
-    assert action["current_branch_head_sha"] == "newsha"
-
-
-def test_cross_project_verify_blocked_noop_improves_park_when_diff_probe_fails(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-    _set_subdir_project_boundary(config, tmp_path)
-    config.enforce_project_scope = False
-    config.verify_command = ""
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feat/cross-project-diff-probe-failure",
-        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
-    )
-    impl.tags = ("cross-project",)
-    store.update(impl)
-
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime(2026, 5, 16, 10, 0, tzinfo=UTC)
-    review.output_content = (
-        "## Summary\n\n- Verify failed.\n\n"
-        "## Blockers\n\n"
-        "### B1 verify_command failure: web verify error\n"
-        "Evidence: dre/web/src/app.tsx:1: error: boom.\n"
-        "Impact: autonomous verify fails.\n"
-        "Required fix: fix the verify failure.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "## Follow-Ups\n\nNone.\n\n"
-        "## Questions / Assumptions\n\nNone.\n\n"
-        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    )
-    review.review_verify_head_sha = "oldsha"
-    store.update(review)
-
-    for hour in (11, 12):
-        improve = store.add("No-op improve", task_type="improve", based_on=impl.id, depends_on=review.id, same_branch=True)
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 5, 16, hour, 0, tzinfo=UTC)
-        improve.branch = impl.branch
-        improve.changed_diff = False
-        store.update(improve)
-
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(),
-            format_version="legacy",
-        ),
-    )
-
-    git = _FakeGit(
-        can_merge=True,
-        existing_branches={impl.branch},
-        ref_shas={impl.branch: "newsha"},
-        name_status_error_by_range={
-            "main...feat/cross-project-diff-probe-failure": RuntimeError("diff probe exploded\nwith stderr"),
-        },
-    )
-
-    action = evaluate_advance_rules(config, store, git, impl, "main")
-
-    assert action["type"] == "needs_discussion"
-    assert action["type"] not in WORKER_CONSUMING_ACTIONS
-    assert action["needs_attention_reason"] == "verify-noop-improve-diff-probe-unavailable"
-    assert "main...feat/cross-project-diff-probe-failure" in action["description"]
-    assert "diff probe exploded with stderr" in action["description"]
-    assert action["verify_command_availability_revision_range"] == "main...feat/cross-project-diff-probe-failure"
-    assert action["verify_command_availability_error"] == "diff probe exploded with stderr"
 
 
 def test_noop_improve_limit_preempts_max_review_cycles_when_thresholds_match(tmp_path: Path, monkeypatch) -> None:
@@ -5734,7 +5481,8 @@ def test_missing_max_noop_improve_config_falls_back_to_authoritative_default(tmp
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.max_noop_improve_cycles == 1
-    assert action["type"] == "verify_noop_improve_then_review"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_two_consecutive_evidence_only_verify_timeout_reviews_need_attention(tmp_path: Path) -> None:
@@ -6903,8 +6651,8 @@ def test_closing_review_in_progress_db_known_wait_matches_full_path_and_skips_la
     assert early_git.resolve_fresh_merge_source_calls
     assert early_git.can_merge_calls == [(impl.branch, "main")]
     assert early_git.rev_parse_calls
-    assert len(full_git.rev_parse_calls) > len(early_git.rev_parse_calls)
-    assert len(full_git.resolve_fresh_merge_source_calls) > len(early_git.resolve_fresh_merge_source_calls)
+    assert full_git.rev_parse_calls == early_git.rev_parse_calls
+    assert full_git.resolve_fresh_merge_source_calls == early_git.resolve_fresh_merge_source_calls
 
 def test_closing_review_in_progress_still_respects_strict_scope_violation(tmp_path: Path) -> None:
     from gza.cli.advance_engine import determine_next_action

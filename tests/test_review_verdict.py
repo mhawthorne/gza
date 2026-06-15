@@ -17,6 +17,39 @@ from gza.review_verdict import (
 )
 
 
+def _gza_4927_review_report() -> str:
+    return (
+        "## Summary\n\n- Implementation is aligned; autonomous verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: targeted pytest failure under the harness\n"
+        "Evidence: verify_command failed with exit status 1 while running "
+        "`./bin/tests -x -o faulthandler_timeout=120`; the captured output also cited "
+        "`pytest_timeout` and `autonomous_verify_timeout_seconds` while the failing phase reported an assertion.\n"
+        "Impact: the branch cannot pass autonomous verification.\n"
+        "Required fix: fix the failing test or command, then rerun verify_command from the current tip.\n"
+        "Required tests: rerun `./bin/tests -x -o faulthandler_timeout=120`.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _pytest_timeout_plugin_failure_review_report() -> str:
+    return (
+        "## Summary\n\n- Verify failed in the unit phase.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: unit pytest assertion failure\n"
+        "Evidence: verify_command failed with exit status 1 while running `./bin/tests`; "
+        "pytest reported `plugins: xdist-3.8.0, timeout-2.4.0` before the assertion failure.\n"
+        "Impact: the branch cannot pass autonomous verification.\n"
+        "Required fix: fix the failing assertion, then rerun verify_command from the current tip.\n"
+        "Required tests: rerun `./bin/tests` and add a regression for the failing assertion path.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
 class TestParseReviewVerdict:
     def test_inline_bold_wrapped(self) -> None:
         assert parse_review_verdict("**Verdict: APPROVED**") == "APPROVED"
@@ -388,6 +421,80 @@ class TestVerifyBlockedReviewClassification:
         assert is_verify_timeout_only_review(content) is False
         assert is_verify_blocked_only_review(content) is True
 
+    def test_classifies_gza_4927_verify_failure_report_as_verify_blocked_not_timeout(self) -> None:
+        content = _gza_4927_review_report()
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_failure_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_blocked_only_review(content) is True
+        assert is_verify_timeout_only_review(content) is False
+
+    def test_does_not_treat_timeout_identifiers_or_flags_as_verify_timeout_markers(self) -> None:
+        content = (
+            "## Summary\n\n- Verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: command exited nonzero\n"
+            "Evidence: verify_command failed while running "
+            "`pytest -o faulthandler_timeout=120 --timeout=30`; the output also mentioned "
+            "`pytest_timeout` and `autonomous_verify_timeout_seconds` before the assertion failure.\n"
+            "Impact: the branch cannot pass autonomous verification.\n"
+            "Required fix: fix the assertion failure and rerun verify_command.\n"
+            "Required tests: rerun `pytest -o faulthandler_timeout=120 --timeout=30`.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_failure_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_blocked_only_review(content) is True
+        assert is_verify_timeout_only_review(content) is False
+
+    def test_does_not_treat_pytest_timeout_plugin_version_as_verify_timeout_marker(self) -> None:
+        content = _pytest_timeout_plugin_failure_review_report()
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_failure_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_blocked_only_review(content) is True
+        assert is_verify_timeout_only_review(content) is False
+
+    def test_preserves_verify_failure_when_required_tests_mentions_standalone_timeout_budget(
+        self,
+    ) -> None:
+        content = (
+            "## Summary\n\n- Verify failed in the unit phase.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: unit pytest assertion failure\n"
+            "Evidence: verify_command failed with exit status 1 while running `./bin/tests`.\n"
+            "Impact: the branch cannot pass autonomous verification.\n"
+            "Required fix: fix the failing assertion, then rerun verify_command from the current tip.\n"
+            "Required tests: rerun `timeout 120 ./bin/tests` and add a regression for the failing assertion path.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 1
+        assert summary.verify_failure_count == 1
+        assert summary.verify_timeout_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_blocked_only_review(content) is True
+        assert is_verify_timeout_only_review(content) is False
+
     def test_does_not_classify_code_blocker_with_generic_verify_command_rerun_as_verify_failure(
         self,
     ) -> None:
@@ -511,6 +618,53 @@ class TestVerifyBlockedReviewClassification:
         assert summary.verify_failure_count == 0
         assert summary.unknown_or_code_count == 0
         assert is_verify_timeout_only_review(content) is True
+
+    def test_does_not_classify_raw_generic_timeout_blocker_as_verify_timeout_only(self) -> None:
+        content = (
+            "## Summary\n\n- Product bug.\n\n"
+            "## Blockers\n\n"
+            "- Request timeout when loading the dashboard.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 0
+        assert summary.verify_timeout_count == 0
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is False
+        assert is_verify_blocked_only_review(content) is False
+
+    def test_keeps_genuine_verify_timeout_detection_for_standalone_timeout_and_exit_status(self) -> None:
+        content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: timeout\n"
+            "Evidence: verify_command timeout on the current tip.\n"
+            "Impact: autonomous verification cannot complete.\n"
+            "Required fix: investigate the timeout before rerunning verify_command.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "### B2 verify_command failure: timed out during full verify\n"
+            "Evidence: Exit status: timed out.\n"
+            "Impact: autonomous verification cannot complete.\n"
+            "Required fix: investigate the timeout before rerunning verify_command.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        summary = summarize_review_blockers(content)
+
+        assert summary.blocker_count == 2
+        assert summary.verify_timeout_count == 2
+        assert summary.verify_failure_count == 0
+        assert summary.unknown_or_code_count == 0
+        assert is_verify_timeout_only_review(content) is True
+        assert is_verify_blocked_only_review(content) is True
 
     def test_does_not_classify_unstructured_mixed_blocker_section_as_timeout_only(self) -> None:
         content = (
