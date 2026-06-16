@@ -712,7 +712,7 @@ def build_merge_context_from_git(git: Git, target_branch: str | None) -> _MergeC
     merge_context = _MergeContext(git=git, default_branch=target_branch)
     try:
         merge_context.existing_branches = frozenset(git.local_branch_names())
-    except (GitError, OSError, ValueError, AttributeError, TypeError) as exc:
+    except (GitError, OSError, ValueError) as exc:
         _record_repository_inspection_warning(
             merge_context,
             key="local-branch-list",

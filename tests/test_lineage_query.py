@@ -11,7 +11,7 @@ import gza.recovery_engine as recovery_engine
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.git import Git, ResolvedMergeSourceRef
+from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.lineage_query import LineageOwnerQuery, _load_indexes, _query_lineage_owner_rows_with_context, query_lineage_owner_rows
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_read_context import RecoveryReadContext
@@ -2673,4 +2673,32 @@ def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seed
     )
     assert failed_ids_no_git == failed_ids_with_git, (
         "seeded vs non-seeded paths produced different owner-row visibility"
+    )
+
+
+def test_build_merge_context_from_git_records_warning_and_clears_existing_branches_on_git_error(
+    tmp_path: Path,
+) -> None:
+    """build_merge_context_from_git must set existing_branches=None and record the
+    local-branch-list inspection warning when local_branch_names() raises GitError,
+    locking the intended narrow (GitError, OSError, ValueError) contract."""
+
+    class _RaisingGit(_MinimalGit):
+        def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
+            raise GitError("simulated git failure")
+
+    git = _RaisingGit()
+    merge_context = recovery_engine.build_merge_context_from_git(git, "main")
+
+    assert merge_context.existing_branches is None, (
+        "existing_branches should be None when local_branch_names() raises GitError"
+    )
+    assert "local-branch-list" in merge_context._warning_keys, (
+        "local-branch-list warning key should be recorded"
+    )
+    assert merge_context.repository_inspection_warnings, (
+        "at least one inspection warning should be recorded"
+    )
+    assert "failed to list local branches" in merge_context.repository_inspection_warnings[0], (
+        "warning text should mention the failed branch listing"
     )
