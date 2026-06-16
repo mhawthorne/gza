@@ -35,7 +35,7 @@ from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
     plan_review_manifest_digest,
 )
-from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from gza.recovery_engine import FailedRecoveryDecision, _MergeContext, decide_failed_task_recovery
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG
 
@@ -158,6 +158,14 @@ class _FakeGit:
         if error is not None:
             raise error
         return self._name_status_by_range.get(revision_range, "")
+
+
+@pytest.fixture(autouse=True)
+def _stub_recovery_merge_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "gza.recovery_engine._load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_FakeGit(), default_branch="main"),
+    )
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
@@ -574,10 +582,17 @@ def _unstructured_mixed_review_report() -> str:
     )
 
 
-def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
+def test_resolve_context_excludes_resume_state_for_test_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.max_noop_improve_cycles = 2
+    monkeypatch.setattr(
+        "gza.recovery_engine._load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_FakeGit(), default_branch="main"),
+    )
 
     failed = store.add("Fix failing tests", task_type="implement")
     failed.status = "failed"

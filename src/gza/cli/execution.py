@@ -840,15 +840,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             if is_blocked:
                 return phase1_error(args, f"Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
     else:
-        git = Git(config.project_dir)
-        target_branch = git.default_branch()
         recovery_entries = collect_recovery_lane_entries(
             store,
             tags=selected_tags,
             any_tag=any_tag,
             max_recovery_attempts=config.max_resume_attempts,
-            git=git,
-            target_branch=target_branch,
         )
         if recovery_entries:
             plural = "candidate is" if len(recovery_entries) == 1 else "candidates are"

@@ -24,7 +24,7 @@ from gza.log_paths import ops_log_path_for
 from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
 from gza.rebase_diff import RebaseDiffBaseline
-from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_engine import _MergeContext, decide_failed_task_recovery
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.cli import _create_improve_task, _create_rebase_task
 from gza.review_verdict import ReviewFinding, parse_review_report
@@ -150,6 +150,65 @@ class TestGetTaskOutputPaths:
         report_path, summary_path = get_task_output_paths(task, tmp_path)
         assert report_path is None
         assert summary_path is None
+
+
+@pytest.fixture(autouse=True)
+def _stub_recovery_merge_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "gza.recovery_engine._load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch="main"),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_runner_git_for_extracted_helpers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cls = getattr(request.node, "cls", None)
+    if cls is None or cls.__name__ != "TestExtractedRunInnerHelpers":
+        return
+
+    class _DefaultRunnerGit:
+        def __init__(self, project_dir: Path) -> None:
+            self.project_dir = project_dir
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def _run(self, *args: object, **kwargs: object) -> Mock:
+            return Mock(stdout="")
+
+        def branch_exists(self, branch: str) -> bool:
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return None
+
+        def current_branch(self) -> str:
+            return "main"
+
+        def resolve_fresh_merge_source(self, branch: str) -> ResolvedMergeSourceRef:
+            return ResolvedMergeSourceRef(branch)
+
+        def get_diff_numstat(self) -> str:
+            return ""
+
+        def status_porcelain(self) -> set[tuple[str, str]]:
+            return set()
+
+        def add(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def commit(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr("gza.runner.Git", _DefaultRunnerGit)
+    monkeypatch.setattr("gza.git.Git.default_branch", lambda self: "main")
+    monkeypatch.setattr("gza.git.Git.rev_parse_if_exists", lambda self, ref: None)
 
 
 class TestPostReviewToPr:
@@ -11059,6 +11118,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.backup_database"),
             patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
             patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
         ):
             mock_provider = Mock()
             mock_provider.name = "Claude"
@@ -11066,6 +11126,11 @@ class TestExtractedRunInnerHelpers:
             mock_provider.check_credentials.return_value = True
             mock_provider.verify_credentials.return_value = True
             mock_get_provider.return_value = mock_provider
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git._run.return_value = Mock(stdout="")
+            mock_git.branch_exists.return_value = False
+            mock_git_class.return_value = mock_git
 
             result = run(config, task_id=task.id)
 
@@ -11812,6 +11877,7 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch("gza.runner.Git") as mock_git_class,
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -11819,6 +11885,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
             patch("gza.runner.task_footer"),
         ):
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.rev_parse_if_exists.return_value = None
+            mock_git_class.return_value = mock_git
             rc = run(config, task_id=task.id, create_pr=True)
 
         assert rc == 0
@@ -11841,7 +11911,12 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch("gza.runner.Git") as mock_git_class,
         ):
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.rev_parse_if_exists.return_value = None
+            mock_git_class.return_value = mock_git
             rc = run(config, task_id=task.id, create_pr=True)
 
         assert rc == 1
@@ -11877,6 +11952,7 @@ class TestExtractedRunInnerHelpers:
         with (
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch("gza.runner.Git") as mock_git_class,
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -11884,6 +11960,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
             patch("gza.runner.task_footer"),
         ):
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.rev_parse_if_exists.return_value = None
+            mock_git_class.return_value = mock_git
             rc = run(config, task_id=task.id)
 
         assert rc == 0

@@ -19,6 +19,15 @@ from gza.recovery_engine import list_failed_tasks_for_recovery
 from tests.cli.conftest import make_store, setup_config
 
 
+@pytest.fixture(autouse=True)
+def _stub_merge_context_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: recovery_engine._MergeContext(git=None, default_branch="main"),
+    )
+
+
 def _set_completed(task, *, when: datetime, branch: str | None, has_commits: bool) -> None:
     task.status = "completed"
     task.completed_at = when

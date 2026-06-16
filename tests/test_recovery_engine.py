@@ -205,6 +205,19 @@ def _stub_merge_context(
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_merge_context_by_default(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if request.node.name in {
+        "test_list_failed_tasks_for_recovery_warns_once_when_local_branch_batch_probe_fails",
+        "test_load_merge_context_warning_says_metadata_based_lineage_suppression_may_still_apply",
+    }:
+        return
+    _stub_merge_context(monkeypatch)
+
+
 def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
     depends_on = None
     based_on = None
@@ -247,11 +260,13 @@ def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
 )
 def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     task_type: str,
     reason: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
     impl = _completed_impl(store, merge_status="merged")
     assert impl.id is not None
 
@@ -270,10 +285,12 @@ def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged
 @pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
 def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not_merged(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     task_type: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
     impl = _completed_impl(store, merge_status="unmerged")
     assert impl.id is not None
 
@@ -373,9 +390,13 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
 
 
-def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp_path: Path) -> None:
+def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -395,9 +416,13 @@ def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
-def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(tmp_path: Path) -> None:
+def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -440,9 +465,13 @@ def test_resolve_pending_recovery_execution_mode(
     assert resolve_pending_recovery_execution_mode(task) == expected
 
 
-def test_empty_task_requires_recovery_false_when_landed_representative_exists(tmp_path: Path) -> None:
+def test_empty_task_requires_recovery_false_when_landed_representative_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     root = store.add("Implementation root", task_type="implement")
     assert root.id is not None
@@ -481,9 +510,13 @@ def test_empty_task_requires_recovery_false_when_landed_representative_exists(tm
     assert list_failed_tasks_for_recovery(store) == []
 
 
-def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without_execution(tmp_path: Path) -> None:
+def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Never-ran implementation", task_type="implement")
     assert failed.id is not None
@@ -507,9 +540,13 @@ def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without
     assert list_failed_tasks_for_recovery(store) == []
 
 
-def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(tmp_path: Path) -> None:
+def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Never-ran redundant implementation", task_type="implement")
     assert failed.id is not None
@@ -533,9 +570,13 @@ def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(tmp
     assert list_failed_tasks_for_recovery(store) == []
 
 
-def test_failed_redundant_branch_with_provider_execution_remains_recoverable(tmp_path: Path) -> None:
+def test_failed_redundant_branch_with_provider_execution_remains_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Executed redundant implementation", task_type="implement")
     assert failed.id is not None
@@ -555,9 +596,13 @@ def test_failed_redundant_branch_with_provider_execution_remains_recoverable(tmp
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
-def test_failed_redundant_branch_with_completed_recovery_descendant_is_already_resolved(tmp_path: Path) -> None:
+def test_failed_redundant_branch_with_completed_recovery_descendant_is_already_resolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     failed = store.add("Executed redundant implementation", task_type="implement")
     assert failed.id is not None
@@ -1244,8 +1289,12 @@ def test_classify_failure_reason_pr_required_is_reconcile_compatibility() -> Non
     assert classify_failure_reason("PR_REQUIRED") == "reconcile"
 
 
-def test_recovery_engine_branch_unpushable_chooses_reconcile(tmp_path: Path) -> None:
+def test_recovery_engine_branch_unpushable_chooses_reconcile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+    _stub_merge_context(monkeypatch)
     task.branch = "feature/branch-unpushable"
     store.update(task)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
@@ -1254,8 +1303,12 @@ def test_recovery_engine_branch_unpushable_chooses_reconcile(tmp_path: Path) -> 
     assert decision.reason_code == "BRANCH_UNPUSHABLE"
 
 
-def test_recovery_engine_branch_unpushable_direct_reconcile_attempt_reaches_retry_limit(tmp_path: Path) -> None:
+def test_recovery_engine_branch_unpushable_direct_reconcile_attempt_reaches_retry_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+    _stub_merge_context(monkeypatch)
     task.branch = "feature/branch-unpushable"
     store.update(task)
     persist_branch_publication_state(
@@ -1274,8 +1327,12 @@ def test_recovery_engine_branch_unpushable_direct_reconcile_attempt_reaches_retr
     assert (decision.attempt_index, decision.attempt_limit) == (2, 2)
 
 
-def test_recovery_engine_legacy_pr_required_chooses_reconcile(tmp_path: Path) -> None:
+def test_recovery_engine_legacy_pr_required_chooses_reconcile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, task = _failed_task(tmp_path, reason="PR_REQUIRED", session_id=None)
+    _stub_merge_context(monkeypatch)
     task.branch = "feature/legacy-pr-required"
     store.update(task)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
@@ -1284,8 +1341,12 @@ def test_recovery_engine_legacy_pr_required_chooses_reconcile(tmp_path: Path) ->
     assert decision.reason_code == "PR_REQUIRED"
 
 
-def test_recovery_engine_branchless_branch_unpushable_parks_for_manual_repair(tmp_path: Path) -> None:
+def test_recovery_engine_branchless_branch_unpushable_parks_for_manual_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+    _stub_merge_context(monkeypatch)
 
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
 
@@ -1303,8 +1364,12 @@ def test_recovery_engine_branchless_branch_unpushable_parks_for_manual_repair(tm
     )
 
 
-def test_recovery_engine_branchless_pr_required_parks_for_manual_repair(tmp_path: Path) -> None:
+def test_recovery_engine_branchless_pr_required_parks_for_manual_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, task = _failed_task(tmp_path, reason="PR_REQUIRED", session_id=None)
+    _stub_merge_context(monkeypatch)
 
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
 
@@ -3477,11 +3542,9 @@ def test_list_failed_tasks_for_recovery_uses_seeded_git_not_load(
 ) -> None:
     """When git+target_branch are supplied, _load_merge_context must not be called.
 
-    Guards the helper contract: when a caller supplies live git+target_branch kwargs,
-    list_failed_tasks_for_recovery must use them and must not fall back to the ambient
-    Config.load(discover=True) + Git() path.  The advance-path wiring (cmd_advance
-    constructing the Git instance and threading it through) is covered separately in
-    tests/cli/test_advance_squash_threshold.py.
+    Guards the advance-path fix: cmd_advance constructs a live Git and passes it so
+    the standalone list_failed_tasks_for_recovery call (used for warnings collection)
+    does not fall back to the ambient Config.load(discover=True) + Git() path.
     """
     setup_config(tmp_path)
     store = make_store(tmp_path)

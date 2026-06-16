@@ -15,7 +15,6 @@ from rich.console import Console
 from rich.text import Text
 
 import gza.colors as colors
-from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
 from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_position_scoped
@@ -23,7 +22,7 @@ from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
-from gza.git import Git, GitError
+from gza.git import GitError
 from gza.pr_ops import LookupTaskPrResult
 from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
@@ -14557,59 +14556,3 @@ class TestLineageOwnerParity:
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
         assert f"{dropped_one.id} (dropped)" not in tree_output
         assert f"{dropped_two.id} (dropped)" not in tree_output
-
-
-def test_cmd_next_does_not_call_load_merge_context_when_git_provided(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """cmd_next must construct a live Git and thread it through to collect_recovery_lane_entries
-    so _load_merge_context (the ambient discover=True load) is never invoked.
-
-    Mirrors test_collect_recovery_lane_entries_does_not_call_load_merge_context_when_git_provided
-    in test_lineage_query.py for the gza next call site.
-    """
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-
-    failed = store.add("Failed implement for next test", task_type="implement")
-    assert failed.id is not None
-    failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
-    failed.branch = "feature/cmd-next-recovery-test"
-    failed.completed_at = datetime.now(UTC)
-    store.update(failed)
-
-    def _must_not_be_called(_project_dir: object = None) -> object:
-        raise AssertionError(
-            "_load_merge_context was called; cmd_next did not thread git through "
-            "to collect_recovery_lane_entries"
-        )
-
-    monkeypatch.setattr(_recovery_engine_module, "_load_merge_context", _must_not_be_called)
-
-    class _TestGit(Git):
-        """Git subclass that satisfies isinstance checks without running subprocess calls."""
-
-        def __init__(self, repo_dir: object) -> None:
-            self.repo_dir = repo_dir  # type: ignore[assignment]
-            self._cache = None
-
-        def default_branch(self) -> str:
-            return "main"
-
-        def local_branch_names(self) -> frozenset:
-            return frozenset()
-
-    monkeypatch.setattr(query_cli, "Git", _TestGit)
-
-    args = argparse.Namespace(
-        project_dir=tmp_path,
-        tags=None,
-        any_tag=False,
-        all=False,
-    )
-
-    result = query_cli.cmd_next(args)
-    # Must not raise — _load_merge_context was not called.
-    assert result == 0
