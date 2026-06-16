@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ..db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..git import Git
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
@@ -37,6 +38,8 @@ def collect_recovery_lane_entries(
     tags: tuple[str, ...] | None,
     any_tag: bool,
     max_recovery_attempts: int,
+    git: Git | None = None,
+    target_branch: str | None = None,
 ) -> list[RecoveryLaneEntry]:
     """Return visible recovery-lane entries in deterministic watch order."""
     with store.read_session():
@@ -50,6 +53,8 @@ def collect_recovery_lane_entries(
                 exclude_dropped_from_planning=True,
                 max_recovery_attempts=max_recovery_attempts,
             ),
+            git=git,
+            target_branch=target_branch,
         )
     apply_pending_recovery_reconciliations(store, read_context=read_context)
     failed_rows = [

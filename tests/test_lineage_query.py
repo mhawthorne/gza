@@ -2702,3 +2702,47 @@ def test_build_merge_context_from_git_records_warning_and_clears_existing_branch
     assert "failed to list local branches" in merge_context.repository_inspection_warnings[0], (
         "warning text should mention the failed branch listing"
     )
+
+
+def test_collect_recovery_lane_entries_does_not_call_load_merge_context_when_git_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """collect_recovery_lane_entries must not invoke _load_merge_context when a live
+    git/target_branch are threaded through.
+
+    Mirrors the watch-loop test: when git is passed, _query_lineage_owner_rows_with_context
+    seeds read_context.merge_context via build_merge_context_from_git before
+    list_failed_tasks_for_recovery runs, so the ambient discover=True load is never needed.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/recovery-lane"
+    failed.completed_at = datetime(2026, 6, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    def _must_not_be_called(_project_dir: object = None) -> object:
+        raise AssertionError(
+            "_load_merge_context was called despite holding a live git; "
+            "the ambient discover=True load was not eliminated by the pre-seeded merge context"
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _must_not_be_called)
+
+    git = _MinimalGit(branches=frozenset({failed.branch}))
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+        git=git,
+        target_branch="main",
+    )
+
+    # Must not raise — _load_merge_context was not called.
+    assert isinstance(entries, list)

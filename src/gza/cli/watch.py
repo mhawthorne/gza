@@ -1289,12 +1289,16 @@ def _emit_recovery_dry_run_report(
     any_tag: bool,
     max_recovery_attempts: int,
     show_skipped: bool = False,
+    git: Git | None = None,
+    target_branch: str | None = None,
 ) -> _RecoveryReport:
     entries = collect_recovery_lane_entries(
         store,
         tags=tags,
         any_tag=any_tag,
         max_recovery_attempts=max_recovery_attempts,
+        git=git,
+        target_branch=target_branch,
     )
     scope = ",".join(tags) if tags else "*"
     print(f"Failed recovery plan (tags={scope}, mode=recovery-only)")
@@ -2843,12 +2847,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         # Preview the first watch pass and ask for confirmation before executing
         if recovery_mode == "recovery-only" and dry_run:
+            _dry_run_git = Git(config.project_dir)
+            _dry_run_target_branch = _dry_run_git.default_branch()
             _emit_recovery_dry_run_report(
                 store=store,
                 tags=tag_filters,
                 any_tag=any_tag,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
+                git=_dry_run_git,
+                target_branch=_dry_run_target_branch,
             )
             return 0
 
@@ -3153,6 +3161,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
         tags=normalized_tag_filters,
         any_tag=any_tag,
         max_recovery_attempts=config.max_resume_attempts,
+        git=queue_git,
+        target_branch=queue_target_branch,
     )
     queue_rows = [
         row
