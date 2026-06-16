@@ -123,6 +123,7 @@ def _make_default_runner_git() -> MagicMock:
     return git
 
 
+
 @pytest.fixture(autouse=True)
 def _mock_watch_git(monkeypatch):
     """Prevent _run_cycle from creating real Git objects in the unit lane.
@@ -134,6 +135,10 @@ def _mock_watch_git(monkeypatch):
     can block long enough to trip the 2-second unit watchdog under xdist.
 
     Also patches:
+    - gza.git.Git.default_branch: SqliteTaskStore.default_merge_target() creates
+      a bare Git(project_root) and calls default_branch() when project_root is set
+      (which happens when the store is created via from_config with a real project
+      dir). Patching the method on the class prevents all such subprocess calls.
     - gza.runner.Git: called by prepare_task_startup_phase when generating slug
       for a new recovery/resume child task. branch_exists=False so generate_slug
       terminates immediately (slug not taken).
@@ -147,9 +152,50 @@ def _mock_watch_git(monkeypatch):
     monkeypatch for its duration.
     """
     import gza.cli.watch as _watch_module
+    import gza.git as _git_module
     import gza.recovery_engine as _recovery_module
     import gza.runner as _runner_module
 
+    # Patch subprocess-calling methods on the Git class itself so that any
+    # Git(project_dir) constructed in CLI code (query.py, git_ops.py, db.py,
+    # etc.) never spawns a git process.
+    #
+    # We patch _run (the single subprocess entry-point) so it raises GitError.
+    # Code that catches GitError degrades gracefully; code that does not will
+    # surface a loud failure instead of a silent timeout.
+    #
+    # default_branch is patched separately to return "main" (not raise) because
+    # SqliteTaskStore.default_merge_target() calls Git(root).default_branch()
+    # without wrapping in try/except and needs a valid branch string.
+    #
+    # Tests that inject a fake _run on a specific instance (e.g.
+    # git._run = _fake_run) are unaffected: instance attribute lookup takes
+    # precedence over the class-level patch, so the instance's fake _run is
+    # used instead.  Tests that patch a specific method via
+    # ``with patch("gza.cli.query.Git.worktree_list", …)`` also work because
+    # the method patch short-circuits before _run is reached.
+    import subprocess as _subprocess
+
+    def _unit_lane_git_guard(self, *args, check=True, stdin=None):
+        # check=False callers (branch_exists, ref_exists, can_merge probe, …)
+        # just need a failure result — return one without spawning a process so
+        # they safely resolve to False / "not found" without a subprocess call.
+        # check=True callers (local_branch_names, worktree_list, …) expect to
+        # read git output; raise GitError so callers with broad except blocks
+        # degrade gracefully while callers without them surface a loud failure.
+        if not check:
+            return _subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout="",
+                stderr="not a git repository (unit-lane guard)",
+            )
+        raise _git_module.GitError(
+            f"real git invoked in unit lane via Git._run — mock git or mark @pytest.mark.functional: git {' '.join(str(a) for a in args)}"
+        )
+
+    monkeypatch.setattr(_git_module.Git, "_run", _unit_lane_git_guard)
+    monkeypatch.setattr(_git_module.Git, "default_branch", lambda self: "main")
     monkeypatch.setattr(_watch_module, "Git", lambda _project_dir: _make_default_watch_git())
     monkeypatch.setattr(_runner_module, "Git", lambda _project_dir: _make_default_runner_git())
     monkeypatch.setattr(
