@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -137,3 +138,48 @@ def _isolate_launch_permit_state():
         yield
     finally:
         _clear_process_local_launch_state()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_git_in_unit_lane(tmp_path: Path, monkeypatch):
+    """Block real git subprocess calls in the unit lane.
+
+    Creates a stub 'git' script and prepends its directory to PATH. Any
+    unguarded real git invocation fails with a clear message and records the
+    command in a sentinel file. After each test the fixture checks the file;
+    if populated it calls pytest.fail() so the error is loud and deterministic
+    rather than a silent timeout under xdist load.
+
+    Tests that properly mock subprocess.run or the Git class are unaffected —
+    their mocks shadow the PATH entry before it can execute.
+    Must NOT run in tests_functional/ (that conftest is separate).
+    """
+    sentinel_file = tmp_path / "_git_guard_fired"
+    stub_dir = tmp_path / "_git_guard"
+    stub_dir.mkdir()
+    stub_git = stub_dir / "git"
+    stub_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "f = os.environ.get('_GZA_GIT_GUARD_FILE', '')\n"
+        "if f:\n"
+        "    with open(f, 'a') as fp:\n"
+        "        fp.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "sys.stderr.write(\n"
+        "    'real git invoked in unit lane'\n"
+        "    ' — mock git or mark @pytest.mark.functional\\n'\n"
+        ")\n"
+        "sys.exit(1)\n"
+    )
+    stub_git.chmod(stub_git.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    current_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{stub_dir}:{current_path}")
+    monkeypatch.setenv("_GZA_GIT_GUARD_FILE", str(sentinel_file))
+    yield
+    if sentinel_file.exists():
+        lines = sentinel_file.read_text().splitlines()
+        commands = "\n".join(f"    git {line}" for line in lines)
+        pytest.fail(
+            "real git invoked in unit lane — mock git or mark @pytest.mark.functional\n"
+            f"{commands}"
+        )

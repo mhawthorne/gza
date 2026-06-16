@@ -2,6 +2,9 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 from tests.helpers.cli import invoke_gza
@@ -94,3 +97,63 @@ def setup_db_with_tasks(tmp_path: Path, tasks: list[dict], project_name: str = "
         if task.status in ("completed", "failed"):
             task.completed_at = datetime.now(UTC)
         store.update(task)
+
+
+def _make_default_watch_git() -> MagicMock:
+    """Return a pre-configured mock Git for the watch cycle (branch_exists=True)."""
+    git = MagicMock()
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = False
+    git.can_merge.return_value = True
+    git.is_merged.return_value = False
+    git.count_commits_ahead.return_value = 1
+    git.get_diff_stat_parsed.return_value = (1, 1, 0)
+    git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
+    return git
+
+
+def _make_default_runner_git() -> MagicMock:
+    """Return a pre-configured mock Git for the runner (branch_exists=False for slug generation)."""
+    git = MagicMock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = False
+    git.default_branch.return_value = "main"
+    return git
+
+
+@pytest.fixture(autouse=True)
+def _mock_watch_git(monkeypatch):
+    """Prevent _run_cycle from creating real Git objects in the unit lane.
+
+    _run_cycle (watch.py) constructs Git(config.project_dir) unconditionally,
+    then calls git.default_branch() and passes the object to
+    _query_owner_rows_with_context, which calls git.local_branch_names() via
+    build_merge_context_from_git. On a non-git tmp_path those subprocess calls
+    can block long enough to trip the 2-second unit watchdog under xdist.
+
+    Also patches:
+    - gza.runner.Git: called by prepare_task_startup_phase when generating slug
+      for a new recovery/resume child task. branch_exists=False so generate_slug
+      terminates immediately (slug not taken).
+    - recovery_engine._load_merge_context: when the mock git is not an instanceof
+      gza.git.Git, read_context.merge_context is left None and
+      decide_failed_task_recovery falls back to _load_merge_context. Returning a
+      no-git _MergeContext prevents all subsidiary git calls.
+
+    Tests that need specific git behaviour override the patch inside their own
+    ``with patch(...)`` block — unittest.mock.patch() takes precedence over
+    monkeypatch for its duration.
+    """
+    import gza.cli.watch as _watch_module
+    import gza.recovery_engine as _recovery_module
+    import gza.runner as _runner_module
+
+    monkeypatch.setattr(_watch_module, "Git", lambda _project_dir: _make_default_watch_git())
+    monkeypatch.setattr(_runner_module, "Git", lambda _project_dir: _make_default_runner_git())
+    monkeypatch.setattr(
+        _recovery_module,
+        "_load_merge_context",
+        lambda _project_dir=None: _recovery_module._MergeContext(git=None, default_branch="main"),
+    )
