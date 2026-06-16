@@ -328,6 +328,13 @@ def _auto_select_tasks(
             if task is not None:
                 linger_tasks.append(task)
 
+    # Prefer most-recently-completed linger tasks so that when more linger tasks exist
+    # than available slots, the newest ones take priority.
+    linger_tasks.sort(
+        key=lambda t: t.completed_at or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+
     # Reserve slots for linger tasks; in-progress fills the remainder.
     ip_limit = max(max_slots - len(linger_tasks), 0)
     selected = list(in_progress[:ip_limit])
@@ -337,6 +344,8 @@ def _auto_select_tasks(
         if task.id is not None and task.id not in seen_ids:
             selected.append(task)
             seen_ids.add(task.id)
+            if len(selected) >= max_slots:
+                break
 
     if len(selected) >= max_slots:
         return selected

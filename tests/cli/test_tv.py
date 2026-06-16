@@ -439,6 +439,46 @@ def test_tv_auto_mode_linger_keeps_just_completed_task_visible_when_slots_full(m
     assert _FakeLive.instance.updates[-1] == [task_3.id, task_2.id]
 
 
+def test_auto_select_tasks_caps_result_at_max_slots_when_linger_exceeds_budget(tmp_path: Path):
+    """_auto_select_tasks must never return more than max_slots items.
+
+    When more tasks complete within the linger window than there are display
+    slots, only the most-recently-completed ones (up to max_slots) are kept so
+    that _lines_per_panel's height budget is never exceeded.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task_a = store.add("Task A", task_type="implement")
+    task_b = store.add("Task B", task_type="implement")
+    task_c = store.add("Task C", task_type="implement")
+    assert task_a.id and task_b.id and task_c.id
+
+    # All three tasks are completed (no in_progress tasks at all)
+    task_a.status = "completed"
+    task_a.completed_at = base + timedelta(minutes=1)
+    task_b.status = "completed"
+    task_b.completed_at = base + timedelta(minutes=2)
+    task_c.status = "completed"
+    task_c.completed_at = base + timedelta(minutes=3)
+    store.update(task_a)
+    store.update(task_b)
+    store.update(task_c)
+
+    # All three IDs are lingering simultaneously
+    linger_ids = {task_a.id, task_b.id, task_c.id}
+
+    result = tv_module._auto_select_tasks(store, max_slots=2, linger_ids=linger_ids)
+
+    assert len(result) <= 2, f"Expected at most 2 results, got {len(result)}: {[t.id for t in result]}"
+    # The two most-recently-completed tasks (C then B) should be preferred
+    result_ids = [t.id for t in result]
+    assert task_c.id in result_ids, "Most-recently-completed task_c should be selected"
+    assert task_b.id in result_ids, "Second-most-recently-completed task_b should be selected"
+    assert task_a.id not in result_ids, "Oldest linger task_a should be dropped"
+
+
 def test_tv_auto_mode_does_not_exit_on_finished_fallback(monkeypatch, tmp_path: Path):
     """Auto-select mode should keep polling when only finished fallback tasks are showing."""
     setup_config(tmp_path)
