@@ -490,12 +490,18 @@ def cmd_tv(args: argparse.Namespace) -> int:
     else:
         _ip_init = store.get_in_progress()
         running_count = len(_ip_init)
-        prev_in_progress_ids: set[str] = {t.id for t in _ip_init if t.id is not None}
         linger_remaining: dict[str, int] = {}
         can_pad_to_min = _can_pad_to_min(store, running_count, min_slots)
         rendered_slots = _desired_slot_count(running_count, min_slots, max_slots, can_pad_to_min)
         ticks_below = 0
         tasks = _auto_select_tasks(store, rendered_slots)
+        _ip_init_ids = {t.id for t in _ip_init if t.id is not None}
+        # Track tasks that were both displayed AND in_progress; only these are
+        # linger candidates. Excludes off-screen in_progress tasks so a task
+        # that was never visible cannot be injected on completion.
+        prev_displayed_running_ids: set[str] = {
+            t.id for t in tasks if t.id is not None and t.id in _ip_init_ids
+        }
 
     n_tasks = len(tasks)
     n_lines = _lines_per_panel(n_tasks)
@@ -538,7 +544,10 @@ def cmd_tv(args: argparse.Namespace) -> int:
 
                     # Detect tasks that left in_progress while on-screen and add
                     # them to the linger set so their final log lines can render.
-                    for tid in prev_in_progress_ids:
+                    # Restricted to tasks that were both displayed AND in_progress
+                    # last tick, so off-screen completions are not injected and
+                    # linger tasks already shown cannot re-trigger after expiry.
+                    for tid in prev_displayed_running_ids:
                         if tid not in in_progress_ids and tid not in linger_remaining:
                             refreshed = store.get(tid)
                             if refreshed is not None and refreshed.status not in {"in_progress", "pending"}:
@@ -565,7 +574,9 @@ def cmd_tv(args: argparse.Namespace) -> int:
                     log_paths = _resolve_log_paths(config, registry, tasks)
 
                     # Advance linger countdown; expire entries that hit zero.
-                    prev_in_progress_ids = in_progress_ids
+                    prev_displayed_running_ids = {
+                        t.id for t in tasks if t.id is not None and t.id in in_progress_ids
+                    }
                     linger_remaining = {
                         tid: count - 1
                         for tid, count in linger_remaining.items()

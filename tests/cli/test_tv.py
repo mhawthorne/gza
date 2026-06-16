@@ -439,6 +439,64 @@ def test_tv_auto_mode_linger_keeps_just_completed_task_visible_when_slots_full(m
     assert _FakeLive.instance.updates[-1] == [task_3.id, task_2.id]
 
 
+def test_tv_auto_mode_off_screen_completion_is_not_injected_as_linger(monkeypatch, tmp_path: Path):
+    """A task that completes while never on-screen must not be injected via linger.
+
+    Scenario: 3 in_progress tasks but only 2 slots.  task_3 (the oldest, lowest
+    priority, never displayed) completes between ticks.  The display should continue
+    showing task_1 and task_2 and must NOT inject task_3.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task_1 = store.add("Task one", task_type="implement")
+    task_2 = store.add("Task two", task_type="implement")
+    task_3 = store.add("Task three (off-screen)", task_type="implement")
+    assert task_1.id and task_2.id and task_3.id
+
+    # All three in_progress; _auto_select_tasks picks newest-first so task_3 is off-screen
+    _set_in_progress(task_3, base)
+    _set_in_progress(task_2, base + timedelta(minutes=1))
+    _set_in_progress(task_1, base + timedelta(minutes=2))
+    store.update(task_3)
+    store.update(task_2)
+    store.update(task_1)
+
+    sleep_calls = 0
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            # task_3 (off-screen) completes; task_1 and task_2 remain running
+            refreshed_3 = store.get(task_3.id)
+            assert refreshed_3 is not None
+            refreshed_3.status = "completed"
+            refreshed_3.completed_at = base + timedelta(minutes=3)
+            store.update(refreshed_3)
+        elif sleep_calls > tv_module.LINGER_TICKS + 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
+
+    args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=2)
+    rc = tv_module.cmd_tv(args)
+
+    assert rc == 0
+    assert _FakeLive.instance is not None
+    # Initial display: 2 slots, newest-first → task_1 and task_2 (task_3 off-screen)
+    assert _FakeLive.instance.updates[0] == [task_1.id, task_2.id]
+    # After task_3 completes off-screen: it must NOT appear in any update
+    for update in _FakeLive.instance.updates[1:]:
+        assert task_3.id not in update, (
+            f"Off-screen task_3 must not be injected via linger, but appeared in: {update}"
+        )
+
+
 def test_auto_select_tasks_caps_result_at_max_slots_when_linger_exceeds_budget(tmp_path: Path):
     """_auto_select_tasks must never return more than max_slots items.
 
