@@ -11,7 +11,7 @@ import gza.recovery_engine as recovery_engine
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.git import Git
+from gza.git import Git, ResolvedMergeSourceRef
 from gza.lineage_query import LineageOwnerQuery, _load_indexes, _query_lineage_owner_rows_with_context, query_lineage_owner_rows
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_read_context import RecoveryReadContext
@@ -2471,7 +2471,10 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
 
 
 class _MinimalGit(Git):
-    """Minimal Git subclass that satisfies isinstance checks and build_merge_context_from_git."""
+    """Minimal Git subclass that satisfies isinstance checks and build_merge_context_from_git.
+
+    All methods that would run subprocesses are overridden to return safe in-memory answers.
+    """
 
     def __init__(self, *, branches: frozenset[str] = frozenset()) -> None:
         self.repo_dir = Path("/dev/null")
@@ -2486,6 +2489,10 @@ class _MinimalGit(Git):
 
     def branch_exists(self, branch: str) -> bool:
         return branch in self._branches
+
+    def resolve_fresh_merge_source(self, branch: str, **_kwargs: object) -> ResolvedMergeSourceRef:
+        # No remote; the branch itself is the source (avoids subprocess calls).
+        return ResolvedMergeSourceRef(None)
 
 
 def test_query_lineage_owner_rows_does_not_call_load_merge_context_when_git_provided(
@@ -2579,3 +2586,91 @@ def test_query_lineage_owner_rows_calls_load_merge_context_when_target_branch_no
     )
     assert rows is not None
     assert call_count, "_load_merge_context should have been called when target_branch is None"
+
+
+def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seeded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed owner resolved by a landed sibling is suppressed identically whether git is
+    seeded or not.  In the seeded variant _load_merge_context must never be called — the
+    seeded _MergeContext built from build_merge_context_from_git is what drives the recovery
+    decision (via the lineage scan fallback when git.is_merged returns False)."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    root = store.add("Implementation root", task_type="implement")
+    assert root.id is not None
+    _set_completed(root, when=datetime(2026, 5, 16, 8, 0, tzinfo=UTC), branch="feature/root", has_commits=True)
+    store.update(root)
+
+    failed = store.add("Failed manual follow-up", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-seeded-landed"
+    failed.branch = "feature/seeded-landed"
+    failed.num_steps_computed = 3
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    landed = store.add("Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert landed.id is not None
+    _set_completed(landed, when=datetime(2026, 5, 16, 10, 0, tzinfo=UTC), branch=failed.branch, has_commits=True)
+    landed.merge_status = "merged"
+    store.update(landed)
+
+    # Baseline (non-seeded): _load_merge_context is invoked via the ambient path.
+    rows_no_git = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+    failed_ids_no_git = {
+        row.recovery_leaf_task.id
+        for row in rows_no_git
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed.id not in failed_ids_no_git, "baseline: failed owner should be suppressed"
+
+    # Seeded variant: _load_merge_context must not be called.
+    # _MinimalGit includes the failed branch so the git-branch-check path is exercised;
+    # is_merged returns False, so suppression falls through to the lineage scan.
+    def _raise_if_called(_project_dir=None):
+        raise AssertionError(
+            "_load_merge_context was called even though git + target_branch were pre-seeded"
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _raise_if_called)
+
+    git = _MinimalGit(branches=frozenset({failed.branch}))
+    rows_with_git = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    failed_ids_with_git = {
+        row.recovery_leaf_task.id
+        for row in rows_with_git
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+    assert failed.id not in failed_ids_with_git, (
+        "seeded context failed to suppress failed owner resolved by landed sibling"
+    )
+    assert failed_ids_no_git == failed_ids_with_git, (
+        "seeded vs non-seeded paths produced different owner-row visibility"
+    )
