@@ -2676,6 +2676,128 @@ def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seed
     )
 
 
+def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_landed_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seeded git that proves a branch merged suppresses the failed owner even with no
+    landed-sibling DB row, directly exercising build_merge_context_from_git's
+    existing_branches/is_merged wiring.
+
+    This is the complement of test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seeded:
+    that test covers the lineage-scan fallback (is_merged→False); this one covers the
+    git-proven-merged path (is_merged→True) so a regression in that specific wiring
+    (e.g. existing_branches populated incorrectly or wrong default_branch) cannot be
+    masked by an incidental landed-sibling lineage-scan hit.
+
+    _load_merge_context is patched to raise to confirm the seeded merge context is the
+    sole source of merge truth.  A baseline pass with the branch absent from
+    existing_branches proves the task does appear in results when the git path cannot
+    confirm the merge, so the suppression assertion is non-trivial."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    root = store.add("Implementation root", task_type="implement")
+    assert root.id is not None
+    _set_completed(root, when=datetime(2026, 5, 16, 8, 0, tzinfo=UTC), branch="feature/root-git-proven", has_commits=True)
+    store.update(root)
+
+    failed = store.add("Failed follow-up", task_type="implement", based_on=root.id, recovery_origin="manual")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    # session_id intentionally left None so _is_resumable_timeout_implementation returns
+    # False — otherwise the git-driven path in _is_resolved_by_landed_lineage is skipped.
+    failed.branch = "feature/git-proven-merged"
+    failed.has_commits = True
+    failed.num_steps_computed = 3
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    # No landed-sibling DB row: the only suppression evidence must be the seeded git path.
+
+    class _MergedBranchGit(_MinimalGit):
+        """Variant that reports the task branch as merged and returns it as its own source ref.
+
+        resolve_fresh_merge_source returns the branch itself (not ResolvedMergeSourceRef(None))
+        so that classify_branch_merge_state_for_target has a non-None source_ref and reaches
+        the merged_proof path.  rev_parse_if_exists and count_commits_ahead_checked return None
+        so no subprocess is invoked — classify_proven_merged_state then defaults to
+        state="merged", which is what drives suppression in _is_resolved_by_landed_lineage."""
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+            return branch == failed.branch
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object) -> ResolvedMergeSourceRef:
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            return None
+
+        def ref_exists(self, ref: str) -> bool:  # type: ignore[override]
+            return ref in self._branches
+
+        def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:  # type: ignore[override]
+            return None
+
+    # Baseline: branch absent from existing_branches so the git path cannot confirm the
+    # merge.  The lineage scan runs but finds no landed sibling → task must appear.
+    git_no_branch = _MergedBranchGit(branches=frozenset())
+    rows_baseline = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git_no_branch,
+        target_branch="main",
+    )
+    failed_ids_baseline = {
+        row.recovery_leaf_task.id
+        for row in rows_baseline
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed.id in failed_ids_baseline, (
+        "baseline: failed owner should appear in results when the task branch is absent "
+        "from existing_branches (git cannot confirm merge, no landed sibling in DB)"
+    )
+
+    # Seeded git-proven path: patch _load_merge_context to raise, proving the seeded
+    # context is the sole source of merge truth.
+    def _raise_if_called(_project_dir=None):
+        raise AssertionError(
+            "_load_merge_context was called even though git + target_branch were pre-seeded"
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _raise_if_called)
+
+    git_merged = _MergedBranchGit(branches=frozenset({failed.branch}))
+    rows_git_proven = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git_merged,
+        target_branch="main",
+    )
+    failed_ids_git_proven = {
+        row.recovery_leaf_task.id
+        for row in rows_git_proven
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+    assert failed.id not in failed_ids_git_proven, (
+        "seeded git path: failed owner should be suppressed when is_merged proves the "
+        "task branch merged into main, even with no landed-sibling DB row"
+    )
+
+
 def test_build_merge_context_from_git_records_warning_and_clears_existing_branches_on_git_error(
     tmp_path: Path,
 ) -> None:
