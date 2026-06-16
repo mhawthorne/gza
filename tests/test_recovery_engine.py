@@ -3477,9 +3477,11 @@ def test_list_failed_tasks_for_recovery_uses_seeded_git_not_load(
 ) -> None:
     """When git+target_branch are supplied, _load_merge_context must not be called.
 
-    Guards the advance-path fix: cmd_advance constructs a live Git and passes it so
-    the standalone list_failed_tasks_for_recovery call (used for warnings collection)
-    does not fall back to the ambient Config.load(discover=True) + Git() path.
+    Guards the helper contract: when a caller supplies live git+target_branch kwargs,
+    list_failed_tasks_for_recovery must use them and must not fall back to the ambient
+    Config.load(discover=True) + Git() path.  The advance-path wiring (cmd_advance
+    constructing the Git instance and threading it through) is covered separately in
+    tests/cli/test_advance_squash_threshold.py.
     """
     setup_config(tmp_path)
     store = make_store(tmp_path)

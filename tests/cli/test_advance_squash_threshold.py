@@ -279,3 +279,41 @@ def test_load_and_validate_reject_bool_and_quoted_numeric_values(
 
     with pytest.raises(ConfigError, match=expected_error):
         Config.load(tmp_path)
+
+
+def test_cmd_advance_passes_git_instance_to_list_failed_tasks(tmp_path: Path) -> None:
+    """Guards advance-path wiring: cmd_advance must thread its live Git instance and
+    resolved target_branch through to list_failed_tasks_for_recovery so the helper
+    never falls back to ambient Config.load(discover=True) + Git() discovery."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    # A failed task ensures the recovery-warning path is exercised (no_resume_failed=False).
+    failed = store.add("Failed impl", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/advance-wiring-test"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    mock_git = _mock_git(current_branch="main")
+    captured: dict = {}
+
+    def _spy(store_arg, *, warnings, git, target_branch, **kwargs):
+        captured["git"] = git
+        captured["target_branch"] = target_branch
+        return []
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=mock_git),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", side_effect=_spy),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    assert rc == 0
+    assert "git" in captured, "list_failed_tasks_for_recovery was not called by cmd_advance"
+    # The Git instance constructed inside cmd_advance must be the one forwarded.
+    assert captured["git"] is mock_git
+    # target_branch is resolved via git.current_branch() when no task_id is supplied.
+    assert captured["target_branch"] == "main"
