@@ -58,7 +58,8 @@ import gza.colors as colors
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.config import Config
 from gza.db import WatchProgressObservation
-from gza.git import GitError
+import gza.recovery_engine as recovery_engine
+from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.watch_progress import (
@@ -12711,3 +12712,79 @@ def test_watch_iterate_helper_skips_duplicate_impl_worker_for_pending_child(tmp_
     assert result.message == f"{impl.id}: iterate already running for implementation chain"
     assert result.worker_label == "iterate"
     assert result.guarded_pending_task_id == improve.id
+
+
+def _make_preseeded_watch_git(tmp_path: Path) -> "Git":
+    """Create a Git subclass instance that satisfies isinstance(git, Git).
+
+    _run_cycle constructs git = Git(config.project_dir) and lineage_query seeds
+    read_context.merge_context only when isinstance(git, Git) is True.  A plain
+    MagicMock does not pass that check, so a real subclass is required to prove
+    the ambient _load_merge_context path is eliminated.
+    """
+
+    class _PreseedWatchGit(Git):
+        def __init__(self, repo_dir: Path) -> None:
+            self.repo_dir = repo_dir
+            self._cache = None
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
+            return frozenset()
+
+        def branch_exists(self, branch: str) -> bool:
+            return False
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            return False
+
+    return _PreseedWatchGit(tmp_path)
+
+
+def test_watch_run_does_not_call_load_merge_context_when_git_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_run_cycle must not invoke _load_merge_context when it holds a live git/target_branch.
+
+    _run_cycle constructs git = Git(config.project_dir) and passes it to
+    _query_owner_rows_with_context, which seeds read_context.merge_context via
+    build_merge_context_from_git before list_failed_tasks_for_recovery runs.
+    When seeding works, _load_merge_context is never called — the pre-seeded
+    context from the run's own git is used instead of the ambient discover=True path.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    def _must_not_be_called(_project_dir: object = None) -> object:
+        raise AssertionError(
+            "_load_merge_context was called despite holding a live git; "
+            "the ambient discover=True load was not eliminated by the pre-seeded merge context"
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _must_not_be_called)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    preseeded_git = _make_preseeded_watch_git(tmp_path)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=preseeded_git),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=True,
+            log=log,
+        )
+
+    # The run completed without triggering the ambient _load_merge_context path.
+    assert result is not None
