@@ -15,8 +15,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
+import gza.cli.execution as _execution_module
 from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
@@ -19721,3 +19723,74 @@ class TestClearReviewState:
         assert second.review_cleared_at is not None
         assert first_cleared is not None
         assert second.review_cleared_at > first_cleared
+
+
+def test_cmd_run_startup_note_does_not_call_load_merge_context_when_git_provided(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gza work's recovery-count startup note must construct a live Git and thread it
+    through to collect_recovery_lane_entries so _load_merge_context is never invoked.
+
+    Mirrors test_collect_recovery_lane_entries_does_not_call_load_merge_context_when_git_provided
+    in test_lineage_query.py for the gza work call site.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement for work test", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/cmd-run-recovery-test"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    def _must_not_be_called(_project_dir: object = None) -> object:
+        raise AssertionError(
+            "_load_merge_context was called; gza work did not thread git through "
+            "to the recovery-count startup note"
+        )
+
+    monkeypatch.setattr(_recovery_engine_module, "_load_merge_context", _must_not_be_called)
+
+    class _TestGit(Git):
+        """Git subclass that satisfies isinstance checks without running subprocess calls."""
+
+        def __init__(self, repo_dir: object) -> None:
+            self.repo_dir = repo_dir  # type: ignore[assignment]
+            self._cache = None
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def local_branch_names(self) -> frozenset:
+            return frozenset()
+
+    monkeypatch.setattr(_execution_module, "Git", _TestGit)
+
+    # Bypass worker registration to avoid env-var side effects in tests.
+    monkeypatch.setattr(
+        _execution_module,
+        "_run_with_registered_worker",
+        lambda *, config, worker_id, run_command, allow_same_pid_reentry=True: run_command(),
+    )
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        no_docker=True,
+        max_turns=None,
+        background=False,
+        worker_mode=False,
+        tags=None,
+        any_tag=False,
+        task_ids=[],  # Empty → goes to else branch that calls collect_recovery_lane_entries
+        count=0,  # Zero iterations → _run_session exits without running any task
+        force=False,
+        create_pr=False,
+        resume=False,
+    )
+
+    result = _execution_module.cmd_run(args)
+    # Must not raise — _load_merge_context was not called.
+    assert result == 0
