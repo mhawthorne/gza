@@ -339,30 +339,6 @@ def _format_recovery_report_subject(row: LineageOwnerRow, task: DbTask) -> str:
     return " ".join(subject_ids)
 
 
-def _query_owner_rows(
-    *,
-    store: SqliteTaskStore,
-    config: Config | None = None,
-    git: Git | None = None,
-    target_branch: str | None = None,
-    tags: tuple[str, ...] | None = None,
-    any_tag: bool = False,
-    max_recovery_attempts: int,
-    include_skipped: bool,
-) -> list[LineageOwnerRow]:
-    rows, _ = _query_owner_rows_with_context(
-        store=store,
-        config=config,
-        git=git,
-        target_branch=target_branch,
-        tags=tags,
-        any_tag=any_tag,
-        max_recovery_attempts=max_recovery_attempts,
-        include_skipped=include_skipped,
-    )
-    return rows
-
-
 def _query_owner_rows_with_context(
     *,
     store: SqliteTaskStore,

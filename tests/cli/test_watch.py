@@ -37,7 +37,6 @@ from gza.cli.watch import (
     _format_wake_message,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
-    _query_owner_rows,
     _query_owner_rows_with_context,
     _refresh_watch_no_progress_after_state_change,
     _resolve_watch_attention_display_task,
@@ -133,7 +132,7 @@ def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> 
     store.update(plan)
 
     git = _make_watch_git()
-    rows = _query_owner_rows(
+    rows, _ = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=git,
@@ -523,7 +522,7 @@ def test_watch_query_owner_rows_filters_target_branch_and_keeps_legacy_fallback(
     git.get_diff_stat_parsed.return_value = (1, 1, 0)
     git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
 
-    rows = _query_owner_rows(
+    rows, _ = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=git,
@@ -569,7 +568,7 @@ def test_watch_owner_rows_keep_lifecycle_merge_candidate_and_failed_recovery_sep
     assert failed_rebase.id is not None
     store.get_or_create_merge_unit_for_task(failed_rebase)
 
-    owner_rows = _query_owner_rows(
+    owner_rows, _ = _query_owner_rows_with_context(
         store=store,
         max_recovery_attempts=1,
         include_skipped=True,
@@ -7629,7 +7628,7 @@ def test_watch_cycle_skips_parked_retry_limit_lineage_without_recomputing_or_spa
 
     config = Config.load(tmp_path)
     git = _make_watch_git()
-    rows = _query_owner_rows(
+    rows, _ = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=git,
@@ -7730,7 +7729,7 @@ def test_watch_cycle_attention_uses_impl_owner_for_plan_owned_rebase_row(tmp_pat
     store, plan, impl, rebase = _setup_watch_plan_owned_branch_action_row(tmp_path)
 
     config = Config.load(tmp_path)
-    rows = _query_owner_rows(
+    rows, _ = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=_make_watch_git(),
@@ -7827,7 +7826,7 @@ def test_watch_cycle_execution_attention_uses_impl_owner_for_plan_owned_rebase_r
     store, plan, impl, rebase = _setup_watch_plan_owned_branch_action_row(tmp_path)
 
     config = Config.load(tmp_path)
-    rows = _query_owner_rows(
+    rows, _ = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=_make_watch_git(),
@@ -8167,7 +8166,7 @@ def test_watch_cycle_completed_rebase_without_owner_review_routes_to_iterate_bef
     store.get_or_create_merge_unit_for_task(rebase)
 
     config = Config.load(tmp_path)
-    rows = _query_owner_rows(
+    rows, _ = _query_owner_rows_with_context(
         store=store,
         config=config,
         git=_make_watch_git(),
@@ -9272,7 +9271,7 @@ def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path
     )
 
     with patch("gza.cli.advance_engine.determine_next_action", return_value=action):
-        rows = _query_owner_rows(
+        rows, _ = _query_owner_rows_with_context(
             store=store,
             config=Config.load(tmp_path),
             git=_make_watch_git(),
