@@ -304,6 +304,7 @@ def _auto_select_tasks(
     store: SqliteTaskStore,
     max_slots: int,
     linger_ids: set[str] | None = None,
+    prev_tasks: list[DbTask] | None = None,
 ) -> list[DbTask]:
     """Pick tasks for auto mode, filling slots with live tasks first and recent finished tasks second.
 
@@ -311,6 +312,10 @@ def _auto_select_tasks(
     on-screen.  They are injected into the selected set (displacing the
     lowest-priority in-progress tasks if necessary) so their final log lines
     render before the panel falls off.
+
+    ``prev_tasks`` is the task list from the previous tick.  When provided,
+    lingering tasks are placed back at their prior slot index so the panel does
+    not jump around visually.
     """
     linger_ids = linger_ids or set()
 
@@ -337,15 +342,53 @@ def _auto_select_tasks(
 
     # Reserve slots for linger tasks; in-progress fills the remainder.
     ip_limit = max(max_slots - len(linger_tasks), 0)
-    selected = list(in_progress[:ip_limit])
-    seen_ids = {task.id for task in selected if task.id is not None}
 
+    # Use a slot array to preserve each linger task at its prior screen position.
+    prev_positions: dict[str, int] = (
+        {t.id: i for i, t in enumerate(prev_tasks) if t.id is not None}
+        if prev_tasks
+        else {}
+    )
+    slots: list[DbTask | None] = [None] * max_slots
+    seen_ids: set[str] = set()
+
+    # Place linger tasks at their prior slot; collect unplaceable ones for later.
+    unplaced_linger: list[DbTask] = []
     for task in linger_tasks:
-        if task.id is not None and task.id not in seen_ids:
-            selected.append(task)
+        if task.id is None or task.id in seen_ids:
+            continue
+        prior = prev_positions.get(task.id)
+        if prior is not None and prior < max_slots and slots[prior] is None:
+            slots[prior] = task
             seen_ids.add(task.id)
-            if len(selected) >= max_slots:
+        else:
+            unplaced_linger.append(task)
+
+    # Fill remaining slots with in-progress tasks (newest-first).
+    ip_count = 0
+    for task in in_progress:
+        if ip_count >= ip_limit:
+            break
+        if task.id is None or task.id in seen_ids:
+            continue
+        for i in range(max_slots):
+            if slots[i] is None:
+                slots[i] = task
+                seen_ids.add(task.id)
+                ip_count += 1
                 break
+
+    # Place any linger tasks that could not reclaim their prior slot.
+    for task in unplaced_linger:
+        if task.id is None or task.id in seen_ids:
+            continue
+        for i in range(max_slots):
+            if slots[i] is None:
+                slots[i] = task
+                seen_ids.add(task.id)
+                break
+
+    selected = [t for t in slots if t is not None]
 
     if len(selected) >= max_slots:
         return selected
@@ -570,7 +613,7 @@ def cmd_tv(args: argparse.Namespace) -> int:
                     # tasks fall off the screen and newly running tasks replace them.
                     # Linger tasks (just completed) stay visible for LINGER_TICKS
                     # extra ticks so closing log lines have time to render.
-                    tasks = _auto_select_tasks(store, rendered_slots, linger_ids=linger_ids)
+                    tasks = _auto_select_tasks(store, rendered_slots, linger_ids=linger_ids, prev_tasks=tasks)
                     log_paths = _resolve_log_paths(config, registry, tasks)
 
                     # Advance linger countdown; expire entries that hit zero.

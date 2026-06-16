@@ -497,6 +497,99 @@ def test_tv_auto_mode_off_screen_completion_is_not_injected_as_linger(monkeypatc
         )
 
 
+def test_tv_auto_mode_linger_preserves_prior_slot_position(monkeypatch, tmp_path: Path):
+    """A lingering task stays in its prior slot rather than jumping to the bottom.
+
+    Scenario: 2 slots, task_A at slot 0 (top, newest) and task_B at slot 1.
+    task_A completes.  task_C starts.  With position preservation, task_A
+    should remain at slot 0 (top) during its linger window, not move to slot 1.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task_a = store.add("Task A (newest)", task_type="implement")
+    task_b = store.add("Task B (older)", task_type="implement")
+    task_c = store.add("Task C (replacement)", task_type="implement")
+    assert task_a.id and task_b.id and task_c.id
+
+    # task_A is newest so it ends up at slot 0 after in_progress.reverse()
+    _set_in_progress(task_b, base)
+    _set_in_progress(task_a, base + timedelta(minutes=1))
+    task_c.status = "pending"
+    store.update(task_a)
+    store.update(task_b)
+    store.update(task_c)
+
+    sleep_calls = 0
+
+    def fake_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            # task_A (slot 0) completes; task_C starts as newest in_progress
+            refreshed_a = store.get(task_a.id)
+            refreshed_c = store.get(task_c.id)
+            assert refreshed_a is not None and refreshed_c is not None
+            refreshed_a.status = "completed"
+            refreshed_a.completed_at = base + timedelta(minutes=2)
+            _set_in_progress(refreshed_c, base + timedelta(minutes=3))
+            store.update(refreshed_a)
+            store.update(refreshed_c)
+        elif sleep_calls >= 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(tv_module, "Live", _FakeLive)
+    monkeypatch.setattr(tv_module, "_render_all", _render_task_ids)
+    monkeypatch.setattr(tv_module, "_resolve_task_log_path", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(tv_module, "_sleep", fake_sleep)
+
+    args = argparse.Namespace(project_dir=tmp_path, task_ids=[], number=2)
+    rc = tv_module.cmd_tv(args)
+
+    assert rc == 0
+    assert _FakeLive.instance is not None
+    # Initial: task_A at slot 0 (newest), task_B at slot 1
+    assert _FakeLive.instance.updates[0] == [task_a.id, task_b.id]
+    # After task_A completes: task_A lingers at slot 0 (preserved), task_C fills slot 1
+    assert _FakeLive.instance.updates[1] == [task_a.id, task_c.id], (
+        "Linger task should preserve its prior slot (0/top), not jump to bottom"
+    )
+
+
+def test_auto_select_tasks_linger_preserves_prior_slot_position(tmp_path: Path):
+    """_auto_select_tasks places lingering tasks at their prior slot when prev_tasks is given."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    base = datetime(2026, 4, 15, 12, 0, tzinfo=UTC)
+    task_a = store.add("Task A (slot 0)", task_type="implement")
+    task_b = store.add("Task B (slot 1)", task_type="implement")
+    task_c = store.add("Task C (replacement)", task_type="implement")
+    assert task_a.id and task_b.id and task_c.id
+
+    # task_A completed; task_B and task_C are in_progress
+    task_a.status = "completed"
+    task_a.completed_at = base + timedelta(minutes=2)
+    _set_in_progress(task_b, base)
+    _set_in_progress(task_c, base + timedelta(minutes=3))
+    store.update(task_a)
+    store.update(task_b)
+    store.update(task_c)
+
+    # prev_tasks: task_A was at slot 0 (top), task_B was at slot 1
+    prev = [task_a, task_b]
+
+    result = tv_module._auto_select_tasks(
+        store, max_slots=2, linger_ids={task_a.id}, prev_tasks=prev
+    )
+
+    assert len(result) == 2
+    # task_A should be preserved at position 0, not moved to the bottom
+    assert result[0].id == task_a.id, "Linger task_A should remain at slot 0 (prior position)"
+    assert result[1].id == task_c.id, "Newest in_progress task_C should fill slot 1"
+
+
 def test_auto_select_tasks_caps_result_at_max_slots_when_linger_exceeds_budget(tmp_path: Path):
     """_auto_select_tasks must never return more than max_slots items.
 
