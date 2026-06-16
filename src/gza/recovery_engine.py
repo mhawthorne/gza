@@ -934,12 +934,15 @@ def list_failed_tasks_for_recovery(
     any_tag: bool = False,
     warnings: list[str] | None = None,
     read_context: RecoveryReadContext | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
 ) -> list[DbTask]:
-    merge_context = (
-        read_context.merge_context
-        if read_context is not None and isinstance(read_context.merge_context, _MergeContext)
-        else _load_merge_context(_project_dir_for_store(store))
-    )
+    if read_context is not None and isinstance(read_context.merge_context, _MergeContext):
+        merge_context = read_context.merge_context
+    elif isinstance(git, Git) and target_branch is not None:
+        merge_context = build_merge_context_from_git(git, target_branch)
+    else:
+        merge_context = _load_merge_context(_project_dir_for_store(store))
     if read_context is not None and read_context.merge_context is None:
         read_context.merge_context = merge_context
     failed = list(read_context.failed_tasks()) if read_context is not None else [task for task in store.get_all() if task.status == "failed"]

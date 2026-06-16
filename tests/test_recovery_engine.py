@@ -9,7 +9,7 @@ from gza.branch_publication import BranchPublicationState, persist_branch_public
 from gza.config import Config
 from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
-from gza.git import GitError
+from gza.git import Git, GitError
 from gza.lineage_query import _load_indexes
 from gza.operator_state import MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_read_context import RecoveryReadContext
@@ -3445,3 +3445,64 @@ def test_decide_failed_task_recovery_uses_read_context_merge_context_not_load(
     )
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_redundant"
+
+
+class _MinimalRecoveryGit(Git):
+    """Git subclass satisfying isinstance checks for list_failed_tasks_for_recovery tests.
+
+    Overrides subprocess-backed methods so tests run in-process.
+    """
+
+    def __init__(self, *, branches: frozenset[str] = frozenset()) -> None:
+        self.repo_dir = Path("/dev/null")
+        self._cache = None
+        self._branches = branches
+
+    def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
+        return self._branches
+
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+        return False
+
+    def branch_exists(self, branch: str) -> bool:  # type: ignore[override]
+        return branch in self._branches
+
+    def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
+        from gza.git import ResolvedMergeSourceRef
+        return ResolvedMergeSourceRef(None)
+
+
+def test_list_failed_tasks_for_recovery_uses_seeded_git_not_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When git+target_branch are supplied, _load_merge_context must not be called.
+
+    Guards the advance-path fix: cmd_advance constructs a live Git and passes it so
+    the standalone list_failed_tasks_for_recovery call (used for warnings collection)
+    does not fall back to the ambient Config.load(discover=True) + Git() path.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Advance-path implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/advance-preseed-test"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    def _must_not_be_called(_project_dir: object = None) -> _MergeContext:
+        raise AssertionError(
+            "_load_merge_context was called despite holding a live git+target_branch; "
+            "the advance path did not eliminate the ambient discover=True load"
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _must_not_be_called)
+
+    git = _MinimalRecoveryGit(branches=frozenset({failed.branch}))
+    warnings: list[str] = []
+
+    # Must not raise (i.e., _load_merge_context is never called)
+    result = list_failed_tasks_for_recovery(store, warnings=warnings, git=git, target_branch="main")
+    assert result is not None

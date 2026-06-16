@@ -2994,7 +2994,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 )
             )
             if not no_resume_failed:
-                list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings)
+                list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings, git=git, target_branch=target_branch)
             if no_resume_failed:
                 owner_rows = [
                     row
