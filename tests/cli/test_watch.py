@@ -2799,7 +2799,10 @@ def test_watch_cycle_recovery_only_direct_reconcile_blocks_pending_pickup(
     assert str(pending_plan.id) not in log_text
 
 
-def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_consumed(tmp_path: Path) -> None:
+def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A failed direct reconcile attempt should consume the shared recovery budget."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -2815,6 +2818,16 @@ def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_co
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
+    preseeded_git = _make_preseeded_watch_git(tmp_path)
+
+    def _seeded_merge_context(_project_dir: object = None) -> object:
+        return recovery_engine._MergeContext(  # noqa: SLF001
+            git=preseeded_git,
+            default_branch="main",
+            existing_branches=frozenset(),
+        )
+
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _seeded_merge_context)
 
     def _execute_and_fail_once(*, task, action, context):
         persist_branch_publication_state(
@@ -2834,6 +2847,7 @@ def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_co
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=preseeded_git),
         patch("gza.cli.watch.execute_advance_action", side_effect=_execute_and_fail_once) as execute_action,
     ):
         first = _run_cycle(
@@ -2862,7 +2876,12 @@ def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_co
     assert execute_action.call_count == 1
     refreshed = store.get(failed.id)
     assert refreshed is not None
-    decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+    decision = decide_failed_task_recovery(
+        store,
+        refreshed,
+        max_recovery_attempts=1,
+        merge_context=recovery_engine._MergeContext(git=None, default_branch=None),  # noqa: SLF001
+    )
     assert decision.reason_code == "retry_limit_reached"
 
 
@@ -12728,6 +12747,12 @@ def _make_preseeded_watch_git(tmp_path: Path) -> "Git":
             self.repo_dir = repo_dir
             self._cache = None
 
+        def _unexpected_git_subprocess(self, method_name: str) -> AssertionError:
+            return AssertionError(
+                f"{method_name} should not be reached in unit tests; "
+                "patch the watch git seam instead of spawning real git subprocesses"
+            )
+
         def default_branch(self) -> str:
             return "main"
 
@@ -12737,8 +12762,27 @@ def _make_preseeded_watch_git(tmp_path: Path) -> "Git":
         def branch_exists(self, branch: str) -> bool:
             return False
 
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def branches_exist(self, branches: object) -> dict[str, bool]:
+            if not isinstance(branches, (tuple, list, set, frozenset)):
+                return {}
+            return {str(branch): False for branch in branches}
+
+        def resolve_refs(self, refs: object, *, peel: str = "commit") -> dict[str, str | None]:
+            if not isinstance(refs, (tuple, list, set, frozenset)):
+                return {}
+            return {str(ref): None for ref in refs}
+
         def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
             return False
+
+        def _run_readonly_cached(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise self._unexpected_git_subprocess("_run_readonly_cached")
+
+        def _run_readonly_success_cached(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise self._unexpected_git_subprocess("_run_readonly_success_cached")
 
     return _PreseedWatchGit(tmp_path)
 
