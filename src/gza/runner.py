@@ -116,7 +116,6 @@ from .review_scope import resolve_review_scope_for_impl
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
-    is_verify_blocked_only_review,
     is_verify_timeout_only_review,
     parse_review_report,
     parse_review_template,
@@ -4042,6 +4041,24 @@ def _task_has_current_passing_review_verify_evidence(
     return task.review_verify_head_sha == current_head_sha
 
 
+def _review_verify_failed_at_head(
+    *,
+    review_task: Task,
+    current_branch: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    """Require runner-owned review verify failure evidence for the current head."""
+    if review_task.review_verify_status != "failed":
+        return False
+    if not current_branch or not review_task.review_verify_branch:
+        return False
+    if review_task.review_verify_branch != current_branch:
+        return False
+    if not current_head_sha or not review_task.review_verify_head_sha:
+        return False
+    return review_task.review_verify_head_sha == current_head_sha
+
+
 def _noop_improve_resolves_verify_only_review(
     *,
     config: Config,
@@ -4061,8 +4078,11 @@ def _noop_improve_resolves_verify_only_review(
     if review_task is None or review_task.task_type != "review" or review_task.status != "completed":
         return False
 
-    review_content = _get_task_output(review_task, Path(config.project_dir))
-    if not is_verify_blocked_only_review(review_content):
+    if not _review_verify_failed_at_head(
+        review_task=review_task,
+        current_branch=current_branch,
+        current_head_sha=current_head_sha,
+    ):
         return False
 
     if not _task_has_current_passing_review_verify_evidence(
@@ -4094,8 +4114,12 @@ def _capture_noop_improve_review_verify_result(
     if review_task is None or review_task.task_type != "review" or review_task.status != "completed":
         return None
 
-    review_content = _get_task_output(review_task, Path(config.project_dir))
-    if not is_verify_blocked_only_review(review_content):
+    current_head_sha = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
+    if not _review_verify_failed_at_head(
+        review_task=review_task,
+        current_branch=branch_name,
+        current_head_sha=current_head_sha,
+    ):
         return None
 
     verify_command = config.verify_command if isinstance(config.verify_command, str) else ""

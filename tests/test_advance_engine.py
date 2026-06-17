@@ -3221,17 +3221,20 @@ def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path
     review.status = "completed"
     review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
     review.output_content = (
-        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Summary\n\n- The code still looks risky.\n\n"
         "## Blockers\n\n"
-        "### B1 verify_command failure: mypy error\n"
-        "Evidence: verify_command failed with exit status 1.\n"
-        "Impact: autonomous verify fails.\n"
-        "Required fix: rerun verify_command on the current tip.\n"
+        "### B1 Missing provider-result normalization\n"
+        "Evidence: src/gza/foo.py:10 still appears to surface raw provider failures.\n"
+        "Impact: callers may still see inconsistent error behavior.\n"
+        "Required fix: normalize the failure path, then rerun verify_command.\n"
         "Required tests: rerun verify_command.\n\n"
         "## Follow-Ups\n\nNone.\n\n"
         "## Questions / Assumptions\n\nNone.\n\n"
         "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
     )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
     store.update(review)
 
     improve = _add_completed_improve_for_review(
@@ -3266,17 +3269,19 @@ def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tm
     review.status = "completed"
     review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
     review.output_content = (
-        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Summary\n\n- Verify passed, but the code issue remains.\n\n"
         "## Blockers\n\n"
-        "### B1 verify_command failure: mypy error\n"
-        "Evidence: verify_command failed with exit status 1.\n"
-        "Impact: autonomous verify fails.\n"
-        "Required fix: rerun verify_command on the current tip.\n"
-        "Required tests: rerun verify_command.\n\n"
+        "### B1 Missing provider-result normalization\n"
+        "Evidence: src/gza/foo.py:10 still appears to surface raw provider failures.\n"
+        "Impact: callers may still see inconsistent error behavior.\n"
+        "Required fix: normalize the failure path.\n"
+        "Required tests: add a regression for malformed provider responses.\n\n"
         "## Follow-Ups\n\nNone.\n\n"
         "## Questions / Assumptions\n\nNone.\n\n"
         "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
     )
+    review.review_verify_status = "passed"
+    review.review_verify_branch = impl.branch
     review.review_verify_head_sha = "current-sha"
     store.update(review)
 
