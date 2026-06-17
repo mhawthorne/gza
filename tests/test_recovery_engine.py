@@ -636,6 +636,44 @@ def test_decide_failed_task_recovery_live_resolution_for_unitless_redundant_bran
     assert list_failed_tasks_for_recovery(store) == []
 
 
+def test_decide_failed_task_recovery_live_resolution_for_unitless_empty_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unit-less task whose live branch resolves empty uses MOOT_EMPTY_LIFECYCLE_DETAIL.
+
+    Verifies that the live-moot empty path sources its reason_text from the centralized
+    constant rather than a hardcoded string, so future edits to the constant propagate here.
+    """
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Unitless empty implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/unitless-empty"
+    failed.has_commits = False
+    failed.num_steps_computed = 0
+    failed.num_steps_reported = 0
+    failed.output_tokens = 0
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    # No merge unit attached — live probe determines state
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "resolve_task_merge_state_for_target",
+        lambda **kwargs: "empty",
+    )
+    _stub_merge_context(monkeypatch)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_empty"
+    assert decision.reason_text == MOOT_EMPTY_LIFECYCLE_DETAIL
+    assert list_failed_tasks_for_recovery(store) == []
+
+
 def test_decide_failed_task_recovery_live_probe_failure_logs_warning_and_does_not_silently_moot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
