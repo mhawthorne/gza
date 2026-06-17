@@ -452,8 +452,14 @@ def _parse_slice(value: object) -> PlanReviewSlice:
     slice_id = _require_non_empty_string(value.get("slice_id"), "slice_id")
     title = _require_non_empty_string(value.get("title"), f"slice {slice_id}.title")
     prompt = _require_non_empty_string(value.get("prompt"), f"slice {slice_id}.prompt")
-    scope = _require_non_empty_str_list(value.get("scope"), f"slice {slice_id}.scope")
-    out_of_scope = _require_str_list(value.get("out_of_scope"), f"slice {slice_id}.out_of_scope")
+    scope = _require_non_empty_str_list(
+        _coerce_string_to_str_list(value.get("scope")),
+        f"slice {slice_id}.scope",
+    )
+    out_of_scope = _require_str_list(
+        _coerce_string_to_str_list(value.get("out_of_scope")),
+        f"slice {slice_id}.out_of_scope",
+    )
     acceptance_criteria = _require_non_empty_str_list(
         value.get("acceptance_criteria"),
         f"slice {slice_id}.acceptance_criteria",
@@ -557,3 +563,9 @@ def _require_non_empty_str_list(value: object, field_name: str) -> tuple[str, ..
     if not result:
         raise PlanReviewValidationError(f"{field_name} must not be empty")
     return result
+
+
+def _coerce_string_to_str_list(value: object) -> object:
+    if isinstance(value, str):
+        return [value]
+    return value

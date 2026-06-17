@@ -46,6 +46,9 @@ Output contract:
   - `requires_code_review`
   - `tags`
 - Every slice must set `requires_code_review` to `true`.
+- `scope`, `out_of_scope`, `acceptance_criteria`, `depends_on_slices`, and `tags` must be JSON arrays of strings.
+- `scope` and `acceptance_criteria` must be non-empty arrays. `out_of_scope` may be an empty array.
+- Example slice fields: `"scope": ["Touch parser only", "Add manifest coercion helper"]`, `"out_of_scope": ["Advance engine behavior changes"]`
 - Every slice must include non-empty `prompt`, `scope`, `acceptance_criteria`, and `review_scope`.
 - `slice_id` values must be unique and stable within the manifest.
 - All dependency references must point only to earlier slices.

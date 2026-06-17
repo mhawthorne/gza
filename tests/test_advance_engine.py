@@ -1206,6 +1206,37 @@ def test_completed_plan_review_with_valid_approved_manifest_materializes_slices(
     assert action["type"] == "materialize_plan_slices"
 
 
+def test_completed_plan_review_with_string_scope_manifest_still_materializes_slices(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    manifest = _approved_plan_review_manifest(plan.id)
+    first_slice = manifest["slices"][0]
+    assert isinstance(first_slice, dict)
+    first_slice["scope"] = "Add parser"
+    first_slice["out_of_scope"] = "Executor"
+
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = _approved_plan_review_report(manifest)
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "materialize_plan_slices"
+    assert "needs_attention_reason" not in action
+    assert action["manifest"].slices[0].scope == ("Add parser",)
+    assert action["manifest"].slices[0].out_of_scope == ("Executor",)
+
+
 def test_completed_plan_with_partial_unrecorded_plan_materialization_needs_repair(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

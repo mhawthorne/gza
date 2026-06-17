@@ -164,6 +164,22 @@ class TestValidatePlanReviewReport:
         assert manifest.verdict == "APPROVED"
         assert [slice_manifest.slice_id for slice_manifest in manifest.slices] == ["S1", "S2"]
 
+    def test_coerces_string_scope_fields_in_approved_manifest(self) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        manifest["slices"][0]["scope"] = "Add task types"
+        manifest["slices"][0]["out_of_scope"] = "Lifecycle rule changes"
+
+        validated = validate_plan_review_report(
+            _report_for_manifest(manifest),
+            source_task_id="gza-123",
+            source_task_type="plan",
+            max_slice_timeout_minutes=45,
+        )
+
+        assert validated is not None
+        assert validated.slices[0].scope == ("Add task types",)
+        assert validated.slices[0].out_of_scope == ("Lifecycle rule changes",)
+
     @pytest.mark.parametrize(
         ("mutate", "message"),
         [
