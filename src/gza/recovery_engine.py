@@ -1484,7 +1484,7 @@ def decide_failed_task_recovery(
                 reason_text=(
                     MOOT_REDUNDANT_LIFECYCLE_DETAIL
                     if merge_state == "redundant"
-                    else "moot (empty branch with no recorded provider execution)"
+                    else MOOT_EMPTY_LIFECYCLE_DETAIL
                 ),
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,

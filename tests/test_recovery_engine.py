@@ -11,7 +11,7 @@ from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError
 from gza.git import Git, GitError
 from gza.lineage_query import _load_indexes
-from gza.operator_state import MOOT_REDUNDANT_LIFECYCLE_DETAIL
+from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import (
     _MergeContext,
@@ -503,7 +503,8 @@ def test_list_failed_tasks_for_recovery_filters_moot_failed_empty_branch_without
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_empty"
-    assert decision.reason_text == "moot (empty branch with no recorded provider execution)"
+    assert decision.reason_text == MOOT_EMPTY_LIFECYCLE_DETAIL
+    assert decision.reason_text != MOOT_REDUNDANT_LIFECYCLE_DETAIL
     assert list_failed_tasks_for_recovery(store) == []
 
 
@@ -528,7 +529,8 @@ def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(tmp
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_redundant"
-    assert decision.reason_text == "moot (commits already present on target)"
+    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
+    assert decision.reason_text != MOOT_EMPTY_LIFECYCLE_DETAIL
     assert should_hide_failed_recovery_decision(decision) is True
     assert list_failed_tasks_for_recovery(store) == []
 
@@ -2408,7 +2410,8 @@ def test_recovery_engine_prerequisite_unmerged_stored_redundant_row_is_moot_afte
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_redundant"
-    assert decision.reason_text == "moot (commits already present on target)"
+    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
+    assert decision.reason_text != MOOT_EMPTY_LIFECYCLE_DETAIL
     assert list_failed_tasks_for_recovery(store) == []
 
     unit = store.resolve_merge_unit_for_task(failed.id)
@@ -2588,7 +2591,8 @@ def test_recovery_engine_prerequisite_unmerged_live_redundant_branch_persists_re
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
     assert decision.reason_code == "merge_unit_redundant"
-    assert decision.reason_text == "moot (commits already present on target)"
+    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
+    assert decision.reason_text != MOOT_EMPTY_LIFECYCLE_DETAIL
 
     unit = store.resolve_merge_unit_for_task(failed.id)
     assert unit is not None
