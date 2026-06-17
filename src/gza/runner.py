@@ -6852,7 +6852,7 @@ def _post_complete_code_task(
                 )
             if cleared_verify_only_blocker:
                 console.print(
-                    "[blue]Review State: cleared verify-only blocker from persisted passing no-op improve verify evidence.[/blue]"
+                    "[blue]Review State: cleared verify-origin blocker from persisted passing no-op improve verify evidence.[/blue]"
                 )
 
     # Rebase tasks run provider-side conflict resolution in the worktree.

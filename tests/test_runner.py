@@ -10152,7 +10152,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at is None
         output = capsys.readouterr().out
-        assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" not in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
     def test_post_complete_noop_improve_clears_verify_only_review_block_with_current_green_verify_evidence(
         self,
@@ -10240,7 +10240,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl.review_cleared_at is not None
         assert refreshed_impl.review_cleared_at >= review.completed_at
         output = capsys.readouterr().out
-        assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
 
     def test_post_complete_noop_improve_keeps_current_green_verify_evidence_when_recapture_would_overwrite_it(
         self,
@@ -10357,7 +10357,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_improve.review_verify_captured_at == review.completed_at + timedelta(seconds=1)
 
         output = capsys.readouterr().out
-        assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
 
     def test_post_complete_noop_improve_captures_passing_verify_evidence_clears_review_and_becomes_mergeable(
         self,
@@ -10510,7 +10510,7 @@ class TestExtractedRunInnerHelpers:
         assert action["type"] == "merge"
 
         output = capsys.readouterr().out
-        assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
 
     def test_post_complete_noop_improve_persists_fresh_failed_verify_evidence_without_clearing_review(
         self,
@@ -10628,7 +10628,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_improve.review_verify_head_sha == "abc1234"
         assert refreshed_improve.review_verify_captured_at == captured_at
         output = capsys.readouterr().out
-        assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" not in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
     @pytest.mark.parametrize(
         ("label", "seed_evidence"),
@@ -10844,7 +10844,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at is None
         output = capsys.readouterr().out
-        assert "cleared verify-only blocker from persisted passing no-op improve verify evidence" not in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
     def test_post_complete_noop_improve_does_not_clear_substantive_review_block(
         self,
