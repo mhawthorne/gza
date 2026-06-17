@@ -180,6 +180,9 @@ def _build_task_panel(
         meta.append(task.task_type, style=rc.task_type)
     meta.append("  ")
     meta.append(task.status or "unknown", style=sc)
+    if task.model:
+        meta.append("  ")
+        meta.append(task.model, style=rc.task_type)
 
     elapsed = _task_elapsed_seconds(task)
     if elapsed is not None:

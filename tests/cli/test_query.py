@@ -843,6 +843,25 @@ class TestHistoryCommand:
         assert internal_task.id in ids
         assert public_task.id not in ids
 
+    def test_history_json_includes_model_field_by_default(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("history model json", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.model = "claude-opus-4-8"
+        store.update(task)
+
+        result = invoke_gza("history", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert len(payload) == 1
+        assert payload[0]["id"] == task.id
+        assert payload[0]["provider"] is None
+        assert payload[0]["model"] == "claude-opus-4-8"
+
     def test_history_text_fields_multi_field_uses_generic_blocks(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -896,6 +915,21 @@ class TestHistoryCommand:
         assert result.returncode == 0
         payload = json.loads(result.stdout)
         assert payload == [{"id": task.id, "status": "completed"}]
+
+    def test_history_fields_accept_model_projection(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("history model projection", task_type="implement")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.model = "claude-opus-4-8"
+        store.update(task)
+
+        result = invoke_gza("history", "--fields", "id,model", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"id: {task.id}" in result.stdout
+        assert "model: claude-opus-4-8" in result.stdout
 
     def test_history_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -1248,6 +1282,7 @@ class TestHistoryCommand:
         review.output_content = "Verdict: CHANGES_REQUESTED\n\nNeeds revisions."
         review.duration_seconds = 99
         review.cost_usd = 0.25
+        review.model = "claude-opus-4-8"
         store.update(review)
         assert review.id is not None
 
@@ -1277,6 +1312,8 @@ class TestHistoryCommand:
         assert f"unmerged  {improve.id}" not in result.stdout
         assert "verdict:" in result.stdout
         assert "CHANGES_REQUESTED" in result.stdout
+        assert "| model: claude-opus-4-8 | stats:" in result.stdout
+        assert "| model: - | stats:" in result.stdout
         assert "| stats:" in result.stdout
         assert result.stdout.count("branch: ") == 1
         assert "└──     [review]" not in result.stdout
@@ -1711,6 +1748,27 @@ class TestHistoryCommand:
 
         assert result.returncode == 0
         assert "comments: 2" in result.stdout
+
+    def test_history_shows_model_in_default_view_and_dash_when_unset(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        with_model = store.add("Task with stored model", task_type="implement")
+        with_model.status = "completed"
+        with_model.completed_at = datetime.now(UTC)
+        with_model.model = "claude-opus-4-8"
+        store.update(with_model)
+
+        without_model = store.add("Task without stored model", task_type="implement")
+        without_model.status = "completed"
+        without_model.completed_at = datetime.now(UTC)
+        store.update(without_model)
+
+        result = invoke_gza("history", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "model: claude-opus-4-8" in result.stdout
+        assert "model: -" in result.stdout
 
     def test_history_shows_both_based_on_and_depends_on(self, tmp_path: Path):
         """History shows both based_on and depends_on when a task has both set."""
@@ -4157,6 +4215,22 @@ class TestShowCommand:
         assert "Trigger Source: manual" in manual_result.stdout
         assert legacy_result.returncode == 0
         assert "Trigger Source: unknown" in legacy_result.stdout
+
+    def test_show_displays_provider_and_model_lines(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Task with stored execution model")
+        assert task.id is not None
+        task.provider = "claude"
+        task.model = "claude-opus-4-8"
+        store.update(task)
+
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Provider: claude" in result.stdout
+        assert "Model: claude-opus-4-8" in result.stdout
 
     def test_show_review_displays_verdict_and_score(self, tmp_path: Path):
         """Show command includes derived review verdict and score metadata."""
@@ -6876,19 +6950,79 @@ class TestPsCommand:
         assert header == (
             f"[{expected_header_color}]"
             f"{'TASK ID':<10} {'TYPE':<10} {'STATUS':<16} {'PID':<8} "
-            f"{'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+            f"{'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'MODEL':<22} {'TASK'}"
             f"[/{expected_header_color}]"
         )
-        assert separator == f"[{expected_header_color}]" + "─" * 106 + f"[/{expected_header_color}]"
+        assert separator == f"[{expected_header_color}]" + "─" * len(
+            f"{'TASK ID':<10} {'TYPE':<10} {'STATUS':<16} {'PID':<8} "
+            f"{'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'MODEL':<22} {'TASK'}"
+        ) + f"[/{expected_header_color}]"
         assert (
             f"[{expected_task_id_color}]{task.id:<10}[/{expected_task_id_color}]"
             in row
         )
+        assert f"{'-':<22}" in row
         assert (
             f"[{expected_prompt_color}]Theme-aware ps row[/{expected_prompt_color}]"
             in row
         )
-        assert "[cyan]" not in row
+
+    def test_ps_shows_model_column_and_json_key(self, tmp_path: Path) -> None:
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        with_model = store.add("ps task with model")
+        with_model.model = "claude-opus-4-8"
+        store.update(with_model)
+
+        without_model = store.add("ps task without model")
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-model-1",
+                pid=99997,
+                task_id=with_model.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-model-2",
+                pid=99996,
+                task_id=without_model.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        try:
+            text_result = invoke_gza("ps", "--project", str(tmp_path))
+            json_result = invoke_gza("ps", "--json", "--project", str(tmp_path))
+        finally:
+            registry.remove("w-test-ps-model-1")
+            registry.remove("w-test-ps-model-2")
+
+        assert text_result.returncode == 0
+        assert "MODEL" in text_result.stdout
+        assert "claude-opus-4-8" in text_result.stdout
+        assert "ps task without model" in text_result.stdout
+
+        payload = json.loads(json_result.stdout)
+        rows_by_id = {row["task_id"]: row for row in payload}
+        assert rows_by_id[with_model.id]["model"] == "claude-opus-4-8"
+        assert rows_by_id[without_model.id]["model"] is None
 
     def test_ps_reconciles_db_and_worker_with_source_both(self, tmp_path: Path):
         """PS dedupes by task_id and marks row source as both."""

@@ -1103,6 +1103,7 @@ def cmd_history(args: argparse.Namespace) -> int:
                     compact_parts.append(f"verdict: {verdict}")
                 if manifest_detail:
                     compact_parts.append(manifest_detail)
+            compact_parts.append(f"model: [{c['stats']}]{task.model or '-'}[/{c['stats']}]")
             stats_str = format_stats(task)
             if stats_str:
                 compact_parts.append(f"stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -1119,6 +1120,7 @@ def cmd_history(args: argparse.Namespace) -> int:
             console.print(f"{detail_prefix}    branch: [{c['branch']}]{task.branch}[/{c['branch']}]")
         if task.report_file:
             console.print(f"{detail_prefix}    report: [{c['file']}]{task.report_file}[/{c['file']}]")
+        console.print(f"{detail_prefix}    model: [{c['stats']}]{task.model or '-'}[/{c['stats']}]")
         stats_str = format_stats(task)
         if stats_str:
             console.print(f"{detail_prefix}    stats: [{c['stats']}]{stats_str}[/{c['stats']}]")
@@ -2758,10 +2760,10 @@ def _print_ps_output(
 
     header = (
         f"{'TASK ID':<10} {'TYPE':<10} "
-        f"{'STATUS':<16} {'PID':<8} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'TASK'}"
+        f"{'STATUS':<16} {'PID':<8} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'MODEL':<22} {'TASK'}"
     )
     console.print(f"[{header_color}]{header}[/{header_color}]", soft_wrap=True)
-    console.print(f"[{header_color}]" + "─" * 106 + f"[/{header_color}]", soft_wrap=True)
+    console.print(f"[{header_color}]" + "─" * len(header) + f"[/{header_color}]", soft_wrap=True)
 
     for row in rows:
         task_id_display = f"{row['task_id']}" if row["task_id"] is not None else ""
@@ -2776,6 +2778,7 @@ def _print_ps_output(
         console.print(
             f"[{task_id_color}]{task_id_display:<10}[/{task_id_color}] {row['type']:<10} "
             f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
+            f"{(row['model'] or '-'):<22} "
             f"[{task_prompt_color}]{task_display}[/{task_prompt_color}]",
             soft_wrap=True,
         )
@@ -3077,6 +3080,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "worker_id": worker_id,
         "pid": pid,
         "type": task_type_display,
+        "model": task.model if task else None,
         "source": source,
         "task_id": task_id,
         "status": status,
@@ -3688,6 +3692,8 @@ def _cmd_show_output(
     if merge_status:
         console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{merge_status}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
+    console.print(f"[{c['label']}]Provider:[/{c['label']}] [{c['value']}]{task.provider or '-'}[/{c['value']}]")
+    console.print(f"[{c['label']}]Model:[/{c['label']}] [{c['value']}]{task.model or '-'}[/{c['value']}]")
     if task.task_type == "plan":
         auto_implement_detail = "yes"
         if task.auto_implement is False:

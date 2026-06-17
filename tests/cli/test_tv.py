@@ -247,6 +247,21 @@ def test_tv_panel_displays_rebase_log_content_for_completed_task(tmp_path: Path)
     assert "(no log available)" not in rendered
 
 
+def test_tv_panel_title_includes_model_when_present(tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("TV model task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.model = "claude-opus-4-8"
+    store.update(task)
+
+    panel = tv_module._build_task_panel(task, None, n_lines=4, width=100)
+
+    assert panel.title is not None
+    assert "claude-opus-4-8" in panel.title.plain
+
+
 def test_tv_explicit_ids_stay_fixed(monkeypatch, tmp_path: Path):
     """Explicit task IDs should remain on screen and keep polling after completion."""
     setup_config(tmp_path)

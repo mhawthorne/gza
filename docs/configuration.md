@@ -837,6 +837,7 @@ Runtime reconciliation notes:
   - `WORKER_DIED` when `running_pid` is missing/invalid or the PID is no longer alive.
   - `TIMEOUT` when runtime exceeds configured `timeout_minutes`.
 - `gza ps` merges worker rows and DB in-progress tasks by task ownership, so healthy background runs appear as one active task row.
+- When available, `gza ps` shows the full stored execution model ID in a dedicated `MODEL` column; tasks that have never run render `-`.
 
 ### kill
 
@@ -1045,6 +1046,7 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: foreground_inline` for `gza run-inline` runner-managed foreground runs
 - `Execution Mode: manual` for legacy tasks that were manually forced to `in_progress` in older releases
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
+- `Provider: <provider>` and `Model: <full-model-id>` from the stored execution record (`-` when unset)
 
 For completed `review` tasks, `gza show` also includes:
 - `Verdict: <APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION|...>` when parseable from review output.
@@ -1273,6 +1275,8 @@ gza history [options]
 | `--json` | Output JSON rows from the unified query API |
 
 Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
+
+Default human output also shows each task's stored execution model. Projection/JSON output supports `model` (and `provider`) fields, so `gza history --fields id,status,model` and `gza history --json` include them directly.
 
 ### incomplete
 
@@ -1874,6 +1878,8 @@ gza tv [task_id ...] [options]
 | `--number N`, `-n N` | Fixed slot count (equivalent to `--min N --max N`) |
 | `--min N` | Minimum slot count in auto-select mode (default: 1) |
 | `--max N` | Maximum slot count in auto-select mode (default: 4) |
+
+Each task panel title includes the task ID, type, status, and, when known, the full stored execution model ID before the elapsed/steps/token stats cluster.
 
 ### migrate
 
