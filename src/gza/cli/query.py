@@ -2758,28 +2758,56 @@ def _print_ps_output(
     task_prompt_color = _colors.TASK_COLORS.prompt
     header_color = _colors.TASK_COLORS.header
 
-    header = (
-        f"{'TASK ID':<10} {'TYPE':<10} "
-        f"{'STATUS':<16} {'PID':<8} {'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'MODEL':<22} {'TASK'}"
-    )
+    columns = [
+        ("TASK ID", "task_id"),
+        ("TYPE", "type"),
+        ("STATUS", "status"),
+        ("PID", "pid"),
+        ("STARTED", "started"),
+        ("STEPS", "steps"),
+        ("DURATION", "duration"),
+        ("MODEL", "model"),
+        ("MERGE UNIT", "merge_unit"),
+    ]
+    cells = []
+    for row in rows:
+        status = row["status"]
+        if status == "failed" and row.get("startup_failure"):
+            status = "failed(startup)"
+        cells.append(
+            {
+                "task_id": f"{row['task_id']}" if row["task_id"] is not None else "",
+                "type": row["type"],
+                "status": status,
+                "sc": STATUS_COLORS.get(status, "white"),
+                "pid": str(row["pid"]),
+                "started": row["started"],
+                "steps": str(row["steps"]),
+                "duration": row["duration"],
+                "model": row["model"] or "-",
+                "merge_unit": row.get("merge_unit") or "-",
+                "task": row["task"].replace("[", "\\[") if row["task"] else "",
+            }
+        )
+
+    widths = {key: len(label) for label, key in columns}
+    for cell in cells:
+        for _, key in columns:
+            widths[key] = max(widths[key], len(cell[key]))
+
+    header = " ".join(f"{label:<{widths[key]}}" for label, key in columns) + " TASK"
     console.print(f"[{header_color}]{header}[/{header_color}]", soft_wrap=True)
     console.print(f"[{header_color}]" + "─" * len(header) + f"[/{header_color}]", soft_wrap=True)
 
-    for row in rows:
-        task_id_display = f"{row['task_id']}" if row["task_id"] is not None else ""
-        status = row['status']
-        if status == "failed" and row.get("startup_failure"):
-            status = "failed(startup)"
-        sc = STATUS_COLORS.get(status, "white")
-
-        # Escape Rich markup in task display (may contain brackets from truncation)
-        task_display = row['task'].replace('[', '\\[') if row['task'] else ''
-
+    for cell in cells:
         console.print(
-            f"[{task_id_color}]{task_id_display:<10}[/{task_id_color}] {row['type']:<10} "
-            f"[{sc}]{status:<16}[/{sc}] {row['pid']:<8} {row['started']:<24} {row['steps']:<7} {row['duration']:<10} "
-            f"{(row['model'] or '-'):<22} "
-            f"[{task_prompt_color}]{task_display}[/{task_prompt_color}]",
+            f"[{task_id_color}]{cell['task_id']:<{widths['task_id']}}[/{task_id_color}] "
+            f"{cell['type']:<{widths['type']}} "
+            f"[{cell['sc']}]{cell['status']:<{widths['status']}}[/{cell['sc']}] "
+            f"{cell['pid']:<{widths['pid']}} {cell['started']:<{widths['started']}} "
+            f"{cell['steps']:<{widths['steps']}} {cell['duration']:<{widths['duration']}} "
+            f"{cell['model']:<{widths['model']}} {cell['merge_unit']:<{widths['merge_unit']}} "
+            f"[{task_prompt_color}]{cell['task']}[/{task_prompt_color}]",
             soft_wrap=True,
         )
 
@@ -3056,6 +3084,15 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         task_type_display = "-"
 
     task_id = task.id if task and task.id is not None else worker.task_id if worker else None
+    merge_unit_display = None
+    if store is not None and task is not None and task.id is not None:
+        merge_unit = store.resolve_merge_unit_for_task(task.id)
+        if merge_unit is not None:
+            merge_unit_display = (
+                f"{merge_unit.id} / {merge_unit.owner_task_id}"
+                if merge_unit.owner_task_id
+                else merge_unit.id
+            )
     task_display = ""
     if task and task.slug:
         task_display = task.slug
@@ -3080,6 +3117,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         "worker_id": worker_id,
         "pid": pid,
         "type": task_type_display,
+        "merge_unit": merge_unit_display,
         "model": task.model if task else None,
         "source": source,
         "task_id": task_id,

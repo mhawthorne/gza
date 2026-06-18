@@ -6947,25 +6947,105 @@ class TestPsCommand:
 
         assert len(recording_console.outputs) == 3
         header, separator, row = recording_console.outputs
-        assert header == (
-            f"[{expected_header_color}]"
-            f"{'TASK ID':<10} {'TYPE':<10} {'STATUS':<16} {'PID':<8} "
-            f"{'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'MODEL':<22} {'TASK'}"
-            f"[/{expected_header_color}]"
-        )
-        assert separator == f"[{expected_header_color}]" + "─" * len(
-            f"{'TASK ID':<10} {'TYPE':<10} {'STATUS':<16} {'PID':<8} "
-            f"{'STARTED':<24} {'STEPS':<7} {'DURATION':<10} {'MODEL':<22} {'TASK'}"
-        ) + f"[/{expected_header_color}]"
-        assert (
-            f"[{expected_task_id_color}]{task.id:<10}[/{expected_task_id_color}]"
-            in row
-        )
-        assert f"{'-':<22}" in row
+        assert header.startswith(f"[{expected_header_color}]")
+        assert header.endswith(f"[/{expected_header_color}]")
+        assert "TASK ID" in header
+        assert "MERGE UNIT" in header
+        assert separator.startswith(f"[{expected_header_color}]")
+        assert separator.endswith(f"[/{expected_header_color}]")
+        assert f"[{expected_task_id_color}]{task.id:<10}[/{expected_task_id_color}]" in row
+        assert f"{'-':<5}" in row
+        assert f"{'-':<10}" in row
         assert (
             f"[{expected_prompt_color}]Theme-aware ps row[/{expected_prompt_color}]"
             in row
         )
+
+    def test_ps_shows_merge_unit_column_and_json_key(self, tmp_path: Path) -> None:
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("ps task with merge unit")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+
+        unit = store.create_merge_unit(
+            source_branch="feature/ps-merge-unit",
+            target_branch="main",
+            owner_task_id=task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-merge-unit",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        try:
+            text_result = invoke_gza("ps", "--project", str(tmp_path))
+            json_result = invoke_gza("ps", "--json", "--project", str(tmp_path))
+        finally:
+            registry.remove("w-test-ps-merge-unit")
+
+        assert text_result.returncode == 0
+        assert "MERGE UNIT" in text_result.stdout
+        assert f"{unit.id} / {task.id}" in text_result.stdout
+
+        payload = json.loads(json_result.stdout)
+        rows_by_id = {row["task_id"]: row for row in payload}
+        assert rows_by_id[task.id]["merge_unit"] == f"{unit.id} / {task.id}"
+
+    def test_ps_renders_dash_when_task_has_no_merge_unit(self, tmp_path: Path) -> None:
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("ps task without merge unit")
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-no-merge-unit",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        try:
+            result = invoke_gza("ps", "--project", str(tmp_path))
+        finally:
+            registry.remove("w-test-ps-no-merge-unit")
+
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert any("MERGE UNIT" in line for line in lines)
+        row = next(line for line in lines if task.id in line)
+        header = next(line for line in lines if "MERGE UNIT" in line)
+        merge_unit_start = header.index("MERGE UNIT")
+        task_start = header.rindex("TASK")
+        assert row[merge_unit_start:task_start].strip() == "-"
 
     def test_ps_shows_model_column_and_json_key(self, tmp_path: Path) -> None:
         from gza.workers import WorkerMetadata, WorkerRegistry
@@ -7023,6 +7103,57 @@ class TestPsCommand:
         rows_by_id = {row["task_id"]: row for row in payload}
         assert rows_by_id[with_model.id]["model"] == "claude-opus-4-8"
         assert rows_by_id[without_model.id]["model"] is None
+
+    def test_ps_self_sizes_type_column_so_status_stays_aligned(self, tmp_path: Path) -> None:
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        short_type = store.add("short type row", task_type="plan")
+        long_type = store.add("long type row", task_type="plan_improve")
+        store.mark_in_progress(short_type)
+        store.mark_in_progress(long_type)
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-align-short",
+                pid=os.getpid(),
+                task_id=short_type.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-ps-align-long",
+                pid=os.getpid(),
+                task_id=long_type.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        try:
+            result = invoke_gza("ps", "--project", str(tmp_path), env={"FORCE_COLOR": ""})
+        finally:
+            registry.remove("w-test-ps-align-short")
+            registry.remove("w-test-ps-align-long")
+
+        assert result.returncode == 0
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        short_row = next(line for line in lines if short_type.id in line)
+        long_row = next(line for line in lines if long_type.id in line)
+        assert short_row.index("in_progress") == long_row.index("in_progress")
 
     def test_ps_reconciles_db_and_worker_with_source_both(self, tmp_path: Path):
         """PS dedupes by task_id and marks row source as both."""

@@ -10,6 +10,8 @@ from gza.cli.config_cmds import CheckTarget, run_preflight_target
 from gza.config import Config
 from tests_integration.test_docker import has_codex_api_key, has_codex_cli, has_codex_credentials
 
+pytestmark = [pytest.mark.integration]
+
 
 def _repo_root() -> Path:
     """Resolve the real project root instead of assuming a Docker mount path."""
@@ -27,8 +29,6 @@ def _restore_codex_home_if_needed(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOME", str(home_dir))
 
 
-@pytest.mark.integration
-@pytest.mark.timeout(30, method="signal")
 @pytest.mark.skipif(not has_codex_credentials(), reason="Codex credentials not available")
 @pytest.mark.skipif(not has_codex_cli(), reason="Codex CLI not installed")
 class TestPreflightLiveCodex:

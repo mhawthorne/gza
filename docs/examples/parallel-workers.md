@@ -27,10 +27,10 @@ Each worker atomically claims a pending task—no conflicts or duplicate work.
 
 ```bash
 $ gza ps
-TASK ID    TYPE       STATUS           STARTED                  STEPS   DURATION   TASK
-gza-2t     implement  running          2026-01-08 16:00:01 UTC  12      1m 23s     20260108-add-user-avatar-upload
-gza-2u     implement  running          2026-01-08 16:00:02 UTC  11      1m 22s     20260108-implement-email-notifications
-gza-2v     implement  failed(startup)  2026-01-08 16:00:03 UTC  -       8s         20260108-add-dark-mode-toggle
+TASK ID TYPE      STATUS          PID   STARTED                  STEPS DURATION MODEL MERGE UNIT        TASK
+gza-2t  implement in_progress     4242  2026-01-08 16:00:01 UTC  12    1m 23s   -     gza-mu-1 / gza-2t 20260108-add-user-avatar-upload
+gza-2u  implement in_progress     4243  2026-01-08 16:00:02 UTC  11    1m 22s   -     -                 20260108-implement-email-notifications
+gza-2v  implement failed(startup) 4244  2026-01-08 16:00:03 UTC  -     8s       -     -                 20260108-add-dark-mode-toggle
 ```
 
 Default output includes running tasks and startup failures. Include all completed/failed rows:

@@ -838,6 +838,7 @@ Runtime reconciliation notes:
   - `TIMEOUT` when runtime exceeds configured `timeout_minutes`.
 - `gza ps` merges worker rows and DB in-progress tasks by task ownership, so healthy background runs appear as one active task row.
 - When available, `gza ps` shows the full stored execution model ID in a dedicated `MODEL` column; tasks that have never run render `-`.
+- `gza ps` shows the task merge unit in a dedicated `MERGE UNIT` column as `<merge-unit-id> / <owner-task-id>`; tasks not attached to a merge unit render `-`.
 
 ### kill
 
