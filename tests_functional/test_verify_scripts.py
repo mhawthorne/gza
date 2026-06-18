@@ -17,18 +17,11 @@ def _make_executable(path: Path, body: str) -> None:
 
 
 def _setup_verify_script_fixture(tmp_path: Path) -> Path:
-    repo_root = Path(__file__).resolve().parents[1]
     fixture_root = tmp_path / "verify-fixture"
     (fixture_root / "bin").mkdir(parents=True)
-    (fixture_root / "src" / "gza").mkdir(parents=True)
-    (fixture_root / "src" / "gza" / "__init__.py").write_text("", encoding="utf-8")
+    repo_root = Path(__file__).resolve().parents[1]
     (fixture_root / "bin" / "tests").write_text((repo_root / "bin" / "tests").read_text(encoding="utf-8"), encoding="utf-8")
-    (fixture_root / "bin" / "test-latency").write_text(
-        (repo_root / "bin" / "test-latency").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
     (fixture_root / "bin" / "tests").chmod(0o755)
-    (fixture_root / "bin" / "test-latency").chmod(0o755)
     return fixture_root
 
 
@@ -38,9 +31,8 @@ def _write_fake_venv_python(path: Path, log_path: Path) -> None:
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         f"printf 'python %s\\n' \"$*\" >> {str(log_path)!r}\n"
-        "if [[ \"${1:-}\" == \"-\" ]]; then\n"
-        "  cat >/dev/null\n"
-        "  printf 'fake-tree-fingerprint\\n'\n"
+        "if [[ \"${1:-}\" == \"-m\" && \"${2:-}\" == \"gza.tools.verify_phase\" ]]; then\n"
+        f"  exec {sys.executable!r} \"$@\"\n"
         "fi\n",
     )
 
@@ -60,9 +52,8 @@ def _write_fake_uv(path: Path, log_path: Path) -> None:
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         f"printf 'uv %s\\n' \"$*\" >> {str(log_path)!r}\n"
-        "if [[ \"${1:-}\" == \"run\" && \"${2:-}\" == \"python\" && \"${3:-}\" == \"-\" ]]; then\n"
-        "  cat >/dev/null\n"
-        "  printf 'fake-tree-fingerprint\\n'\n"
+        "if [[ \"${1:-}\" == \"run\" && \"${2:-}\" == \"python\" && \"${3:-}\" == \"-m\" && \"${4:-}\" == \"gza.tools.verify_phase\" ]]; then\n"
+        f"  shift 2\n  exec {sys.executable!r} \"$@\"\n"
         "fi\n",
     )
 
@@ -72,7 +63,18 @@ def _write_real_venv_python(path: Path) -> None:
         path,
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        f"exec {sys.executable!r} \"$@\"\n",
+        "if [[ \"${1:-}\" == \"-m\" && \"${2:-}\" == \"gza.tools.verify_phase\" ]]; then\n"
+        f"  exec {sys.executable!r} \"$@\"\n"
+        "fi\n",
+    )
+
+
+def _write_fake_python(path: Path, log_path: Path) -> None:
+    _make_executable(
+        path,
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf 'python %s\\n' \"$*\" >> {str(log_path)!r}\n",
     )
 
 
@@ -81,10 +83,12 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     tool_log = fixture_root / "venv-tools.log"
     uv_log = fixture_root / "uv.log"
+    repo_root = Path(__file__).resolve().parents[1]
 
     venv_bin = fixture_root / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-latency", tool_log, "test-latency")
     for tool_name in ("ruff", "ty", "mypy", "pytest"):
         _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
 
@@ -96,6 +100,7 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["PYTEST_XDIST_WORKERS"] = "7"
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
     result = subprocess.run(
         ["bash", "bin/tests"],
         cwd=fixture_root,
@@ -108,9 +113,10 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     assert result.returncode == 0, result.stderr
     assert "use_venv=1" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert "python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert "python -m gza.tools.verify_phase unit -- ./bin/test-latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert "test-latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
-        "pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
+        "python -m gza.tools.verify_phase functional -- pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
     )
     assert uv_log.read_text(encoding="utf-8") == ""
@@ -120,15 +126,22 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
 def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     uv_log = fixture_root / "uv.log"
+    tool_log = fixture_root / "tools.log"
+    repo_root = Path(__file__).resolve().parents[1]
 
     fake_bin = fixture_root / "fake-bin"
     fake_bin.mkdir()
     _write_fake_uv(fake_bin / "uv", uv_log)
+    _write_fake_python(fake_bin / "python", tool_log)
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-latency", tool_log, "test-latency")
+    for tool_name in ("ruff", "ty", "mypy", "pytest"):
+        _write_fake_passthrough_tool(fake_bin / tool_name, tool_log, tool_name)
     uv_log.write_text("", encoding="utf-8")
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["PYTEST_XDIST_WORKERS"] = "7"
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
     result = subprocess.run(
         ["bash", "bin/tests"],
         cwd=fixture_root,
@@ -141,8 +154,9 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     assert result.returncode == 0, result.stderr
     assert "use_venv=0" in result.stdout
     uv_invocations = uv_log.read_text(encoding="utf-8")
-    assert "uv run python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
-    assert "uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+    assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
+    assert "uv run python -m gza.tools.verify_phase unit -- ./bin/test-latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+    assert "uv run python -m gza.tools.verify_phase functional -- uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -153,6 +167,7 @@ def test_full_verify_only_runs_integration_suite_with_integration_flag(tmp_path:
     venv_bin = fixture_root / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-latency", tool_log, "test-latency")
     for tool_name in ("ruff", "ty", "mypy", "pytest"):
         _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
 
@@ -212,7 +227,9 @@ def test_quick_verify_omits_tree_fingerprint_when_gitdir_is_unavailable(tmp_path
     )
 
     assert result.returncode == 0, result.stderr
+    assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
     assert "tree_fingerprint=None" not in result.stdout
     assert "tree_fingerprint=" not in result.stdout
-    assert "git diff" not in result.stderr
+    assert "failed to compute exact tree fingerprint for timeout resume checkpoints" in result.stderr
+    assert "not a git repository" in result.stderr

@@ -12,6 +12,7 @@ RUN_INTEGRATION=0
 QUICK_MODE=0
 TARGET_ARGS=()
 USE_VENV=0
+VERIFY_PHASE_CMD=()
 
 usage() {
     echo "Usage: $0 [--quick [-- <pytest-target> ...]] [-i|--integration]" >&2
@@ -41,88 +42,15 @@ done
 if [[ -d ".venv/bin" ]]; then
     export PATH="$(pwd)/.venv/bin:$PATH"
     USE_VENV=1
+    VERIFY_PHASE_CMD=(python -m gza.tools.verify_phase)
+else
+    VERIFY_PHASE_CMD=(uv run python -m gza.tools.verify_phase)
 fi
-
-run_tool() {
-    if [[ "$USE_VENV" -eq 1 ]]; then
-        "$@"
-    else
-        uv run "$@"
-    fi
-}
-
-run_python_module() {
-    if [[ "$USE_VENV" -eq 1 ]]; then
-        python -m "$@"
-    else
-        uv run python -m "$@"
-    fi
-}
-
-run_pytest() {
-    if [[ "$USE_VENV" -eq 1 ]]; then
-        pytest "$@"
-    else
-        uv run pytest "$@"
-    fi
-}
-
-current_tree_fingerprint() {
-    if [[ "$USE_VENV" -eq 1 ]]; then
-        python - <<'PY' 2>/dev/null
-from pathlib import Path
-
-from gza.git import Git
-from gza.runner import _compute_tree_fingerprint
-
-print(_compute_tree_fingerprint(Git(Path.cwd())) or "")
-PY
-    else
-        uv run python - <<'PY' 2>/dev/null
-from pathlib import Path
-
-from gza.git import Git
-from gza.runner import _compute_tree_fingerprint
-
-print(_compute_tree_fingerprint(Git(Path.cwd())) or "")
-PY
-    fi
-}
-
-emit_phase_result() {
-    local status="$1"
-    local phase_name="$2"
-    local duration_seconds="$3"
-    local tree_fingerprint
-
-    tree_fingerprint="$(current_tree_fingerprint)"
-    if [[ "$tree_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
-        echo "gza-verify phase=${status} name=${phase_name} duration_seconds=${duration_seconds}.0 tree_fingerprint=${tree_fingerprint}"
-        return
-    fi
-
-    echo "gza-verify phase=${status} name=${phase_name} duration_seconds=${duration_seconds}.0"
-}
 
 run_phase() {
     local phase_name="$1"
     shift
-    local start_seconds
-    local end_seconds
-    local duration_seconds
-    start_seconds=$(date +%s)
-    echo "gza-verify phase=start name=${phase_name}"
-    if "$@"; then
-        end_seconds=$(date +%s)
-        duration_seconds=$((end_seconds - start_seconds))
-        emit_phase_result passed "${phase_name}" "${duration_seconds}"
-    else
-        local status=$?
-        end_seconds=$(date +%s)
-        duration_seconds=$((end_seconds - start_seconds))
-        emit_phase_result failed "${phase_name}" "${duration_seconds}"
-        return "$status"
-    fi
+    "${VERIFY_PHASE_CMD[@]}" "${phase_name}" -- "$@"
 }
 
 echo "verify: mode=$([[ "$QUICK_MODE" -eq 1 ]] && echo quick || echo full) cores=$CORES xdist_workers=$PYTEST_XDIST_WORKERS faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}s use_venv=$USE_VENV"
@@ -133,10 +61,19 @@ if [[ "$QUICK_MODE" -eq 1 ]]; then
         exit 2
     fi
 
-    run_phase ruff run_tool ruff check src/gza/
-    run_phase checks run_python_module checks
+    if [[ "$USE_VENV" -eq 1 ]]; then
+        run_phase ruff ruff check src/gza/
+        run_phase checks python -m checks
+    else
+        run_phase ruff uv run ruff check src/gza/
+        run_phase checks uv run python -m checks
+    fi
     if [[ "${#TARGET_ARGS[@]}" -gt 0 ]]; then
-        run_phase targeted_pytest run_pytest "${TARGET_ARGS[@]}" -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+        if [[ "$USE_VENV" -eq 1 ]]; then
+            run_phase targeted_pytest pytest "${TARGET_ARGS[@]}" -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+        else
+            run_phase targeted_pytest uv run pytest "${TARGET_ARGS[@]}" -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+        fi
     else
         echo "quick verify: no targeted pytest args supplied; skipping pytest phase"
     fi
@@ -147,13 +84,28 @@ if [[ "${#TARGET_ARGS[@]}" -gt 0 ]]; then
     usage
 fi
 
-run_phase ruff run_tool ruff check src/gza/
-run_phase ty run_tool ty check src/gza/
-run_phase mypy run_tool mypy src/gza/
-run_phase checks run_python_module checks
+if [[ "$USE_VENV" -eq 1 ]]; then
+    run_phase ruff ruff check src/gza/
+    run_phase ty ty check src/gza/
+    run_phase mypy mypy src/gza/
+    run_phase checks python -m checks
+else
+    run_phase ruff uv run ruff check src/gza/
+    run_phase ty uv run ty check src/gza/
+    run_phase mypy uv run mypy src/gza/
+    run_phase checks uv run python -m checks
+fi
 run_phase unit ./bin/test-latency --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-run_phase functional run_pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+if [[ "$USE_VENV" -eq 1 ]]; then
+    run_phase functional pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+else
+    run_phase functional uv run pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+fi
 
 if [[ "$RUN_INTEGRATION" -eq 1 ]]; then
-    run_phase integration run_pytest tests_integration -xv
+    if [[ "$USE_VENV" -eq 1 ]]; then
+        run_phase integration pytest tests_integration -xv
+    else
+        run_phase integration uv run pytest tests_integration -xv
+    fi
 fi
