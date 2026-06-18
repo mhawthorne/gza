@@ -71,7 +71,6 @@ FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
         "retryable-provider-error",
     }
 )
-ALLOW_NOOP_IMPROVE_TAG = "allow-noop-improve"
 DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
 REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS = 3
 
@@ -199,7 +198,6 @@ class AdvanceContext:
     active_improve_pending: DbTask | None = None
     latest_noop_improve: DbTask | None = None
     consecutive_noop_improves: int = 0
-    noop_improve_allowed: bool = False
     noop_improve_trigger: str | None = None
     duplicate_blocker_streak: DuplicateBlockerStreak | None = None
     has_improve_after_review: bool = False
@@ -784,10 +782,7 @@ def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> 
 def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
     if ctx.latest_noop_improve is None or ctx.consecutive_noop_improves <= 0:
         return ""
-    suffix = f"; previous no-op improve {_task_id(ctx.latest_noop_improve)} made no tracked diff change"
-    if ctx.noop_improve_allowed:
-        suffix += f" and `{ALLOW_NOOP_IMPROVE_TAG}` allows continuing"
-    return suffix
+    return f"; previous no-op improve {_task_id(ctx.latest_noop_improve)} made no tracked diff change"
 
 
 def _needs_attention_subject_id(ctx: AdvanceContext) -> str | None:
@@ -801,13 +796,12 @@ def _needs_attention_subject_id(ctx: AdvanceContext) -> str | None:
 def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
     latest_noop_id = _task_id(ctx.latest_noop_improve)
     source = "unresolved comments remain open after" if ctx.noop_improve_trigger == "comments" else "review feedback remains unresolved after"
-    opt_out_note = f" Tag `{ALLOW_NOOP_IMPROVE_TAG}` to continue automation anyway." if not ctx.noop_improve_allowed else ""
     return with_needs_attention(
         {
             "type": "needs_discussion",
             "description": (
                 f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
-                f"(latest {latest_noop_id}); {source} no tracked diff change.{opt_out_note}"
+                f"(latest {latest_noop_id}); {source} no tracked diff change."
             ),
         },
         reason="improve-no-op",
@@ -834,8 +828,7 @@ def _verify_blocked_no_code_issues_action(ctx: AdvanceContext) -> dict[str, Any]
 def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
     """Park a no-op loop unless runner-owned verify evidence has already cleared it."""
     if (
-        not ctx.noop_improve_allowed
-        and ctx.review_verdict == "CHANGES_REQUESTED"
+        ctx.review_verdict == "CHANGES_REQUESTED"
         and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
         and ctx.active_improve_running is None
         and ctx.active_improve_pending is None
@@ -1746,7 +1739,6 @@ def _resolve_review_state(
     DbTask | None,
     DbTask | None,
     int,
-    bool,
     str | None,
     bool,
     bool,
@@ -1776,7 +1768,6 @@ def _resolve_review_state(
     active_improve_pending: DbTask | None = None
     latest_noop_improve: DbTask | None = None
     consecutive_noop_improves = 0
-    noop_improve_allowed = False
     noop_improve_trigger: str | None = None
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
@@ -1815,12 +1806,6 @@ def _resolve_review_state(
         active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
         latest_noop_improve, consecutive_noop_improves = _count_consecutive_noop_improves(improve_tasks)
-        latest_completed_improve = next((t for t in improve_tasks if t.status == "completed"), None)
-        noop_improve_allowed = (
-            _has_tag(task, ALLOW_NOOP_IMPROVE_TAG)
-            or _has_tag(latest_completed_review, ALLOW_NOOP_IMPROVE_TAG)
-            or _has_tag(latest_completed_improve, ALLOW_NOOP_IMPROVE_TAG)
-        )
 
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
             has_improve_after_review = (
@@ -1876,7 +1861,6 @@ def _resolve_review_state(
         active_improve_pending,
         latest_noop_improve,
         consecutive_noop_improves,
-        noop_improve_allowed,
         noop_improve_trigger,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
@@ -2384,7 +2368,6 @@ def resolve_advance_context(
         active_improve_pending,
         latest_noop_improve,
         consecutive_noop_improves,
-        noop_improve_allowed,
         noop_improve_trigger,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
@@ -2428,7 +2411,6 @@ def resolve_advance_context(
         active_improve_pending=active_improve_pending,
         latest_noop_improve=latest_noop_improve,
         consecutive_noop_improves=consecutive_noop_improves,
-        noop_improve_allowed=noop_improve_allowed,
         noop_improve_trigger=noop_improve_trigger,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
@@ -3079,8 +3061,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="fresh_comments_noop_improve_limit",
         matches=lambda ctx: ctx.task_type == "implement"
         and ctx.noop_improve_trigger == "comments"
-        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
-        and not ctx.noop_improve_allowed,
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles,
         action=_noop_improve_limit_action,
     ),
     AdvanceRule(
@@ -3132,8 +3113,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and ctx.review_verdict == "CHANGES_REQUESTED"
         and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
         and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None
-        and not ctx.noop_improve_allowed,
+        and ctx.active_improve_pending is None,
         action=_noop_improve_limit_action,
     ),
     AdvanceRule(

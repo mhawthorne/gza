@@ -4108,13 +4108,14 @@ def test_threshold_reached_with_pending_improve_still_runs(tmp_path: Path, monke
     assert pending_improve.id in action["description"]
 
 
-def test_allow_noop_improve_tag_bypasses_stop_rule(tmp_path: Path, monkeypatch) -> None:
+def test_legacy_noop_override_tag_is_inert_at_noop_limit(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    legacy_tag = "allow" + "-noop-improve"
 
-    impl = store.add("Implement feature", task_type="implement", tags=("allow-noop-improve",))
+    impl = store.add("Implement feature", task_type="implement", tags=(legacy_tag,))
     assert impl.id is not None
     impl.status = "completed"
     impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
@@ -4150,8 +4151,8 @@ def test_allow_noop_improve_tag_bypasses_stop_rule(tmp_path: Path, monkeypatch) 
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "improve"
-    assert "allow-noop-improve" in action["description"]
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_legacy_unknown_changed_diff_does_not_trigger_noop_stop_rule(tmp_path: Path, monkeypatch) -> None:
@@ -6353,7 +6354,6 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         latest_noop_improve=noop_improve,
         consecutive_noop_improves=2,
         max_noop_improve_cycles=2,
-        noop_improve_allowed=False,
         noop_improve_trigger="comments",
         duplicate_blocker_streak=SimpleNamespace(
             cycles=3,

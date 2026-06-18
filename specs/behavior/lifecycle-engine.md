@@ -193,8 +193,8 @@ When a current review exists for the implementation lineage:
   condition. When the review-time runner verify PASSED, or no runner-owned review verify
   exists, the blocker is treated as a genuine code issue and still requires a real code
   change before merge.
-- Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
-  `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`).
+- Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` →
+  `needs_discussion` (reason `improve-no-op`).
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the

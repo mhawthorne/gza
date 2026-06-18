@@ -3959,27 +3959,9 @@ def _resolve_impl_ancestor(store: SqliteTaskStore, task: Task) -> Task | None:
     return None
 
 
-def _task_has_tag(task: Task | None, tag: str) -> bool:
-    """Return whether a task carries the given tag."""
-    return task is not None and tag in task.tags
-
-
-def _noop_improve_warning_text(
-    store: SqliteTaskStore,
-    task: Task,
-    impl_ancestor: Task | None,
-) -> str:
+def _noop_improve_warning_text() -> str:
     """Build explicit operator-facing warning text for a no-op improve."""
-    review_task = store.get(task.depends_on) if task.depends_on is not None else None
-    opt_out = (
-        _task_has_tag(impl_ancestor, "allow-noop-improve")
-        or _task_has_tag(review_task, "allow-noop-improve")
-        or _task_has_tag(task, "allow-noop-improve")
-    )
-    warning = "Improve completed with no tracked diff change."
-    if opt_out:
-        warning += " Tag `allow-noop-improve` is present, so continuation is explicitly allowed."
-    return warning
+    return "Improve completed with no tracked diff change."
 
 
 def _resolved_merge_state_for_task(store: SqliteTaskStore, task: Task) -> str | None:
@@ -6925,7 +6907,7 @@ def _post_complete_code_task(
     console.print("")
     if task.task_type == "improve" and improve_changed_diff is not None:
         if improve_changed_diff is False:
-            console.print(f"[yellow]Warning: {_noop_improve_warning_text(store, task, impl_ancestor)}[/yellow]")
+            console.print(f"[yellow]Warning: {_noop_improve_warning_text()}[/yellow]")
         changed_diff_text = (
             "yes (tracked improve diff changed or comparison unavailable)"
             if improve_changed_diff

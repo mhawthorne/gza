@@ -10980,19 +10980,16 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at == datetime(2026, 5, 11, 9, 30, tzinfo=UTC)
 
-    def test_post_complete_noop_improve_warning_mentions_allow_noop_opt_out(
+    def test_post_complete_noop_improve_warning_omits_removed_allow_noop_tag(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
+        legacy_tag = "allow" + "-noop-improve"
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        impl = store.add(
-            prompt="Implement with review",
-            task_type="implement",
-            tags=("allow-noop-improve",),
-        )
+        impl = store.add(prompt="Implement with review", task_type="implement")
         impl.status = "completed"
         impl.branch = "feature/noop-opt-out"
         store.update(impl)
@@ -11037,7 +11034,7 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         output = capsys.readouterr().out
         assert "Warning: Improve completed with no tracked diff change." in output
-        assert "allow-noop-improve" in output
+        assert legacy_tag not in output
 
     def test_post_complete_improve_gh_unavailable_still_runs_auto_review_without_noise(
         self,

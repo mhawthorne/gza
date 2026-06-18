@@ -178,7 +178,7 @@ def test_advance_workflow_has_single_noop_improve_limit_row() -> None:
 
     condition = (
         "| Consecutive completed no-op improves for the latest `(impl, review)` pair >= "
-        "`max_noop_improve_cycles`, lineage is not tagged `allow-noop-improve` |"
+        "`max_noop_improve_cycles` |"
     )
     action = (
         "`needs_discussion` — reason=`improve-no-op`; stop repeated no-op improve loops "
