@@ -41,7 +41,7 @@ Output contract:
   - `depends_on_slices`
   - `based_on_slice`
   - `review_scope`
-  - `estimated_complexity`
+  - `estimated_complexity` (`large`, `medium`, or `small`)
   - `expected_timeout_minutes`
   - `requires_code_review`
   - `tags`

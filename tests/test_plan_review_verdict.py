@@ -196,9 +196,36 @@ class TestValidatePlanReviewReport:
         assert validated is not None
         assert validated.slices[0].estimated_complexity == estimated_complexity
 
-    def test_rejects_out_of_enum_estimated_complexity(self) -> None:
+    @pytest.mark.parametrize(
+        ("estimated_complexity", "expected_complexity"),
+        [
+            ("high", "large"),
+            ("  HIGH  ", "large"),
+            ("low", "small"),
+            (" Low ", "small"),
+        ],
+    )
+    def test_coerces_common_estimated_complexity_synonyms(
+        self,
+        estimated_complexity: str,
+        expected_complexity: str,
+    ) -> None:
         manifest = copy.deepcopy(_base_manifest())
-        manifest["slices"][0]["estimated_complexity"] = "high"
+        manifest["slices"][0]["estimated_complexity"] = estimated_complexity
+
+        validated = validate_plan_review_report(
+            _report_for_manifest(manifest),
+            source_task_id="gza-123",
+            source_task_type="plan",
+            max_slice_timeout_minutes=45,
+        )
+
+        assert validated is not None
+        assert validated.slices[0].estimated_complexity == expected_complexity
+
+    def test_rejects_unknown_estimated_complexity(self) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        manifest["slices"][0]["estimated_complexity"] = "tiny"
 
         with pytest.raises(
             PlanReviewValidationError,
