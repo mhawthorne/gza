@@ -533,7 +533,9 @@ class TestPromptBuilderBuild:
         assert "Treat `45` minutes as the target maximum per slice." in result
         assert "`depends_on_slices` may contain at most one earlier slice ID" in result
         assert "`scope`, `out_of_scope`, `acceptance_criteria`, `depends_on_slices`, and `tags` must be JSON arrays of strings" in result
+        assert "Every slice's `estimated_complexity` must be exactly one of: `large`, `medium`, `small`." in result
         assert '"scope": ["Touch parser only", "Add manifest coercion helper"]' in result
+        assert '"estimated_complexity": "small"' in result
 
     def test_build_plan_review_type_with_plan_improve_source_includes_exact_source_identity(
         self, tmp_path: Path

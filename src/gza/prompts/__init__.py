@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from gza.plan_review_verdict import SLICE_COMPLEXITIES
 from gza.project_discovery import discover_repo_project_configs
 
 if TYPE_CHECKING:
@@ -194,6 +195,7 @@ class PromptBuilder:
                         if config.max_plan_slices is not None
                         else "unset"
                     ),
+                    slice_complexities=", ".join(f"`{value}`" for value in sorted(SLICE_COMPLEXITIES)),
                 )
         elif task.task_type == "plan_improve":
             if report_path:

@@ -26,7 +26,7 @@ _HEADING_PATTERN = re.compile(r"^(#{2,6})\s+(.+?)\s*$", re.MULTILINE)
 _JSON_FENCE_PATTERN = re.compile(r"```json\s*\n(.*?)\n```", re.IGNORECASE | re.DOTALL)
 _SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
 _SOURCE_TASK_TYPES = frozenset({"plan", "plan_improve"})
-_SLICE_COMPLEXITIES = frozenset({"small", "medium", "large"})
+SLICE_COMPLEXITIES = frozenset({"small", "medium", "large"})
 
 
 class PlanReviewValidationError(ValueError):
@@ -480,9 +480,9 @@ def _parse_slice(value: object) -> PlanReviewSlice:
         value.get("estimated_complexity"),
         f"slice {slice_id}.estimated_complexity",
     )
-    if estimated_complexity not in _SLICE_COMPLEXITIES:
+    if estimated_complexity not in SLICE_COMPLEXITIES:
         raise PlanReviewValidationError(
-            f"slice {slice_id}.estimated_complexity must be one of {sorted(_SLICE_COMPLEXITIES)}"
+            f"slice {slice_id}.estimated_complexity must be one of {sorted(SLICE_COMPLEXITIES)}"
         )
     expected_timeout_minutes = _require_positive_int(
         value.get("expected_timeout_minutes"),

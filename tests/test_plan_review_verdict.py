@@ -7,6 +7,7 @@ import pytest
 
 from gza.plan_review_verdict import (
     PlanReviewValidationError,
+    SLICE_COMPLEXITIES,
     parse_plan_review_report,
     parse_plan_review_verdict,
     validate_plan_review_report,
@@ -179,6 +180,36 @@ class TestValidatePlanReviewReport:
         assert validated is not None
         assert validated.slices[0].scope == ("Add task types",)
         assert validated.slices[0].out_of_scope == ("Lifecycle rule changes",)
+
+    @pytest.mark.parametrize("estimated_complexity", sorted(SLICE_COMPLEXITIES))
+    def test_accepts_each_allowed_estimated_complexity(self, estimated_complexity: str) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        manifest["slices"][0]["estimated_complexity"] = estimated_complexity
+
+        validated = validate_plan_review_report(
+            _report_for_manifest(manifest),
+            source_task_id="gza-123",
+            source_task_type="plan",
+            max_slice_timeout_minutes=45,
+        )
+
+        assert validated is not None
+        assert validated.slices[0].estimated_complexity == estimated_complexity
+
+    def test_rejects_out_of_enum_estimated_complexity(self) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        manifest["slices"][0]["estimated_complexity"] = "high"
+
+        with pytest.raises(
+            PlanReviewValidationError,
+            match=r"slice S1\.estimated_complexity must be one of",
+        ):
+            validate_plan_review_report(
+                _report_for_manifest(manifest),
+                source_task_id="gza-123",
+                source_task_type="plan",
+                max_slice_timeout_minutes=45,
+            )
 
     @pytest.mark.parametrize(
         ("mutate", "message"),
