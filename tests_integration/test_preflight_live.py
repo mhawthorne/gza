@@ -1,4 +1,4 @@
-"""Functional live tests for the `gza preflight` provider/model round-trip."""
+"""Integration live tests for the `gza preflight` provider/model round-trip."""
 
 import os
 import pwd
@@ -27,7 +27,7 @@ def _restore_codex_home_if_needed(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOME", str(home_dir))
 
 
-@pytest.mark.functional
+@pytest.mark.integration
 @pytest.mark.timeout(30, method="signal")
 @pytest.mark.skipif(not has_codex_credentials(), reason="Codex credentials not available")
 @pytest.mark.skipif(not has_codex_cli(), reason="Codex CLI not installed")

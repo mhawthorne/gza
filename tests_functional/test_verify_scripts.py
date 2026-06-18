@@ -108,9 +108,9 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     assert result.returncode == 0, result.stderr
     assert "use_venv=1" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert "python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2" in tool_invocations
+    assert "python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
-        "pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2"
+        "pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
     )
     assert uv_log.read_text(encoding="utf-8") == ""
@@ -141,8 +141,52 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     assert result.returncode == 0, result.stderr
     assert "use_venv=0" in result.stdout
     uv_invocations = uv_log.read_text(encoding="utf-8")
-    assert "uv run python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2" in uv_invocations
-    assert "uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=2" in uv_invocations
+    assert "uv run python -m gza.test_latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+    assert "uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_full_verify_only_runs_integration_suite_with_integration_flag(tmp_path: Path) -> None:
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    tool_log = fixture_root / "venv-tools.log"
+
+    venv_bin = fixture_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    _write_fake_venv_python(venv_bin / "python", tool_log)
+    for tool_name in ("ruff", "ty", "mypy", "pytest"):
+        _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
+
+    env = os.environ.copy()
+    env["PYTEST_XDIST_WORKERS"] = "3"
+
+    default_result = subprocess.run(
+        ["bash", "bin/tests"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert default_result.returncode == 0, default_result.stderr
+    default_invocations = tool_log.read_text(encoding="utf-8")
+    assert "pytest tests_functional/ -n 3 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in default_invocations
+    assert "pytest tests_integration -xv" not in default_invocations
+
+    tool_log.write_text("", encoding="utf-8")
+
+    integration_result = subprocess.run(
+        ["bash", "bin/tests", "--integration"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert integration_result.returncode == 0, integration_result.stderr
+    integration_invocations = tool_log.read_text(encoding="utf-8")
+    assert "pytest tests_integration -xv" in integration_invocations
 
 
 @pytest.mark.timeout(30, method="signal")

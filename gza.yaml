@@ -3,6 +3,7 @@
 project_name: gza
 
 verify_command: './bin/tests'
+autonomous_verify_timeout_seconds: 300
 docker_setup_command: 'uv sync'
 
 branch_strategy: date_slug
