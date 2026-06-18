@@ -29,6 +29,7 @@ from gza.providers.base import (
     _get_default_dockerfile_content,
     _get_file_sha256,
     _get_image_created_time,
+    _looks_like_docker_crash,
     build_docker_cmd,
     classify_provider_api_error,
     ensure_docker_image,
@@ -149,6 +150,51 @@ def test_codex_provider_error_type_classifies_forked_agent_diagnostic_as_retryab
     }
 
     assert _codex_provider_error_type(event) == "retryable_provider_error"
+
+
+def test_looks_like_docker_crash_matches_empty_turn_launcher_exit(tmp_path: Path) -> None:
+    conversation_log = tmp_path / "task.log"
+    ops_log = tmp_path / "task.ops.jsonl"
+    conversation_log.write_text(
+        json.dumps({"type": "thread.started", "thread_id": "thread_123"}) + "\n"
+        + json.dumps({"type": "turn.started"}) + "\n",
+        encoding="utf-8",
+    )
+    ops_log.write_text("", encoding="utf-8")
+
+    assert _looks_like_docker_crash(137, ops_log, conversation_log) is True
+
+
+@pytest.mark.parametrize("exit_code", [125, 137])
+def test_looks_like_docker_crash_matches_daemon_error_output(tmp_path: Path, exit_code: int) -> None:
+    conversation_log = tmp_path / "task.log"
+    ops_log = tmp_path / "task.ops.jsonl"
+    conversation_log.write_text("", encoding="utf-8")
+    ops_log.write_text(
+        json.dumps(
+            {
+                "type": "gza",
+                "subtype": "process_output",
+                "provider_output": "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _looks_like_docker_crash(exit_code, ops_log, conversation_log) is True
+
+
+def test_looks_like_docker_crash_preserves_timeout_exit_code(tmp_path: Path) -> None:
+    conversation_log = tmp_path / "task.log"
+    ops_log = tmp_path / "task.ops.jsonl"
+    conversation_log.write_text("", encoding="utf-8")
+    ops_log.write_text(
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n",
+        encoding="utf-8",
+    )
+
+    assert _looks_like_docker_crash(124, ops_log, conversation_log) is False
 
 
 class TestDockerConfig:
@@ -1377,6 +1423,7 @@ class TestCodexGitRepoCheckBypass:
 
         cmd = mock_run_parse.call_args[0][0]
         assert "--skip-git-repo-check" in cmd
+        assert mock_run_parse.call_args.kwargs["docker_backed"] is True
 
     def test_codex_direct_includes_skip_git_repo_check(self, tmp_path):
         """Direct codex exec command should include --skip-git-repo-check."""
@@ -1394,6 +1441,7 @@ class TestCodexGitRepoCheckBypass:
 
         cmd = mock_run_parse.call_args[0][0]
         assert "--skip-git-repo-check" in cmd
+        assert mock_run_parse.call_args.kwargs.get("docker_backed", False) is False
 
 
 class TestGeminiHeadlessTrust:
@@ -4591,6 +4639,77 @@ class TestCodexOutputParsing:
             )
 
         assert result.error_type == "config_error"
+
+    def test_classifies_docker_daemon_crash_as_infrastructure_error(self, tmp_path):
+        """Codex Docker launcher failures with no agent activity should be retryable infra errors."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        json_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread_123"}) + "\n",
+            json.dumps({"type": "turn.started"}) + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 125
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["docker", "run", "--rm", "codex"],
+                log_file=log_file,
+                timeout_minutes=30,
+                docker_backed=True,
+            )
+
+        assert result.error_type == "infrastructure_error"
+
+    def test_classifies_zero_output_docker_launcher_failure_as_infrastructure_error(self, tmp_path):
+        """Codex should classify Docker launcher exits even when the provider emitted nothing."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 125
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["docker", "run", "--rm", "codex"],
+                log_file=log_file,
+                timeout_minutes=30,
+                docker_backed=True,
+            )
+
+        assert result.error_type == "infrastructure_error"
+        assert log_file.exists()
+        assert log_file.stat().st_size == 0
+
+    def test_does_not_classify_zero_output_direct_launcher_failure_as_infrastructure_error(self, tmp_path):
+        """Direct Codex exits must not inherit the Docker-only crash classifier."""
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(())
+            mock_process.wait.return_value = None
+            mock_process.returncode = 125
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.error_type is None
+        assert log_file.exists()
+        assert log_file.stat().st_size == 0
 
     def test_new_turn_tool_substep_does_not_attach_to_previous_step(self, tmp_path):
         """Tool items before the next message should attach to the new turn's step."""

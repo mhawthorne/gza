@@ -124,6 +124,28 @@ def test_resolve_failure_reason_maps_provider_error_types() -> None:
             log_file=None,
         ) == "RETRYABLE_PROVIDER_ERROR"
     )
+    assert (
+        resolve_failure_reason(
+            error_type="infrastructure_error",
+            exit_code=125,
+            log_file=None,
+        ) == "INFRASTRUCTURE_ERROR"
+    )
+
+
+def test_resolve_failure_reason_prefers_infrastructure_error_before_log_fallback(tmp_path: Path) -> None:
+    log_file = tmp_path / "task.log"
+    log_file.write_text("", encoding="utf-8")
+
+    assert (
+        resolve_failure_reason(
+            error_type="infrastructure_error",
+            exit_code=137,
+            log_file=log_file,
+            fallback_to_log=True,
+        )
+        == "INFRASTRUCTURE_ERROR"
+    )
 
 
 def test_resolve_failure_reason_log_fallback_preserves_config_error(tmp_path: Path) -> None:

@@ -91,6 +91,8 @@ def resolve_failure_reason(
         return "PROVIDER_UNAVAILABLE"
     if error_type == "retryable_provider_error":
         return "RETRYABLE_PROVIDER_ERROR"
+    if error_type == "infrastructure_error":
+        return "INFRASTRUCTURE_ERROR"
     if fallback_to_log and log_file is not None:
         return _extract_log_fallback_failure_reason(log_file)
     return "UNKNOWN"

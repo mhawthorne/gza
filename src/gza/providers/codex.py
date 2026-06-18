@@ -19,6 +19,7 @@ from .base import (
     PreflightCheckResult,
     Provider,
     RunResult,
+    _looks_like_docker_crash,
     build_docker_cmd,
     classify_provider_api_error,
     ensure_docker_image,
@@ -937,6 +938,7 @@ class CodexProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            docker_backed=True,
         )
 
     def _run_direct(
@@ -1028,6 +1030,7 @@ class CodexProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        docker_backed: bool = False,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
         conversation_log_file = log_file
@@ -1217,6 +1220,14 @@ class CodexProvider(Provider):
             # Store session ID for resume capability
             if "thread_id" in accumulated:
                 result.session_id = accumulated["thread_id"]
+
+        if (
+            docker_backed
+            and result.exit_code != 0
+            and result.error_type is None
+            and _looks_like_docker_crash(result.exit_code, ops_log_file, conversation_log_file)
+        ):
+            result.error_type = "infrastructure_error"
 
         return result
 

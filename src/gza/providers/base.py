@@ -91,6 +91,13 @@ _PROVIDER_CONFIG_ERROR_MESSAGE_SNIPPETS = (
     "does not exist",
     "invalid model",
 )
+_DOCKER_DAEMON_ERROR_SNIPPETS = (
+    "cannot connect to the docker daemon",
+    "error during connect",
+    "docker: error response from daemon",
+    "is the docker daemon running",
+)
+_DOCKER_CRASH_EXIT_CODES = frozenset({125, 126, 127, 137})
 
 
 @dataclass
@@ -452,6 +459,38 @@ def is_docker_running() -> bool:
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
+
+
+def _looks_like_docker_crash(
+    exit_code: int | None,
+    ops_log_file: Path | None,
+    conversation_log_file: Path | None,
+) -> bool:
+    """Return whether a non-timeout Docker launch/run likely died with daemon issues."""
+    if exit_code == 124:
+        return False
+
+    ops_text = ""
+    if ops_log_file is not None:
+        try:
+            ops_text = ops_log_file.read_text(encoding="utf-8", errors="replace").casefold()
+        except OSError:
+            ops_text = ""
+    if ops_text and any(snippet in ops_text for snippet in _DOCKER_DAEMON_ERROR_SNIPPETS):
+        return True
+
+    if exit_code not in _DOCKER_CRASH_EXIT_CODES or conversation_log_file is None:
+        return False
+
+    try:
+        if conversation_log_file.stat().st_size == 0:
+            return True
+    except OSError:
+        return False
+
+    from ..runner import _log_has_empty_turn_signature
+
+    return _log_has_empty_turn_signature(conversation_log_file)
 
 
 def _tail(text: str, max_chars: int = 2000) -> str:
