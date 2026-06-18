@@ -6569,10 +6569,13 @@ class TestImproveCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        # Run improve command without --queue (will attempt to run)
-        result = invoke_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
+        # Run improve command without --queue. Stub the foreground worker because
+        # this test only cares that the default path attempts immediate execution.
+        with patch("gza.cli._run_foreground", return_value=0):
+            result = invoke_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the improve task was created and run was attempted
+        assert result.returncode == 0
         assert "Created improve task " in result.stdout
         assert "Running improve task " in result.stdout
 

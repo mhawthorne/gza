@@ -145,18 +145,13 @@ def test_monorepo_project_boundary_flow(tmp_path: Path) -> None:
     assert allowed_task.branch is not None
     assert git.count_commits_ahead(allowed_task.branch, "main") == 1
 
-    edit_result = run_gza_subprocess(
-        "edit",
-        str(blocked.id),
-        "--add-tag",
-        "cross-project",
-        "--project",
-        str(project_dir),
-        cwd=project_dir,
-        env=env,
-        timeout=60,
-    )
-    assert edit_result.returncode == 0, edit_result.stderr
+    # The cross-project retry path is already covered elsewhere; set the tag
+    # directly here so this end-to-end scope test only pays for the commands it
+    # actually needs to exercise.
+    blocked_task = store.get(blocked.id)
+    assert blocked_task is not None
+    blocked_task.tags = ("cross-project",)
+    store.update(blocked_task)
 
     retry_result = run_gza_subprocess(
         "retry",

@@ -59,7 +59,7 @@ def _write_timeout_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     return parent_script, child_script, pid_file, lock_file
 
 
-def _wait_for_file(path: Path, *, timeout_seconds: float = 2.0) -> None:
+def _wait_for_file(path: Path, *, timeout_seconds: float = 1.0) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if path.exists() and path.read_text(encoding="utf-8").strip():
@@ -88,7 +88,7 @@ def _child_lock_held(lock_file: Path) -> bool:
         return False
 
 
-def _wait_for_process_exit(pid: int, *, timeout_seconds: float = 2.0) -> bool:
+def _wait_for_process_exit(pid: int, *, timeout_seconds: float = 1.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if not _process_exists(pid):
@@ -97,7 +97,7 @@ def _wait_for_process_exit(pid: int, *, timeout_seconds: float = 2.0) -> bool:
     return not _process_exists(pid)
 
 
-def _wait_for_lock_release(lock_file: Path, *, timeout_seconds: float = 2.0) -> bool:
+def _wait_for_lock_release(lock_file: Path, *, timeout_seconds: float = 1.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if lock_file.exists() and not _child_lock_held(lock_file):
@@ -223,7 +223,7 @@ def test_parent_only_sigterm_control_leaves_descendant_alive(tmp_path: Path) -> 
         _wait_for_file(pid_file)
         child_pid = int(pid_file.read_text(encoding="utf-8").strip())
         os.kill(process.pid, signal.SIGTERM)
-        process.wait(timeout=1.0)
+        process.wait(timeout=0.5)
         assert _process_exists(child_pid), "portable PID probe should catch a surviving descendant"
         assert _child_lock_held(lock_file), "child lock should still be held when only the parent dies"
     finally:
@@ -257,11 +257,11 @@ def test_run_review_verify_command_forces_kill_when_inherited_pipe_descendant_su
     result = _run_review_verify_command(
         verify_command,
         cwd=tmp_path,
-        timeout_seconds=1,
-        timeout_grace_seconds=0.2,
+        timeout_seconds=0.2,
+        timeout_grace_seconds=0.1,
     )
 
     assert result.status == "failed"
     assert result.exit_status == "timed out"
-    assert "sent SIGTERM, waited 0.2s, then sent SIGKILL" in (result.output or "")
+    assert "sent SIGTERM, waited 0.1s, then sent SIGKILL" in (result.output or "")
     assert _wait_for_lock_release(lock_file), "child lock should release after timeout kill"
