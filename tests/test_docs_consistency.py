@@ -122,6 +122,26 @@ def test_practices_document_gitignored_derived_artifacts_as_non_blockers() -> No
         assert snippet in practices_content
 
 
+def test_practices_document_verify_timeout_diagnostics_recipe() -> None:
+    """Internal practices should describe the verify-command SIGTERM diagnostic contract."""
+    repo_root = Path(__file__).resolve().parents[1]
+    practices_content = (repo_root / "docs" / "internal" / "practices.md").read_text()
+
+    required_snippets = [
+        "## Verify commands must flush diagnostics on timeout",
+        "The lifecycle runner sends",
+        "SIGTERM to the verify process group before escalating to SIGKILL",
+        "emits a slow-test summary during normal operation",
+        "faulthandler.register(signal.SIGTERM, chain=True)",
+        "unit and functional pytest",
+        "register_sigterm_faulthandler()` helper at",
+        "python -m gza.test_latency",
+        "summary before re-raising termination",
+    ]
+    for snippet in required_snippets:
+        assert snippet in practices_content
+
+
 def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() -> None:
     """Tracked lifecycle docs/spec should not describe the removed detached no-op reverify path."""
     repo_root = Path(__file__).resolve().parents[1]

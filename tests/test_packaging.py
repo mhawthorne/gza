@@ -177,6 +177,22 @@ def test_unit_test_conftest_uses_millisecond_timeout_override(monkeypatch: pytes
     assert item.markers[0].mark.kwargs == {"method": "signal"}
 
 
+def test_unit_test_conftest_registers_sigterm_faulthandler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tests/conftest.py should enable SIGTERM faulthandler dumps for verify shutdowns."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    calls: list[bool] = []
+
+    def _fake_register() -> bool:
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr("gza.pytest_timeout_diagnostics.register_sigterm_faulthandler", _fake_register)
+
+    _load_module(conftest_path, "tests_timeout_conftest_sigterm")
+
+    assert calls == [True]
+
+
 def test_unit_test_conftest_rejects_boundary_violations(monkeypatch: pytest.MonkeyPatch) -> None:
     """tests/conftest.py should fail collection loudly when shell-backed tests drift into tests/."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
@@ -237,6 +253,25 @@ def test_functional_suite_conftest_registers_sigterm_faulthandler(monkeypatch: p
     _load_module(conftest_path, "tests_functional_sigterm_conftest")
 
     assert calls == [True]
+
+
+def test_pytest_suite_conftests_do_not_register_sigterm_faulthandler_inline() -> None:
+    """Pytest suite conftests should route SIGTERM registration through the shared helper."""
+    repo_root = Path(__file__).resolve().parents[1]
+
+    for relative_path in ("tests/conftest.py", "tests_functional/conftest.py"):
+        conftest_path = repo_root / relative_path
+        conftest = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
+        direct_registrations = [
+            node
+            for node in ast.walk(conftest)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "register"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "faulthandler"
+        ]
+        assert direct_registrations == [], f"{relative_path} should use register_sigterm_faulthandler()"
 
 
 def test_functional_subprocess_timeouts_within_watchdog() -> None:

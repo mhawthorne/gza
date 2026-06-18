@@ -94,6 +94,29 @@ In practice:
 - If the full gate fails, fix the failures and rerun it. Do not keep
   relaunching the full suite after every intermediate edit.
 
+## Verify commands must flush diagnostics on timeout
+
+Autonomous review verification treats timeout diagnostics as part of the
+contract, not optional nice-to-have logging. The lifecycle runner sends
+SIGTERM to the verify process group before escalating to SIGKILL, and it
+persists whatever stdout/stderr the harness flushes during that grace period
+as review evidence.
+
+A good `verify_command` therefore does three things:
+
+- emits a slow-test summary during normal operation for the expensive test
+  phases;
+- registers a SIGTERM-triggered stack dump for in-flight Python tests, for
+  example `faulthandler.register(signal.SIGTERM, chain=True)`;
+- flushes any best-effort summary or other diagnostics before allowing the
+  SIGTERM to terminate the process.
+
+For gza's own harness, that recipe means `./bin/tests` keeps `--durations=25`
+on the unit and functional pytest phases, the unit and functional pytest
+suite conftests call the shared `register_sigterm_faulthandler()` helper at
+import time, and `python -m gza.test_latency --summary` emits its current
+summary before re-raising termination.
+
 ## Gitignored derived artifacts are not review blockers
 
 `.claude/skills/` is installed per-worktree by `gza skills-install` from the
