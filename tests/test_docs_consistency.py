@@ -150,6 +150,10 @@ def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() 
         "overview": (repo_root / "specs" / "behavior" / "00-overview.md").read_text(),
         "lifecycle_engine": (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text(),
     }
+    normalized_docs = {
+        name: " ".join(content.split())
+        for name, content in tracked_docs.items()
+    }
 
     required_snippets = [
         "lifecycle no longer launches a detached fallback verify pass",
@@ -157,7 +161,7 @@ def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() 
         "runner-owned passing verify evidence has already cleared the review",
     ]
     for snippet in required_snippets:
-        assert any(snippet in content for content in tracked_docs.values())
+        assert any(snippet in content for content in normalized_docs.values())
 
     retired_snippets = [
         "safe reverify",
@@ -188,6 +192,25 @@ def test_advance_workflow_has_single_noop_improve_limit_row() -> None:
 
     assert workflow.count(condition) == 1
     assert action in workflow
+
+
+def test_verify_only_noop_improve_contract_does_not_claim_generic_recapture() -> None:
+    """Spec/report text should stay aligned with the narrowed same-head failed-review recapture path."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle_engine = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    behavior_check = (repo_root / "reviews" / "20260618084043-behavior-check.md").read_text()
+    overview = (repo_root / "specs" / "behavior" / "00-overview.md").read_text()
+
+    assert "it re-runs verify for a no-op improve that is eligible to clear a verify-only review" in lifecycle_engine
+    assert "blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when" in lifecycle_engine
+    assert "the current review row already carries runner-owned review-time failure evidence for" in lifecycle_engine
+    assert "the same branch/head." in lifecycle_engine
+    assert "each time it runs a no-op improve" not in lifecycle_engine
+
+    assert "only after that same-head failed-review gate applies" in behavior_check
+    assert "requires runner-owned review-time failure evidence at the same branch/head" in behavior_check
+
+    assert "review FAILED and the no-op improve later PASSED at the same branch head" in overview
 
 
 def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:

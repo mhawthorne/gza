@@ -116,6 +116,7 @@ from .review_scope import resolve_review_scope_for_impl
 from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
 from .review_verdict import (
     compute_review_score,
+    is_verify_blocked_only_review,
     is_verify_timeout_only_review,
     parse_review_report,
     parse_review_template,
@@ -4041,6 +4042,22 @@ def _review_verify_failed_at_head(
     return review_task.review_verify_head_sha == current_head_sha
 
 
+def _review_is_verify_only_blocked_at_head(
+    *,
+    review_task: Task,
+    current_branch: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    """Require a verify-only review plus runner-owned failure evidence for the current head."""
+    if not is_verify_blocked_only_review(review_task.output_content):
+        return False
+    return _review_verify_failed_at_head(
+        review_task=review_task,
+        current_branch=current_branch,
+        current_head_sha=current_head_sha,
+    )
+
+
 def _noop_improve_resolves_verify_only_review(
     *,
     config: Config,
@@ -4060,7 +4077,7 @@ def _noop_improve_resolves_verify_only_review(
     if review_task is None or review_task.task_type != "review" or review_task.status != "completed":
         return False
 
-    if not _review_verify_failed_at_head(
+    if not _review_is_verify_only_blocked_at_head(
         review_task=review_task,
         current_branch=current_branch,
         current_head_sha=current_head_sha,
@@ -4097,7 +4114,7 @@ def _capture_noop_improve_review_verify_result(
         return None
 
     current_head_sha = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
-    if not _review_verify_failed_at_head(
+    if not _review_is_verify_only_blocked_at_head(
         review_task=review_task,
         current_branch=branch_name,
         current_head_sha=current_head_sha,

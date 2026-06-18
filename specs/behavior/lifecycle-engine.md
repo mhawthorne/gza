@@ -182,19 +182,26 @@ When a current review exists for the implementation lineage:
 **Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
 - Review→improve cycles reach `max_review_cycles` → `max_cycles_reached`.
-- Verify-origin review clear invariant. The runner MUST persist its own
-  `verify_command` result each time it runs a review and each time it runs a no-op
-  improve, keyed by branch + head SHA. A review blocker is verify-origin when the
-  runner-owned review-time verify FAILED at the current branch/head; reviewer wording is
-  corroborating only and MUST NOT decide this gate. A verify-origin block MUST be
-  cleared when a later runner-owned verify captured by the no-op improve PASSES at that
-  same branch/head, with durable provenance recorded after the review completed. The
-  engine MUST NOT run a separate isolated detached-worktree verify solely to clear this
-  condition. When the review-time runner verify PASSED, or no runner-owned review verify
-  exists, the blocker is treated as a genuine code issue and still requires a real code
-  change before merge.
-- Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` →
-  `needs_discussion` (reason `improve-no-op`).
+- **A. Verify-only review clear invariant.** A review whose blockers are solely
+  runner-captured `verify_command` failures or timeouts MUST be cleared when the
+  subsequent no-op improve captures a passing `verify_command` in that improve's own
+  worktree at the same committed branch head. The clear MUST require durable provenance
+  recorded after the review completed, with matching branch and head SHA. The runner
+  MUST persist its own `verify_command` result each time it runs a review and each time
+  it re-runs verify for a no-op improve that is eligible to clear a verify-only review
+  blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when
+  the current review row already carries runner-owned review-time failure evidence for
+  the same branch/head. Reviewer wording is corroborating only and MUST NOT decide this
+  gate. The engine MUST NOT run a separate isolated detached-worktree verify solely to
+  clear this condition.
+- Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
+  `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). If current
+  passing in-improve evidence has already cleared the review, normal merge rules apply.
+  Otherwise, if `verify_command` still fails, the evidence is absent, stale, or recorded
+  at a different branch/head, or the blocker is not verify-only, the no-op improve limit
+  MUST park rather than auto-clear. When the review-time runner verify PASSED, or no
+  runner-owned review verify exists, the blocker is treated as a genuine code issue and
+  still requires a real code change before merge.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the
@@ -343,8 +350,8 @@ is a spec change. The accompanying human message is free text.
 | `branch-already-rebased-lineage-incomplete` | needs_discussion | §4 branch contains target tip, lineage unresolved |
 | `stale-review-needs-manual-refresh` | needs_discussion | §5 rebase invalidated review, `advance_create_reviews` off |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
-| `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no runner-owned same-head fail→pass clear |
-| `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound without runner-owned same-head fail→pass clear |
+| `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no current in-improve passing verify evidence clearing the verify-only review |
+| `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound when current in-improve passing verify evidence did not clear the verify-only review |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
 | `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |

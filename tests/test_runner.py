@@ -10176,12 +10176,12 @@ class TestExtractedRunInnerHelpers:
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = (
-            "## Summary\n\n- The code path still looks risky.\n\n"
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
             "## Blockers\n\n"
-            "### B1 Missing error normalization in review output\n"
-            "Evidence: src/gza/foo.py:10 still appears to return raw provider failures.\n"
-            "Impact: callers may still surface inconsistent errors.\n"
-            "Required fix: normalize the failure path, then rerun verification.\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
             "Required tests: rerun verify_command.\n\n"
             "## Follow-Ups\n\nNone.\n\n"
             "## Questions / Assumptions\n\nNone.\n\n"
@@ -10381,12 +10381,12 @@ class TestExtractedRunInnerHelpers:
         review.status = "completed"
         review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
         review.output_content = (
-            "## Summary\n\n- Review still describes this as a code issue.\n\n"
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
             "## Blockers\n\n"
-            "### B1 Missing guard around provider result parsing\n"
-            "Evidence: src/gza/foo.py:10-12 still looks like it assumes the provider returned data.\n"
-            "Impact: malformed provider responses may still break the task.\n"
-            "Required fix: harden the parser path, then rerun verify_command.\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
             "Required tests: rerun verify_command.\n\n"
             "## Follow-Ups\n\nNone.\n\n"
             "## Questions / Assumptions\n\nNone.\n\n"
@@ -10924,6 +10924,194 @@ class TestExtractedRunInnerHelpers:
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
         assert refreshed_impl.review_cleared_at is None
+
+    def test_capture_noop_improve_review_verify_result_skips_non_verify_only_noop_improve(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with substantive review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-substantive-no-recapture"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before no-op improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+        review.output_content = (
+            "## Summary\n\n- Verify passed, but the code issue remains.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing empty-input guard\n"
+            "Evidence: src/gza/foo.py:10-12 indexes the first item before validating input.\n"
+            "Impact: empty selections still raise IndexError.\n"
+            "Required fix: return early when the selection is empty.\n"
+            "Required tests: add an empty-selection regression.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        review.review_verify_status = "passed"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "abc1234"
+        store.update(review)
+
+        improve = store.add(
+            prompt="No-op improve after substantive review",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        config.verify_command = "uv run pytest tests/ -q"
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        with patch("gza.runner._run_review_verify_command") as run_verify:
+            result = _capture_noop_improve_review_verify_result(
+                config=config,
+                store=store,
+                task=improve,
+                worktree_git=worktree_git,
+                branch_name=impl.branch,
+            )
+
+        assert result is None
+        run_verify.assert_not_called()
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status is None
+
+    def test_post_complete_noop_improve_does_not_clear_mixed_review_block_even_after_passing_verify_recapture(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with mixed review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-mixed-review-stays-parked"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before no-op improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+        review.output_content = (
+            "## Summary\n\n- verify_command failed, and the code issue remains.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing empty-input guard\n"
+            "Evidence: src/gza/foo.py:10-12 indexes the first item before validating input.\n"
+            "Impact: empty selections still raise IndexError.\n"
+            "Required fix: return early when the selection is empty, then rerun verify_command.\n"
+            "Required tests: add an empty-selection regression and rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        review.review_verify_status = "failed"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "abc1234"
+        store.update(review)
+
+        improve = store.add(
+            prompt="No-op improve after mixed review",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        improve.slug = "20260618-noop-mixed-review"
+        store.update(improve)
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "verify_command: uv run pytest tests/ -q\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.verify_command = "uv run pytest tests/ -q"
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = tmp_path
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch("gza.runner._capture_noop_improve_review_verify_result", wraps=_capture_noop_improve_review_verify_result) as capture_verify,
+            patch("gza.runner._run_review_verify_command") as run_verify,
+            patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        capture_verify.assert_called_once()
+        run_verify.assert_not_called()
+        sync_branch.assert_not_called()
+        run_review.assert_not_called()
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is None
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status is None
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "cafebabe", impl.branch: "abc1234"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_impl, "main")
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == "improve-no-op"
+
+        output = capsys.readouterr().out
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
     def test_post_complete_noop_improve_preserves_impl_review_state_timestamp(
         self,
