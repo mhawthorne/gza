@@ -2698,7 +2698,7 @@ class TestResumeCommand:
 
     def test_resume_running_in_progress_task_fails(self, tmp_path: Path):
         """Resume command fails for an in_progress task that has a live worker."""
-        import subprocess as sp
+        import os
 
         from gza.workers import WorkerMetadata, WorkerRegistry
 
@@ -2712,28 +2712,22 @@ class TestResumeCommand:
         task.started_at = datetime.now(UTC)
         store.update(task)
 
-        # Spawn a real sleeping process to act as the live worker
-        sleeper = sp.Popen(["sleep", "30"])
-        try:
-            workers_path = tmp_path / ".gza" / "workers"
-            workers_path.mkdir(parents=True, exist_ok=True)
-            registry = WorkerRegistry(workers_path)
-            worker = WorkerMetadata(
-                worker_id="w-test-running",
-                pid=sleeper.pid,
-                task_id=task.id,
-                task_slug=None,
-                started_at=datetime.now(UTC).isoformat(),
-                status="running",
-                log_file=None,
-                worktree=None,
-            )
-            registry.register(worker)
+        workers_path = tmp_path / ".gza" / "workers"
+        workers_path.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_path)
+        worker = WorkerMetadata(
+            worker_id="w-test-running",
+            pid=os.getpid(),
+            task_id=task.id,
+            task_slug=None,
+            started_at=datetime.now(UTC).isoformat(),
+            status="running",
+            log_file=None,
+            worktree=None,
+        )
+        registry.register(worker)
 
-            result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
-        finally:
-            sleeper.kill()
-            sleeper.wait()
+        result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "still running" in result.stdout.lower()

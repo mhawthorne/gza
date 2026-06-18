@@ -339,8 +339,8 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     )
 
 
-def test_unit_suite_keeps_cli_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
-    """Unit tests and test fixtures should keep CLI subprocesses and direct shell commands out."""
+def test_unit_suite_keeps_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
+    """Unit tests and test fixtures should keep subprocesses and direct shell commands out."""
     repo_root = Path(__file__).resolve().parents[1]
     violations = _find_unit_suite_boundary_violations(repo_root / "tests")
 
@@ -439,6 +439,42 @@ def test_unit_suite_boundary_flags_direct_git_subprocess(tmp_path: Path) -> None
 
     assert violations == [
         f"{nested_test}:4 direct git subprocess belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_generic_subprocess_popen(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_background_worker.py"
+    nested_test.write_text(
+        "import subprocess\n\n"
+        "def test_background_worker_probe():\n"
+        "    subprocess.Popen(['sleep', '1'])\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:4 subprocess-backed test belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_subprocess_alias_popen(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_background_worker_alias.py"
+    nested_test.write_text(
+        "import subprocess as sp\n\n"
+        "def test_background_worker_probe():\n"
+        "    sp.Popen(['sleep', '1'])\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:4 subprocess-backed test belongs in tests_functional/"
     ]
 
 

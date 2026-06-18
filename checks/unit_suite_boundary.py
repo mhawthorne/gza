@@ -10,8 +10,7 @@ from pathlib import Path
 DEFAULT_PATHS = [Path("tests")]
 
 _DIRECT_GIT_RUN_CALL = re.compile(r"\.\s*_run\s*\(")
-_CLI_SUBPROCESS_RUN_CALL = re.compile(r"\bsubprocess\s*\.\s*run\s*\(")
-_GIT_SUBPROCESS_CALL = re.compile(r"\bsubprocess\s*\.\s*(?:run|Popen|check_call|check_output)\s*\(")
+_SUBPROCESS_NAME = re.compile(r"\bsubprocess\b")
 
 
 @dataclass(frozen=True)
@@ -29,7 +28,7 @@ def _has_direct_git_run_candidate(source: str) -> bool:
 
 
 def _has_cli_subprocess_candidate(source: str) -> bool:
-    return _CLI_SUBPROCESS_RUN_CALL.search(source) is not None and (
+    return _SUBPROCESS_NAME.search(source) is not None and (
         "sys.executable" in source
         or "'gza'" in source
         or '"gza"' in source
@@ -39,7 +38,7 @@ def _has_cli_subprocess_candidate(source: str) -> bool:
 
 
 def _has_git_subprocess_candidate(source: str) -> bool:
-    return _GIT_SUBPROCESS_CALL.search(source) is not None and (
+    return _SUBPROCESS_NAME.search(source) is not None and (
         "'git'" in source
         or '"git"' in source
     )
@@ -61,21 +60,30 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
     has_direct_git_run_call = _has_direct_git_run_candidate(source)
     has_cli_subprocess_call = _has_cli_subprocess_candidate(source)
     has_git_subprocess_call = _has_git_subprocess_candidate(source)
+    has_generic_subprocess_candidate = _SUBPROCESS_NAME.search(source) is not None
     has_legacy_cli_helper = "run_gza" in source or "run_gza_subprocess" in source
     has_tests_functional_import = "tests_functional" in source
     if not (
         has_direct_git_run_call
         or has_cli_subprocess_call
         or has_git_subprocess_call
+        or has_generic_subprocess_candidate
         or has_legacy_cli_helper
         or has_tests_functional_import
     ):
         return []
 
     module = ast.parse(source, filename=str(test_file))
+    subprocess_names = {
+        alias.asname or alias.name
+        for node in ast.walk(module)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "subprocess"
+    }
     parent_map = (
         {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
-        if has_direct_git_run_call or has_git_subprocess_call
+        if has_direct_git_run_call or has_git_subprocess_call or subprocess_names
         else {}
     )
     violations: list[Violation] = []
@@ -119,9 +127,18 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
             isinstance(node.func, ast.Attribute)
             and node.func.attr in {"run", "Popen", "check_call", "check_output"}
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "subprocess"
-            and node.args
+            and node.func.value.id in subprocess_names
         ):
+            if not node.args:
+                violations.append(
+                    Violation(
+                        path=test_file,
+                        line=node.lineno,
+                        message="subprocess-backed test belongs in tests_functional/",
+                    )
+                )
+                continue
+
             command_arg = node.args[0]
             parts: list[str | None] | None = None
             if isinstance(command_arg, ast.List):
@@ -161,6 +178,7 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
                 continue
 
             if isinstance(command_arg, ast.Name):
+                flagged_direct_git = False
                 current = parent_map.get(node)
                 while current is not None:
                     if (
@@ -183,9 +201,20 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
                                         message="direct git subprocess belongs in tests_functional/",
                                     )
                                 )
+                                flagged_direct_git = True
                                 break
                         break
                     current = parent_map.get(current)
+                if flagged_direct_git:
+                    continue
+
+            violations.append(
+                Violation(
+                    path=test_file,
+                    line=node.lineno,
+                    message="subprocess-backed test belongs in tests_functional/",
+                )
+            )
             continue
 
         if isinstance(node.func, ast.Name):

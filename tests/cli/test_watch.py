@@ -4,7 +4,6 @@ import argparse
 import io
 import re
 import signal
-import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7313,9 +7312,7 @@ def test_watch_dry_run_command_does_not_reconcile_or_prune_dead_in_progress_task
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    proc = subprocess.Popen(["true"])
-    proc.wait()
-    dead_pid = proc.pid
+    dead_pid = 999_999_999
 
     task = store.add("Dead worker in progress", task_type="implement")
     assert task.id is not None
@@ -7340,19 +7337,20 @@ def test_watch_dry_run_command_does_not_reconcile_or_prune_dead_in_progress_task
     before_worker = registry.get("w-watch-dry-run-command")
     assert before_worker is not None
 
-    result = invoke_gza(
-        "watch",
-        "--dry-run",
-        "--poll",
-        "1",
-        "--max-idle",
-        "1",
-        "--batch",
-        "1",
-        "--quiet",
-        "--project",
-        str(tmp_path),
-    )
+    with patch("gza.cli._common.WorkerRegistry.is_running", return_value=False):
+        result = invoke_gza(
+            "watch",
+            "--dry-run",
+            "--poll",
+            "1",
+            "--max-idle",
+            "1",
+            "--batch",
+            "1",
+            "--quiet",
+            "--project",
+            str(tmp_path),
+        )
 
     assert result.returncode == 0
     after_row = store.get(task.id)
@@ -7376,9 +7374,7 @@ def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Pa
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
 
-    proc = subprocess.Popen(["true"])
-    proc.wait()
-    dead_pid = proc.pid
+    dead_pid = 999_999_999
 
     task = store.add("Dead worker in progress", task_type="implement")
     assert task.id is not None
@@ -7404,14 +7400,15 @@ def test_run_cycle_dry_run_real_helpers_does_not_reconcile_or_prune(tmp_path: Pa
     assert before_worker is not None
 
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
-    result = _run_cycle(
-        config=config,
-        store=store,
-        batch=1,
-        max_iterations=10,
-        dry_run=True,
-        log=log,
-    )
+    with patch("gza.cli._common.WorkerRegistry.is_running", return_value=False):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
 
     assert result.work_done is False
     after_row = store.get(task.id)

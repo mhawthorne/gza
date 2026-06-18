@@ -7200,8 +7200,6 @@ class TestPsCommand:
 
     def test_ps_prunes_dead_worker_for_terminal_task(self, tmp_path: Path):
         """ps/status should prune stale worker entries once their task is terminal."""
-        import subprocess
-
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -7212,9 +7210,7 @@ class TestPsCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        proc = subprocess.Popen(["true"])
-        proc.wait()
-        dead_pid = proc.pid
+        dead_pid = 999_999_999
 
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
@@ -7232,10 +7228,11 @@ class TestPsCommand:
             )
         )
 
-        result = invoke_gza("ps", "--all", "--json", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "No in-progress tasks" in result.stdout
-        assert registry.get("w-prune-on-ps") is None
+        with patch("gza.cli.query.WorkerRegistry.is_running", return_value=False):
+            result = invoke_gza("ps", "--all", "--json", "--project", str(tmp_path))
+            assert result.returncode == 0
+            assert "No in-progress tasks" in result.stdout
+            assert registry.get("w-prune-on-ps") is None
 
     def test_ps_no_id_background_claim_reconciles_single_active_row(self, tmp_path: Path):
         """No-id background claim should reconcile into one active non-orphaned task row."""
