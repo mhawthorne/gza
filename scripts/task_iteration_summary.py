@@ -200,6 +200,23 @@ def _error_reason(task: Task) -> str:
     return task.failure_reason or ""
 
 
+def _verify_note(task: Task) -> str:
+    """Verify-failure note for a review row, or '' when verify passed/absent.
+
+    Read straight off the review task's runner-owned verify fields rather than
+    inferred from verdict-minus-blockers: a failed verify records the verdict as
+    CHANGES_REQUESTED just like a real code blocker, but persists its outcome in
+    review_verify_status. Improve/implement rows and legacy reviews (field unset)
+    return ''.
+    """
+    status = task.review_verify_status
+    if status not in ("failed", "unavailable"):
+        return ""
+    detail = task.review_verify_exit_status or task.review_verify_failure or ""
+    label = "verify failed" if status == "failed" else "verify unavailable"
+    return f"{label}: {detail}" if detail else label
+
+
 def _fmt_delta(delta: tuple[int, int] | None) -> tuple[str, str]:
     if delta is None:
         return "-", "-"
@@ -475,7 +492,10 @@ def _render_table(rows: list[RunRow]) -> None:
         dfiles, dlines = _fmt_delta(r.delta) if r.kind != "review" else ("", "")
         dur = _fmt_duration(r.task.duration_seconds)
         tokens = _fmt_tokens(_read_cache_usage(r.task))
-        error = _truncate(_error_reason(r.task), 40)
+        # Reviews never carry a failure_reason; reuse the Error column to report a
+        # verify failure (the verdict alone reads as a normal CHANGES_REQUESTED).
+        reason = _verify_note(r.task) if r.kind == "review" else _error_reason(r.task)
+        error = _truncate(reason, 40)
         print(
             f"{cycle:<6}{r.task.id or '-':<12}{r.kind:<11}{when:<17}{r.result:<18}"
             f"{blockers:>3}{followups:>3}  {dfiles:>7}{dlines:>8}  {dur:>9}{tokens:>9}  {error}"
@@ -496,6 +516,8 @@ def _render_table(rows: list[RunRow]) -> None:
     print("ΔFiles/ΔLines = change introduced by that run (implement: vs base; improve:")
     print("diff of bracketing review HEADs). '-' when review SHAs weren't captured or the")
     print("run isn't bounded by a following review.")
+    print("Error on a review row reports a verify failure/unavailability (verdict stays")
+    print("CHANGES_REQUESTED) — distinguishing it from real code blockers.")
     print()
 
 
@@ -539,7 +561,9 @@ def main() -> int:
 
     if args.verbose:
         for idx, c in enumerate(cycles, start=1):
-            print(f"Cycle {idx} — {c.review.id} ({c.verdict}):")
+            note = _verify_note(c.review)
+            suffix = f" [{note}]" if note else ""
+            print(f"Cycle {idx} — {c.review.id} ({c.verdict}){suffix}:")
             for item in c.blockers + c.followups:
                 print(f"  {item.label}: {_truncate(item.impact or item.evidence, args.width)}")
             print()
