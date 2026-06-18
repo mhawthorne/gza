@@ -7209,16 +7209,13 @@ class TestPsCommand:
         task.status = "failed"
         task.completed_at = datetime.now(UTC)
         store.update(task)
-
-        dead_pid = 999_999_999
-
         workers_dir = tmp_path / ".gza" / "workers"
         workers_dir.mkdir(parents=True, exist_ok=True)
         registry = WorkerRegistry(workers_dir)
         registry.register(
             WorkerMetadata(
                 worker_id="w-prune-on-ps",
-                pid=dead_pid,
+                pid=12345,
                 task_id=task.id,
                 task_slug=None,
                 started_at=datetime.now(UTC).isoformat(),
@@ -7228,11 +7225,11 @@ class TestPsCommand:
             )
         )
 
-        with patch("gza.cli.query.WorkerRegistry.is_running", return_value=False):
+        with patch.object(WorkerRegistry, "is_running", return_value=False):
             result = invoke_gza("ps", "--all", "--json", "--project", str(tmp_path))
-            assert result.returncode == 0
-            assert "No in-progress tasks" in result.stdout
-            assert registry.get("w-prune-on-ps") is None
+        assert result.returncode == 0
+        assert "No in-progress tasks" in result.stdout
+        assert registry.get("w-prune-on-ps") is None
 
     def test_ps_no_id_background_claim_reconciles_single_active_row(self, tmp_path: Path):
         """No-id background claim should reconcile into one active non-orphaned task row."""

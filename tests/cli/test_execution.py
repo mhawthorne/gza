@@ -2698,8 +2698,6 @@ class TestResumeCommand:
 
     def test_resume_running_in_progress_task_fails(self, tmp_path: Path):
         """Resume command fails for an in_progress task that has a live worker."""
-        import os
-
         from gza.workers import WorkerMetadata, WorkerRegistry
 
         setup_config(tmp_path)
@@ -2717,7 +2715,7 @@ class TestResumeCommand:
         registry = WorkerRegistry(workers_path)
         worker = WorkerMetadata(
             worker_id="w-test-running",
-            pid=os.getpid(),
+            pid=12345,
             task_id=task.id,
             task_slug=None,
             started_at=datetime.now(UTC).isoformat(),
@@ -2727,7 +2725,8 @@ class TestResumeCommand:
         )
         registry.register(worker)
 
-        result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
+        with patch.object(WorkerRegistry, "is_running", return_value=True):
+            result = invoke_gza("resume", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert "still running" in result.stdout.lower()
