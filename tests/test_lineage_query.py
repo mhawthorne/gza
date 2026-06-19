@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import subprocess
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -17,6 +18,21 @@ from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import list_failed_tasks_for_recovery
 from tests.cli.conftest import make_store, setup_config
+
+
+@pytest.fixture(autouse=True)
+def _stub_ambient_merge_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit coverage in-process when a test does not seed a live Git context."""
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: recovery_engine._MergeContext(
+            git=None,
+            default_branch="main",
+            existing_branches=frozenset(),
+        ),
+    )
 
 
 def _set_completed(task, *, when: datetime, branch: str | None, has_commits: bool) -> None:
@@ -2476,13 +2492,87 @@ class _MinimalGit(Git):
     All methods that would run subprocesses are overridden to return safe in-memory answers.
     """
 
-    def __init__(self, *, branches: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        *,
+        branches: frozenset[str] = frozenset(),
+        can_merge_result: bool = False,
+        diff_name_status: str = "",
+        count_commits_behind_result: int = 0,
+        resolved_merge_source_ref: str | None = None,
+    ) -> None:
         self.repo_dir = Path("/dev/null")
         self._cache = None
         self._branches = branches
+        self._can_merge_result = can_merge_result
+        self._diff_name_status = diff_name_status
+        self._count_commits_behind_result = count_commits_behind_result
+        self._resolved_merge_source_ref = resolved_merge_source_ref
 
     def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
         return self._branches
+
+    def default_branch(self) -> str:
+        return "main"
+
+    def _run(  # type: ignore[override]
+        self,
+        *args: str,
+        check: bool = True,
+        stdin: bytes | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del stdin
+        command = args[0] if args else ""
+        returncode = 0
+        stdout = ""
+
+        if command == "merge-tree":
+            returncode = 0 if self._can_merge_result else 1
+        elif command == "merge-base":
+            stdout = "main-sha\n"
+        elif command == "rev-parse":
+            resolved = self.rev_parse_if_exists(args[-1]) if len(args) >= 2 else None
+            if resolved is None:
+                returncode = 1
+            else:
+                stdout = f"{resolved}\n"
+        elif command == "symbolic-ref":
+            stdout = "refs/remotes/origin/main\n"
+
+        result = subprocess.CompletedProcess(
+            args=["git", *args],
+            returncode=returncode,
+            stdout=stdout,
+            stderr="",
+        )
+        if check and returncode != 0:
+            raise GitError(f"git {' '.join(args)} failed")
+        return result
+
+    def branches_exist(self, branches: tuple[str, ...]) -> dict[str, bool]:
+        return {branch: branch in self._branches for branch in branches}
+
+    def resolve_refs(
+        self,
+        refs: tuple[str, ...] | list[str],
+        *,
+        peel: str = "commit",
+    ) -> dict[str, str | None]:
+        del peel
+        return {ref: self.rev_parse_if_exists(ref) for ref in refs}
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref == "main":
+            return "main-sha"
+        if ref == "main^{commit}":
+            return "main-sha"
+        if ref == "main^{tree}":
+            return "main-tree"
+        if ref.startswith("origin/") and ref.removeprefix("origin/") in self._branches:
+            return f"{ref.removeprefix('origin/')}-sha"
+        if ref in self._branches:
+            return f"{ref}-sha"
+        return None
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         return False
@@ -2490,9 +2580,27 @@ class _MinimalGit(Git):
     def branch_exists(self, branch: str) -> bool:
         return branch in self._branches
 
+    def can_merge(self, source_branch: str, target_branch: str) -> bool:
+        del source_branch, target_branch
+        return self._can_merge_result
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        del ancestor, descendant
+        return False
+
+    def count_commits_behind(self, source_ref: str, target_branch: str) -> int:
+        del source_ref, target_branch
+        return self._count_commits_behind_result
+
+    def get_diff_name_status(self, base_ref: str, tip_ref: str) -> str:
+        del base_ref, tip_ref
+        return self._diff_name_status
+
     def resolve_fresh_merge_source(self, branch: str, **_kwargs: object) -> ResolvedMergeSourceRef:
         # No remote; the branch itself is the source (avoids subprocess calls).
-        return ResolvedMergeSourceRef(None)
+        if self._resolved_merge_source_ref is not None:
+            return ResolvedMergeSourceRef(self._resolved_merge_source_ref)
+        return ResolvedMergeSourceRef(branch if branch in self._branches else None)
 
 
 def test_query_lineage_owner_rows_does_not_call_load_merge_context_when_git_provided(
@@ -2855,6 +2963,10 @@ def test_collect_recovery_lane_entries_does_not_call_load_merge_context_when_git
         )
 
     monkeypatch.setattr(recovery_engine, "_load_merge_context", _must_not_be_called)
+    monkeypatch.setattr(
+        "gza.cli.advance_engine.determine_next_action",
+        lambda *args, **kwargs: {"type": "noop"},
+    )
 
     git = _MinimalGit(branches=frozenset({failed.branch}))
     entries = collect_recovery_lane_entries(

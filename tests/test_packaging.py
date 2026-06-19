@@ -206,7 +206,7 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_are_explicit_and
     # Each known offender module the guard surfaces keeps a narrow, module-scoped
     # exemption pointing at the follow-up implement task that will clean it up.
     assert "tests/cli/test_advance_auto_plans.py" not in exemptions
-    assert exemptions["tests/test_lineage_query.py"][0] == "gza-5361"
+    assert "tests/test_lineage_query.py" not in exemptions
 
     # Every exemption must stay module-scoped (a tests/ path, no ``::`` nodeid),
     # cite a real follow-up task ID (never a placeholder, gza-5177 B3), and carry

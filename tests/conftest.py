@@ -31,12 +31,6 @@ UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED = (
 # must stay narrow, temporary, and point at a dedicated follow-up implement
 # task so real subprocess drift is still surfaced at author time.
 UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS: dict[str, tuple[str, str]] = {
-    "tests/test_lineage_query.py": (
-        "gza-5361",
-        "Temporary module-scoped exemption tracked by gza-5361, which converts this "
-        "module's subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
     # tests/cli/* offenders the guard surfaces; cleanup tracked by gza-5375.
     "tests/cli/test_advance_squash_threshold.py": (
         "gza-5375",
