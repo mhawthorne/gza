@@ -78,17 +78,48 @@ def _task_count(store) -> int:
     return int(row["c"])
 
 
-def _make_watch_git() -> MagicMock:
-    git = MagicMock()
-    git.default_branch.return_value = "main"
-    git.current_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.ref_exists.return_value = False
-    git.can_merge.return_value = True
-    git.is_merged.return_value = False
-    git.count_commits_ahead.return_value = 1
-    git.get_diff_stat_parsed.return_value = (1, 1, 0)
-    git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
+def _make_watch_git() -> Git:
+    class _UnitWatchGit(Git):
+        def __init__(self) -> None:
+            self.repo_dir = Path("/watch-test-repo")
+            self._cache = None
+
+        def _unexpected_git_subprocess(self, method_name: str) -> AssertionError:
+            return AssertionError(
+                f"{method_name} should not be reached in unit tests; "
+                "patch the watch git seam instead of spawning real git subprocesses"
+            )
+
+        def _run(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise self._unexpected_git_subprocess("_run")
+
+        def _run_readonly_cached(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise self._unexpected_git_subprocess("_run_readonly_cached")
+
+        def _run_readonly_success_cached(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise self._unexpected_git_subprocess("_run_readonly_success_cached")
+
+    git = _UnitWatchGit()
+    git.default_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
+    git.current_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
+    git.local_branch_names = MagicMock(return_value=frozenset({"main"}))  # type: ignore[method-assign]
+    git.branch_exists = MagicMock(return_value=True)  # type: ignore[method-assign]
+    git.branches_exist = MagicMock(return_value={})  # type: ignore[method-assign]
+    git.ref_exists = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.resolve_refs = MagicMock(return_value={})  # type: ignore[method-assign]
+    git.can_merge = MagicMock(return_value=True)  # type: ignore[method-assign]
+    git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.count_commits_ahead = MagicMock(return_value=1)  # type: ignore[method-assign]
+    git.count_commits_ahead_checked = MagicMock(return_value=1)  # type: ignore[method-assign]
+    git.get_diff_name_status = MagicMock(return_value="M\tfeature.txt\n")  # type: ignore[method-assign]
+    git.get_diff_stat_parsed = MagicMock(return_value=(1, 1, 0))  # type: ignore[method-assign]
+    git.get_diff_numstat = MagicMock(return_value="1\t0\tfeature.txt\n")  # type: ignore[method-assign]
+    return git
+
+
+def _make_watch_startup_git() -> Git:
+    git = _make_watch_git()
+    git.branch_exists.return_value = False  # type: ignore[attr-defined]
     return git
 
 
@@ -109,6 +140,22 @@ def _run_cycle_and_emit_transition_events(
     after = _task_snapshot(store)
     _emit_transition_events(before, after, store=store, config=config, log=log)
     return result
+
+
+@pytest.fixture(autouse=True)
+def _patch_watch_git_runtime() -> object:
+    with (
+        patch("gza.cli.watch.Git", side_effect=lambda *_args, **_kwargs: _make_watch_git()) as watch_git_cls,
+        patch("gza.runner.Git", side_effect=lambda *_args, **_kwargs: _make_watch_startup_git()) as runner_git_cls,
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            side_effect=lambda *_args, **_kwargs: recovery_engine.build_merge_context_from_git(
+                _make_watch_git(),
+                "main",
+            ),
+        ) as load_merge_context,
+    ):
+        yield watch_git_cls, runner_git_cls, load_merge_context
 
 
 def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> None:
@@ -511,16 +558,7 @@ def test_watch_query_owner_rows_filters_target_branch_and_keeps_legacy_fallback(
     store.dual_write_legacy_merge_status(release_unit.id)
 
     config = Config.load(tmp_path)
-    git = MagicMock()
-    git.default_branch.return_value = "main"
-    git.current_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.ref_exists.return_value = False
-    git.can_merge.return_value = True
-    git.is_merged.return_value = False
-    git.count_commits_ahead.return_value = 1
-    git.get_diff_stat_parsed.return_value = (1, 1, 0)
-    git.get_diff_numstat.return_value = "1\t0\tfeature.txt\n"
+    git = _make_watch_git()
 
     rows, _ = _query_owner_rows_with_context(
         store=store,
@@ -570,6 +608,9 @@ def test_watch_owner_rows_keep_lifecycle_merge_candidate_and_failed_recovery_sep
 
     owner_rows, _ = _query_owner_rows_with_context(
         store=store,
+        config=Config.load(tmp_path),
+        git=_make_watch_git(),
+        target_branch="main",
         max_recovery_attempts=1,
         include_skipped=True,
     )
@@ -3672,7 +3713,7 @@ def test_watch_cycle_reports_out_of_scope_runnable_child_without_starting_it(tmp
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
     ):
         _run_cycle(
             config=config,
@@ -3721,7 +3762,7 @@ def test_watch_cycle_reports_depends_on_only_out_of_scope_runnable_child_without
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
     ):
         _run_cycle(
             config=config,
@@ -3775,7 +3816,7 @@ def test_watch_cycle_reports_blocked_out_of_scope_pending_child_without_starting
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
     ):
         _run_cycle(
             config=config,
@@ -3875,7 +3916,7 @@ def test_watch_cycle_does_not_warn_when_depends_on_only_child_inherits_scope_tag
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
     ):
         _run_cycle(
             config=config,
@@ -3921,7 +3962,7 @@ def test_watch_cycle_does_not_warn_when_runnable_scoped_owner_has_out_of_scope_d
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
     ):
         _run_cycle(
             config=config,
@@ -5597,6 +5638,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch(
             "gza.cli.determine_next_action",
             return_value={

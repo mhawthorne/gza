@@ -206,7 +206,6 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_are_explicit_and
     # Each known offender module the guard surfaces keeps a narrow, module-scoped
     # exemption pointing at the follow-up implement task that will clean it up.
     assert "tests/cli/test_advance_auto_plans.py" not in exemptions
-    assert exemptions["tests/cli/test_watch.py"][0] == "gza-5360"
     assert exemptions["tests/test_lineage_query.py"][0] == "gza-5361"
 
     # Every exemption must stay module-scoped (a tests/ path, no ``::`` nodeid),
@@ -236,13 +235,11 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_match_module_pre
         )
         is None
     )
-    assert module._find_unit_runtime_subprocess_guard_exemption(
-        "tests/cli/test_watch.py::test_example"
-    ) == (
-        "gza-5360",
-        "Temporary module-scoped exemption tracked by gza-5360, which converts this "
-        "module's subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
+    assert (
+        module._find_unit_runtime_subprocess_guard_exemption(
+            "tests/cli/test_watch.py::test_example"
+        )
+        is None
     )
     assert (
         module._find_unit_runtime_subprocess_guard_exemption(
