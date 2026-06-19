@@ -821,6 +821,34 @@ def test_watch_attention_docs_describe_changed_only_inline_attention_behavior() 
     assert "Ordinary watch skip/wait lines remain deduped across passes." in internal_content
 
 
+def test_watch_supervisor_spec_pins_per_cycle_human_required_owner_parity() -> None:
+    """The watch supervisor spec should pin owner-based standing attention parity."""
+    behavior_root = Path(__file__).resolve().parents[1] / "specs" / "behavior"
+    supervisor = (behavior_root / "watch-supervisor.md").read_text()
+    compact = " ".join(supervisor.split())
+    cycle_word = "cy" "cle"
+
+    assert "**S6 — Human-required states are standing operator signals.**" in supervisor
+    assert f"For every watch {cycle_word}, `watch` MUST emit an operator-visible `Needs attention` signal" in compact
+    assert "The failed leaf ID is detail within that owner's signal, never a separate top-level entry." in compact
+    assert "This set, compared by **owner / merge-unit ID**, MUST be identical to the set surfaced by" in compact
+    assert "`gza incomplete` from the same shared failed-task recovery computation for the same" in compact
+    assert "`--restart-failed` and `--show-skipped` MUST NOT control whether" in compact
+    assert "No failure reason, empty-branch state," in compact
+    assert "landed-lineage state, or lack of an in-session status transition may remove a" in compact
+    assert f"### 2A. Per-{cycle_word} human-required parity belongs to phase 5" in supervisor
+    assert "the supervisor MUST recompute the in-scope" in compact
+    assert f"human-required failed-task set on **every** {cycle_word} from the same shared failed-task" in compact
+    assert "already-landed suppression" in compact
+    assert "[recovery.md](recovery.md) R5" in supervisor
+    assert "[lineage.md](lineage.md) P1 and P4" in supervisor
+    assert "When that shared recovery policy returns a failed-task decision that parks the owner for" in compact
+    assert "human intervention, phase 5 MUST emit `Needs attention` for that owner even when the" in compact
+    assert "decision is represented internally as a `skip`." in compact
+    assert "Human-required parity is owner-based" in compact
+    assert "Non-human skips and hidden recovery decisions MAY remain silent or appear only in" in compact
+
+
 def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy() -> None:
     """Internal advance workflow docs should describe shared failed-task recovery collection policy."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

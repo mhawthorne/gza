@@ -46,9 +46,18 @@ This document answers questions the engine spec intentionally does not:
   new worker spawns, so later worker starts evaluate against the freshest landed target.
 - **S5 — Scope is explicit.** When tag filters are active, watch MUST act only on
   in-scope work: merges, recovery, new starts, queue pickup, and operator summaries.
-- **S6 — Bounded operator-visible degradation.** Repeated failures, backoff, drift
-  restart, idle exit, and human-needed parked states MUST surface explicit operator
-  signals. Watch MUST NOT silently stall.
+- **S6 — Human-required states are standing operator signals.** Repeated failures,
+  backoff, drift restart, idle exit, and human-needed parked states MUST surface explicit
+  operator signals. For every watch cycle, `watch` MUST emit an operator-visible `Needs
+  attention` signal for every in-scope **lineage owner / merge unit** that contains a
+  failed task whose shared recovery decision parks it for human intervention. The failed
+  leaf ID is detail within that owner's signal, never a separate top-level entry. This
+  set, compared by **owner / merge-unit ID**, MUST be identical to the set surfaced by
+  `gza incomplete` from the same shared failed-task recovery computation for the same
+  store and tag filters. `--restart-failed` and `--show-skipped` MUST NOT control whether
+  these human-required owners are visible. No failure reason, empty-branch state,
+  landed-lineage state, or lack of an in-session status transition may remove a
+  human-required owner from this surface. Watch MUST NOT silently stall.
 
 ## Core invariants
 
@@ -91,6 +100,25 @@ state to win over already-mergeable fresh code.
 - `watch.max_iterations` / `--max-iterations` are **not** a supervisor loop bound. They
   bound iterate workers launched for implementation chains. Watch MUST pass that budget to
   those workers, but MUST NOT treat it as "run only N watch cycles."
+
+### 2A. Per-cycle human-required parity belongs to phase 5
+
+- During phase 5 ("Observe outcomes"), the supervisor MUST recompute the in-scope
+  human-required failed-task set on **every** cycle from the same shared failed-task
+  recovery policy that powers `gza incomplete`, including the already-landed suppression
+  rule in [recovery.md](recovery.md) R5 and the owner/merge-unit visibility rules in
+  [lineage.md](lineage.md) P1 and P4.
+- When that shared recovery policy returns a failed-task decision that parks the owner for
+  human intervention, phase 5 MUST emit `Needs attention` for that owner even when the
+  decision is represented internally as a `skip`.
+- `--restart-failed` and `--show-skipped` MAY affect which non-attention recovery
+  diagnostics are printed, but they MUST NOT gate the visibility of the human-required
+  owner set defined by S6.
+- Human-required parity is owner-based: the compared set is the set of lineage-owner /
+  merge-unit IDs, and the failed leaf ID MUST appear only as detail within the owner's
+  signal.
+- Non-human skips and hidden recovery decisions MAY remain silent or appear only in
+  ordinary skipped diagnostics, as the shared recovery policy requires.
 
 ### 3. Concurrency uses live-slot accounting
 
