@@ -205,7 +205,7 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_are_explicit_and
 
     # Each known offender module the guard surfaces keeps a narrow, module-scoped
     # exemption pointing at the follow-up implement task that will clean it up.
-    assert exemptions["tests/cli/test_advance_auto_plans.py"][0] == "gza-5359"
+    assert "tests/cli/test_advance_auto_plans.py" not in exemptions
     assert exemptions["tests/cli/test_watch.py"][0] == "gza-5360"
     assert exemptions["tests/test_lineage_query.py"][0] == "gza-5361"
 
@@ -230,6 +230,12 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_match_module_pre
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
     module = _load_module(conftest_path, "tests_runtime_guard_exemption_lookup_conftest")
 
+    assert (
+        module._find_unit_runtime_subprocess_guard_exemption(
+            "tests/cli/test_advance_auto_plans.py::test_example"
+        )
+        is None
+    )
     assert module._find_unit_runtime_subprocess_guard_exemption(
         "tests/cli/test_watch.py::test_example"
     ) == (

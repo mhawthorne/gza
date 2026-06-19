@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from gza.cli.git_ops import cmd_advance
 from gza.git import GitError
 from gza.recovery_engine import _MergeContext
@@ -81,6 +83,30 @@ def _create_completed_review(store, impl, *, verdict: str = "APPROVED"):
     return review
 
 
+def _merge_context_without_repo_state(*, default_branch: str = "main") -> _MergeContext:
+    class _MergeGit:
+        def branch_exists(self, branch: str) -> bool:
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+    return _MergeContext(git=_MergeGit(), default_branch=default_branch)
+
+
+@pytest.fixture(autouse=True)
+def _stub_accidental_real_git_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("gza.git.Git.default_branch", lambda _self: "main")
+    monkeypatch.setattr("gza.git.Git.local_branch_names", lambda _self: frozenset())
+    monkeypatch.setattr("gza.git.Git.branch_exists", lambda _self, _branch: False)
+    monkeypatch.setattr("gza.git.Git.ref_exists", lambda _self, _ref: False)
+    monkeypatch.setattr("gza.git.Git.remote_branch_exists", lambda _self, _branch, remote="origin": False)
+    monkeypatch.setattr("gza.git.Git.is_merged", lambda _self, _source, _into="main": False)
+
+
 def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -96,6 +122,11 @@ def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) 
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
     ):
         rc = cmd_advance(_advance_args(tmp_path))
@@ -118,6 +149,11 @@ def test_advance_create_plan_review_inherits_tags_from_completed_plan(tmp_path: 
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_worker", return_value=0),
     ):
         rc = cmd_advance(_advance_args(tmp_path))
@@ -140,6 +176,11 @@ def test_advance_auto_implement_inherits_all_parent_tags(tmp_path: Path, capsys)
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_worker", return_value=0),
     ):
         rc = cmd_advance(_advance_args(tmp_path))
@@ -162,6 +203,8 @@ def test_advance_create_plan_review_startup_failure_rolls_back_child_and_skips_s
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
         patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
         patch(
             "gza.cli.git_ops._spawn_background_worker",
@@ -337,7 +380,13 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     failed_impl.completed_at = datetime.now(UTC)
     store.update(failed_impl)
 
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: _merge_context_without_repo_state(),
+        ),
+    ):
         rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
     captured = capsys.readouterr()
 
@@ -348,7 +397,13 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     assert str(failed_impl.id) in captured.out
     assert "Resume failed task (MAX_TURNS)" in captured.out
 
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: _merge_context_without_repo_state(),
+        ),
+    ):
         rc = cmd_advance(_advance_args(tmp_path, dry_run=True, no_resume_failed=True))
     captured = capsys.readouterr()
 
@@ -375,6 +430,11 @@ def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
     ):
         rc = cmd_advance(_advance_args(tmp_path, batch=1))
@@ -425,6 +485,10 @@ def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: _merge_context_without_repo_state(),
+        ),
         patch(
             "gza.advance_engine.get_review_report",
             return_value=SimpleNamespace(
@@ -727,6 +791,8 @@ def test_advance_new_pending_implement_iterate_spawn_marks_auto_iterate(tmp_path
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
         patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
         patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
@@ -779,6 +845,8 @@ def test_advance_new_pending_resume_row_on_empty_branch_preserves_resume_startup
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
         patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
         patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.git_ops._spawn_background_iterate_worker", side_effect=fake_spawn_iterate),
@@ -806,6 +874,8 @@ def test_advance_new_pending_implement_iterate_startup_failure_surfaces_and_skip
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
         patch("gza.cli.git_ops._advance_uses_iterate", return_value=True),
         patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("creator boom")),
         patch(
@@ -862,6 +932,8 @@ def test_advance_creates_exactly_one_closing_review_after_completed_improve(
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
         patch(
             "gza.cli.git_ops._prepare_create_review_action",
             return_value=SimpleNamespace(
