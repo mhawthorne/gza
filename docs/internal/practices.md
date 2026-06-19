@@ -16,14 +16,16 @@ trades early-localized detection for late-aggregate detection.
 For the unit suite, keep median latency below 25ms, p95 below 150ms, and p99
 below 250ms. Those are warning thresholds, not budgets to spend.
 
-The unit-suite watchdog is configured through `GZA_UNIT_TEST_TIMEOUT_MS`. In
-the cleanup stage, keep the effective default at 1000ms while driving the
-slow tail down. The rollout target is 500ms, and any unit test approaching
-that limit is a latency bug. Tests at or above 400ms require deliberate
-classification: optimize in place, move subprocess or real-shell coverage to
-`tests_functional/`, or add a narrow `@pytest.mark.timeout(1.0,
-method="signal")` override with a comment explaining why the test must remain
-in `tests/`.
+The unit-suite watchdog is split into two knobs with different jobs:
+`GZA_UNIT_TEST_HANG_GUARD_SECONDS` keeps a generous wall-clock
+`pytest-timeout` SIGALRM guard so genuinely hung tests still get interrupted,
+while `GZA_UNIT_TEST_CPU_BUDGET_SECONDS` is the real post-hoc "this unit test
+did too much work" budget. Keep the default CPU budget at 1.5s while driving
+the slow tail down. The rollout target remains 500ms of CPU time, and any unit
+test approaching that limit is a latency bug. Tests at or above 400ms require
+deliberate classification: optimize in place, move subprocess or real-shell
+coverage to `tests_functional/`, or add a narrow timeout override with a
+comment explaining why the test must remain in `tests/`.
 
 Fixture setup and teardown time count against the unit watchdog. Do not assume
 fixture cost is free, and do not switch to `func_only=True` just to hide slow

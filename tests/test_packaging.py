@@ -1,7 +1,9 @@
 """Packaging configuration regression tests."""
 
 import ast
+import contextlib
 import importlib.util
+import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,12 +115,12 @@ def test_unit_test_conftest_injects_only_unit_watchdog() -> None:
 
     assert len(plain_unit.markers) == 1
     assert plain_unit.markers[0].mark.name == "timeout"
-    assert plain_unit.markers[0].mark.args == (module.UNIT_TEST_TIMEOUT_SECONDS,)
+    assert plain_unit.markers[0].mark.args == (module.UNIT_TEST_HANG_GUARD_SECONDS,)
     assert plain_unit.markers[0].mark.kwargs == {"method": "signal"}
 
     assert len(plain_unit_2.markers) == 1
     assert plain_unit_2.markers[0].mark.name == "timeout"
-    assert plain_unit_2.markers[0].mark.args == (module.UNIT_TEST_TIMEOUT_SECONDS,)
+    assert plain_unit_2.markers[0].mark.args == (module.UNIT_TEST_HANG_GUARD_SECONDS,)
     assert plain_unit_2.markers[0].mark.kwargs == {"method": "signal"}
 
     assert explicit_timeout.markers == []
@@ -129,7 +131,8 @@ def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
 ) -> None:
     """tests/conftest.py should still inject a watchdog when the override env is unset."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.delenv("GZA_UNIT_TEST_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("GZA_UNIT_TEST_HANG_GUARD_SECONDS", raising=False)
+    monkeypatch.delenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", raising=False)
     module = _load_module(conftest_path, "tests_timeout_conftest_default")
 
     class FakeItem:
@@ -145,17 +148,18 @@ def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
     item = FakeItem()
     module.pytest_collection_modifyitems([item])
 
-    assert module.UNIT_TEST_TIMEOUT_SECONDS == module.UNIT_TEST_TIMEOUT_MS / 1000
+    assert module.UNIT_TEST_HANG_GUARD_SECONDS == 5
+    assert module.UNIT_TEST_CPU_BUDGET_SECONDS == 1.5
     assert len(item.markers) == 1
-    assert item.markers[0].mark.args == (module.UNIT_TEST_TIMEOUT_SECONDS,)
+    assert item.markers[0].mark.args == (module.UNIT_TEST_HANG_GUARD_SECONDS,)
     assert item.markers[0].mark.kwargs == {"method": "signal"}
 
 
-def test_unit_test_conftest_uses_millisecond_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """tests/conftest.py should convert the millisecond override to the timeout marker budget."""
+def test_unit_test_conftest_uses_hang_guard_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tests/conftest.py should use the hang-guard override for the timeout marker budget."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.setenv("GZA_UNIT_TEST_TIMEOUT_MS", "500")
-    module = _load_module(conftest_path, "tests_timeout_conftest_ms_override")
+    monkeypatch.setenv("GZA_UNIT_TEST_HANG_GUARD_SECONDS", "7.5")
+    module = _load_module(conftest_path, "tests_timeout_conftest_hang_override")
 
     class FakeItem:
         def __init__(self) -> None:
@@ -170,11 +174,42 @@ def test_unit_test_conftest_uses_millisecond_timeout_override(monkeypatch: pytes
     item = FakeItem()
     module.pytest_collection_modifyitems([item])
 
-    assert module.UNIT_TEST_TIMEOUT_MS == 500
-    assert module.UNIT_TEST_TIMEOUT_SECONDS == 0.5
+    assert module.UNIT_TEST_HANG_GUARD_SECONDS == 7.5
     assert len(item.markers) == 1
-    assert item.markers[0].mark.args == (0.5,)
+    assert item.markers[0].mark.args == (7.5,)
     assert item.markers[0].mark.kwargs == {"method": "signal"}
+
+
+def test_unit_test_conftest_uses_cpu_budget_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tests/conftest.py should read the CPU budget override from the environment."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1.75")
+    module = _load_module(conftest_path, "tests_timeout_conftest_cpu_override")
+
+    assert module.UNIT_TEST_CPU_BUDGET_SECONDS == 1.75
+
+
+def test_unit_test_conftest_cpu_budget_failure_is_clear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tests/conftest.py should fail slow unit tests with a CPU-budget-specific message."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1")
+    module = _load_module(conftest_path, "tests_timeout_conftest_cpu_failure")
+
+    with pytest.raises(pytest.fail.Exception, match="exceeded the unit-test CPU budget"):
+        module._fail_if_unit_test_exceeds_cpu_budget("tests/example.py::test_slow", 1.25)
+
+
+def test_unit_test_conftest_cpu_budget_ignores_wall_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wall-clock sleep with low CPU should not trip the post-hoc CPU budget guard."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "0.05")
+    module = _load_module(conftest_path, "tests_timeout_conftest_cpu_sleep")
+
+    watchdog = module._watch_unit_test_cpu_budget("tests/example.py::test_sleep")
+    next(watchdog)
+    time.sleep(0.1)
+    with contextlib.suppress(StopIteration):
+        next(watchdog)
 
 
 def test_unit_test_conftest_registers_sigterm_faulthandler(monkeypatch: pytest.MonkeyPatch) -> None:

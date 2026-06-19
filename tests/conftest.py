@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -10,14 +11,13 @@ import pytest
 from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
 from gza.pytest_timeout_diagnostics import register_sigterm_faulthandler
 
-# NOTE: 2000ms is a short-term bridge. A 1s wall-clock per-test budget is
-# inherently flaky under xdist contention (wall time inflates when workers
-# compete for CPU). The durable fix is a CPU-time latency guard
-# (time.process_time delta) plus a generous wall-clock hang-guard; see the
-# follow-up task. Until then, 2s gives the heaviest in-process lifecycle tests
-# (~0.8s solo) enough headroom to stop intermittently timing out.
-UNIT_TEST_TIMEOUT_MS = int(os.environ.get("GZA_UNIT_TEST_TIMEOUT_MS", "2000"))
-UNIT_TEST_TIMEOUT_SECONDS = UNIT_TEST_TIMEOUT_MS / 1000
+# The unit suite uses two separate guards:
+# - a generous wall-clock SIGALRM hang-guard that can still interrupt a stuck
+#   process even when it is deadlocked or blocked in C code;
+# - a post-hoc CPU-time budget that fails tests which finish after burning too
+#   much in-process CPU, without false-positiving under xdist wall contention.
+UNIT_TEST_HANG_GUARD_SECONDS = float(os.environ.get("GZA_UNIT_TEST_HANG_GUARD_SECONDS", "5"))
+UNIT_TEST_CPU_BUDGET_SECONDS = float(os.environ.get("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1.5"))
 
 register_sigterm_faulthandler()
 
@@ -40,11 +40,31 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 def pytest_collection_modifyitems(items):
     """Apply the unit-suite watchdog unless a test sets its own timeout."""
-    unit_timeout_marker = pytest.mark.timeout(UNIT_TEST_TIMEOUT_SECONDS, method="signal")
+    unit_timeout_marker = pytest.mark.timeout(UNIT_TEST_HANG_GUARD_SECONDS, method="signal")
     for item in items:
         if item.get_closest_marker("timeout") is not None:
             continue
         item.add_marker(unit_timeout_marker)
+
+
+def _fail_if_unit_test_exceeds_cpu_budget(nodeid: str, cpu_seconds: float) -> None:
+    if cpu_seconds <= UNIT_TEST_CPU_BUDGET_SECONDS:
+        return
+    pytest.fail(
+        f"{nodeid} exceeded the unit-test CPU budget: used {cpu_seconds:.3f}s CPU "
+        f"with a {UNIT_TEST_CPU_BUDGET_SECONDS:.3f}s budget."
+    )
+
+
+def _watch_unit_test_cpu_budget(nodeid: str):
+    start_cpu_seconds = time.process_time()
+    yield
+    _fail_if_unit_test_exceeds_cpu_budget(nodeid, time.process_time() - start_cpu_seconds)
+
+
+@pytest.fixture(autouse=True)
+def _enforce_unit_test_cpu_budget(request: pytest.FixtureRequest):
+    yield from _watch_unit_test_cpu_budget(request.node.nodeid)
 
 
 @pytest.fixture(autouse=True)
