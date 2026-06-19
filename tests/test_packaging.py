@@ -126,6 +126,126 @@ def test_unit_test_conftest_injects_only_unit_watchdog() -> None:
     assert explicit_timeout.markers == []
 
 
+def test_unit_test_conftest_runtime_subprocess_guard_fails_real_git() -> None:
+    """The unit-lane autouse guard should fail loudly on real git subprocesses."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = _load_module(conftest_path, "tests_runtime_guard_conftest")
+
+    class GuardTriggered(Exception):
+        pass
+
+    def _fail(message: str) -> None:
+        raise GuardTriggered(message)
+
+    with module.install_unit_runtime_subprocess_guard(
+        nodeid="tests/demo/test_probe.py::test_real_git_shell",
+        fail=_fail,
+    ):
+        with pytest.raises(GuardTriggered, match="Unit-suite boundary violation") as exc_info:
+            module.subprocess.run(["git", "status"])
+
+    assert "real git command" in str(exc_info.value)
+    assert "mock it or move the coverage to tests_functional/" in str(exc_info.value).lower()
+
+
+def test_unit_test_conftest_runtime_subprocess_guard_is_on_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The autouse runtime subprocess guard should protect the default unit lane."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+
+    monkeypatch.delenv("GZA_ENABLE_UNIT_SUBPROCESS_GUARD", raising=False)
+    enabled_module = _load_module(conftest_path, "tests_runtime_guard_default_on_conftest")
+    assert enabled_module.UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED is True
+
+    class GuardTriggered(Exception):
+        pass
+
+    def _fail(message: str) -> None:
+        raise GuardTriggered(message)
+
+    fake_request = SimpleNamespace(
+        node=SimpleNamespace(nodeid="tests/demo/test_probe.py::test_real_subprocess"),
+    )
+    real_install = enabled_module.install_unit_runtime_subprocess_guard
+    guard = enabled_module._guard_unit_subprocesses.__wrapped__(fake_request)
+    try:
+        with pytest.raises(GuardTriggered, match="Unit-suite boundary violation"):
+            with enabled_module.patch.object(
+                enabled_module, "install_unit_runtime_subprocess_guard"
+            ) as install:
+                install.return_value = real_install(
+                    nodeid=fake_request.node.nodeid,
+                    fail=_fail,
+                )
+                next(guard)
+                install.assert_called_once_with(nodeid=fake_request.node.nodeid)
+                enabled_module.subprocess.run(["python", "-c", "print('boom')"])
+    finally:
+        guard.close()
+
+
+def test_unit_test_conftest_runtime_subprocess_guard_can_be_explicitly_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A narrow env override can disable the guard for emergency triage only."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+
+    monkeypatch.setenv("GZA_ENABLE_UNIT_SUBPROCESS_GUARD", "0")
+    disabled_module = _load_module(conftest_path, "tests_runtime_guard_disabled_conftest")
+    assert disabled_module.UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED is False
+
+
+def test_unit_test_conftest_runtime_subprocess_guard_exemptions_are_explicit_and_narrow() -> None:
+    """Temporary exemptions must stay module-scoped and carry follow-up context."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = _load_module(conftest_path, "tests_runtime_guard_exemptions_conftest")
+
+    exemptions = module.UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS
+
+    # Each known offender module the guard surfaces keeps a narrow, module-scoped
+    # exemption pointing at the follow-up implement task that will clean it up.
+    assert exemptions["tests/cli/test_advance_auto_plans.py"][0] == "gza-5359"
+    assert exemptions["tests/cli/test_watch.py"][0] == "gza-5360"
+    assert exemptions["tests/test_lineage_query.py"][0] == "gza-5361"
+
+    # Every exemption must stay module-scoped (a tests/ path, no ``::`` nodeid),
+    # cite a real follow-up task ID (never a placeholder, gza-5177 B3), and carry
+    # actionable cleanup context referencing that task.
+    for module_path, value in exemptions.items():
+        assert module_path.startswith("tests/") and "::" not in module_path, (
+            f"exemption key {module_path!r} must be a module-scoped tests/ path"
+        )
+        task_id, reason = value
+        assert task_id.startswith("gza-") and task_id[len("gza-") :].isdigit(), (
+            f"exemption for {module_path} must cite a real gza-<n> follow-up task, got {task_id!r}"
+        )
+        assert task_id in reason, (
+            f"exemption reason for {module_path} should reference its follow-up task {task_id}"
+        )
+
+
+def test_unit_test_conftest_runtime_subprocess_guard_exemptions_match_module_prefix() -> None:
+    """Module-scoped exemptions should match child nodeids but not unrelated tests."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = _load_module(conftest_path, "tests_runtime_guard_exemption_lookup_conftest")
+
+    assert module._find_unit_runtime_subprocess_guard_exemption(
+        "tests/cli/test_watch.py::test_example"
+    ) == (
+        "gza-5360",
+        "Temporary module-scoped exemption tracked by gza-5360, which converts this "
+        "module's subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    )
+    assert (
+        module._find_unit_runtime_subprocess_guard_exemption(
+            "tests/demo/test_probe.py::test_real_subprocess"
+        )
+        is None
+    )
+
+
 def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -477,6 +597,25 @@ def test_unit_suite_boundary_flags_direct_git_subprocess(tmp_path: Path) -> None
     ]
 
 
+def test_unit_suite_boundary_flags_direct_subprocess_run_import_alias(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_run_alias.py"
+    nested_test.write_text(
+        "from subprocess import run\n\n"
+        "def test_git_subprocess(tmp_path):\n"
+        "    run(['git', 'status'], cwd=tmp_path)\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:1 direct subprocess callable imports are banned in tests/ because they bypass the unit-suite runtime guard; import subprocess and patch the seam instead, or move the test to tests_functional/",
+        f"{nested_test}:4 subprocess.run alias calls belong in tests_functional/ unless patched through an in-process seam",
+    ]
+
+
 def test_unit_suite_boundary_flags_generic_subprocess_popen(tmp_path: Path) -> None:
     tests_root = tmp_path / "tests"
     nested = tests_root / "cli"
@@ -510,6 +649,44 @@ def test_unit_suite_boundary_flags_subprocess_alias_popen(tmp_path: Path) -> Non
 
     assert violations == [
         f"{nested_test}:4 subprocess-backed test belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_direct_subprocess_popen_import_alias(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_popen_alias.py"
+    nested_test.write_text(
+        "from subprocess import Popen as pop\n\n"
+        "def test_git_subprocess(tmp_path):\n"
+        "    pop(['git', 'status'], cwd=tmp_path)\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:1 direct subprocess callable imports are banned in tests/ because they bypass the unit-suite runtime guard; import subprocess and patch the seam instead, or move the test to tests_functional/",
+        f"{nested_test}:4 subprocess.Popen alias calls belong in tests_functional/ unless patched through an in-process seam",
+    ]
+
+
+def test_unit_suite_boundary_flags_direct_subprocess_check_output_import_alias(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_check_output_alias.py"
+    nested_test.write_text(
+        "from subprocess import check_output\n\n"
+        "def test_non_git_subprocess(tmp_path):\n"
+        "    check_output(['python', '-c', 'print(1)'], cwd=tmp_path)\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:1 direct subprocess callable imports are banned in tests/ because they bypass the unit-suite runtime guard; import subprocess and patch the seam instead, or move the test to tests_functional/",
+        f"{nested_test}:4 subprocess.check_output alias calls belong in tests_functional/ unless patched through an in-process seam",
     ]
 
 
@@ -549,6 +726,24 @@ def test_unit_suite_boundary_flags_spaced_dot_cli_subprocess(tmp_path: Path) -> 
 
     assert violations == [
         f"{nested_test}:5 CLI subprocess invocation belongs in tests_functional/"
+    ]
+
+
+def test_unit_suite_boundary_flags_module_alias_subprocess_calls(tmp_path: Path) -> None:
+    tests_root = tmp_path / "tests"
+    nested = tests_root / "cli"
+    nested.mkdir(parents=True)
+    nested_test = nested / "test_module_alias.py"
+    nested_test.write_text(
+        "import subprocess as sp\n\n"
+        "def test_git_subprocess(tmp_path):\n"
+        "    sp.run(['git', 'status'], cwd=tmp_path)\n"
+    )
+
+    violations = _find_unit_suite_boundary_violations(tests_root)
+
+    assert violations == [
+        f"{nested_test}:4 direct git subprocess belongs in tests_functional/"
     ]
 
 

@@ -4,7 +4,12 @@ import contextlib
 import fcntl
 import os
 import time
+import shlex
+import subprocess
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -18,8 +23,241 @@ from gza.pytest_timeout_diagnostics import register_sigterm_faulthandler
 #   much in-process CPU, without false-positiving under xdist wall contention.
 UNIT_TEST_HANG_GUARD_SECONDS = float(os.environ.get("GZA_UNIT_TEST_HANG_GUARD_SECONDS", "5"))
 UNIT_TEST_CPU_BUDGET_SECONDS = float(os.environ.get("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1.5"))
+UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED = (
+    os.environ.get("GZA_ENABLE_UNIT_SUBPROCESS_GUARD", "1") != "0"
+)
+
+# Keep the runtime guard on for the default unit lane. Any future exemption
+# must stay narrow, temporary, and point at a dedicated follow-up implement
+# task so real subprocess drift is still surfaced at author time.
+UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS: dict[str, tuple[str, str]] = {
+    "tests/cli/test_advance_auto_plans.py": (
+        "gza-5359",
+        "Temporary module-scoped exemption tracked by gza-5359, which converts this "
+        "module's subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_watch.py": (
+        "gza-5360",
+        "Temporary module-scoped exemption tracked by gza-5360, which converts this "
+        "module's subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_lineage_query.py": (
+        "gza-5361",
+        "Temporary module-scoped exemption tracked by gza-5361, which converts this "
+        "module's subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    # tests/cli/* offenders the guard surfaces; cleanup tracked by gza-5375.
+    "tests/cli/test_advance_squash_threshold.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_config_cmds.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_execution.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_extract.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_git_ops.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_git_ops_merge_units.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_main.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_no_color.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_query.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/cli/test_tmux.py": (
+        "gza-5375",
+        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
+        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    # tests/* offenders the guard surfaces; cleanup tracked by gza-5376.
+    "tests/test_advance_engine.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_attach_wrapper.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_git.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_providers.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_query.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_recovery_engine.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_runner.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+    "tests/test_task_query.py": (
+        "gza-5376",
+        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
+        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
+        "tests_functional/) and then removes this exemption.",
+    ),
+}
 
 register_sigterm_faulthandler()
+
+
+def _subprocess_command_preview(command: object) -> str:
+    if command is None:
+        return "<unknown command>"
+    if isinstance(command, bytes):
+        return command.decode("utf-8", errors="replace")
+    if isinstance(command, str):
+        return command
+    if isinstance(command, os.PathLike):
+        return os.fspath(command)
+    if isinstance(command, tuple | list):
+        return shlex.join(
+            os.fspath(part) if isinstance(part, os.PathLike) else str(part)
+            for part in command
+        )
+    return repr(command)
+
+
+def _is_git_subprocess_command(command: object) -> bool:
+    if isinstance(command, bytes):
+        command = command.decode("utf-8", errors="replace")
+    if isinstance(command, str):
+        stripped = command.lstrip()
+        return stripped == "git" or stripped.startswith("git ")
+    if isinstance(command, tuple | list) and command:
+        head = command[0]
+        if isinstance(head, os.PathLike):
+            head = os.fspath(head)
+        return head == "git"
+    return False
+
+
+def _build_unit_subprocess_guard_message(nodeid: str, command: object) -> str:
+    preview = _subprocess_command_preview(command)
+    operation = "real git command" if _is_git_subprocess_command(command) else "real subprocess"
+    return (
+        f"Unit-suite boundary violation in {nodeid}: this unit test invoked a {operation} "
+        f"({preview}). Mock it or move the coverage to tests_functional/ and mark it "
+        "@pytest.mark.functional."
+    )
+
+
+def _find_unit_runtime_subprocess_guard_exemption(nodeid: str) -> tuple[str, str] | None:
+    if nodeid in UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS:
+        return UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS[nodeid]
+    module_nodeid = nodeid.split("::", 1)[0]
+    return UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS.get(module_nodeid)
+
+
+def install_unit_runtime_subprocess_guard(
+    *,
+    nodeid: str,
+    fail: Any | None = None,
+) -> contextlib.AbstractContextManager[None]:
+    stack = ExitStack()
+    if _find_unit_runtime_subprocess_guard_exemption(nodeid) is not None:
+        return stack
+
+    def _fail(command: object) -> None:
+        message = _build_unit_subprocess_guard_message(nodeid, command)
+        if fail is None:
+            pytest.fail(message, pytrace=False)
+        fail(message)
+
+    def _command_from_call(*popenargs: object, **kwargs: object) -> object:
+        if popenargs:
+            return popenargs[0]
+        return kwargs.get("args")
+
+    def _guard_run(*popenargs: object, **kwargs: object):
+        _fail(_command_from_call(*popenargs, **kwargs))
+
+    def _guard_popen(*popenargs: object, **kwargs: object):
+        _fail(_command_from_call(*popenargs, **kwargs))
+
+    class _PopenGuard:
+        # Keep import-time annotations like subprocess.Popen[Any] working while
+        # still failing any attempt to instantiate a real child process.
+        def __call__(self, *popenargs: object, **kwargs: object):
+            _guard_popen(*popenargs, **kwargs)
+
+        def __getitem__(self, _item: object):
+            return self
+
+        def __or__(self, _other: object):
+            return self
+
+        def __ror__(self, _other: object):
+            return self
+
+    stack.enter_context(patch.object(subprocess, "run", _guard_run))
+    stack.enter_context(patch.object(subprocess, "Popen", _PopenGuard()))
+    stack.enter_context(patch.object(subprocess, "check_call", _guard_run))
+    stack.enter_context(patch.object(subprocess, "check_output", _guard_run))
+    return stack
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -65,6 +303,15 @@ def _watch_unit_test_cpu_budget(nodeid: str):
 @pytest.fixture(autouse=True)
 def _enforce_unit_test_cpu_budget(request: pytest.FixtureRequest):
     yield from _watch_unit_test_cpu_budget(request.node.nodeid)
+
+
+@pytest.fixture(autouse=True)
+def _guard_unit_subprocesses(request: pytest.FixtureRequest):
+    if not UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED:
+        yield
+        return
+    with install_unit_runtime_subprocess_guard(nodeid=request.node.nodeid):
+        yield
 
 
 @pytest.fixture(autouse=True)

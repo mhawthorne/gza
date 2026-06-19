@@ -11,6 +11,9 @@ DEFAULT_PATHS = [Path("tests")]
 
 _DIRECT_GIT_RUN_CALL = re.compile(r"\.\s*_run\s*\(")
 _SUBPROCESS_NAME = re.compile(r"\bsubprocess\b")
+_SUBPROCESS_IMPORT_CALL = re.compile(r"\bfrom\s+subprocess\s+import\s+(?:run|Popen|check_call|check_output)\b")
+_SUBPROCESS_MODULE_IMPORT = re.compile(r"\bimport\s+subprocess\b")
+_FORBIDDEN_SUBPROCESS_CALLS = {"run", "Popen", "check_call", "check_output"}
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,10 @@ def _has_git_subprocess_candidate(source: str) -> bool:
     )
 
 
+def _has_subprocess_alias_candidate(source: str) -> bool:
+    return _SUBPROCESS_IMPORT_CALL.search(source) is not None or _SUBPROCESS_MODULE_IMPORT.search(source) is not None
+
+
 def iter_candidate_files(tests_root: Path) -> list[Path]:
     candidates: set[Path] = set(tests_root.rglob("test_*.py"))
     candidates.update(tests_root.rglob("conftest.py"))
@@ -61,6 +68,7 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
     has_cli_subprocess_call = _has_cli_subprocess_candidate(source)
     has_git_subprocess_call = _has_git_subprocess_candidate(source)
     has_generic_subprocess_candidate = _SUBPROCESS_NAME.search(source) is not None
+    has_subprocess_alias_call = _has_subprocess_alias_candidate(source)
     has_legacy_cli_helper = "run_gza" in source or "run_gza_subprocess" in source
     has_tests_functional_import = "tests_functional" in source
     if not (
@@ -68,6 +76,7 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
         or has_cli_subprocess_call
         or has_git_subprocess_call
         or has_generic_subprocess_candidate
+        or has_subprocess_alias_call
         or has_legacy_cli_helper
         or has_tests_functional_import
     ):
@@ -83,13 +92,41 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
     }
     parent_map = (
         {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
-        if has_direct_git_run_call or has_git_subprocess_call or subprocess_names
+        if has_direct_git_run_call
+        or has_git_subprocess_call
+        or has_generic_subprocess_candidate
+        or has_subprocess_alias_call
         else {}
     )
+    subprocess_module_aliases = {"subprocess"}
+    subprocess_callable_aliases: dict[str, str] = {}
     violations: list[Violation] = []
 
     for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    subprocess_module_aliases.add(alias.asname or alias.name)
+            continue
+
         if isinstance(node, ast.ImportFrom):
+            if node.module == "subprocess":
+                for alias in node.names:
+                    if alias.name not in _FORBIDDEN_SUBPROCESS_CALLS:
+                        continue
+                    bound_name = alias.asname or alias.name
+                    subprocess_callable_aliases[bound_name] = alias.name
+                    violations.append(
+                        Violation(
+                            path=test_file,
+                            line=node.lineno,
+                            message=(
+                                "direct subprocess callable imports are banned in tests/ because they "
+                                "bypass the unit-suite runtime guard; import subprocess and patch the "
+                                "seam instead, or move the test to tests_functional/"
+                            ),
+                        )
+                    )
             if node.module in {"tests.helpers.cli", "tests.cli.conftest"}:
                 for alias in node.names:
                     if alias.name == "run_gza":
@@ -127,7 +164,7 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
             isinstance(node.func, ast.Attribute)
             and node.func.attr in {"run", "Popen", "check_call", "check_output"}
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in subprocess_names
+            and node.func.value.id in subprocess_module_aliases
         ):
             if not node.args:
                 violations.append(
@@ -218,6 +255,18 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
             continue
 
         if isinstance(node.func, ast.Name):
+            if node.func.id in subprocess_callable_aliases:
+                violations.append(
+                    Violation(
+                        path=test_file,
+                        line=node.lineno,
+                        message=(
+                            f"subprocess.{subprocess_callable_aliases[node.func.id]} alias calls belong in "
+                            "tests_functional/ unless patched through an in-process seam"
+                        ),
+                    )
+                )
+                continue
             if node.func.id == "run_gza":
                 violations.append(
                     Violation(

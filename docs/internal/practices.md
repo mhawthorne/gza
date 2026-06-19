@@ -66,6 +66,23 @@ stays fast and regressions surface quickly. Subprocess startup routinely
 blows that budget; the dedicated functional suite gives those tests the
 headroom they actually need without stretching the unit watchdog.
 
+The unit suite also installs a default-on runtime subprocess guard in
+`tests/conftest.py`. If a unit test still needs a temporary escape hatch
+while being cleaned up, use a narrow exemption that cites a follow-up task;
+use `GZA_ENABLE_UNIT_SUBPROCESS_GUARD=0` only for emergency local triage.
+
+Turning this guard on red-lines the existing unit tests that drive real
+`git` in temp repos. The guard-installing change does **not** rewrite those
+offenders inline — that would balloon an infrastructure change into a mass
+edit of unrelated test modules. Instead, each offending module the guard
+surfaces gets a narrow, module-scoped exemption that cites a dedicated
+follow-up implement task (one `gza-<n>` per cluster of related modules). The
+guard ships with that small exemption table, and the follow-up tasks then
+convert each module's subprocess/git tests to in-process mocks (or relocate
+them to `tests_functional/` with `@pytest.mark.functional`) and remove the
+matching exemption. The rollout rule: install the guard and file separate
+follow-ups for its offenders — do not convert offenders in the same commit.
+
 ## Skip `uv run` inside the test suite
 
 When a test must spawn the CLI as a subprocess, use `sys.executable -m gza`
