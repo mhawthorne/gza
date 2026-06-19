@@ -231,6 +231,155 @@ def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path,
     assert "You have uncommitted changes. Please commit or stash them first." in output
 
 
+def test_merge_single_task_default_keeps_merge_mechanics_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement merge output", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/default-merge-output"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    output = capsys.readouterr().out
+    assert "Merging 'feature/default-merge-output' into 'main'..." in output
+    assert "✓ Successfully merged feature/default-merge-output" in output
+
+
+def test_merge_single_task_quiet_mechanics_suppresses_default_success_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement quiet merge output", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/quiet-merge-output"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(
+        task.id,
+        config,
+        store,
+        git,
+        args,
+        "main",
+        quiet_mechanics=True,
+    )
+
+    assert result.rc == 0
+    output = capsys.readouterr().out
+    assert "Merging 'feature/quiet-merge-output' into 'main'..." not in output
+    assert "✓ Successfully merged feature/quiet-merge-output" not in output
+
+
+def test_merge_single_task_quiet_mechanics_keeps_squash_reconcile_warning_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement quiet squash merge output", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/quiet-squash-merge-output"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+        rev_parse=MagicMock(return_value="squash-oid"),
+        rev_parse_if_exists=MagicMock(side_effect=lambda ref: f"{ref}-oid"),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=True,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with patch(
+        "gza.cli.git_ops._reconcile_squash_merged_branch_with_origin",
+        return_value=SquashBranchReconcileResult(
+            status="failed_remote_tracking_ref_update",
+            branch="feature/quiet-squash-merge-output",
+            reason="cannot lock ref 'refs/remotes/origin/feature/quiet-squash-merge-output'",
+        ),
+    ):
+        result = _merge_single_task(
+            task.id,
+            config,
+            store,
+            git,
+            args,
+            "main",
+            quiet_mechanics=True,
+        )
+
+    assert result.rc == 0
+    output = capsys.readouterr().out
+    assert "Merging 'feature/quiet-squash-merge-output' into 'main'..." not in output
+    assert "✓ Successfully squash merged feature/quiet-squash-merge-output and created commit" not in output
+    assert "✓ Reconciled origin/feature/quiet-squash-merge-output to the squash merge commit" not in output
+    assert "could not be updated" in output
+    assert "git fetch origin +refs/heads/feature/quiet-squash-merge-output:refs/remotes/origin/feature/quiet-squash-merge-output" in output
+
+
 def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
@@ -2877,6 +3026,21 @@ def test_print_squash_reconcile_result_does_not_emit_lease_guidance_for_policy_r
     assert "changed since it was last observed" not in output
     assert "protected branch hook declined" in output
     assert "git push --force-with-lease=refs/heads/feature/demo:remote-oid" in output
+
+
+def test_print_squash_reconcile_result_suppresses_only_success_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _print_squash_reconcile_result(
+        SquashBranchReconcileResult(
+            status="updated",
+            branch="feature/demo",
+            remote="origin",
+        ),
+        suppress_success=True,
+    )
+
+    assert capsys.readouterr().out == ""
 
 
 def test_print_squash_reconcile_result_emits_lease_guidance_for_stale_info_rejection(

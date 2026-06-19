@@ -847,7 +847,21 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
                 failure_reason,
                 completion_reason,
                 depends_on,
-                merge_status,
+                COALESCE(
+                    (
+                        SELECT mu.state
+                        FROM merge_unit_tasks mut
+                        JOIN merge_units mu
+                          ON mu.project_id = mut.project_id
+                         AND mu.id = mut.merge_unit_id
+                        WHERE mut.project_id = tasks.project_id
+                          AND mut.task_id = tasks.id
+                          AND mu.superseded_by_unit_id IS NULL
+                        ORDER BY mu.updated_at DESC, mu.id DESC
+                        LIMIT 1
+                    ),
+                    merge_status
+                ) AS merge_status,
                 (
                     SELECT mu.target_branch
                     FROM merge_unit_tasks mut
@@ -887,6 +901,7 @@ class _WatchLog:
         self._has_emitted_cycle = False
         self._skip_keys_prev_cycle: set[str] = set()
         self._skip_keys_this_cycle: set[str] = set()
+        self._merge_logged_this_cycle: set[str] = set()
         self._sticky_attention_prev_cycle: dict[str, str] = {}
         self._sticky_attention_this_cycle: dict[str, str] = {}
         self._visible_attention_this_cycle: dict[str, str] = {}
@@ -898,6 +913,7 @@ class _WatchLog:
             if not self.quiet:
                 console.print()
         self._skip_keys_this_cycle.clear()
+        self._merge_logged_this_cycle.clear()
         self._sticky_attention_this_cycle.clear()
         self._visible_attention_this_cycle.clear()
         self._has_emitted_cycle = True
@@ -918,6 +934,12 @@ class _WatchLog:
 
     def visible_attention_messages(self) -> tuple[str, ...]:
         return tuple(self._visible_attention_this_cycle.values())
+
+    def note_merge_logged(self, task_id: str) -> None:
+        self._merge_logged_this_cycle.add(task_id)
+
+    def was_merge_logged(self, task_id: str) -> bool:
+        return task_id in self._merge_logged_this_cycle
 
     def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
         if event == "SKIP" and dedupe_key is not None:
@@ -990,7 +1012,8 @@ def _emit_transition_events(
 
         if task_id in old and old_row.get("merge_status") != "merged" and new_row.get("merge_status") == "merged":
             merge_target = new_row.get("merge_target_branch") or store.default_merge_target()
-            log.emit("MERGE", f"{task_id} -> {merge_target}")
+            if not log.was_merge_logged(task_id):
+                log.emit("MERGE", f"{task_id} -> {merge_target}")
 
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
@@ -1852,6 +1875,18 @@ def _run_cycle(
                     continue
                 merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
                 merge_execution_branch = target_branch if isolation_enabled else current_branch
+                merge_log_task_ids = [display_task.id] if display_task.id is not None else []
+                if display_task.id is not None:
+                    merge_unit = store.resolve_merge_unit_for_task(display_task.id)
+                    if merge_unit is not None:
+                        merge_log_task_ids = sorted(
+                            [member.id for member in store.list_tasks_for_merge_unit(merge_unit.id) if member.id is not None],
+                            key=task_id_numeric_key,
+                        )
+                merge_status_before = {
+                    task_id: (_task_snapshot(store).get(task_id) or {}).get("merge_status")
+                    for task_id in merge_log_task_ids
+                }
                 merge_result = _run_with_optional_stdout_suppressed(
                     quiet,
                     lambda: _execute_merge_action(
@@ -1866,9 +1901,19 @@ def _run_cycle(
                         merge_current_branch=merge_execution_branch,
                         already_merged_behavior="mark_merged",
                         merge_source=MERGE_SOURCE_WATCH,
+                        quiet_mechanics=True,
                     ),
                 )
                 rc = merge_result.rc
+                if rc == 0 and merge_log_task_ids:
+                    merge_status_after = {
+                        task_id: (_task_snapshot(store).get(task_id) or {}).get("merge_status")
+                        for task_id in merge_log_task_ids
+                    }
+                    for task_id in merge_log_task_ids:
+                        if merge_status_before.get(task_id) != "merged" and merge_status_after.get(task_id) == "merged":
+                            log.emit("MERGE", f"{task_id} -> {target_branch}")
+                            log.note_merge_logged(task_id)
                 for followup_task in merge_result.created_followups:
                     log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
                 for followup_task in merge_result.reused_followups:

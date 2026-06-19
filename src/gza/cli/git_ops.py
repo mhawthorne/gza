@@ -825,10 +825,16 @@ def _reconcile_squash_merged_branch_with_origin(
     )
 
 
-def _print_squash_reconcile_result(result: SquashBranchReconcileResult) -> None:
+def _print_squash_reconcile_result(
+    result: SquashBranchReconcileResult,
+    *,
+    suppress_success: bool = False,
+) -> None:
     if result.status == "skipped_no_remote_tracking_ref":
         return
     if result.status == "updated":
+        if suppress_success:
+            return
         print(f"✓ Reconciled {result.remote}/{result.branch} to the squash merge commit")
         return
 
@@ -1131,6 +1137,7 @@ def _merge_single_task(
     current_branch: str,
     *,
     merge_source: str = MERGE_SOURCE_MANUAL,
+    quiet_mechanics: bool = False,
 ) -> _MergeSingleTaskResult:
     """Merge a single task's branch."""
     target_branch = git.default_branch()
@@ -1257,7 +1264,8 @@ def _merge_single_task(
             print(f"✓ Fast-forwarded {current_branch} to {merge_branch}")
         else:
             # Regular merge or squash merge
-            print(f"Merging '{merge_source_ref}' into '{current_branch}'...")
+            if not quiet_mechanics:
+                print(f"Merging '{merge_source_ref}' into '{current_branch}'...")
 
             # For squash merge, create a commit message from the task
             commit_message = None
@@ -1288,7 +1296,8 @@ def _merge_single_task(
                             squash_oid=squash_oid,
                             pre_squash_local_oid=pre_squash_local_oid,
                             pre_squash_remote_oid=pre_squash_remote_oid,
-                        )
+                        ),
+                        suppress_success=quiet_mechanics,
                     )
                 elif squash_oid is not None:
                     pending_squash_reconcile = _PendingSquashBranchReconcile(
@@ -1296,9 +1305,11 @@ def _merge_single_task(
                         pre_squash_local_oid=pre_squash_local_oid,
                         pre_squash_remote_oid=pre_squash_remote_oid,
                     )
-                print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
+                if not quiet_mechanics:
+                    print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
             else:
-                print(f"✓ Successfully merged {merge_source_ref}")
+                if not quiet_mechanics:
+                    print(f"✓ Successfully merged {merge_source_ref}")
 
         # Delete branch if requested
         if args.delete:
@@ -2619,6 +2630,7 @@ def _execute_merge_action(
     merge_current_branch: str | None = None,
     already_merged_behavior: str = "error",
     merge_source: str = MERGE_SOURCE_MANUAL,
+    quiet_mechanics: bool = False,
 ) -> _MergeActionResult:
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
@@ -2720,6 +2732,7 @@ def _execute_merge_action(
             merge_args,
             execution_branch,
             merge_source=merge_source,
+            quiet_mechanics=quiet_mechanics,
         )
     )
     rc = merge_result.rc
@@ -2736,7 +2749,8 @@ def _execute_merge_action(
                         pre_squash_local_oid=pending.pre_squash_local_oid,
                         pre_squash_remote_oid=pending.pre_squash_remote_oid,
                         remote=pending.remote,
-                    )
+                    ),
+                    suppress_success=quiet_mechanics,
                 )
             if resolved_subject is not None and resolved_subject.merge_unit_id is not None:
                 store.set_merge_unit_state(

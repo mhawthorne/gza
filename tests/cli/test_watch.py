@@ -4188,6 +4188,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
     assert execute_merge.call_count == 1
     assert execute_merge.call_args.kwargs["merge_git"] is rebuilt_git
     assert execute_merge.call_args.kwargs["merge_current_branch"] == "main"
+    assert execute_merge.call_args.kwargs["quiet_mechanics"] is True
     log_text = log_path.read_text()
     assert "isolated merge checkout refresh failed; rebuilding: stale checkout" in log_text
     assert "isolated merge checkout rebuilt" in log_text
@@ -4522,7 +4523,7 @@ def test_execute_merge_action_reconciles_pending_squash_only_after_isolated_prom
     assert result.rc == 0
     promote.assert_called_once_with(repo_git, merge_git, "main")
     reconcile.assert_called_once()
-    print_reconcile.assert_called_once_with(reconcile_result)
+    print_reconcile.assert_called_once_with(reconcile_result, suppress_success=False)
     refreshed_task = store.get(task.id)
     assert refreshed_task is not None
     assert refreshed_task.merge_status == "merged"
@@ -5299,6 +5300,104 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
     git.count_commits_ahead.assert_called_with(source_ref, "main")
 
 
+def test_watch_cycle_logs_inline_merge_before_same_cycle_start(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_task = store.add("Completed task", task_type="implement")
+    assert merged_task.id is not None
+    merged_task.status = "completed"
+    merged_task.completed_at = datetime.now(UTC)
+    merged_task.branch = "feature/watch-inline-merge-order"
+    store.update(merged_task)
+    store.set_merge_status(merged_task.id, "unmerged")
+
+    pending_review = store.add("Pending review", task_type="review")
+    assert pending_review.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
+        if task.id == merged_task.id:
+            return {"type": "merge"}
+        return {"type": "skip"}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(merged_task.id, "merged"),
+                SimpleNamespace(rc=0, created_followups=[], reused_followups=[]),
+            )[1],
+        ),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    lines = log_path.read_text().splitlines()
+    merge_index = next(i for i, line in enumerate(lines) if f"MERGE     {merged_task.id} -> main" in line)
+    start_index = next(i for i, line in enumerate(lines) if f"START     {pending_review.id} review" in line)
+    assert merge_index < start_index
+
+
+def test_watch_cycle_non_quiet_passes_quiet_mechanics_and_keeps_structured_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-non-quiet-merge"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    git = _make_watch_git()
+
+    def fake_execute_merge_action(*_args, **kwargs):
+        assert kwargs["quiet_mechanics"] is True
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert f"MERGE     {task.id} -> main" in log_path.read_text()
+
+
 def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5357,6 +5456,56 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
     stdout = capsys.readouterr().out
     assert "Merging 'feature/watch-quiet-merge' into 'main'..." not in stdout
     assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
+
+
+def test_watch_cycle_non_quiet_keeps_reconcile_failure_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-warning-merge"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=False)
+    git = _make_watch_git()
+
+    def fake_execute_merge_action(*_args, **kwargs):
+        assert kwargs["quiet_mechanics"] is True
+        print(
+            "Warning: Squash merge landed, but origin/feature/watch-warning-merge could not be reconciled: "
+            "git push failed: stale info"
+        )
+        print(
+            "origin/feature/watch-warning-merge changed since it was last observed; "
+            "reconcile it manually before relying on watch."
+        )
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "could not be reconciled: git push failed: stale info" in stdout
+    assert "reconcile it manually before relying on watch." in stdout
 
 
 def test_watch_cycle_dirty_checkout_blocks_merge_pass_and_stops_later_merges(tmp_path: Path) -> None:
@@ -5492,6 +5641,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     assert kwargs["target_branch"] == "main"
     assert kwargs["current_branch"] == "main"
     assert kwargs["merge_source"] == "watch"
+    assert kwargs["quiet_mechanics"] is True
     assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
     assert any(
         line.split(maxsplit=2)[1] == "FOLLOW" and "gza-999 created from" in line
@@ -5666,6 +5816,72 @@ def test_emit_transition_events_logs_merge_unit_target_branch_on_external_merge_
     log_text = log_path.read_text()
     assert log_text.count(f"MERGE     {task.id} -> release") == 1
     assert f"MERGE     {task.id} -> main" not in log_text
+
+
+def test_watch_cycle_logs_each_merged_merge_unit_member_once(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Owner task", task_type="implement")
+    sibling = store.add("Sibling task", task_type="implement", based_on=owner.id)
+    assert owner.id is not None
+    assert sibling.id is not None
+    for task in (owner, sibling):
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/watch-merge-unit"
+        task.has_commits = True
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch="feature/watch-merge-unit",
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(sibling.id, unit.id, "same_branch")
+    store.dual_write_legacy_merge_status(unit.id)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
+        if task.id == owner.id:
+            return {"type": "merge"}
+        return {"type": "skip"}
+
+    def merge_unit_side_effect(*_args, **_kwargs):
+        store.set_merge_unit_state(unit.id, "merged")
+        store.set_merge_status(owner.id, "merged")
+        store.set_merge_status(sibling.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            side_effect=merge_unit_side_effect,
+        ),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    assert log_text.count(f"MERGE     {owner.id} -> main") == 1
+    assert log_text.count(f"MERGE     {sibling.id} -> main") == 1
 
 
 def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:
