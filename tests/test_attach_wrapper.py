@@ -10,7 +10,7 @@ from gza.attach_wrapper import main
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.log_paths import ops_log_path_for
-from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 
 
 def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
@@ -257,6 +257,10 @@ def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
         patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+        patch(
+            "gza.attach_wrapper._prepare_task_for_immediate_execution",
+            side_effect=lambda _config, task, **_kwargs: task,
+        ),
     ):
         rc = main()
 
@@ -303,6 +307,10 @@ def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retr
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
         patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+        patch(
+            "gza.attach_wrapper._prepare_task_for_immediate_execution",
+            side_effect=lambda _config, task, **_kwargs: task,
+        ),
     ):
         rc = main()
 
@@ -345,6 +353,10 @@ def test_attach_wrapper_retry_handoff_failure_logs_retry_failed(tmp_path: Path) 
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
         patch("gza.attach_wrapper._spawn_background_iterate", return_value=9),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
+        patch(
+            "gza.attach_wrapper._prepare_task_for_immediate_execution",
+            side_effect=lambda _config, task, **_kwargs: task,
+        ),
     ):
         rc = main()
 
@@ -433,6 +445,10 @@ def test_attach_wrapper_retryable_failed_non_implement_handoff_uses_worker_path(
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
         patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+        patch(
+            "gza.attach_wrapper._prepare_task_for_immediate_execution",
+            side_effect=lambda _config, task, **_kwargs: task,
+        ),
     ):
         rc = main()
 
@@ -486,7 +502,9 @@ def test_attach_wrapper_failed_resume_descendant_does_not_auto_recover_further(t
     mock_spawn.assert_not_called()
 
 
-def test_attach_wrapper_timeout_parent_with_failed_resume_descendant_stops_at_manual_review(tmp_path: Path) -> None:
+def test_attach_wrapper_timeout_parent_with_failed_resume_descendant_stops_at_manual_review(
+    tmp_path: Path,
+) -> None:
     """Repeated handoff after timeout budget consumption should not relaunch original task."""
     task_id, _ = _setup_task_with_log(tmp_path)
     config = Config.load(tmp_path)
@@ -518,6 +536,18 @@ def test_attach_wrapper_timeout_parent_with_failed_resume_descendant_stops_at_ma
             "--session-id", original.session_id,
             "--project", str(tmp_path),
         ]),
+        patch(
+            "gza.attach_wrapper.decide_failed_task_recovery",
+            return_value=FailedRecoveryDecision(
+                task_id=task_id,
+                action="skip",
+                reason_code="retry_limit_reached",
+                reason_text="automatic recovery stops here; retry limit reached",
+                launch_mode="none",
+                attempt_index=1,
+                attempt_limit=config.max_resume_attempts,
+            ),
+        ),
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
     ):
@@ -911,6 +941,11 @@ def test_attach_wrapper_retry_iterate_success_passes_prepared_metadata(tmp_path:
     failed.failure_reason = "INFRASTRUCTURE_ERROR"
     store.update(failed)
 
+    retry_child = store.add(failed.prompt, task_type=failed.task_type, based_on=task_id)
+    assert retry_child.id is not None
+    retry_child.recovery_origin = "retry"
+    store.update(retry_child)
+
     with (
         patch.object(sys, "argv", [
             "gza.attach_wrapper",
@@ -918,9 +953,27 @@ def test_attach_wrapper_retry_iterate_success_passes_prepared_metadata(tmp_path:
             "--session-id", "sess-123",
             "--project", str(tmp_path),
         ]),
+        patch(
+            "gza.attach_wrapper.decide_failed_task_recovery",
+            return_value=FailedRecoveryDecision(
+                task_id=task_id,
+                action="retry",
+                reason_code="INFRASTRUCTURE_ERROR",
+                reason_text="INFRASTRUCTURE_ERROR restart with fresh attempt",
+                launch_mode="iterate",
+                attempt_index=0,
+                attempt_limit=config.max_resume_attempts,
+                recovery_task_id=retry_child.id,
+                reuse_existing=True,
+            ),
+        ),
         patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
         patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+        patch(
+            "gza.attach_wrapper._prepare_task_for_immediate_execution",
+            side_effect=lambda _config, task, **_kwargs: task,
+        ),
     ):
         rc = main()
 

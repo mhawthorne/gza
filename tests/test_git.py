@@ -1079,7 +1079,8 @@ class TestMergeOperations:
         git = Git(repo_dir)
 
         with patch.object(git, 'branch_exists', return_value=False), \
-             patch.object(git, 'ref_exists', return_value=False):
+             patch.object(git, 'ref_exists', return_value=False), \
+             patch.object(git, 'default_branch', return_value='main'):
             result = git.can_merge("nonexistent")
 
             assert result is False

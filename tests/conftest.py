@@ -32,54 +32,6 @@ UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED = (
 # task so real subprocess drift is still surfaced at author time.
 UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS: dict[str, tuple[str, str]] = {
     # tests/* offenders the guard surfaces; cleanup tracked by gza-5376.
-    "tests/test_advance_engine.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_attach_wrapper.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_git.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_providers.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_query.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_recovery_engine.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_runner.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/test_task_query.py": (
-        "gza-5376",
-        "Temporary module-scoped exemption tracked by gza-5376, which converts the "
-        "tests/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
 }
 
 register_sigterm_faulthandler()

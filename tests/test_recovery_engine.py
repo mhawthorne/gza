@@ -49,6 +49,23 @@ def _read_context_for_store(store) -> RecoveryReadContext:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_ambient_merge_context_for_unit_tests(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    if request.node.name in {
+        "test_load_merge_context_warning_says_metadata_based_lineage_suppression_may_still_apply",
+        "test_list_failed_tasks_for_recovery_warns_once_when_local_branch_batch_probe_fails",
+    }:
+        return
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch="main"),
+    )
+
+
 def _failed_task(tmp_path: Path, *, task_type: str = "implement", reason: str = "MAX_TURNS", session_id: str | None = "sess-1"):
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -247,11 +264,17 @@ def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
 )
 def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     task_type: str,
     reason: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch="main"),
+    )
     impl = _completed_impl(store, merge_status="merged")
     assert impl.id is not None
 
@@ -270,10 +293,16 @@ def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged
 @pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
 def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not_merged(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     task_type: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch="main"),
+    )
     impl = _completed_impl(store, merge_status="unmerged")
     assert impl.id is not None
 
@@ -373,9 +402,17 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
 
 
-def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp_path: Path) -> None:
+def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch="main"),
+    )
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -395,9 +432,17 @@ def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
-def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(tmp_path: Path) -> None:
+def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch="main"),
+    )
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -2639,9 +2684,11 @@ def test_recovery_engine_prerequisite_unmerged_live_redundant_branch_persists_re
 
 def test_recovery_engine_prerequisite_unmerged_with_commits_retries_after_dependency_merge(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
 
     dependency = store.add("Dependency", task_type="implement")
     assert dependency.id is not None
@@ -3577,6 +3624,13 @@ class _MinimalRecoveryGit(Git):
 
     def branch_exists(self, branch: str) -> bool:  # type: ignore[override]
         return branch in self._branches
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+        if ref == "main":
+            return "target-tip"
+        if ref in self._branches:
+            return f"{ref}-tip"
+        return None
 
     def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):  # type: ignore[override]
         from gza.git import ResolvedMergeSourceRef

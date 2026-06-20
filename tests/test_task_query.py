@@ -33,6 +33,14 @@ def _store(tmp_path: Path) -> SqliteTaskStore:
     return SqliteTaskStore(tmp_path / "test.db")
 
 
+@pytest.fixture(autouse=True)
+def _patch_failed_task_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "gza.recovery_engine.list_failed_tasks_for_recovery",
+        lambda store, **_kwargs: [task for task in store.get_all() if task.status == "failed"],
+    )
+
+
 def test_search_default_matches_pending_and_internal(tmp_path: Path) -> None:
     store = _store(tmp_path)
     pending = store.add("needle pending", task_type="implement")

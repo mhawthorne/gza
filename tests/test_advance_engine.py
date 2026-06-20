@@ -574,7 +574,10 @@ def _unstructured_mixed_review_report() -> str:
     )
 
 
-def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
+def test_resolve_context_excludes_resume_state_for_test_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.max_noop_improve_cycles = 2
@@ -586,6 +589,19 @@ def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
     failed.completed_at = datetime.now(UTC)
     failed.branch = "feat/test-failure"
     store.update(failed)
+
+    monkeypatch.setattr(
+        "gza.advance_engine.decide_failed_task_recovery",
+        lambda *_args, **_kwargs: FailedRecoveryDecision(
+            task_id=failed.id,
+            action="skip",
+            reason_code="manual_review_only",
+            reason_text="TEST_FAILURE requires manual review",
+            launch_mode="none",
+            attempt_index=0,
+            attempt_limit=config.max_resume_attempts,
+        ),
+    )
 
     ctx = resolve_advance_context(
         config,
@@ -2335,7 +2351,10 @@ def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: P
     assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
 
 
-def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
+def test_evaluate_resumes_timeout_retry_descendant_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
@@ -2358,6 +2377,19 @@ def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
     resumed.completed_at = datetime.now(UTC)
     resumed.branch = "feat/resume"
     store.update(resumed)
+
+    monkeypatch.setattr(
+        "gza.advance_engine.decide_failed_task_recovery",
+        lambda *_args, **_kwargs: FailedRecoveryDecision(
+            task_id=resumed.id,
+            action="resume",
+            reason_code="resume_failed_task",
+            reason_text="MAX_STEPS retry descendant should resume once",
+            launch_mode="worker",
+            attempt_index=1,
+            attempt_limit=config.max_resume_attempts,
+        ),
+    )
 
     action = evaluate_advance_rules(
         config,
@@ -2389,6 +2421,8 @@ def test_actionable_failed_recovery_actions_are_not_needs_attention(tmp_path: Pa
 
 
 def test_branch_unpushable_failed_recovery_lowers_to_reconcile_action(tmp_path: Path) -> None:
+    from gza.recovery_engine import _MergeContext
+
     store = _make_store(tmp_path)
 
     failed = store.add("Implement feature", task_type="implement")
@@ -2399,7 +2433,12 @@ def test_branch_unpushable_failed_recovery_lowers_to_reconcile_action(tmp_path: 
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
 
-    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    decision = decide_failed_task_recovery(
+        store,
+        failed,
+        max_recovery_attempts=1,
+        merge_context=_MergeContext(git=None, default_branch="main"),
+    )
     action = failed_recovery_decision_to_action(failed, decision)
 
     assert decision.action == "reconcile"
@@ -2500,7 +2539,10 @@ def test_failed_review_terminal_skip_subjects_owning_implementation(tmp_path: Pa
     assert action["subject_task_id"] == impl.id
 
 
-def test_failed_rebase_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
+def test_failed_rebase_terminal_skip_subjects_owning_implementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -2517,13 +2559,33 @@ def test_failed_rebase_terminal_skip_subjects_owning_implementation(tmp_path: Pa
     rebase.branch = impl.branch
     store.update(rebase)
 
+    monkeypatch.setattr(
+        "gza.advance_engine.decide_failed_task_recovery",
+        lambda *_args, **_kwargs: FailedRecoveryDecision(
+            task_id=rebase.id,
+            action="skip",
+            reason_code="manual_failure_reason",
+            reason_text="UNKNOWN requires manual intervention",
+            launch_mode="none",
+            attempt_index=0,
+            attempt_limit=config.max_resume_attempts,
+        ),
+    )
+    monkeypatch.setattr(
+        "gza.advance_engine.get_failed_recovery_needs_attention_reason",
+        lambda *_args, **_kwargs: "manual-failure-reason",
+    )
+
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
 
     assert classify_advance_action(action) == "needs_attention"
     assert action["subject_task_id"] == impl.id
 
 
-def test_failed_chained_improve_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
+def test_failed_chained_improve_terminal_skip_subjects_owning_implementation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -2561,6 +2623,23 @@ def test_failed_chained_improve_terminal_skip_subjects_owning_implementation(tmp
     failed_improve.completed_at = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)
     failed_improve.branch = impl.branch
     store.update(failed_improve)
+
+    monkeypatch.setattr(
+        "gza.advance_engine.decide_failed_task_recovery",
+        lambda *_args, **_kwargs: FailedRecoveryDecision(
+            task_id=failed_improve.id,
+            action="skip",
+            reason_code="manual_failure_reason",
+            reason_text="UNKNOWN requires manual intervention",
+            launch_mode="none",
+            attempt_index=0,
+            attempt_limit=config.max_resume_attempts,
+        ),
+    )
+    monkeypatch.setattr(
+        "gza.advance_engine.get_failed_recovery_needs_attention_reason",
+        lambda *_args, **_kwargs: "manual-failure-reason",
+    )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), failed_improve, "main")
 
@@ -4674,6 +4753,7 @@ def test_failed_timeout_implement_no_review_stays_in_recovery_not_merge(tmp_path
 
 def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -4698,6 +4778,15 @@ def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip
     assert refreshed_unit is not None
     assert refreshed_unit.state == "redundant"
 
+    monkeypatch.setattr(
+        "gza.recovery_engine.list_failed_tasks_for_recovery",
+        lambda *_args, **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        "gza.cli.advance_engine.failed_recovery_decision_to_attention_action",
+        lambda *_args, **_kwargs: None,
+    )
+
     rows = query_lineage_owner_rows(
         store,
         LineageOwnerQuery(limit=None, include_skipped=False),
@@ -4719,6 +4808,7 @@ def test_empty_and_redundant_advance_skip_descriptions_are_distinct() -> None:
 
 def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_target_tip(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -4747,6 +4837,11 @@ def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_ta
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
 
+    monkeypatch.setattr(
+        "gza.recovery_engine.list_failed_tasks_for_recovery",
+        lambda *_args, **_kwargs: (),
+    )
+
     rows = query_lineage_owner_rows(
         store,
         LineageOwnerQuery(limit=None, include_skipped=False),
@@ -4759,6 +4854,7 @@ def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_ta
 
 def test_empty_branch_persists_empty_and_skips_merge_actions(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -4784,6 +4880,11 @@ def test_empty_branch_persists_empty_and_skips_merge_actions(
     assert refreshed_unit.state == "redundant"
     assert refreshed_unit.merged_at is None
     assert refreshed_unit.merged_by_task_id is None
+
+    monkeypatch.setattr(
+        "gza.recovery_engine.list_failed_tasks_for_recovery",
+        lambda *_args, **_kwargs: (),
+    )
 
     rows = query_lineage_owner_rows(
         store,

@@ -234,6 +234,26 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_are_explicit_and
         )
 
 
+def test_unit_test_conftest_runtime_subprocess_guard_does_not_exempt_cleaned_unit_modules() -> None:
+    """Recently cleaned unit modules should stay out of the runtime subprocess exemption list."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = _load_module(conftest_path, "tests_runtime_guard_cleaned_modules_conftest")
+
+    exemptions = module.UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS
+    cleaned_modules = {
+        "tests/test_advance_engine.py",
+        "tests/test_attach_wrapper.py",
+        "tests/test_git.py",
+        "tests/test_providers.py",
+        "tests/test_query.py",
+        "tests/test_recovery_engine.py",
+        "tests/test_runner.py",
+        "tests/test_task_query.py",
+    }
+
+    assert cleaned_modules.isdisjoint(exemptions)
+
+
 def test_unit_test_conftest_runtime_subprocess_guard_exemptions_match_module_prefix() -> None:
     """Module-scoped exemptions should match child nodeids but not unrelated tests."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"

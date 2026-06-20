@@ -9,6 +9,7 @@ import stat
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
@@ -1284,10 +1285,20 @@ class TestReviewContextFromChain:
 
     def test_run_review_verify_command_captures_failed_output(self, tmp_path: Path):
         """Autonomous review verify should record command, status, exit code, and trimmed output."""
-        result = _run_review_verify_command(
-            "printf 'lint failed\\n' && exit 7",
-            cwd=tmp_path,
-        )
+        with patch(
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=SimpleNamespace(
+                returncode=7,
+                stdout=b"lint failed\n",
+                stderr=b"",
+                timed_out=False,
+                forced_kill=False,
+            ),
+        ):
+            result = _run_review_verify_command(
+                "printf 'lint failed\\n' && exit 7",
+                cwd=tmp_path,
+            )
 
         rendered = _format_review_verify_result(result)
         assert result.command == "printf 'lint failed\\n' && exit 7"
@@ -5669,6 +5680,13 @@ class TestNonCodeWorktreeCleanup:
 class TestFailureReasonGroundTruth:
     """Code-task regressions for failure reason precedence."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_recovery_merge_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: SimpleNamespace(git=None, default_branch="main"),
+        )
+
     def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -5752,6 +5770,9 @@ class TestFailureReasonGroundTruth:
             patch("gza.runner.get_provider", return_value=mock_provider),
             patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
             patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner._compute_tree_fingerprint", return_value="fingerprint"),
+            patch("gza.runner._post_complete_code_task", return_value=0),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
             patch("gza.runner.load_dotenv"),
             patch("gza.runner.build_prompt", return_value="prompt"),
             patch("gza.runner.task_footer") as mock_task_footer,
@@ -5760,8 +5781,16 @@ class TestFailureReasonGroundTruth:
 
         return exit_status, store, task, mock_task_footer
 
-    def test_code_task_uses_timeout_ground_truth_over_log_markers(self, tmp_path: Path):
+    def test_code_task_uses_timeout_ground_truth_over_log_markers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         """Host timeout exit code should persist TIMEOUT even if logs contain markers."""
+        monkeypatch.setattr(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: SimpleNamespace(git=None, default_branch="main"),
+        )
         exit_code, store, task, _ = self._run_code_task_failure(
             tmp_path,
             exit_code=124,
@@ -6578,7 +6607,10 @@ class TestResumeVerificationPrompt:
         # Mock provider and git
         with patch('gza.runner.get_provider') as mock_get_provider, \
              patch('gza.runner.Git') as mock_git_class, \
-             patch('gza.runner.load_dotenv'):
+             patch('gza.runner.load_dotenv'), \
+             patch('gza.runner._compute_tree_fingerprint', return_value='fingerprint'), \
+             patch('gza.runner._post_complete_code_task', return_value=0), \
+             patch.object(SqliteTaskStore, 'default_merge_target', return_value='main'):
 
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
@@ -7710,6 +7742,20 @@ class TestBackupDatabase:
 class TestNoChangesWithExistingCommits:
     """Tests for the fix that prevents false 'No changes made' failure on resume."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_completion_git_seams(self) -> object:
+        def _fake_post_complete(*_args, **_kwargs) -> int:
+            print("gza merge")
+            print("gza pr")
+            return 0
+
+        with (
+            patch("gza.runner._compute_tree_fingerprint", return_value="fingerprint"),
+            patch("gza.runner._post_complete_code_task", side_effect=_fake_post_complete),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
+        ):
+            yield
+
     def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -7879,6 +7925,22 @@ class TestNoChangesWithExistingCommits:
 
 class TestTaskClaimSafety:
     """Regression tests for explicit status handling and CAS contention."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_recovery_merge_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: SimpleNamespace(git=None, default_branch="main"),
+        )
+
+    @pytest.fixture(autouse=True)
+    def _stub_runner_git(self) -> object:
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git.branch_exists.return_value = False
+        mock_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+        with patch("gza.runner.Git", return_value=mock_git):
+            yield
 
     def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
         config = Mock(spec=Config)
@@ -8185,6 +8247,7 @@ class TestTaskClaimSafety:
             patch("gza.runner.backup_database"),
             patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
             patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
         ):
             mock_provider = Mock()
             mock_provider.name = "Claude"
@@ -8192,6 +8255,12 @@ class TestTaskClaimSafety:
             mock_provider.check_credentials.return_value = True
             mock_provider.verify_credentials.return_value = True
             mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.branch_exists.return_value = False
+            mock_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+            mock_git_class.return_value = mock_git
 
             result = run(
                 config,
@@ -8224,6 +8293,7 @@ class TestTaskClaimSafety:
             patch("gza.runner.backup_database"),
             patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
             patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
         ):
             mock_provider = Mock()
             mock_provider.name = "Codex"
@@ -8231,6 +8301,12 @@ class TestTaskClaimSafety:
             mock_provider.check_credentials.return_value = True
             mock_provider.verify_credentials.return_value = True
             mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.branch_exists.return_value = False
+            mock_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+            mock_git_class.return_value = mock_git
 
             result = run(
                 config,
@@ -8264,6 +8340,7 @@ class TestTaskClaimSafety:
             patch("gza.runner.backup_database"),
             patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
             patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
         ):
             mock_provider = Mock()
             mock_provider.name = "Claude"
@@ -8271,6 +8348,12 @@ class TestTaskClaimSafety:
             mock_provider.check_credentials.return_value = True
             mock_provider.verify_credentials.return_value = True
             mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.branch_exists.return_value = False
+            mock_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+            mock_git_class.return_value = mock_git
 
             result = run(
                 config,
@@ -8473,6 +8556,15 @@ class TestTaskClaimSafety:
 
 class TestSameBranchLineageWalk:
     """Tests for same_branch resolution walking the based_on lineage chain."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_completion_git_seams(self) -> object:
+        with (
+            patch("gza.runner._compute_tree_fingerprint", return_value="fingerprint"),
+            patch("gza.runner._post_complete_code_task", return_value=0),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
+        ):
+            yield
 
     def _make_config(self, tmp_path: Path, db_path: Path) -> Mock:
         config = Mock(spec=Config)
@@ -8864,6 +8956,13 @@ class TestSameBranchLineageWalk:
 class TestExtractedRunInnerHelpers:
     """Unit tests for helpers extracted from _run_inner orchestration."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_recovery_merge_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "gza.recovery_engine._load_merge_context",
+            lambda _project_dir=None: SimpleNamespace(git=None, default_branch="main"),
+        )
+
     def _make_config(self, tmp_path: Path) -> Mock:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
@@ -8873,6 +8972,18 @@ class TestExtractedRunInnerHelpers:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         return config
+
+    def _make_pr_retry_git(self, branch_name: str) -> Mock:
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.rev_parse_if_exists.side_effect = lambda ref: {
+            branch_name: "head-sha",
+            "main": "base-sha",
+        }.get(ref)
+        git._run.return_value = Mock(returncode=0)
+        git.branch_exists.return_value = False
+        git.worktree_list.return_value = []
+        return git
 
     def test_resolve_code_task_branch_name_walks_lineage(self, tmp_path: Path):
         """same_branch lineage resolution should return an ancestor branch that exists."""
@@ -11363,6 +11474,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.backup_database"),
             patch("gza.runner._run_inner", return_value=0) as mock_run_inner,
             patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
         ):
             mock_provider = Mock()
             mock_provider.name = "Claude"
@@ -11370,6 +11482,12 @@ class TestExtractedRunInnerHelpers:
             mock_provider.check_credentials.return_value = True
             mock_provider.verify_credentials.return_value = True
             mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.return_value = "main"
+            mock_git.branch_exists.return_value = False
+            mock_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+            mock_git_class.return_value = mock_git
 
             result = run(config, task_id=task.id)
 
@@ -12112,10 +12230,13 @@ class TestExtractedRunInnerHelpers:
         task.output_content = "summary"
         task.has_commits = True
         store.update(task)
+        git = self._make_pr_retry_git(task.branch)
 
         with (
+            patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -12177,10 +12298,13 @@ class TestExtractedRunInnerHelpers:
         task.output_content = "summary"
         task.has_commits = True
         store.update(task)
+        git = self._make_pr_retry_git(task.branch)
 
         with (
+            patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -12229,11 +12353,13 @@ class TestExtractedRunInnerHelpers:
         improve.has_commits = True
         store.update(improve)
         assert improve.id is not None
+        git = self._make_pr_retry_git(improve.branch)
 
         with (
-            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -12279,11 +12405,13 @@ class TestExtractedRunInnerHelpers:
         assert improve.id is not None
 
         store.add_comment(parent.id, "New comment after improve creation", source="direct")
+        git = self._make_pr_retry_git(improve.branch)
 
         with (
-            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -12339,11 +12467,13 @@ class TestExtractedRunInnerHelpers:
         assert improve2.id is not None
 
         store.add_comment(impl.id, "New root comment after retry creation", source="direct")
+        git = self._make_pr_retry_git(improve2.branch)
 
         with (
-            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch("gza.runner.Git", return_value=git),
             patch("gza.runner.backup_database"),
             patch("gza.runner.load_dotenv"),
+            patch.object(SqliteTaskStore, "default_merge_target", return_value="main"),
             patch(
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
@@ -14884,7 +15014,37 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
+        def stub_review_verify(
+            verify_command: str,
+            *,
+            cwd: Path,
+            reviewed_branch: str | None = None,
+            reviewed_head_sha: str | None = None,
+            reviewed_base_sha: str | None = None,
+            timeout_seconds: int = 0,
+            timeout_grace_seconds: float = 0.0,
+        ) -> ReviewVerifyResult:
+            del timeout_seconds, timeout_grace_seconds
+            return ReviewVerifyResult(
+                command=verify_command,
+                status="failed",
+                exit_status="7",
+                captured_at=datetime.now(UTC),
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(cwd),
+                output=(
+                    "gza-verify phase=passed name=ruff duration_seconds=1.25 "
+                    f"tree_fingerprint={passed_fingerprint}\n"
+                    "gza-verify phase=failed name=pytest duration_seconds=3.5 "
+                    f"tree_fingerprint={failed_fingerprint}\n"
+                    "lint failed"
+                ),
+            )
+
         with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._run_review_verify_command", side_effect=stub_review_verify), \
              patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
@@ -14988,7 +15148,31 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
+        def stub_review_verify(
+            verify_command: str,
+            *,
+            cwd: Path,
+            reviewed_branch: str | None = None,
+            reviewed_head_sha: str | None = None,
+            reviewed_base_sha: str | None = None,
+            timeout_seconds: int = 0,
+            timeout_grace_seconds: float = 0.0,
+        ) -> ReviewVerifyResult:
+            del timeout_seconds, timeout_grace_seconds
+            return ReviewVerifyResult(
+                command=verify_command,
+                status="passed",
+                exit_status="0",
+                captured_at=datetime.now(UTC),
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(cwd),
+                output="all good",
+            )
+
         with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._run_review_verify_command", side_effect=stub_review_verify), \
              patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
@@ -15062,7 +15246,31 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
+        def stub_review_verify(
+            verify_command: str,
+            *,
+            cwd: Path,
+            reviewed_branch: str | None = None,
+            reviewed_head_sha: str | None = None,
+            reviewed_base_sha: str | None = None,
+            timeout_seconds: int = 0,
+            timeout_grace_seconds: float = 0.0,
+        ) -> ReviewVerifyResult:
+            del timeout_seconds, timeout_grace_seconds
+            return ReviewVerifyResult(
+                command=verify_command,
+                status="failed",
+                exit_status="9",
+                captured_at=datetime.now(UTC),
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(cwd),
+                output=large_output,
+            )
+
         with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._run_review_verify_command", side_effect=stub_review_verify), \
              patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
@@ -16219,7 +16427,10 @@ class TestProviderPromptSanitization:
                 error_type=None,
             )
 
-        with patch("gza.runner.get_provider") as mock_get_provider, patch("gza.runner.Git") as mock_git_class, patch("gza.runner.load_dotenv"):
+        with patch("gza.runner.get_provider") as mock_get_provider, \
+             patch("gza.runner.Git") as mock_git_class, \
+             patch("gza.runner.load_dotenv"), \
+             patch.object(SqliteTaskStore, "default_merge_target", return_value="main"):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True
@@ -16315,7 +16526,10 @@ class TestProviderPromptSanitization:
                 error_type=None,
             )
 
-        with patch("gza.runner.get_provider") as mock_get_provider, patch("gza.runner.Git") as mock_git_class, patch("gza.runner.load_dotenv"):
+        with patch("gza.runner.get_provider") as mock_get_provider, \
+             patch("gza.runner.Git") as mock_git_class, \
+             patch("gza.runner.load_dotenv"), \
+             patch.object(SqliteTaskStore, "default_merge_target", return_value="main"):
             mock_provider = Mock()
             mock_provider.name = "TestProvider"
             mock_provider.check_credentials.return_value = True

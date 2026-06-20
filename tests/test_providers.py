@@ -736,7 +736,13 @@ class TestBuildDockerCmd:
         )
 
         # Ensure the var is not set
-        with patch.dict(os.environ, {}, clear=True):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "gza.providers.base.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout="", stderr=""),
+            ),
+        ):
             # Need to preserve PATH etc for the test to work
             cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10)
 

@@ -2923,9 +2923,14 @@ def test_query_lineage_owner_rows_calls_load_merge_context_when_git_not_provided
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without git, _load_merge_context IS invoked as the fallback ambient path."""
+    """Without git, unresolved failed owners still fall back to _load_merge_context."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    failed = store.add("failed impl", task_type="implement")
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.failure_reason = "TEST_FAILURE"
+    store.update(failed)
 
     call_count: list[int] = []
 
@@ -2951,10 +2956,14 @@ def test_query_lineage_owner_rows_calls_load_merge_context_when_target_branch_no
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without target_branch, _load_merge_context is still invoked even when git is provided,
-    because we cannot seed a deterministic default_branch without it."""
+    """Without target_branch, unresolved failed owners still load ambient merge context."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    failed = store.add("failed impl", task_type="implement")
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    failed.failure_reason = "TEST_FAILURE"
+    store.update(failed)
 
     call_count: list[int] = []
 

@@ -475,6 +475,13 @@ class TestQueryHistoryWithLineage:
 class TestQueryIncomplete:
     """Tests for unresolved-lineage query behavior."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_failed_task_listing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "gza.recovery_engine.list_failed_tasks_for_recovery",
+            lambda store, **_kwargs: [task for task in store.get_all() if task.status == "failed"],
+        )
+
     def _store(self, tmp_path: Path) -> SqliteTaskStore:
         return SqliteTaskStore(tmp_path / "test.db")
 
@@ -489,7 +496,11 @@ class TestQueryIncomplete:
         task.status = "failed"
         task.completed_at = datetime.now(UTC)
 
-    def test_merged_root_hides_completed_review_and_improve(self, tmp_path: Path):
+    def test_merged_root_hides_completed_review_and_improve(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         store = self._store(tmp_path)
 
         root = store.add("implement root", task_type="implement")
@@ -506,10 +517,19 @@ class TestQueryIncomplete:
         self._complete(improve, merge_status="unmerged")
         store.update(improve)
 
+        monkeypatch.setattr(
+            "gza.recovery_engine.list_failed_tasks_for_recovery",
+            lambda *_args, **_kwargs: (),
+        )
+
         lineages = query_incomplete(store, HistoryFilter(limit=None))
         assert lineages == []
 
-    def test_failed_improve_under_merged_root_is_suppressed(self, tmp_path: Path):
+    def test_failed_improve_under_merged_root_is_suppressed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         store = self._store(tmp_path)
 
         root = store.add("implement root", task_type="implement")
@@ -521,6 +541,11 @@ class TestQueryIncomplete:
         self._fail(improve)
         store.update(improve)
         assert improve.id is not None
+
+        monkeypatch.setattr(
+            "gza.recovery_engine.list_failed_tasks_for_recovery",
+            lambda *_args, **_kwargs: (),
+        )
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
