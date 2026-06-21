@@ -44,3 +44,4 @@ Additional rules for authors:
 | [recovery.md](recovery.md) | Failed-task recovery policy: moot vs recoverable terminal no-work (`empty`/`redundant`) states, resume vs retry vs manual stop. |
 | [watch-supervisor.md](watch-supervisor.md) | Runtime loop contract for `gza watch`: cycle order, slot accounting, adoption, restart, and stop/backoff behavior. |
 | [worktree-reclaim.md](worktree-reclaim.md) | Worktree acquisition and reclaim rules at task start. |
+| [systemic-fix-triage.md](systemic-fix-triage.md) | Turning the stuck-task pile into systemic auto-merge fixes: failure-class taxonomy, blast-radius ranking, already-tracked/escalation rules, and the `system` tag convention. |
