@@ -3040,7 +3040,7 @@ class TestQueueCommand:
         assert refreshed_ops_first.queue_position == 1
         assert refreshed_ops_second.queue_position == 2
 
-    def test_queue_tag_scoped_ordering_fails_closed_for_repeated_tags_with_any_tag_mismatch(
+    def test_queue_tag_scoped_ordering_fails_closed_for_repeated_tags_with_all_tag_mismatch(
         self,
         tmp_path: Path,
     ):
@@ -3071,7 +3071,7 @@ class TestQueueCommand:
             "release",
             "--tag",
             "release",
-            "--any-tag",
+            "--all-tags",
             "--project",
             str(tmp_path),
         )
@@ -3437,6 +3437,7 @@ class TestQueueCommand:
             "202606-recovery",
             "--tag",
             "v0.5.0",
+            "--all-tags",
             "--project",
             str(tmp_path),
         )
@@ -3561,7 +3562,7 @@ class TestQueueCommand:
         assert "Scoped runnable owner" in result.stdout
         assert child.id not in result.stdout
 
-    def test_queue_tag_scope_uses_any_tag_matching_for_scope_gap_detection(
+    def test_queue_tag_scope_uses_default_any_tag_matching_for_scope_gap_detection(
         self,
         tmp_path: Path,
     ) -> None:
@@ -3593,7 +3594,6 @@ class TestQueueCommand:
             "202606-recovery",
             "--tag",
             "ops",
-            "--any-tag",
             "--project",
             str(tmp_path),
         )
@@ -3616,7 +3616,6 @@ class TestQueueCommand:
             "202606-recovery",
             "--tag",
             "ops",
-            "--any-tag",
             "--project",
             str(tmp_path),
         )
@@ -3994,6 +3993,46 @@ class TestQueueCommand:
         assert "Release blocked" not in result.stdout
         assert "Backlog runnable" not in result.stdout
         assert "1 task blocked by dependencies" in result.stdout
+
+    def test_next_repeated_tag_filters_use_or_by_default_and_all_tags_for_and(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        store.add("Recovery-only runnable", tags=("202606-recovery",))
+        store.add("System-only runnable", tags=("system",))
+        store.add("Both tags runnable", tags=("202606-recovery", "system"))
+        store.add("Backlog runnable", tags=("backlog",))
+
+        default_result = invoke_gza(
+            "next",
+            "--tag",
+            "202606-recovery",
+            "--tag",
+            "system",
+            "--project",
+            str(tmp_path),
+        )
+        assert default_result.returncode == 0
+        assert "Recovery-only runnable" in default_result.stdout
+        assert "System-only runnable" in default_result.stdout
+        assert "Both tags runnable" in default_result.stdout
+        assert "Backlog runnable" not in default_result.stdout
+
+        all_tags_result = invoke_gza(
+            "next",
+            "--tag",
+            "202606-recovery",
+            "--tag",
+            "system",
+            "--all-tags",
+            "--project",
+            str(tmp_path),
+        )
+        assert all_tags_result.returncode == 0
+        assert "Recovery-only runnable" not in all_tags_result.stdout
+        assert "System-only runnable" not in all_tags_result.stdout
+        assert "Both tags runnable" in all_tags_result.stdout
+        assert "Backlog runnable" not in all_tags_result.stdout
 
     def test_next_command_uses_shared_queue_theme_renderables(self, tmp_path: Path) -> None:
         from gza.colors import QueueColors

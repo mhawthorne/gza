@@ -255,10 +255,10 @@ def main() -> int:
         help="Only pick pending tasks matching tag filters when no task IDs are specified (repeatable)",
     )
     work_parser.add_argument(
-        "--any-tag",
+        "--all-tags",
         action="store_true",
-        dest="any_tag",
-        help="With repeated --tag values, match any tag instead of all tags",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
     )
 
     # run-inline command
@@ -326,10 +326,10 @@ def main() -> int:
         help="Only show recovery and pending lanes matching tag filters (repeatable)",
     )
     next_parser.add_argument(
-        "--any-tag",
+        "--all-tags",
         action="store_true",
-        dest="any_tag",
-        help="With repeated --tag values, match any tag instead of all tags",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
     )
 
     # history command
@@ -573,10 +573,10 @@ def main() -> int:
         help="Exclude matches by tag (repeatable, same matching mode as --tag)",
     )
     search_parser.add_argument(
-        "--any-tag",
+        "--all-tags",
         action="store_true",
-        dest="any_tag",
-        help="With repeated --tag/--tag-not values, match any requested tag instead of all tags",
+        dest="all_tags",
+        help="With repeated --tag/--tag-not values, require all requested tags instead of the default any-tag matching",
     )
 
     # unmerged command
@@ -888,10 +888,10 @@ def main() -> int:
         help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview matching recovery candidates plus pending pickup order. Scoped watch reports out-of-scope derived blockers but does not start them",
     )
     watch_parser.add_argument(
-        "--any-tag",
+        "--all-tags",
         action="store_true",
-        dest="any_tag",
-        help="With repeated --tag values, match any tag instead of all tags",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
     )
 
     # queue command
@@ -910,10 +910,10 @@ def main() -> int:
         help="Only list recovery and pending lanes matching tag filters (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. When matching lineages are blocked by out-of-scope derived children, queue reports the blocker without starting it",
     )
     queue_parser.add_argument(
-        "--any-tag",
+        "--all-tags",
         action="store_true",
-        dest="any_tag",
-        help="With repeated --tag values, match any tag instead of all tags",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
     )
     queue_parser.add_argument(
         "-n",
@@ -938,10 +938,10 @@ def main() -> int:
             help=f"Check runnable status only within matching tag filters while {action} (repeatable)",
         )
         subparser.add_argument(
-            "--any-tag",
+            "--all-tags",
             action="store_true",
-            dest="any_tag",
-            help="With repeated --tag values, match any tag instead of all tags",
+            dest="all_tags",
+            help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
         )
 
     queue_subparsers = queue_parser.add_subparsers(dest="queue_action")

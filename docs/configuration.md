@@ -615,7 +615,7 @@ gza work [task_id...] [options]
 | `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
 | `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
-| `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 
 `uv run gza work` starts pending tasks only. It does not run failed-task recovery (`resume` / `retry` / manual-review parking) and it does not progress review/rebase/merge lifecycle work for already-started lineages. If recovery candidates exist, `work` leaves them untouched and starts from the pending lane anyway.
 
@@ -1266,9 +1266,9 @@ gza history [options]
 | `--end-date YYYY-MM-DD` | Show only tasks on or before this date |
 | `--status STATUS` | Filter by status: `completed`, `failed`, or `unmerged` |
 | `--status-not STATUS` | Exclude the given status |
-| `--tag TAG` | Filter by tag (repeatable; all tags required by default) |
+| `--tag TAG` | Filter by tag (repeatable; matches any requested tag by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
-| `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
+| `--all-tags` | With repeated `--tag` and/or `--tag-not` values, require all requested tags instead of the default any-tag matching |
 | `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
@@ -1342,9 +1342,9 @@ gza search <term> [options]
 | `--related-to-not TASK_ID` | Deprecated alias for `--lineage-of-not` |
 | `--root CSV` | Restrict by lineage root IDs (comma-separated) |
 | `--root-not CSV` | Exclude lineage root IDs (comma-separated) |
-| `--tag TAG` | Filter by tag (repeatable; all tags required by default) |
+| `--tag TAG` | Filter by tag (repeatable; matches any requested tag by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
-| `--any-tag` | With repeated `--tag` and/or `--tag-not` values, match any requested tag instead of all |
+| `--all-tags` | With repeated `--tag` and/or `--tag-not` values, require all requested tags instead of the default any-tag matching |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
 | `--json` | Output JSON rows from the unified query API |
@@ -1522,7 +1522,8 @@ gza next [options]
 - Recovery lane: visible failed-task recovery and manual-attention lineages that `uv run gza advance` / `uv run gza watch` act on ahead of ordinary pending pickup.
 - Pending lane: pending tasks that `uv run gza work` / `uv run gza watch` can start, with blocked dependencies separated as before.
 
-Use `--tag TAG` (repeatable) to scope both sections to matching tags.
+Use `--tag TAG` (repeatable) to scope both sections to matching tags. Repeated tags use
+any-tag matching by default; add `--all-tags` to require every requested tag.
 
 ### queue
 
@@ -1542,7 +1543,7 @@ gza queue clear <task_id>
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
 | `--tag TAG` | Only list recovery and pending lanes matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; if a matching lineage is blocked by an out-of-scope derived child, queue reports the blocker without starting it) |
-| `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `-n, --limit N` | Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks) |
 | `--all` | Show all runnable tasks (blocked tasks are always shown) |
 
@@ -1553,7 +1554,7 @@ Queue pickup ordering is:
 
 Use `gza queue next <task_id>` to make a task the next ordered item, or `gza queue move <task_id> <position>` to assign positions like 1, 2, and 3 without having to order every task. Use `gza queue clear <task_id>` to remove explicit ordering and fall back to lane/FIFO behavior.
 When `queue move`, `queue next`, or `queue clear` include `--tag` filters, explicit ordering is shared across all tasks matching that tag scope, even when some tasks have additional unrelated tags.
-Those commands fail closed when the target task does not match the provided tag scope (`all` semantics by default, `any` with `--any-tag`) and do not mutate queue ordering in that case.
+Those commands fail closed when the target task does not match the provided tag scope (`any` semantics by default, `all` with `--all-tags`) and do not mutate queue ordering in that case.
 When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
 `gza queue` also renders two distinct sections:
 
@@ -1792,7 +1793,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next watch-pass boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order. Scoped watch reports out-of-scope derived blockers but does not start them |
-| `--any-tag` | With repeated `--tag` values, match any requested tag instead of all |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 
 `uv run gza watch` combines the two surfaces above: it runs recovery decisions, review/rebase/merge lifecycle work, and pending-lane pickup in one loop. Recovery and pending are still distinct sets even when watch is driving both.
 
@@ -1811,7 +1812,7 @@ watch:
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever.
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
-`INFO      scope: tags=<comma-separated-tags> mode=all|any`.
+`INFO      scope: tags=<comma-separated-tags> mode=any|all`.
 
 Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, exhausted failed-task recovery, and improve-recovery stop reasons are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch reuses the same formatted task line as `uv run gza advance`, including the stable `reason=...` policy slug. Inline `ATTENTION` is emitted only when an attention row is newly visible for the current watch session or when that row's message changes from the previous watch pass; unchanged inline reminders are suppressed. Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set, so unchanged rows stay operator-visible even when no new inline `ATTENTION` line appears. Attention row identity comes from the action's declared subject task, so held plans and similar follow-up gates render against the task the operator should inspect. Guarded pending routing skips use the same centralized attention path on the first observed guarded skip, then follow the same unchanged-inline suppression while remaining present in the roundup. Successful watch-managed merges now surface as structured `MERGE <task-id> -> <target>` lines at the moment the merge lands; watch suppresses the shared cosmetic `Merging...`, `Successfully squash merged`, and `✓ Reconciled ...` success chatter, but still prints squash-reconcile warning/failure guidance when origin reconciliation diverges. For fix-handoff reasons such as `review-max-cycles-reached`, `automatic-recovery-disabled`, `retry-limit-reached`, and `retryable-provider-error`, `uv run gza advance` and `uv run gza iterate` also print `Recommended next step: uv run gza fix <task-id>`. Lineages parked because automatic recovery hit `retry-limit-reached` or `retryable-provider-error` stay parked until a human changes the lineage state; watch does not re-select them for a fresh iterate worker in the meantime. Treat `manual-review-required` as a legacy alias rather than a current parked reason. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
 

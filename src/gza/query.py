@@ -40,7 +40,7 @@ class HistoryFilter:
     lineage_depth: int = 0  # Expand lineage N levels (0 = flat)
     tags: tuple[str, ...] | None = None
     tags_not: tuple[str, ...] | None = None
-    any_tag: bool = False
+    any_tag: bool = True
 
 
 @dataclass

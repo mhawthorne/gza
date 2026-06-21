@@ -90,7 +90,7 @@ class LineageOwnerQuery:
     exclude_task_types: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
     exclude_tags: tuple[str, ...] | None = None
-    any_tag: bool = False
+    any_tag: bool = True
     date_filter: DateFilter | None = None
     include_skipped: bool = False
     exclude_dropped_from_planning: bool = False

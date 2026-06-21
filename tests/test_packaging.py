@@ -312,6 +312,20 @@ def test_unit_test_conftest_uses_cpu_budget_override(monkeypatch: pytest.MonkeyP
     assert module.UNIT_TEST_CPU_BUDGET_SECONDS == 1.75
 
 
+def test_unit_test_conftest_uses_cpu_budget_marker_override() -> None:
+    """tests/conftest.py should allow narrow per-test CPU budget overrides."""
+    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+    module = _load_module(conftest_path, "tests_timeout_conftest_cpu_marker_override")
+
+    class FakeItem:
+        def get_closest_marker(self, name: str):
+            if name == "cpu_budget":
+                return pytest.mark.cpu_budget(2.25).mark
+            return None
+
+    assert module._unit_test_cpu_budget_for_item(FakeItem()) == 2.25
+
+
 def test_unit_test_conftest_cpu_budget_failure_is_clear(monkeypatch: pytest.MonkeyPatch) -> None:
     """tests/conftest.py should fail slow unit tests with a CPU-budget-specific message."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
@@ -497,6 +511,7 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     )
 
 
+@pytest.mark.cpu_budget(2.0)
 def test_unit_suite_keeps_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
     """Unit tests and test fixtures should keep subprocesses and direct shell commands out."""
     repo_root = Path(__file__).resolve().parents[1]

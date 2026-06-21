@@ -262,11 +262,11 @@ def parse_cli_tag_filters(
     args: argparse.Namespace,
     *,
     tags_attr: str = "tags",
-    any_tag_attr: str = "any_tag",
+    all_tags_attr: str = "all_tags",
 ) -> tuple[tuple[str, ...] | None, bool]:
     """Parse and validate CLI tag filter flags from argparse args."""
     selected_tags = [_validate_tag_value(raw) for raw in (getattr(args, tags_attr, None) or [])]
-    return (tuple(selected_tags) if selected_tags else None, bool(getattr(args, any_tag_attr, False)))
+    return (tuple(selected_tags) if selected_tags else None, not bool(getattr(args, all_tags_attr, False)))
 
 
 def validate_cli_tag_values(values: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
@@ -1306,8 +1306,8 @@ def _spawn_background_worker(
     elif selected_tags:
         for tag in selected_tags:
             inner_cmd.extend(["--tag", tag])
-        if any_tag:
-            inner_cmd.append("--any-tag")
+        if not any_tag:
+            inner_cmd.append("--all-tags")
 
     if args.no_docker:
         inner_cmd.append("--no-docker")
@@ -3717,7 +3717,7 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Filter by tag (repeatable, AND semantics by default)",
+        help="Filter by tag (repeatable; matches any requested tag by default)",
     )
     parser.add_argument(
         "--tag-not",
@@ -3727,10 +3727,10 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         help="Exclude by tag (repeatable, same matching mode as --tag)",
     )
     parser.add_argument(
-        "--any-tag",
+        "--all-tags",
         action="store_true",
-        dest="any_tag",
-        help="With repeated --tag/--tag-not values, match any requested tag instead of all tags",
+        dest="all_tags",
+        help="With repeated --tag/--tag-not values, require all requested tags instead of the default any-tag matching",
     )
 
 

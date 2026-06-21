@@ -24,6 +24,7 @@ from gza.task_query import (
     TaskQueryPresets,
     TaskQueryService,
     collect_scoped_tag_scope_gaps,
+    task_matches_tag_filters,
 )
 
 
@@ -1103,7 +1104,12 @@ def test_queue_listing_preset_includes_blocked_tasks_after_runnable_rows(tmp_pat
     assert blocked_flags == [False, False, True]
 
 
-def test_task_query_tag_filter_matches_any_of_selected_tags(tmp_path: Path) -> None:
+def test_task_matches_tag_filters_use_or_by_default_and_and_with_all_tags() -> None:
+    assert task_matches_tag_filters(task_tags=("release",), tag_filters=("release", "ops")) is True
+    assert task_matches_tag_filters(task_tags=("release",), tag_filters=("release", "ops"), any_tag=False) is False
+
+
+def test_task_query_tag_filter_matches_any_of_selected_tags_by_default(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.add("Release task", tags=("release",))
     store.add("Backlog task", tags=("backlog",))
@@ -1114,7 +1120,6 @@ def test_task_query_tag_filter_matches_any_of_selected_tags(tmp_path: Path) -> N
         TaskQuery(
             scope="tasks",
             tag_filters=("release", "ops"),
-            any_tag=True,
             limit=None,
         )
     )

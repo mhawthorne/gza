@@ -88,7 +88,7 @@ class TaskQuery:
     merge_unit_ids: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     exclude_tag_filters: tuple[str, ...] | None = None
-    any_tag: bool = False
+    any_tag: bool = True
     pickup_only: bool = False
     date_filter: DateFilter | None = None
     sort: SortSpec = DEFAULT_SORT
@@ -351,7 +351,7 @@ class TaskQueryPresets:
         *,
         limit: int | None = 10,
         tags: tuple[str, ...] | None = None,
-        any_tag: bool = False,
+        any_tag: bool = True,
     ) -> TaskQuery:
         return TaskQuery(
             scope="tasks",
@@ -372,7 +372,7 @@ class TaskQueryPresets:
         *,
         limit: int | None = None,
         tags: tuple[str, ...] | None = None,
-        any_tag: bool = False,
+        any_tag: bool = True,
     ) -> TaskQuery:
         return TaskQuery(
             scope="tasks",
@@ -1136,7 +1136,7 @@ def task_matches_tag_filters(
     *,
     task_tags: Sequence[str],
     tag_filters: tuple[str, ...] | None,
-    any_tag: bool,
+    any_tag: bool = True,
 ) -> bool:
     """Return whether a task's tags match normalized filter tags."""
     if tag_filters is None:

@@ -23,6 +23,8 @@ ALLOWED_CYCLE_LINES = {
     ("src/gza/lineage.py", '                return None, f"{label} task {task.id} has a cycle in its based_on chain"'),
     ("src/gza/runner.py", '                "Slug override cycle detected for task #%s while walking based_on chain: "'),
     ("src/gza/runner.py", "            # Walk up the based_on chain, with cycle detection"),
+    ("src/gza/skills/gza-system-triage/SKILL.md", "If many failures — **including retries** — cluster in a short window on infra reasons, treat them as **one root cause**, not N findings. The right fix is a watch **cycle-level precondition gate** that pauses the whole cycle (recovery lane included) so nothing burns retries while the precondition is broken. Before proposing it, check whether detection/gating already exists (e.g. docker-daemon-crash detection); if it does, point at it rather than re-proposing. A scheduled task cannot fix this — with scarce slots it would deadlock behind a recovery lane that never drains."),
+    ("src/gza/skills/gza-system-triage/SKILL.md", "- **The systemic fix**, stated as a *precondition or rule change*, and its shape: a code change to file, a cycle-level gate, or a `/gza-task-fix` per-task handoff."),
     ("tests/cli/test_execution.py", '        result = invoke_gza("cycle", "testproject-1", "--dry-run", "--project", str(tmp_path))'),
     ("tests/cli/test_execution.py", '        assert "invalid choice: \'cycle\'" in result.stderr'),
     ("tests/cli/test_main.py", '        """Removed `cycle` command should now fail at parser validation."""'),

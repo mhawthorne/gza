@@ -805,8 +805,8 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     argv.append("--resumed-reexec")
     for tag in getattr(args, "tags", None) or ():
         argv.extend(["--tag", tag])
-    if getattr(args, "any_tag", False):
-        argv.append("--any-tag")
+    if getattr(args, "all_tags", False):
+        argv.append("--all-tags")
     if not getattr(args, "auto_restart_on_drift", True):
         argv.append("--no-auto-restart-on-drift")
     return argv

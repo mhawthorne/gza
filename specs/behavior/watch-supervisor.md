@@ -296,7 +296,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
 | `watch.no_activity_timeout` | Reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
-| `--tag` / `--any-tag` | Supervisor execution scope |
+| `--tag` / `--all-tags` | Supervisor execution scope (`--tag` matches any requested tag by default; `--all-tags` requires all of them) |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to

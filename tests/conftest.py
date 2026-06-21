@@ -276,15 +276,37 @@ def _fail_if_unit_test_exceeds_cpu_budget(nodeid: str, cpu_seconds: float) -> No
     )
 
 
-def _watch_unit_test_cpu_budget(nodeid: str):
+def _unit_test_cpu_budget_for_item(item: pytest.Item) -> float:
+    marker = item.get_closest_marker("cpu_budget")
+    if marker is None:
+        return UNIT_TEST_CPU_BUDGET_SECONDS
+    if len(marker.args) != 1 or not isinstance(marker.args[0], int | float):
+        raise pytest.UsageError("cpu_budget marker must be called with one numeric seconds argument")
+    return float(marker.args[0])
+
+
+def _watch_unit_test_cpu_budget(
+    nodeid: str,
+    *,
+    cpu_budget_seconds: float = UNIT_TEST_CPU_BUDGET_SECONDS,
+):
     start_cpu_seconds = time.process_time()
     yield
-    _fail_if_unit_test_exceeds_cpu_budget(nodeid, time.process_time() - start_cpu_seconds)
+    cpu_seconds = time.process_time() - start_cpu_seconds
+    if cpu_seconds <= cpu_budget_seconds:
+        return
+    pytest.fail(
+        f"{nodeid} exceeded the unit-test CPU budget: used {cpu_seconds:.3f}s CPU "
+        f"with a {cpu_budget_seconds:.3f}s budget."
+    )
 
 
 @pytest.fixture(autouse=True)
 def _enforce_unit_test_cpu_budget(request: pytest.FixtureRequest):
-    yield from _watch_unit_test_cpu_budget(request.node.nodeid)
+    yield from _watch_unit_test_cpu_budget(
+        request.node.nodeid,
+        cpu_budget_seconds=_unit_test_cpu_budget_for_item(request.node),
+    )
 
 
 @pytest.fixture(autouse=True)

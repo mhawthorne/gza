@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -322,10 +323,24 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
     return violations
 
 
+@lru_cache(maxsize=None)
+def _find_file_violations_cached(
+    test_file: Path,
+    *,
+    mtime_ns: int,
+    size: int,
+) -> tuple[Violation, ...]:
+    del mtime_ns, size
+    return tuple(_find_file_violations(test_file))
+
+
 def find_unit_suite_boundary_violations(tests_root: Path) -> list[Violation]:
     violations: list[Violation] = []
     for path in iter_candidate_files(tests_root):
-        violations.extend(_find_file_violations(path))
+        stat = path.stat()
+        violations.extend(
+            _find_file_violations_cached(path, mtime_ns=stat.st_mtime_ns, size=stat.st_size)
+        )
     return violations
 
 

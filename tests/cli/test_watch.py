@@ -741,37 +741,33 @@ def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Pat
     assert spawn_worker.call_args.kwargs["task_id"] == bumped.id
 
 
-def test_watch_cycle_tag_filters_pending_pickup(tmp_path: Path) -> None:
-    """Tag-scoped watch should only start pending tasks from the selected tag."""
+def test_cmd_watch_repeated_tag_filters_use_or_by_default(tmp_path: Path) -> None:
+    """CLI watch should forward repeated tag filters as OR unless --all-tags is set."""
     setup_config(tmp_path)
-    store = make_store(tmp_path)
 
-    release_task = store.add("Release plan", task_type="plan", group="release-1")
-    backlog_task = store.add("Backlog plan", task_type="plan", group="backlog")
-    assert release_task.id is not None
-    assert backlog_task.id is not None
-
-    config = Config.load(tmp_path)
-    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+        tags=["release-1", "system"],
+        all_tags=False,
+    )
 
     with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
     ):
-        result = _run_cycle_and_emit_transition_events(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-            tags=("release-1",),
-        )
+        rc = cmd_watch(args)
 
-    assert result.work_done is True
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == release_task.id
+    assert rc == 0
+    assert run_cycle.call_args.kwargs["tags"] == ("release-1", "system")
+    assert run_cycle.call_args.kwargs["any_tag"] is True
 
 
 def test_watch_cycle_tag_prefers_explicit_queue_order(tmp_path: Path) -> None:
@@ -3882,7 +3878,7 @@ def test_watch_cycle_logs_tag_scoped_pending_count_in_wake_line(tmp_path: Path) 
 
 
 def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
-    """Tag-scoped watch should log normalized filter scope with all-tag semantics."""
+    """Tag-scoped watch should log when all-tag matching is enabled."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -3905,6 +3901,7 @@ def test_watch_cycle_logs_tag_scope_with_all_mode(tmp_path: Path) -> None:
             dry_run=False,
             log=log,
             tags=("Release-1.2", "backend"),
+            any_tag=False,
         )
 
     assert "INFO      scope: tags=backend,release-1.2 mode=all" in log_path.read_text()
@@ -10237,7 +10234,7 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         quiet=True,
         yes=True,
         tags=["release", "urgent"],
-        any_tag=True,
+        all_tags=True,
         auto_restart_on_drift=False,
     )
 
@@ -10271,7 +10268,7 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         "release",
         "--tag",
         "urgent",
-        "--any-tag",
+        "--all-tags",
         "--no-auto-restart-on-drift",
     ]
 

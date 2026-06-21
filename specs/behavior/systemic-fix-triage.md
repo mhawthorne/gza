@@ -66,8 +66,9 @@ whole class of tasks from getting stuck in the first place.
 - **S7 — Systemic-fix work is tagged and discoverable.** Every task created to carry a
   systemic fix MUST carry the shared **`system`** tag. The tag is the link between a failure
   class and the work fixing it: the S6 "already tracked?" check and the S5 recurrence check
-  both read it. A systemic-fix task MUST also carry whatever scope tag the active supervisor
-  requires, so it is actually executed rather than silently orphaned.
+  both read it. A systemic-fix task MUST also satisfy the active supervisor scope
+  (`watch --tag ...`, with the active any-tag vs all-tags matching mode), so it is actually
+  executed rather than silently orphaned.
 
 - **S8 — Minimize the human.** The only human action this policy should require is deciding
   *whether* to file proposed fixes (and only in manual mode). Every other state — bucketing,
@@ -94,7 +95,7 @@ reasons extend the table; they do not fork the policy.
 | Knob | Default | Governs |
 |------|---------|---------|
 | systemic-fix tag | `system` | The durable cross-skill tag marking system-improvement work (S6, S7). |
-| supervisor scope tag | operator-set (e.g. `202606-recovery`) | The tag the active supervisor requires so filed fixes are executed (S7). |
+| supervisor scope | operator-set (for example `--tag 202606-recovery --tag system`, optionally `--all-tags`) | The active watch scope a filed fix must satisfy so it is executed (S7). |
 | recency window | last 24h | How far back stuck rows are gathered before bucketing. |
 | triage mode | manual | Whether proposed fixes are presented for confirmation (manual) or filed automatically (auto). |
 

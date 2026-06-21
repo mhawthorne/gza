@@ -175,7 +175,7 @@ class TestHelpOutput:
         assert "works in text or JSON mode" in history_help.stdout
         assert "--list-fields" in history_help.stdout
         assert "--" + "incomplete" not in history_help.stdout
-        assert "--tag/--tag-not values" in history_help.stdout
+        assert "--all-tags" in history_help.stdout
         assert search_help.returncode == 0
         assert "--status-not" in search_help.stdout
         assert "--type-not" in search_help.stdout
@@ -187,6 +187,7 @@ class TestHelpOutput:
         assert "Deprecated alias for --lineage-of" in search_help.stdout
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
+        assert "--all-tags" in search_help.stdout
         assert docs_text.count("| `--list-fields` | List valid `--fields` values for this command and exit |") >= 4
 
     def test_history_and_search_reject_removed_preset_flag(self, tmp_path):

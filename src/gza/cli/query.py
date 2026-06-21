@@ -879,7 +879,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
-    any_tag = bool(getattr(args, "any_tag", False))
+    any_tag = not bool(getattr(args, "all_tags", False))
 
     # If a date-based filter is active and --last/-n wasn't explicitly provided,
     # don't cap results with the default limit.
@@ -1264,7 +1264,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
-    any_tag = bool(getattr(args, "any_tag", False))
+    any_tag = not bool(getattr(args, "all_tags", False))
 
     date_filter = _TaskDateFilter(
         field=cast(_QueryDateField, getattr(args, "date_field", "created")),
