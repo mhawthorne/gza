@@ -3,7 +3,7 @@ name: gza-system-triage
 description: Turn the recurring `watch` stuck-task pile into systemic auto-merge fixes. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, ranks fixes by blast radius (cascade-preventer first), and — manual mode presents, auto mode files — `system`-tagged gza tasks. Delegates per-task rescue to /gza-task-fix; never merges, retries, resumes, or edits code.
 allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
 version: 1.0.0
-public: true
+public: false
 ---
 
 # Gza System Triage
