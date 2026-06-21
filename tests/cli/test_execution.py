@@ -13681,6 +13681,7 @@ class TestIterateCommand:
         ("failure_reason", "seed_chain"),
         [
             ("TEST_FAILURE", False),
+            ("UNKNOWN", False),
             ("MAX_STEPS", True),
         ],
     )

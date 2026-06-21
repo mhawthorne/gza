@@ -9,7 +9,7 @@ import re
 import signal
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -101,6 +101,7 @@ from .advance_engine import (
     failed_recovery_decision_to_action,
     failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
+    get_action_subject_task_id,
     get_needs_attention_reason,
     resolve_subject_task,
     with_needs_attention,
@@ -322,6 +323,47 @@ def _failed_recovery_attention_action(
         task,
         decision,
         max_recovery_attempts=max_recovery_attempts,
+    )
+
+
+def _reroot_failed_recovery_attention_action(
+    *,
+    owner_task: DbTask,
+    failed_task: DbTask,
+    attention_action: Mapping[str, object],
+) -> dict[str, object]:
+    if owner_task.id is None or failed_task.id is None:
+        return dict(attention_action)
+    annotated = dict(attention_action)
+    annotated["subject_task_id"] = owner_task.id
+    if owner_task.id != failed_task.id:
+        description = str(annotated.get("description", "")).strip()
+        leaf_detail = f"failed leaf {failed_task.id}"
+        if leaf_detail not in description:
+            annotated["description"] = f"{description}; {leaf_detail}" if description else leaf_detail
+    return annotated
+
+
+def _owner_failed_recovery_attention_action(
+    *,
+    store: SqliteTaskStore,
+    owner_task: DbTask,
+    failed_task: DbTask,
+    decision: FailedRecoveryDecision,
+    max_recovery_attempts: int,
+) -> dict[str, object] | None:
+    attention_action = _failed_recovery_attention_action(
+        store=store,
+        task=failed_task,
+        decision=decision,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    if attention_action is None:
+        return None
+    return _reroot_failed_recovery_attention_action(
+        owner_task=owner_task,
+        failed_task=failed_task,
+        attention_action=attention_action,
     )
 
 
@@ -1581,6 +1623,18 @@ def _run_cycle(
             task_id_numeric_key(row.owner_task.id),
         )
     )
+    recovery_lane_entry_by_failed_id: dict[str, RecoveryLaneEntry] = {
+        entry.task.id: entry
+        for entry in collect_recovery_lane_entries(
+            store,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+            git=git,
+            target_branch=target_branch,
+        )
+        if entry.task.id is not None
+    }
     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
 
     def _watch_spawn_worker(task_obj: DbTask, task_kind: str) -> int:
@@ -1838,10 +1892,30 @@ def _run_cycle(
             display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
-                display_task = _resolve_watch_attention_display_task(store, row)
+                attention_key: str
+                recovery_entry = (
+                    recovery_lane_entry_by_failed_id.get(row.recovery_leaf_task.id)
+                    if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+                    else None
+                )
+                if recovery_entry is None:
+                    recovery_entry = recovery_lane_entry_by_failed_id.get(get_action_subject_task_id(action) or "")
+                if recovery_entry is not None and recovery_entry.attention_action is not None:
+                    display_task = recovery_entry.owner_task
+                    action = _reroot_failed_recovery_attention_action(
+                        owner_task=display_task,
+                        failed_task=recovery_entry.task,
+                        attention_action=action,
+                    )
+                    attention_key = (
+                        f"failed-recovery-attention:{display_task.id}:{recovery_entry.decision.reason_code}"
+                    )
+                else:
+                    display_task = _resolve_watch_attention_display_task(store, row)
+                    attention_key = f"advance-attention:{display_task.id}:{action_type}"
                 # Lineage-progress attention comes from the advance action plan only.
                 log.emit_attention(
-                    attention_key=f"advance-attention:{display_task.id}:{action_type}",
+                    attention_key=attention_key,
                     message=_watch_needs_attention_message(display_task, action),
                 )
                 continue
@@ -2217,14 +2291,44 @@ def _run_cycle(
         decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=max_recovery_attempts, read_context=watch_read_context)
         if decision.action != "skip" and decision.recovery_task_id is not None:
             pending_recovery_task_ids.add(decision.recovery_task_id)
-        if decision.action == "skip" and not _is_watch_observable_recovery_skip(decision):
-            if recovery_slots > 0 and show_skipped:
-                log.emit(
-                    "SKIP",
-                    f"{row.owner_task.id} failed {failed.task_type}: {decision.reason_code}",
-                    dedupe_key=f"recovery-skip:{row.owner_task.id}:{decision.reason_code}",
+        if decision.action == "skip":
+            if should_hide_failed_recovery_decision(decision):
+                continue
+            recovery_entry = recovery_lane_entry_by_failed_id.get(str(failed.id))
+            owner_task = recovery_entry.owner_task if recovery_entry is not None else row.owner_task
+            attention_action = (
+                _reroot_failed_recovery_attention_action(
+                    owner_task=owner_task,
+                    failed_task=failed,
+                    attention_action=recovery_entry.attention_action,
                 )
-            continue
+                if recovery_entry is not None and recovery_entry.attention_action is not None
+                else _owner_failed_recovery_attention_action(
+                    store=store,
+                    owner_task=owner_task,
+                    failed_task=failed,
+                    decision=decision,
+                    max_recovery_attempts=max_recovery_attempts,
+                )
+            )
+            if (
+                attention_action is not None
+                and classify_advance_action(attention_action) == "needs_attention"
+            ):
+                owner_id = owner_task.id or failed.id or "unknown"
+                log.emit_attention(
+                    attention_key=f"failed-recovery-attention:{owner_id}:{decision.reason_code}",
+                    message=_watch_needs_attention_message(owner_task, attention_action),
+                )
+                continue
+            if not _is_watch_observable_recovery_skip(decision):
+                if recovery_slots > 0 and show_skipped:
+                    log.emit(
+                        "SKIP",
+                        f"{owner_task.id} failed {failed.task_type}: {decision.reason_code}",
+                        dedupe_key=f"recovery-skip:{owner_task.id}:{decision.reason_code}",
+                    )
+                continue
         recovery_action = failed_recovery_decision_to_action(failed, decision)
         worker_consuming_recovery = is_worker_consuming_advance_action(str(recovery_action.get("type", "")))
         action_task = _resolve_recovery_action_task(

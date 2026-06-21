@@ -51,7 +51,8 @@ from gza.cli.watch import (
     cmd_watch,
 )
 from gza.recovery_read_context import RecoveryReadContext
-from gza.advance_engine import failed_recovery_decision_to_action
+from gza.advance_engine import classify_advance_action, failed_recovery_decision_to_action
+from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
 import gza.colors as colors
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
@@ -268,6 +269,71 @@ def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str
     store.get_or_create_merge_unit_for_task(failed_rebase)
 
     return store, impl, failed_rebase
+
+
+def _setup_watch_unknown_failed_empty_branch_owner(tmp_path: Path):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed_leaf = store.add(
+        "Failed empty-branch descendant",
+        task_type="implement",
+        recovery_origin="manual",
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "UNKNOWN"
+    failed_leaf.session_id = "sess-watch-empty-unknown"
+    failed_leaf.branch = "feature/watch-empty-unknown"
+    failed_leaf.has_commits = False
+    failed_leaf.output_content = "provider produced analysis before failing"
+    failed_leaf.completed_at = datetime(2026, 6, 5, 9, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    blocked = store.add("Blocked dependent", task_type="plan", depends_on=failed_leaf.id)
+    assert blocked.id is not None
+
+    return store, failed_leaf, blocked
+
+
+def _patch_watch_empty_branch_merge_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    empty_branch: str,
+) -> None:
+    class _EmptyMergedBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in {"main", empty_branch}:
+                return "shared-tip"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return into == "main" and branch == empty_branch
+
+        def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+            if branch == empty_branch and base == "main":
+                return 0
+            return 1
+
+        def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+            return commit == "shared-tip" and target == "main"
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: recovery_engine._MergeContext(
+            git=_EmptyMergedBranchGit(),
+            default_branch="main",
+        ),
+    )
 
 
 def _setup_watch_plan_owned_branch_action_row(tmp_path: Path):
@@ -1338,11 +1404,11 @@ def test_watch_cycle_default_mode_non_actionable_failed_row_starts_pending(tmp_p
     assert spawn_worker.call_args.kwargs["task_id"] == pending.id
 
 
-def test_watch_cycle_skipped_failed_descendant_does_not_emit_attention_without_owner_plan_attention(
+def test_watch_cycle_default_watch_emits_owner_attention_for_manual_failed_recovery(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
-    store, _, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")
+    store, owner, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
@@ -1370,9 +1436,29 @@ def test_watch_cycle_skipped_failed_descendant_does_not_emit_attention_without_o
         )
 
     assert result.work_done is False
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    expected_owner_ids = {
+        entry.owner_task.id
+        for entry in entries
+        if entry.attention_action is not None and classify_advance_action(entry.attention_action) == "needs_attention"
+    }
     text = log_path.read_text()
-    assert "ATTENTION" not in text
-    assert failed_rebase.id not in text
+    assert "ATTENTION" in text
+    attention_lines = [line for line in text.splitlines() if "ATTENTION" in line]
+    emitted_owner_ids = {
+        match.group(1)
+        for line in attention_lines
+        if (match := re.search(r"ATTENTION\s+([a-z0-9]+-\d+)\s", line)) is not None
+    }
+    assert emitted_owner_ids == expected_owner_ids == {owner.id}
+    assert f"{owner.id} implement" in text
+    assert f"failed leaf {failed_rebase.id}" in text
+    assert "Needs attention (1 task):" in text
 
 
 def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_descendant(
@@ -1412,9 +1498,9 @@ def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_de
 
     assert result.work_done is False
     attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
-    assert len(attention_lines) == 1
-    assert impl.id in attention_lines[0]
-    assert failed_rebase.id not in attention_lines[0]
+    assert len(attention_lines) == 2
+    assert any("reason=owner-needs-attention" in line and impl.id in line for line in attention_lines)
+    assert any("reason=manual-failure-reason" in line and f"failed leaf {failed_rebase.id}" in line for line in attention_lines)
 
 
 def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(tmp_path: Path) -> None:
@@ -1455,7 +1541,7 @@ def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(t
     assert recovery_children[0].trigger_source == "watch"
 
 
-def test_watch_cycle_show_skipped_emits_skip_for_failed_descendant_without_attention(tmp_path: Path) -> None:
+def test_watch_cycle_show_skipped_keeps_manual_failed_recovery_on_attention_channel(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store, impl, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")
 
@@ -1487,12 +1573,184 @@ def test_watch_cycle_show_skipped_emits_skip_for_failed_descendant_without_atten
 
     assert result.work_done is False
     text = log_path.read_text()
-    assert "ATTENTION" not in text
-    assert any(
+    assert "ATTENTION" in text
+    assert any("ATTENTION" in line and impl.id in line for line in text.splitlines())
+    assert f"failed leaf {failed_rebase.id}" in text
+    assert not any(
         "SKIP" in line and f"{impl.id} failed rebase: manual_failure_reason" in line
         for line in text.splitlines()
     )
-    assert failed_rebase.id not in text
+
+
+def test_watch_cycle_unknown_manual_empty_branch_matches_incomplete_owner_surface(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store, failed_leaf, _blocked = _setup_watch_unknown_failed_empty_branch_owner(tmp_path)
+    watch_git = _make_empty_merged_watch_git(tmp_path, empty_branch=str(failed_leaf.branch))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=config.max_resume_attempts,
+        git=watch_git,
+        target_branch="main",
+    )
+    expected_owner_ids = {
+        entry.owner_task.id
+        for entry in entries
+        if entry.attention_action is not None and classify_advance_action(entry.attention_action) == "needs_attention"
+    }
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=watch_git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("manual recovery row should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("manual recovery row should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
+    emitted_owner_ids = {
+        match.group(1)
+        for line in attention_lines
+        if (match := re.search(r"ATTENTION\s+([a-z0-9]+-\d+)\s", line)) is not None
+    }
+    assert emitted_owner_ids == expected_owner_ids == {failed_leaf.id}
+    assert any(
+        failed_leaf.id in line and 'implement "Failed empty-branch descendant"' in line
+        for line in attention_lines
+    )
+    text = log_path.read_text()
+    assert "Needs attention (1 task):" in text
+
+
+def test_watch_cycle_default_watch_false_positives_stay_silent(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    resume = store.add("Resume candidate", task_type="implement")
+    assert resume.id is not None
+    resume.status = "failed"
+    resume.failure_reason = "MAX_TURNS"
+    resume.session_id = "sess-resume"
+    resume.completed_at = datetime.now(UTC)
+    store.update(resume)
+
+    retry = store.add("Retry candidate", task_type="plan")
+    assert retry.id is not None
+    retry.status = "failed"
+    retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    retry.completed_at = datetime.now(UTC)
+    store.update(retry)
+
+    hidden = store.add("Hidden failed candidate", task_type="implement")
+    assert hidden.id is not None
+    hidden.status = "failed"
+    hidden.failure_reason = "MAX_TURNS"
+    hidden.session_id = "sess-hidden"
+    hidden.branch = "feature/hidden-watch-row"
+    hidden.completed_at = datetime.now(UTC)
+    store.update(hidden)
+
+    pending_retry = store.add(hidden.prompt, task_type="implement", based_on=hidden.id)
+    assert pending_retry.id is not None
+    pending_retry.status = "pending"
+    pending_retry.branch = "feature/hidden-watch-row-retry"
+    store.update(pending_retry)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+    assert "Needs attention" not in text
+
+
+def test_watch_cycle_manual_failed_recovery_emits_one_steady_attention_per_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store, failed_leaf, _blocked = _setup_watch_unknown_failed_empty_branch_owner(tmp_path)
+    watch_git = _make_empty_merged_watch_git(tmp_path, empty_branch=str(failed_leaf.branch))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=watch_git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
+        ),
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert first.work_done is False
+    assert second.work_done is False
+    text = log_path.read_text()
+    stdout = capsys.readouterr().out
+    assert text.count("ATTENTION") == 1
+    assert text.count("Needs attention (1 task):") == 2
+    assert stdout.count("Needs attention (1 task):") == 2
+    assert text.count(f"{failed_leaf.id} implement") == 3
 
 
 def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
@@ -9639,9 +9897,13 @@ def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> N
         )
 
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 0
-    assert text.count("SKIP") == 1
-    assert f"{failed.id} failed implement: automatic_recovery_disabled" in text
+    assert text.count("ATTENTION") == 1
+    assert text.count("SKIP") == 0
+    assert text.count("Needs attention (1 task):") == 2
+    assert (
+        f'{failed.id} implement "Failed resume attempt" reason=automatic-recovery-disabled '
+        "automatic recovery is disabled"
+    ) in text
 
 
 def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> None:
@@ -13040,6 +13302,90 @@ def _make_preseeded_watch_git(tmp_path: Path) -> "Git":
             raise self._unexpected_git_subprocess("_run_readonly_success_cached")
 
     return _PreseedWatchGit(tmp_path)
+
+
+def _make_empty_merged_watch_git(tmp_path: Path, *, empty_branch: str) -> "Git":
+    class _EmptyMergedWatchGit(Git):
+        def __init__(self, repo_dir: Path) -> None:
+            self.repo_dir = repo_dir
+            self._cache = None
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def current_branch(self) -> str:
+            return "main"
+
+        def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
+            return frozenset({empty_branch})
+
+        def branch_exists(self, branch: str) -> bool:
+            return branch == empty_branch
+
+        def branches_exist(self, branches: object) -> dict[str, bool]:
+            if not isinstance(branches, (tuple, list, set, frozenset)):
+                return {}
+            return {str(branch): str(branch) == empty_branch for branch in branches}
+
+        def ref_exists(self, ref: str) -> bool:
+            return ref in {empty_branch, "main"}
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def resolve_refs(self, refs: object, *, peel: str = "commit") -> dict[str, str | None]:
+            if not isinstance(refs, (tuple, list, set, frozenset)):
+                return {}
+            return {
+                str(ref): ("shared-tip" if str(ref) in {empty_branch, "main"} else None)
+                for ref in refs
+            }
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            if ref in {empty_branch, "main"}:
+                return "shared-tip"
+            return None
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            return branch == empty_branch and into == "main"
+
+        # Close the merge-state seam fully so the unit test never falls back to
+        # inherited Git subprocess helpers when classification probes ancestry.
+        def merge_base(self, ref1: str, ref2: str) -> str:  # type: ignore[override]
+            if {ref1, ref2} == {empty_branch, "main"}:
+                return "shared-tip"
+            return "synthetic-merge-base"
+
+        def count_commits_ahead(self, source_ref: str, target_ref: str) -> int:  # type: ignore[override]
+            checked = self.count_commits_ahead_checked(source_ref, target_ref)
+            if checked is None:
+                raise RuntimeError("ahead-count unavailable")
+            return checked
+
+        def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:  # type: ignore[override]
+            if source_ref == empty_branch and target_ref == "main":
+                return 0
+            if source_ref == empty_branch and target_ref == "shared-tip":
+                return 0
+            return 1
+
+        def get_diff_name_status(
+            self,
+            revision_range: str,
+            paths: tuple[str, ...] | list[str] = (),
+            *,
+            check: bool = False,
+        ) -> str:  # type: ignore[override]
+            if revision_range in {f"main...{empty_branch}", f"shared-tip...{empty_branch}"}:
+                return ""
+            return "M\tfeature.txt\n"
+
+        def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+            return commit == "shared-tip" and target == "main"
+
+    return _EmptyMergedWatchGit(tmp_path)
 
 
 def test_watch_run_does_not_call_load_merge_context_when_git_provided(
