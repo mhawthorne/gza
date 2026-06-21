@@ -70,19 +70,23 @@ If many failures — **including retries** — cluster in a short window on infr
 
 ### Step 4: Dedup against already-tracked classes
 
-This is the main saving over re-derivation. For each class, check whether open `system` work already covers it:
+This is the main saving over re-derivation. For each class, check whether **open** `system` work already covers it — the pending and recovery lanes, filtered by tag:
 
 ```bash
-uv run gza search --tag system --status-not completed,failed --json --last 0
+uv run gza next --all --tag system
 ```
 
-If an open `system` task already names/covers the class, **collapse those rows to "tracked by gza-XXXX — skip"** and move on. Then check recurrence-after-fix:
+`gza next` has no `--json`; read the text lanes and run `uv run gza show <id>` on any candidate to confirm which class its prompt covers. If an open `system` task already covers the class, **collapse those rows to "tracked by gza-XXXX — skip"** and move on.
+
+Then check recurrence-after-fix against **landed** `system` fixes:
 
 ```bash
-uv run gza search --tag system --status completed --json --last 0
+uv run gza history --status completed --tag system --json --last 0
 ```
 
 If a class still recurs *after* its fix landed, flag it for **cause-layer escalation** — do not propose another narrow guard (behavior-spec rule).
+
+(Note: `gza search` is substring-over-prompt and requires a search term, so it is not the right tool for a pure tag-scoped lane query — use `next`/`history` with `--tag` as above.)
 
 ### Step 5: Rank the remaining classes by blast radius
 
