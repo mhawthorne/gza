@@ -66,3 +66,22 @@ not longer budgets:
   timeout context, but they must not advertise reusable verify phases.
 - Verification wrappers should omit `tree_fingerprint=` entirely when exact
   fingerprinting is unavailable, rather than emitting placeholder values.
+
+## Unit parallel-only rerun bridge
+
+The unit verify lane keeps its wall-clock behavior unchanged on the all-green
+path, but it now has a bounded bridge for contention-style parallel failures:
+
+- the parallel xdist pass runs first with `--maxfail=GZA_UNIT_RERUN_CAP+1`, so
+  the harness can see the whole bounded failure set instead of stopping at the
+  first failure;
+- if that pass fails only because a bounded set of per-test node IDs failed,
+  the harness reruns just those node IDs serially with the normal per-test
+  timeout and logs each `PARALLEL-ONLY FAILURE (passed serially)` line;
+- collection errors, internal errors, unattributable exits, or failure sets
+  over the cap fail immediately with `unit-rerun: NOT masking - ...`.
+
+This bridge is intentionally narrow. It is an interim run-level arbiter for
+known xdist contention artifacts, not a replacement for the durable per-test
+budgeting work. `GZA_UNIT_SERIAL_RERUN=0` disables the bridge for operator
+triage, and `GZA_UNIT_RERUN_CAP` keeps broad failure sets fail-closed.

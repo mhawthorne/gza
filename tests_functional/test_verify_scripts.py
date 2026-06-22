@@ -22,6 +22,11 @@ def _setup_verify_script_fixture(tmp_path: Path) -> Path:
     repo_root = Path(__file__).resolve().parents[1]
     (fixture_root / "bin" / "tests").write_text((repo_root / "bin" / "tests").read_text(encoding="utf-8"), encoding="utf-8")
     (fixture_root / "bin" / "tests").chmod(0o755)
+    (fixture_root / "bin" / "test-unit").write_text(
+        (repo_root / "bin" / "test-unit").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (fixture_root / "bin" / "test-unit").chmod(0o755)
     return fixture_root
 
 
@@ -88,7 +93,7 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     venv_bin = fixture_root / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     _write_fake_venv_python(venv_bin / "python", tool_log)
-    _write_fake_passthrough_tool(fixture_root / "bin" / "test-latency", tool_log, "test-latency")
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-unit", tool_log, "test-unit")
     for tool_name in ("ruff", "ty", "mypy", "pytest"):
         _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
 
@@ -113,8 +118,8 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     assert result.returncode == 0, result.stderr
     assert "use_venv=1" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert "python -m gza.tools.verify_phase unit -- ./bin/test-latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
-    assert "test-latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert "python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert "test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
         "python -m gza.tools.verify_phase functional -- pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
@@ -133,7 +138,7 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     fake_bin.mkdir()
     _write_fake_uv(fake_bin / "uv", uv_log)
     _write_fake_python(fake_bin / "python", tool_log)
-    _write_fake_passthrough_tool(fixture_root / "bin" / "test-latency", tool_log, "test-latency")
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-unit", tool_log, "test-unit")
     for tool_name in ("ruff", "ty", "mypy", "pytest"):
         _write_fake_passthrough_tool(fake_bin / tool_name, tool_log, tool_name)
     uv_log.write_text("", encoding="utf-8")
@@ -155,7 +160,7 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     assert "use_venv=0" in result.stdout
     uv_invocations = uv_log.read_text(encoding="utf-8")
     assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
-    assert "uv run python -m gza.tools.verify_phase unit -- ./bin/test-latency --summary -- tests/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+    assert "uv run python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in uv_invocations
     assert "uv run python -m gza.tools.verify_phase functional -- uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
 
 
@@ -167,7 +172,7 @@ def test_full_verify_only_runs_integration_suite_with_integration_flag(tmp_path:
     venv_bin = fixture_root / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     _write_fake_venv_python(venv_bin / "python", tool_log)
-    _write_fake_passthrough_tool(fixture_root / "bin" / "test-latency", tool_log, "test-latency")
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-unit", tool_log, "test-unit")
     for tool_name in ("ruff", "ty", "mypy", "pytest"):
         _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
 

@@ -29,6 +29,6 @@ jobs:
 
       - name: Run tests
         env:
-          GZA_UNIT_TEST_TIMEOUT_MS: "2000"
+          GZA_UNIT_TEST_TIMEOUT_MS: "1000"
           GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS: "4"
         run: ./bin/tests

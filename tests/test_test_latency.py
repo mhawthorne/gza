@@ -214,3 +214,23 @@ def test_reemit_sigterm_still_restores_default_and_resends_when_previous_handler
         ("signal", signal.SIGTERM),
         ("kill", signal.SIGTERM),
     ]
+
+
+def test_run_pytest_accepts_extra_plugins(monkeypatch) -> None:
+    extra_plugin = object()
+    seen_plugins: list[object] = []
+
+    def _fake_pytest_main(pytest_args: list[str], *, plugins: list[object]) -> int:
+        del pytest_args
+        seen_plugins.extend(plugins)
+        return 0
+
+    monkeypatch.setattr(test_latency.pytest, "main", _fake_pytest_main)
+
+    exit_code, durations, total_wall_time = test_latency.run_pytest(["tests/"], extra_plugins=[extra_plugin])
+
+    assert exit_code == 0
+    assert durations == []
+    assert total_wall_time >= 0
+    assert len(seen_plugins) == 2
+    assert seen_plugins[1] is extra_plugin

@@ -95,7 +95,7 @@ else
     run_phase mypy uv run mypy src/gza/
     run_phase checks uv run python -m checks
 fi
-run_phase unit ./bin/test-latency --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+run_phase unit ./bin/test-unit --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 if [[ "$USE_VENV" -eq 1 ]]; then
     run_phase functional pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 else
