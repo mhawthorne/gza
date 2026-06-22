@@ -87,6 +87,11 @@ from ._common import (
     set_task_queue_position_scoped,
     set_task_urgency,
 )
+from ._lifecycle_actions import (
+    collect_lifecycle_action_entries,
+    format_cycle_lifecycle_action_summary,
+    print_lifecycle_action_entries,
+)
 from ._queue_render import (
     QueueRenderRow,
     build_queue_summary,
@@ -128,7 +133,6 @@ from .git_ops import (
 )
 from .query import _resolve_incomplete_owner_task
 
-_WATCH_ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0}
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset(
@@ -138,6 +142,7 @@ _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
 )
 T = TypeVar("T")
+_WATCH_EXECUTION_ACTION_ORDER: dict[str, int] = {"merge": 0}
 
 
 def _render_watch_stdout(line: str) -> Text:
@@ -1870,10 +1875,15 @@ def _run_cycle(
             )
         action_plan.sort(
             key=lambda item: (
-                _WATCH_ADVANCE_ACTION_ORDER.get(item[2].get("type", ""), 1),
+                _WATCH_EXECUTION_ACTION_ORDER.get(item[2].get("type", ""), 1),
                 1 if item[1].task_type in {"plan", "explore"} else 0,
             )
         )
+        lifecycle_summary = format_cycle_lifecycle_action_summary(
+            (row.owner_task, action) for row, _task, action in action_plan
+        )
+        if lifecycle_summary is not None:
+            log.emit("INFO", lifecycle_summary)
         has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan)
         can_merge = merge_actions_available
         if has_merge_action:
@@ -3313,6 +3323,16 @@ def cmd_queue(args: argparse.Namespace) -> int:
         git=queue_git,
         target_branch=queue_target_branch,
     )
+    lifecycle_entries = collect_lifecycle_action_entries(
+        store,
+        config=config,
+        git=queue_git,
+        target_branch=queue_target_branch,
+        tags=normalized_tag_filters,
+        any_tag=any_tag,
+        max_recovery_attempts=config.max_resume_attempts,
+        persist_post_merge_rebase_state=False,
+    )
     queue_rows = [
         row
         for row in service.run(
@@ -3322,7 +3342,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     ]
     runnable_pending = [row.task for row in queue_rows if not bool(row.values.get("blocked"))]
     blocked_pending = [row for row in queue_rows if bool(row.values.get("blocked"))]
-    if not runnable_pending and not blocked_pending and not recovery_entries:
+    if not runnable_pending and not blocked_pending and not recovery_entries and not lifecycle_entries:
         if tag_filters:
             print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
             for gap in scope_gaps:
@@ -3385,6 +3405,17 @@ def cmd_queue(args: argparse.Namespace) -> int:
             console.print(_format_queue_recovery_lane_detail(entry))
     else:
         console.print("No recovery candidates")
+
+    console.print()
+    console.print(
+        build_queue_summary(
+            "Lifecycle actions: `advance` / `watch` lifecycle work visible ahead of pending pickup."
+        )
+    )
+    if lifecycle_entries:
+        print_lifecycle_action_entries(console, lifecycle_entries)
+    else:
+        console.print("No lifecycle actions")
 
     console.print()
     console.print(

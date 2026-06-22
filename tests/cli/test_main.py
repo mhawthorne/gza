@@ -149,9 +149,9 @@ class TestHelpOutput:
         watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
 
         assert next_help.returncode == 0
-        assert "recovery lane and pending lane separately" in next_help.stdout
+        assert "recovery, lifecycle, and pending lanes separately" in next_help.stdout
         assert queue_help.returncode == 0
-        assert "Preview recovery vs pending lanes separately" in queue_help.stdout
+        assert "Preview recovery, lifecycle, and pending lanes separately" in queue_help.stdout
         assert work_help.returncode == 0
         assert "does not run recovery or review/merge lifecycle work" in work_help.stdout
         assert advance_help.returncode == 0
@@ -595,7 +595,7 @@ class TestHelpOutput:
         assert "If GitHub is unavailable, lookup fails, or no live PR exists, fix preserves the normal auto-review flow." in docs_text
 
     def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
-        """Help/docs should describe queue tag scope as two lanes, with pending as watch's pickup order."""
+        """Help/docs should describe queue tag scope across recovery, lifecycle, and pending lanes."""
         setup_config(tmp_path)
 
         watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
@@ -607,14 +607,14 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'uv run gza queue --tag TAG' to preview matching recovery candidates plus pending pickup order" in watch_text
+        assert "use 'uv run gza queue --tag TAG' to preview matching recovery candidates, lifecycle actions, and the pending pickup order" in watch_text
         assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_text
         assert "pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'" in queue_text
         assert "queue reports the blocker without starting it" in queue_text
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
-        assert "Only list recovery and pending lanes matching tag filters" in docs_text
-        assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in docs_text
+        assert "Only list recovery, lifecycle, and pending lanes matching tag filters" in docs_text
+        assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates, lifecycle actions, and the pending pickup order" in docs_text
         assert "if a matching lineage is blocked by an out-of-scope derived child, queue reports the blocker without starting it" in docs_text
         assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 

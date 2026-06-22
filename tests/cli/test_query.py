@@ -18,12 +18,14 @@ import gza.colors as colors
 from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
 from gza import dependency_preconditions as dependency_preconditions_module
+from gza.cli import _lifecycle_actions as lifecycle_actions_cli
 from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_position_scoped
 from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
 from gza.git import Git, GitError
+from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
 from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
@@ -105,6 +107,31 @@ class _FastUnmergedGit:
 
     def run_forbidden_subprocess(self, *args: str) -> None:
         raise AssertionError("fast unmerged git double does not run subprocesses")
+
+
+class _PreviewLifecycleGit(_FastUnmergedGit):
+    def __init__(self, *, merged_branches: tuple[str, ...] = ()) -> None:
+        super().__init__()
+        self._branches.update(merged_branches)
+        self._refs.update({"main", *merged_branches, *(f"origin/{branch}" for branch in merged_branches)})
+        for branch in merged_branches:
+            self._merged[(f"origin/{branch}", "main")] = True
+            self._merged[(branch, "main")] = True
+
+    def resolve_fresh_merge_source(self, branch: str):
+        if f"origin/{branch}" in self._refs:
+            return (f"origin/{branch}", None)
+        return (branch, None)
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref in self._refs:
+            if ref == "main" or ref.startswith("origin/merged/") or ref.startswith("merged/"):
+                return "merged-tip"
+            return f"sha-{ref}"
+        return None
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return descendant in {ancestor, "origin/merged/already-landed", "merged/already-landed"}
 
 
 class _UnavailableGitHub:
@@ -201,6 +228,124 @@ def _create_failed_recovery_candidate(
     return task
 
 
+def _approved_plan_review_manifest(source_task_id: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "source_task_id": source_task_id,
+        "source_task_type": "plan",
+        "verdict": "APPROVED",
+        "slice_quality": {
+            "fits_single_task_budget": True,
+            "timeout_budget_minutes": 30,
+            "max_expected_files_changed_per_slice": 8,
+            "rationale": "Bounded slices.",
+        },
+        "slices": [
+            {
+                "slice_id": "S1",
+                "title": "Foundation",
+                "prompt": "Implement slice S1.",
+                "scope": ["Add parser"],
+                "out_of_scope": ["Executor"],
+                "acceptance_criteria": ["Parser works"],
+                "depends_on_slices": [],
+                "based_on_slice": None,
+                "review_scope": "Parser only.",
+                "estimated_complexity": "medium",
+                "expected_timeout_minutes": 30,
+                "requires_code_review": True,
+                "tags": ["lifecycle"],
+            }
+        ],
+    }
+
+
+def _approved_plan_review_report(manifest: dict[str, object]) -> str:
+    return "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n" + json.dumps(manifest) + "\n```\n"
+
+
+def _seed_visible_lifecycle_and_recovery_fixture(tmp_path: Path) -> tuple[Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = _create_failed_recovery_candidate(store, prompt="Resume me")
+
+    plan = store.add("Reviewed plan pending materialization", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Approved plan review", task_type="plan_review", depends_on=plan.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = _approved_plan_review_report(_approved_plan_review_manifest(plan.id))
+    store.update(review)
+
+    store.add("Pending queue work")
+    return failed, plan
+
+
+def _seed_preview_persistence_fixture(tmp_path: Path) -> tuple[Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_impl = store.add("Merged implement should stay preview-only", task_type="implement")
+    assert merged_impl.id is not None
+    merged_impl.status = "completed"
+    merged_impl.completed_at = datetime.now(UTC)
+    merged_impl.branch = "merged/already-landed"
+    merged_impl.has_commits = True
+    merged_impl.merge_status = "unmerged"
+    store.update(merged_impl)
+
+    merged_review = store.add("Approved merged review", task_type="review", depends_on=merged_impl.id)
+    merged_review.status = "completed"
+    merged_review.completed_at = datetime.now(UTC)
+    merged_review.output_content = "**Verdict: APPROVED**"
+    store.update(merged_review)
+
+    plan = store.add("Reviewed plan pending materialization", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    plan_review = store.add("Approved plan review", task_type="plan_review", depends_on=plan.id)
+    plan_review.status = "completed"
+    plan_review.completed_at = datetime.now(UTC)
+    plan_review.output_content = _approved_plan_review_report(_approved_plan_review_manifest(plan.id))
+    store.update(plan_review)
+
+    return merged_impl, plan
+
+
+def _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path: Path) -> tuple[Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = _create_failed_recovery_candidate(store, prompt="Resume me")
+
+    legacy_impl = store.add("Legacy unmerged implement ready to merge", task_type="implement")
+    assert legacy_impl.id is not None
+    store.mark_completed(legacy_impl, has_commits=True, branch="feature/legacy-unmerged-preview")
+
+    approved_review = store.add("Approved review for legacy unmerged implement", task_type="review", depends_on=legacy_impl.id)
+    approved_review.status = "completed"
+    approved_review.completed_at = datetime.now(UTC)
+    approved_review.output_content = "**Verdict: APPROVED**"
+    store.update(approved_review)
+
+    legacy_impl = store.get(legacy_impl.id)
+    assert legacy_impl is not None
+    legacy_impl.status = "unmerged"
+    legacy_impl.merge_status = None
+    store.update(legacy_impl)
+
+    store.add("Pending queue work")
+    return failed, legacy_impl
+
+
 def _first_nonempty_output_line(output: str) -> str:
     return next(line for line in output.splitlines() if line.strip())
 
@@ -209,6 +354,65 @@ def _lineage_root_id(output: str) -> str:
     match = re.search(r"\b[a-z0-9]{1,12}-\d+\b", _first_nonempty_output_line(output))
     assert match is not None
     return match.group(0)
+
+
+def test_collect_lifecycle_action_entries_forwards_persist_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Lifecycle owner", task_type="plan")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    store.update(owner)
+
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner,
+    )
+    monkeypatch.setattr(
+        lifecycle_actions_cli,
+        "_query_lineage_owner_rows_with_context",
+        lambda *args, **kwargs: ((row,), object()),
+    )
+
+    calls: list[bool] = []
+
+    def _fake_determine_next_action(*args, persist_post_merge_rebase_state: bool = True, **kwargs):
+        calls.append(persist_post_merge_rebase_state)
+        return {"type": "create_implement", "description": "Create implementation task"}
+
+    monkeypatch.setattr(lifecycle_actions_cli, "determine_next_action", _fake_determine_next_action)
+
+    lifecycle_actions_cli.collect_lifecycle_action_entries(
+        store,
+        config=config,
+        git=_mock_unmerged_git(),
+        target_branch="main",
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+    )
+    lifecycle_actions_cli.collect_lifecycle_action_entries(
+        store,
+        config=config,
+        git=_mock_unmerged_git(),
+        target_branch="main",
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+        persist_post_merge_rebase_state=False,
+    )
+
+    assert calls == [True, False]
 
 
 def _seed_same_branch_merge_owner_and_improve(tmp_path: Path) -> tuple[Task, Task]:
@@ -2536,6 +2740,64 @@ class TestNextCommand:
         pending_task_idx = result.stdout.index("Pending work")
         assert recovery_idx < pending_header_idx < pending_task_idx
 
+    def test_next_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
+        failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Recovery lane:" in result.stdout
+        assert "Lifecycle actions:" in result.stdout
+        assert "Pending lane:" in result.stdout
+        assert f"resume {failed.id}" in normalized
+        assert plan.id in result.stdout
+        assert "Materialize implementation slices from plan review" in result.stdout
+        recovery_idx = result.stdout.index("Recovery lane:")
+        lifecycle_idx = result.stdout.index("Lifecycle actions:")
+        pending_idx = result.stdout.index("Pending lane:")
+        assert recovery_idx < lifecycle_idx < pending_idx
+
+    def test_next_preview_does_not_persist_merged_lifecycle_state_in_query_only_mode(self, tmp_path: Path):
+        merged_impl, plan = _seed_preview_persistence_fixture(tmp_path)
+        preview_git = _PreviewLifecycleGit(merged_branches=(merged_impl.branch or "",))
+
+        with patch("gza.cli.query.Git", return_value=preview_git):
+            result = invoke_gza("next", "--project", str(tmp_path))
+
+        store = make_store(tmp_path)
+        refreshed_impl = store.get(merged_impl.id)
+
+        assert result.returncode == 0
+        assert "Lifecycle actions:" in result.stdout
+        assert plan.id in result.stdout
+        assert "Materialize implementation slices from plan review" in result.stdout
+        assert "readonly" not in result.stderr.lower()
+        assert "traceback" not in result.stderr.lower()
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        assert store.resolve_merge_unit_for_task(merged_impl.id) is None
+
+    def test_next_shows_legacy_unmerged_merge_action_between_recovery_and_pending(self, tmp_path: Path):
+        failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Recovery lane:" in result.stdout
+        assert "Lifecycle actions:" in result.stdout
+        assert "Pending lane:" in result.stdout
+        assert f"resume {failed.id}" in normalized
+        assert legacy_impl.id in result.stdout
+        assert "Merge (review APPROVED)" in result.stdout
+        recovery_idx = result.stdout.index("Recovery lane:")
+        lifecycle_idx = result.stdout.index("Lifecycle actions:")
+        pending_idx = result.stdout.index("Pending lane:")
+        assert recovery_idx < lifecycle_idx < pending_idx
+
     def test_next_pending_lane_header_is_preview_only_not_lane_owner(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2698,6 +2960,62 @@ class TestQueueCommand:
         assert "Pending lane:" in result.stdout
         assert f"retry {failed.id}" in " ".join(result.stdout.split())
         assert "Pending queue task" in result.stdout
+
+    def test_queue_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
+        failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
+
+        with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Recovery lane:" in result.stdout
+        assert "Lifecycle actions:" in result.stdout
+        assert "Pending lane:" in result.stdout
+        assert f"resume {failed.id}" in normalized
+        assert plan.id in result.stdout
+        assert "Materialize implementation slices from plan review" in result.stdout
+        recovery_idx = result.stdout.index("Recovery lane:")
+        lifecycle_idx = result.stdout.index("Lifecycle actions:")
+        pending_idx = result.stdout.index("Pending lane:")
+        assert recovery_idx < lifecycle_idx < pending_idx
+
+    def test_queue_preview_does_not_persist_merged_lifecycle_state(self, tmp_path: Path):
+        merged_impl, plan = _seed_preview_persistence_fixture(tmp_path)
+        preview_git = _PreviewLifecycleGit(merged_branches=(merged_impl.branch or "",))
+
+        with patch("gza.cli.watch.Git", return_value=preview_git):
+            result = invoke_gza("queue", "--project", str(tmp_path))
+
+        store = make_store(tmp_path)
+        refreshed_impl = store.get(merged_impl.id)
+
+        assert result.returncode == 0
+        assert "Lifecycle actions:" in result.stdout
+        assert plan.id in result.stdout
+        assert "Materialize implementation slices from plan review" in result.stdout
+        assert refreshed_impl is not None
+        assert refreshed_impl.merge_status == "unmerged"
+        assert store.resolve_merge_unit_for_task(merged_impl.id) is None
+
+    def test_queue_shows_legacy_unmerged_merge_action_between_recovery_and_pending(self, tmp_path: Path):
+        failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
+
+        with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Recovery lane:" in result.stdout
+        assert "Lifecycle actions:" in result.stdout
+        assert "Pending lane:" in result.stdout
+        assert f"resume {failed.id}" in normalized
+        assert legacy_impl.id in result.stdout
+        assert "Merge (review APPROVED)" in result.stdout
+        recovery_idx = result.stdout.index("Recovery lane:")
+        lifecycle_idx = result.stdout.index("Lifecycle actions:")
+        pending_idx = result.stdout.index("Pending lane:")
+        assert recovery_idx < lifecycle_idx < pending_idx
 
     def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
         setup_config(tmp_path)

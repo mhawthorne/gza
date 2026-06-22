@@ -768,6 +768,7 @@ def query_lineage_owner_rows(
     config: Config | None = None,
     git: Git | None = None,
     target_branch: str | None = None,
+    persist_post_merge_rebase_state: bool = True,
 ) -> tuple[LineageOwnerRow, ...]:
     rows, _read_context = _query_lineage_owner_rows_with_context(
         store,
@@ -775,6 +776,7 @@ def query_lineage_owner_rows(
         config=config,
         git=git,
         target_branch=target_branch,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
     )
     return rows
 
@@ -785,6 +787,7 @@ def _query_lineage_owner_rows_with_context(
     config: Config | None = None,
     git: Git | None = None,
     target_branch: str | None = None,
+    persist_post_merge_rebase_state: bool = True,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .cli.advance_engine import determine_next_action, failed_recovery_decision_to_attention_action
     from .query import is_lineage_complete
@@ -1123,6 +1126,7 @@ def _query_lineage_owner_rows_with_context(
                 target_branch,
                 impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                 max_resume_attempts=query.max_recovery_attempts,
+                persist_post_merge_rebase_state=persist_post_merge_rebase_state,
             )
             if lifecycle_action_task is not None and lifecycle_action_task.id is not None:
                 candidate = build_watch_progress_candidate(

@@ -113,6 +113,7 @@ from ._common import (
     resolve_id,
     validate_cli_tag_values,
 )
+from ._lifecycle_actions import collect_lifecycle_action_entries, print_lifecycle_action_entries
 from ._queue_render import (
     QueueRenderRow as _QueueRenderRow,
     build_blocked_count_summary as _build_blocked_count_summary,
@@ -738,6 +739,19 @@ def _print_pending_lane_header(*, preview_label: str) -> None:
     )
 
 
+def _print_lifecycle_action_section(entries) -> None:
+    console.print()
+    console.print(
+        _build_queue_summary(
+            "Lifecycle actions: `advance` / `watch` lifecycle work visible ahead of pending pickup."
+        )
+    )
+    if not entries:
+        console.print("No lifecycle actions")
+        return
+    print_lifecycle_action_entries(console, entries)
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     """List recovery candidates and upcoming pending tasks in their distinct lanes."""
     config = Config.load(args.project_dir)
@@ -759,6 +773,16 @@ def cmd_next(args: argparse.Namespace) -> int:
         git=git,
         target_branch=target_branch,
     )
+    lifecycle_entries = collect_lifecycle_action_entries(
+        store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        tags=tag_filters,
+        any_tag=any_tag,
+        max_recovery_attempts=config.max_resume_attempts,
+        persist_post_merge_rebase_state=False,
+    )
     queue_rows = [
         row
         for row in service.run(
@@ -773,7 +797,7 @@ def cmd_next(args: argparse.Namespace) -> int:
     registry = WorkerRegistry(config.workers_path)
     orphaned = _get_orphaned_tasks(registry, store)
 
-    if not queue_rows and not recovery_entries:
+    if not queue_rows and not recovery_entries and not lifecycle_entries:
         if tag_filters:
             console.print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
@@ -783,6 +807,7 @@ def cmd_next(args: argparse.Namespace) -> int:
         return 0
 
     _print_recovery_lane_section(recovery_entries)
+    _print_lifecycle_action_section(lifecycle_entries)
     _print_pending_lane_header(preview_label="gza next")
 
     # Filter blocked tasks unless --all is specified

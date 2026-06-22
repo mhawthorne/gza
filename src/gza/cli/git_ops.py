@@ -122,6 +122,7 @@ from ._common import (
     phase1_error,
     resolve_id,
 )
+from ._lifecycle_actions import ADVANCE_ACTION_ORDER, LifecycleActionEntry, print_lifecycle_action_entries
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
@@ -2564,13 +2565,6 @@ def _cmd_advance_unimplemented(
     return 0
 
 
-# Maps advance action types to their execution priority (lower = runs first).
-# 'merge' actions are fast and synchronous; running them first ensures freshly
-# merged code is on the current branch before any review/improve workers are
-# spawned, reducing rebase conflicts for those workers.
-_ADVANCE_ACTION_ORDER: dict[str, int] = {'merge': 0, 'merge_with_followups': 0}
-
-
 @dataclass
 class _MergeActionResult:
     rc: int
@@ -3180,7 +3174,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
             plan.append((row, action_task, action))
 
-        plan.sort(key=lambda item: _ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
+        plan.sort(key=lambda item: ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
 
         attention_plan = [
             (
@@ -3257,13 +3251,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 print(f"Warning: {warning}", file=sys.stderr)
             if preview_actionable_rows:
                 print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
-                for row, _task, action, description in preview_actionable_rows:
-                    display_task = row.owner_task
-                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    _color = _advance_action_color(action['type'])
-                    console.print(f"      [{_color}]→ {description}[/{_color}]")
-                    print()
+                print_lifecycle_action_entries(
+                    console,
+                    [
+                        LifecycleActionEntry(
+                            owner_task=row.owner_task,
+                            action_task=task,
+                            action=action,
+                            description=description,
+                        )
+                        for row, task, action, description in preview_actionable_rows
+                    ],
+                )
             elif not preview_attention_plan:
                 print("No eligible tasks to advance")
             _print_needs_attention_section(preview_attention_plan)
@@ -3299,13 +3298,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         if preview_actionable_rows:
             print(f"Will advance {len(preview_actionable_rows)} task(s):\n")
-            for row, _task, action, description in preview_actionable_rows:
-                display_task = row.owner_task
-                prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                _color = _advance_action_color(action['type'])
-                console.print(f"      [{_color}]→ {description}[/{_color}]")
-                print()
+            print_lifecycle_action_entries(
+                console,
+                [
+                    LifecycleActionEntry(
+                        owner_task=row.owner_task,
+                        action_task=task,
+                        action=action,
+                        description=description,
+                    )
+                    for row, task, action, description in preview_actionable_rows
+                ],
+            )
             if preview_attention_plan:
                 _print_needs_attention_section(preview_attention_plan)
                 print()

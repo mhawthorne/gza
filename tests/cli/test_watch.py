@@ -57,7 +57,7 @@ from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advan
 import gza.colors as colors
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.config import Config
-from gza.db import WatchProgressObservation
+from gza.db import Task, WatchProgressObservation
 import gza.recovery_engine as recovery_engine
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
@@ -116,6 +116,28 @@ def _make_watch_git() -> Git:
     git.get_diff_stat_parsed = MagicMock(return_value=(1, 1, 0))  # type: ignore[method-assign]
     git.get_diff_numstat = MagicMock(return_value="1\t0\tfeature.txt\n")  # type: ignore[method-assign]
     return git
+
+
+def _seed_watch_lifecycle_summary_fixture(tmp_path: Path) -> tuple[object, object]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Completed plan for lifecycle summary", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    impl = store.add("Completed impl for lifecycle summary", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-lifecycle-summary"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    return store, {plan.id: plan, impl.id: impl}
 
 
 def _make_watch_startup_git() -> Git:
@@ -10033,6 +10055,187 @@ def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pyt
         "\n"
         "18:13:47 WAKE      checking... (1 running, 0 pending, 0 slots)\n"
     )
+
+
+def test_watch_cycle_emits_one_lifecycle_summary_line_per_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store, tasks = _seed_watch_lifecycle_summary_fixture(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    git = _make_watch_git()
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        if task.id == next(task_id for task_id, task_obj in tasks.items() if task_obj.task_type == "plan"):
+            return {
+                "type": "materialize_plan_slices",
+                "description": "Materialize implementation slices from approved plan review",
+            }
+        return {
+            "type": "create_review",
+            "description": "Create review before merge",
+        }
+
+    def _fake_execute_advance_action(*, task, action, context):
+        return AdvanceActionExecutionResult(
+            action_type=action["type"],
+            status="dry_run",
+            message=f"Would {action['type']}",
+            worker_label="worker",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    text = log_path.read_text()
+    stdout = capsys.readouterr().out
+    assert text.count("Lifecycle actions (2):") == 1
+    assert stdout.count("Lifecycle actions (2):") == 1
+    assert any(f"{task_id}→materialize_plan_slices" in text for task_id, task in tasks.items() if task.task_type == "plan")
+    assert any(f"{task_id}→create_review" in text for task_id, task in tasks.items() if task.task_type == "implement")
+
+
+def test_watch_cycle_quiet_routes_lifecycle_summary_to_watch_log(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store, tasks = _seed_watch_lifecycle_summary_fixture(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        if task.id == next(task_id for task_id, task_obj in tasks.items() if task_obj.task_type == "plan"):
+            return {
+                "type": "materialize_plan_slices",
+                "description": "Materialize implementation slices from approved plan review",
+            }
+        return {
+            "type": "create_review",
+            "description": "Create review before merge",
+        }
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="create_review",
+                status="dry_run",
+                message="Would create_review",
+                worker_label="worker",
+            ),
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert "Lifecycle actions (2):" in log_path.read_text()
+    assert "Lifecycle actions (2):" not in capsys.readouterr().out
+
+
+def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    review_owner = store.add("Needs review before merge", task_type="implement")
+    assert review_owner.id is not None
+    review_owner.status = "completed"
+    review_owner.completed_at = datetime.now(UTC)
+    review_owner.branch = "feature/watch-create-review"
+    review_owner.has_commits = True
+    review_owner.merge_status = "unmerged"
+    store.update(review_owner)
+
+    followup_owner = store.add("Approved with followups", task_type="implement")
+    assert followup_owner.id is not None
+    followup_owner.status = "completed"
+    followup_owner.completed_at = datetime.now(UTC)
+    followup_owner.branch = "feature/watch-followups"
+    followup_owner.has_commits = True
+    followup_owner.merge_status = "unmerged"
+    store.update(followup_owner)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+
+    def _row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        )
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        if task.id == review_owner.id:
+            return {"type": "create_review", "description": "Create review before merge"}
+        return {"type": "merge_with_followups", "description": "Merge approved task into main and create follow-up tasks"}
+
+    def _fake_execute_advance_action(*, task, action, context):
+        return AdvanceActionExecutionResult(
+            action_type=action["type"],
+            status="dry_run",
+            message=f"Would {action['type']}",
+            worker_label="worker",
+            worker_consuming=action["type"] == "create_review",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([_row(review_owner), _row(followup_owner)], RecoveryReadContext())),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    stdout = capsys.readouterr().out
+    assert "Lifecycle actions (2):" in stdout
+    assert stdout.index("(new) review for") < stdout.index("MERGE")
 
 
 def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps_roundups(

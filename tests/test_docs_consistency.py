@@ -344,9 +344,10 @@ def test_configuration_docs_describe_recovery_vs_pending_operating_surface() -> 
         "| `uv run gza advance` | No by default. Yes with `--new` after lifecycle/recovery planning. |",
         "| `uv run gza watch` | Yes. Maintains the configured batch from the pending lane. |",
         "Recovery lane entries belong to `advance` / `watch`, not `work`.",
+        "Lifecycle-action entries belong to `advance` / `watch`, not `work`.",
         "Pending lane entries belong to `work` / `watch`.",
-        "`gza next` now renders two distinct sections:",
-        "`gza queue` also renders two distinct sections:",
+        "`gza next` now renders three distinct sections:",
+        "`gza queue` also renders three distinct sections:",
     ]
 
     for snippet in required_snippets:
@@ -775,10 +776,10 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in watch_section
     assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup" in watch_section
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
-    assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates plus the pending pickup order" in watch_section
+    assert "use `uv run gza queue --tag TAG` to preview matching recovery candidates, lifecycle actions, and the pending pickup order" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
     assert "queue reports the blocker without starting it" in config_content
-    assert "Only list recovery and pending lanes matching tag filters" in config_content
+    assert "Only list recovery, lifecycle, and pending lanes matching tag filters" in config_content
     assert "Only list pending tasks matching tag filters" not in config_content
 
     assert "\ngza advance [task_id] [options]\n" not in advance_section
@@ -811,11 +812,13 @@ def test_watch_attention_docs_describe_changed_only_inline_attention_behavior() 
     assert "surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines" in watch_section
     assert "Inline `ATTENTION` is emitted only when an attention row is newly visible" in watch_section
     assert "Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set" in watch_section
+    assert "Each watch pass also emits one counted `Lifecycle actions (...)` summary line before execution when actionable lifecycle work is queued for that pass" in watch_section
     assert "Guarded pending routing skips use the same centralized attention path on the first observed guarded skip" in watch_section
     assert "watch does not re-select them for a fresh iterate worker in the meantime" in watch_section
     assert "Ordinary wait/skip states keep the existing `SKIP` dedupe behavior." in watch_section
     assert "Inline `ATTENTION` appears only when an attention key is newly visible" in internal_content
     assert "Each watch pass that emits visible attention also prints a counted `Needs attention (...)` section with the same formatted task rows for the full current visible set" in internal_content
+    assert "each watch pass now emits one concise `Lifecycle actions (...)` summary line" in internal_content
     assert "Guarded-pending routing skips are promoted through the same centralized attention path on the first observed guarded skip" in internal_content
     assert "watch reuses that parked action instead of recomputing a fresh lifecycle step" in internal_content
     assert "Ordinary watch skip/wait lines remain deduped across passes." in internal_content
