@@ -106,6 +106,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
     ConfigKeySpec("max_plan_review_cycles", "int", 2, "Cap for plan_review/plan_improve loops in lifecycle automation."),
+    ConfigKeySpec(
+        "max_failed_plan_review_retries",
+        "int",
+        3,
+        "Max failed plan_review attempts for one plan source before lifecycle parks it as needs_attention instead of auto-spawning another review; 0 escalates after the first failure.",
+    ),
     ConfigKeySpec("max_noop_improve_cycles", "int", 1, "Cap for consecutive no-op improves before lifecycle automation stops for discussion."),
     ConfigKeySpec("max_plan_slices", "int | null", None, "Optional cap on auto-materialized implementation slices from one approved plan review."),
     ConfigKeySpec(

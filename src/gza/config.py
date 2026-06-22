@@ -79,6 +79,7 @@ DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_MAX_PLAN_REVIEW_CYCLES = 2
+DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES = 3
 DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 1
 DEFAULT_MAX_PLAN_SLICES: int | None = None
 DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES: int | None = None
@@ -125,7 +126,8 @@ VALID_CONFIG_FIELDS = {
     "verify_command", "inner_verify_command",
     "advance_create_reviews", "advance_create_plan_reviews", "require_review_before_merge",
     "require_plan_review_before_implement", "pr_integration", "advance_mode", "max_resume_attempts",
-    "max_review_cycles", "max_plan_review_cycles", "max_noop_improve_cycles", "max_plan_slices",
+    "max_review_cycles", "max_plan_review_cycles", "max_failed_plan_review_retries",
+    "max_noop_improve_cycles", "max_plan_slices",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
@@ -208,6 +210,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "max_concurrent": None,
     "max_review_cycles": None,
     "max_plan_review_cycles": None,
+    "max_failed_plan_review_retries": None,
     "max_noop_improve_cycles": None,
     "max_plan_slices": None,
     "plan_slice_target_timeout_minutes": None,
@@ -331,6 +334,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "max_concurrent": None,
     "max_review_cycles": None,
     "max_plan_review_cycles": None,
+    "max_failed_plan_review_retries": None,
     "max_noop_improve_cycles": None,
     "max_plan_slices": None,
     "plan_slice_target_timeout_minutes": None,
@@ -976,6 +980,7 @@ class Config:
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
     max_plan_review_cycles: int = DEFAULT_MAX_PLAN_REVIEW_CYCLES
+    max_failed_plan_review_retries: int = DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES
     max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
     max_plan_slices: int | None = DEFAULT_MAX_PLAN_SLICES
     plan_slice_target_timeout_minutes: int | None = DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES
@@ -1903,6 +1908,13 @@ class Config:
         )
         if max_plan_review_cycles <= 0:
             raise ConfigError("'max_plan_review_cycles' must be positive")
+        max_failed_plan_review_retries = _load_strict_int_field(
+            data,
+            "max_failed_plan_review_retries",
+            DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES,
+        )
+        if max_failed_plan_review_retries < 0:
+            raise ConfigError("'max_failed_plan_review_retries' must be non-negative")
         max_noop_improve_cycles = _load_strict_int_field(
             data, "max_noop_improve_cycles", DEFAULT_MAX_NOOP_IMPROVE_CYCLES
         )
@@ -2279,6 +2291,7 @@ class Config:
             max_concurrent=max_concurrent,
             max_review_cycles=max_review_cycles,
             max_plan_review_cycles=max_plan_review_cycles,
+            max_failed_plan_review_retries=max_failed_plan_review_retries,
             max_noop_improve_cycles=max_noop_improve_cycles,
             max_plan_slices=max_plan_slices,
             plan_slice_target_timeout_minutes=plan_slice_target_timeout_minutes,
@@ -2764,6 +2777,11 @@ class Config:
                 errors.append("'max_plan_review_cycles' must be an integer")
             elif data["max_plan_review_cycles"] <= 0:
                 errors.append("'max_plan_review_cycles' must be positive")
+        if "max_failed_plan_review_retries" in data:
+            if not _is_strict_int(data["max_failed_plan_review_retries"]):
+                errors.append("'max_failed_plan_review_retries' must be an integer")
+            elif data["max_failed_plan_review_retries"] < 0:
+                errors.append("'max_failed_plan_review_retries' must be non-negative")
         if "max_noop_improve_cycles" in data:
             if not _is_strict_int(data["max_noop_improve_cycles"]):
                 errors.append("'max_noop_improve_cycles' must be an integer")

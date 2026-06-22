@@ -67,6 +67,7 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 | Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up (`reason=awaiting-human-review`) |
 | Completed non-held plan with no plan review and `require_plan_review_before_implement=true` | `create_plan_review` — create and run plan-review task |
 | Completed non-held plan with pending or in-progress plan review | `run_plan_review` / `wait_plan_review` — reuse the current review attempt, never duplicate it |
+| Completed non-held plan whose failed `plan_review` attempts hit the configured cap | `needs_discussion` — stop auto-respawning and require a human decision (`reason=plan-review-repeatedly-failed`) |
 | Completed non-held plan with approved valid plan review manifest | `materialize_plan_slices` — create sliced implement tasks |
 | Completed non-held plan with `CHANGES_REQUESTED` plan review | `create_plan_improve` / `run_plan_improve` / `wait_plan_improve` — revise the plan until approval or the configured iteration bound |
 | Completed non-held plan with `NEEDS_DISCUSSION` or unknown plan-review verdict | `needs_discussion` — stop for a human (`reason=plan-review-needs-discussion` or `plan-review-unknown-verdict`) |

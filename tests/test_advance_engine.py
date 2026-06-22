@@ -857,6 +857,56 @@ def test_completed_plan_with_pending_plan_review_uses_legacy_create_implement_wh
     assert action["type"] == "create_implement"
 
 
+def test_completed_plan_with_failed_plan_reviews_below_retry_bound_creates_plan_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_failed_plan_review_retries = 3
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    for index in range(config.max_failed_plan_review_retries - 1):
+        review = store.add(f"Review attempt {index + 1}", task_type="plan_review", depends_on=plan.id)
+        review.status = "failed"
+        review.failure_reason = "INFRASTRUCTURE_ERROR"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "create_plan_review"
+    assert action["description"] == "Create and start plan review task"
+
+
+def test_completed_plan_with_failed_plan_reviews_at_retry_bound_needs_attention(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_failed_plan_review_retries = 3
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    for index in range(config.max_failed_plan_review_retries):
+        review = store.add(f"Review attempt {index + 1}", task_type="plan_review", depends_on=plan.id)
+        review.status = "failed"
+        review.failure_reason = "INFRASTRUCTURE_ERROR"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "plan-review-repeatedly-failed"
+    assert action["subject_task_id"] == plan.id
+    assert "3 failed attempts" in action["description"]
+
+
 def test_completed_plan_review_with_pending_plan_improve_returns_run_plan_improve(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -6384,6 +6434,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         active_plan_review_pending=SimpleNamespace(id="testproject-plan-review-pending"),
         active_plan_review_running=SimpleNamespace(id="testproject-plan-review-running"),
         latest_completed_plan_review=SimpleNamespace(id="testproject-plan-review-completed"),
+        failed_plan_review_count=3,
         plan_review_verdict=None,
         validated_plan_review_manifest=None,
         plan_review_validation_error=None,
@@ -6393,6 +6444,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         require_plan_review_before_implement=True,
         completed_plan_review_cycles=0,
         max_plan_review_cycles=2,
+        max_failed_plan_review_retries=3,
         latest_plan_source=None,
         plan_materialization_state=None,
     )
@@ -6410,6 +6462,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "awaiting_human_plan_review",
         "plan_invalid_approved_review",
         "plan_max_cycles_reached",
+        "plan_review_failed_retry_limit",
         "plan_partial_materialization_requires_repair",
         "plan_review_manual_creation_required",
         "plan_review_needs_discussion",

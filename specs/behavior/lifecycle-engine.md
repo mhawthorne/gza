@@ -63,6 +63,7 @@ as confidence grows.
 | `auto_implement` (per lineage) | — | Whether a completed plan auto-creates its implement, vs holding for a human (§1). |
 | `max_review_cycles` | 3 | Bound on review→improve cycles before escalation (§6). |
 | `max_noop_improve_cycles` | 1 | Bound on consecutive improves that change nothing (§6). |
+| plan-review failure circuit breaker | 3 | Bound on repeated failed automated `plan_review` attempts for one plan source before escalation (§1). |
 | rebase-failure circuit breaker | 3 | Bound on repeated failed rebases with no progress (§5). |
 | duplicate-blocker bound | 3 | Bound on the same blocker repeating across reviews (§6). |
 | recovery attempts | bounded | Automatic resume/retry budget before escalation (§7). |
@@ -81,6 +82,9 @@ operator changing a value is configuration, not a spec violation.
   with no implementation follow-up MUST enter automated `plan_review` first when
   `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
   then materialize bounded implementation slices only after an approved valid manifest.
+  Repeated failed automated `plan_review` attempts for the same plan source MUST be bounded by
+  a circuit breaker; once the failed-attempt cap is reached, the engine MUST park with
+  `plan-review-repeatedly-failed` instead of spawning another review.
   If implement descendants exist for an approved manifest but the durable materialization
   record is missing or incomplete, the engine MUST park with
   `plan-review-materialization-repair-needed`; it MUST NOT silently treat a partial
@@ -337,6 +341,7 @@ is a spec change. The accompanying human message is free text.
 | `plan-review-invalid-slices` | needs_discussion | §1 approved plan review has no valid effective slice manifest |
 | `plan-review-needs-discussion` | needs_discussion | §1 completed plan review returned `NEEDS_DISCUSSION` |
 | `plan-review-unknown-verdict` | needs_discussion | §1 completed plan review verdict missing or unparseable |
+| `plan-review-repeatedly-failed` | needs_discussion | §1 failed automated plan-review attempts reached the configured cap |
 | `plan-review-max-cycles-reached` | needs_discussion | §1 `plan_review` / `plan_improve` loop hit `max_plan_review_cycles` |
 | `plan-review-materialization-repair-needed` | needs_discussion | §1 approved manifest has implement descendants without a durable complete materialization record |
 | `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |

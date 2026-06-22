@@ -79,6 +79,7 @@ def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
         "advance_create_plan_reviews: false\n"
         "require_plan_review_before_implement: false\n"
         "max_plan_review_cycles: 4\n"
+        "max_failed_plan_review_retries: 5\n"
         "max_plan_slices: 7\n"
         "plan_slice_target_timeout_minutes: 25\n"
     )
@@ -88,6 +89,7 @@ def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
     assert config.advance_create_plan_reviews is False
     assert config.require_plan_review_before_implement is False
     assert config.max_plan_review_cycles == 4
+    assert config.max_failed_plan_review_retries == 5
     assert config.max_plan_slices == 7
     assert config.plan_slice_target_timeout_minutes == 25
     assert config.get_plan_slice_target_timeout_minutes() == 25

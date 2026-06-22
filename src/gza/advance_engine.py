@@ -155,6 +155,7 @@ class AdvanceContext:
     advance_create_plan_reviews: bool
     require_plan_review_before_implement: bool
     max_plan_review_cycles: int
+    max_failed_plan_review_retries: int
     max_plan_slices: int | None
     plan_slice_target_timeout_minutes: int
     max_noop_improve_cycles: int
@@ -209,6 +210,7 @@ class AdvanceContext:
     active_plan_review_pending: DbTask | None = None
     active_plan_review_running: DbTask | None = None
     latest_completed_plan_review: DbTask | None = None
+    failed_plan_review_count: int = 0
     plan_review_verdict: str | None = None
     parsed_plan_review_manifest: PlanReviewManifest | None = None
     validated_plan_review_manifest: PlanReviewManifest | None = None
@@ -1352,6 +1354,7 @@ def _resolve_plan_review_state(
         default=None,
         key=_task_event_time,
     )
+    failed_plan_review_count = sum(1 for child in plan_reviews if child.status == "failed")
     active_plan_improve_pending = max(
         (child for child in plan_improves if child.status == "pending"),
         default=None,
@@ -1405,6 +1408,7 @@ def _resolve_plan_review_state(
         "active_plan_review_pending": active_plan_review_pending,
         "active_plan_review_running": active_plan_review_running,
         "latest_completed_plan_review": latest_completed_plan_review,
+        "failed_plan_review_count": failed_plan_review_count,
         "plan_review_verdict": plan_review_verdict,
         "parsed_plan_review_manifest": validated_manifest,
         "validated_plan_review_manifest": validated_manifest,
@@ -1477,6 +1481,22 @@ def _plan_review_timeout_budget_minutes(config: Any) -> int:
     if value is None:
         value = getattr(config, "code_task_diff_timeout_cap_minutes", 30)
     return int(value or 30)
+
+
+def _failed_plan_review_retry_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                "SKIP: automated plan review repeatedly failed without a parseable verdict "
+                f"({ctx.failed_plan_review_count} failed attempt"
+                f"{'' if ctx.failed_plan_review_count == 1 else 's'}; "
+                f"limit {ctx.max_failed_plan_review_retries})"
+            ),
+        },
+        reason="plan-review-repeatedly-failed",
+        subject_task_id=ctx.task.id,
+    )
 
 
 def _resolve_plan_materialization_state(
@@ -2047,6 +2067,7 @@ def _build_base_advance_context(
         advance_create_plan_reviews=getattr(config, "advance_create_plan_reviews", True),
         require_plan_review_before_implement=getattr(config, "require_plan_review_before_implement", True),
         max_plan_review_cycles=getattr(config, "max_plan_review_cycles", 2),
+        max_failed_plan_review_retries=getattr(config, "max_failed_plan_review_retries", 3),
         max_plan_slices=getattr(config, "max_plan_slices", None),
         plan_slice_target_timeout_minutes=_plan_review_timeout_budget_minutes(config),
         max_noop_improve_cycles=effective_max_noop_improves,
@@ -2769,6 +2790,23 @@ ADVANCE_RULES: list[AdvanceRule] = [
             reason="plan-review-needs-manual-creation",
             subject_task_id=ctx.task.id,
         ),
+    ),
+    AdvanceRule(
+        name="plan_review_failed_retry_limit",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.advance_create_plan_reviews
+            and ctx.active_plan_review_pending is None
+            and ctx.active_plan_review_running is None
+            and ctx.latest_completed_plan_review is None
+            and ctx.failed_plan_review_count > 0
+            and ctx.failed_plan_review_count >= ctx.max_failed_plan_review_retries
+        ),
+        action=_failed_plan_review_retry_limit_action,
     ),
     AdvanceRule(
         name="plan_create_review",
