@@ -982,11 +982,11 @@ class _WatchLog:
     def visible_attention_messages(self) -> tuple[str, ...]:
         return tuple(self._visible_attention_this_cycle.values())
 
-    def note_merge_logged(self, task_id: str) -> None:
-        self._merge_logged_this_cycle.add(task_id)
+    def note_merge_logged(self, merge_key: str) -> None:
+        self._merge_logged_this_cycle.add(merge_key)
 
-    def was_merge_logged(self, task_id: str) -> bool:
-        return task_id in self._merge_logged_this_cycle
+    def was_merge_logged(self, merge_key: str) -> bool:
+        return merge_key in self._merge_logged_this_cycle
 
     def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
         if event == "SKIP" and dedupe_key is not None:
@@ -1058,9 +1058,49 @@ def _emit_transition_events(
                 log.emit("FAIL", f"{task_id} {task_type}: {reason}{elapsed_suffix}")
 
         if task_id in old and old_row.get("merge_status") != "merged" and new_row.get("merge_status") == "merged":
-            merge_target = new_row.get("merge_target_branch") or store.default_merge_target()
-            if not log.was_merge_logged(task_id):
-                log.emit("MERGE", f"{task_id} -> {merge_target}")
+            merge_event = _resolve_watch_merge_log_event(
+                store,
+                task_id=task_id,
+                target_branch=new_row.get("merge_target_branch"),
+            )
+            if merge_event is not None and not log.was_merge_logged(merge_event.merge_key):
+                log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
+                log.note_merge_logged(merge_event.merge_key)
+
+
+@dataclass(frozen=True)
+class _WatchMergeLogEvent:
+    merge_key: str
+    display_task_id: str
+    target_branch: str
+
+
+def _resolve_watch_merge_log_event(
+    store: SqliteTaskStore,
+    *,
+    task_id: str,
+    target_branch: str | None = None,
+) -> _WatchMergeLogEvent | None:
+    task = store.get(task_id)
+    if task is None or task.id is None:
+        return None
+
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is not None:
+        owner = store.resolve_merge_unit_owner_task(merge_unit)
+        owner_task_id = owner.id if owner is not None and owner.id is not None else merge_unit.owner_task_id
+        if owner_task_id is not None:
+            return _WatchMergeLogEvent(
+                merge_key=merge_unit.id,
+                display_task_id=owner_task_id,
+                target_branch=target_branch or merge_unit.target_branch or store.default_merge_target(),
+            )
+
+    return _WatchMergeLogEvent(
+        merge_key=task.id,
+        display_task_id=task.id,
+        target_branch=target_branch or store.default_merge_target(),
+    )
 
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
@@ -1954,23 +1994,34 @@ def _run_cycle(
                     )
                     continue
                 if dry_run:
-                    log.emit("MERGE", f"{display_task.id} -> {target_branch} [dry-run]")
+                    merge_event = None
+                    if display_task.id is not None:
+                        merge_event = _resolve_watch_merge_log_event(
+                            store,
+                            task_id=display_task.id,
+                            target_branch=target_branch,
+                        )
+                    if merge_event is not None:
+                        log.emit(
+                            "MERGE",
+                            f"{merge_event.display_task_id} -> {merge_event.target_branch} [dry-run]",
+                        )
                     work_done = True
                     continue
                 merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
                 merge_execution_branch = target_branch if isolation_enabled else current_branch
-                merge_log_task_ids = [display_task.id] if display_task.id is not None else []
+                merge_event = None
+                merge_status_before: str | None = None
                 if display_task.id is not None:
-                    merge_unit = store.resolve_merge_unit_for_task(display_task.id)
-                    if merge_unit is not None:
-                        merge_log_task_ids = sorted(
-                            [member.id for member in store.list_tasks_for_merge_unit(merge_unit.id) if member.id is not None],
-                            key=task_id_numeric_key,
+                    merge_event = _resolve_watch_merge_log_event(
+                        store,
+                        task_id=display_task.id,
+                        target_branch=target_branch,
+                    )
+                    if merge_event is not None:
+                        merge_status_before = (
+                            (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")
                         )
-                merge_status_before = {
-                    task_id: (_task_snapshot(store).get(task_id) or {}).get("merge_status")
-                    for task_id in merge_log_task_ids
-                }
                 merge_result = _run_with_optional_stdout_suppressed(
                     quiet,
                     lambda: _execute_merge_action(
@@ -1989,15 +2040,17 @@ def _run_cycle(
                     ),
                 )
                 rc = merge_result.rc
-                if rc == 0 and merge_log_task_ids:
-                    merge_status_after = {
-                        task_id: (_task_snapshot(store).get(task_id) or {}).get("merge_status")
-                        for task_id in merge_log_task_ids
-                    }
-                    for task_id in merge_log_task_ids:
-                        if merge_status_before.get(task_id) != "merged" and merge_status_after.get(task_id) == "merged":
-                            log.emit("MERGE", f"{task_id} -> {target_branch}")
-                            log.note_merge_logged(task_id)
+                if rc == 0 and merge_event is not None:
+                    merge_status_after = (
+                        (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")
+                    )
+                    if (
+                        merge_status_before != "merged"
+                        and merge_status_after == "merged"
+                        and not log.was_merge_logged(merge_event.merge_key)
+                    ):
+                        log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
+                        log.note_merge_logged(merge_event.merge_key)
                 for followup_task in merge_result.created_followups:
                     log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
                 for followup_task in merge_result.reused_followups:

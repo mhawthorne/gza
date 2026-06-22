@@ -4561,6 +4561,58 @@ def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp
     assert f"MERGE     {task.id} -> main [dry-run]" in log_path.read_text()
 
 
+def test_watch_cycle_dry_run_logs_only_merge_unit_owner(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Completed owner", task_type="implement")
+    assert owner.id is not None
+    review = store.add("Attached review", task_type="review", depends_on=owner.id)
+    assert review.id is not None
+    for task in (owner, review):
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/watch-dry-run-merge-unit"
+        task.has_commits = True
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch="feature/watch-dry-run-merge-unit",
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(review.id, unit.id, "review")
+    store.dual_write_legacy_merge_status(unit.id)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert result.work_done is True
+    execute_merge.assert_not_called()
+    log_text = log_path.read_text()
+    assert f"MERGE     {owner.id} -> main [dry-run]" in log_text
+    assert f"MERGE     {review.id} -> main [dry-run]" not in log_text
+
+
 def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_worktree(tmp_path: Path) -> None:
     """Isolation helper should not leave the integration worktree attached to the shared default-branch ref."""
     setup_config(tmp_path)
@@ -6137,20 +6189,78 @@ def test_emit_transition_events_logs_merge_unit_target_branch_on_external_merge_
     assert f"MERGE     {task.id} -> main" not in log_text
 
 
-def test_watch_cycle_logs_each_merged_merge_unit_member_once(tmp_path: Path) -> None:
+def test_emit_transition_events_logs_only_merge_unit_owner(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
     owner = store.add("Owner task", task_type="implement")
-    sibling = store.add("Sibling task", task_type="implement", based_on=owner.id)
     assert owner.id is not None
-    assert sibling.id is not None
-    for task in (owner, sibling):
+    review = store.add("Attached review", task_type="review", depends_on=owner.id)
+    rebase = store.add("Attached rebase", task_type="rebase", based_on=owner.id)
+    assert review.id is not None
+    assert rebase.id is not None
+    for task in (owner, review, rebase):
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = "feature/watch-transition-merge-unit"
+        task.has_commits = True
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch="feature/watch-transition-merge-unit",
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(review.id, unit.id, "review")
+    store.attach_task_to_merge_unit(rebase.id, unit.id, "same_branch")
+    store.dual_write_legacy_merge_status(unit.id)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    before = _task_snapshot(store)
+    store.set_merge_unit_state(unit.id, "merged")
+    after = _task_snapshot(store)
+
+    _emit_transition_events(before, after, store=store, config=config, log=log)
+
+    log_text = log_path.read_text()
+    assert log_text.count(f"MERGE     {owner.id} -> main") == 1
+    assert f"MERGE     {review.id} -> main" not in log_text
+    assert f"MERGE     {rebase.id} -> main" not in log_text
+
+
+def test_watch_cycle_logs_one_merge_line_for_merge_unit_owner_and_keeps_member_credit_on_unit(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Owner task", task_type="implement")
+    assert owner.id is not None
+    review = store.add("Attached review", task_type="review", depends_on=owner.id)
+    rebase = store.add("Attached rebase", task_type="rebase", based_on=owner.id)
+    failed_impl = store.add("Failed sibling", task_type="implement", based_on=owner.id)
+    recovery = store.add("Recovery child", task_type="implement", based_on=failed_impl.id)
+    assert owner.id is not None
+    assert review.id is not None
+    assert rebase.id is not None
+    assert failed_impl.id is not None
+    assert recovery.id is not None
+    for task in (owner, review, rebase, recovery):
         task.status = "completed"
         task.completed_at = datetime.now(UTC)
         task.branch = "feature/watch-merge-unit"
         task.has_commits = True
         store.update(task)
+    failed_impl.status = "failed"
+    failed_impl.failure_reason = "simulated failure"
+    failed_impl.branch = "feature/watch-merge-unit"
+    failed_impl.has_commits = True
+    store.update(failed_impl)
 
     unit = store.create_merge_unit(
         source_branch="feature/watch-merge-unit",
@@ -6159,7 +6269,10 @@ def test_watch_cycle_logs_each_merged_merge_unit_member_once(tmp_path: Path) -> 
         state="unmerged",
     )
     store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
-    store.attach_task_to_merge_unit(sibling.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(review.id, unit.id, "review")
+    store.attach_task_to_merge_unit(rebase.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(failed_impl.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(recovery.id, unit.id, "same_branch")
     store.dual_write_legacy_merge_status(unit.id)
 
     config = Config.load(tmp_path)
@@ -6174,8 +6287,6 @@ def test_watch_cycle_logs_each_merged_merge_unit_member_once(tmp_path: Path) -> 
 
     def merge_unit_side_effect(*_args, **_kwargs):
         store.set_merge_unit_state(unit.id, "merged")
-        store.set_merge_status(owner.id, "merged")
-        store.set_merge_status(sibling.id, "merged")
         return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
 
     with (
@@ -6200,7 +6311,29 @@ def test_watch_cycle_logs_each_merged_merge_unit_member_once(tmp_path: Path) -> 
     assert result.work_done is True
     log_text = log_path.read_text()
     assert log_text.count(f"MERGE     {owner.id} -> main") == 1
-    assert log_text.count(f"MERGE     {sibling.id} -> main") == 1
+    assert f"MERGE     {review.id} -> main" not in log_text
+    assert f"MERGE     {rebase.id} -> main" not in log_text
+    assert f"MERGE     {failed_impl.id} -> main" not in log_text
+    assert f"MERGE     {recovery.id} -> main" not in log_text
+    for task_id in (owner.id, review.id, rebase.id, failed_impl.id, recovery.id):
+        member_unit = store.resolve_merge_unit_for_task(task_id)
+        assert member_unit is not None
+        assert member_unit.state == "merged"
+    owner_task = store.get(owner.id)
+    review_task = store.get(review.id)
+    rebase_task = store.get(rebase.id)
+    failed_impl_task = store.get(failed_impl.id)
+    recovery_task = store.get(recovery.id)
+    assert owner_task is not None
+    assert review_task is not None
+    assert rebase_task is not None
+    assert failed_impl_task is not None
+    assert recovery_task is not None
+    assert owner_task.merge_status == "merged"
+    assert review_task.merge_status is None
+    assert rebase_task.merge_status is None
+    assert failed_impl_task.merge_status is None
+    assert recovery_task.merge_status is None
 
 
 def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:

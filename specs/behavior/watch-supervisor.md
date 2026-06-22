@@ -70,9 +70,11 @@ Each watch cycle MUST execute these phases in order:
 2. **Compute capacity.** Derive current `running` and `slots`.
 3. **Evaluate direct lifecycle work first.** Execute merge-ready and other direct
    non-worker actions before spawning any new workers (S4). When a watch-managed merge
-   action succeeds, watch MUST emit a structured `MERGE <task-id> -> <target>` line at
-   merge time, before any same-cycle worker starts, queue pickup, or informational
-   summary output that follows from the fresher target-branch state.
+   action succeeds, watch MUST emit exactly one structured
+   `MERGE <owner-task-id> -> <target>` line for the landed merge unit at merge time,
+   before any same-cycle worker starts, queue pickup, or informational summary output
+   that follows from the fresher target-branch state. The logged task ID is the
+   merge-unit owner/leader, not every credited member.
 4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
    lifecycle worker starts selected by the shared engine. Recovery allocation is not a
    pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before
@@ -82,8 +84,9 @@ Each watch cycle MUST execute these phases in order:
 5. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
    parked states, recovery decisions, and failures. Snapshot-based transition detection
    remains responsible for repaired or otherwise out-of-band merge transitions, but it
-   MUST NOT duplicate a `MERGE` line that was already emitted inline for the same task
-   when the direct merge action landed.
+   MUST emit at most one `MERGE` line per merge unit per cycle and MUST NOT duplicate a
+   `MERGE` line that was already emitted inline for the same merge unit owner when the
+   direct merge action landed.
 6. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
    next poll interval.
 
