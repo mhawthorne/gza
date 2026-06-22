@@ -2696,6 +2696,91 @@ def test_query_lineage_owner_rows_calls_load_merge_context_when_target_branch_no
     assert call_count, "_load_merge_context should have been called when target_branch is None"
 
 
+def test_query_lineage_owner_rows_short_circuits_merged_history_before_lineage_walk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_owner_ids: list[str] = []
+    live_owner_ids: list[str] = []
+    base_time = datetime(2026, 6, 22, 12, 0, tzinfo=UTC)
+
+    for index in range(5):
+        failed = store.add(f"Merged historical failed {index}", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.branch = f"feature/merged-history-{index}"
+        failed.completed_at = base_time.replace(minute=index)
+        store.update(failed)
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="merged",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+        merged_owner_ids.append(failed.id)
+
+    for index in range(2):
+        failed = store.add(f"Live unresolved failed {index}", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.branch = f"feature/live-history-{index}"
+        failed.completed_at = base_time.replace(hour=13, minute=index)
+        store.update(failed)
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+        live_owner_ids.append(failed.id)
+
+    read_context_calls: list[str] = []
+    store_calls: list[str] = []
+
+    original_read_context_get_lineage_children = RecoveryReadContext.get_lineage_children
+    original_store_get_lineage_children = store.get_lineage_children
+
+    def _count_read_context_get_lineage_children(
+        self: RecoveryReadContext,
+        task_id: str,
+        *,
+        parent=None,
+    ):
+        read_context_calls.append(task_id)
+        return original_read_context_get_lineage_children(self, task_id, parent=parent)
+
+    def _count_store_get_lineage_children(task_id: str):
+        store_calls.append(task_id)
+        return original_store_get_lineage_children(task_id)
+
+    monkeypatch.setattr(
+        RecoveryReadContext,
+        "get_lineage_children",
+        _count_read_context_get_lineage_children,
+    )
+    monkeypatch.setattr(store, "get_lineage_children", _count_store_get_lineage_children)
+
+    rows, _read_context = _query_lineage_owner_rows_with_context(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+    )
+
+    assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == set(live_owner_ids)
+    assert len(read_context_calls) == len(live_owner_ids)
+    assert len(store_calls) == len(live_owner_ids)
+    assert set(read_context_calls) == set(live_owner_ids)
+    assert set(store_calls) == set(live_owner_ids)
+    assert not (set(read_context_calls) & set(merged_owner_ids))
+    assert not (set(store_calls) & set(merged_owner_ids))
+
+
 def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seeded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

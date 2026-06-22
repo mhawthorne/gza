@@ -798,6 +798,42 @@ def _task_lineage_branch_keys(
     return keys
 
 
+def _resolve_task_merge_unit(
+    store: SqliteTaskStore,
+    task_id: str,
+    *,
+    read_context: RecoveryReadContext | None = None,
+):
+    if read_context is not None:
+        return read_context.resolve_merge_unit_for_task(task_id)
+    return store.resolve_merge_unit_for_task(task_id)
+
+
+def _is_resolved_by_landed_merge_unit_or_owner(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
+    """Return whether DB lifecycle state already proves this failed work landed.
+
+    Owner-row and watch recovery scans call this before any lineage traversal so
+    settled merged units contribute near-zero work regardless of age.
+    """
+    if task.id is None:
+        return False
+    unit = _resolve_task_merge_unit(store, task.id, read_context=read_context)
+    if unit is not None:
+        if unit.state == "merged":
+            return True
+        owner_task_id = unit.owner_task_id
+        if owner_task_id and owner_task_id != task.id:
+            owner_unit = _resolve_task_merge_unit(store, owner_task_id, read_context=read_context)
+            if owner_unit is not None and owner_unit.state == "merged":
+                return True
+    return False
+
+
 def _is_independent_follow_up_root(
     store: SqliteTaskStore,
     task: DbTask,
@@ -825,6 +861,8 @@ def _is_resolved_by_landed_lineage(
     # This helper only suppresses failed rows during failed-task recovery.
     if task.id is None or task.status != "failed":
         return False
+    if _is_resolved_by_landed_merge_unit_or_owner(store, task, read_context=read_context):
+        return True
 
     prefer_explicit_recovery = _is_resumable_timeout_implementation(task)
     target_branch: str | None = None
