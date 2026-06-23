@@ -904,7 +904,7 @@ def collect_stale_unmerged_sweep_candidates(
                 owner_task=owner,
                 merge_unit=merge_unit,
                 drop_task_ids=drop_task_ids,
-                member_task_ids=tuple(sorted(member_task_ids, key=task_id_numeric_key)),
+                member_task_ids=tuple(sorted(member_task_ids, key=lambda task_id: task_id_numeric_key(task_id))),
                 last_activity_at=last_activity_at,
                 stale_days=max(0, (current_time - last_activity_at).days),
             )

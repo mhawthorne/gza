@@ -142,7 +142,7 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
         if task.id is not None:
             live_task_ids.add(str(task.id))
 
-    running_task_ids = tuple(sorted(live_task_ids, key=task_id_numeric_key))
+    running_task_ids = tuple(sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id)))
     anonymous_worker_count = max(0, len(live_pids) - len(running_task_ids))
     return live_pids, running_task_ids, anonymous_worker_count
 

@@ -27,9 +27,14 @@ def _current_timestamp() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-@dataclass
+@dataclass(eq=False)
 class _FailureCapturePlugin:
-    """Collect rerunnable test failures and non-rerunnable pytest errors."""
+    """Collect rerunnable test failures and non-rerunnable pytest errors.
+
+    ``eq=False`` keeps identity-based ``__hash__``: pytest registers this as a
+    plugin and stores it in a set during fixture parsing, so the instance must be
+    hashable (a default ``@dataclass`` sets ``__hash__ = None``).
+    """
 
     failed_nodeids: list[str] = field(default_factory=list)
     collection_errors: list[str] = field(default_factory=list)
