@@ -150,6 +150,36 @@ and L2 can find it:
 *Implementation note: `cli/_common.py` resume/retry creation sets `based_on=original_task.id`
 plus `recovery_origin`.*
 
+### L5 — Stale unmerged sweep
+
+Operators MAY run a conservative stale-unmerged sweep to drop abandoned never-merged work
+units that are still cluttering unresolved views. This is a maintenance operation over
+the lineage graph; it does not change merge truth.
+
+- **Eligible unit states.** The sweep MUST consider only active merge units still recorded
+  as `unmerged`, `blocked`, or `stale`.
+- **Fresh canonical merge proof.** Before reporting or dropping a candidate, the sweep MUST
+  re-check that merge unit against the local canonical default target using the same
+  non-network merge-truth semantics as plain default-target `gza unmerged`. A candidate
+  proven `merged`, `empty`, or `redundant` there MUST be excluded. If that proof fails for
+  any candidate, the command MUST fail before applying any drops rather than falling back
+  to cached merge-unit state.
+- **Terminal attached work only.** The sweep MUST skip any candidate with attached
+  `pending` or `in_progress` tasks. It MAY drop only lineages whose attached tasks are
+  otherwise terminal and old enough for the configured staleness threshold.
+- **Live-edge safety rule.** The sweep MUST NOT drop a candidate when any external
+  `depends_on` edge still points to or from a lineage that remains unresolved under the
+  canonical lineage/lifecycle rules. In practice, pending work, in-progress work,
+  unresolved never-merged work, and failed work still awaiting recovery all keep the edge
+  live. An edge to a lineage already resolved under L1/L2 — for example one whose merge
+  unit is `merged`, `empty`, or `redundant`, or whose recovery chain already completed —
+  MUST NOT keep the stale candidate visible on its own.
+- **Dry-run by default.** The maintenance command MUST default to reporting candidates
+  without mutating task state. Mutation requires an explicit operator opt-in.
+- **Mutation boundary.** When the operator explicitly executes the sweep, it MUST route
+  task-state changes through the canonical manual drop path for the attached task rows. It
+  MUST NOT delete branches or discard branch provenance as part of the sweep.
+
 ## Merge units & the ownership model
 
 A **merge unit** is the durable record of "one body of work being merged into one place".

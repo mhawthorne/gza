@@ -5,6 +5,7 @@ Covers: next, history, unmerged, ps, kill, delete, show, attach.
 
 import argparse
 import datetime as _dt
+import json
 import os
 import shlex
 import shutil
@@ -48,7 +49,11 @@ from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
 from ..lifecycle_completion import TERMINAL_MERGE_STATES
 from ..lineage import walk_based_on_descendants
-from ..lineage_query import filter_display_unresolved_tasks_for_incomplete
+from ..lineage_query import (
+    StaleUnmergedSweepCandidate,
+    collect_stale_unmerged_sweep_candidates,
+    filter_display_unresolved_tasks_for_incomplete,
+)
 from ..operator_state import (
     blocked_by_empty_prereq_label,
     blocked_dependency_label,
@@ -69,7 +74,10 @@ from ..query import (
     resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
+from ..status_ops import apply_manual_task_status
 from ..sync_ops import (
+    BranchCohort,
+    BranchSyncResult,
     build_branch_cohorts_for_tasks,
     build_unmerged_branch_cohorts,
     reconcile_branch_merge_truth,
@@ -2546,27 +2554,17 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                     to_stderr=use_json,
                 )
             refresh_cohorts = build_unmerged_branch_cohorts(store)
-            refresh_candidate_count = sum(len(cohort.tasks) for cohort in refresh_cohorts)
-            _print_unmerged_progress(
-                f"refreshing canonical merge truth for {refresh_candidate_count} candidate tasks "
-                f"across {len(refresh_cohorts)} branches",
-                to_stderr=True,
-            )
-            reconcile_results, partial = sync_branch_cohorts(
+            _reconcile_results, refresh_error = _refresh_canonical_default_branch_merge_truth(
                 store,
                 cast(Git, git_client),
                 refresh_cohorts,
-                include_git=True,
-                include_pr=False,
-                dry_run=False,
                 fetch_remote=bool(getattr(args, "fetch", False)),
-                allow_cached_remote_target_ref_without_fetch=True,
+                dry_run=False,
+                include_diff_stats=True,
             )
-            if partial:
-                errors = [error for result in reconcile_results for error in result.errors]
-                if errors:
-                    print(f"Error: failed to refresh canonical merge truth: {errors[0]}")
-                    return 1
+            if refresh_error is not None:
+                print(f"Error: failed to refresh canonical merge truth: {refresh_error}")
+                return 1
             if store.supports_merge_units():
                 selected_tasks = []
                 for unit in store.get_unmerged_merge_units():
@@ -2665,6 +2663,231 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
             console.print(footer)
 
     return 0
+
+
+def cmd_stale_unmerged(args: argparse.Namespace) -> int:
+    """Report or drop abandoned unmerged merge units conservatively."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    candidates = collect_stale_unmerged_sweep_candidates(
+        store,
+        threshold_days=args.days,
+    )
+    git_client = Git(config.project_dir)
+    candidates, refresh_error = _prove_stale_unmerged_candidates_against_canonical_target(
+        store,
+        git_client,
+        candidates,
+    )
+    if refresh_error is not None:
+        print(f"Error: failed to refresh canonical merge truth: {refresh_error}")
+        return 1
+    execute = bool(getattr(args, "execute", False))
+    use_json = bool(getattr(args, "json", False))
+
+    applied_drop_task_ids_by_unit: dict[str, tuple[str, ...]] = {}
+    dropped_task_count = 0
+    if execute:
+        for candidate in candidates:
+            applied_drop_task_ids = _apply_stale_unmerged_candidate_drops(
+                config=config,
+                store=store,
+                candidate=candidate,
+            )
+            applied_drop_task_ids_by_unit[candidate.merge_unit.id] = applied_drop_task_ids
+            dropped_task_count += len(applied_drop_task_ids)
+
+    if use_json:
+        rows = [
+            _stale_unmerged_candidate_row(
+                candidate,
+                execute_requested=execute,
+                applied_drop_task_ids=applied_drop_task_ids_by_unit.get(candidate.merge_unit.id, ()),
+            )
+            for candidate in candidates
+        ]
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    if not candidates:
+        console.print("No stale unmerged merge units found")
+        return 0
+
+    action_label = "Dropping" if execute else "Would drop"
+    console.print(
+        f"{action_label} {len(candidates)} stale unmerged merge unit(s) older than {args.days} day(s):"
+    )
+    for candidate in candidates:
+        owner_id = candidate.owner_task.id or "unknown"
+        last_activity = candidate.last_activity_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        console.print(
+            rich_escape(
+                f"{owner_id}: {candidate.owner_task.prompt} "
+                f"[{candidate.merge_unit.source_branch} -> {candidate.merge_unit.target_branch}] "
+                f"last-activity={last_activity} stale={candidate.stale_days}d "
+                f"drop={', '.join(candidate.drop_task_ids)}"
+            )
+        )
+    if not execute:
+        console.print("Dry run only. Re-run with `--execute` to apply these drops.")
+        return 0
+
+    console.print(
+        f"Dropped {dropped_task_count} task(s) across {len(candidates)} stale unmerged merge unit(s)"
+    )
+    return 0
+
+
+def _refresh_canonical_default_branch_merge_truth(
+    store: SqliteTaskStore,
+    git_client: Git,
+    cohorts: list[BranchCohort],
+    *,
+    fetch_remote: bool,
+    dry_run: bool,
+    include_diff_stats: bool,
+) -> tuple[list[BranchSyncResult], str | None]:
+    refresh_candidate_count = sum(len(cohort.tasks) for cohort in cohorts)
+    _print_unmerged_progress(
+        f"refreshing canonical merge truth for {refresh_candidate_count} candidate tasks "
+        f"across {len(cohorts)} branches",
+        to_stderr=True,
+    )
+    reconcile_results, partial = sync_branch_cohorts(
+        store,
+        git_client,
+        cohorts,
+        include_git=True,
+        include_pr=False,
+        include_diff_stats=include_diff_stats,
+        dry_run=dry_run,
+        fetch_remote=fetch_remote,
+        allow_cached_remote_target_ref_without_fetch=True,
+    )
+    errors = [error for result in reconcile_results for error in result.errors]
+    if partial and errors:
+        return reconcile_results, errors[0]
+    if errors:
+        return reconcile_results, errors[0]
+    return reconcile_results, None
+
+
+def _stale_unmerged_proof_failure_message(
+    candidate: StaleUnmergedSweepCandidate,
+    result: BranchSyncResult | None,
+) -> str | None:
+    owner_id = candidate.owner_task.id or "unknown"
+    if result is None:
+        return (
+            f"candidate {owner_id} (merge unit {candidate.merge_unit.id}) "
+            "could not be proven against the canonical target: missing canonical proof result"
+        )
+    if result.skipped_reason is not None:
+        return (
+            f"candidate {owner_id} (merge unit {candidate.merge_unit.id}) "
+            f"could not be proven against the canonical target: {result.skipped_reason}"
+        )
+
+    # The stale sweep is destructive under ``--execute``, so warning-only
+    # degradation that preserves the cached non-terminal state is not enough
+    # proof to keep a candidate drop-eligible.
+    proof_warning = next(
+        (
+            warning
+            for warning in result.warnings
+            if "could not determine unique commit count" in warning
+            and "preserving existing merge state" in warning
+        ),
+        None,
+    )
+    if proof_warning is not None:
+        return (
+            f"candidate {owner_id} (merge unit {candidate.merge_unit.id}) "
+            f"could not be proven against the canonical target: {proof_warning}"
+        )
+    return None
+
+
+def _prove_stale_unmerged_candidates_against_canonical_target(
+    store: SqliteTaskStore,
+    git_client: Git,
+    candidates: tuple[StaleUnmergedSweepCandidate, ...],
+) -> tuple[tuple[StaleUnmergedSweepCandidate, ...], str | None]:
+    if not candidates:
+        return candidates, None
+
+    candidate_tasks = [candidate.owner_task for candidate in candidates if candidate.owner_task.id is not None]
+    candidate_cohorts = build_branch_cohorts_for_tasks(store, candidate_tasks)
+    reconcile_results, refresh_error = _refresh_canonical_default_branch_merge_truth(
+        store,
+        git_client,
+        candidate_cohorts,
+        fetch_remote=False,
+        dry_run=True,
+        include_diff_stats=False,
+    )
+    if refresh_error is not None:
+        return (), refresh_error
+
+    results_by_unit_id = {
+        cohort.merge_unit_id: result
+        for cohort, result in zip(candidate_cohorts, reconcile_results, strict=True)
+        if cohort.merge_unit_id is not None
+    }
+    filtered_candidates = []
+    for candidate in candidates:
+        result = results_by_unit_id.get(candidate.merge_unit.id)
+        proof_failure = _stale_unmerged_proof_failure_message(candidate, result)
+        if proof_failure is not None:
+            return (), proof_failure
+        assert result is not None
+        if result.merge_status in TERMINAL_MERGE_STATES:
+            continue
+        filtered_candidates.append(candidate)
+    return tuple(filtered_candidates), None
+
+
+def _apply_stale_unmerged_candidate_drops(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    candidate: StaleUnmergedSweepCandidate,
+) -> tuple[str, ...]:
+    applied_drop_task_ids: list[str] = []
+    for task_id in candidate.drop_task_ids:
+        task = store.get(task_id)
+        if task is None or task.status == "dropped":
+            continue
+        apply_manual_task_status(
+            config=config,
+            store=store,
+            task=task,
+            status="dropped",
+        )
+        applied_drop_task_ids.append(task_id)
+    return tuple(applied_drop_task_ids)
+
+
+def _stale_unmerged_candidate_row(
+    candidate: StaleUnmergedSweepCandidate,
+    *,
+    execute_requested: bool,
+    applied_drop_task_ids: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        "owner_task_id": candidate.owner_task.id,
+        "prompt": candidate.owner_task.prompt,
+        "merge_unit_id": candidate.merge_unit.id,
+        "source_branch": candidate.merge_unit.source_branch,
+        "target_branch": candidate.merge_unit.target_branch,
+        "merge_unit_state": candidate.merge_unit.state,
+        "member_task_ids": list(candidate.member_task_ids),
+        "drop_task_ids": list(candidate.drop_task_ids),
+        "last_activity_at": candidate.last_activity_at.astimezone(UTC).isoformat(),
+        "stale_days": candidate.stale_days,
+        "execute_requested": execute_requested,
+        "applied_drop_task_ids": list(applied_drop_task_ids),
+    }
 
 
 def _print_ps_output(

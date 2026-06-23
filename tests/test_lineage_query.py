@@ -13,7 +13,13 @@ from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import Git, GitError, ResolvedMergeSourceRef
-from gza.lineage_query import LineageOwnerQuery, _load_indexes, _query_lineage_owner_rows_with_context, query_lineage_owner_rows
+from gza.lineage_query import (
+    LineageOwnerQuery,
+    _load_indexes,
+    _query_lineage_owner_rows_with_context,
+    collect_stale_unmerged_sweep_candidates,
+    query_lineage_owner_rows,
+)
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import list_failed_tasks_for_recovery
@@ -149,6 +155,24 @@ def _build_tag_filtered_merge_unit_case(tmp_path: Path) -> tuple[SqliteTaskStore
     return store, tag, owner.id, rebase.id
 
 
+def _set_merge_unit_timestamps(store: SqliteTaskStore, merge_unit_id: str, *, when: datetime) -> None:
+    timestamp = when.strftime("%Y-%m-%d %H:%M:%S")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE merge_units SET created_at = ?, updated_at = ? WHERE id = ?",
+            (timestamp, timestamp, merge_unit_id),
+        )
+
+
+def _set_task_created_at(store: SqliteTaskStore, task_id: str, *, when: datetime) -> None:
+    timestamp = when.strftime("%Y-%m-%d %H:%M:%S")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (timestamp, task_id),
+        )
+
+
 def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp_path: Path) -> None:
     store, tag, owner_id, rebase_id = _build_tag_filtered_merge_unit_case(tmp_path)
     config = Config.load(tmp_path)
@@ -176,6 +200,220 @@ def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp
     assert row.next_action is not None
     assert row.next_action["type"] in {"merge", "merge_with_followups"}
     assert "no branch" not in str(row.next_action.get("description", "")).lower()
+
+
+def test_collect_stale_unmerged_sweep_candidates_selects_only_old_unlinked_units(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+
+    stale_owner = store.add("Old abandoned implement", task_type="implement")
+    assert stale_owner.id is not None
+    _set_completed(
+        stale_owner,
+        when=datetime(2026, 4, 1, 9, 0, tzinfo=UTC),
+        branch="feature/stale",
+        has_commits=True,
+    )
+    store.update(stale_owner)
+    _set_task_created_at(store, stale_owner.id, when=datetime(2026, 4, 1, 8, 0, tzinfo=UTC))
+    stale_review = store.add("Old review", task_type="review", depends_on=stale_owner.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 4, 2, 9, 0, tzinfo=UTC)
+    store.update(stale_review)
+    _set_task_created_at(store, stale_review.id, when=datetime(2026, 4, 2, 8, 0, tzinfo=UTC))
+    stale_unit = store.create_merge_unit(
+        source_branch="feature/stale",
+        target_branch="main",
+        owner_task_id=stale_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(stale_owner.id, stale_unit.id, "owner")
+    store.attach_task_to_merge_unit(stale_review.id, stale_unit.id, "review")
+    _set_merge_unit_timestamps(store, stale_unit.id, when=datetime(2026, 4, 2, 9, 0, tzinfo=UTC))
+
+    recent_owner = store.add("Recent implement", task_type="implement")
+    assert recent_owner.id is not None
+    _set_completed(
+        recent_owner,
+        when=datetime(2026, 6, 15, 9, 0, tzinfo=UTC),
+        branch="feature/recent",
+        has_commits=True,
+    )
+    store.update(recent_owner)
+    recent_unit = store.create_merge_unit(
+        source_branch="feature/recent",
+        target_branch="main",
+        owner_task_id=recent_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(recent_owner.id, recent_unit.id, "owner")
+    _set_merge_unit_timestamps(store, recent_unit.id, when=datetime(2026, 6, 15, 9, 0, tzinfo=UTC))
+
+    blocked_owner = store.add("Blocked stale implement", task_type="implement")
+    assert blocked_owner.id is not None
+    _set_completed(
+        blocked_owner,
+        when=datetime(2026, 4, 3, 9, 0, tzinfo=UTC),
+        branch="feature/blocked",
+        has_commits=True,
+    )
+    store.update(blocked_owner)
+    _set_task_created_at(store, blocked_owner.id, when=datetime(2026, 4, 3, 8, 0, tzinfo=UTC))
+    blocked_unit = store.create_merge_unit(
+        source_branch="feature/blocked",
+        target_branch="main",
+        owner_task_id=blocked_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(blocked_owner.id, blocked_unit.id, "owner")
+    _set_merge_unit_timestamps(store, blocked_unit.id, when=datetime(2026, 4, 3, 9, 0, tzinfo=UTC))
+
+    dependent = store.add("Live dependent", task_type="implement", depends_on=blocked_owner.id)
+    assert dependent.id is not None
+    dependent.status = "pending"
+    store.update(dependent)
+
+    candidates = collect_stale_unmerged_sweep_candidates(
+        store,
+        threshold_days=45,
+        now=now,
+    )
+
+    assert [candidate.owner_task.id for candidate in candidates] == [stale_owner.id]
+    assert candidates[0].drop_task_ids == (stale_owner.id, stale_review.id)
+
+
+def test_collect_stale_unmerged_sweep_candidates_ignore_resolved_external_dependency_edges(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+
+    merged_upstream = store.add("Merged upstream", task_type="implement")
+    assert merged_upstream.id is not None
+    _set_completed(
+        merged_upstream,
+        when=datetime(2026, 4, 1, 9, 0, tzinfo=UTC),
+        branch="feature/upstream",
+        has_commits=True,
+    )
+    store.update(merged_upstream)
+    _set_task_created_at(store, merged_upstream.id, when=datetime(2026, 4, 1, 8, 0, tzinfo=UTC))
+    merged_upstream_unit = store.create_merge_unit(
+        source_branch="feature/upstream",
+        target_branch="main",
+        owner_task_id=merged_upstream.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_upstream.id, merged_upstream_unit.id, "owner")
+    _set_merge_unit_timestamps(store, merged_upstream_unit.id, when=datetime(2026, 4, 1, 9, 0, tzinfo=UTC))
+
+    depends_on_resolved = store.add(
+        "Stale implement with merged prerequisite",
+        task_type="implement",
+        depends_on=merged_upstream.id,
+    )
+    assert depends_on_resolved.id is not None
+    _set_completed(
+        depends_on_resolved,
+        when=datetime(2026, 4, 2, 9, 0, tzinfo=UTC),
+        branch="feature/stale-outgoing",
+        has_commits=True,
+    )
+    store.update(depends_on_resolved)
+    _set_task_created_at(store, depends_on_resolved.id, when=datetime(2026, 4, 2, 8, 0, tzinfo=UTC))
+    depends_on_resolved_unit = store.create_merge_unit(
+        source_branch="feature/stale-outgoing",
+        target_branch="main",
+        owner_task_id=depends_on_resolved.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(depends_on_resolved.id, depends_on_resolved_unit.id, "owner")
+    _set_merge_unit_timestamps(store, depends_on_resolved_unit.id, when=datetime(2026, 4, 2, 9, 0, tzinfo=UTC))
+
+    incoming_resolved = store.add("Stale implement with merged dependent", task_type="implement")
+    assert incoming_resolved.id is not None
+    _set_completed(
+        incoming_resolved,
+        when=datetime(2026, 4, 3, 9, 0, tzinfo=UTC),
+        branch="feature/stale-incoming",
+        has_commits=True,
+    )
+    store.update(incoming_resolved)
+    _set_task_created_at(store, incoming_resolved.id, when=datetime(2026, 4, 3, 8, 0, tzinfo=UTC))
+    incoming_resolved_unit = store.create_merge_unit(
+        source_branch="feature/stale-incoming",
+        target_branch="main",
+        owner_task_id=incoming_resolved.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(incoming_resolved.id, incoming_resolved_unit.id, "owner")
+    _set_merge_unit_timestamps(store, incoming_resolved_unit.id, when=datetime(2026, 4, 3, 9, 0, tzinfo=UTC))
+
+    merged_dependent = store.add(
+        "Merged downstream",
+        task_type="implement",
+        depends_on=incoming_resolved.id,
+    )
+    assert merged_dependent.id is not None
+    _set_completed(
+        merged_dependent,
+        when=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+        branch="feature/downstream",
+        has_commits=True,
+    )
+    store.update(merged_dependent)
+    _set_task_created_at(store, merged_dependent.id, when=datetime(2026, 4, 4, 8, 0, tzinfo=UTC))
+    merged_dependent_unit = store.create_merge_unit(
+        source_branch="feature/downstream",
+        target_branch="main",
+        owner_task_id=merged_dependent.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_dependent.id, merged_dependent_unit.id, "owner")
+    _set_merge_unit_timestamps(store, merged_dependent_unit.id, when=datetime(2026, 4, 4, 9, 0, tzinfo=UTC))
+
+    blocked_by_pending = store.add("Stale implement with live dependent", task_type="implement")
+    assert blocked_by_pending.id is not None
+    _set_completed(
+        blocked_by_pending,
+        when=datetime(2026, 4, 5, 9, 0, tzinfo=UTC),
+        branch="feature/stale-blocked",
+        has_commits=True,
+    )
+    store.update(blocked_by_pending)
+    _set_task_created_at(store, blocked_by_pending.id, when=datetime(2026, 4, 5, 8, 0, tzinfo=UTC))
+    blocked_by_pending_unit = store.create_merge_unit(
+        source_branch="feature/stale-blocked",
+        target_branch="main",
+        owner_task_id=blocked_by_pending.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(blocked_by_pending.id, blocked_by_pending_unit.id, "owner")
+    _set_merge_unit_timestamps(store, blocked_by_pending_unit.id, when=datetime(2026, 4, 5, 9, 0, tzinfo=UTC))
+
+    live_dependent = store.add(
+        "Pending downstream",
+        task_type="implement",
+        depends_on=blocked_by_pending.id,
+    )
+    assert live_dependent.id is not None
+    live_dependent.status = "pending"
+    store.update(live_dependent)
+
+    candidates = collect_stale_unmerged_sweep_candidates(
+        store,
+        threshold_days=45,
+        now=now,
+    )
+
+    assert {candidate.owner_task.id for candidate in candidates} == {
+        depends_on_resolved.id,
+        incoming_resolved.id,
+    }
 
 
 def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representative(tmp_path: Path) -> None:

@@ -84,6 +84,7 @@ from ..recovery_engine import (
 )
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, remove_task_startup_artifacts
+from ..status_ops import apply_manual_task_status
 from ..task_types import CLI_ADD_TASK_TYPES
 from ..workers import WorkerRegistry
 from ._common import (
@@ -2790,28 +2791,13 @@ def cmd_set_status(args: argparse.Namespace) -> int:
             f"(current target: '{args.status}')"
         )
 
-    if args.status == "failed":
-        mark_task_failed_from_cause(
-            task=task,
-            config=config,
-            store=store,
-            log_file=task.log_file,
-            branch=task.branch,
-            has_commits=bool(task.has_commits),
-            explicit_reason=args.reason,
-        )
-    else:
-        task.status = args.status
-    if args.status == "pending":
-        task.completed_at = None
-        task.failure_reason = None
-        task.completion_reason = None
-        store.update(task)
-    elif args.status == "dropped":
-        task.completed_at = datetime.now(UTC)
-        task.failure_reason = None
-        task.completion_reason = None
-        store.update(task)
+    apply_manual_task_status(
+        config=config,
+        store=store,
+        task=task,
+        status=args.status,
+        reason=args.reason,
+    )
     _cleanup_worker_registry(config, task_id)
 
     print(f"Task {task_id} status: {old_status} → {args.status}")

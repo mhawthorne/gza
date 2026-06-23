@@ -210,6 +210,221 @@ def _setup_task_with_worktree_metadata(
     return task, worktree_path
 
 
+def _set_merge_unit_timestamps(store, merge_unit_id: str, *, when: datetime) -> None:
+    timestamp = when.strftime("%Y-%m-%d %H:%M:%S")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE merge_units SET created_at = ?, updated_at = ? WHERE id = ?",
+            (timestamp, timestamp, merge_unit_id),
+        )
+
+
+def _set_task_created_at(store, task_id: str, *, when: datetime) -> None:
+    timestamp = when.strftime("%Y-%m-%d %H:%M:%S")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (timestamp, task_id),
+        )
+
+
+def _seed_stale_unmerged_cli_cases(tmp_path: Path) -> tuple[Task, Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_owner = store.add("Merged implement", task_type="implement")
+    assert merged_owner.id is not None
+    merged_owner.status = "completed"
+    merged_owner.completed_at = datetime(2026, 4, 1, 9, 0, tzinfo=UTC)
+    merged_owner.branch = "feature/merged"
+    merged_owner.has_commits = True
+    store.update(merged_owner)
+    _set_task_created_at(store, merged_owner.id, when=datetime(2026, 4, 1, 8, 0, tzinfo=UTC))
+    merged_unit = store.create_merge_unit(
+        source_branch=merged_owner.branch,
+        target_branch="main",
+        owner_task_id=merged_owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_owner.id, merged_unit.id, "owner")
+    _set_merge_unit_timestamps(store, merged_unit.id, when=merged_owner.completed_at)
+
+    live_owner = store.add("Recent implement", task_type="implement")
+    assert live_owner.id is not None
+    live_owner.status = "completed"
+    live_owner.completed_at = datetime(2026, 6, 15, 9, 0, tzinfo=UTC)
+    live_owner.branch = "feature/live"
+    live_owner.has_commits = True
+    store.update(live_owner)
+    _set_task_created_at(store, live_owner.id, when=datetime(2026, 6, 15, 8, 0, tzinfo=UTC))
+    live_unit = store.create_merge_unit(
+        source_branch=live_owner.branch,
+        target_branch="main",
+        owner_task_id=live_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(live_owner.id, live_unit.id, "owner")
+    _set_merge_unit_timestamps(store, live_unit.id, when=live_owner.completed_at)
+
+    stale_owner = store.add("Old abandoned implement", task_type="implement")
+    assert stale_owner.id is not None
+    stale_owner.status = "completed"
+    stale_owner.completed_at = datetime(2026, 4, 2, 9, 0, tzinfo=UTC)
+    stale_owner.branch = "feature/stale"
+    stale_owner.has_commits = True
+    store.update(stale_owner)
+    _set_task_created_at(store, stale_owner.id, when=datetime(2026, 4, 2, 8, 0, tzinfo=UTC))
+    stale_review = store.add("Old attached review", task_type="review", depends_on=stale_owner.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 4, 3, 9, 0, tzinfo=UTC)
+    store.update(stale_review)
+    _set_task_created_at(store, stale_review.id, when=datetime(2026, 4, 3, 8, 0, tzinfo=UTC))
+    stale_unit = store.create_merge_unit(
+        source_branch=stale_owner.branch,
+        target_branch="main",
+        owner_task_id=stale_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(stale_owner.id, stale_unit.id, "owner")
+    store.attach_task_to_merge_unit(stale_review.id, stale_unit.id, "review")
+    _set_merge_unit_timestamps(store, stale_unit.id, when=stale_review.completed_at)
+
+    return merged_owner, live_owner, stale_owner
+
+
+def _seed_stale_unmerged_resolved_dependency_cases(tmp_path: Path) -> tuple[Task, Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merged_upstream = store.add("Merged upstream", task_type="implement")
+    assert merged_upstream.id is not None
+    merged_upstream.status = "completed"
+    merged_upstream.completed_at = datetime(2026, 4, 1, 9, 0, tzinfo=UTC)
+    merged_upstream.branch = "feature/upstream"
+    merged_upstream.has_commits = True
+    store.update(merged_upstream)
+    _set_task_created_at(store, merged_upstream.id, when=datetime(2026, 4, 1, 8, 0, tzinfo=UTC))
+    merged_upstream_unit = store.create_merge_unit(
+        source_branch=merged_upstream.branch,
+        target_branch="main",
+        owner_task_id=merged_upstream.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_upstream.id, merged_upstream_unit.id, "owner")
+    _set_merge_unit_timestamps(store, merged_upstream_unit.id, when=merged_upstream.completed_at)
+
+    stale_outgoing = store.add(
+        "Stale implement with merged prerequisite",
+        task_type="implement",
+        depends_on=merged_upstream.id,
+    )
+    assert stale_outgoing.id is not None
+    stale_outgoing.status = "completed"
+    stale_outgoing.completed_at = datetime(2026, 4, 2, 9, 0, tzinfo=UTC)
+    stale_outgoing.branch = "feature/stale-outgoing"
+    stale_outgoing.has_commits = True
+    store.update(stale_outgoing)
+    _set_task_created_at(store, stale_outgoing.id, when=datetime(2026, 4, 2, 8, 0, tzinfo=UTC))
+    stale_outgoing_unit = store.create_merge_unit(
+        source_branch=stale_outgoing.branch,
+        target_branch="main",
+        owner_task_id=stale_outgoing.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(stale_outgoing.id, stale_outgoing_unit.id, "owner")
+    _set_merge_unit_timestamps(store, stale_outgoing_unit.id, when=stale_outgoing.completed_at)
+
+    stale_incoming = store.add("Stale implement with merged dependent", task_type="implement")
+    assert stale_incoming.id is not None
+    stale_incoming.status = "completed"
+    stale_incoming.completed_at = datetime(2026, 4, 3, 9, 0, tzinfo=UTC)
+    stale_incoming.branch = "feature/stale-incoming"
+    stale_incoming.has_commits = True
+    store.update(stale_incoming)
+    _set_task_created_at(store, stale_incoming.id, when=datetime(2026, 4, 3, 8, 0, tzinfo=UTC))
+    stale_incoming_unit = store.create_merge_unit(
+        source_branch=stale_incoming.branch,
+        target_branch="main",
+        owner_task_id=stale_incoming.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(stale_incoming.id, stale_incoming_unit.id, "owner")
+    _set_merge_unit_timestamps(store, stale_incoming_unit.id, when=stale_incoming.completed_at)
+
+    merged_dependent = store.add(
+        "Merged downstream",
+        task_type="implement",
+        depends_on=stale_incoming.id,
+    )
+    assert merged_dependent.id is not None
+    merged_dependent.status = "completed"
+    merged_dependent.completed_at = datetime(2026, 4, 4, 9, 0, tzinfo=UTC)
+    merged_dependent.branch = "feature/downstream"
+    merged_dependent.has_commits = True
+    store.update(merged_dependent)
+    _set_task_created_at(store, merged_dependent.id, when=datetime(2026, 4, 4, 8, 0, tzinfo=UTC))
+    merged_dependent_unit = store.create_merge_unit(
+        source_branch=merged_dependent.branch,
+        target_branch="main",
+        owner_task_id=merged_dependent.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_dependent.id, merged_dependent_unit.id, "owner")
+    _set_merge_unit_timestamps(store, merged_dependent_unit.id, when=merged_dependent.completed_at)
+
+    blocked_owner = store.add("Blocked stale implement", task_type="implement")
+    assert blocked_owner.id is not None
+    blocked_owner.status = "completed"
+    blocked_owner.completed_at = datetime(2026, 4, 5, 9, 0, tzinfo=UTC)
+    blocked_owner.branch = "feature/stale-blocked"
+    blocked_owner.has_commits = True
+    store.update(blocked_owner)
+    _set_task_created_at(store, blocked_owner.id, when=datetime(2026, 4, 5, 8, 0, tzinfo=UTC))
+    blocked_unit = store.create_merge_unit(
+        source_branch=blocked_owner.branch,
+        target_branch="main",
+        owner_task_id=blocked_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(blocked_owner.id, blocked_unit.id, "owner")
+    _set_merge_unit_timestamps(store, blocked_unit.id, when=blocked_owner.completed_at)
+
+    live_dependent = store.add(
+        "Pending downstream",
+        task_type="implement",
+        depends_on=blocked_owner.id,
+    )
+    assert live_dependent.id is not None
+    live_dependent.status = "pending"
+    store.update(live_dependent)
+
+    return stale_outgoing, stale_incoming, blocked_owner
+
+
+def _seed_stale_unmerged_off_target_cli_case(tmp_path: Path) -> Task:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    stale_owner = store.add("Old abandoned release-target implement", task_type="implement")
+    assert stale_owner.id is not None
+    stale_owner.status = "completed"
+    stale_owner.completed_at = datetime(2026, 4, 2, 9, 0, tzinfo=UTC)
+    stale_owner.branch = "feature/stale-release"
+    stale_owner.has_commits = True
+    store.update(stale_owner)
+    _set_task_created_at(store, stale_owner.id, when=datetime(2026, 4, 2, 8, 0, tzinfo=UTC))
+    stale_unit = store.create_merge_unit(
+        source_branch=stale_owner.branch,
+        target_branch="release",
+        owner_task_id=stale_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(stale_owner.id, stale_unit.id, "owner")
+    _set_merge_unit_timestamps(store, stale_unit.id, when=stale_owner.completed_at)
+    return stale_owner
+
+
 def _create_failed_recovery_candidate(
     store,
     *,
@@ -258,6 +473,271 @@ def _approved_plan_review_manifest(source_task_id: str) -> dict[str, object]:
             }
         ],
     }
+
+
+def test_stale_unmerged_dry_run_reports_only_old_abandoned_units(tmp_path: Path) -> None:
+    merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+
+    with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
+        result = invoke_gza("stale-unmerged", "--days", "45", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert "Would drop 1 stale unmerged merge unit" in result.stdout
+    assert stale_owner.id in result.stdout
+    assert live_owner.id not in result.stdout
+    assert merged_owner.id not in result.stdout
+
+    store = make_store(tmp_path)
+    stale_task = store.get(stale_owner.id)
+    assert stale_task is not None
+    assert stale_task.status == "completed"
+
+
+def test_stale_unmerged_execute_drops_only_selected_tasks_and_keeps_branch_history(tmp_path: Path) -> None:
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+    store = make_store(tmp_path)
+    stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
+    stale_unit = store.resolve_merge_unit_for_task(stale_owner.id)
+    assert stale_unit is not None
+
+    with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
+        result = invoke_gza("stale-unmerged", "--days", "45", "--execute", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    assert "Dropped 2 task(s) across 1 stale unmerged merge unit(s)" in result.stdout
+
+    store = make_store(tmp_path)
+    updated_stale_owner = store.get(stale_owner.id)
+    updated_stale_review = store.get(stale_review.id)
+    updated_live_owner = store.get(live_owner.id)
+    assert updated_stale_owner is not None
+    assert updated_stale_review is not None
+    assert updated_live_owner is not None
+    assert updated_stale_owner.status == "dropped"
+    assert updated_stale_review.status == "dropped"
+    assert updated_live_owner.status == "completed"
+    assert updated_stale_owner.branch == "feature/stale"
+    assert store.resolve_merge_unit_for_task(stale_owner.id) is not None
+
+
+def test_stale_unmerged_execute_json_applies_drops_and_reports_them(tmp_path: Path) -> None:
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+    store = make_store(tmp_path)
+    stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
+
+    with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
+        result = invoke_gza("stale-unmerged", "--days", "45", "--execute", "--json", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    row = payload[0]
+    assert row["owner_task_id"] == stale_owner.id
+    assert row["execute_requested"] is True
+    assert row["drop_task_ids"] == [stale_owner.id, stale_review.id]
+    assert row["applied_drop_task_ids"] == [stale_owner.id, stale_review.id]
+
+    store = make_store(tmp_path)
+    updated_stale_owner = store.get(stale_owner.id)
+    updated_stale_review = store.get(stale_review.id)
+    updated_live_owner = store.get(live_owner.id)
+    assert updated_stale_owner is not None
+    assert updated_stale_review is not None
+    assert updated_live_owner is not None
+    assert updated_stale_owner.status == "dropped"
+    assert updated_stale_review.status == "dropped"
+    assert updated_live_owner.status == "completed"
+
+
+def test_stale_unmerged_execute_json_drops_candidates_with_only_resolved_external_links(
+    tmp_path: Path,
+) -> None:
+    stale_outgoing, stale_incoming, blocked_owner = _seed_stale_unmerged_resolved_dependency_cases(tmp_path)
+
+    with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
+        result = invoke_gza("stale-unmerged", "--days", "45", "--execute", "--json", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert [row["owner_task_id"] for row in payload] == [stale_outgoing.id, stale_incoming.id]
+    assert all(row["execute_requested"] is True for row in payload)
+    assert all(row["applied_drop_task_ids"] == [row["owner_task_id"]] for row in payload)
+
+    store = make_store(tmp_path)
+    updated_stale_outgoing = store.get(stale_outgoing.id)
+    updated_stale_incoming = store.get(stale_incoming.id)
+    updated_blocked_owner = store.get(blocked_owner.id)
+    assert updated_stale_outgoing is not None
+    assert updated_stale_incoming is not None
+    assert updated_blocked_owner is not None
+    assert updated_stale_outgoing.status == "dropped"
+    assert updated_stale_incoming.status == "dropped"
+    assert updated_blocked_owner.status == "completed"
+
+
+def test_stale_unmerged_skips_cached_unmerged_unit_proven_merged_into_canonical_target(
+    tmp_path: Path,
+) -> None:
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+    git = _FastUnmergedGit()
+    git._merged[("feature/stale", "main")] = True
+
+    with patch("gza.cli.query.Git", return_value=git):
+        dry_run = invoke_gza("stale-unmerged", "--days", "45", "--project", str(tmp_path))
+
+    assert dry_run.returncode == 0
+    assert "No stale unmerged merge units found" in dry_run.stdout
+    assert stale_owner.id not in dry_run.stdout
+    assert live_owner.id not in dry_run.stdout
+
+    store = make_store(tmp_path)
+    stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
+    stale_task = store.get(stale_owner.id)
+    live_task = store.get(live_owner.id)
+    assert stale_task is not None
+    assert stale_review is not None
+    assert live_task is not None
+    assert stale_task.status == "completed"
+    assert stale_review.status == "completed"
+    assert live_task.status == "completed"
+
+    with patch("gza.cli.query.Git", return_value=git):
+        execute = invoke_gza("stale-unmerged", "--days", "45", "--execute", "--project", str(tmp_path))
+
+    assert execute.returncode == 0
+    assert "No stale unmerged merge units found" in execute.stdout
+
+    store = make_store(tmp_path)
+    updated_stale_task = store.get(stale_owner.id)
+    updated_stale_review = store.get(stale_review.id)
+    updated_live_task = store.get(live_owner.id)
+    assert updated_stale_task is not None
+    assert updated_stale_review is not None
+    assert updated_live_task is not None
+    assert updated_stale_task.status == "completed"
+    assert updated_stale_review.status == "completed"
+    assert updated_live_task.status == "completed"
+
+
+def test_stale_unmerged_execute_fails_closed_when_canonical_merge_truth_proof_errors(
+    tmp_path: Path,
+) -> None:
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+
+    class _StaleSweepProofFailingGit(_FastUnmergedGit):
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+            if branch == "feature/stale" and into == "main":
+                raise GitError("simulated canonical merge proof failure")
+            return super().is_merged(branch, into=into, use_cherry=use_cherry)
+
+    with patch("gza.cli.query.Git", return_value=_StaleSweepProofFailingGit()):
+        result = invoke_gza("stale-unmerged", "--days", "45", "--execute", "--project", str(tmp_path))
+
+    assert result.returncode == 1
+    assert "failed to refresh canonical merge truth" in result.stdout
+    assert "simulated canonical merge proof failure" in result.stdout
+    assert "Dropped" not in result.stdout
+
+    store = make_store(tmp_path)
+    stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
+    stale_task = store.get(stale_owner.id)
+    live_task = store.get(live_owner.id)
+    assert stale_task is not None
+    assert stale_review is not None
+    assert live_task is not None
+    assert stale_task.status == "completed"
+    assert stale_review.status == "completed"
+    assert live_task.status == "completed"
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expect_json_mode"),
+    [
+        ([], False),
+        (["--execute"], False),
+        (["--execute", "--json"], True),
+    ],
+)
+def test_stale_unmerged_fails_closed_when_canonical_proof_degrades_to_warning(
+    tmp_path: Path,
+    extra_args: list[str],
+    expect_json_mode: bool,
+) -> None:
+    _merged_owner, live_owner, stale_owner = _seed_stale_unmerged_cli_cases(tmp_path)
+
+    class _StaleSweepIndeterminateProofGit(_FastUnmergedGit):
+        def __init__(self) -> None:
+            super().__init__()
+            self._refs.update({"feature/stale", "main"})
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in self._refs:
+                return f"sha-{ref}"
+            return None
+
+        def count_commits_ahead(self, branch: str, target: str):
+            if branch == "feature/stale" and target == "main":
+                return None
+            return super().count_commits_ahead(branch, target)
+
+        def count_commits_ahead_checked(self, branch: str, target: str) -> int | None:
+            if branch == "feature/stale" and target == "main":
+                raise RuntimeError("simulated canonical classification failure")
+            return super().count_commits_ahead_checked(branch, target)
+
+    args = ["stale-unmerged", "--days", "45", *extra_args, "--project", str(tmp_path)]
+    with patch("gza.cli.query.Git", return_value=_StaleSweepIndeterminateProofGit()):
+        result = invoke_gza(*args)
+
+    assert result.returncode == 1
+    assert result.stdout.startswith("Error: failed to refresh canonical merge truth:")
+    assert stale_owner.id in result.stdout
+    assert "could not be proven against the canonical target" in result.stdout
+    assert "could not determine unique commit count" in result.stdout
+    assert "Would drop" not in result.stdout
+    assert "Dropped" not in result.stdout
+    if expect_json_mode:
+        assert not result.stdout.lstrip().startswith("[")
+
+    store = make_store(tmp_path)
+    stale_review = next(task for task in store.get_lineage_children(stale_owner.id) if task.task_type == "review")
+    stale_task = store.get(stale_owner.id)
+    live_task = store.get(live_owner.id)
+    assert stale_task is not None
+    assert stale_review is not None
+    assert live_task is not None
+    assert stale_task.status == "completed"
+    assert stale_review.status == "completed"
+    assert live_task.status == "completed"
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_stale_unmerged_fails_closed_when_canonical_proof_is_skipped(
+    tmp_path: Path,
+    execute: bool,
+) -> None:
+    stale_owner = _seed_stale_unmerged_off_target_cli_case(tmp_path)
+
+    args = ["stale-unmerged", "--days", "45", "--project", str(tmp_path)]
+    if execute:
+        args.insert(3, "--execute")
+
+    with patch("gza.cli.query.Git", return_value=_FastUnmergedGit()):
+        result = invoke_gza(*args)
+
+    assert result.returncode == 1
+    assert "failed to refresh canonical merge truth" in result.stdout
+    assert stale_owner.id in result.stdout
+    assert "could not be proven against the canonical target" in result.stdout
+    assert "merge unit targets 'release', not requested target 'main'" in result.stdout
+    assert "No stale unmerged merge units found" not in result.stdout
+    assert "Dropped" not in result.stdout
+
+    store = make_store(tmp_path)
+    updated_stale_owner = store.get(stale_owner.id)
+    assert updated_stale_owner is not None
+    assert updated_stale_owner.status == "completed"
 
 
 def _approved_plan_review_report(manifest: dict[str, object]) -> str:

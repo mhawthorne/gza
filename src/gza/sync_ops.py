@@ -854,6 +854,7 @@ def sync_branch_cohorts(
     *,
     include_git: bool,
     include_pr: bool,
+    include_diff_stats: bool = True,
     pr_integration: bool = True,
     dry_run: bool = False,
     fetch_remote: bool = True,
@@ -906,7 +907,7 @@ def sync_branch_cohorts(
             git,
             eligible_cohorts,
             target_branch=default_branch,
-            include_diff_stats=True,
+            include_diff_stats=include_diff_stats,
             remote_target_ref=remote_default_ref,
         )
     else:

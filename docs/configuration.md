@@ -1248,6 +1248,22 @@ For each unmerged implementation in the default text view, output includes:
   - `review stale` when code-changing work (for example an improve task) happened after the latest review.
 - When a completed review has a stored derived score, verdict badges include it as `(<score>)`, for example `✓ approved (82)`.
 
+### stale-unmerged
+
+Report or drop stale never-merged merge units whose attached tasks are terminal, old, and not linked by live dependency edges.
+
+```bash
+uv run gza stale-unmerged [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--days N` | Minimum stale age in days before a candidate is eligible (default: `45`) |
+| `--execute` | Apply the drops instead of only reporting candidates |
+| `--json` | Output structured JSON rows; when combined with `--execute`, each row includes the applied drops |
+
+`uv run gza stale-unmerged` is intentionally conservative. It only considers active merge units still recorded as `unmerged`, `blocked`, or `stale`, then re-checks those candidates against the canonical default target using the same local merge-truth proof semantics as plain `uv run gza unmerged`. Any candidate proven terminal there (`merged`, `empty`, or `redundant`) is excluded instead of being reported or dropped, and any proof error aborts the command before mutation. The sweep also skips anything with attached `pending` or `in_progress` work, and skips units whose external dependency edges still point to live unresolved lineages. Historical edges to already resolved external work, for example a prerequisite or dependent whose merge unit is already `merged`, do not keep a stale unit visible on their own. Dry-run is the default so operators can audit what would be dropped before mutating task state. `--execute` drops only the attached task rows via the same manual drop path used by `uv run gza set-status <id> dropped`; it never deletes branches. JSON mode does not downgrade execution: `uv run gza stale-unmerged --execute --json` applies the drops first and then emits rows with both the candidate `drop_task_ids` and the `applied_drop_task_ids` actually mutated.
+
 ### history
 
 List recent completed or failed tasks.

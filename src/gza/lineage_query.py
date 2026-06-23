@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -80,6 +80,16 @@ class LineageOwnerRow:
 
 
 @dataclass(frozen=True)
+class StaleUnmergedSweepCandidate:
+    owner_task: DbTask
+    merge_unit: MergeUnit
+    drop_task_ids: tuple[str, ...]
+    member_task_ids: tuple[str, ...]
+    last_activity_at: datetime
+    stale_days: int
+
+
+@dataclass(frozen=True)
 class LineageOwnerQuery:
     limit: int | None = None
     statuses: tuple[str, ...] | None = None
@@ -120,6 +130,26 @@ def _normalize_dt(value: datetime | None) -> datetime:
     if value.tzinfo is not None:
         return value.astimezone(UTC).replace(tzinfo=None)
     return value
+
+
+def _iter_task_activity_timestamps(task: DbTask) -> tuple[datetime | None, ...]:
+    return (
+        task.created_at,
+        task.started_at,
+        task.completed_at,
+        task.pr_last_synced_at,
+        task.sync_last_synced_at,
+        task.review_cleared_at,
+    )
+
+
+def _iter_merge_unit_activity_timestamps(unit: MergeUnit) -> tuple[datetime | None, ...]:
+    return (
+        unit.created_at,
+        unit.updated_at,
+        unit.pr_last_synced_at,
+        unit.sync_last_synced_at,
+    )
 
 
 def _task_event_time(task: DbTask) -> datetime:
@@ -724,6 +754,171 @@ def resolve_lineage_owner_task_id(store: SqliteTaskStore, task_id: str) -> str |
     return owner.id if owner is not None else None
 
 
+def _latest_lineage_activity_at(
+    *,
+    tasks: Sequence[DbTask],
+    merge_unit: MergeUnit,
+    observations: Sequence[Any] = (),
+) -> datetime:
+    latest = datetime.min.replace(tzinfo=UTC)
+    for timestamp in _iter_merge_unit_activity_timestamps(merge_unit):
+        if timestamp is not None and timestamp > latest:
+            latest = timestamp
+    for task in tasks:
+        for timestamp in _iter_task_activity_timestamps(task):
+            if timestamp is not None and timestamp > latest:
+                latest = timestamp
+    for observation in observations:
+        observed_at = getattr(observation, "observed_at", None)
+        if observed_at is not None and observed_at > latest:
+            latest = observed_at
+    return latest
+
+
+def _owner_has_external_dependency_links(
+    owner_id: str,
+    *,
+    member_task_ids: set[str],
+    indexes: _LineageIndexes,
+    live_owner_ids: frozenset[str],
+) -> bool:
+    for task_id in member_task_ids:
+        task = indexes.task_by_id.get(task_id)
+        if task is None:
+            continue
+        if task.depends_on is not None and task.depends_on not in member_task_ids:
+            dep_owner = indexes.owner_by_task_id.get(task.depends_on)
+            if dep_owner is not None and dep_owner.id != owner_id and dep_owner.id in live_owner_ids:
+                return True
+        for dependent in indexes.depends_on_children.get(task_id, ()):
+            dependent_id = dependent.id
+            if dependent_id is None or dependent_id in member_task_ids:
+                continue
+            dependent_owner = indexes.owner_by_task_id.get(dependent_id)
+            if (
+                dependent_owner is not None
+                and dependent_owner.id != owner_id
+                and dependent_owner.id in live_owner_ids
+            ):
+                return True
+    return False
+
+
+def _collect_live_owner_ids_for_stale_dependency_links(
+    store: SqliteTaskStore,
+    *,
+    indexes: _LineageIndexes,
+) -> frozenset[str]:
+    """Return unresolved owner ids whose lineages still represent live external work."""
+    with store.read_session():
+        rows, _read_context = _query_lineage_owner_rows_with_context(
+            store,
+            LineageOwnerQuery(limit=None, exclude_dropped_from_planning=True),
+            persist_post_merge_rebase_state=False,
+        )
+    live_owner_ids = {
+        row.owner_task.id
+        for row in rows
+        if row.owner_task.id is not None
+    }
+    for owner_id, members in indexes.members_by_owner_id.items():
+        if any(task.status in {"pending", "in_progress"} for task in members):
+            live_owner_ids.add(owner_id)
+    return frozenset(live_owner_ids)
+
+
+def collect_stale_unmerged_sweep_candidates(
+    store: SqliteTaskStore,
+    *,
+    threshold_days: int,
+    now: datetime | None = None,
+) -> tuple[StaleUnmergedSweepCandidate, ...]:
+    """Return conservative stale unmerged merge units that are safe to drop."""
+    current_time = now or datetime.now(UTC)
+    cutoff = current_time - timedelta(days=threshold_days)
+    indexes = _load_indexes(store)
+    live_owner_ids = _collect_live_owner_ids_for_stale_dependency_links(store, indexes=indexes)
+    candidates: list[StaleUnmergedSweepCandidate] = []
+
+    for owner_id, owner, owner_members, _root in _candidate_owner_rows(
+        indexes,
+        LineageOwnerQuery(limit=None, exclude_dropped_from_planning=True),
+        owner_ids_filter=None,
+        task_ids_filter=None,
+    ):
+        merge_units_by_member = {
+            task.id: indexes.merge_units_by_task_id[task.id]
+            for task in owner_members
+            if task.id is not None and task.id in indexes.merge_units_by_task_id
+        }
+        merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
+        if merge_unit is None or merge_unit.state not in {"unmerged", "blocked", "stale"}:
+            continue
+        member_task_ids = {
+            task.id
+            for task in store.list_tasks_for_merge_unit(merge_unit.id)
+            if task.id is not None
+        }
+        if not member_task_ids:
+            continue
+        merge_unit_members = tuple(
+            indexes.task_by_id[task_id]
+            for task_id in member_task_ids
+            if task_id in indexes.task_by_id
+        )
+        if not merge_unit_members:
+            continue
+        if any(task.status in {"pending", "in_progress"} for task in merge_unit_members):
+            continue
+        if _owner_has_external_dependency_links(
+            owner_id,
+            member_task_ids=member_task_ids,
+            indexes=indexes,
+            live_owner_ids=live_owner_ids,
+        ):
+            continue
+        observations = (
+            store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=merge_unit.id)
+            if store.supports_watch_progress_observations()
+            else ()
+        )
+        last_activity_at = _latest_lineage_activity_at(
+            tasks=merge_unit_members,
+            merge_unit=merge_unit,
+            observations=observations,
+        )
+        if last_activity_at > cutoff:
+            continue
+        drop_task_ids = tuple(
+            task.id
+            for task in sorted(
+                merge_unit_members,
+                key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id)),
+            )
+            if task.id is not None and task.status != "dropped"
+        )
+        if not drop_task_ids:
+            continue
+        candidates.append(
+            StaleUnmergedSweepCandidate(
+                owner_task=owner,
+                merge_unit=merge_unit,
+                drop_task_ids=drop_task_ids,
+                member_task_ids=tuple(sorted(member_task_ids, key=task_id_numeric_key)),
+                last_activity_at=last_activity_at,
+                stale_days=max(0, (current_time - last_activity_at).days),
+            )
+        )
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate.last_activity_at,
+            task_id_numeric_key(candidate.owner_task.id),
+        )
+    )
+    return tuple(candidates)
+
+
 def _candidate_owner_rows(
     indexes: _LineageIndexes,
     query: LineageOwnerQuery,
@@ -1194,8 +1389,10 @@ __all__ = [
     "LineageOwnerRow",
     "LineageOwnerSnapshot",
     "LineageResolution",
+    "StaleUnmergedSweepCandidate",
     "UnresolvedLeafSummary",
     "_query_lineage_owner_rows_with_context",
+    "collect_stale_unmerged_sweep_candidates",
     "filter_display_unresolved_tasks_for_incomplete",
     "is_lineage_resolved",
     "query_lineage_owner_rows",

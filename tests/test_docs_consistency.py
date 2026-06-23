@@ -970,6 +970,25 @@ def test_skills_docs_describe_spec_coherence_as_behavior_spec_set_gate() -> None
     assert "reviews/<timestamp>-spec-coherence.md" in skills_content
 
 
+def test_lineage_spec_and_operator_docs_define_stale_unmerged_sweep_contract() -> None:
+    """The stale-unmerged maintenance rule should be codified in both the behavior spec and operator docs."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lineage_spec = (repo_root / "specs" / "behavior" / "lineage.md").read_text()
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+
+    assert "### L5 — Stale unmerged sweep" in lineage_spec
+    assert "The sweep MUST NOT drop a candidate when any external" in lineage_spec
+    assert "`depends_on` edge still points to or from a lineage that remains unresolved" in lineage_spec
+    assert "non-network merge-truth semantics as plain default-target `gza unmerged`" in lineage_spec
+    assert "Dry-run by default." in lineage_spec
+    assert "MUST NOT delete branches or discard branch provenance as part of the sweep." in lineage_spec
+
+    assert "live unresolved lineages" in config_docs
+    assert "Historical edges to already resolved external work" in config_docs
+    assert "re-checks those candidates against the canonical default target" in config_docs
+    assert "proof error aborts the command before mutation" in config_docs
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

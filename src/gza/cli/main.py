@@ -92,6 +92,7 @@ from .query import (
     cmd_ps,
     cmd_search,
     cmd_show,
+    cmd_stale_unmerged,
     cmd_unmerged,
 )
 from .tv import cmd_tv
@@ -623,6 +624,37 @@ def main() -> int:
         "--json",
         action="store_true",
         help="Output JSON rows from the unified query API",
+    )
+
+    stale_unmerged_parser = subparsers.add_parser(
+        "stale-unmerged",
+        help="Report or drop abandoned unmerged merge units",
+        description=(
+            "Report stale unmerged merge units conservatively. Dry-run is the default; "
+            "before reporting or dropping, gza re-proves each candidate against the canonical default target "
+            "and excludes anything already landed or otherwise terminal. "
+            "pass --execute to drop the selected attached tasks via the existing manual drop path. "
+            "JSON mode still honors --execute and reports the applied drops. "
+            "Resolved external dependency history does not block a stale candidate."
+        ),
+    )
+    add_common_args(stale_unmerged_parser)
+    stale_unmerged_parser.add_argument(
+        "--days",
+        type=_parse_non_negative_int,
+        default=45,
+        metavar="N",
+        help="Minimum stale age in days before a never-merged unit is eligible (default: 45)",
+    )
+    stale_unmerged_parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply the drops instead of only reporting candidates",
+    )
+    stale_unmerged_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output structured JSON rows; with --execute, rows include the applied drops",
     )
 
     merged_parser = subparsers.add_parser("merged", help="List merged merge units")
@@ -2818,6 +2850,8 @@ def main() -> int:
             return cmd_search(args)
         elif args.command == "unmerged":
             return cmd_unmerged(args)
+        elif args.command == "stale-unmerged":
+            return cmd_stale_unmerged(args)
         elif args.command == "merged":
             return cmd_merged(args)
         elif args.command == "advance":

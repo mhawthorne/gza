@@ -802,6 +802,32 @@ class TestHelpOutput:
         assert "logs concise progress for the refresh, query, and render phases" in docs_text
         assert "showing only the selected branch-owner task and its descendants" in docs_text
 
+    def test_stale_unmerged_help_and_docs_describe_json_execute_contract(self, tmp_path):
+        """stale-unmerged help/docs should state that JSON mode still honors execution."""
+        setup_config(tmp_path)
+
+        stale_help = invoke_gza("stale-unmerged", "--help", "--project", str(tmp_path))
+        assert stale_help.returncode == 0
+
+        help_text = " ".join(stale_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "--execute" in stale_help.stdout
+        assert "--json" in stale_help.stdout
+        assert "JSON mode still honors --execute and reports the applied drops" in help_text
+        assert "re-proves each candidate against the canonical default target" in help_text
+        assert "Output structured JSON rows; with --execute, rows include the applied drops" in help_text
+        assert "Resolved external dependency history does not block a stale candidate" in help_text
+
+        assert "uv run gza stale-unmerged [options]" in docs_text
+        assert "| `--json` | Output structured JSON rows; when combined with `--execute`, each row includes the applied drops |" in docs_text
+        assert "JSON mode does not downgrade execution" in docs_text
+        assert "re-checks those candidates against the canonical default target" in docs_text
+        assert "Any candidate proven terminal there (`merged`, `empty`, or `redundant`) is excluded" in docs_text
+        assert "`uv run gza stale-unmerged --execute --json` applies the drops first" in docs_text
+        assert "`applied_drop_task_ids`" in docs_text
+        assert "live unresolved lineages" in docs_text
+
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)
