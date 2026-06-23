@@ -91,6 +91,10 @@ _PROVIDER_CONFIG_ERROR_MESSAGE_SNIPPETS = (
     "does not exist",
     "invalid model",
 )
+_PROVIDER_UNAVAILABLE_MESSAGE_SNIPPETS = (
+    "at capacity",
+    "try again shortly",
+)
 _DOCKER_DAEMON_ERROR_SNIPPETS = (
     "cannot connect to the docker daemon",
     "error during connect",
@@ -122,6 +126,10 @@ def classify_provider_api_error(*, status: int | None, error_type: str | None, m
         return "config_error"
     if normalized_error_type in _PROVIDER_CONFIG_ERROR_TYPES:
         return "config_error"
+    if normalized_message and any(
+        snippet in normalized_message for snippet in _PROVIDER_UNAVAILABLE_MESSAGE_SNIPPETS
+    ):
+        return "provider_unavailable"
     if normalized_message and any(
         snippet in normalized_message for snippet in _PROVIDER_CONFIG_ERROR_MESSAGE_SNIPPETS
     ):

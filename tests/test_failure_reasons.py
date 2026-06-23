@@ -3,8 +3,10 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 from gza.db import TaskStats
-from gza.failure_reasons import resolve_failure_reason
+from gza.failure_reasons import preserves_failure_reason_over_terminal_no_work, resolve_failure_reason
 
 _ALLOWED_FAILURE_REASON_MARK_FAILED_OWNERS = {
     ("src/gza/failure_reasons.py", "mark_task_failed_from_cause"),
@@ -108,6 +110,25 @@ def test_resolve_failure_reason_uses_reported_steps_when_computed_is_below_limit
     assert reason == "MAX_STEPS"
 
 
+@pytest.mark.parametrize(
+    ("failure_reason", "expected"),
+    [
+        ("MAX_TURNS", True),
+        ("MAX_STEPS", True),
+        ("TIMEOUT", True),
+        ("TERMINATED", True),
+        ("PROVIDER_UNAVAILABLE", True),
+        ("CONFIG_ERROR", False),
+        ("TERMINAL_NO_WORK", False),
+    ],
+)
+def test_preserves_failure_reason_over_terminal_no_work(
+    failure_reason: str,
+    expected: bool,
+) -> None:
+    assert preserves_failure_reason_over_terminal_no_work(failure_reason) is expected
+
+
 def test_resolve_failure_reason_maps_provider_error_types() -> None:
     assert resolve_failure_reason(error_type="config_error", exit_code=1, log_file=None) == "CONFIG_ERROR"
     assert (
@@ -171,6 +192,24 @@ def test_resolve_failure_reason_log_fallback_filters_provider_unavailable(tmp_pa
     )
 
     # Provider unavailability remains runner-owned on the fallback path.
+    assert (
+        resolve_failure_reason(
+            error_type=None,
+            exit_code=1,
+            log_file=log_file,
+            fallback_to_log=True,
+        )
+        == "UNKNOWN"
+    )
+
+
+def test_resolve_failure_reason_log_fallback_filters_terminal_no_work(tmp_path: Path) -> None:
+    log_file = tmp_path / "task.log"
+    log_file.write_text(
+        "runner classified branch\n[GZA_FAILURE:TERMINAL_NO_WORK]\n",
+        encoding="utf-8",
+    )
+
     assert (
         resolve_failure_reason(
             error_type=None,

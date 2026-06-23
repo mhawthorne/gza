@@ -3265,6 +3265,7 @@ def _failure_summary(
         "MAX_STEPS": "Stopped due to max steps limit.",
         "MAX_TURNS": "Stopped due to max turns limit.",
         "TERMINATED": "Stopped by an external termination signal.",
+        "TERMINAL_NO_WORK": "Task produced no publishable work; the branch resolved as terminal no-work.",
         "PREREQUISITE_UNMERGED": "Dependency is not yet merged to main.",
         "TEST_FAILURE": "Stopped due to verification/test failure.",
         "UNKNOWN": "Task failed; inspect log output for details.",

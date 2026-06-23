@@ -9150,7 +9150,141 @@ class TestExtractedRunInnerHelpers:
         assert outcome_entry["failure_reason"] == "PROVIDER_EMPTY_TURN"
         assert outcome_entry["stderr_tail"] == "provider stderr line"
 
-    def test_complete_code_task_keeps_genuine_no_change_run_non_retryable(self, tmp_path: Path) -> None:
+    def test_complete_code_task_classifies_capacity_no_change_run_as_provider_unavailable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement capacity failure", task_type="implement")
+        task.slug = "20260623-capacity-failure"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text(
+            '{"type":"thread.started"}\n'
+            '{"type":"turn.started"}\n'
+            '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Try again shortly."}}\n'
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "test/branch",
+            TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+            1,
+            pre_run_status=set(),
+            worktree_summary_path=tmp_path / "worktree-summary.md",
+            summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+            summary_dir=tmp_path / ".gza" / "summaries",
+            error_type="provider_unavailable",
+        )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "retry"
+        assert decision.reason_code == "PROVIDER_UNAVAILABLE"
+
+    @pytest.mark.parametrize(
+        ("error_type", "stats", "exit_code", "expected_reason", "expected_action"),
+        [
+            (
+                "provider_unavailable",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                1,
+                "PROVIDER_UNAVAILABLE",
+                "retry",
+            ),
+            (
+                None,
+                TaskStats(duration_seconds=1.0, cost_usd=0.01),
+                124,
+                "TIMEOUT",
+                "resume",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+    def test_complete_code_task_preserves_recoverable_failure_reason_over_terminal_no_work_merge_states(
+        self,
+        tmp_path: Path,
+        error_type: str | None,
+        stats: TaskStats,
+        exit_code: int,
+        expected_reason: str,
+        expected_action: str,
+        merge_state: str,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement capacity failure", task_type="implement")
+        task.slug = f"20260623-capacity-failure-{merge_state}"
+        task.session_id = f"sess-capacity-failure-{merge_state}"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text(
+            '{"type":"thread.started"}\n'
+            '{"type":"turn.started"}\n'
+            '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Try again shortly."}}\n'
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        with patch("gza.runner.resolve_task_merge_state_for_target", return_value=merge_state):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                stats,
+                exit_code,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+                error_type=error_type,
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == expected_reason
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == merge_state
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == expected_action
+        assert decision.reason_code == expected_reason
+
+    def test_complete_code_task_classifies_no_change_run_as_moot_empty_when_branch_has_no_work(
+        self,
+        tmp_path: Path,
+    ) -> None:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement no-op", task_type="implement")
@@ -9168,20 +9302,168 @@ class TestExtractedRunInnerHelpers:
         worktree_git.default_branch.return_value = "main"
         worktree_git.count_commits_ahead.return_value = 0
 
-        rc = _complete_code_task(
-            task,
-            config,
-            store,
-            worktree_git,
-            log_file,
-            "test/branch",
-            TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
-            0,
-            pre_run_status=set(),
-            worktree_summary_path=tmp_path / "worktree-summary.md",
-            summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
-            summary_dir=tmp_path / ".gza" / "summaries",
-        )
+        with patch("gza.runner.resolve_task_merge_state_for_target", return_value="empty"):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TERMINAL_NO_WORK"
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "empty"
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "skip"
+        assert decision.reason_code == "merge_unit_empty"
+
+    def test_complete_code_task_classifies_no_change_run_as_moot_redundant_when_branch_is_already_landed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement already-landed no-op", task_type="implement")
+        task.slug = "20260623-already-landed-no-op"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text('{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        with patch("gza.runner.resolve_task_merge_state_for_target", return_value="redundant"):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TERMINAL_NO_WORK"
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "redundant"
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "skip"
+        assert decision.reason_code == "merge_unit_redundant"
+
+    @pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+    def test_complete_code_task_keeps_session_backed_terminal_no_work_in_recovery_lane(
+        self,
+        tmp_path: Path,
+        merge_state: str,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement recoverable no-op", task_type="implement")
+        task.slug = f"20260623-recoverable-no-op-{merge_state}"
+        task.session_id = f"sess-recoverable-no-op-{merge_state}"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text('{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        with patch("gza.runner.resolve_task_merge_state_for_target", return_value=merge_state):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TERMINAL_NO_WORK"
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "resume"
+        assert decision.reason_code == "TERMINAL_NO_WORK"
+
+    def test_complete_code_task_keeps_genuinely_unclassifiable_no_change_run_unknown(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement ambiguous no-op", task_type="implement")
+        task.slug = "20260623-ambiguous-no-op"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text('{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        with patch("gza.runner.resolve_task_merge_state_for_target", return_value=None):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
 
         assert rc == 0
         refreshed = store.get(task.id)
@@ -9191,6 +9473,64 @@ class TestExtractedRunInnerHelpers:
         decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
         assert decision.action == "skip"
         assert decision.reason_code == "manual_failure_reason"
+
+    def test_complete_code_task_logs_warning_when_no_work_merge_probe_fails(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement ambiguous no-op", task_type="implement")
+        task.slug = "20260623-probe-failure-no-op"
+        task.session_id = "sess-probe-failure-no-op"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text('{"type":"thread.started"}\n{"type":"turn.started"}\n{"type":"turn.completed"}\n')
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        with (
+            patch("gza.runner.resolve_task_merge_state_for_target", side_effect=GitError("simulated probe failure")),
+            caplog.at_level(logging.WARNING, logger="gza.runner"),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        warning_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+        assert any("no-work merge-state probe failed" in message for message in warning_messages)
+
+        ops_log_file = ops_log_path_for(log_file)
+        log_entries = [json.loads(line) for line in ops_log_file.read_text().splitlines()]
+        warning_entries = [entry for entry in log_entries if entry.get("subtype") == "warning"]
+        assert warning_entries
+        assert warning_entries[-1]["branch"] == "test/branch"
+        assert warning_entries[-1]["target_branch"] == "main"
+        assert "Leaving terminal no-work unclassified." in warning_entries[-1]["message"]
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "UNKNOWN"
 
     def test_complete_code_task_selectively_stages_new_files(self, tmp_path: Path):
         """Completion helper should stage only provider-introduced changes."""

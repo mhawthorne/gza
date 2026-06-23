@@ -109,6 +109,7 @@ class TestGetProvider:
         (400, "server_error", None, "config_error"),
         (None, "invalid_request_error", None, "config_error"),
         (None, None, "This model is not supported for this account", "config_error"),
+        (None, None, "Selected model is at capacity. Try again shortly.", "provider_unavailable"),
         (429, "invalid_request_error", "invalid model", "provider_unavailable"),
         (503, "invalid_request_error", "model is not supported", "provider_unavailable"),
         (None, None, None, None),
@@ -150,6 +151,17 @@ def test_codex_provider_error_type_classifies_forked_agent_diagnostic_as_retryab
     }
 
     assert _codex_provider_error_type(event) == "retryable_provider_error"
+
+
+def test_codex_provider_error_type_classifies_turn_failed_capacity_as_provider_unavailable() -> None:
+    event = {
+        "type": "turn.failed",
+        "error": {
+            "message": "Selected model is at capacity. Try again shortly.",
+        },
+    }
+
+    assert _codex_provider_error_type(event) == "provider_unavailable"
 
 
 def test_looks_like_docker_crash_matches_empty_turn_launcher_exit(tmp_path: Path) -> None:

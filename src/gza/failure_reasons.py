@@ -4,8 +4,17 @@ from pathlib import Path
 
 from .config import Config
 from .db import DB_UNSET, SqliteTaskStore, Task, TaskStats, extract_failure_reason
+from .resume_policy import is_resumable_failure_reason
 
+TERMINAL_NO_WORK_FAILURE_REASON = "TERMINAL_NO_WORK"
 TERMINATED_FAILURE_REASON = "TERMINATED"
+_TERMINAL_NO_WORK_OVERRIDEABLE_FAILURE_REASONS = frozenset(
+    {
+        "INFRASTRUCTURE_ERROR",
+        "PROVIDER_UNAVAILABLE",
+        "RETRYABLE_PROVIDER_ERROR",
+    }
+)
 _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
     {
         "BRANCH_UNPUSHABLE",
@@ -20,6 +29,7 @@ _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
         "PREREQUISITE_UNMERGED",
         "PR_REQUIRED",
         "PROVIDER_UNAVAILABLE",
+        TERMINAL_NO_WORK_FAILURE_REASON,
         "TERMINATED",
         "TIMEOUT",
         "WORKER_DIED",
@@ -27,9 +37,12 @@ _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
 )
 
 __all__ = [
+    "TERMINAL_NO_WORK_FAILURE_REASON",
     "TERMINATED_FAILURE_REASON",
     "mark_task_failed_from_cause",
+    "preserves_failure_reason_over_terminal_no_work",
     "resolve_failure_reason",
+    "terminal_no_work_failure_reason",
 ]
 
 
@@ -47,6 +60,21 @@ def _extract_log_fallback_failure_reason(log_file: Path) -> str:
     if reason in _RUNNER_OWNED_LOG_FALLBACK_REASONS:
         return "UNKNOWN"
     return reason
+
+
+def terminal_no_work_failure_reason(merge_state: str | None) -> str | None:
+    """Return the canonical failure reason for a proven terminal no-work branch."""
+    if merge_state in {"empty", "redundant"}:
+        return TERMINAL_NO_WORK_FAILURE_REASON
+    return None
+
+
+def preserves_failure_reason_over_terminal_no_work(failure_reason: str) -> bool:
+    """Return whether a concrete retryable failure should outrank no-work classification."""
+    return (
+        failure_reason in _TERMINAL_NO_WORK_OVERRIDEABLE_FAILURE_REASONS
+        or is_resumable_failure_reason(failure_reason)
+    )
 
 
 def resolve_failure_reason(

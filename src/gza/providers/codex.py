@@ -1308,6 +1308,9 @@ class CodexProvider(Provider):
     ) -> None:
         _ = data, model, max_steps, chat_text_display_length, log_handle, on_session_id, on_step_count, ops_log_file, ensure_step_store, current_turn_id
         formatter.print_error(f"Error: {_codex_error_message(event)}")
+        provider_error_type = _codex_provider_error_type(event)
+        if provider_error_type is not None and "provider_error_type" not in data:
+            data["provider_error_type"] = provider_error_type
 
     def _handle_live_error_event(
         self,

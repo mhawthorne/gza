@@ -71,7 +71,9 @@ from .extractions import (
 )
 from .failure_reasons import (
     mark_task_failed_from_cause as _mark_task_failed,
+    preserves_failure_reason_over_terminal_no_work as _preserves_failure_reason_over_terminal_no_work,
     resolve_failure_reason as _resolve_failure_reason,
+    terminal_no_work_failure_reason as _terminal_no_work_failure_reason,
 )
 from .git import (
     Git,
@@ -94,6 +96,7 @@ from .lifecycle_completion import (
 )
 from .lineage import get_plan_for_task
 from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
+from .merge_state import resolve_task_merge_state_for_target
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
 from .project_discovery import (
     RepoProjectConfig,
@@ -6546,13 +6549,57 @@ def _complete_code_task(
                     "PROVIDER_EMPTY_TURN"
                     if empty_turn
                     else _resolve_failure_reason(
-                        error_type=None,
+                        error_type=error_type,
                         exit_code=exit_code,
                         log_file=log_file,
                         stats=stats,
                         fallback_to_log=True,
                     )
                 )
+                if not empty_turn and task.id is not None:
+                    merge_state: str | None = None
+                    if not task.branch:
+                        task.branch = branch_name
+                    try:
+                        merge_state = resolve_task_merge_state_for_target(
+                            store=store,
+                            task=task,
+                            git=worktree_git,
+                            target_branch=default_branch,
+                        )
+                    except GitError as exc:
+                        warning_message = (
+                            "Warning: Could not classify no-work merge state for "
+                            f"{branch_name} against {default_branch}: {exc}. "
+                            "Leaving terminal no-work unclassified."
+                        )
+                        logger.warning(
+                            "runner: no-work merge-state probe failed for branch %s against %s: %s",
+                            branch_name,
+                            default_branch,
+                            exc,
+                        )
+                        write_log_entry(
+                            log_file,
+                            {
+                                "type": "gza",
+                                "subtype": "warning",
+                                "message": warning_message,
+                                "branch": branch_name,
+                                "target_branch": default_branch,
+                                "probe_error": str(exc),
+                            },
+                        )
+                    terminal_no_work_reason = _terminal_no_work_failure_reason(merge_state)
+                    if (
+                        terminal_no_work_reason is not None
+                        and not _preserves_failure_reason_over_terminal_no_work(failure_reason)
+                    ):
+                        failure_reason = terminal_no_work_reason
+                    if merge_state in {"empty", "redundant"}:
+                        unit = store.get_or_create_merge_unit_for_task(task)
+                        if unit is not None and unit.state != merge_state:
+                            store.set_merge_unit_state(unit.id, merge_state)
                 provider_stderr_tail = _extract_provider_stderr_tail(log_file) if empty_turn else ""
                 task_footer(
                     task,

@@ -45,7 +45,7 @@ _RETRY_REASONS = {
     "NO_ACTIVITY",
 }
 _RECONCILE_REASONS = frozenset({"BRANCH_UNPUSHABLE", "PR_REQUIRED"})
-_TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED"})
+_TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED", "TERMINAL_NO_WORK"})
 _UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
 _UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
 _MERGED_TARGET_RESOLUTION_TYPES = frozenset({"review", "improve", "rebase"})

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import gza.recovery_engine as recovery_engine
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.config import Config
 from gza.config import ConfigError
-from gza.db import MergeTargetResolutionError
+from gza.db import MergeTargetResolutionError, SqliteTaskStore, Task
 from gza.git import Git, GitError
 from gza.lineage_query import _load_indexes
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
@@ -373,14 +374,18 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id, failed_retry.id]
 
 
-def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure_reason", ["MAX_TURNS", "MAX_STEPS", "TIMEOUT"])
+def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(
+    tmp_path: Path,
+    failure_reason: str,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
     failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
+    failed.failure_reason = failure_reason
     failed.session_id = "sess-empty"
     failed.branch = "feature/resume-empty"
     failed.num_steps_computed = 2
@@ -392,10 +397,15 @@ def test_empty_task_requires_recovery_for_session_backed_failed_empty_branch(tmp
 
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "resume"
+    assert decision.reason_code == failure_reason
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
-def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missing(
+    tmp_path: Path,
+    merge_state: str,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -407,10 +417,17 @@ def test_empty_task_requires_recovery_fail_closed_when_session_metrics_are_missi
     failed.branch = "feature/resume-empty-missing"
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
-    _attach_empty_merge_unit(store, failed)
+    if merge_state == "redundant":
+        failed.has_commits = True
+        store.update(failed)
+        _attach_redundant_merge_unit(store, failed)
+    else:
+        _attach_empty_merge_unit(store, failed)
 
     assert empty_task_requires_recovery(store, failed) is True
-    assert decide_failed_task_recovery(store, failed, max_recovery_attempts=1).action == "resume"
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.reason_code == "MAX_TURNS"
 
 
 @pytest.mark.parametrize(
@@ -535,14 +552,18 @@ def test_failed_redundant_branch_without_execution_uses_distinct_moot_reason(tmp
     assert list_failed_tasks_for_recovery(store) == []
 
 
-def test_failed_redundant_branch_with_provider_execution_remains_recoverable(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure_reason", ["MAX_TURNS", "MAX_STEPS", "TIMEOUT"])
+def test_failed_redundant_branch_with_provider_execution_remains_recoverable(
+    tmp_path: Path,
+    failure_reason: str,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
     failed = store.add("Executed redundant implementation", task_type="implement")
     assert failed.id is not None
     failed.status = "failed"
-    failed.failure_reason = "MAX_TURNS"
+    failed.failure_reason = failure_reason
     failed.session_id = "sess-redundant-executed"
     failed.branch = "feature/recoverable-redundant"
     failed.has_commits = True
@@ -552,8 +573,48 @@ def test_failed_redundant_branch_with_provider_execution_remains_recoverable(tmp
     _attach_redundant_merge_unit(store, failed)
 
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
-    assert decision.action != "skip"
-    assert decision.reason_code != "merge_unit_redundant"
+    assert decision.action == "resume"
+    assert decision.reason_code == failure_reason
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+@pytest.mark.parametrize(
+    ("merge_state", "attach_merge_unit"),
+    [("empty", _attach_empty_merge_unit), ("redundant", _attach_redundant_merge_unit)],
+)
+@pytest.mark.parametrize(
+    "execution_fields",
+    [
+        {"num_steps_computed": 1, "num_steps_reported": 0, "output_tokens": 0},
+        {"num_steps_computed": None, "num_steps_reported": None, "output_tokens": None},
+    ],
+)
+def test_terminal_no_work_failed_branch_with_session_evidence_remains_recoverable(
+    tmp_path: Path,
+    merge_state: str,
+    attach_merge_unit: Callable[[SqliteTaskStore, Task], None],
+    execution_fields: dict[str, int | None],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add(f"Executed {merge_state} implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TERMINAL_NO_WORK"
+    failed.session_id = f"sess-terminal-no-work-{merge_state}"
+    failed.branch = f"feature/recoverable-{merge_state}"
+    failed.has_commits = merge_state == "redundant"
+    failed.num_steps_computed = execution_fields["num_steps_computed"]
+    failed.num_steps_reported = execution_fields["num_steps_reported"]
+    failed.output_tokens = execution_fields["output_tokens"]
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    attach_merge_unit(store, failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "resume"
+    assert decision.reason_code == "TERMINAL_NO_WORK"
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 

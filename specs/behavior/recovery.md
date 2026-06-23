@@ -76,6 +76,10 @@ Consequences:
 - `empty`/`redundant` + predicate **true** = **recoverable**. The task MUST stay eligible
   for the normal recovery policy and MUST NOT be suppressed merely because the branch
   currently has no commits to land.
+- A no-change / no-commit failed run whose branch resolves to `empty` or `redundant`
+  against the target MUST persist a canonical non-`UNKNOWN` no-work failure reason
+  (currently `TERMINAL_NO_WORK`) and MUST be classified through this shared no-work
+  policy rather than falling back to `UNKNOWN` / manual-only parking.
 
 ### 2. Resume vs retry vs manual
 
@@ -83,6 +87,9 @@ Consequences:
   choose `resume` on the first automatic recovery attempt.
 - Retryable provider/infrastructure failures that should not reuse the same execution
   thread MUST choose `retry`.
+- Provider-side transient availability failures surfaced as stream/log errors (for
+  example a Codex `turn.failed` reporting that the selected model is at capacity)
+  MUST classify as a retryable provider-availability failure, not `UNKNOWN`.
 - Manual-only failures MUST park for a human and MUST NOT be auto-resumed or auto-retried.
 - A fresh retry MUST create a new execution attempt. A resume MUST preserve the provider
   session/thread being continued.
