@@ -54,10 +54,12 @@ from gza.recovery_read_context import RecoveryReadContext
 from gza.advance_engine import classify_advance_action, failed_recovery_decision_to_action
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
+from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 import gza.colors as colors
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.config import Config
 from gza.db import Task, WatchProgressObservation
+from gza.plan_review_verdict import validate_plan_review_manifest
 import gza.recovery_engine as recovery_engine
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
@@ -7753,7 +7755,10 @@ def test_watch_cycle_skips_iterate_for_already_reachable_branch_with_stale_merge
         )
 
     assert result.work_done is False
-    assert "implementation chain already merged; not starting iterate" in log_path.read_text()
+    assert (
+        "already merged into target branch" in log_path.read_text()
+        or "implementation chain already merged; not starting iterate" in log_path.read_text()
+    )
 
 
 def test_watch_cycle_next_pass_skips_iterate_after_child_reconciles_merged_state(tmp_path: Path) -> None:
@@ -10332,17 +10337,39 @@ def test_watch_cycle_emits_one_lifecycle_summary_line_per_cycle(
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=False)
     git = _make_watch_git()
-
-    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
-        if task.id == next(task_id for task_id, task_obj in tasks.items() if task_obj.task_type == "plan"):
-            return {
+    plan_task = next(task_obj for task_obj in tasks.values() if task_obj.task_type == "plan")
+    impl_task = next(task_obj for task_obj in tasks.values() if task_obj.task_type == "implement")
+    rows = [
+        LineageOwnerRow(
+            owner_task=plan_task,
+            members=(plan_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={
                 "type": "materialize_plan_slices",
                 "description": "Materialize implementation slices from approved plan review",
-            }
-        return {
-            "type": "create_review",
-            "description": "Create review before merge",
-        }
+            },
+            next_action_reason="materialize",
+            unresolved_tasks=(plan_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=plan_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+        LineageOwnerRow(
+            owner_task=impl_task,
+            members=(impl_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={"type": "create_review", "description": "Create review before merge"},
+            next_action_reason="review",
+            unresolved_tasks=(impl_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=impl_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+    ]
 
     def _fake_execute_advance_action(*, task, action, context):
         return AdvanceActionExecutionResult(
@@ -10356,7 +10383,15 @@ def test_watch_cycle_emits_one_lifecycle_summary_line_per_cycle(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=(rows, RecoveryReadContext())),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            side_effect=lambda _config, _store, _git, task, _target_branch, **_kwargs: (
+                {"type": "materialize_plan_slices", "description": "Materialize implementation slices from approved plan review"}
+                if task.id == plan_task.id
+                else {"type": "create_review", "description": "Create review before merge"}
+            ),
+        ),
         patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
     ):
         _run_cycle(
@@ -10382,23 +10417,53 @@ def test_watch_cycle_quiet_routes_lifecycle_summary_to_watch_log(tmp_path: Path,
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-
-    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
-        if task.id == next(task_id for task_id, task_obj in tasks.items() if task_obj.task_type == "plan"):
-            return {
+    plan_task = next(task_obj for task_obj in tasks.values() if task_obj.task_type == "plan")
+    impl_task = next(task_obj for task_obj in tasks.values() if task_obj.task_type == "implement")
+    rows = [
+        LineageOwnerRow(
+            owner_task=plan_task,
+            members=(plan_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={
                 "type": "materialize_plan_slices",
                 "description": "Materialize implementation slices from approved plan review",
-            }
-        return {
-            "type": "create_review",
-            "description": "Create review before merge",
-        }
+            },
+            next_action_reason="materialize",
+            unresolved_tasks=(plan_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=plan_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+        LineageOwnerRow(
+            owner_task=impl_task,
+            members=(impl_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={"type": "create_review", "description": "Create review before merge"},
+            next_action_reason="review",
+            unresolved_tasks=(impl_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=impl_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+    ]
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=(rows, RecoveryReadContext())),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            side_effect=lambda _config, _store, _git, task, _target_branch, **_kwargs: (
+                {"type": "materialize_plan_slices", "description": "Materialize implementation slices from approved plan review"}
+                if task.id == plan_task.id
+                else {"type": "create_review", "description": "Create review before merge"}
+            ),
+        ),
         patch(
             "gza.cli.watch.execute_advance_action",
             return_value=AdvanceActionExecutionResult(
@@ -10422,7 +10487,7 @@ def test_watch_cycle_quiet_routes_lifecycle_summary_to_watch_log(tmp_path: Path,
     assert "Lifecycle actions (2):" not in capsys.readouterr().out
 
 
-def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
+def test_watch_cycle_executes_direct_lifecycle_actions_before_worker_consuming_actions(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -10438,6 +10503,12 @@ def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
     review_owner.merge_status = "unmerged"
     store.update(review_owner)
 
+    plan_owner = store.add("Approved plan ready to materialize", task_type="plan")
+    assert plan_owner.id is not None
+    plan_owner.status = "completed"
+    plan_owner.completed_at = datetime.now(UTC)
+    store.update(plan_owner)
+
     followup_owner = store.add("Approved with followups", task_type="implement")
     assert followup_owner.id is not None
     followup_owner.status = "completed"
@@ -10450,6 +10521,7 @@ def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=False)
+    executed_actions: list[str] = []
 
     def _row(task: Task) -> LineageOwnerRow:
         return LineageOwnerRow(
@@ -10469,9 +10541,15 @@ def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
     def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
         if task.id == review_owner.id:
             return {"type": "create_review", "description": "Create review before merge"}
+        if task.id == plan_owner.id:
+            return {
+                "type": "materialize_plan_slices",
+                "description": "Materialize implementation slices from approved plan review",
+            }
         return {"type": "merge_with_followups", "description": "Merge approved task into main and create follow-up tasks"}
 
     def _fake_execute_advance_action(*, task, action, context):
+        executed_actions.append(action["type"])
         return AdvanceActionExecutionResult(
             action_type=action["type"],
             status="dry_run",
@@ -10485,7 +10563,10 @@ def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
-        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([_row(review_owner), _row(followup_owner)], RecoveryReadContext())),
+        patch(
+            "gza.cli.watch._query_owner_rows_with_context",
+            return_value=([_row(review_owner), _row(plan_owner), _row(followup_owner)], RecoveryReadContext()),
+        ),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
         patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
@@ -10500,8 +10581,282 @@ def test_watch_cycle_keeps_merge_with_followups_after_worker_consuming_actions(
         )
 
     stdout = capsys.readouterr().out
-    assert "Lifecycle actions (2):" in stdout
-    assert stdout.index("(new) review for") < stdout.index("MERGE")
+    assert "Lifecycle actions (3):" in stdout
+    assert executed_actions == ["materialize_plan_slices", "create_review"]
+    assert stdout.index("MERGE") < stdout.index("(new) review for")
+
+
+def test_watch_cycle_executes_non_worker_lifecycle_actions_with_zero_slots_and_skips_moot_rows(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    actionable_plan = store.add("Approved plan ready to materialize", task_type="plan")
+    assert actionable_plan.id is not None
+    actionable_plan.status = "completed"
+    actionable_plan.completed_at = datetime.now(UTC)
+    store.update(actionable_plan)
+
+    moot_plan = store.add("Moot plan should not rematerialize", task_type="plan")
+    assert moot_plan.id is not None
+    moot_plan.status = "completed"
+    moot_plan.completed_at = datetime.now(UTC)
+    store.update(moot_plan)
+
+    review_owner = store.add("Implementation still needs review", task_type="implement")
+    assert review_owner.id is not None
+    review_owner.status = "completed"
+    review_owner.completed_at = datetime.now(UTC)
+    review_owner.branch = "feature/watch-slot-gated-review"
+    review_owner.has_commits = True
+    review_owner.merge_status = "unmerged"
+    store.update(review_owner)
+
+    plan_review = store.add("Review actionable plan", task_type="plan_review", depends_on=actionable_plan.id)
+    assert plan_review.id is not None
+    plan_review.status = "completed"
+    plan_review.completed_at = datetime.now(UTC)
+    store.update(plan_review)
+
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": actionable_plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Foundation",
+                    "prompt": "Implement slice S1.",
+                    "scope": ["Add parser"],
+                    "out_of_scope": ["Executor"],
+                    "acceptance_criteria": ["Parser works"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Parser only.",
+                    "estimated_complexity": "medium",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": ["watch"],
+                }
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=actionable_plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+
+    actionable_row = LineageOwnerRow(
+        owner_task=actionable_plan,
+        members=(actionable_plan, plan_review),
+        tree=None,
+        lineage_status="actionable",
+        next_action={
+            "type": "materialize_plan_slices",
+            "description": f"Materialize implementation slices from plan review {plan_review.id}",
+            "plan_review_task": plan_review,
+            "manifest": manifest,
+            "plan_source_task": actionable_plan,
+        },
+        next_action_reason="materialize",
+        unresolved_tasks=(actionable_plan,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=actionable_plan,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+    moot_row = LineageOwnerRow(
+        owner_task=moot_plan,
+        members=(moot_plan,),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "SKIP: moot (commits already present on target)"},
+        next_action_reason="moot",
+        unresolved_tasks=(moot_plan,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=moot_plan,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+    review_row = LineageOwnerRow(
+        owner_task=review_owner,
+        members=(review_owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "create_review", "description": "Create review before merge"},
+        next_action_reason="review",
+        unresolved_tasks=(review_owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=review_owner,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch._query_owner_rows_with_context",
+            return_value=([actionable_row, moot_row, review_row], RecoveryReadContext()),
+        ),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            side_effect=lambda _config, _store, _git, task, _target_branch, **_kwargs: (
+                {"type": "create_review", "description": "Create review before merge"}
+                if task.id == review_owner.id
+                else {
+                    "type": "materialize_plan_slices",
+                    "description": f"Materialize implementation slices from plan review {plan_review.id}",
+                    "plan_review_task": plan_review,
+                    "manifest": manifest,
+                    "plan_source_task": actionable_plan,
+                }
+            ),
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    implement_tasks = [task for task in store.get_all() if task.task_type == "implement" and task.based_on == actionable_plan.id]
+    review_tasks = [task for task in store.get_all() if task.task_type == "review" and task.depends_on == review_owner.id]
+
+    assert len(implement_tasks) == 1
+    assert implement_tasks[0].trigger_source == "plan-review"
+    assert not any(task.based_on == moot_plan.id for task in store.get_all() if task.task_type == "implement")
+    assert review_tasks == []
+
+
+def test_watch_cycle_uses_shared_lifecycle_execution_gate(tmp_path: Path) -> None:
+    store, tasks = _seed_watch_lifecycle_summary_fixture(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    gate_calls: list[tuple[str, int]] = []
+    plan_task = next(task_obj for task_obj in tasks.values() if task_obj.task_type == "plan")
+    impl_task = next(task_obj for task_obj in tasks.values() if task_obj.task_type == "implement")
+    merge_task = store.add("Approved task ready to merge", task_type="implement")
+    assert merge_task.id is not None
+    merge_task.status = "completed"
+    merge_task.completed_at = datetime.now(UTC)
+    merge_task.branch = "feature/watch-shared-gate-merge"
+    merge_task.has_commits = True
+    merge_task.merge_status = "unmerged"
+    store.update(merge_task)
+
+    rows = [
+        LineageOwnerRow(
+            owner_task=merge_task,
+            members=(merge_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={
+                "type": "merge_with_followups",
+                "description": "Merge approved task into main and create follow-up tasks",
+            },
+            next_action_reason="merge",
+            unresolved_tasks=(merge_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=merge_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+        LineageOwnerRow(
+            owner_task=plan_task,
+            members=(plan_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={
+                "type": "materialize_plan_slices",
+                "description": "Materialize implementation slices from approved plan review",
+            },
+            next_action_reason="materialize",
+            unresolved_tasks=(plan_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=plan_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+        LineageOwnerRow(
+            owner_task=impl_task,
+            members=(impl_task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action={"type": "create_review", "description": "Create review before merge"},
+            next_action_reason="review",
+            unresolved_tasks=(impl_task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=impl_task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+    ]
+
+    def _record_gate(action, *, free_worker_slots):
+        gate_calls.append((str(action.get("type")), free_worker_slots))
+        if action.get("type") == "merge_with_followups":
+            return False
+        return real_should_execute_lifecycle_action(action, free_worker_slots=free_worker_slots)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=(rows, RecoveryReadContext())),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            side_effect=lambda _config, _store, _git, task, _target_branch, **_kwargs: (
+                {"type": "materialize_plan_slices", "description": "Materialize implementation slices from approved plan review"}
+                if task.id == plan_task.id
+                else {"type": "create_review", "description": "Create review before merge"}
+                if task.id == impl_task.id
+                else {"type": "merge_with_followups", "description": "Merge approved task into main and create follow-up tasks"}
+            ),
+        ),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            side_effect=lambda *, task, action, context: AdvanceActionExecutionResult(
+                action_type=action["type"],
+                status="dry_run",
+                message="Would run",
+                worker_label="worker",
+                worker_consuming=action["type"] == "create_review",
+            ),
+        ),
+        patch("gza.cli._lifecycle_actions.should_execute_lifecycle_action", side_effect=_record_gate),
+        patch("gza.cli.watch._resolve_watch_merge_log_event") as resolve_merge_event,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    resolve_merge_event.assert_not_called()
+    assert ("merge_with_followups", 1) in gate_calls
+    assert ("materialize_plan_slices", 1) in gate_calls
+    assert ("create_review", 1) in gate_calls
 
 
 def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps_roundups(

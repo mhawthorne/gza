@@ -27,7 +27,9 @@ are *progress* (review, improve, merge). Reordering changes behavior.
 
 - **Worker-spawning** (subject to batch limits): create/run a `review`, `improve`,
   `rebase`, `implement`, resume, or retry task.
-- **Direct** (not batch-limited): `merge`, `merge_with_followups`.
+- **Direct** (not batch-limited): `merge`, `merge_with_followups`,
+  `materialize_plan_slices`, and other non-worker lifecycle actions such as direct
+  branch-divergence reconciliation.
 - **Wait**: an expected task is in progress; do nothing and re-evaluate next pass.
 - **Stop-for-human**: `awaiting_human`, `needs_discussion`, `max_cycles_reached` (see the
   escalation table in the overview).

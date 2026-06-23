@@ -9,6 +9,8 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
+from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
+from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
@@ -2754,7 +2756,9 @@ def test_advance_batch_limit_skips_reconcile_conflict_fallback_without_spawning_
     assert spawn_worker.call_count == 1
     assert len(created_rebases) == 1
     output = capsys.readouterr().out
-    assert "batch limit reached (1/1), cannot start rebase worker" in output
+    assert output.index(str(second.id)) < output.index(str(first.id))
+    assert "Created rebase task" in output
+    assert "SKIP: batch limit reached (1/1), cannot start rebase worker" in output
 
 
 @pytest.mark.timeout(4, method="signal")
@@ -2809,6 +2813,182 @@ def test_advance_dry_run_surfaces_diverged_merge_source_for_reconcile(
     assert "Would advance 1 task(s):" in output
     assert "Reconcile diverged local/origin refs" in output
     assert "Needs attention" not in output
+
+
+def test_cmd_advance_uses_shared_lifecycle_execution_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/shared-lifecycle-gate"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "create_review", "description": "Create review before merge"},
+        next_action_reason="review",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+
+    gate_calls: list[tuple[str, int]] = []
+
+    def _record_gate(action, *, free_worker_slots):
+        gate_calls.append((str(action.get("type")), free_worker_slots))
+        return real_should_execute_lifecycle_action(action, free_worker_slots=free_worker_slots)
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli._lifecycle_actions.should_execute_lifecycle_action", side_effect=_record_gate),
+        patch(
+            "gza.cli.git_ops.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="create_review",
+                status="success",
+                message="Started review",
+                success_message="Started review",
+                handled_task_id="testproject-2",
+                attempted_spawn=True,
+                worker_started=True,
+                worker_label="review",
+                worker_consuming=True,
+            ),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 0
+    assert any(action_type == "create_review" and free_worker_slots > 0 for action_type, free_worker_slots in gate_calls)
+    assert "Will advance 1 task(s):" in capsys.readouterr().out
+
+
+def test_cmd_advance_orders_direct_non_worker_actions_before_slot_gated_worker_actions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    review_owner = store.add("Implementation still needs review", task_type="implement")
+    assert review_owner.id is not None
+    review_owner.status = "completed"
+    review_owner.completed_at = datetime.now(UTC)
+    review_owner.branch = "feature/advance-slot-gated-review"
+    review_owner.merge_status = "unmerged"
+    review_owner.has_commits = True
+    store.update(review_owner)
+
+    plan_owner = store.add("Approved plan ready to materialize", task_type="plan")
+    assert plan_owner.id is not None
+    plan_owner.status = "completed"
+    plan_owner.completed_at = datetime.now(UTC)
+    store.update(plan_owner)
+
+    rows = [
+        LineageOwnerRow(
+            owner_task=review_owner,
+            members=(review_owner,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="review",
+            unresolved_tasks=(review_owner,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=review_owner,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+        LineageOwnerRow(
+            owner_task=plan_owner,
+            members=(plan_owner,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="materialize",
+            unresolved_tasks=(plan_owner,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=plan_owner,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        ),
+    ]
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+
+    executed_actions: list[str] = []
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        if task.id == review_owner.id:
+            return {"type": "create_review", "description": "Create review before merge"}
+        if task.id == plan_owner.id:
+            return {
+                "type": "materialize_plan_slices",
+                "description": "Materialize implementation slices from approved plan review",
+            }
+        raise AssertionError(f"unexpected task: {task.id}")
+
+    def _fake_execute(*, task, action, context):
+        if not context.dry_run:
+            executed_actions.append(f"{task.id}:{action['type']}")
+        return AdvanceActionExecutionResult(
+            action_type=action["type"],
+            status="success",
+            message="Materialized plan slices",
+            success_message="Materialized plan slices",
+            work_done=True,
+            worker_consuming=False,
+        )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch(
+            "gza.cli.git_ops.get_concurrency_snapshot",
+            return_value=SimpleNamespace(available=0, running=1, limit=1),
+        ),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=rows),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.git_ops.execute_advance_action", side_effect=_fake_execute),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, review_owner.id)), "task_id": None}))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Will advance 1 task(s):" in output
+    assert executed_actions == [f"{plan_owner.id}:materialize_plan_slices"]
+    assert output.index(str(plan_owner.id)) < output.index(str(review_owner.id))
+    assert "Materialize implementation slices from approved plan review" in output
+    assert str(review_owner.id) in output
+    assert "already at max concurrent tasks: 1 running, limit is 1, skipping" in output
+    assert "skipping" in output
 
 
 def test_advance_retryable_provider_attention_recommends_fix_even_without_actionable_work(

@@ -1,10 +1,10 @@
-"""Shared lifecycle-action collection and rendering for operator surfaces."""
+"""Shared lifecycle-action collection, selection, and rendering for operator surfaces."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import gza.colors as _colors
 
@@ -13,10 +13,12 @@ from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git
 from ..lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
+from ..pickup import is_worker_consuming_advance_action
 from ..task_query import normalize_tag_filters
 from .advance_engine import classify_advance_action, determine_next_action
 
 ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0, "merge_with_followups": 0}
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,24 @@ class LifecycleActionEntry:
     action_task: DbTask
     action: dict[str, Any]
     description: str
+
+
+@dataclass(frozen=True)
+class LifecycleExecutionDecision(Generic[T]):
+    """Shared lifecycle execution-gate decision for one sorted plan item."""
+
+    item: T
+    free_worker_slots: int
+    selected: bool
+
+
+def lifecycle_action_execution_sort_key(action_task: DbTask, action: Mapping[str, Any]) -> tuple[int, int, int]:
+    """Return the shared execution order for lifecycle actions."""
+    action_type = str(action.get("type", ""))
+    worker_consuming_rank = 1 if is_worker_consuming_advance_action(action_type) else 0
+    direct_action_rank = ADVANCE_ACTION_ORDER.get(action_type, 1) if worker_consuming_rank == 0 else 0
+    plan_explore_rank = 1 if action_task.task_type in {"plan", "explore"} else 0
+    return (worker_consuming_rank, direct_action_rank, plan_explore_rank)
 
 
 def collect_lifecycle_action_entries(
@@ -84,12 +104,7 @@ def collect_lifecycle_action_entries(
             )
         )
 
-    entries.sort(
-        key=lambda entry: (
-            ADVANCE_ACTION_ORDER.get(str(entry.action.get("type", "")), 1),
-            1 if entry.action_task.task_type in {"plan", "explore"} else 0,
-        )
-    )
+    entries.sort(key=lambda entry: lifecycle_action_execution_sort_key(entry.action_task, entry.action))
     return entries
 
 
@@ -120,6 +135,46 @@ def format_cycle_lifecycle_action_summary(
     if not parts:
         return None
     return f"Lifecycle actions ({len(parts)}): {', '.join(parts)}"
+
+
+def should_execute_lifecycle_action(
+    action: Mapping[str, Any],
+    *,
+    free_worker_slots: int,
+) -> bool:
+    """Apply the shared watch/advance execution gate for one planned action."""
+    if classify_advance_action(action) != "actionable":
+        return False
+    action_type = str(action.get("type", ""))
+    if not is_worker_consuming_advance_action(action_type):
+        return True
+    return free_worker_slots > 0
+
+
+def plan_lifecycle_execution(
+    items: Iterable[T],
+    *,
+    free_worker_slots: int,
+    get_action: Callable[[T], Mapping[str, Any]],
+) -> list[LifecycleExecutionDecision[T]]:
+    """Apply the shared lifecycle execution gate across a sorted action plan."""
+    remaining_slots = max(0, free_worker_slots)
+    decisions: list[LifecycleExecutionDecision[T]] = []
+
+    for item in items:
+        action = get_action(item)
+        selected = should_execute_lifecycle_action(action, free_worker_slots=remaining_slots)
+        decisions.append(
+            LifecycleExecutionDecision(
+                item=item,
+                free_worker_slots=remaining_slots,
+                selected=selected,
+            )
+        )
+        if selected and is_worker_consuming_advance_action(str(action.get("type", ""))):
+            remaining_slots -= 1
+
+    return decisions
 
 
 def _advance_action_color(action_type: str) -> str:

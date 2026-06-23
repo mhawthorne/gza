@@ -122,7 +122,12 @@ from ._common import (
     phase1_error,
     resolve_id,
 )
-from ._lifecycle_actions import ADVANCE_ACTION_ORDER, LifecycleActionEntry, print_lifecycle_action_entries
+from ._lifecycle_actions import (
+    LifecycleActionEntry,
+    lifecycle_action_execution_sort_key,
+    plan_lifecycle_execution,
+    print_lifecycle_action_entries,
+)
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
@@ -2885,6 +2890,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
     preview_actionable_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
+    preview_gated_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
     new_pending_tasks: list = []
 
     with planning_cache:
@@ -3174,7 +3180,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
             plan.append((row, action_task, action))
 
-        plan.sort(key=lambda item: ADVANCE_ACTION_ORDER.get(item[2]['type'], 1))
+        plan.sort(key=lambda item: lifecycle_action_execution_sort_key(item[1], item[2]))
 
         attention_plan = [
             (
@@ -3187,9 +3193,26 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         preview_context = _build_action_context(dry_run_mode=True)
         preview_attention_plan = list(attention_plan)
+        execution_decisions = plan_lifecycle_execution(
+            plan,
+            free_worker_slots=effective_start_budget,
+            get_action=lambda item: item[2],
+        )
 
-        for row, task, action in plan:
+        def _gated_lifecycle_skip_message(*, free_worker_slots: int) -> str:
+            selected_workers = max(0, effective_start_budget - free_worker_slots)
+            if batch_limit is not None and effective_start_budget == batch_limit and selected_workers >= batch_limit:
+                return f"batch limit reached ({selected_workers}/{batch_limit}), skipping"
+            return f"{capacity_message}, skipping"
+
+        for decision in execution_decisions:
+            row, task, action = decision.item
             if classify_advance_action(action) != "actionable":
+                continue
+            if not decision.selected:
+                preview_gated_rows.append(
+                    (row, task, action, _gated_lifecycle_skip_message(free_worker_slots=decision.free_worker_slots))
+                )
                 continue
             description = action["description"]
             if action["type"] in {"merge", "merge_with_followups"} and dry_run:
@@ -3230,6 +3253,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                         _color = _advance_action_color(action['type'])
                         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                    for row, _task, _action, description in preview_gated_rows:
+                        display_task = row.owner_task
+                        prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                        console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
                     print()
                 return 0
             if preview_attention_plan:
@@ -3244,6 +3272,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                for row, _task, _action, description in preview_gated_rows:
+                    display_task = row.owner_task
+                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
                 print()
 
         if dry_run:
@@ -3279,6 +3312,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action['type'])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                    print()
+                for row, _task, _action, description in preview_gated_rows:
+                    if not skip_rows_printed:
+                        print()
+                        skip_rows_printed = True
+                    display_task = row.owner_task
+                    prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
+                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
                     print()
             if new_mode and batch_limit is not None:
                 planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
@@ -3379,7 +3421,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
         elif exec_result.worker_consuming:
             error_count += 1
 
-    for row, task, action in plan:
+    for decision in execution_decisions:
+        row, task, action = decision.item
         assert task.id is not None
         display_task = row.owner_task
         prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
@@ -3396,19 +3439,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 )
             continue
 
-        # Worker-spawning actions: check batch limit before proceeding
-        if is_worker_consuming_advance_action(action_type):
-            if workers_started >= effective_start_budget:
-                console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                message = (
-                    f"batch limit reached ({workers_started}/{batch_limit}), skipping"
-                    if batch_limit is not None and workers_started >= batch_limit
-                    else f"{capacity_message}, skipping"
-                )
-                console.print(f"      [{_c_warn}]— {message}[/{_c_warn}]")
-                print()
-                skip_count += 1
-                continue
+        if not decision.selected:
+            console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            message = _gated_lifecycle_skip_message(free_worker_slots=decision.free_worker_slots)
+            console.print(f"      [{_c_warn}]— {message}[/{_c_warn}]")
+            print()
+            skip_count += 1
+            continue
 
         console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)

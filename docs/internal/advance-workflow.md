@@ -260,8 +260,8 @@ These actions create background workers and count toward the batch limit. The so
 
 ## Execution Order
 
-1. **Merges execute first** (priority 0) before worker spawns (priority 1). This ensures fresh code lands on the current branch before review/improve workers start, reducing rebase conflicts.
-2. Within the same priority, tasks are processed in DB order.
+1. **Direct lifecycle actions execute before worker-consuming actions.** `merge` and `merge_with_followups` still lead that direct lane, but other non-worker lifecycle actions such as approved-plan materialization or branch-divergence reconciliation must also run before watch spends worker slots on review/improve/rebase work.
+2. Within the same lane, existing lifecycle ordering stays deterministic and keeps plan/explore rows behind implementation rows at the same action rank.
 
 ## Batch Limits
 
@@ -350,6 +350,8 @@ At the start of each watch pass, watch also fingerprints the installed `gza` Pyt
 When `main_checkout_isolate: true`, `gza watch` still plans against the repo default branch but executes merge attempts inside a dedicated detached integration checkout reset to the default-branch tip (`config.main_checkout_integration_path`). Successful isolated merges are then promoted onto the real default-branch ref before `merge_status` flips to `merged`; if the default branch is attached in another checkout, watch hard-resets that checkout to the new tip so it stays clean. Rebase/conflict-resolution ownership is unchanged: conflicts create rebase tasks on the task branch, and those tasks run through the normal rebase workflow.
 
 Default `gza watch` uses the same bounded shared recovery policy as the explicit failed-task recovery queue, but it now exposes that policy through a two-lane split. `watch.recovery_slots` (default `1`) reserves that many worker slots per watch pass for worker-consuming failed-task recovery before pending pickup, and leaves the remaining `batch - recovery_slots` worker slots for pending work. The rule is uniform for worker-consuming recovery: batch-1 plain watch gives the single slot to worker-consuming recovery first; `--pending-only` or `watch.recovery_slots: 0` are the escape hatch for operators who intentionally want single-slot pending-only behavior. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot.
+
+`gza watch` now shares the same lifecycle execution gate as `gza advance`: every actionable non-worker lifecycle action runs regardless of free worker slots, while worker-consuming actions remain slot-gated. Watch still owns scheduling order and live slot accounting; only the action-type gate is shared.
 Separately from the failed-task recovery lane, each watch pass now emits one concise `Lifecycle actions (...)` summary line for the actionable review/rebase/merge/materialization work already queued in that pass's lifecycle plan. The summary reuses the shared lifecycle action types rather than inventing watch-only wording, and it appears once per pass before execution so operators can compare watch behavior with `advance --dry-run`.
 
 When the recovery lane is active:

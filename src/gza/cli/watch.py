@@ -90,6 +90,8 @@ from ._common import (
 from ._lifecycle_actions import (
     collect_lifecycle_action_entries,
     format_cycle_lifecycle_action_summary,
+    lifecycle_action_execution_sort_key,
+    plan_lifecycle_execution,
     print_lifecycle_action_entries,
 )
 from ._queue_render import (
@@ -142,7 +144,6 @@ _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
 )
 T = TypeVar("T")
-_WATCH_EXECUTION_ACTION_ORDER: dict[str, int] = {"merge": 0}
 
 
 def _render_watch_stdout(line: str) -> Text:
@@ -1896,12 +1897,19 @@ def _run_cycle(
         for row in lifecycle_rows:
             task = row.lifecycle_action_task or row.owner_task
             parked_action = _watch_parked_lineage_action(row)
+            precomputed_skip_action = (
+                row.next_action
+                if row.next_action is not None and classify_advance_action(row.next_action) == "skip"
+                else None
+            )
             action_plan.append(
                 (
                     row,
                     task,
                     parked_action
                     if parked_action is not None
+                    else precomputed_skip_action
+                    if precomputed_skip_action is not None
                     else determine_next_action(
                         config,
                         store,
@@ -1913,12 +1921,7 @@ def _run_cycle(
                     ),
                 )
             )
-        action_plan.sort(
-            key=lambda item: (
-                _WATCH_EXECUTION_ACTION_ORDER.get(item[2].get("type", ""), 1),
-                1 if item[1].task_type in {"plan", "explore"} else 0,
-            )
-        )
+        action_plan.sort(key=lambda item: lifecycle_action_execution_sort_key(item[1], item[2]))
         lifecycle_summary = format_cycle_lifecycle_action_summary(
             (row.owner_task, action) for row, _task, action in action_plan
         )
@@ -1937,8 +1940,14 @@ def _run_cycle(
                     quiet,
                     lambda: _require_default_branch(git, current_branch, "merge"),
                 )
+        execution_decisions = plan_lifecycle_execution(
+            action_plan,
+            free_worker_slots=slots,
+            get_action=lambda item: item[2],
+        )
 
-        for row, task, action in action_plan:
+        for execution_decision in execution_decisions:
+            row, task, action = execution_decision.item
             display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
@@ -1976,6 +1985,9 @@ def _run_cycle(
                     _watch_skip_message(display_task, action),
                     dedupe_key=f"advance-skip:{action_type}:{display_task.id}",
                 )
+                continue
+
+            if not execution_decision.selected:
                 continue
 
             if action_type in {"merge", "merge_with_followups"}:
@@ -2171,14 +2183,6 @@ def _run_cycle(
                         f"{display_task.id}: merge failed",
                         dedupe_key=f"merge-failed:{display_task.id}",
                     )
-                continue
-
-            if (
-                not is_worker_consuming_advance_action(str(action_type))
-                and action_type != "reconcile_branch_divergence"
-            ) or action_type == "resume":
-                continue
-            if is_worker_consuming_advance_action(str(action_type)) and slots <= 0:
                 continue
             if not dry_run and display_task.id is not None:
                 no_progress_attention = _maybe_park_watch_no_progress(

@@ -68,9 +68,12 @@ Each watch cycle MUST execute these phases in order:
 1. **Reconcile runtime state.** Reap or reconcile stale in-progress state, then discover
    live detached workers and live in-progress tasks.
 2. **Compute capacity.** Derive current `running` and `slots`.
-3. **Evaluate direct lifecycle work first.** Execute merge-ready and other direct
-   non-worker actions before spawning any new workers (S4). When a watch-managed merge
-   action succeeds, watch MUST emit exactly one structured
+3. **Evaluate direct lifecycle work first.** Execute merge-ready and every other
+   actionable non-worker lifecycle action selected by the shared lifecycle gate before
+   spawning any new workers (S4). This includes direct follow-on creation such as
+   approved-plan materialization; watch MUST NOT maintain a watch-only allowlist that can
+   diverge from `advance`. When a watch-managed merge action succeeds, watch MUST emit
+   exactly one structured
    `MERGE <owner-task-id> -> <target>` line for the landed merge unit at merge time,
    before any same-cycle worker starts, queue pickup, or informational summary output
    that follows from the fresher target-branch state. The logged task ID is the
