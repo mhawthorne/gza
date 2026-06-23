@@ -2,7 +2,7 @@
 name: gza-system-triage
 description: Turn the recurring `watch` stuck-task pile into (1) a diagnosis of why each class is stuck, (2) the existing stuck rows actually cleared now, and (3) systemic prevention so it does not recur. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, unsticks each row by its clearing action (drop moot/dead/stale, spawn follow-up, hand review-loop rows to /gza-task-fix), then ranks and files `system`-tagged prevention fixes by blast radius (cascade-preventer first). Never merges, retries, resumes, deletes branches, or edits code.
 allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza implement:*), Bash(uv run gza set-status:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
-version: 1.3.0
+version: 1.4.0
 public: false
 ---
 
@@ -136,10 +136,20 @@ A manual unstick — above all a `/gza-task-fix` RESCUE — is itself proof that
 
 Report the pairing outcome per rescue: *filed-broad* / *already-tracked* / *escalated-to-cause-layer*.
 
+**Second — the before/after trace gate (required for every systemic fix before filing).**
+
+A fix you can't trace from the actual failure to merge is a guess. For each proposed systemic fix, pick the **exemplar stuck task** it targets and write two concrete, step-by-step timelines:
+
+- **Actual** — what happened to the exemplar, step by step, into the stuck state, citing real evidence (the `failure_reason`, the *deciding log line*, the lineage/verdict). Trace the real sequence; do not summarize.
+- **With the fix in place** — the same sequence holding everything else constant and changing **only** the proposed fix, step by step, to its end state.
+
+The with-fix timeline must either **reach an auto-merge**, or **name the next root cause that still blocks** — and each remaining root becomes its own paired finding (loop it back through the pairing gate above). If you cannot trace a concrete path from the failure toward merge, the fix is not grounded — refine or drop it, do not file it. This catches plausible-but-ineffective fixes and, crucially, surfaces **compounding root causes**: a fix that removes one park but leaves the task blocked on another (e.g. classifying a provider-capacity error as recoverable still won't merge the task while `main`'s verify is red — two roots, two fixes). Read the exemplar's actual log to ground the "Actual" timeline; do not infer it from status fields alone.
+
 Then, for each ranked class produce one block:
 
 - **Class** + **blast radius** (N rows) + affected task IDs.
 - **The systemic fix**, stated as a *precondition or rule change*, and its shape: a code change to file, a cycle-level gate, or a `/gza-task-fix` per-task handoff.
+- **Before/after trace** — the two timelines from the trace gate (actual → stuck; with-fix → merge or next-root), naming the exemplar task. A fix block without a trace is not ready to file.
 - **Dedup result** — "already tracked by gza-XXXX" when applicable, so the user sees what was *not* re-derived.
 
 **Manual mode:** print the ranked blocks, then `AskUserQuestion`: file all / pick a subset / skip.
@@ -165,7 +175,7 @@ uv run gza queue bump <new-task-id>
 
 **Report** (both modes): **rows unstuck** (dropped / follow-ups spawned / handed to `/gza-task-fix`, with counts and IDs), classes filed for prevention (new IDs, tags, bumped?), classes skipped as already-tracked, classes escalated for cause-layer re-diagnosis. The headline proves all three happened — e.g. "87 rows cleared, 1 cascade prevention filed, 1 class already tracked."
 
-**Persist the report to a timestamped file (both modes, always — this is the durable record, not just conversation output).** Write the full report — the class buckets with blast radius, every per-row unstick decision (drop / spawn / rescue / leave), the pairing-gate outcome per rescue (*filed-broad* / *already-tracked* / *escalated-to-cause-layer*), and all filed task IDs — to `.gza/system-triage/${TS}-triage.md`, reusing the **same `${TS}` prefix** as the snapshot from Step 1 (timestamp is the filename **prefix**, not a suffix). This gives an audit trail and lets a later session diff against it instead of re-deriving the landscape. Mirror how `explore`/`review` tasks persist reports to `.gza/explorations/` and `.gza/reviews/`. Write this file even when the user skips filing — the findings still stand.
+**Persist the report to a timestamped file (both modes, always — this is the durable record, not just conversation output).** Write the full report — the class buckets with blast radius, every per-row unstick decision (drop / spawn / rescue / leave), the pairing-gate outcome per rescue (*filed-broad* / *already-tracked* / *escalated-to-cause-layer*), the **before/after trace** for each filed systemic fix, and all filed task IDs — to `.gza/system-triage/${TS}-triage.md`, reusing the **same `${TS}` prefix** as the snapshot from Step 1 (timestamp is the filename **prefix**, not a suffix). This gives an audit trail and lets a later session diff against it instead of re-deriving the landscape. Mirror how `explore`/`review` tasks persist reports to `.gza/explorations/` and `.gza/reviews/`. Write this file even when the user skips filing — the findings still stand.
 
 ## Output style
 
