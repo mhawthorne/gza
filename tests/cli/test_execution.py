@@ -10489,8 +10489,18 @@ class TestIterateCommand:
         assert "reason=retry-limit-reached" in output
         assert "Cannot resume failed implementation" not in output
 
-    def test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention(self, tmp_path: Path):
+    def test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
         """Automatic iterate should keep the shared attention stop when a newer failed resume child already exists."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -10512,10 +10522,62 @@ class TestIterateCommand:
         failed_resume_child.session_id = root.session_id
         store.update(failed_resume_child)
 
-        result = invoke_gza("iterate", str(root.id), "--resume", "--auto-iterate", "--project", str(tmp_path))
+        args = argparse.Namespace(
+            project_dir=str(tmp_path),
+            impl_task_id=str(root.id),
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+            auto_iterate=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            require_review_before_merge=False,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            workers_path=tmp_path / ".gza" / "workers",
+        )
 
-        assert result.returncode == 3
-        output = result.stdout + (result.stderr or "")
+        def fake_run_foreground(config, task_id, resume=False, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "MAX_TURNS"
+            task.session_id = root.session_id
+            store.update(task)
+            return 1
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.advance_engine.prompt_available_width", return_value=40),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        ):
+            result = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        output = captured.out
+        resumed_task_id = run_fg.call_args.kwargs["task_id"]
+        failed_resume_grandchild = store.get(resumed_task_id)
+        assert failed_resume_grandchild is not None
+        assert failed_resume_grandchild.based_on == root.id
+        assert failed_resume_grandchild.id != failed_resume_child.id
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            failed_resume_grandchild,
+            max_recovery_attempts=1,
+        )
+
+        assert result == 3
+        assert run_fg.call_count == 1
+        assert run_fg.call_args.kwargs.get("resume") is True
+        assert terminal_decision.reason_code == "retry_limit_reached"
         assert output.count("Needs attention:") == 1
         assert "reason=retry-limit-reached" in output
         assert "Cannot resume failed implementation" not in output
