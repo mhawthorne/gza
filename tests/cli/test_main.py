@@ -1338,6 +1338,7 @@ class TestWorkForceBackgroundDispatch:
                 ],
             ),
             patch("gza.cli.execution._prepare_task_for_immediate_execution", side_effect=lambda _c, prepared_task, **_k: prepared_task),
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, task: task),
             patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
         ):
             rc = main()

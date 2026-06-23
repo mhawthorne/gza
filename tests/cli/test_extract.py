@@ -229,6 +229,10 @@ def test_extract_per_commit_background_preserves_task_id_order_but_uses_parallel
             side_effect=[(created_tasks[0], tmp_path / "bundle-one"), (created_tasks[1], tmp_path / "bundle-two")],
         ),
         patch("gza.cli.execution._print_extraction_plan_summary"),
+        patch(
+            "gza.cli.execution._prepare_task_for_reserved_launch",
+            side_effect=lambda _config, task, **_kwargs: task,
+        ),
         patch("gza.cli.execution._spawn_background_worker") as mock_spawn_one,
         patch("gza.cli.execution._spawn_background_workers", return_value=0) as mock_spawn_many,
     ):

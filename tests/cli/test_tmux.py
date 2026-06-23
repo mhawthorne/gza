@@ -1026,6 +1026,10 @@ class TestClaudeProviderTmuxMode:
              patch("gza.cli._common.get_tmux_session_pid", return_value=9999), \
              patch("gza.cli._common.get_store") as mock_get_store, \
              patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task), \
+             patch(
+                 "gza.cli._common._spawn_detached_worker_process",
+                 return_value=(MagicMock(pid=4242), ".gza/workers/w-test-startup.log"),
+             ), \
              patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"):
             mock_get_store.return_value = store
             from gza.cli._common import _spawn_background_worker

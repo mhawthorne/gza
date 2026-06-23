@@ -61,7 +61,14 @@ class TestConfigRequirements:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text("project_name: test\nunknown_key: value\n")
 
-        result = invoke_gza("next", "--project", str(tmp_path))
+        with (
+            patch("gza.cli.query.Git") as mock_git_cls,
+            patch("gza.git.Git.default_branch", return_value="main"),
+            patch("gza.git.Git.local_branch_names", return_value=()),
+        ):
+            mock_git = mock_git_cls.return_value
+            mock_git.default_branch.return_value = "main"
+            result = invoke_gza("next", "--project", str(tmp_path))
 
         # Should succeed
         assert result.returncode == 0

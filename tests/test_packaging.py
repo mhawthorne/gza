@@ -206,6 +206,16 @@ def test_unit_test_conftest_runtime_subprocess_guard_exemptions_are_explicit_and
     # Each known offender module the guard surfaces keeps a narrow, module-scoped
     # exemption pointing at the follow-up implement task that will clean it up.
     assert "tests/cli/test_advance_auto_plans.py" not in exemptions
+    assert "tests/cli/test_advance_squash_threshold.py" not in exemptions
+    assert "tests/cli/test_config_cmds.py" not in exemptions
+    assert "tests/cli/test_execution.py" not in exemptions
+    assert "tests/cli/test_extract.py" not in exemptions
+    assert "tests/cli/test_git_ops.py" not in exemptions
+    assert "tests/cli/test_git_ops_merge_units.py" not in exemptions
+    assert "tests/cli/test_main.py" not in exemptions
+    assert "tests/cli/test_no_color.py" not in exemptions
+    assert "tests/cli/test_query.py" not in exemptions
+    assert "tests/cli/test_tmux.py" not in exemptions
     assert "tests/test_lineage_query.py" not in exemptions
 
     # Every exemption must stay module-scoped (a tests/ path, no ``::`` nodeid),

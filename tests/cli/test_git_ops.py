@@ -1457,6 +1457,8 @@ def test_cmd_advance_wraps_planning_in_git_cache(tmp_path: Path) -> None:
 
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
     ):
@@ -1718,6 +1720,8 @@ def test_cmd_advance_explicit_child_member_scopes_query_to_owner_lineage(tmp_pat
 
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
         patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
     ):
@@ -1778,6 +1782,8 @@ def test_cmd_advance_explicit_failed_leaf_scopes_query_to_owner_lineage(tmp_path
 
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
     ):
         rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed_rebase.id)), "dry_run": True}))
@@ -1849,6 +1855,8 @@ def test_cmd_advance_explicit_dropped_owner_fallback_scopes_second_query_to_owne
 
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
         patch("gza.cli.git_ops.query_lineage_owner_rows", side_effect=_query_rows),
     ):
@@ -2024,9 +2032,27 @@ def test_cmd_advance_explicit_failed_leaf_preloads_only_owner_lineage_refs(
     fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
     fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{requested.branch}")
 
+    row = LineageOwnerRow(
+        owner_task=requested,
+        members=(requested, failed_rebase),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(failed_rebase,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=failed_rebase,
+    )
+
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
         patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
     ):
         rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed_rebase.id)), "dry_run": True}))
 
@@ -2161,9 +2187,27 @@ def test_cmd_advance_explicit_dropped_owner_fallback_preloads_only_requested_lin
     fake_git, ref_calls, branch_calls = _make_preload_recording_git(tmp_path)
     fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(owner.branch)
 
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, requested),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(requested,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
         patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
     ):
         rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, requested.id)), "dry_run": True}))
 
@@ -2690,6 +2734,10 @@ def test_advance_batch_limit_skips_reconcile_conflict_fallback_without_spawning_
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[first_row, second_row]),
         patch("gza.cli.git_ops._create_rebase_task", side_effect=_create_rebase_task),
         patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_k: task),
+        patch(
+            "gza.cli.advance_executor._prepare_task_for_reserved_launch",
+            side_effect=lambda _config, task, permit, rollback_on_failure: task,
+        ),
         patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
         patch(
             "gza.cli.git_ops._reconcile_diverged_branch_with_origin",
@@ -2749,7 +2797,11 @@ def test_advance_dry_run_surfaces_diverged_merge_source_for_reconcile(
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
 
-    with patch("gza.cli.git_ops.Git", return_value=fake_git):
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+    ):
         rc = cmd_advance(args)
 
     output = capsys.readouterr().out

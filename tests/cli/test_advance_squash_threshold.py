@@ -13,6 +13,17 @@ from gza.config import Config, ConfigError
 from tests.cli.conftest import make_store, setup_config
 
 
+@pytest.fixture(autouse=True)
+def _patch_ambient_real_git():
+    with (
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.git.Git.branch_exists", return_value=True),
+        patch("gza.git.Git.ref_exists", return_value=False),
+    ):
+        yield
+
+
 def _advance_args(tmp_path: Path, **overrides) -> argparse.Namespace:
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -73,6 +84,8 @@ def test_advance_no_squash_when_threshold_zero(tmp_path: Path) -> None:
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
     ):
         rc = cmd_advance(_advance_args(tmp_path))
@@ -89,6 +102,8 @@ def test_advance_squash_when_commits_meet_threshold(tmp_path: Path) -> None:
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
     ):
         rc = cmd_advance(_advance_args(tmp_path, squash_threshold=2))
@@ -105,6 +120,8 @@ def test_advance_no_squash_when_commits_below_threshold(tmp_path: Path) -> None:
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=2)),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops._merge_single_task", return_value=0) as merge_single,
     ):
         rc = cmd_advance(_advance_args(tmp_path, squash_threshold=3))
@@ -119,7 +136,11 @@ def test_advance_squash_threshold_cli_override(tmp_path: Path, capsys) -> None:
     store = make_store(tmp_path)
     _create_completed_non_implement_task(store)
 
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=2)):
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=2)),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+    ):
         rc = cmd_advance(_advance_args(tmp_path, dry_run=True, squash_threshold=2))
 
     assert rc == 0
@@ -135,7 +156,11 @@ def test_advance_dry_run_shows_squash_annotation(tmp_path: Path, capsys) -> None
     store = make_store(tmp_path)
     _create_completed_non_implement_task(store)
 
-    with patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)):
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git(commit_count=3)),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+    ):
         rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
 
     assert rc == 0
@@ -307,6 +332,10 @@ def test_cmd_advance_passes_git_instance_to_list_failed_tasks(tmp_path: Path) ->
 
     with (
         patch("gza.cli.git_ops.Git", return_value=mock_git),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter(())),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.list_failed_tasks_for_recovery", side_effect=_spy),
     ):
         rc = cmd_advance(_advance_args(tmp_path))

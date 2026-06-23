@@ -1,8 +1,12 @@
 """Functional tests for execution flows that require a real git repo."""
 
+import argparse
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from gza.cli import cmd_iterate
 from gza.cli._common import reconcile_in_progress_tasks
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -139,6 +143,219 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
     assert "would iterate implementation" in result.stdout.lower()
     assert "first iteration 1/3 action: create_review" in result.stdout.lower()
     assert "code changed since the last review" in result.stdout.lower()
+
+
+@pytest.mark.functional
+def test_failed_task_retry_runs_then_iterates(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    impl.status = "failed"
+    impl.same_branch = True
+    impl.branch = "feature/existing-impl-branch"
+    store.update(impl)
+
+    def fake_run_foreground(config, task_id, **kwargs):
+        task = store.get(task_id)
+        assert task is not None
+        if task.task_type == "review":
+            task.status = "completed"
+            task.output_content = "**Verdict: APPROVED**"
+            task.completed_at = datetime.now()
+            store.update(task)
+            return 0
+        if task.status == "pending":
+            task.status = "completed"
+            if task.task_type == "implement":
+                task.branch = "test-project/20260101-retry"
+            task.completed_at = datetime.now()
+            store.update(task)
+            return 0
+        raise AssertionError(f"unexpected task id: {task_id}")
+
+    args = argparse.Namespace(
+        project_dir=str(tmp_path),
+        impl_task_id=str(impl.id),
+        max_iterations=1,
+        dry_run=False,
+        no_docker=True,
+        resume=False,
+        retry=True,
+        background=False,
+    )
+    mock_config = MagicMock(
+        project_dir=tmp_path,
+        use_docker=False,
+        project_prefix="testproject",
+        require_review_before_merge=False,
+        advance_create_reviews=True,
+        max_review_cycles=3,
+        max_resume_attempts=1,
+    )
+    mock_git = MagicMock()
+    mock_git.current_branch.return_value = "main"
+    mock_git.can_merge.return_value = True
+    with (
+        patch("gza.cli.Config.load", return_value=mock_config),
+        patch("gza.cli.get_store", return_value=store),
+        patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        patch("gza.cli.Git", return_value=mock_git),
+    ):
+        result = cmd_iterate(args)
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert run_fg.call_count >= 1
+    first_task_id = run_fg.call_args_list[0][1]["task_id"]
+    assert first_task_id != impl.id
+    retry_task = store.get(first_task_id)
+    assert retry_task is not None
+    assert retry_task.same_branch is False
+    assert retry_task.base_branch == "feature/existing-impl-branch"
+    assert "Retrying failed implementation" in output
+    assert "Iterate complete: APPROVED" in output
+
+
+@pytest.mark.functional
+def test_failed_task_resume_runs_then_iterates(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+    """gza iterate --resume on a failed task resumes then enters the loop via real engine transitions."""
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    impl.status = "failed"
+    impl.failure_reason = "MAX_TURNS"
+    impl.session_id = "resume-session-1"
+    store.update(impl)
+
+    def fake_run_foreground(config, task_id, **kwargs):
+        task = store.get(task_id)
+        if task and task.status == "pending":
+            task.status = "completed"
+            if task.task_type == "review":
+                task.output_content = "**Verdict: APPROVED**"
+            elif task.task_type == "implement":
+                task.branch = "test-project/20260101-resume"
+            task.completed_at = datetime.now()
+            store.update(task)
+        return 0
+
+    args = argparse.Namespace(
+        project_dir=str(tmp_path),
+        impl_task_id=str(impl.id),
+        max_iterations=1,
+        dry_run=False,
+        no_docker=True,
+        resume=True,
+        retry=False,
+        background=False,
+    )
+    mock_config = MagicMock(
+        project_dir=tmp_path,
+        use_docker=False,
+        project_prefix="testproject",
+        require_review_before_merge=False,
+        advance_create_reviews=True,
+        max_review_cycles=3,
+        max_resume_attempts=1,
+    )
+    mock_git = MagicMock()
+    mock_git.current_branch.return_value = "main"
+    mock_git.can_merge.return_value = True
+
+    with (
+        patch("gza.cli.Config.load", return_value=mock_config),
+        patch("gza.cli.get_store", return_value=store),
+        patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+        patch("gza.cli.Git", return_value=mock_git),
+    ):
+        result = cmd_iterate(args)
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert run_fg.call_count >= 1
+    first_task_id = run_fg.call_args_list[0][1]["task_id"]
+    assert first_task_id != impl.id
+    assert "Resuming failed implementation" in output
+    assert "Iterate complete: APPROVED" in output
+
+
+@pytest.mark.functional
+def test_iterate_improve_resume_passes_resume_true_to_run_foreground(
+    tmp_path,
+) -> None:
+    """When iterate picks resume for an improve, it must call _run_foreground with resume=True."""
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Completed implementation", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "test-project/20260101-impl"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    review.status = "completed"
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "TIMEOUT"
+    failed_improve.session_id = "improve-session"
+    failed_improve.branch = impl.branch
+    store.update(failed_improve)
+
+    args = argparse.Namespace(
+        impl_task_id=impl.id,
+        max_iterations=1,
+        dry_run=False,
+        project_dir=tmp_path,
+        no_docker=True,
+        resume=False,
+        retry=False,
+        background=False,
+    )
+    mock_config = MagicMock(
+        project_dir=tmp_path,
+        use_docker=False,
+        project_prefix="testproject",
+        max_resume_attempts=3,
+    )
+    mock_git = MagicMock()
+    mock_git.current_branch.return_value = "main"
+
+    def fake_run_foreground(config, task_id, resume=False, **kwargs):
+        task = store.get(task_id)
+        assert task is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return 0
+
+    improve_action = {"type": "improve", "description": "Create improve", "review_task": review}
+    engine_actions = [improve_action, improve_action, {"type": "skip", "description": "done"}]
+
+    with (
+        patch("gza.cli.Config.load", return_value=mock_config),
+        patch("gza.cli.get_store", return_value=store),
+        patch("gza.cli.Git", return_value=mock_git),
+        patch("gza.cli.determine_next_action", side_effect=engine_actions),
+        patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
+    ):
+        cmd_iterate(args)
+
+    assert run_fg.call_count == 1
+    assert run_fg.call_args_list[0].kwargs.get("resume") is True
 
 
 def test_cycle_dry_run(tmp_path) -> None:

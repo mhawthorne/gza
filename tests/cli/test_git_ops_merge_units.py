@@ -2,9 +2,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from gza.cli.git_ops import _collect_advance_completed_tasks
 from tests.cli.conftest import make_store, setup_config
 from tests.helpers.cli import invoke_gza
+
+
+@pytest.fixture(autouse=True)
+def _patch_ambient_real_git():
+    with (
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+    ):
+        yield
 
 
 class _MergeGit:
@@ -220,6 +231,8 @@ def test_advance_explicit_task_uses_default_target_merge_unit_over_stale_legacy_
 
     with (
         patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
     ):
         result = invoke_gza("advance", task.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
@@ -260,6 +273,8 @@ def test_advance_failed_task_recovery_planning_uses_merge_unit_over_stale_legacy
 
     with (
         patch("gza.cli.git_ops.Git", lambda _project_dir: _AdvanceGit()),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine_next_action),
     ):
         result = invoke_gza("advance", failed.id, "--dry-run", "--project", str(tmp_path), cwd=tmp_path)

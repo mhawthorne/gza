@@ -12,7 +12,7 @@ from gza.console import build_console, set_config_no_color
 from gza.db import Task
 
 from .conftest import make_store, mark_orphaned, invoke_gza, setup_config
-from .test_query import _FastUnmergedGit
+from .test_query import _FastUnmergedGit, _UnavailableGitHub
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -48,8 +48,17 @@ def _capture_command_output(
     monkeypatch.setattr(query_cli, "console", tty_console)
     monkeypatch.setattr(watch_cli, "console", tty_console)
     monkeypatch.setattr(query_cli, "_stderr_console", tty_console)
+    fake_git = _FastUnmergedGit()
+    fake_git._branches.add("main")
 
-    result = invoke_gza(*args, "--project", str(tmp_path), env=env)
+    with (
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.query.GitHub", _UnavailableGitHub),
+        patch.object(query_cli, "Git", lambda _project_dir: fake_git),
+        patch.object(watch_cli, "Git", lambda _project_dir: fake_git),
+    ):
+        result = invoke_gza(*args, "--project", str(tmp_path), env=env)
     return result.returncode, result.stdout + output.getvalue()
 
 
@@ -82,7 +91,10 @@ def test_no_color_config_disables_ansi_on_forced_tty(
         cli_args = (command_name,)
 
     if command_name != "unmerged":
-        returncode, output = _capture_command_output(monkeypatch, tmp_path, *cli_args)
+        with patch("gza.cli.query.Git") as mock_git_cls:
+            mock_git = mock_git_cls.return_value
+            mock_git.default_branch.return_value = "main"
+            returncode, output = _capture_command_output(monkeypatch, tmp_path, *cli_args)
 
     assert returncode == 0
     assert ANSI_RE.search(output) is None, output

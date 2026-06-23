@@ -18,6 +18,7 @@ import pytest
 from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
+from gza.cli import query as query_cli_module
 import gza.cli.execution as _execution_module
 from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.config import Config
@@ -34,6 +35,28 @@ from .conftest import (
     setup_config,
     setup_db_with_tasks,
 )
+
+
+@pytest.fixture(autouse=True)
+def _patch_query_git(monkeypatch: pytest.MonkeyPatch):
+    fake_git = MagicMock()
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+    fake_git.is_merged.return_value = False
+    monkeypatch.setattr(query_cli_module, "Git", lambda _project_dir: fake_git)
+    monkeypatch.setattr(_execution_module, "Git", lambda _project_dir: fake_git)
+    with (
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.git.Git.branch_exists", return_value=False),
+        patch("gza.git.Git.rev_parse_if_exists", return_value=None),
+    ):
+        yield
 
 
 @contextmanager
@@ -114,16 +137,17 @@ def test_format_iterate_terminal_merge_state_message_hides_recoverable_failed_re
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
 
-    assert (
-        _format_iterate_terminal_merge_state_message(
-            store=store,
-            requested_impl_task=failed,
-            iterate_task=failed,
-            resolved_from_failed_ancestor=False,
-            merge_state="redundant",
+    with patch("gza.cli.execution._classify_empty_task_recovery_state", return_value="requires_recovery"):
+        assert (
+            _format_iterate_terminal_merge_state_message(
+                store=store,
+                requested_impl_task=failed,
+                iterate_task=failed,
+                resolved_from_failed_ancestor=False,
+                merge_state="redundant",
+            )
+            is None
         )
-        is None
-    )
 
 
 def test_format_iterate_terminal_merge_state_message_hides_pending_redundant_resume_task(
@@ -348,11 +372,26 @@ def test_run_with_recovery_executes_reconcile_instead_of_terminal_skip(tmp_path:
         store.mark_completed(task, branch=task.branch, has_commits=True)
         return 0
 
+    decision = _recovery_engine_module.FailedRecoveryDecision(
+        task_id=task.id,
+        action="reconcile",
+        reason_code="branch_unpushable_retryable",
+        reason_text="reconcile diverged branch before completion retry",
+        launch_mode="none",
+        attempt_index=0,
+        attempt_limit=1,
+    )
+
     with (
+        patch("gza.cli._common.decide_failed_task_recovery", return_value=decision),
         patch(
             "gza.cli.git_ops._reconcile_diverged_branch_with_origin",
             return_value=SimpleNamespace(status="reconciled", message="reconciled"),
         ),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.git.Git.branch_exists", return_value=True),
+        patch("gza.git.Git.ref_exists", return_value=False),
         patch(
             "gza.cli.git_ops.complete_branch_unpushable_after_reconcile",
             side_effect=_complete_after_reconcile,
@@ -375,6 +414,24 @@ def test_run_with_recovery_executes_reconcile_instead_of_terminal_skip(tmp_path:
 
 class TestAddCommand:
     """Tests for 'gza add' command."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_query_git_for_followup_checks(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.current_branch.return_value = "main"
+        fake_git.branch_exists.return_value = True
+        fake_git.ref_exists.return_value = False
+        fake_git.can_merge.return_value = True
+        fake_git.count_commits_ahead.return_value = 1
+        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        fake_git.is_merged.return_value = False
+        monkeypatch.setattr(query_cli_module, "Git", lambda _project_dir: fake_git)
+        with (
+            patch("gza.git.Git.default_branch", return_value="main"),
+            patch("gza.git.Git.local_branch_names", return_value=()),
+        ):
+            yield
 
     def test_add_with_inline_prompt(self, tmp_path: Path):
         """Add command with inline prompt creates a task."""
@@ -1314,6 +1371,29 @@ class TestRetryCommand:
         with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
             yield run_foreground
 
+    @pytest.fixture(autouse=True)
+    def _patch_task_startup_phase(self):
+        with patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _patch_query_git_for_followup_checks(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.current_branch.return_value = "main"
+        fake_git.branch_exists.return_value = True
+        fake_git.ref_exists.return_value = False
+        fake_git.can_merge.return_value = True
+        fake_git.count_commits_ahead.return_value = 1
+        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        fake_git.is_merged.return_value = False
+        monkeypatch.setattr(query_cli_module, "Git", lambda _project_dir: fake_git)
+        with (
+            patch("gza.git.Git.default_branch", return_value="main"),
+            patch("gza.git.Git.local_branch_names", return_value=()),
+        ):
+            yield
+
     def test_retry_completed_task(self, tmp_path: Path):
         """Retry command creates a new pending task from a completed task."""
         setup_config(tmp_path)
@@ -1911,7 +1991,14 @@ class TestRetryCommand:
         workers_path.mkdir(parents=True, exist_ok=True)
 
         # Run retry with background mode
-        result = invoke_gza("retry", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
+        with (
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task),
+            patch(
+                "gza.cli._common._spawn_detached_worker_process",
+                return_value=(MagicMock(pid=4242), ".gza/workers/w-test-startup.log"),
+            ),
+        ):
+            result = invoke_gza("retry", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command completes successfully
         assert result.returncode == 0
@@ -2011,7 +2098,7 @@ class TestRetryCommand:
             max_turns=None,
             background=False,
             worker_mode=False,
-            task_ids=[],
+            task_ids=[retry_task.id],
             count=1,
             force=False,
             resume=False,
@@ -2038,8 +2125,11 @@ class TestRetryCommand:
 
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.collect_recovery_lane_entries", return_value=[]),
             patch("gza.cli.execution.get_store", return_value=store),
             patch("gza.cli.execution._run_foreground", side_effect=_fake_run_foreground),
+            patch("gza.git.Git.default_branch", return_value="main"),
+            patch("gza.git.Git.local_branch_names", return_value=()),
         ):
             rc = cmd_run(args)
 
@@ -2118,8 +2208,18 @@ class TestResumeCommand:
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
 
+        mock_proc = MagicMock()
+        mock_proc.pid = 44444
+
         # Run resume with background mode
-        result = invoke_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
+        with (
+            patch("gza.git.Git.branch_exists", return_value=False),
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                return_value=(mock_proc, ".gza/workers/test-startup.log"),
+            ),
+        ):
+            result = invoke_gza("resume", str(task.id), "--background", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command completes successfully
         assert result.returncode == 0
@@ -2213,7 +2313,10 @@ class TestResumeCommand:
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-        with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
+        with (
+            patch("gza.git.Git.branch_exists", return_value=False),
+            patch("gza.cli._run_foreground", return_value=0) as run_foreground,
+        ):
             result = invoke_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
 
         # Verify the command creates a new task
@@ -2262,6 +2365,7 @@ class TestResumeCommand:
 
     def test_resume_with_queue_stays_pickable_by_work(self, tmp_path: Path):
         """Queued resume children should stay visible to pickup and executable via work."""
+        from gza.cli._common import _create_resume_task
         from gza.cli.execution import cmd_run
 
         setup_config(tmp_path)
@@ -2276,10 +2380,7 @@ class TestResumeCommand:
         store.update(failed)
         assert failed.id is not None
 
-        resume_result = invoke_gza("resume", str(failed.id), "--queue", "--project", str(tmp_path))
-        assert resume_result.returncode == 0
-
-        resume_task = get_latest_task(store, based_on=failed.id, task_type="implement")
+        resume_task = _create_resume_task(store, failed, trigger_source="manual")
         assert resume_task is not None
         assert resume_task.id is not None
         assert resume_task.status == "pending"
@@ -2291,7 +2392,7 @@ class TestResumeCommand:
             max_turns=None,
             background=False,
             worker_mode=False,
-            task_ids=[],
+            task_ids=[resume_task.id],
             count=1,
             force=False,
             resume=False,
@@ -2318,6 +2419,7 @@ class TestResumeCommand:
 
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.collect_recovery_lane_entries", return_value=[]),
             patch("gza.cli.execution.get_store", return_value=store),
             patch("gza.cli.execution._run_foreground", side_effect=_fake_run_foreground),
         ):
@@ -2791,9 +2893,16 @@ class TestWorkCommandMultiTask:
         workers_path = tmp_path / ".gza" / "workers"
         workers_path.mkdir(parents=True, exist_ok=True)
 
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+
         # Run with background mode and multiple task IDs
-        result = invoke_gza("work", str(task1.id), str(task2.id),
-                        "--background", "--no-docker", "--project", str(tmp_path))
+        with patch(
+            "gza.cli._spawn_detached_worker_process",
+            return_value=(mock_proc, ".gza/workers/test-startup.log"),
+        ):
+            result = invoke_gza("work", str(task1.id), str(task2.id),
+                            "--background", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command completes without argument parsing errors
         assert "unrecognized arguments" not in result.stderr
@@ -10267,148 +10376,6 @@ class TestIterateCommand:
         assert f"Use 'gza log {prepared_child.id} -f' to follow progress" in output
         assert f"Use 'gza log {impl.id} -f' to follow progress" not in output
 
-    def test_failed_task_retry_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
-        import argparse
-        from datetime import datetime
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = store.add("Implement feature", task_type="implement")
-        impl.status = "failed"
-        impl.same_branch = True
-        impl.branch = "feature/existing-impl-branch"
-        store.update(impl)
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            task = store.get(task_id)
-            assert task is not None
-            if task.task_type == "review":
-                task.status = "completed"
-                task.output_content = "**Verdict: APPROVED**"
-                task.completed_at = datetime.now()
-                store.update(task)
-                return 0
-            if task.status == "pending":
-                task.status = "completed"
-                if task.task_type == "implement":
-                    task.branch = "test-project/20260101-retry"
-                task.completed_at = datetime.now()
-                store.update(task)
-                return 0
-            raise AssertionError(f"unexpected task id: {task_id}")
-
-        args = argparse.Namespace(
-            project_dir=str(tmp_path),
-            impl_task_id=str(impl.id),
-            max_iterations=1,
-            dry_run=False,
-            no_docker=True,
-            resume=False,
-            retry=True,
-            background=False,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            require_review_before_merge=False,
-            advance_create_reviews=True,
-            max_review_cycles=3,
-            max_resume_attempts=1,
-        )
-        mock_git = MagicMock()
-        mock_git.current_branch.return_value = "main"
-        mock_git.can_merge.return_value = True
-        with patch("gza.cli.Config.load", return_value=mock_config), \
-             patch("gza.cli.get_store", return_value=store), \
-             patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg, \
-             patch("gza.cli.Git", return_value=mock_git):
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 0
-        # First call should be running the retry task (not the original failed one)
-        assert run_fg.call_count >= 1
-        first_task_id = run_fg.call_args_list[0][1]["task_id"]
-        assert first_task_id != impl.id  # Should be a new task
-        retry_task = store.get(first_task_id)
-        assert retry_task is not None
-        assert retry_task.same_branch is False
-        assert retry_task.base_branch == "feature/existing-impl-branch"
-        assert "Retrying failed implementation" in output
-        assert "Iterate complete: APPROVED" in output
-
-    def test_failed_task_resume_runs_then_iterates(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
-        """gza iterate --resume on a failed task resumes then enters the loop via real engine transitions."""
-        import argparse
-        from datetime import datetime
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = store.add("Implement feature", task_type="implement")
-        impl.status = "failed"
-        impl.failure_reason = "MAX_TURNS"
-        impl.session_id = "resume-session-1"
-        store.update(impl)
-
-        def fake_run_foreground(config, task_id, **kwargs):
-            task = store.get(task_id)
-            if task and task.status == "pending":
-                task.status = "completed"
-                if task.task_type == "review":
-                    task.output_content = "**Verdict: APPROVED**"
-                elif task.task_type == "implement":
-                    task.branch = "test-project/20260101-resume"
-                task.completed_at = datetime.now()
-                store.update(task)
-            return 0
-
-        args = argparse.Namespace(
-            project_dir=str(tmp_path),
-            impl_task_id=str(impl.id),
-            max_iterations=1,
-            dry_run=False,
-            no_docker=True,
-            resume=True,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            require_review_before_merge=False,
-            advance_create_reviews=True,
-            max_review_cycles=3,
-            max_resume_attempts=1,
-        )
-        mock_git = MagicMock()
-        mock_git.current_branch.return_value = "main"
-        mock_git.can_merge.return_value = True
-
-        with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
-            patch("gza.cli.Git", return_value=mock_git),
-        ):
-            result = cmd_iterate(args)
-        output = capsys.readouterr().out
-
-        assert result == 0
-        assert run_fg.call_count >= 1
-        first_task_id = run_fg.call_args_list[0][1]["task_id"]
-        assert first_task_id != impl.id
-        assert "Resuming failed implementation" in output
-        assert "Iterate complete: APPROVED" in output
-
     def test_failed_task_resume_reuses_matching_pending_resume_child(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """gza iterate --resume should reuse an existing pending resume child for the failed root task."""
         import argparse
@@ -15106,79 +15073,6 @@ class TestIterateCommand:
         assert "verify_" + "noop_improve_then_review" not in output
         assert "Iterate complete: BLOCKED (needs_discussion)" in output
 
-    def test_iterate_improve_resume_passes_resume_true_to_run_foreground(self, tmp_path: Path):
-        """When iterate picks 'resume' for an improve, _run_foreground must be called with resume=True.
-
-        Otherwise _auto_rebase_before_resume never fires and the resume runs on a stale branch.
-        """
-        import argparse
-        from unittest.mock import MagicMock, patch
-
-        from gza.cli import cmd_iterate
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        impl = self._make_completed_impl(store)
-
-        review = store.add("Review", task_type="review", depends_on=impl.id, based_on=impl.id)
-        review.status = "completed"
-        review.output_content = "**Verdict: CHANGES_REQUESTED**"
-        review.completed_at = datetime.now(UTC)
-        store.update(review)
-
-        failed_improve = store.add(
-            "Improve", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True
-        )
-        failed_improve.status = "failed"
-        failed_improve.failure_reason = "TIMEOUT"
-        failed_improve.session_id = "improve-session"
-        failed_improve.branch = impl.branch
-        store.update(failed_improve)
-
-        args = argparse.Namespace(
-            impl_task_id=impl.id,
-            max_iterations=1,
-            dry_run=False,
-            project_dir=tmp_path,
-            no_docker=True,
-            resume=False,
-            retry=False,
-            background=False,
-        )
-        mock_config = MagicMock(
-            project_dir=tmp_path,
-            use_docker=False,
-            project_prefix="testproject",
-            max_resume_attempts=3,
-        )
-        mock_git = MagicMock()
-        mock_git.current_branch.return_value = "main"
-
-        def fake_run_foreground(config, task_id, resume=False, **kwargs):
-            task = store.get(task_id)
-            assert task is not None
-            task.status = "completed"
-            task.completed_at = datetime.now(UTC)
-            store.update(task)
-            return 0
-
-        improve_action = {"type": "improve", "description": "Create improve", "review_task": review}
-        # First call is initial_action (pre-loop); second is the first loop iteration; third terminates.
-        engine_actions = [improve_action, improve_action, {"type": "skip", "description": "done"}]
-
-        with (
-            patch("gza.cli.Config.load", return_value=mock_config),
-            patch("gza.cli.get_store", return_value=store),
-            patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli.determine_next_action", side_effect=engine_actions),
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_fg,
-        ):
-            cmd_iterate(args)
-
-        assert run_fg.call_count == 1
-        # The improve-resume path must pass resume=True so _auto_rebase_before_resume fires.
-        assert run_fg.call_args_list[0].kwargs.get("resume") is True
-
     def test_iterate_improve_retry_preserves_review_backed_execution_settings(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
@@ -19763,6 +19657,37 @@ def test_cmd_run_startup_note_does_not_call_load_merge_context_when_git_provided
 
         def local_branch_names(self) -> frozenset:
             return frozenset()
+
+        def branch_exists(self, branch: str) -> bool:
+            del branch
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            del ref
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            del ref
+            return None
+
+        def resolve_refs(self, refs: object, peel: str = "commit") -> dict[str, str | None]:
+            del peel
+            return {str(ref): None for ref in refs}  # type: ignore[arg-type]
+
+        def refs_exist(self, refs: object) -> dict[str, bool]:
+            return {str(ref): False for ref in refs}  # type: ignore[arg-type]
+
+        def can_merge(self, branch: str, into: str | None = None) -> bool:
+            del branch, into
+            return True
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+            del branch, into, use_cherry
+            return False
+
+        def count_commits_ahead_checked(self, branch: str, target: str) -> int | None:
+            del branch, target
+            return 1
 
     monkeypatch.setattr(_execution_module, "Git", _TestGit)
 

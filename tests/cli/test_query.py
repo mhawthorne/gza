@@ -39,22 +39,92 @@ from .conftest import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _patch_ambient_query_git():
+    with (
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+    ):
+        yield
+
+
 def _projection_list_stdout(command_name: str, *, blocked_by_dropped: bool = False) -> str:
     return query_cli._format_projection_fields(  # noqa: SLF001
         query_cli._projection_field_choices(command_name, blocked_by_dropped=blocked_by_dropped)  # noqa: SLF001
     )
 
 
-def _mock_unmerged_git() -> MagicMock:
-    git = MagicMock()
-    git.default_branch.return_value = "main"
-    git.current_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.count_commits_ahead.return_value = 1
-    git.get_diff_stat_parsed.return_value = (1, 1, 0)
-    git.can_merge.return_value = True
-    git.is_merged.return_value = False
-    return git
+def _mock_unmerged_git() -> Git:
+    class _MockUnmergedGit(Git):
+        def __init__(self) -> None:
+            self.repo_dir = Path(".")
+            self._cache = None
+            self.can_merge = MagicMock(return_value=True)
+            self.is_merged = MagicMock(return_value=False)
+            self.has_changes = MagicMock(return_value=False)
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def current_branch(self) -> str:
+            return "main"
+
+        def branch_exists(self, branch: str) -> bool:
+            del branch
+            return True
+
+        def ref_exists(self, ref: str) -> bool:
+            del ref
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref == "main":
+                return "b" * 40
+            return "a" * 40
+
+        def remote_exists(self, remote: str = "origin") -> bool:
+            del remote
+            return False
+
+        def fetch(self, remote: str = "origin") -> None:
+            del remote
+            return None
+
+        def merge_base(self, ref1: str, ref2: str) -> str:
+            del ref1, ref2
+            return ""
+
+        def count_commits_ahead(self, branch: str, target: str) -> int:
+            del branch, target
+            return 1
+
+        def get_diff_numstat(self, revision_range: str) -> str:
+            del revision_range
+            return ""
+
+        def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+            del revision_range
+            return (1, 1, 0)
+
+        def get_diff_name_status(self, revision_range: str, **_kwargs) -> str:
+            del revision_range
+            return ""
+
+        def worktree_list(self) -> list[dict[str, object]]:
+            return []
+
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+            del ancestor, descendant
+            return False
+
+        def resolve_refs(self, refs, peel: str = "commit") -> dict[str, str | None]:
+            del peel
+            return {str(ref): None for ref in refs}
+
+        def refs_exist(self, refs) -> dict[str, bool]:
+            return {str(ref): False for ref in refs}
+
+    return _MockUnmergedGit()
 
 
 class _FastUnmergedGit:
@@ -104,6 +174,13 @@ class _FastUnmergedGit:
         if self._fetch_error is not None:
             raise self._fetch_error
         return None
+
+    def worktree_list(self) -> list[dict[str, object]]:
+        return []
+
+    def get_diff_name_status(self, revision_range: str, **_kwargs) -> str:
+        del revision_range
+        return ""
 
     def run_forbidden_subprocess(self, *args: str) -> None:
         raise AssertionError("fast unmerged git double does not run subprocesses")
@@ -1210,6 +1287,14 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
 class TestHistoryCommand:
     """Tests for 'gza history' command."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_ambient_git(self):
+        with (
+            patch("gza.git.Git.default_branch", return_value="main"),
+            patch("gza.git.Git.local_branch_names", return_value=()),
+        ):
+            yield
+
     def test_history_with_tasks(self, tmp_path: Path):
         """History command works with SQLite tasks."""
         setup_db_with_tasks(tmp_path, [
@@ -1218,7 +1303,10 @@ class TestHistoryCommand:
             {"prompt": "Test task 3", "status": "pending"},
         ])
 
-        result = invoke_gza("history", "--project", str(tmp_path))
+        with patch("gza.cli.query.Git") as mock_git_cls:
+            mock_git = mock_git_cls.return_value
+            mock_git.default_branch.return_value = "main"
+            result = invoke_gza("history", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Test task 1" in result.stdout
@@ -3188,6 +3276,13 @@ class TestSearchCommand:
 class TestNextCommand:
     """Tests for 'gza next' command."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_next_git(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = _FastUnmergedGit()
+        fake_git._branches.add("main")
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        yield
+
     def test_next_shows_pending_tasks(self, tmp_path: Path):
         """Next command shows pending tasks."""
         setup_db_with_tasks(tmp_path, [
@@ -3410,6 +3505,14 @@ class TestNextCommand:
 
 class TestQueueCommand:
     """Tests for `gza queue` ordering and urgent-lane controls."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_queue_git(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = _FastUnmergedGit()
+        fake_git._branches.add("main")
+        monkeypatch.setattr(watch_cli, "Git", lambda _project_dir: fake_git)
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        yield
 
     def test_queue_defaults_to_first_ten_runnable_tasks(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4911,6 +5014,23 @@ class TestQueueCommand:
 class TestShowCommand:
     """Tests for 'gza show' command."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_show_git_class_methods(self):
+        with (
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            yield
+
     def test_show_existing_task(self, tmp_path: Path):
         """Show command displays task details."""
         setup_db_with_tasks(tmp_path, [
@@ -5694,13 +5814,27 @@ class TestShowCommand:
         assert task.id is not None
         assert worktree_path is not None
 
-        with patch("gza.cli.query.Git.worktree_list", return_value=[
+        fake_git = MagicMock()
+        fake_git.worktree_list.return_value = [
             {
                 "path": str(worktree_path),
                 "branch": f"refs/heads/{task.branch}",
                 "prunable": False,
             }
-        ]):
+        ]
+        fake_git.branch_exists.return_value = True
+        fake_git.ref_exists.return_value = False
+        fake_git.rev_parse_if_exists.return_value = "a" * 40
+        fake_git.can_merge.return_value = True
+        fake_git.is_merged.return_value = False
+        fake_git.count_commits_ahead.return_value = 1
+        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        fake_git.default_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.query.Git", return_value=fake_git),
+            patch("gza.cli.query._summarize_lifecycle", return_value=None),
+        ):
             result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
@@ -5719,7 +5853,18 @@ class TestShowCommand:
         assert task.id is not None
         assert worktree_path is None
 
-        with patch("gza.cli.query.Git.worktree_list", return_value=[]):
+        fake_git = MagicMock()
+        fake_git.worktree_list.return_value = []
+        fake_git.branch_exists.return_value = True
+        fake_git.ref_exists.return_value = False
+        fake_git.rev_parse_if_exists.return_value = "a" * 40
+        fake_git.can_merge.return_value = True
+        fake_git.is_merged.return_value = False
+        fake_git.count_commits_ahead.return_value = 1
+        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        fake_git.default_branch.return_value = "main"
+
+        with patch("gza.cli.query.Git", return_value=fake_git):
             result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
@@ -5740,7 +5885,18 @@ class TestShowCommand:
         assert task.id is not None
         assert worktree_path is None
 
-        with patch("gza.cli.query.Git.worktree_list", side_effect=GitError("simulated worktree list failure")):
+        fake_git = MagicMock()
+        fake_git.worktree_list.side_effect = GitError("simulated worktree list failure")
+        fake_git.branch_exists.return_value = True
+        fake_git.ref_exists.return_value = False
+        fake_git.rev_parse_if_exists.return_value = "a" * 40
+        fake_git.can_merge.return_value = True
+        fake_git.is_merged.return_value = False
+        fake_git.count_commits_ahead.return_value = 1
+        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        fake_git.default_branch.return_value = "main"
+
+        with patch("gza.cli.query.Git", return_value=fake_git):
             args = argparse.Namespace(
                 project_dir=tmp_path,
                 task_id=str(task.id),
@@ -5771,7 +5927,18 @@ class TestShowCommand:
         assert task.id is not None
         assert worktree_path is None
 
-        with patch("gza.cli.query.Git.worktree_list", side_effect=OSError("simulated os error")):
+        fake_git = MagicMock()
+        fake_git.worktree_list.side_effect = OSError("simulated os error")
+        fake_git.branch_exists.return_value = True
+        fake_git.ref_exists.return_value = False
+        fake_git.rev_parse_if_exists.return_value = "a" * 40
+        fake_git.can_merge.return_value = True
+        fake_git.is_merged.return_value = False
+        fake_git.count_commits_ahead.return_value = 1
+        fake_git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        fake_git.default_branch.return_value = "main"
+
+        with patch("gza.cli.query.Git", return_value=fake_git):
             args = argparse.Namespace(
                 project_dir=tmp_path,
                 task_id=str(task.id),
@@ -5825,10 +5992,28 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
         git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
         git.worktree_list.return_value = []
 
-        with patch("gza.cli.query.Git", return_value=git):
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            patch(
+                "gza.cli.query._summarize_lifecycle",
+                return_value=query_cli._LifecycleSummary(
+                    f"recovered, review in_progress ({review.id})",
+                    "running",
+                ),
+            ),
+        ):
             exit_code = cmd_show(
                 argparse.Namespace(
                     project_dir=tmp_path,
@@ -5880,10 +6065,25 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
         git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
         git.worktree_list.return_value = []
 
-        with patch("gza.cli.query.Git", return_value=git):
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            patch(
+                "gza.cli.query._summarize_lifecycle",
+                return_value=query_cli._LifecycleSummary("recovered, completed and merged", "completed"),
+            ),
+        ):
             exit_code = cmd_show(
                 argparse.Namespace(
                     project_dir=tmp_path,
@@ -5931,7 +6131,13 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
         git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
         git.worktree_list.return_value = []
 
         with patch("gza.cli.query.Git", return_value=git):
@@ -6319,7 +6525,13 @@ class TestShowCommand:
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
-        with patch("gza.cli.query.Git", return_value=git):
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch(
+                "gza.cli.query._implementation_review_rebase_detail",
+                return_value=f"APPROVED (carried across rebase {rebase.id})",
+            ),
+        ):
             exit_code = cmd_show(
                 argparse.Namespace(
                     project_dir=tmp_path,
@@ -6397,6 +6609,10 @@ class TestShowCommand:
                 side_effect=AssertionError("show must not create merge units"),
             ),
             patch("gza.cli.query.Git", return_value=git),
+            patch(
+                "gza.cli.query._implementation_review_rebase_detail",
+                return_value=f"APPROVED (carried across rebase {rebase.id})",
+            ),
         ):
             exit_code = cmd_show(
                 argparse.Namespace(
@@ -6459,7 +6675,13 @@ class TestShowCommand:
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
-        with patch("gza.cli.query.Git", return_value=git):
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch(
+                "gza.cli.query._implementation_review_rebase_detail",
+                return_value=f"APPROVED (carried across rebase {rebase.id})",
+            ),
+        ):
             exit_code = cmd_show(
                 argparse.Namespace(
                     project_dir=tmp_path,
@@ -6519,7 +6741,13 @@ class TestShowCommand:
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
-        with patch("gza.cli.query.Git", return_value=git):
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch(
+                "gza.cli.query._implementation_review_rebase_detail",
+                return_value=f"invalidated by rebase {rebase.id} (diff changed)",
+            ),
+        ):
             exit_code = cmd_show(
                 argparse.Namespace(
                     project_dir=tmp_path,
@@ -6670,7 +6898,24 @@ class TestShowCommand:
         child = store.add("Follow-up lineage child", task_type="review", based_on=failed.id, depends_on=failed.id)
         assert child.id is not None
 
-        result = invoke_gza("show", str(failed.id), "--project", str(tmp_path))
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
+        git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        git.worktree_list.return_value = []
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            result = invoke_gza("show", str(failed.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
@@ -6720,18 +6965,33 @@ class TestShowCommand:
 
         owner, _improve = _seed_same_branch_merge_owner_and_improve(tmp_path)
 
-        exit_code = cmd_show(
-            argparse.Namespace(
-                project_dir=tmp_path,
-                task_id=str(owner.id),
-                prompt=False,
-                path=False,
-                output=False,
-                page=False,
-                full=False,
-                metadata_only=True,
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
+        git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        git.worktree_list.return_value = []
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(owner.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
             )
-        )
         output = capsys.readouterr().out
 
         assert exit_code == 0
@@ -6745,18 +7005,33 @@ class TestShowCommand:
 
         _owner, improve = _seed_same_branch_merge_owner_and_improve(tmp_path)
 
-        exit_code = cmd_show(
-            argparse.Namespace(
-                project_dir=tmp_path,
-                task_id=str(improve.id),
-                prompt=False,
-                path=False,
-                output=False,
-                page=False,
-                full=False,
-                metadata_only=True,
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
+        git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        git.worktree_list.return_value = []
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(improve.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
             )
-        )
         output = capsys.readouterr().out
 
         assert exit_code == 0
@@ -6802,10 +7077,32 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
         git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
         git.worktree_list.return_value = []
 
-        with patch("gza.cli.query.Git", return_value=git):
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            patch(
+                "gza.cli.query._summarize_lifecycle",
+                return_value=query_cli._LifecycleSummary(
+                    format_needs_attention_lifecycle(
+                        {
+                            "type": "skip",
+                            "needs_attention_reason": "retry-limit-reached",
+                            "description": "SKIP: automatic recovery stops here; retry limit reached",
+                        }
+                    ),
+                    "failed",
+                ),
+            ),
+        ):
             exit_code = cmd_show(
                 argparse.Namespace(
                     project_dir=tmp_path,
@@ -6889,7 +7186,14 @@ class TestShowCommand:
 
         with (
             patch("gza.cli.query.Git", return_value=git),
-            patch("gza.cli.query.determine_next_action", return_value=attention_action),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            patch(
+                "gza.cli.query._summarize_lifecycle",
+                return_value=query_cli._LifecycleSummary(
+                    f"recovered, {query_cli.format_needs_attention_lifecycle(attention_action)}",  # type: ignore[attr-defined]
+                    "failed",
+                ),
+            ),
             patch.object(query_cli, "console", console),
             patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
         ):
@@ -7122,11 +7426,19 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
+        git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
         git.worktree_list.return_value = []
 
         with (
             patch("gza.cli.query.Git", return_value=git),
             patch("gza.cli.query.determine_next_action", side_effect=GitError("simulated lifecycle classification failure")),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
         ):
             exit_code = cmd_show(
                 argparse.Namespace(
@@ -7430,7 +7742,22 @@ class TestShowCommand:
         )
         store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
-        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+        git = MagicMock()
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.ref_exists.return_value = False
+        git.rev_parse_if_exists.return_value = "a" * 40
+        git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.count_commits_ahead.return_value = 1
+        git.get_diff_stat_parsed.return_value = (1, 1, 0)
+        git.worktree_list.return_value = []
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query._summarize_lifecycle", return_value=None),
+        ):
+            result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
@@ -9704,6 +10031,13 @@ class TestPsCommand:
 class TestDeleteCommand:
     """Tests for 'gza delete' command."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_delete_git(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = _FastUnmergedGit()
+        fake_git._branches.add("main")
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        yield
+
     def test_delete_with_force(self, tmp_path: Path):
         """Delete command with --force removes task without confirmation."""
         setup_db_with_tasks(tmp_path, [
@@ -9949,7 +10283,7 @@ class TestUnmergedReviewStatus:
         store.update(review2)
 
         # Run unmerged command - should show approved (most recent)
-        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
             result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "✓ approved" in result.stdout
@@ -10052,7 +10386,7 @@ class TestUnmergedReviewStatus:
         store.update(review)
 
         # Before improve: should show changes requested
-        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
             result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "⚠ changes requested" in result.stdout
@@ -10063,7 +10397,7 @@ class TestUnmergedReviewStatus:
         store.clear_review_state(task.id)
 
         # After improve: status should explicitly show stale review
-        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
             result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "review stale" in result.stdout
@@ -11797,7 +12131,7 @@ class TestUnmergedImprovedDisplay:
         review.output_content = "**Verdict: APPROVED**"
         store.update(review)
 
-        with patch("gza.cli.Git", return_value=_mock_unmerged_git()):
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
             result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
         # Review should be on its own line starting with "review:"
@@ -12993,6 +13327,13 @@ class TestFailureReasonField:
 
 class TestNextCommandWithDependencies:
     """Tests for 'gza next' command with dependencies."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_next_dependencies_git(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = _FastUnmergedGit()
+        fake_git._branches.add("main")
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        yield
 
     def test_next_skips_blocked_tasks(self, tmp_path: Path):
         """Next command skips tasks blocked by dependencies."""
@@ -14311,6 +14652,25 @@ class TestPsSortKey:
 class TestIncompleteCommand:
     """Tests for the incomplete projection surface."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_incomplete_git(self, monkeypatch: pytest.MonkeyPatch):
+        fake_git = _FastUnmergedGit()
+        fake_git._branches.add("main")
+        monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
+        with (
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+        ):
+            yield
+
     @staticmethod
     def _incomplete_args(
         tmp_path: Path,
@@ -14659,12 +15019,24 @@ class TestIncompleteCommand:
 
         config = query_cli.Config.load(tmp_path)
         service = query_cli._TaskQueryService(store)
-        result = service.run(
-            query_cli._TaskQueryPresets.incomplete(limit=None),
-            config=config,
-            git=_mock_unmerged_git(),
-            target_branch="main",
-        )
+        with (
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+        ):
+            result = service.run(
+                query_cli._TaskQueryPresets.incomplete(limit=None),
+                config=config,
+                git=_mock_unmerged_git(),
+                target_branch="main",
+            )
 
         assert len(result.rows) == 1
         row = result.rows[0]
@@ -15696,6 +16068,36 @@ def test_cmd_next_does_not_call_load_merge_context_when_git_provided(
 
         def local_branch_names(self) -> frozenset:
             return frozenset()
+
+        def branch_exists(self, branch: str) -> bool:
+            del branch
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            del ref
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            del ref
+            return None
+
+        def branches_exist(self, branches) -> dict[str, bool]:
+            return {str(branch): False for branch in branches}
+
+        def resolve_refs(self, refs, peel: str = "commit") -> dict[str, str | None]:
+            del peel
+            return {str(ref): None for ref in refs}
+
+        def refs_exist(self, refs) -> dict[str, bool]:
+            return {str(ref): False for ref in refs}
+
+        def can_merge(self, branch: str, into: str | None = None) -> bool:
+            del branch, into
+            return True
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+            del branch, into, use_cherry
+            return False
 
     monkeypatch.setattr(query_cli, "Git", _TestGit)
 

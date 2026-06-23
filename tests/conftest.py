@@ -31,67 +31,6 @@ UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED = (
 # must stay narrow, temporary, and point at a dedicated follow-up implement
 # task so real subprocess drift is still surfaced at author time.
 UNIT_RUNTIME_SUBPROCESS_GUARD_EXEMPTIONS: dict[str, tuple[str, str]] = {
-    # tests/cli/* offenders the guard surfaces; cleanup tracked by gza-5375.
-    "tests/cli/test_advance_squash_threshold.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_config_cmds.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_execution.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_extract.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_git_ops.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_git_ops_merge_units.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_main.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_no_color.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_query.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
-    "tests/cli/test_tmux.py": (
-        "gza-5375",
-        "Temporary module-scoped exemption tracked by gza-5375, which converts the "
-        "tests/cli/ subprocess/git tests to in-process mocks (or relocates them to "
-        "tests_functional/) and then removes this exemption.",
-    ),
     # tests/* offenders the guard surfaces; cleanup tracked by gza-5376.
     "tests/test_advance_engine.py": (
         "gza-5376",
