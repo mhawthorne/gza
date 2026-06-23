@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import gza.recovery_engine as recovery_engine
 from gza.db import MergeUnit, SqliteTaskStore, Task
 from gza.lineage_query import LineageOwnerSnapshot, is_lineage_resolved
 from gza.query import (
@@ -965,6 +966,79 @@ class TestQueryIncomplete:
         assert lineages[0].root.id == root.id
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {resumed.id, improve.id}
+
+    def test_query_incomplete_flushes_prerequisite_reconciliation_after_read_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = self._store(tmp_path)
+
+        dependency = store.add("Merged dependency", task_type="implement")
+        assert dependency.id is not None
+        dependency.status = "completed"
+        dependency.merge_status = "merged"
+        dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+        store.update(dependency)
+
+        failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "PREREQUISITE_UNMERGED"
+        failed.branch = "feature/query-incomplete-prereq-empty"
+        failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+        store.update(failed)
+
+        class _EmptyBranchGit:
+            def resolve_fresh_merge_source(self, branch: str):
+                from gza.git import ResolvedMergeSourceRef
+
+                return ResolvedMergeSourceRef(branch)
+
+            def rev_parse_if_exists(self, ref: str) -> str | None:
+                if ref in {"main", failed.branch}:
+                    return "same-sha"
+                return None
+
+            def branch_exists(self, branch: str) -> bool:
+                return bool(branch)
+
+            def is_merged(self, branch: str, into: str) -> bool:
+                return False
+
+        monkeypatch.setattr(
+            recovery_engine,
+            "_load_merge_context",
+            lambda _project_dir=None: recovery_engine._MergeContext(
+                git=_EmptyBranchGit(),
+                default_branch="main",
+                existing_branches=frozenset({failed.branch}),
+            ),
+        )
+
+        depths: list[tuple[str, int]] = []
+        original_get_or_create = store.get_or_create_merge_unit_for_task
+        original_set_state = store.set_merge_unit_state
+
+        def _record_get_or_create(task):
+            depths.append(("get_or_create", store._read_session_depth))
+            return original_get_or_create(task)
+
+        def _record_set_state(unit_id: str, state: str) -> None:
+            depths.append(("set_merge_unit_state", store._read_session_depth))
+            original_set_state(unit_id, state)
+
+        monkeypatch.setattr(store, "get_or_create_merge_unit_for_task", _record_get_or_create)
+        monkeypatch.setattr(store, "set_merge_unit_state", _record_set_state)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+
+        assert lineages == []
+        assert depths
+        assert all(depth == 0 for _name, depth in depths)
+        merge_unit = store.resolve_merge_unit_for_task(failed.id)
+        assert merge_unit is not None
+        assert merge_unit.state == "empty"
 
     def test_status_failed_excludes_completed_unmerged_rows(self, tmp_path: Path):
         store = self._store(tmp_path)

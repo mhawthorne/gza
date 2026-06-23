@@ -6536,6 +6536,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         consecutive_noop_improves=2,
         max_noop_improve_cycles=2,
         noop_improve_trigger="comments",
+        noop_improve_verify_probe_warning=None,
         duplicate_blocker_streak=SimpleNamespace(
             cycles=3,
             title="Repeated blocker",

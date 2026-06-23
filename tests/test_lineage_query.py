@@ -2247,6 +2247,49 @@ def test_collect_recovery_lane_entries_uses_one_read_session_connection(
     assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
 
 
+def test_query_lineage_owner_rows_builds_owner_trees_without_store_lineage_child_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Failed implement owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "failed"
+    owner.failure_reason = "TEST_FAILURE"
+    owner.session_id = "tree-session"
+    owner.branch = "feature/tree-owner"
+    owner.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(owner)
+
+    child = store.add("Pending improve child", task_type="improve", based_on=owner.id, same_branch=True)
+    assert child.id is not None
+
+    grandchild = store.add("Pending review grandchild", task_type="review", depends_on=child.id)
+    assert grandchild.id is not None
+
+    lineage_child_calls: list[str] = []
+    original_get_lineage_children = store.get_lineage_children
+
+    def _counting_get_lineage_children(task_id: str):
+        lineage_child_calls.append(task_id)
+        return original_get_lineage_children(task_id)
+
+    monkeypatch.setattr(store, "get_lineage_children", _counting_get_lineage_children)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+    )
+
+    assert [row.owner_task.id for row in rows] == [owner.id]
+    assert rows[0].tree is not None
+    assert rows[0].tree.task.id == owner.id
+    assert [task.id for task in rows[0].members] == [owner.id]
+    assert lineage_child_calls == []
+
+
 def test_collect_recovery_lane_entries_performs_prerequisite_reconciliation_writes_only_after_read_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3011,10 +3054,8 @@ def test_query_lineage_owner_rows_short_circuits_merged_history_before_lineage_w
     )
 
     assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == set(live_owner_ids)
-    assert len(read_context_calls) == len(live_owner_ids)
-    assert len(store_calls) == len(live_owner_ids)
-    assert set(read_context_calls) == set(live_owner_ids)
-    assert set(store_calls) == set(live_owner_ids)
+    assert read_context_calls == []
+    assert store_calls == []
     assert not (set(read_context_calls) & set(merged_owner_ids))
     assert not (set(store_calls) & set(merged_owner_ids))
 
@@ -3108,8 +3149,8 @@ def test_query_lineage_owner_rows_short_circuits_attached_member_when_owner_unit
     )
 
     assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == {live_failed.id}
-    assert read_context_calls == [live_failed.id]
-    assert store_calls == [live_failed.id]
+    assert read_context_calls == []
+    assert store_calls == []
     assert attached_failed.id not in read_context_calls
     assert attached_failed.id not in store_calls
 

@@ -7,6 +7,7 @@ gza.api.v0 scripting namespace.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -392,7 +393,7 @@ def query_incomplete(
     target_branch: str | None = None,
 ) -> list[IncompleteLineage]:
     """Return unresolved lineages grouped by canonical root for attention workflows."""
-    from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+    from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
     from .task_query import DateFilter, normalize_tag_filters
 
     statuses: tuple[str, ...] | None = None
@@ -415,7 +416,7 @@ def query_incomplete(
         start=datetime.fromisoformat(f.start_date).date() if f.start_date else None,
         end=datetime.fromisoformat(f.end_date).date() if f.end_date else None,
     )
-    rows = query_lineage_owner_rows(
+    rows, _read_context = query_lineage_owner_rows_in_read_session(
         store,
         LineageOwnerQuery(
             limit=f.limit,
@@ -653,12 +654,62 @@ def build_lineage_tree(
     max_depth: int | None = None,
 ) -> TaskLineageNode:
     """Build a canonical lineage tree by walking both depends_on and based_on edges."""
+    if root_task.id is None:
+        return TaskLineageNode(task=root_task, depth=0, relationship="root")
+
+    def _load_children(parent_id: str) -> list[Task]:
+        return store.get_lineage_children(parent_id)
+
+    return _build_lineage_tree_from_child_loader(
+        root_task,
+        load_children=_load_children,
+        max_depth=max_depth,
+    )
+
+
+def build_lineage_tree_from_index(
+    root_task: Task,
+    *,
+    based_on_children: Mapping[str, list[Task]],
+    depends_on_children: Mapping[str, list[Task]],
+    max_depth: int | None = None,
+) -> TaskLineageNode:
+    """Build a lineage tree from preloaded child indexes instead of store queries."""
+    if root_task.id is None:
+        return TaskLineageNode(task=root_task, depth=0, relationship="root")
+
+    def _load_children(parent_id: str) -> list[Task]:
+        children_by_id: dict[str, Task] = {}
+        for child in based_on_children.get(parent_id, ()):
+            if child.id is None:
+                continue
+            children_by_id.setdefault(child.id, child)
+        for child in depends_on_children.get(parent_id, ()):
+            if child.id is None:
+                continue
+            children_by_id.setdefault(child.id, child)
+        return list(children_by_id.values())
+
+    return _build_lineage_tree_from_child_loader(
+        root_task,
+        load_children=_load_children,
+        max_depth=max_depth,
+    )
+
+
+def _build_lineage_tree_from_child_loader(
+    root_task: Task,
+    *,
+    load_children: Callable[[str], list[Task]],
+    max_depth: int | None,
+) -> TaskLineageNode:
+    """Build a canonical lineage tree from a caller-supplied child loader."""
 
     root = TaskLineageNode(task=root_task, depth=0, relationship="root")
-    if root_task.id is None:
-        return root
+    root_task_id = root_task.id
+    assert root_task_id is not None
 
-    attached_ids: set[str] = {root_task.id}
+    attached_ids: set[str] = {root_task_id}
 
     def _populate(node: TaskLineageNode) -> None:
         if max_depth is not None and node.depth >= max_depth:
@@ -667,7 +718,7 @@ def build_lineage_tree(
         if parent_id is None:
             return
 
-        children = store.get_lineage_children(parent_id)
+        children = load_children(parent_id)
         children.sort(key=lambda child: _lineage_child_sort_key(node.task, child))
 
         for child in children:

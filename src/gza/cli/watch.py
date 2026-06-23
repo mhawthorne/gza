@@ -34,7 +34,7 @@ from ..git import Git, GitError
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
-    _query_lineage_owner_rows_with_context,
+    query_lineage_owner_rows_in_read_session,
 )
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
@@ -397,7 +397,7 @@ def _query_owner_rows_with_context(
     max_recovery_attempts: int,
     include_skipped: bool,
 ) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
-    rows, read_context = _query_lineage_owner_rows_with_context(
+    rows, read_context = query_lineage_owner_rows_in_read_session(
         store,
         LineageOwnerQuery(
             limit=None,

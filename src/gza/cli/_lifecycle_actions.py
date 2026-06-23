@@ -12,7 +12,7 @@ from ..colors import pink
 from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git
-from ..lineage_query import LineageOwnerQuery, _query_lineage_owner_rows_with_context
+from ..lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
 from ..task_query import normalize_tag_filters
 from .advance_engine import classify_advance_action, determine_next_action
 
@@ -41,23 +41,22 @@ def collect_lifecycle_action_entries(
     persist_post_merge_rebase_state: bool = True,
 ) -> list[LifecycleActionEntry]:
     """Return actionable lifecycle rows in deterministic advance order."""
-    with store.read_session():
-        owner_rows, read_context = _query_lineage_owner_rows_with_context(
-            store,
-            LineageOwnerQuery(
-                limit=None,
-                statuses=("completed", "unmerged", "dropped"),
-                tags=normalize_tag_filters(tags),
-                any_tag=any_tag,
-                include_skipped=True,
-                exclude_dropped_from_planning=True,
-                max_recovery_attempts=max_recovery_attempts,
-            ),
-            config=config,
-            git=git,
-            target_branch=target_branch,
-            persist_post_merge_rebase_state=persist_post_merge_rebase_state,
-        )
+    owner_rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("completed", "unmerged", "dropped"),
+            tags=normalize_tag_filters(tags),
+            any_tag=any_tag,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=max_recovery_attempts,
+        ),
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+    )
 
     entries: list[LifecycleActionEntry] = []
     for row in owner_rows:

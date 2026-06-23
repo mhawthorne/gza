@@ -9,7 +9,7 @@ from typing import Any, Literal, TypeVar
 
 from . import lineage
 from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
-from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 
 QueryScope = Literal["tasks", "lineages"]
@@ -505,7 +505,7 @@ class TaskQueryService:
                 raise ValueError(
                     "lineages scope with lifecycle_state=incomplete supports at most one task type"
                 )
-            owner_rows = query_lineage_owner_rows(
+            owner_rows, _read_context = query_lineage_owner_rows_in_read_session(
                 self._store,
                 LineageOwnerQuery(
                     limit=None,

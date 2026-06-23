@@ -531,15 +531,21 @@ def _snapshot_task_is_complete(snapshot: LineageOwnerSnapshot, task: DbTask) -> 
 
 
 def _build_owner_tree(
-    store: SqliteTaskStore,
     *,
     root_task: DbTask,
     owner_task: DbTask,
     unresolved_tasks: Sequence[DbTask],
+    based_on_children: Mapping[str, list[DbTask]],
+    depends_on_children: Mapping[str, list[DbTask]],
 ) -> tuple[Any, tuple[DbTask, ...]]:
-    from .query import build_lineage_tree, flatten_lineage_tree
+    from .query import build_lineage_tree_from_index, flatten_lineage_tree
 
-    root_tree = build_lineage_tree(store, root_task, max_depth=None)
+    root_tree = build_lineage_tree_from_index(
+        root_task,
+        based_on_children=based_on_children,
+        depends_on_children=depends_on_children,
+        max_depth=None,
+    )
     keep_ids = {task.id for task in unresolved_tasks if task.id is not None}
     if owner_task.id is not None:
         keep_ids.add(owner_task.id)
@@ -975,6 +981,30 @@ def query_lineage_owner_rows(
     )
     return rows
 
+
+def query_lineage_owner_rows_in_read_session(
+    store: SqliteTaskStore,
+    query: LineageOwnerQuery,
+    *,
+    config: Config | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
+    persist_post_merge_rebase_state: bool = True,
+) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
+    from .recovery_engine import apply_pending_recovery_reconciliations
+
+    with store.read_session():
+        rows, read_context = _query_lineage_owner_rows_with_context(
+            store,
+            query,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        )
+    apply_pending_recovery_reconciliations(store, read_context=read_context)
+    return rows, read_context
+
 def _query_lineage_owner_rows_with_context(
     store: SqliteTaskStore,
     query: LineageOwnerQuery,
@@ -1322,6 +1352,7 @@ def _query_lineage_owner_rows_with_context(
                 impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                 max_resume_attempts=query.max_recovery_attempts,
                 persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+                read_context=read_context,
             )
             if lifecycle_action_task is not None and lifecycle_action_task.id is not None:
                 candidate = build_watch_progress_candidate(
@@ -1339,10 +1370,11 @@ def _query_lineage_owner_rows_with_context(
             continue
 
         tree, rendered_members = _build_owner_tree(
-            store,
             root_task=root,
             owner_task=owner,
             unresolved_tasks=tuple(unresolved_tasks),
+            based_on_children=indexes.based_on_children,
+            depends_on_children=indexes.depends_on_children,
         )
         summaries = tuple(
             UnresolvedLeafSummary(
@@ -1395,6 +1427,7 @@ __all__ = [
     "collect_stale_unmerged_sweep_candidates",
     "filter_display_unresolved_tasks_for_incomplete",
     "is_lineage_resolved",
+    "query_lineage_owner_rows_in_read_session",
     "query_lineage_owner_rows",
     "resolve_lineage_owner_task_id",
 ]

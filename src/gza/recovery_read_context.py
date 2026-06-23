@@ -59,7 +59,7 @@ class RecoveryReadContext:
     def get_based_on_children_by_type(self, task_id: str, task_type: str) -> tuple[DbTask, ...]:
         return tuple(child for child in self.based_on_children.get(task_id, ()) if child.task_type == task_type)
 
-    def get_lineage_children(self, task_id: str, *, parent: DbTask | None = None) -> tuple[DbTask, ...]:
+    def _indexed_lineage_children(self, task_id: str, *, parent: DbTask | None = None) -> tuple[DbTask, ...]:
         children_by_id: dict[str, DbTask] = {}
         ordered_children: list[DbTask] = []
         for child in self.based_on_children.get(task_id, ()):
@@ -82,6 +82,9 @@ class RecoveryReadContext:
             ordered_children.sort(key=lambda child: _lineage_child_sort_key(parent, child))
         return tuple(ordered_children)
 
+    def get_lineage_children(self, task_id: str, *, parent: DbTask | None = None) -> tuple[DbTask, ...]:
+        return self._indexed_lineage_children(task_id, parent=parent)
+
     def resolve_lineage_root(self, task: DbTask) -> DbTask:
         if task.id is None:
             return task
@@ -102,7 +105,7 @@ class RecoveryReadContext:
         return tree
 
     def _build_lineage_tree_uncached(self, root_task: DbTask):
-        from .query import TaskLineageNode, _classify_child_relationship, _lineage_child_sort_key
+        from .query import TaskLineageNode, _classify_child_relationship
 
         root = TaskLineageNode(task=root_task, depth=0, relationship="root")
         if root_task.id is None:
@@ -115,10 +118,7 @@ class RecoveryReadContext:
             if parent_id is None:
                 return
 
-            children = list(self.get_lineage_children(parent_id))
-            children.sort(key=lambda child: _lineage_child_sort_key(node.task, child))
-
-            for child in children:
+            for child in self._indexed_lineage_children(parent_id, parent=node.task):
                 child_id = child.id
                 if child_id is None:
                     continue

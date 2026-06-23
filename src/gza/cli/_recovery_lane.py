@@ -11,13 +11,9 @@ from ..git import Git
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
-    _query_lineage_owner_rows_with_context,
+    query_lineage_owner_rows_in_read_session,
 )
-from ..recovery_engine import (
-    FailedRecoveryDecision,
-    apply_pending_recovery_reconciliations,
-    decide_failed_task_recovery,
-)
+from ..recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from ..task_query import normalize_tag_filters
 from .advance_engine import failed_recovery_decision_to_attention_action
 
@@ -42,21 +38,19 @@ def collect_recovery_lane_entries(
     target_branch: str | None = None,
 ) -> list[RecoveryLaneEntry]:
     """Return visible recovery-lane entries in deterministic watch order."""
-    with store.read_session():
-        owner_rows, read_context = _query_lineage_owner_rows_with_context(
-            store,
-            LineageOwnerQuery(
-                limit=None,
-                tags=normalize_tag_filters(tags),
-                any_tag=any_tag,
-                include_skipped=True,
-                exclude_dropped_from_planning=True,
-                max_recovery_attempts=max_recovery_attempts,
-            ),
-            git=git,
-            target_branch=target_branch,
-        )
-    apply_pending_recovery_reconciliations(store, read_context=read_context)
+    owner_rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            tags=normalize_tag_filters(tags),
+            any_tag=any_tag,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=max_recovery_attempts,
+        ),
+        git=git,
+        target_branch=target_branch,
+    )
     failed_rows = [
         row
         for row in owner_rows

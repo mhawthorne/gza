@@ -225,6 +225,139 @@ def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> 
     assert impl.id not in message
 
 
+def test_watch_query_owner_rows_uses_one_read_session_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implement owner", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "watch-session"
+    failed.branch = "feature/watch-read-session"
+    failed.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    store.update(failed)
+
+    opened_connections: list[tuple[bool, object]] = []
+    original_open_connection = store._open_connection
+
+    def _tracking_open_connection(*, close_on_exit: bool):
+        conn = original_open_connection(close_on_exit=close_on_exit)
+        opened_connections.append((close_on_exit, conn))
+        return conn
+
+    monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+
+    rows, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert [row.owner_task.id for row in rows] == [failed.id]
+    assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
+
+
+def test_watch_query_owner_rows_flushes_prerequisite_reconciliation_after_read_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/watch-prereq-empty"
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    class _EmptyBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in {"main", failed.branch}:
+                return "same-sha"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: recovery_engine._MergeContext(
+            git=_EmptyBranchGit(),
+            default_branch="main",
+            existing_branches=frozenset({failed.branch}),
+        ),
+    )
+
+    depths: list[tuple[str, int]] = []
+    original_get_or_create = store.get_or_create_merge_unit_for_task
+    original_set_state = store.set_merge_unit_state
+
+    def _record_get_or_create(task):
+        depths.append(("get_or_create", store._read_session_depth))
+        return original_get_or_create(task)
+
+    def _record_set_state(unit_id: str, state: str) -> None:
+        depths.append(("set_merge_unit_state", store._read_session_depth))
+        original_set_state(unit_id, state)
+
+    monkeypatch.setattr(store, "get_or_create_merge_unit_for_task", _record_get_or_create)
+    monkeypatch.setattr(store, "set_merge_unit_state", _record_set_state)
+
+    rows, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert [row.owner_task.id for row in rows] == [failed.id]
+    assert depths
+    assert all(depth == 0 for _name, depth in depths)
+    merge_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert merge_unit is not None
+    assert merge_unit.state == "empty"
+
+    rows_after, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert rows_after == []
+
+
 def test_watch_cycle_surfaces_manual_review_creation_as_attention(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"

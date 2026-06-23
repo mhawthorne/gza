@@ -937,7 +937,7 @@ def test_collect_lifecycle_action_entries_forwards_persist_override(tmp_path: Pa
     )
     monkeypatch.setattr(
         lifecycle_actions_cli,
-        "_query_lineage_owner_rows_with_context",
+        "query_lineage_owner_rows_in_read_session",
         lambda *args, **kwargs: ((row,), object()),
     )
 
