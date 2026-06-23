@@ -2,7 +2,7 @@
 name: gza-system-triage
 description: Turn the recurring `watch` stuck-task pile into (1) a diagnosis of why each class is stuck, (2) the existing stuck rows actually cleared now, and (3) systemic prevention so it does not recur. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, unsticks each row by its clearing action (drop moot/dead/stale, spawn follow-up, hand review-loop rows to /gza-task-fix), then ranks and files `system`-tagged prevention fixes by blast radius (cascade-preventer first). Never merges, retries, resumes, deletes branches, or edits code.
 allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza implement:*), Bash(uv run gza set-status:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
-version: 1.2.1
+version: 1.3.0
 public: false
 ---
 
@@ -45,12 +45,13 @@ If the argument is absent or unclear, default to `manual`.
 
 ### Step 1: Snapshot the slow surfaces (and cache)
 
-`watch`/`incomplete`/`queue` are slow to query — capture once and reuse within the session. Write raw outputs to `.gza/system-triage/snapshot-<timestamp>.json` (create the dir if needed). If a snapshot under ~15 minutes old already exists, reuse it unless the caller asks to refresh.
+`watch`/`incomplete`/`queue` are slow to query — capture once and reuse within the session. **Capture a single run timestamp and reuse it as the filename _prefix_ for every artifact this run** (the snapshot here and the findings report in Step 7): `TS=$(date +%Y%m%d-%H%M%S)`. Write raw outputs to `.gza/system-triage/${TS}-snapshot.json` (timestamp is the filename **prefix**, not a suffix; create the dir if needed). If a `*-snapshot.json` under ~15 minutes old already exists, reuse it unless the caller asks to refresh.
 
 Default to **recent** failures (last 24h) — do not dredge an all-time backlog unless asked.
 
 ```bash
 mkdir -p .gza/system-triage
+TS=$(date +%Y%m%d-%H%M%S)                                               # reuse as the prefix for ${TS}-snapshot.json AND ${TS}-triage.md
 uv run gza incomplete --json --last 0                                   # needs-attention rows (next_action_reason)
 uv run gza history --status failed --json --days 1 --date-field effective   # recent failed leaves (failure_reason)
 uv run gza next --all                                                    # recovery + pending lanes, blocked rows
@@ -163,6 +164,8 @@ uv run gza queue bump <new-task-id>
 - A **per-task rescue** (one unit's review/improve churn, not a class) is a `/gza-task-fix <impl-id>` recommendation — do not file a system task for it.
 
 **Report** (both modes): **rows unstuck** (dropped / follow-ups spawned / handed to `/gza-task-fix`, with counts and IDs), classes filed for prevention (new IDs, tags, bumped?), classes skipped as already-tracked, classes escalated for cause-layer re-diagnosis. The headline proves all three happened — e.g. "87 rows cleared, 1 cascade prevention filed, 1 class already tracked."
+
+**Persist the report to a timestamped file (both modes, always — this is the durable record, not just conversation output).** Write the full report — the class buckets with blast radius, every per-row unstick decision (drop / spawn / rescue / leave), the pairing-gate outcome per rescue (*filed-broad* / *already-tracked* / *escalated-to-cause-layer*), and all filed task IDs — to `.gza/system-triage/${TS}-triage.md`, reusing the **same `${TS}` prefix** as the snapshot from Step 1 (timestamp is the filename **prefix**, not a suffix). This gives an audit trail and lets a later session diff against it instead of re-deriving the landscape. Mirror how `explore`/`review` tasks persist reports to `.gza/explorations/` and `.gza/reviews/`. Write this file even when the user skips filing — the findings still stand.
 
 ## Output style
 
