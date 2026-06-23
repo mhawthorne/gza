@@ -2,7 +2,7 @@
 name: gza-system-triage
 description: Turn the recurring `watch` stuck-task pile into (1) a diagnosis of why each class is stuck, (2) the existing stuck rows actually cleared now, and (3) systemic prevention so it does not recur. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, unsticks each row by its clearing action (drop moot/dead/stale, spawn follow-up, hand review-loop rows to /gza-task-fix), then ranks and files `system`-tagged prevention fixes by blast radius (cascade-preventer first). Never merges, retries, resumes, deletes branches, or edits code.
 allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza implement:*), Bash(uv run gza set-status:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
-version: 1.1.0
+version: 1.2.1
 public: false
 ---
 
@@ -30,6 +30,7 @@ These guardrails are load-bearing.
 - **Do not file untagged tasks.** Every filed task gets `system` plus the active recovery tag — an untagged task is a silent orphan watch never runs.
 - **Do not file anything in manual mode without confirmation.**
 - **Do not propose another narrow guard for a class that already recurred after a fix landed.** That is the signal the previous fix missed the cause layer — escalate to re-diagnose deeper (see `specs/behavior/systemic-fix-triage.md`), never patch the symptom again.
+- **Do not rescue a task without accounting for its auto-merge fix, and never re-file a fix that already landed.** Every `/gza-task-fix` rescue is a *failed auto-merge* — run the pairing-with-verification gate (Step 7) before filing any prevention. If the fix that would have auto-merged the task already merged yet the task still got stuck, file a cause-layer escalation, never another copy of that fix. A prevention that clears only the one rescued row is a symptom patch, not a systemic fix.
 
 ## Modes
 
@@ -122,7 +123,19 @@ Prevention (Step 7) stops recurrence; it does **not** clear the rows already stu
 
 ### Step 7: Schedule prevention — present (manual) or file (auto)
 
-For each ranked class produce one block:
+**First — the pairing-with-verification gate (run for every row you unstuck by hand in Step 6).**
+
+A manual unstick — above all a `/gza-task-fix` RESCUE — is itself proof that auto-merge failed for that task. The triage is not done until the fix that *would have auto-merged it* is accounted for. But "file a prevention" is the trap: that fix may already exist, and may already have failed. For each rescued / hand-unstuck task, name the fix that would have auto-merged it, then check its status and **branch on it**:
+
+- **Not filed anywhere** (confirm via `gza next --all --tag system` and `gza history --tag system --json --last 0`) → file the broadest version — one that would auto-merge this task *and its siblings*, never a one-row patch.
+- **Filed, not yet landed** → already tracked; collapse to "tracked by gza-XXXX", do not duplicate.
+- **Landed (merged) but the task still got stuck** → **do NOT file another fix.** The merged fix missed the cause layer. File exactly one *cause-layer escalation* as an **`implement`** task (it investigates-and-fixes in one unit and stays on the auto-merge rails) — or a `plan` if the fix genuinely needs design first. **Never an `explore`:** a completed explore only parks at `explore-needs-follow-up-decision` and auto-merges nothing, so it would just become another stuck row. State the evidence in the prompt: "fix gza-XXXX merged `<date>`, yet this task parked on `<reason>` `<after that date>` — find why the merged path doesn't fire and fix the gap." Re-filing the symptom is forbidden (MUST-NOT recurrence rule). To make this branch real you must look up the candidate fix's **merge state and date** (`gza show <id>` / lineage) and compare against the stuck task's last-activity date — a claim that "X will handle it" without that check is how dud duplicates get filed.
+
+**Breadth test:** reject any prevention that would clear only the one rescued row. The target is the cause that auto-merges multiple stuck siblings; a one-row fix is a symptom patch, not a systemic fix.
+
+Report the pairing outcome per rescue: *filed-broad* / *already-tracked* / *escalated-to-cause-layer*.
+
+Then, for each ranked class produce one block:
 
 - **Class** + **blast radius** (N rows) + affected task IDs.
 - **The systemic fix**, stated as a *precondition or rule change*, and its shape: a code change to file, a cycle-level gate, or a `/gza-task-fix` per-task handoff.
