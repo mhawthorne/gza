@@ -21,6 +21,7 @@ class RecoveryReadContext:
     merge_units_by_task_id: Mapping[str, MergeUnit] = field(default_factory=dict)
     merge_context: object | None = None
     recovery_snapshots: dict[str, object] = field(default_factory=dict)
+    lineage_tree_by_root_task_id: dict[str, object] = field(default_factory=dict)
     lineage_by_root_task_id: dict[str, tuple[DbTask, ...]] = field(default_factory=dict)
     dependency_completion_by_task_id: dict[str, DbTask | None] = field(default_factory=dict)
     pending_prerequisite_no_work_reconciliations: dict[
@@ -86,21 +87,38 @@ class RecoveryReadContext:
             return task
         return self.root_by_task_id.get(task.id, task)
 
-    def build_lineage(self, root_task: DbTask) -> tuple[DbTask, ...]:
+    def build_lineage_tree(self, root_task: DbTask):
         if root_task.id is None:
-            return ()
-        cached = self.lineage_by_root_task_id.get(root_task.id)
+            from .query import TaskLineageNode
+
+            return TaskLineageNode(task=root_task, depth=0, relationship="root")
+
+        cached = self.lineage_tree_by_root_task_id.get(root_task.id)
         if cached is not None:
             return cached
 
-        attached_ids: set[str] = {root_task.id}
-        lineage: list[DbTask] = [root_task]
+        tree = self._build_lineage_tree_uncached(root_task)
+        self.lineage_tree_by_root_task_id[root_task.id] = tree
+        return tree
 
-        def _populate(parent: DbTask) -> None:
-            parent_id = parent.id
+    def _build_lineage_tree_uncached(self, root_task: DbTask):
+        from .query import TaskLineageNode, _classify_child_relationship, _lineage_child_sort_key
+
+        root = TaskLineageNode(task=root_task, depth=0, relationship="root")
+        if root_task.id is None:
+            return root
+
+        attached_ids: set[str] = {root_task.id}
+
+        def _populate(node: TaskLineageNode) -> None:
+            parent_id = node.task.id
             if parent_id is None:
                 return
-            for child in self.get_lineage_children(parent_id, parent=parent):
+
+            children = list(self.get_lineage_children(parent_id))
+            children.sort(key=lambda child: _lineage_child_sort_key(node.task, child))
+
+            for child in children:
                 child_id = child.id
                 if child_id is None:
                     continue
@@ -109,11 +127,27 @@ class RecoveryReadContext:
                 if child_id in attached_ids:
                     continue
                 attached_ids.add(child_id)
-                lineage.append(child)
-                _populate(child)
+                child_node = TaskLineageNode(
+                    task=child,
+                    depth=node.depth + 1,
+                    relationship=_classify_child_relationship(node.task, child),
+                )
+                node.children.append(child_node)
+                _populate(child_node)
 
-        _populate(root_task)
-        flattened = tuple(lineage)
+        _populate(root)
+        return root
+
+    def build_lineage(self, root_task: DbTask) -> tuple[DbTask, ...]:
+        if root_task.id is None:
+            return ()
+        cached = self.lineage_by_root_task_id.get(root_task.id)
+        if cached is not None:
+            return cached
+
+        from .query import flatten_lineage_tree
+
+        flattened = tuple(flatten_lineage_tree(self.build_lineage_tree(root_task)))
         self.lineage_by_root_task_id[root_task.id] = flattened
         return flattened
 

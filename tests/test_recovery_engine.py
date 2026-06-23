@@ -3394,6 +3394,75 @@ def test_list_failed_tasks_for_recovery_uses_indexed_lineage_without_store_walks
     assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
 
 
+def test_list_failed_tasks_for_recovery_memoizes_lineage_tree_by_root_per_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed_root = store.add("Failed implementation", task_type="implement")
+    assert failed_root.id is not None
+    failed_root.status = "failed"
+    failed_root.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_root.branch = "feature/shared-root"
+    failed_root.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(failed_root)
+
+    merged_follow_up = store.add(
+        "Merged same-branch follow-up",
+        task_type="implement",
+        based_on=failed_root.id,
+        recovery_origin="manual",
+    )
+    assert merged_follow_up.id is not None
+    merged_follow_up.status = "completed"
+    merged_follow_up.branch = failed_root.branch
+    merged_follow_up.has_commits = True
+    merged_follow_up.merge_status = "merged"
+    merged_follow_up.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(merged_follow_up)
+
+    review = store.add("Review", task_type="review", depends_on=merged_follow_up.id, based_on=failed_root.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 16, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=failed_root.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.branch = failed_root.branch
+    failed_improve.completed_at = datetime(2026, 5, 16, 11, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    store_result = list_failed_tasks_for_recovery(store)
+    assert store_result == []
+
+    read_context = _read_context_for_store(store)
+    build_count = 0
+    original = read_context._build_lineage_tree_uncached
+
+    def _counting_build(root_task):
+        nonlocal build_count
+        build_count += 1
+        return original(root_task)
+
+    monkeypatch.setattr(read_context, "_build_lineage_tree_uncached", _counting_build)
+
+    indexed_result = list_failed_tasks_for_recovery(store, read_context=read_context)
+
+    assert indexed_result == store_result == []
+    assert build_count == 1
+
+
 def test_decide_failed_task_recovery_uses_injected_merge_context_not_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
