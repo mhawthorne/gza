@@ -54,6 +54,8 @@ from gza.runner import (
     _filter_owned_artifact_paths,
     _find_out_of_scope_paths,
     _project_boundary,
+    _review_is_verify_only_blocked_at_head,
+    _task_has_current_passing_review_verify_evidence,
     _task_is_cross_project,
 )
 from gza.source_followup import (
@@ -133,6 +135,14 @@ class RebaseFailureStreak:
 
 
 @dataclass(frozen=True)
+class BranchHeadResolution:
+    """Current branch-head probe result for verify-evidence freshness checks."""
+
+    head_sha: str | None
+    warning: str | None = None
+
+
+@dataclass(frozen=True)
 class PlanMaterializationState:
     """Whether the current approved plan-review manifest is already materialized."""
 
@@ -200,6 +210,7 @@ class AdvanceContext:
     latest_noop_improve: DbTask | None = None
     consecutive_noop_improves: int = 0
     noop_improve_trigger: str | None = None
+    noop_improve_verify_probe_warning: str | None = None
     duplicate_blocker_streak: DuplicateBlockerStreak | None = None
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
@@ -596,6 +607,65 @@ def _latest_review_is_verify_blocked_only(ctx: AdvanceContext) -> bool:
     )
 
 
+def _resolve_branch_head_sha(git: Any, branch: str | None) -> BranchHeadResolution:
+    if not branch:
+        return BranchHeadResolution(head_sha=None)
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    if not callable(rev_parse_if_exists):
+        return BranchHeadResolution(head_sha=None)
+    try:
+        head_sha = rev_parse_if_exists(branch)
+    except Exception as exc:
+        return BranchHeadResolution(
+            head_sha=None,
+            warning=(
+                f"branch-head probe failed for {branch}: {exc}"
+            ),
+        )
+    return BranchHeadResolution(
+        head_sha=head_sha if isinstance(head_sha, str) and head_sha else None
+    )
+
+
+def _has_persisted_noop_improve_verify_clearance(
+    *,
+    git: Any,
+    task: DbTask,
+    latest_completed_review: DbTask | None,
+    improve_tasks: list[DbTask],
+) -> tuple[bool, str | None]:
+    """Fail closed unless current branch-head evidence clears a verify-only review."""
+    if latest_completed_review is None or task.branch is None:
+        return False, None
+
+    branch_head = _resolve_branch_head_sha(git, task.branch)
+    if branch_head.warning is not None:
+        return False, branch_head.warning
+
+    current_head_sha = branch_head.head_sha
+    if not _review_is_verify_only_blocked_at_head(
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha,
+    ):
+        return False, None
+
+    return (
+        any(
+        improve.status == "completed"
+        and improve.changed_diff is False
+        and _task_has_current_passing_review_verify_evidence(
+            task=improve,
+            review_task=latest_completed_review,
+            current_branch=task.branch,
+            current_head_sha=current_head_sha,
+        )
+        for improve in improve_tasks
+        ),
+        None,
+    )
+
+
 def _normalize_blocker_title(title: str) -> str:
     normalized = re.sub(r"`+", "", title).strip().lower()
     normalized = re.sub(r"^#+\s*", "", normalized)
@@ -811,6 +881,25 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
     )
 
 
+def _noop_improve_verify_probe_failure_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.noop_improve_verify_probe_warning is not None
+    latest_noop_id = _task_id(ctx.latest_noop_improve)
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
+                f"(latest {latest_noop_id}), but verify-only auto-clear could not be validated "
+                f"because {ctx.noop_improve_verify_probe_warning}. Review remains uncleared until "
+                "branch-head freshness can be established."
+            ),
+            "probe_warning": ctx.noop_improve_verify_probe_warning,
+        },
+        reason="improve-no-op",
+        subject_task_id=_needs_attention_subject_id(ctx),
+    )
+
+
 def _verify_blocked_no_code_issues_action(ctx: AdvanceContext) -> dict[str, Any]:
     return with_needs_attention(
         {
@@ -829,6 +918,8 @@ def _verify_blocked_no_code_issues_action(ctx: AdvanceContext) -> dict[str, Any]
 
 def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
     """Park a no-op loop unless runner-owned verify evidence has already cleared it."""
+    if ctx.noop_improve_verify_probe_warning is not None:
+        return _noop_improve_verify_probe_failure_action(ctx)
     if (
         ctx.review_verdict == "CHANGES_REQUESTED"
         and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
@@ -1744,6 +1835,7 @@ def _resolve_review_state(
     config: Any,
     store: SqliteTaskStore,
     task: DbTask,
+    git: Any,
 ) -> tuple[
     list[DbTask],
     DbTask | None,
@@ -1760,6 +1852,7 @@ def _resolve_review_state(
     DbTask | None,
     int,
     str | None,
+    str | None,
     bool,
     bool,
     DbTask | None,
@@ -1771,12 +1864,13 @@ def _resolve_review_state(
     completed_reviews = [r for r in reviews if r.status == "completed"]
     latest_completed_review = completed_reviews[0] if completed_reviews else None
 
-    review_cleared = (
+    persisted_review_cleared = (
         latest_completed_review is not None
         and task.review_cleared_at is not None
         and latest_completed_review.completed_at is not None
         and task.review_cleared_at >= latest_completed_review.completed_at
     )
+    review_cleared = persisted_review_cleared
 
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
@@ -1789,6 +1883,7 @@ def _resolve_review_state(
     latest_noop_improve: DbTask | None = None
     consecutive_noop_improves = 0
     noop_improve_trigger: str | None = None
+    noop_improve_verify_probe_warning: str | None = None
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
     latest_completed_code_change: DbTask | None = None
@@ -1826,6 +1921,13 @@ def _resolve_review_state(
         active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
         latest_noop_improve, consecutive_noop_improves = _count_consecutive_noop_improves(improve_tasks)
+        if not review_cleared:
+            review_cleared, noop_improve_verify_probe_warning = _has_persisted_noop_improve_verify_clearance(
+                git=git,
+                task=task,
+                latest_completed_review=latest_completed_review,
+                improve_tasks=improve_tasks,
+            )
 
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
             has_improve_after_review = (
@@ -1882,6 +1984,7 @@ def _resolve_review_state(
         latest_noop_improve,
         consecutive_noop_improves,
         noop_improve_trigger,
+        noop_improve_verify_probe_warning,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
@@ -2390,11 +2493,12 @@ def resolve_advance_context(
         latest_noop_improve,
         consecutive_noop_improves,
         noop_improve_trigger,
+        noop_improve_verify_probe_warning,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
         closing_review_action,
-    ) = _resolve_review_state(config, store, review_root_task)
+    ) = _resolve_review_state(config, store, review_root_task, git)
 
     ctx = _build_base_advance_context(
         config=config,
@@ -2433,6 +2537,7 @@ def resolve_advance_context(
         latest_noop_improve=latest_noop_improve,
         consecutive_noop_improves=consecutive_noop_improves,
         noop_improve_trigger=noop_improve_trigger,
+        noop_improve_verify_probe_warning=noop_improve_verify_probe_warning,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,

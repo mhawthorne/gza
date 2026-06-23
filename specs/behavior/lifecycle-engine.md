@@ -203,9 +203,12 @@ When a current review exists for the implementation lineage:
   passing in-improve evidence has already cleared the review, normal merge rules apply.
   Otherwise, if `verify_command` still fails, the evidence is absent, stale, or recorded
   at a different branch/head, or the blocker is not verify-only, the no-op improve limit
-  MUST park rather than auto-clear. When the review-time runner verify PASSED, or no
-  runner-owned review verify exists, the blocker is treated as a genuine code issue and
-  still requires a real code change before merge.
+  MUST park rather than auto-clear. If lifecycle cannot resolve the current branch head
+  while checking that provenance, it MUST still fail closed but surface that probe
+  failure in the parked result instead of silently degrading to a generic no-op loop.
+  When the review-time runner verify PASSED, or no runner-owned review verify exists,
+  the blocker is treated as a genuine code issue and still requires a real code change
+  before merge.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the

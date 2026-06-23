@@ -3334,6 +3334,66 @@ def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path
     assert "improve-no-op" not in action["description"]
 
 
+def test_verify_only_noop_improve_with_persisted_green_verify_evidence_becomes_mergeable(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-persisted-green",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "current-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, improve, "main")
+
+    assert ctx.review_cleared is True
+    assert action["type"] == "merge"
+    assert "improve-no-op" not in action["description"]
+
+
 def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -3388,7 +3448,70 @@ def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tm
     assert action["type"] != "merge"
 
 
-def test_noop_improve_limit_ignores_branch_tip_errors_and_skips_verify_availability_probe(tmp_path: Path) -> None:
+def test_verify_only_noop_improve_with_persisted_failing_verify_evidence_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-still-failing",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify still fails.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "failed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "current-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, improve, "main")
+
+    assert ctx.review_cleared is False
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+
+
+def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_availability_probe(
+    tmp_path: Path,
+) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "uv run pytest tests/ -q"
@@ -3435,10 +3558,18 @@ def test_noop_improve_limit_ignores_branch_tip_errors_and_skips_verify_availabil
         rev_parse_errors={impl.branch: GitError("should not resolve branch tip")},
         name_status_error_by_range={f"main...{impl.branch}": GitError("should not inspect verify availability")},
     )
+    ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
+    assert ctx.review_cleared is False
+    assert ctx.noop_improve_verify_probe_warning == (
+        f"branch-head probe failed for {impl.branch}: should not resolve branch tip"
+    )
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["probe_warning"] == ctx.noop_improve_verify_probe_warning
+    assert "branch-head probe failed" in action["description"]
+    assert "verify-only auto-clear could not be validated" in action["description"]
     assert git.name_status_calls == []
 
 
