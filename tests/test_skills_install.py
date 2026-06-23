@@ -19,6 +19,19 @@ def setup_config(tmp_path: Path) -> None:
     )
 
 
+def setup_shared_db_config(tmp_path: Path) -> Path:
+    """Set up a shared-DB config that requires project-bound store resolution."""
+    shared_db = tmp_path / "shared" / "gza.db"
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        "project_name: test-project\n"
+        "project_id: testproject\n"
+        "project_prefix: testproject\n"
+        f"db_path: {shared_db}\n"
+    )
+    return shared_db
+
+
 def _create_store_for_project(tmp_path: Path):
     from gza.config import Config
     from gza.db import SqliteTaskStore
@@ -863,9 +876,31 @@ class TestSkillContentValidation:
         assert "from gza.models import Task" not in content
         assert "config = Config.load(Path.cwd())" in content
         assert "SqliteTaskStore.from_config(config)" in content
+        assert "SqliteTaskStore(config.db_path)" not in content
         assert "store.add(" in content
         assert "store.update(created)" in content
         assert "store.create(" not in content
+
+    def test_manual_task_skill_bootstrap_resolves_existing_task_in_shared_db(self, tmp_path: Path):
+        """The documented manual-task bootstrap must resolve tasks through shared-DB project scoping."""
+        from gza.config import Config
+        from gza.db import SqliteTaskStore
+
+        setup_shared_db_config(tmp_path)
+        config = Config.load(tmp_path)
+
+        shared_store = SqliteTaskStore.from_config(config)
+        created = shared_store.add("Shared DB task for skill bootstrap")
+        assert created.id is not None
+
+        unscoped_store = SqliteTaskStore(config.db_path)
+        assert unscoped_store.get(created.id) is None
+
+        scoped_store = SqliteTaskStore.from_config(config)
+        resolved = scoped_store.get(created.id)
+        assert resolved is not None
+        assert resolved.id == created.id
+        assert resolved.prompt == created.prompt
 
     @pytest.mark.parametrize(
         ("skill_name", "expects_git_import", "path_var"),

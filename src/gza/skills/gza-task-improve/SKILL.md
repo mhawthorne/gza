@@ -36,7 +36,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 
 config = Config.load(Path.cwd())
-store = SqliteTaskStore(config.db_path)
+store = SqliteTaskStore.from_config(config)
 task = store.get(<TASK_ID>)
 if not task:
     print('ERROR: Task not found', file=sys.stderr)
