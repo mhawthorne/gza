@@ -3019,6 +3019,101 @@ def test_query_lineage_owner_rows_short_circuits_merged_history_before_lineage_w
     assert not (set(store_calls) & set(merged_owner_ids))
 
 
+def test_query_lineage_owner_rows_short_circuits_attached_member_when_owner_unit_is_merged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    base_time = datetime(2026, 6, 22, 12, 0, tzinfo=UTC)
+
+    merged_owner = store.add("Merged owner", task_type="implement")
+    assert merged_owner.id is not None
+    _set_completed(
+        merged_owner,
+        when=base_time,
+        branch="feature/merged-owner",
+        has_commits=True,
+    )
+    store.update(merged_owner)
+    merged_owner_unit = store.create_merge_unit(
+        source_branch=merged_owner.branch,
+        target_branch="main",
+        owner_task_id=merged_owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_owner.id, merged_owner_unit.id, "owner")
+
+    attached_failed = store.add("Failed attached review", task_type="review", based_on=merged_owner.id)
+    assert attached_failed.id is not None
+    attached_failed.status = "failed"
+    attached_failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    attached_failed.completed_at = base_time.replace(minute=1)
+    store.update(attached_failed)
+    # The attached member resolves to its own active unmerged unit, but that unit still
+    # points at an owner task whose resolved unit is already merged.
+    attached_unit = store.create_merge_unit(
+        source_branch="feature/merged-owner-review",
+        target_branch="main",
+        owner_task_id=merged_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(attached_failed.id, attached_unit.id, "review")
+
+    live_failed = store.add("Live unresolved failed owner", task_type="implement")
+    assert live_failed.id is not None
+    live_failed.status = "failed"
+    live_failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    live_failed.branch = "feature/live-owner"
+    live_failed.completed_at = base_time.replace(hour=13)
+    store.update(live_failed)
+    live_unit = store.create_merge_unit(
+        source_branch=live_failed.branch,
+        target_branch="main",
+        owner_task_id=live_failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(live_failed.id, live_unit.id, "owner")
+
+    read_context_calls: list[str] = []
+    store_calls: list[str] = []
+
+    original_read_context_get_lineage_children = RecoveryReadContext.get_lineage_children
+    original_store_get_lineage_children = store.get_lineage_children
+
+    def _count_read_context_get_lineage_children(
+        self: RecoveryReadContext,
+        task_id: str,
+        *,
+        parent=None,
+    ):
+        read_context_calls.append(task_id)
+        return original_read_context_get_lineage_children(self, task_id, parent=parent)
+
+    def _count_store_get_lineage_children(task_id: str):
+        store_calls.append(task_id)
+        return original_store_get_lineage_children(task_id)
+
+    monkeypatch.setattr(
+        RecoveryReadContext,
+        "get_lineage_children",
+        _count_read_context_get_lineage_children,
+    )
+    monkeypatch.setattr(store, "get_lineage_children", _count_store_get_lineage_children)
+
+    rows, _read_context = _query_lineage_owner_rows_with_context(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+    )
+
+    assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == {live_failed.id}
+    assert read_context_calls == [live_failed.id]
+    assert store_calls == [live_failed.id]
+    assert attached_failed.id not in read_context_calls
+    assert attached_failed.id not in store_calls
+
+
 def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seeded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
