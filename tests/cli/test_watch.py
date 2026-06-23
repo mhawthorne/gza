@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import json
 import re
 import signal
 import sys
@@ -173,6 +174,13 @@ def _patch_watch_git_runtime() -> object:
         patch("gza.cli.watch.Git", side_effect=lambda *_args, **_kwargs: _make_watch_git()) as watch_git_cls,
         patch("gza.runner.Git", side_effect=lambda *_args, **_kwargs: _make_watch_startup_git()) as runner_git_cls,
         patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch(
             "gza.recovery_engine._load_merge_context",
             side_effect=lambda *_args, **_kwargs: recovery_engine.build_merge_context_from_git(
                 _make_watch_git(),
@@ -204,14 +212,15 @@ def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> 
     store.update(plan)
 
     git = _make_watch_git()
-    rows, _ = _query_owner_rows_with_context(
-        store=store,
-        config=config,
-        git=git,
-        target_branch="main",
-        max_recovery_attempts=config.max_resume_attempts,
-        include_skipped=True,
-    )
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="new-fingerprint"):
+        rows, _ = _query_owner_rows_with_context(
+            store=store,
+            config=config,
+            git=git,
+            target_branch="main",
+            max_recovery_attempts=config.max_resume_attempts,
+            include_skipped=True,
+        )
 
     assert len(rows) == 1
     row = rows[0]
@@ -376,6 +385,7 @@ def test_watch_cycle_surfaces_manual_review_creation_as_attention(tmp_path: Path
     store.set_merge_status(impl.id, "unmerged")
 
     config = Config.load(tmp_path)
+    config.main_checkout_isolate = False
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
 
@@ -783,14 +793,15 @@ def test_watch_query_owner_rows_filters_target_branch_and_keeps_legacy_fallback(
     config = Config.load(tmp_path)
     git = _make_watch_git()
 
-    rows, _ = _query_owner_rows_with_context(
-        store=store,
-        config=config,
-        git=git,
-        target_branch="main",
-        max_recovery_attempts=config.max_resume_attempts,
-        include_skipped=True,
-    )
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="new-fingerprint"):
+        rows, _ = _query_owner_rows_with_context(
+            store=store,
+            config=config,
+            git=git,
+            target_branch="main",
+            max_recovery_attempts=config.max_resume_attempts,
+            include_skipped=True,
+        )
 
     owner_ids = {row.owner_task.id for row in rows}
     assert owner_ids == {main_task.id, legacy_task.id}
@@ -3408,6 +3419,7 @@ def test_watch_cycle_reconcile_completes_failed_branch_unpushable_task(tmp_path:
     ensure_result = SimpleNamespace(ok=True, status="created", error=None, pr_url="https://example.test/pr/2")
     git = SimpleNamespace(
         default_branch=lambda: "main",
+        current_branch=lambda: "main",
         count_commits_ahead=lambda *_args: 1,
         rev_parse_if_exists=lambda ref: {"feature/watch-reconcile-complete": "head123", "main": "base456"}.get(ref),
         can_merge=lambda *_args: True,
@@ -6068,6 +6080,372 @@ def test_watch_cycle_dirty_checkout_blocks_merge_pass_and_stops_later_merges(tmp
     assert "ATTENTION merges blocked: main checkout has uncommitted changes - commit or stash them first" in (
         log_path.read_text()
     )
+
+
+def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    first = store.add("First completed task", task_type="implement")
+    second = store.add("Second completed task", task_type="implement")
+    for task, branch in ((first, "feature/watch-main-red-1"), (second, "feature/watch-main-red-2")):
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = True
+        store.update(task)
+        store.set_merge_status(task.id, "unmerged")
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    green = SimpleNamespace(
+        merges_halted=False,
+        state=SimpleNamespace(task=main_verify_task, alert_message=None),
+    )
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=[green, red]),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert len(merge_calls) == 1
+    skipped_task_id = second.id if merge_calls[0] == first.id else first.id
+    log_text = log_path.read_text()
+    assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing" in log_text
+    assert "Needs attention (1 task):" in log_text
+    assert f"SKIP      {skipped_task_id}: merges halted while local main verify is red" in log_text
+
+
+def test_watch_cycle_green_main_after_merge_keeps_later_merges(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    first = store.add("First completed task", task_type="implement")
+    second = store.add("Second completed task", task_type="implement")
+    for task, branch in ((first, "feature/watch-main-green-1"), (second, "feature/watch-main-green-2")):
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = True
+        store.update(task)
+        store.set_merge_status(task.id, "unmerged")
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    green = SimpleNamespace(
+        merges_halted=False,
+        state=SimpleNamespace(task=main_verify_task, alert_message=None),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=[green, green, green]),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert set(merge_calls) == {first.id, second.id}
+
+
+def test_watch_cycle_configured_unavailable_main_verify_halts_later_merges(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    first = store.add("First completed task", task_type="implement")
+    second = store.add("Second completed task", task_type="implement")
+    for task, branch in ((first, "feature/watch-main-unavailable-1"), (second, "feature/watch-main-unavailable-2")):
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = True
+        store.update(task)
+        store.set_merge_status(task.id, "unmerged")
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    green = SimpleNamespace(
+        merges_halted=False,
+        state=SimpleNamespace(task=main_verify_task, alert_message=None),
+    )
+    unavailable = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `deadbeefcafe` - merges halted; verify status `unavailable`",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=[green, unavailable]),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert len(merge_calls) == 1
+    skipped_task_id = second.id if merge_calls[0] == first.id else first.id
+    log_text = log_path.read_text()
+    assert "main verify RED at `deadbeefcafe` - merges halted; verify status `unavailable`" in log_text
+    assert f"SKIP      {skipped_task_id}: merges halted while local main verify is red" in log_text
+
+
+def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-main-head-change"
+    task.has_commits = True
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    config = Config.load(tmp_path)
+    config.main_checkout_isolate = False
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=red) as check_main_verify,
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    execute_merge.assert_not_called()
+    check_main_verify.assert_called_once()
+    assert f"SKIP      {task.id}: merges halted while local main verify is red" in log_path.read_text()
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing" in log_path.read_text()
+
+
+def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "passed"
+    main_verify_task.review_verify_exit_status = "0"
+    main_verify_task.review_verify_head_sha = "deadbeefcafe"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": None,
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "failing_phase": None,
+            "gate_enabled": True,
+            "head_sha": "deadbeefcafe",
+            "tree_fingerprint": "old-fingerprint",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.main_checkout_isolate = False
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+        ),
+    )
+
+    def _persist_red_main_verify(*args, **kwargs):
+        del args, kwargs
+        main_verify_task.review_verify_command = "./bin/tests"
+        main_verify_task.review_verify_status = "failed"
+        main_verify_task.review_verify_exit_status = "1"
+        main_verify_task.review_verify_failure = "verify_command failed"
+        main_verify_task.review_verify_head_sha = "feedfacecafe"
+        main_verify_task.completed_at = datetime.now(UTC)
+        main_verify_task.output_content = json.dumps(
+            {
+                "alert_message": red.state.alert_message,
+                "captured_at": "2026-06-23T00:05:00+00:00",
+                "failing_phase": "unit",
+                "gate_enabled": True,
+                "head_sha": "feedfacecafe",
+                "tree_fingerprint": "new-fingerprint",
+                "verify_command": "./bin/tests",
+                "verify_timeout_grace_seconds": 5.0,
+                "verify_timeout_seconds": 120,
+            },
+            sort_keys=True,
+        )
+        store.update(main_verify_task)
+        return red
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="new-fingerprint"),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=_persist_red_main_verify) as check_main_verify,
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    execute_merge.assert_not_called()
+    check_main_verify.assert_called_once()
+    log_text = log_path.read_text()
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing" in log_text
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="new-fingerprint"):
+        rows, _ = _query_owner_rows_with_context(
+            store=store,
+            config=config,
+            git=git,
+            target_branch="main",
+            max_recovery_attempts=config.max_resume_attempts,
+            include_skipped=True,
+        )
+    main_rows = [row for row in rows if row.owner_task.id == main_verify_task.id]
+    assert len(main_rows) == 1
+    assert main_rows[0].next_action is not None
+    assert main_rows[0].next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing" in main_rows[0].next_action["description"]
 
 
 def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_tasks(tmp_path: Path) -> None:
@@ -14092,6 +14470,9 @@ def _make_preseeded_watch_git(tmp_path: Path) -> "Git":
             )
 
         def default_branch(self) -> str:
+            return "main"
+
+        def current_branch(self) -> str:
             return "main"
 
         def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]

@@ -3,6 +3,7 @@
 import argparse
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -22,6 +23,18 @@ def _patch_ambient_real_git():
         patch("gza.git.Git.ref_exists", return_value=False),
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _stub_main_integration_verify() -> object:
+    with patch(
+        "gza.cli.git_ops.check_main_integration_verify",
+        return_value=SimpleNamespace(
+            merges_halted=False,
+            state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+        ),
+    ) as mocked:
+        yield mocked
 
 
 def _advance_args(tmp_path: Path, **overrides) -> argparse.Namespace:

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,18 @@ def _patch_ambient_real_git():
     with (
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.git.Git.local_branch_names", return_value=()),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _stub_main_integration_verify():
+    with patch(
+        "gza.cli.git_ops.check_main_integration_verify",
+        return_value=SimpleNamespace(
+            merges_halted=False,
+            state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+        ),
     ):
         yield
 

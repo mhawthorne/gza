@@ -36,6 +36,10 @@ from ..lineage_query import (
     LineageOwnerRow,
     query_lineage_owner_rows_in_read_session,
 )
+from ..main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_REASON,
+    check_main_integration_verify,
+)
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
@@ -1853,45 +1857,70 @@ def _run_cycle(
         ),
         reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
     )
+    current_branch = git.current_branch()
+    merge_git: Git | None = None
+    merge_actions_available = True
+    merge_skip_reason = "merge-not-default-branch"
+    can_merge = True
+
+    def _rebuild_isolated_checkout() -> bool:
+        nonlocal merge_git, can_merge, merge_skip_reason, merge_actions_available
+        try:
+            merge_git = _run_with_optional_stdout_suppressed(
+                quiet,
+                lambda: ensure_watch_main_checkout(config, git, target_branch, rebuild=True),
+            )
+            merge_actions_available = True
+            can_merge = True
+            merge_skip_reason = "merge-not-default-branch"
+            log.emit("INFO", "isolated merge checkout rebuilt")
+            return True
+        except GitError as exc:
+            merge_git = None
+            merge_actions_available = False
+            can_merge = False
+            merge_skip_reason = "merge-isolated-checkout-unavailable"
+            log.emit("ERROR", f"isolated merge checkout rebuild failed: {exc}")
+            return False
+
+    if isolation_enabled and not dry_run:
+        try:
+            merge_git = _run_with_optional_stdout_suppressed(
+                quiet,
+                lambda: ensure_watch_main_checkout(config, git, target_branch),
+            )
+        except GitError as exc:
+            log.emit(
+                "WARN",
+                f"isolated merge checkout refresh failed; rebuilding: {exc}",
+            )
+            _rebuild_isolated_checkout()
+
+    merge_halted_for_cycle = False
+    merge_verify_git: Git | None = None
+    if isolation_enabled:
+        merge_verify_git = merge_git
+    elif current_branch == target_branch:
+        merge_verify_git = git
+    if merge_verify_git is not None:
+        main_verify = _run_with_optional_stdout_suppressed(
+            quiet,
+            lambda: check_main_integration_verify(
+                config,
+                store,
+                merge_verify_git,
+                reason="watch-main-verify",
+            ),
+        )
+        if main_verify.merges_halted:
+            merge_halted_for_cycle = True
+            if main_verify.state.task.id is not None:
+                log.emit_attention(
+                    attention_key=f"main-integration-verify:{main_verify.state.task.id}:{MAIN_INTEGRATION_VERIFY_REASON}",
+                    message=main_verify.state.alert_message or "main verify is red; merges halted",
+                )
+
     if lifecycle_rows:
-        current_branch = git.current_branch()
-        merge_git: Git | None = None
-        merge_actions_available = True
-        merge_skip_reason = "merge-not-default-branch"
-        can_merge = True
-
-        def _rebuild_isolated_checkout() -> bool:
-            nonlocal merge_git, can_merge, merge_skip_reason, merge_actions_available
-            try:
-                merge_git = _run_with_optional_stdout_suppressed(
-                    quiet,
-                    lambda: ensure_watch_main_checkout(config, git, target_branch, rebuild=True),
-                )
-                merge_actions_available = True
-                can_merge = True
-                merge_skip_reason = "merge-not-default-branch"
-                log.emit("INFO", "isolated merge checkout rebuilt")
-                return True
-            except GitError as exc:
-                merge_git = None
-                merge_actions_available = False
-                can_merge = False
-                merge_skip_reason = "merge-isolated-checkout-unavailable"
-                log.emit("ERROR", f"isolated merge checkout rebuild failed: {exc}")
-                return False
-
-        if isolation_enabled and not dry_run:
-            try:
-                merge_git = _run_with_optional_stdout_suppressed(
-                    quiet,
-                    lambda: ensure_watch_main_checkout(config, git, target_branch),
-                )
-            except GitError as exc:
-                log.emit(
-                    "WARN",
-                    f"isolated merge checkout refresh failed; rebuilding: {exc}",
-                )
-                _rebuild_isolated_checkout()
 
         action_plan: list[tuple[LineageOwnerRow, DbTask, dict]] = []
         for row in lifecycle_rows:
@@ -1991,6 +2020,13 @@ def _run_cycle(
                 continue
 
             if action_type in {"merge", "merge_with_followups"}:
+                if merge_halted_for_cycle:
+                    log.emit(
+                        "SKIP",
+                        f"{display_task.id}: merges halted while local main verify is red",
+                        dedupe_key=f"main-integration-verify-skip:{display_task.id}",
+                    )
+                    continue
                 if not can_merge:
                     if isolation_enabled and merge_skip_reason == "merge-isolated-checkout-unavailable":
                         log.emit(
@@ -2063,6 +2099,23 @@ def _run_cycle(
                     ):
                         log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
                         log.note_merge_logged(merge_event.merge_key)
+                if rc == 0 and merge_execution_git is not None:
+                    main_verify = _run_with_optional_stdout_suppressed(
+                        quiet,
+                        lambda: check_main_integration_verify(
+                            config,
+                            store,
+                            merge_execution_git,
+                            reason="watch-post-merge",
+                        ),
+                    )
+                    if main_verify.merges_halted:
+                        merge_halted_for_cycle = True
+                        if main_verify.state.task.id is not None:
+                            log.emit_attention(
+                                attention_key=f"main-integration-verify:{main_verify.state.task.id}:{MAIN_INTEGRATION_VERIFY_REASON}",
+                                message=main_verify.state.alert_message or "main verify is red; merges halted",
+                            )
                 for followup_task in merge_result.created_followups:
                     log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
                 for followup_task in merge_result.reused_followups:

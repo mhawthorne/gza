@@ -3365,6 +3365,202 @@ def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_la
     )
 
 
+def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = (
+        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
+        '"captured_at":"2026-06-23T00:00:00+00:00",'
+        '"failing_phase":"unit",'
+        '"gate_enabled":true,'
+        '"head_sha":"abc123",'
+        '"tree_fingerprint":"fp",'
+        '"verify_command":"./bin/tests",'
+        '"verify_timeout_grace_seconds":5.0,'
+        '"verify_timeout_seconds":120}'
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify RED at `abc123` - merges halted; phase `unit` failing" in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_when_gate_removed(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = None
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = (
+        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
+        '"captured_at":"2026-06-23T00:00:00+00:00",'
+        '"failing_phase":"unit",'
+        '"gate_enabled":true,'
+        '"head_sha":"abc123",'
+        '"tree_fingerprint":"fp",'
+        '"verify_command":"./bin/tests",'
+        '"verify_timeout_grace_seconds":5.0,'
+        '"verify_timeout_seconds":120}'
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert not any(row.owner_task.id == main_verify_task.id for row in rows)
+
+
+def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_when_gate_identity_changes(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/old-verify"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = (
+        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
+        '"captured_at":"2026-06-23T00:00:00+00:00",'
+        '"failing_phase":"unit",'
+        '"gate_enabled":true,'
+        '"head_sha":"abc123",'
+        '"tree_fingerprint":"fp",'
+        '"verify_command":"./bin/old-verify",'
+        '"verify_timeout_grace_seconds":5.0,'
+        '"verify_timeout_seconds":120}'
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert not any(row.owner_task.id == main_verify_task.id for row in rows)
+
+
+def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_default_branch_fingerprint_probe_fails(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = (
+        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
+        '"captured_at":"2026-06-23T00:00:00+00:00",'
+        '"failing_phase":"unit",'
+        '"gate_enabled":true,'
+        '"head_sha":"abc123",'
+        '"tree_fingerprint":"fp",'
+        '"verify_command":"./bin/tests",'
+        '"verify_timeout_grace_seconds":5.0,'
+        '"verify_timeout_seconds":120}'
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, include_skipped=True),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert (
+        "main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"
+        in row.next_action["description"]
+    )
+
+
 def test_build_merge_context_from_git_records_warning_and_clears_existing_branches_on_git_error(
     tmp_path: Path,
 ) -> None:

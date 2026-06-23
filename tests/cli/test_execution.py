@@ -10522,6 +10522,23 @@ class TestIterateCommand:
         failed_resume_child.session_id = root.session_id
         store.update(failed_resume_child)
 
+        decision = decide_failed_task_recovery(
+            store,
+            failed_resume_child,
+            max_recovery_attempts=1,
+        )
+        expected_line = self._expected_failed_recovery_attention_line(
+            store=store,
+            failed_task=failed_resume_child,
+            decision=decision,
+            max_resume_attempts=1,
+        )
+
+        assert decision.reason_code == "retry_limit_reached"
+        assert "reason=retry-limit-reached" in expected_line
+        assert "reason=newer-recovery-descendant-needs-attention" not in expected_line
+        assert "proceeding with manual resume from" not in expected_line
+
         args = argparse.Namespace(
             project_dir=str(tmp_path),
             impl_task_id=str(root.id),

@@ -291,6 +291,25 @@ failure *and* actionable merge/review work remains eligible for the latter.
   mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
   MUST reject merge representatives whose execution status is not `completed` or
   `unmerged`.
+- After a merge lands on the canonical local target, and whenever automation can prove the
+  local target's HEAD changed since the last successful or failed target-level verify
+  fingerprint, watch/advance MUST rerun the configured verify gate against that local
+  target tree before allowing more same-cycle merge work onto it. That checkpoint also
+  becomes stale when the configured gate identity changes on the same tree: at minimum the
+  normalized `verify_command` and the gate-enabled/no-gate state are part of freshness, and
+  the current implementation also keys freshness on the resolved automation timeout
+  settings. If the live local-target checkout cannot produce an exact tree fingerprint for
+  that freshness proof, automation MUST fail closed instead of reusing `HEAD` equality
+  alone: it MUST rerun the verify gate, and if exact-tree freshness still cannot be
+  established it MUST persist an operator-visible unavailable proof state that halts
+  merges for the cycle. More generally, if that target-level verify is not `passed`,
+  automation MUST halt further merges for the cycle and surface one durable
+  needs-attention signal with reason `main-integration-verify-red` that names the failing
+  local target SHA and, when structured phase output exists, the failing phase. Projects
+  with no configured
+  `verify_command` are an explicit no-gate exception: they MAY persist an `unavailable`
+  checkpoint with `exit_status="not configured"` for visibility, but that checkpoint MUST
+  NOT halt merges or emit the red-main attention signal.
 
 Note: the "implementation unit with no review" rule above applies only when the
 implementation still has reviewable commits or diff against the target. Terminal
@@ -366,6 +385,7 @@ is a spec change. The accompanying human message is free text.
 | `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
+| `main-integration-verify-red` | needs_discussion | §8 local target verify failed after target HEAD changed; halt further merges until it is green again |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
 | `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted or terminal manual-review recovery stop |
 | `retryable-provider-error` | HumanParked | §7 fresh retry consumed for a retryable provider failure; hand off to `gza fix` |

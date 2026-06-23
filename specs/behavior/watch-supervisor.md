@@ -77,7 +77,24 @@ Each watch cycle MUST execute these phases in order:
    `MERGE <owner-task-id> -> <target>` line for the landed merge unit at merge time,
    before any same-cycle worker starts, queue pickup, or informational summary output
    that follows from the fresher target-branch state. The logged task ID is the
-   merge-unit owner/leader, not every credited member.
+   merge-unit owner/leader, not every credited member. During this same phase, watch MUST
+   reuse the shared local-target integration verify gate: when the canonical local target's
+   fingerprint differs from the last verified fingerprint, when the configured verify-gate
+   identity changes on the same tree, and after each successful merge onto that target,
+   watch MUST rerun the configured verify gate against the local target tree. Freshness is
+   keyed at least by the normalized `verify_command` plus gate-enabled/no-gate state, and
+   the current implementation also includes the resolved automation timeout settings. If
+   the current default-branch checkout cannot produce an exact tree fingerprint before or
+   after that verify, watch MUST treat freshness as unproven instead of reusing `HEAD`
+   equality alone; it MUST halt further merges for the current cycle and surface one
+   visible durable attention row explaining that exact-tree freshness could not be proven.
+   More generally, if that verify is not `passed`, watch MUST halt further merges for the
+   current cycle and emit one visible durable attention row with reason
+   `main-integration-verify-red` naming the failing target SHA and, when structured phase
+   output exists, the failing phase. If no `verify_command` is configured for the project,
+   that is an explicit no-gate
+   exception: watch MAY record an `unavailable` checkpoint with
+   `exit_status="not configured"` but MUST NOT halt merges or emit red-main attention for it.
 4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
    lifecycle worker starts selected by the shared engine. Recovery allocation is not a
    pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before

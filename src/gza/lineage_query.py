@@ -15,6 +15,7 @@ from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
     task_is_complete_for_lifecycle,
 )
+from .main_integration_verify import MAIN_INTEGRATION_VERIFY_REASON, current_main_integration_verify_alert
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
@@ -130,6 +131,14 @@ def _normalize_dt(value: datetime | None) -> datetime:
     if value.tzinfo is not None:
         return value.astimezone(UTC).replace(tzinfo=None)
     return value
+
+
+def _main_integration_alert_matches_query(query: LineageOwnerQuery) -> bool:
+    if query.task_types is not None and "internal" not in query.task_types:
+        return False
+    if query.exclude_task_types is not None and "internal" in query.exclude_task_types:
+        return False
+    return True
 
 
 def _iter_task_activity_timestamps(task: DbTask) -> tuple[datetime | None, ...]:
@@ -1409,6 +1418,38 @@ def _query_lineage_owner_rows_with_context(
         ),
         reverse=True,
     )
+    if git is not None and config is not None and _main_integration_alert_matches_query(query):
+        main_alert = current_main_integration_verify_alert(store, git, config)
+        if main_alert is not None and main_alert.task.id is not None:
+            action = {
+                "type": "needs_discussion",
+                "description": f"SKIP: {main_alert.alert_message or 'main verify is red; merges halted'}",
+                "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                "subject_task_id": main_alert.task.id,
+            }
+            rows.insert(
+                0,
+                LineageOwnerRow(
+                    owner_task=main_alert.task,
+                    members=(main_alert.task,),
+                    tree=None,
+                    lineage_status="needs_attention",
+                    next_action=action,
+                    next_action_reason=str(action["description"]),
+                    unresolved_tasks=(main_alert.task,),
+                    unresolved_leaf_summary=(
+                        UnresolvedLeafSummary(
+                            task_id=main_alert.task.id,
+                            status=main_alert.task.status,
+                            task_type=main_alert.task.task_type,
+                            reason=main_alert.failure or main_alert.verify_exit_status,
+                        ),
+                    ),
+                    lifecycle_action_task=None,
+                    recovery_action_task=None,
+                    recovery_leaf_task=None,
+                ),
+            )
     if query.limit is not None:
         rows = rows[: query.limit]
     if read_context.allow_reconcile_mutation:

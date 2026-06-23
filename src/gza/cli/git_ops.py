@@ -61,6 +61,10 @@ from ..lineage_query import (
     query_lineage_owner_rows,
 )
 from ..log_paths import resolve_ops_log_path
+from ..main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_REASON,
+    check_main_integration_verify,
+)
 from ..merge_state import resolve_task_merge_state_for_target
 from ..pickup import (
     count_worker_consuming_actions,
@@ -2888,6 +2892,41 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if needs_attention_recommends_fix(aaction):
                 console.print(f"  [{_color}]Recommended next step: uv run gza fix {atask.id}[/{_color}]")
 
+    def _append_attention_once(
+        items: list[tuple[DbTask, dict[str, Any]]],
+        task: DbTask,
+        action: dict[str, Any],
+    ) -> None:
+        task_id = task.id
+        reason = action.get("needs_attention_reason")
+        for existing_task, existing_action in items:
+            if existing_task.id == task_id and existing_action.get("needs_attention_reason") == reason:
+                return
+        items.append((task, action))
+
+    def _main_verify_attention_item() -> tuple[DbTask, dict[str, Any]] | None:
+        if target_branch != actual_current_branch:
+            return None
+        if not any(item_action["type"] in {"merge", "merge_with_followups"} for _, _, item_action in plan):
+            return None
+        main_verify = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="advance-pre-merge",
+        )
+        if not main_verify.merges_halted or main_verify.state.task.id is None:
+            return None
+        return (
+            main_verify.state.task,
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: {main_verify.state.alert_message or 'main verify is red; merges halted'}",
+                "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                "subject_task_id": main_verify.state.task.id,
+            },
+        )
+
     plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
     preview_actionable_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
     preview_gated_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
@@ -3193,6 +3232,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         preview_context = _build_action_context(dry_run_mode=True)
         preview_attention_plan = list(attention_plan)
+        main_verify_attention = _main_verify_attention_item()
+        if main_verify_attention is not None:
+            _append_attention_once(preview_attention_plan, *main_verify_attention)
         execution_decisions = plan_lifecycle_execution(
             plan,
             free_worker_slots=effective_start_budget,
@@ -3214,6 +3256,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     (row, task, action, _gated_lifecycle_skip_message(free_worker_slots=decision.free_worker_slots))
                 )
                 continue
+            if (
+                main_verify_attention is not None
+                and action["type"] in {"merge", "merge_with_followups"}
+            ):
+                continue
             description = action["description"]
             if action["type"] in {"merge", "merge_with_followups"} and dry_run:
                 resolved_subject = (
@@ -3233,7 +3280,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 preview_result = execute_advance_action(task=task, action=action, context=preview_context)
                 attention = resolve_execution_needs_attention(task, preview_result)
                 if attention is not None:
-                    preview_attention_plan.append((getattr(attention, "task", row.owner_task), attention.action))
+                    _append_attention_once(
+                        preview_attention_plan,
+                        getattr(attention, "task", row.owner_task),
+                        attention.action,
+                    )
                     continue
                 if preview_result.status == "dry_run" and preview_result.message:
                     description = preview_result.message
@@ -3389,6 +3440,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     workers_started = 0
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
+    merge_halt_attention = main_verify_attention[1] if main_verify_attention is not None else None
+
+    if main_verify_attention is not None:
+        _append_attention_once(attention_tasks, *main_verify_attention)
 
     def _render_worker_action_result(action_task: DbTask, display_task: DbTask, action_type: str, exec_result) -> None:
         nonlocal workers_started, success_count, skip_count, error_count
@@ -3401,7 +3456,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             skip_count += 1
             attention = resolve_execution_needs_attention(action_task, exec_result)
             if attention is not None:
-                attention_tasks.append((getattr(attention, "task", display_task), attention.action))
+                _append_attention_once(
+                    attention_tasks,
+                    getattr(attention, "task", display_task),
+                    attention.action,
+                )
             return
 
         if exec_result.status == "error":
@@ -3434,8 +3493,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
             console.print(f"      [{_color}]{action['description']}[/{_color}]")
             skip_count += 1
             if classify_advance_action(action) == "needs_attention":
-                attention_tasks.append(
-                    (resolve_subject_task(store, action, row, fallback_task=display_task), action)
+                _append_attention_once(
+                    attention_tasks,
+                    resolve_subject_task(store, action, row, fallback_task=display_task),
+                    action,
                 )
             continue
 
@@ -3452,6 +3513,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
         if action_type in {'merge', 'merge_with_followups'}:
+            if merge_halt_attention is not None:
+                console.print(
+                    f"      [{_c_warn}]SKIP: {merge_halt_attention['description'][6:]}[/{_c_warn}]"
+                )
+                skip_count += 1
+                print()
+                continue
             merge_result = _execute_merge_action(
                 config,
                 store,
@@ -3472,6 +3540,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
                 success_count += 1
+                main_verify = check_main_integration_verify(
+                    config,
+                    store,
+                    git,
+                    reason="advance-post-merge",
+                )
+                if main_verify.merges_halted and main_verify.state.task.id is not None:
+                    merge_halt_attention = {
+                        "type": "needs_discussion",
+                        "description": f"SKIP: {main_verify.state.alert_message or 'main verify is red; merges halted'}",
+                        "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                        "subject_task_id": main_verify.state.task.id,
+                    }
+                    _append_attention_once(attention_tasks, main_verify.state.task, merge_halt_attention)
             else:
                 resolved_subject = (
                     _resolve_merge_subject(store, git, task.id, target_branch=target_branch)

@@ -865,6 +865,8 @@ def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy
     assert "advance --dry-run` surfaces one warning that only git branch reachability suppression is unavailable for this run" in task_collection_section
     assert "metadata-based same-lineage merged-task suppression may still apply" in task_collection_section
     assert "failed-row visibility remains conservative only for the git-reachability decision" in task_collection_section
+    assert "The only exception is an explicit no-gate project with no configured `verify_command`" in task_collection_section
+    assert '`status="unavailable"` / `exit_status="not configured"`' in task_collection_section
     assert "keeps the failed rows visible" not in task_collection_section
     assert "failure_reason IN ('MAX_STEPS', 'MAX_TURNS')" not in task_collection_section
     assert "session_id IS NOT NULL" not in task_collection_section

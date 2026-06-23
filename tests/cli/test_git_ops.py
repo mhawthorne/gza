@@ -35,6 +35,18 @@ from gza.worktree_roots import managed_worktree_root_paths
 from .conftest import make_store, invoke_gza, setup_config
 
 
+@pytest.fixture(autouse=True)
+def _stub_main_integration_verify() -> object:
+    with patch(
+        "gza.cli.git_ops.check_main_integration_verify",
+        return_value=SimpleNamespace(
+            merges_halted=False,
+            state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+        ),
+    ) as mocked:
+        yield mocked
+
+
 def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
     return argparse.Namespace(
         project_dir=tmp_path,
@@ -3041,6 +3053,295 @@ def test_advance_retryable_provider_attention_recommends_fix_even_without_action
     assert "No eligible tasks to advance" in output
     assert "reason=retryable-provider-error" in output
     assert f"Recommended next step: uv run gza fix {task.id}" in output
+
+
+def test_advance_post_merge_red_main_skips_later_merges_and_surfaces_attention(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first, _first_review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-main-red-1",
+        when=datetime.now(UTC),
+    )
+    second, _second_review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-main-red-2",
+        when=datetime.now(UTC),
+    )
+
+    args = _advance_args(tmp_path, first.id)
+    args.task_id = None
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(_config, _store, _git, task, _action, **_kwargs):
+        merge_calls.append(task.id)
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    green = SimpleNamespace(
+        merges_halted=False,
+        state=SimpleNamespace(task=main_verify_task, alert_message=None),
+    )
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing",
+        ),
+    )
+    first_row = LineageOwnerRow(
+        owner_task=first,
+        members=(first,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(first,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=first,
+    )
+    second_row = LineageOwnerRow(
+        owner_task=second,
+        members=(second,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(second,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=second,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[first_row, second_row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=[green, red]),
+        patch("gza.cli.git_ops._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert merge_calls == [first.id]
+    assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing" in output
+    assert f"{second.id}" in output
+    assert "1 advanced" in output
+    assert "1 skipped" in output
+
+
+def test_advance_refreshes_red_main_before_preview_and_skips_confirmation_prompt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task, _review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-preview-main-red",
+        when=datetime.now(UTC),
+    )
+
+    args = argparse.Namespace(**{**vars(_advance_args(tmp_path, task.id)), "auto": False})
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+    )
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `cafebabe1234` - merges halted; phase `unit` failing",
+        ),
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+        patch("gza.cli.git_ops.check_main_integration_verify", return_value=red) as verify_check,
+        patch("builtins.input", side_effect=AssertionError("confirmation prompt should not run")),
+        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
+    ):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert verify_check.call_args.kwargs["reason"] == "advance-pre-merge"
+    assert "No eligible tasks to advance" in output
+    assert "main verify RED at `cafebabe1234` - merges halted; phase `unit` failing" in output
+    assert "Will advance 1 task(s):" not in output
+    assert "Proceed? [Y/n]" not in output
+    execute_merge.assert_not_called()
+
+
+def test_advance_dedupes_persisted_and_live_red_main_attention_in_final_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merge_task, _merge_review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-main-red-dedupe-merge",
+        when=datetime.now(UTC),
+    )
+    plan_task = store.add("Approved plan ready to materialize", task_type="plan")
+    assert plan_task.id is not None
+    plan_task.status = "completed"
+    plan_task.completed_at = datetime.now(UTC)
+    store.update(plan_task)
+
+    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    persisted_main_row = LineageOwnerRow(
+        owner_task=main_verify_task,
+        members=(main_verify_task,),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "needs_discussion",
+            "description": "SKIP: main verify RED at `facefeed9999` - merges halted; phase `unit` failing",
+            "needs_attention_reason": "main-integration-verify-red",
+            "subject_task_id": main_verify_task.id,
+        },
+        next_action_reason="red main verify",
+        unresolved_tasks=(main_verify_task,),
+        unresolved_leaf_summary=(),
+    )
+    merge_row = LineageOwnerRow(
+        owner_task=merge_task,
+        members=(merge_task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(merge_task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=merge_task,
+    )
+    plan_row = LineageOwnerRow(
+        owner_task=plan_task,
+        members=(plan_task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="materialize",
+        unresolved_tasks=(plan_task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=plan_task,
+    )
+
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message="main verify RED at `facefeed9999` - merges halted; phase `unit` failing",
+        ),
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        if task.id == merge_task.id:
+            return {"type": "merge", "description": "Merge"}
+        if task.id == plan_task.id:
+            return {
+                "type": "materialize_plan_slices",
+                "description": "Materialize implementation slices from approved plan review",
+            }
+        raise AssertionError(f"unexpected task: {task.id}")
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[persisted_main_row, merge_row, plan_row]),
+        patch("gza.cli.git_ops.check_main_integration_verify", return_value=red),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine),
+        patch(
+            "gza.cli.git_ops.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="materialize_plan_slices",
+                status="success",
+                message="Materialized plan slices",
+                success_message="Materialized plan slices",
+                work_done=True,
+                worker_consuming=False,
+            ),
+        ),
+        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, merge_task.id)), "task_id": None}))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    execute_merge.assert_not_called()
+    assert "Will advance 1 task(s):" in output
+    final_attention = output[output.rfind("Needs attention"):]
+    assert final_attention.startswith("Needs attention (1 task):")
+    assert final_attention.count("main verify RED at `facefeed9999` - merges halted; phase `unit` failing") == 1
+    assert final_attention.count("main-integration-verify-red") == 1
 
 
 def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_artifacts(tmp_path: Path) -> None:

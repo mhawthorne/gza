@@ -4,6 +4,7 @@
 __pycache__/
 src/gza/_version.py
 .docker-build-marker
+.mypy_cache/
 .pytest_cache/
 tmp/
 gza.local.yaml
