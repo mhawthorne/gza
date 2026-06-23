@@ -112,6 +112,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "max_resume_attempts",
             "max_review_cycles",
             "max_plan_review_cycles",
+            "max_failed_plan_review_retries",
             "max_noop_improve_cycles",
             "max_plan_slices",
             "plan_slice_target_timeout_minutes",

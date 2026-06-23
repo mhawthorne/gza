@@ -78,3 +78,17 @@ def test_full_config_example_groups_review_verify_timeout_grace_under_review() -
     assert review_start < grace_index < learnings_start
     _, other_header, other_section = rendered.partition("# --- Other ---")
     assert not other_header or grace_key not in other_section
+
+
+def test_full_config_example_groups_failed_plan_review_retries_under_lifecycle() -> None:
+    rendered = render_config_example()
+
+    lifecycle_start = rendered.index("# --- Lifecycle ---")
+    review_start = rendered.index("# --- Review ---")
+    retries_key = "# max_failed_plan_review_retries: 3"
+
+    retries_index = rendered.index(retries_key)
+
+    assert lifecycle_start < retries_index < review_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or retries_key not in other_section

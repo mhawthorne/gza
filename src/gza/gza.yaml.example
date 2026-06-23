@@ -286,6 +286,11 @@ project_name: my-project
 # Default: 3
 # max_failed_closing_review_retries: 3
 
+# Max failed plan_review attempts for one plan source before lifecycle parks it as needs_attention
+# instead of auto-spawning another review; 0 escalates after the first failure.
+# Default: 3
+# max_failed_plan_review_retries: 3
+
 # Cap for consecutive no-op improves before lifecycle automation stops for discussion.
 # Default: 1
 # max_noop_improve_cycles: 1
@@ -427,8 +432,3 @@ project_name: my-project
 # cap; if `watch.batch` is omitted, the fallback remains `5`.
 # Default: explicit watch.batch or 5
 # max_concurrent: 5
-
-# Max failed plan_review attempts for one plan source before lifecycle parks it as needs_attention
-# instead of auto-spawning another review; 0 escalates after the first failure.
-# Default: 3
-# max_failed_plan_review_retries: 3
