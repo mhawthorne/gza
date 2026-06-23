@@ -1,25 +1,32 @@
 ---
 name: gza-system-triage
-description: Turn the recurring `watch` stuck-task pile into systemic auto-merge fixes. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, ranks fixes by blast radius (cascade-preventer first), and — manual mode presents, auto mode files — `system`-tagged gza tasks. Delegates per-task rescue to /gza-task-fix; never merges, retries, resumes, or edits code.
-allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
-version: 1.0.0
+description: Turn the recurring `watch` stuck-task pile into (1) a diagnosis of why each class is stuck, (2) the existing stuck rows actually cleared now, and (3) systemic prevention so it does not recur. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, unsticks each row by its clearing action (drop moot/dead/stale, spawn follow-up, hand review-loop rows to /gza-task-fix), then ranks and files `system`-tagged prevention fixes by blast radius (cascade-preventer first). Never merges, retries, resumes, deletes branches, or edits code.
+allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza implement:*), Bash(uv run gza set-status:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
+version: 1.1.0
 public: false
 ---
 
 # Gza System Triage
 
-Every stuck task is a **failed auto-merge**. This skill does not ask "how do I hand-merge this" — hand-merging is debt that grows faster than anyone can service it. It asks, per failure *class*: **"what is the broadest systemic change that would let this and its siblings auto-merge unattended next time?"**
+Every stuck task is a **failed auto-merge**. This skill does three things, in order, for the pile `watch` leaves behind:
 
-It exists because the same conversation recurs daily: `watch` leaves a pile of `ATTENTION` / `Needs attention` rows, and each session re-derives the landscape from scratch and ships another narrow micro-fix that doesn't compound. This skill closes that loop: snapshot once, bucket by class, **skip classes already being fixed**, rank what's left by blast radius, and file the broadest fix.
+1. **Diagnose** — bucket the stuck rows by failure *class* and find why each class is stuck.
+2. **Unstick now** — clear the *existing* stuck rows by their correct action: drop the moot/dead/stale, spawn the missing follow-up, or hand review/improve-loop rows to `/gza-task-fix`. A stuck row left in place is debt that grows faster than anyone can service it.
+3. **Prevent** — for each class, file the broadest `system`-tagged change that would let this and its siblings auto-merge unattended next time, ranked by blast radius.
 
-The per-task rescue (`/gza-task-fix`) and per-lineage drop/rebase classification (`/gza-task-triage`) already exist. This skill is the **systemic layer above them**, not a replacement.
+Diagnosis without unsticking just re-describes the pile; unsticking without prevention means the pile rebuilds tomorrow. Do all three.
+
+It exists because the same conversation recurs daily: `watch` leaves a pile of `ATTENTION` / `Needs attention` rows, and each session re-derives the landscape from scratch and ships another narrow micro-fix that doesn't compound. This skill closes that loop: snapshot once, bucket by class, **skip classes already being fixed**, clear what's clearable now, and file the broadest prevention fix for the rest.
+
+The per-task rescue (`/gza-task-fix`) and per-lineage drop/rebase classification (`/gza-task-triage`) are the workers this skill *drives* — it owns the orchestration (which row gets which action) and executes the safe clearing actions itself, delegating only the heavy per-unit rescue.
 
 ## What this skill MUST NOT do
 
 These guardrails are load-bearing.
 
-- **Do not merge, retry, resume, or delete branches.** If a row warrants one of those, say so and stop.
-- **Do not edit code.** A single unit that needs a code fix is a `/gza-task-fix` handoff, not an inline edit.
+- **Do not merge, retry, resume, or delete branches.** If a row warrants one of those, say so and stop. (Note: **dropping** a task via `gza set-status <id> dropped` is *not* deleting a branch — the branch stays as history — and is the sanctioned way to clear a moot/dead/stale row. Spawning a follow-up via `gza add --based-on` / `gza implement` and handing a row to `/gza-task-fix` are likewise allowed. These are the unstick actions; merge/retry/resume are not.)
+- **Do not edit code.** A single unit that needs a code fix is a `/gza-task-fix` handoff or a filed task, not an inline edit.
+- **Confirm before bulk or destructive unstick actions in manual mode.** Drops are reversible (`set-status ... pending`) but bulk drops still need an explicit go-ahead; never mass-drop on a terse instruction without confirming scope.
 - **Do not file untagged tasks.** Every filed task gets `system` plus the active recovery tag — an untagged task is a silent orphan watch never runs.
 - **Do not file anything in manual mode without confirmation.**
 - **Do not propose another narrow guard for a class that already recurred after a fix landed.** That is the signal the previous fix missed the cause layer — escalate to re-diagnose deeper (see `specs/behavior/systemic-fix-triage.md`), never patch the symptom again.
@@ -97,7 +104,23 @@ For each surviving class, answer the operative question: *"what precondition or 
 
 A fix that itself can't land cheaply (a big general-rule change prone to its own review churn) ranks lower — note the landing risk, because a fix that parks auto-merges nothing.
 
-### Step 6: Present (manual) or file (auto)
+### Step 6: Unstick the existing rows now
+
+Prevention (Step 7) stops recurrence; it does **not** clear the rows already stuck. Do that here. Assign every stuck row exactly one clearing action, then execute the safe ones:
+
+| Action | When | How |
+|---|---|---|
+| **DROP** | moot / dead / stale / superseded / never-merged-and-abandoned (incl. months-old backlog and dead `INFRASTRUCTURE_ERROR` leaves once their owner is resolved elsewhere) | `uv run gza set-status <id> dropped` — clears the row now and stops it reappearing; branch is kept |
+| **SPAWN follow-up** | completed explore/plan blocked only on a "what next" decision (`explore-needs-follow-up-decision`, plan awaiting implement) | `uv run gza add --based-on <id> ...` (from an explore) or `uv run gza implement <plan-id>` (from a plan) — the follow-up *is* the unstick |
+| **RESCUE inline** | review/improve-loop on one unit (`review-no-exit`, per-unit `verify-unreproducible`) | `/gza-task-fix <impl-id>` |
+| **LEAVE** | genuinely-live pending/in-flight work, or ready advance actions (`materialize_plan_slices`, recovery lane) watch will run | nothing — these are not stuck |
+
+- Before dropping a dead leaf, confirm its owner is resolved elsewhere (e.g. a sibling already produced the verdict / merge) so the drop is pure residue cleanup and watch will not just re-spawn it.
+- **Check whether `watch` is running** (`uv run gza ps` / process list) and what tag scope it has — dropping in-scope rows whose owner is still unresolved can trigger an immediate re-spawn before the prevention fix lands.
+- **Manual mode:** confirm scope via `AskUserQuestion` before executing drops (especially bulk), then run them. **Auto mode:** execute the safe drops/spawns directly. Either way, hand RESCUE rows to `/gza-task-fix` rather than fixing inline here.
+- A row's unstick action and its class's prevention fix are complementary: e.g. an unbounded-respawn cascade → **drop** the dead leaves now (Step 6) **and** file the circuit-breaker (Step 7).
+
+### Step 7: Schedule prevention — present (manual) or file (auto)
 
 For each ranked class produce one block:
 
@@ -126,7 +149,7 @@ uv run gza queue bump <new-task-id>
 
 - A **per-task rescue** (one unit's review/improve churn, not a class) is a `/gza-task-fix <impl-id>` recommendation — do not file a system task for it.
 
-**Report** (both modes): classes filed (new IDs, tags, bumped?), classes skipped as already-tracked, classes escalated for cause-layer re-diagnosis, and per-task handoffs.
+**Report** (both modes): **rows unstuck** (dropped / follow-ups spawned / handed to `/gza-task-fix`, with counts and IDs), classes filed for prevention (new IDs, tags, bumped?), classes skipped as already-tracked, classes escalated for cause-layer re-diagnosis. The headline proves all three happened — e.g. "87 rows cleared, 1 cascade prevention filed, 1 class already tracked."
 
 ## Output style
 
@@ -140,4 +163,4 @@ uv run gza queue bump <new-task-id>
 - Log-level anti-patterns (bare commands, test loops, cost outliers) → `/gza-log-insights`
 - Per-task root-cause / loop analysis → `/gza-task-debug`
 
-This skill is the systemic layer, not the per-task worker.
+This skill owns the systemic orchestration — **diagnose, unstick, prevent** — and drives the per-task workers above; it executes the safe clearing actions (drop / spawn) itself but does not do heavy per-unit rescue inline.
