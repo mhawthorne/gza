@@ -1452,8 +1452,9 @@ gza comment <task_id> <text> [options]
 | `task_id` | Full prefixed task ID to comment on (e.g. `gza-1234`) |
 | `text` | Comment text to add |
 | `--author NAME` | Optional author name recorded with the comment |
+| `--kind feedback\|review_scope` | Stored comment kind (default: `feedback`) |
 
-When task comments exist, `gza show` also includes a `Comments:` section.
+When task comments exist, `gza show` also includes a `Comments:` section with source, kind, timestamps, and resolution state.
 When tasks have comments, `gza history` includes a `comments: N` indicator.
 
 ### improve

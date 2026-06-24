@@ -32,6 +32,9 @@ __all__ = [
     "DB_UNSET",
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
+    "TASK_COMMENT_KINDS",
+    "TASK_COMMENT_KIND_FEEDBACK",
+    "TASK_COMMENT_KIND_REVIEW_SCOPE",
     "InvalidTaskIdError",
     "ManualMigrationRequired",
     "MergeTargetResolutionError",
@@ -58,6 +61,15 @@ __all__ = [
 ]
 
 StoreOpenMode = Literal["readwrite", "query_only"]
+
+TASK_COMMENT_KIND_FEEDBACK = "feedback"
+TASK_COMMENT_KIND_REVIEW_SCOPE = "review_scope"
+TASK_COMMENT_KINDS: frozenset[str] = frozenset(
+    {
+        TASK_COMMENT_KIND_FEEDBACK,
+        TASK_COMMENT_KIND_REVIEW_SCOPE,
+    }
+)
 
 
 # Known failure reason categories
@@ -522,6 +534,7 @@ class TaskComment:
     content: str
     source: str
     author: str | None
+    kind: str
     created_at: datetime
     resolved_at: datetime | None
 
@@ -945,8 +958,13 @@ ALTER TABLE watch_progress_observations ADD COLUMN action_task_started_at TEXT;
 ALTER TABLE watch_progress_observations ADD COLUMN action_task_running_pid INTEGER;
 """
 
+# Migration from v53 to v54: typed task comments
+MIGRATION_V53_TO_V54 = f"""
+ALTER TABLE task_comments ADD COLUMN kind TEXT NOT NULL DEFAULT '{TASK_COMMENT_KIND_FEEDBACK}';
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 53
+SCHEMA_VERSION = 54
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1348,6 +1366,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
                 author TEXT,
+                kind TEXT NOT NULL DEFAULT 'feedback',
                 created_at TEXT NOT NULL,
                 resolved_at TEXT,
                 FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
@@ -1507,10 +1526,13 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             task_comments_project_expr = (
                 "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in task_comments_cols else "?"
             )
+            task_comments_kind_expr = (
+                "kind" if "kind" in task_comments_cols else f"'{TASK_COMMENT_KIND_FEEDBACK}'"
+            )
             conn.execute(
                 f"""
-                INSERT INTO task_comments (id, project_id, task_id, content, source, author, created_at, resolved_at)
-                SELECT id, {task_comments_project_expr}, task_id, content, source, author, created_at, resolved_at
+                INSERT INTO task_comments (id, project_id, task_id, content, source, author, kind, created_at, resolved_at)
+                SELECT id, {task_comments_project_expr}, task_id, content, source, author, {task_comments_kind_expr}, created_at, resolved_at
                 FROM task_comments_v35_legacy
                 """,
                 (project_id,),
@@ -1596,7 +1618,7 @@ def _validate_v36_structural_schema(conn: sqlite3.Connection) -> None:
             )
 
 
-_TASK_COMMENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
+_TASK_COMMENTS_V32_REQUIRED_COLUMNS: tuple[str, ...] = (
     "id",
     "task_id",
     "content",
@@ -1604,6 +1626,10 @@ _TASK_COMMENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
     "author",
     "created_at",
     "resolved_at",
+)
+_TASK_COMMENTS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    *_TASK_COMMENTS_V32_REQUIRED_COLUMNS,
+    "kind",
 )
 
 _QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS: tuple[str, ...] = (
@@ -1701,7 +1727,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -1741,6 +1767,7 @@ def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
             content TEXT NOT NULL,
             source TEXT NOT NULL,
             author TEXT,
+            kind TEXT NOT NULL DEFAULT 'feedback',
             created_at TEXT NOT NULL,
             resolved_at TEXT
         )
@@ -1752,6 +1779,7 @@ def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
         "content": "content" if "content" in existing_columns else "''",
         "source": "source" if "source" in existing_columns else "'direct'",
         "author": "author" if "author" in existing_columns else "NULL",
+        "kind": "kind" if "kind" in existing_columns else f"'{TASK_COMMENT_KIND_FEEDBACK}'",
         "created_at": (
             "created_at" if "created_at" in existing_columns else "strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')"
         ),
@@ -1759,13 +1787,14 @@ def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
     }
     conn.execute(
         """
-        INSERT INTO task_comments (id, task_id, content, source, author, created_at, resolved_at)
+        INSERT INTO task_comments (id, task_id, content, source, author, kind, created_at, resolved_at)
         SELECT
             {id},
             {task_id},
             {content},
             {source},
             {author},
+            {kind},
             {created_at},
             {resolved_at}
         FROM task_comments_damaged
@@ -1774,6 +1803,29 @@ def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE task_comments_damaged")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_created ON task_comments(task_id, created_at ASC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_task_comments_task_unresolved ON task_comments(task_id, resolved_at)")
+
+
+def _normalize_comment_kind(kind: str) -> str:
+    """Normalize and validate one task comment kind."""
+    normalized = kind.strip()
+    if normalized not in TASK_COMMENT_KINDS:
+        raise ValueError(f"Unknown comment kind: {kind}")
+    return normalized
+
+
+def _normalize_comment_kinds(kinds: Iterable[str] | None) -> tuple[str, ...] | None:
+    """Normalize and deduplicate comment-kind filters while preserving order."""
+    if kinds is None:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for kind in kinds:
+        normalized_kind = _normalize_comment_kind(kind)
+        if normalized_kind in seen:
+            continue
+        normalized.append(normalized_kind)
+        seen.add(normalized_kind)
+    return tuple(normalized)
 
 
 def _rebuild_task_artifacts_table(conn: sqlite3.Connection) -> None:
@@ -1885,7 +1937,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
     if target_version == 32:
         if not _table_exists(conn, "task_comments"):
             raise RuntimeError("Auto-migration to v32 incomplete: missing required table task_comments")
-        missing_comment_columns = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+        missing_comment_columns = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_V32_REQUIRED_COLUMNS)
         if missing_comment_columns:
             raise RuntimeError(
                 "Auto-migration to v32 incomplete: missing required column "
@@ -1920,6 +1972,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         51: ("watch_progress_observations", "observed_at"),
         52: ("tasks", "review_verify_artifact_file"),
         53: ("watch_progress_observations", "action_task_running_pid"),
+        54: ("task_comments", "kind"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -1994,8 +2047,11 @@ def _ensure_required_auto_migration_artifacts(
                 "missing task_comments table; use a writable database."
             ) from exc
 
+    required_comment_columns = (
+        _TASK_COMMENTS_REQUIRED_COLUMNS if target_version >= 54 else _TASK_COMMENTS_V32_REQUIRED_COLUMNS
+    )
     missing_comment_columns = (
-        _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+        _missing_required_columns(conn, "task_comments", required_comment_columns)
         if target_version >= 32
         else []
     )
@@ -2008,7 +2064,7 @@ def _ensure_required_auto_migration_artifacts(
                 "Schema integrity check failed while repairing required column "
                 f"task_comments.{missing_column}: use a writable database."
             ) from exc
-        remaining_missing = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_REQUIRED_COLUMNS)
+        remaining_missing = _missing_required_columns(conn, "task_comments", required_comment_columns)
         if remaining_missing:
             raise SchemaIntegrityError(
                 "Schema integrity check failed while repairing required column "
@@ -2477,6 +2533,7 @@ CREATE TABLE IF NOT EXISTS task_comments (
     content TEXT NOT NULL,
     source TEXT NOT NULL,
     author TEXT,
+    kind TEXT NOT NULL DEFAULT 'feedback',
     created_at TEXT NOT NULL,
     resolved_at TEXT,
     FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
@@ -2829,6 +2886,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (51, MIGRATION_V50_TO_V51),
     (52, MIGRATION_V51_TO_V52),
     (53, MIGRATION_V52_TO_V53),
+    (54, MIGRATION_V53_TO_V54),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3336,6 +3394,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing required column task_comments.source; "
                 "task comments will use default source values."
             )
+        elif not self._query_only_has_column("task_comments", "kind"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing required column task_comments.kind; "
+                "task comments will default to kind=feedback."
+            )
         if self._query_only_table_exists.get("watch_progress_observations", False):
             if not self._query_only_supports_watch_progress_observations():
                 self._startup_warnings.append(
@@ -3752,6 +3815,7 @@ class SqliteTaskStore:
             content=row["content"],
             source=row["source"] if "source" in keys else "direct",
             author=row["author"] if "author" in keys else None,
+            kind=row["kind"] if "kind" in keys else TASK_COMMENT_KIND_FEEDBACK,
             created_at=created_at,
             resolved_at=_parse_db_timestamp(row["resolved_at"]),
         )
@@ -6656,10 +6720,12 @@ class SqliteTaskStore:
         *,
         source: str = "direct",
         author: str | None = None,
+        kind: str = TASK_COMMENT_KIND_FEEDBACK,
     ) -> TaskComment:
         """Persist a task comment and return it."""
         if source not in {"direct", "github"}:
             raise ValueError(f"Unknown comment source: {source}")
+        normalized_kind = _normalize_comment_kind(kind)
         normalized = content.strip()
         if not normalized:
             raise ValueError("Comment content cannot be empty")
@@ -6688,10 +6754,10 @@ class SqliteTaskStore:
             created_at = _next_monotonic_iso_timestamp(datetime.now(UTC), previous_created_at)
             cur = conn.execute(
                 """
-                INSERT INTO task_comments (project_id, task_id, content, source, author, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO task_comments (project_id, task_id, content, source, author, kind, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (self._project_id, task_id, normalized, source, author, created_at),
+                (self._project_id, task_id, normalized, source, author, normalized_kind, created_at),
             )
             row = conn.execute(
                 "SELECT * FROM task_comments WHERE project_id = ? AND id = ?",
@@ -6706,14 +6772,26 @@ class SqliteTaskStore:
         *,
         unresolved_only: bool = False,
         created_on_or_before: datetime | None = None,
+        kinds: Iterable[str] | None = None,
     ) -> list[TaskComment]:
         """Return comments for a task in creation order."""
         if not self._query_only_supports_comments():
             return []
+        normalized_kinds = _normalize_comment_kinds(kinds)
+        if normalized_kinds == ():
+            return []
+        kind_column_available = self._query_only_has_column("task_comments", "kind")
         query = "SELECT * FROM task_comments WHERE project_id = ? AND task_id = ?"
         params: list[Any] = [self._project_id, task_id]
         if unresolved_only:
             query += " AND resolved_at IS NULL"
+        if normalized_kinds is not None:
+            if kind_column_available:
+                placeholders = ", ".join("?" for _ in normalized_kinds)
+                query += f" AND kind IN ({placeholders})"
+                params.extend(normalized_kinds)
+            elif TASK_COMMENT_KIND_FEEDBACK not in normalized_kinds:
+                return []
         if created_on_or_before is not None:
             cutoff = created_on_or_before
             if cutoff.tzinfo is not None:
@@ -6725,7 +6803,28 @@ class SqliteTaskStore:
         query += " ORDER BY created_at ASC, id ASC"
         with self._connect() as conn:
             cur = conn.execute(query, tuple(params))
-            return [self._row_to_task_comment(row) for row in cur.fetchall()]
+            comments = [self._row_to_task_comment(row) for row in cur.fetchall()]
+        if normalized_kinds is not None and not kind_column_available:
+            return [comment for comment in comments if comment.kind in normalized_kinds]
+        return comments
+
+    def get_latest_comment_by_kind(
+        self,
+        task_id: str,
+        *,
+        kind: str,
+        unresolved_only: bool = False,
+        created_on_or_before: datetime | None = None,
+    ) -> TaskComment | None:
+        """Return the latest comment for one kind, if any."""
+        normalized_kind = _normalize_comment_kind(kind)
+        comments = self.get_comments(
+            task_id,
+            unresolved_only=unresolved_only,
+            created_on_or_before=created_on_or_before,
+            kinds=(normalized_kind,),
+        )
+        return comments[-1] if comments else None
 
     def resolve_comments(
         self,
@@ -8087,9 +8186,13 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                             ),
                         )
                 if _table_exists(local_conn, "task_comments"):
+                    local_comment_columns = _table_columns(local_conn, "task_comments")
+                    local_kind_expr = (
+                        "kind" if "kind" in local_comment_columns else f"'{TASK_COMMENT_KIND_FEEDBACK}'"
+                    )
                     comment_rows = shared_conn.execute(
-                        """
-                        SELECT task_id, content, source, author, created_at, resolved_at
+                        f"""
+                        SELECT task_id, content, source, author, {local_kind_expr} AS kind, created_at, resolved_at
                         FROM legacy_local.task_comments
                         ORDER BY id
                         """
@@ -8106,6 +8209,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                               AND content = ?
                               AND source = ?
                               AND COALESCE(author, '') = COALESCE(?, '')
+                              AND kind = ?
                               AND created_at = ?
                             LIMIT 1
                             """,
@@ -8115,6 +8219,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                                 row["content"],
                                 row["source"],
                                 row["author"],
+                                row["kind"],
                                 created_at,
                             ),
                         ).fetchone()
@@ -8123,9 +8228,9 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         shared_conn.execute(
                             """
                             INSERT INTO task_comments(
-                                project_id, task_id, content, source, author, created_at, resolved_at
+                                project_id, task_id, content, source, author, kind, created_at, resolved_at
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 store._project_id,
@@ -8133,6 +8238,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                                 row["content"],
                                 row["source"],
                                 row["author"],
+                                row["kind"],
                                 created_at,
                                 resolved_at,
                             ),

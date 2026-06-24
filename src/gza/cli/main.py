@@ -13,6 +13,7 @@ from ..config import (
 )
 from ..db import (
     MERGE_SOURCE_VALUES,
+    TASK_COMMENT_KINDS,
     InvalidTaskIdError,
     ManualMigrationRequired,
     MergeTargetResolutionError,
@@ -1802,6 +1803,12 @@ def main() -> int:
         "--author",
         type=str,
         help="Optional author attribution",
+    )
+    comment_parser.add_argument(
+        "--kind",
+        choices=sorted(TASK_COMMENT_KINDS),
+        default="feedback",
+        help="Comment kind to store (default: feedback)",
     )
     add_common_args(comment_parser)
 

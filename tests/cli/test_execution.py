@@ -7531,7 +7531,32 @@ class TestCommentCommand:
         assert len(comments) == 1
         assert comments[0].source == "direct"
         assert comments[0].author == "alice"
+        assert comments[0].kind == "feedback"
         assert comments[0].content == "Please add regression coverage."
+
+    def test_comment_stores_requested_kind(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Task needing review scope", task_type="implement")
+        assert task.id is not None
+
+        result = invoke_gza(
+            "comment",
+            str(task.id),
+            "Grade only the API validation slice.",
+            "--kind",
+            "review_scope",
+            "--project",
+            str(tmp_path),
+            env={"FORCE_COLOR": ""},
+        )
+
+        assert result.returncode == 0
+        assert "Added comment" in result.stdout
+        comments = store.get_comments(task.id)
+        assert len(comments) == 1
+        assert comments[0].kind == "review_scope"
 
 
 class TestReviewCommand:

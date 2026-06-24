@@ -4180,6 +4180,7 @@ def _cmd_show_output(
                 meta_parts = [
                     f"id={comment.id}",
                     f"source={comment.source}",
+                    f"kind={comment.kind}",
                     f"state={state}",
                     f"created={_format_utc_timestamp(comment.created_at)}",
                 ]

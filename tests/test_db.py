@@ -2158,6 +2158,8 @@ class TestTaskComments:
         assert [c.id for c in all_comments] == [first.id, second.id]
         assert all_comments[0].author == "alice"
         assert all_comments[1].author is None
+        assert all_comments[0].kind == "feedback"
+        assert all_comments[1].kind == "feedback"
         assert all_comments[0].resolved_at is None
 
         unresolved = store.get_comments(task.id, unresolved_only=True)
@@ -2188,6 +2190,16 @@ class TestTaskComments:
 
         with pytest.raises(ValueError, match="cannot be empty"):
             store.add_comment(task.id, "   ")
+
+    def test_add_comment_rejects_unknown_kind(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with bad comment kind")
+        assert task.id is not None
+
+        with pytest.raises(ValueError, match="Unknown comment kind"):
+            store.add_comment(task.id, "Invalid kind", kind="context")
 
     def test_add_comment_rejects_unknown_task_id(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -2237,6 +2249,34 @@ class TestTaskComments:
 
         scoped = store.get_comments(task.id, created_on_or_before=first.created_at)
         assert [comment.content for comment in scoped] == ["First comment"]
+
+    def test_get_comments_can_filter_by_kind(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with typed comments", task_type="implement")
+        assert task.id is not None
+
+        store.add_comment(task.id, "Feedback 1", kind="feedback")
+        review_scope = store.add_comment(task.id, "Scope override", kind="review_scope")
+        store.add_comment(task.id, "Feedback 2", kind="feedback")
+
+        feedback_comments = store.get_comments(task.id, kinds=("feedback",))
+        scope_comments = store.get_comments(task.id, kinds=("review_scope",))
+
+        assert [comment.content for comment in feedback_comments] == ["Feedback 1", "Feedback 2"]
+        assert [comment.content for comment in scope_comments] == ["Scope override"]
+        assert store.get_latest_comment_by_kind(task.id, kind="review_scope") == review_scope
+
+    def test_get_comments_rejects_unknown_kind_filter(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with invalid filter", task_type="implement")
+        assert task.id is not None
+
+        with pytest.raises(ValueError, match="Unknown comment kind"):
+            store.get_comments(task.id, kinds=("context",))
 
 
 class TestMergeStatus:
@@ -8481,6 +8521,85 @@ class TestSharedDbIsolationAndImportGating:
         assert comments[0].source == "direct"
         assert comments[1].source == "github"
 
+    def test_auto_migration_v53_to_v54_adds_task_comments_kind_column(self, tmp_path: Path) -> None:
+        """Opening a v53 DB should migrate task_comments.kind and default legacy rows to feedback."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before task_comments kind migration")
+        assert task.id is not None
+        store.add_comment(task.id, "Legacy comment before kind migration", source="direct")
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE schema_version SET version = 53")
+        conn.execute("ALTER TABLE task_comments RENAME TO task_comments_old")
+        conn.execute(
+            """
+            CREATE TABLE task_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                author TEXT,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_comments (id, project_id, task_id, content, source, author, created_at, resolved_at)
+            SELECT id, project_id, task_id, content, source, author, created_at, resolved_at
+            FROM task_comments_old
+            """
+        )
+        conn.execute("DROP TABLE task_comments_old")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_created ON task_comments(project_id, task_id, created_at ASC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_comments_project_task_unresolved ON task_comments(project_id, task_id, resolved_at)"
+        )
+        conn.commit()
+        conn.close()
+
+        migrated_store = SqliteTaskStore(db_path, prefix="gza")
+
+        conn = sqlite3.connect(db_path)
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_comments)")}
+        conn.close()
+
+        comments = migrated_store.get_comments(task.id)
+        assert version == SCHEMA_VERSION
+        assert "kind" in columns
+        assert [comment.kind for comment in comments] == ["feedback"]
+
+    def test_open_current_db_repairs_missing_task_comments_kind_column(self, tmp_path: Path) -> None:
+        """Opening a current DB should repair missing task_comments.kind and preserve legacy rows as feedback."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before task_comments kind damage")
+        store.add_comment(task.id, "Existing comment before kind repair", source="direct")
+
+        _drop_task_comments_column(db_path, "kind")
+
+        repaired_store = SqliteTaskStore(db_path, prefix="gza")
+        repaired_store.add_comment(task.id, "Scope comment after repair", source="direct", kind="review_scope")
+
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_comments)")}
+        conn.close()
+
+        comments = repaired_store.get_comments(task.id)
+        assert "kind" in columns
+        assert [comment.kind for comment in comments] == ["feedback", "review_scope"]
+
     def test_open_current_v32_db_missing_execution_mode_column_fails_on_read_only_db(
         self, tmp_path: Path
     ) -> None:
@@ -8550,6 +8669,26 @@ class TestSharedDbIsolationAndImportGating:
             with pytest.raises(
                 SchemaIntegrityError,
                 match=r"required column task_comments\.source",
+            ):
+                SqliteTaskStore(db_path, prefix="gza")
+        finally:
+            db_path.chmod(0o644)
+
+    def test_open_current_db_missing_task_comments_kind_fails_on_read_only_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Read-only current-schema damage should fail early with SchemaIntegrityError for task_comments.kind."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before read-only kind damage")
+        store.add_comment(task.id, "Existing comment", source="direct")
+        _drop_task_comments_column(db_path, "kind")
+
+        db_path.chmod(0o444)
+        try:
+            with pytest.raises(
+                SchemaIntegrityError,
+                match=r"required column task_comments\.kind",
             ):
                 SqliteTaskStore(db_path, prefix="gza")
         finally:
@@ -9217,6 +9356,39 @@ class TestSharedDbIsolationAndImportGating:
 
         assert comments == []
         assert any("task_comments" in warning for warning in query_store.startup_warnings())
+
+    def test_query_only_open_current_db_missing_task_comments_kind_warns_and_reads_comments(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should default missing task_comments.kind to feedback."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task with query-only comment kind damage")
+        assert task.id is not None
+        store.add_comment(task.id, "Existing comment", source="direct")
+
+        _drop_task_comments_column(db_path, "kind")
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            comments = query_store.get_comments(task.id)
+            feedback_comments = query_store.get_comments(task.id, kinds=("feedback",))
+            review_scope_comments = query_store.get_comments(task.id, kinds=("review_scope",))
+            latest_feedback = query_store.get_latest_comment_by_kind(task.id, kind="feedback")
+            latest_review_scope = query_store.get_latest_comment_by_kind(task.id, kind="review_scope")
+        finally:
+            db_path.chmod(0o644)
+
+        assert len(comments) == 1
+        assert comments[0].kind == "feedback"
+        assert [comment.kind for comment in feedback_comments] == ["feedback"]
+        assert review_scope_comments == []
+        assert latest_feedback is not None
+        assert latest_feedback.kind == "feedback"
+        assert latest_feedback.content == "Existing comment"
+        assert latest_review_scope is None
+        assert any("task_comments.kind" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_current_db_missing_run_steps_project_id_warns_and_degrades_counts(
         self, tmp_path: Path

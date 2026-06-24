@@ -5279,7 +5279,7 @@ class TestShowCommand:
 
         resolved_seed = store.add_comment(task.id, "First note", source="direct", author="alice")
         store.resolve_comments(task.id, created_on_or_before=resolved_seed.created_at)
-        store.add_comment(task.id, "Second note", source="github")
+        store.add_comment(task.id, "Second note", source="github", kind="review_scope")
 
         comments = store.get_comments(task.id)
         assert len(comments) == 2
@@ -5297,12 +5297,14 @@ class TestShowCommand:
         assert "Comments:" in result.stdout
         assert f"id={resolved_comment.id}" in result.stdout
         assert "source=direct" in result.stdout
+        assert "kind=feedback" in result.stdout
         assert "author=alice" in result.stdout
         assert "state=resolved" in result.stdout
         assert f"created={resolved_created}" in result.stdout
         assert f"resolved={resolved_at}" in result.stdout
         assert f"id={open_comment.id}" in result.stdout
         assert "source=github" in result.stdout
+        assert "kind=review_scope" in result.stdout
         assert "state=open" in result.stdout
         assert f"created={open_created}" in result.stdout
         assert "First note" in result.stdout

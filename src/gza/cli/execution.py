@@ -3270,8 +3270,9 @@ def cmd_comment(args: argparse.Namespace) -> int:
         return 1
 
     author = getattr(args, "author", None)
+    kind = getattr(args, "kind", "feedback")
     try:
-        comment = store.add_comment(task_id, args.text, source="direct", author=author)
+        comment = store.add_comment(task_id, args.text, source="direct", author=author, kind=kind)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
