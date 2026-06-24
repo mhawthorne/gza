@@ -43,6 +43,7 @@ def determine_next_action(
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
     persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible entrypoint for advance action selection."""
@@ -55,6 +56,7 @@ def determine_next_action(
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        persist_review_clearance=persist_review_clearance,
         read_context=read_context,
     )
 

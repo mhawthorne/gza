@@ -4367,7 +4367,7 @@ def _task_has_current_passing_review_verify_evidence(
         return False
     if task.review_verify_captured_at is None:
         return False
-    if review_task.completed_at is not None and task.review_verify_captured_at < review_task.completed_at:
+    if review_task.completed_at is not None and task.review_verify_captured_at <= review_task.completed_at:
         return False
     if not current_branch or not task.review_verify_branch:
         return False

@@ -830,6 +830,7 @@ def _collect_live_owner_ids_for_stale_dependency_links(
             store,
             LineageOwnerQuery(limit=None, exclude_dropped_from_planning=True),
             persist_post_merge_rebase_state=False,
+            persist_review_clearance=False,
         )
     live_owner_ids = {
         row.owner_task.id
@@ -979,6 +980,7 @@ def query_lineage_owner_rows(
     git: Git | None = None,
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
 ) -> tuple[LineageOwnerRow, ...]:
     rows, read_context = _query_lineage_owner_rows_with_context(
         store,
@@ -987,6 +989,7 @@ def query_lineage_owner_rows(
         git=git,
         target_branch=target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        persist_review_clearance=persist_review_clearance,
     )
     if not read_context.allow_reconcile_mutation:
         _record_pending_recovery_reconciliation_context(store, read_context)
@@ -1023,6 +1026,7 @@ def query_lineage_owner_rows_in_read_session(
     git: Git | None = None,
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .recovery_engine import apply_pending_recovery_reconciliations
 
@@ -1034,6 +1038,7 @@ def query_lineage_owner_rows_in_read_session(
             git=git,
             target_branch=target_branch,
             persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+            persist_review_clearance=persist_review_clearance,
         )
     apply_pending_recovery_reconciliations(store, read_context=read_context)
     return rows, read_context
@@ -1046,6 +1051,7 @@ def _query_lineage_owner_rows_with_context(
     git: Git | None = None,
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .cli.advance_engine import determine_next_action, failed_recovery_decision_to_attention_action
     from .query import is_lineage_complete
@@ -1385,6 +1391,7 @@ def _query_lineage_owner_rows_with_context(
                 impl_based_on_ids=indexes.non_dropped_impl_source_ids,
                 max_resume_attempts=query.max_recovery_attempts,
                 persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+                persist_review_clearance=persist_review_clearance,
                 read_context=read_context,
             )
             if lifecycle_action_task is not None and lifecycle_action_task.id is not None:

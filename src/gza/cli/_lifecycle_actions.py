@@ -76,6 +76,7 @@ def collect_lifecycle_action_entries(
         git=git,
         target_branch=target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        persist_review_clearance=persist_post_merge_rebase_state,
     )
 
     entries: list[LifecycleActionEntry] = []
@@ -91,6 +92,7 @@ def collect_lifecycle_action_entries(
             target_branch,
             max_resume_attempts=max_recovery_attempts,
             persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+            persist_review_clearance=persist_post_merge_rebase_state,
             read_context=read_context,
         )
         if classify_advance_action(action) != "actionable":

@@ -258,12 +258,26 @@ def test_verify_only_noop_improve_contract_does_not_claim_generic_recapture() ->
     assert "blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when" in lifecycle_engine
     assert "the current review row already carries runner-owned review-time failure evidence for" in lifecycle_engine
     assert "the same branch/head." in lifecycle_engine
+    assert "lifecycle MUST first conservatively classify the blocker set as" in lifecycle_engine
+    assert "verify-only before same-head runner-owned evidence can clear it" in lifecycle_engine
+    assert "prose alone MUST NOT" in lifecycle_engine
+    assert "decide stale/non-stale provenance." in lifecycle_engine
+    assert "ordinary non-timeout" in lifecycle_engine
+    assert "review-fail then no-op-improve-pass evidence pair" in lifecycle_engine
     assert "each time it runs a no-op improve" not in lifecycle_engine
 
-    assert "only after that same-head failed-review gate applies" in behavior_check
-    assert "requires runner-owned review-time failure evidence at the same branch/head" in behavior_check
+    assert "LE-\u00a76-VERIFY-ONLY-CLEAR" in behavior_check
+    assert "verify-only review classification plus runner-owned review-time failure evidence" in behavior_check
+    assert "review-fail/no-op-improve-pass evidence" in behavior_check
+    assert "persists `clear_review_state(...)`" in behavior_check
+    assert "detached re-verify action" in behavior_check
+    assert "ordinary `verify_command` failures as well as timeouts" in behavior_check
+    assert "runner.py:" not in behavior_check
+    assert "advance_engine.py:" not in behavior_check
 
     assert "review FAILED and the no-op improve later PASSED at the same branch head" in overview
+    assert "Ordinary verify-failure-only stale reviews are handled by that same-head evidence-clear path" in overview
+    assert "lifecycle first classifies the blocker set as verify-only" in overview
 
 
 def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:

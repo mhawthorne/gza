@@ -227,6 +227,7 @@ class AdvanceContext:
     active_review: DbTask | None = None
     latest_completed_review: DbTask | None = None
     latest_completed_code_change: DbTask | None = None
+    effective_review_cleared_at: datetime | None = None
     review_cleared: bool = False
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
@@ -664,21 +665,23 @@ def _resolve_branch_head_sha(git: Any, branch: str | None) -> BranchHeadResoluti
     )
 
 
-def _has_persisted_noop_improve_verify_clearance(
+def _resolve_noop_improve_verify_clearance(
     *,
+    store: SqliteTaskStore,
     git: Any,
     project_dir: Path,
     task: DbTask,
     latest_completed_review: DbTask | None,
     improve_tasks: list[DbTask],
-) -> tuple[bool, str | None]:
-    """Fail closed unless current branch-head evidence clears a verify-only review."""
-    if latest_completed_review is None or task.branch is None:
-        return False, None
+    persist: bool,
+) -> tuple[bool, datetime | None, str | None]:
+    """Return verify-only review clearance and optionally persist it."""
+    if latest_completed_review is None or task.branch is None or task.id is None:
+        return False, None, None
 
     branch_head = _resolve_branch_head_sha(git, task.branch)
     if branch_head.warning is not None:
-        return False, branch_head.warning
+        return False, None, branch_head.warning
 
     current_head_sha = branch_head.head_sha
     if not _review_is_verify_only_blocked_at_head(
@@ -687,22 +690,41 @@ def _has_persisted_noop_improve_verify_clearance(
         current_branch=task.branch,
         current_head_sha=current_head_sha,
     ):
-        return False, None
+        return False, None, None
 
-    return (
-        any(
-        improve.status == "completed"
-        and improve.changed_diff is False
-        and _task_has_current_passing_review_verify_evidence(
-            task=improve,
-            review_task=latest_completed_review,
-            current_branch=task.branch,
-            current_head_sha=current_head_sha,
-        )
-        for improve in improve_tasks
+    latest_completed_noop_improve = next(
+        (
+            improve
+            for improve in improve_tasks
+            if improve.status == "completed" and improve.changed_diff is False
         ),
         None,
     )
+    if latest_completed_noop_improve is None:
+        return False, None, None
+
+    if not _task_has_current_passing_review_verify_evidence(
+        task=latest_completed_noop_improve,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha,
+    ):
+        return False, None, None
+
+    clearance_time = (
+        latest_completed_noop_improve.review_verify_captured_at
+        or latest_completed_noop_improve.completed_at
+        or latest_completed_noop_improve.started_at
+    )
+    if not persist:
+        return True, clearance_time, None
+
+    store.clear_review_state(task.id)
+    persisted_task = store.get(task.id)
+    if persisted_task is None or persisted_task.review_cleared_at is None:
+        return False, None, None
+    task.review_cleared_at = persisted_task.review_cleared_at
+    return True, persisted_task.review_cleared_at, None
 
 
 def _review_has_current_verify_blocker_clearance(
@@ -1963,7 +1985,7 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
         if latest_completed_rebase_time > failed_rebase_time:
             return False
 
-    review_cleared_at = ctx.task.review_cleared_at
+    review_cleared_at = ctx.effective_review_cleared_at
     if review_cleared_at is not None and _normalize_time(review_cleared_at) >= failed_rebase_time:
         return False
 
@@ -2158,10 +2180,13 @@ def _resolve_review_state(
     store: SqliteTaskStore,
     task: DbTask,
     git: Any,
+    *,
+    persist_review_clearance: bool,
 ) -> tuple[
     list[DbTask],
     DbTask | None,
     DbTask | None,
+    datetime | None,
     bool,
     str | None,
     ParsedReviewReport | None,
@@ -2199,6 +2224,7 @@ def _resolve_review_state(
         and latest_completed_review.completed_at is not None
         and task.review_cleared_at >= latest_completed_review.completed_at
     )
+    effective_review_cleared_at = task.review_cleared_at if persisted_review_cleared else None
     review_cleared = persisted_review_cleared
 
     review_verdict: str | None = None
@@ -2258,12 +2284,18 @@ def _resolve_review_state(
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
         latest_noop_improve, consecutive_noop_improves = _count_consecutive_noop_improves(improve_tasks)
         if not review_cleared:
-            review_cleared, noop_improve_verify_probe_warning = _has_persisted_noop_improve_verify_clearance(
+            (
+                review_cleared,
+                effective_review_cleared_at,
+                noop_improve_verify_probe_warning,
+            ) = _resolve_noop_improve_verify_clearance(
+                store=store,
                 git=git,
                 project_dir=Path(config.project_dir),
                 task=task,
                 latest_completed_review=latest_completed_review,
                 improve_tasks=improve_tasks,
+                persist=persist_review_clearance,
             )
 
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
@@ -2360,6 +2392,7 @@ def _resolve_review_state(
         reviews,
         active_review,
         latest_completed_review,
+        effective_review_cleared_at,
         review_cleared,
         review_verdict,
         review_report,
@@ -2689,7 +2722,7 @@ def _resolve_pre_closing_review_git_context(
         latest_completed_rebase=latest_completed_rebase,
         latest_completed_review=ctx.latest_completed_review,
         latest_completed_code_change=ctx.latest_completed_code_change,
-        review_cleared_at=task.review_cleared_at,
+        review_cleared_at=ctx.effective_review_cleared_at,
     )
 
     return replace(
@@ -2769,6 +2802,7 @@ def resolve_advance_context(
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
     persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
 ) -> AdvanceContext:
     """Resolve state once, then let rules evaluate pure context."""
@@ -2876,6 +2910,7 @@ def resolve_advance_context(
         reviews,
         active_review,
         latest_completed_review,
+        effective_review_cleared_at,
         review_cleared,
         review_verdict,
         review_report,
@@ -2900,7 +2935,13 @@ def resolve_advance_context(
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
         closing_review_action,
-    ) = _resolve_review_state(config, store, review_root_task, git)
+    ) = _resolve_review_state(
+        config,
+        store,
+        review_root_task,
+        git,
+        persist_review_clearance=persist_review_clearance,
+    )
 
     ctx = _build_base_advance_context(
         config=config,
@@ -2927,6 +2968,7 @@ def resolve_advance_context(
         active_review=active_review,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,
+        effective_review_cleared_at=effective_review_cleared_at,
         review_cleared=review_cleared,
         review_verdict=review_verdict,
         review_report=review_report,
@@ -3845,6 +3887,7 @@ def evaluate_advance_rules(
     impl_based_on_ids: set[str] | None = None,
     max_resume_attempts: int | None = None,
     persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
@@ -3857,6 +3900,7 @@ def evaluate_advance_rules(
         impl_based_on_ids=impl_based_on_ids,
         max_resume_attempts=max_resume_attempts,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        persist_review_clearance=persist_review_clearance,
         read_context=read_context,
     )
 

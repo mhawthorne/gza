@@ -207,7 +207,10 @@ When a current review exists for the implementation lineage:
 - **A. Verify-only review clear invariant.** A review whose blockers are solely
   runner-captured `verify_command` failures or timeouts MUST be cleared when the
   subsequent no-op improve captures a passing `verify_command` in that improve's own
-  worktree at the same committed branch head. A review-preserved rebase
+  worktree at the same committed branch head. This applies to ordinary non-timeout
+  `verify_command` failures as well as timeout failures; the durable clear proof is the
+  same-head runner-owned review-fail then no-op-improve-pass evidence pair. A
+  review-preserved rebase
   (`changed_diff = 0`) MAY refresh that persisted head provenance from the pre-rebase
   head to the rewritten post-rebase head for the preserved review and its no-op improve
   chain; outside that explicit preserved-rebase carry-forward, the clear MUST require
@@ -218,8 +221,10 @@ When a current review exists for the implementation lineage:
   blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when
   the current review row already carries runner-owned review-time failure evidence for
   the same branch/head. A preserved rebase MAY carry that key forward to the new head
-  only when the diff-preservation proof succeeds. Reviewer wording is corroborating only
-  and MUST NOT decide this gate. The engine MUST NOT run a separate isolated
+  only when the diff-preservation proof succeeds. Reviewer wording MAY corroborate the
+  situation, but lifecycle MUST first conservatively classify the blocker set as
+  verify-only before same-head runner-owned evidence can clear it; prose alone MUST NOT
+  decide stale/non-stale provenance. The engine MUST NOT run a separate isolated
   detached-worktree verify solely to clear this condition.
 - **B. Disputed non-verify CODE blocker adjudication.** When the latest
   `CHANGES_REQUESTED` review carries a non-verify CODE blocker and the latest completed
@@ -240,14 +245,15 @@ When a current review exists for the implementation lineage:
   `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). This generic
   no-op park applies only after ruling out rule B adjudication-eligible disputed
   non-verify CODE blockers. If current passing in-improve evidence has already cleared
-  the review, normal merge rules apply. Otherwise, if `verify_command` still fails, the
-  evidence is absent, stale, or recorded at a different branch/head, or the blocker is
-  not verify-only, the no-op improve limit MUST park rather than auto-clear. If
-  lifecycle cannot resolve the current branch head while checking that provenance, it
-  MUST still fail closed but surface that probe failure in the parked result instead of
-  silently degrading to a generic no-op loop. When the review-time runner verify PASSED,
-  or no runner-owned review verify exists, the blocker is treated as a genuine code
-  issue and still requires a real code change before merge.
+  the review, normal merge rules apply before the no-op limit can park. Otherwise, if
+  `verify_command` still fails, the evidence is absent, stale, or recorded at a
+  different branch/head, or the blocker is not verify-only, the no-op improve limit
+  MUST park rather than auto-clear. If lifecycle cannot resolve the current branch head
+  while checking that provenance, it MUST still fail closed but surface that probe
+  failure in the parked result instead of silently degrading to a generic no-op loop.
+  When the review-time runner verify PASSED, or no runner-owned review verify exists,
+  the blocker is treated as a genuine code issue and still requires a real code change
+  before merge.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the

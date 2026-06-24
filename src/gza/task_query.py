@@ -957,6 +957,7 @@ class TaskQueryService:
             git,
             owner_task,
             target_branch,
+            persist_review_clearance=False,
         )
 
     def _latest_review_verdict(self, owner_task: DbTask) -> str | None:

@@ -339,6 +339,7 @@ def _implementation_review_rebase_detail(
             task,
             target_branch,
             persist_post_merge_rebase_state=False,
+            persist_review_clearance=False,
         )
     except (GitError, OSError, ValueError):
         return None
@@ -446,6 +447,7 @@ def _summarize_lifecycle(
             planning_task,
             target_branch,
             persist_post_merge_rebase_state=False,
+            persist_review_clearance=False,
         )
     except (GitError, OSError, ValueError) as exc:
         detail = f"lifecycle unavailable - failed to classify lifecycle: {' '.join(str(exc).split())}"

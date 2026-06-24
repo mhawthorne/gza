@@ -12287,6 +12287,15 @@ class TestExtractedRunInnerHelpers:
                 ),
             ),
             (
+                "captured_at_review_completed",
+                lambda improve, review, impl: (
+                    setattr(improve, "review_verify_status", "passed"),
+                    setattr(improve, "review_verify_branch", impl.branch),
+                    setattr(improve, "review_verify_head_sha", "abc1234"),
+                    setattr(improve, "review_verify_captured_at", review.completed_at),
+                ),
+            ),
+            (
                 "branch_mismatch",
                 lambda improve, review, impl: (
                     setattr(improve, "review_verify_status", "passed"),
