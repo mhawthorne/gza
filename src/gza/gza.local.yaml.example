@@ -329,6 +329,11 @@
 # Default: 120
 # autonomous_verify_timeout_seconds: 120
 
+# Maximum age of a failed/unavailable local-target integration verify checkpoint before automation
+# reruns it even when the tree fingerprint is unchanged.
+# Default: 30
+# main_integration_verify_red_ttl_minutes: 30
+
 # Deprecated compatibility key; accepted but ignored.
 # Default: 1
 # recommend_rebase_behind_commits: 1

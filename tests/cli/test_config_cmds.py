@@ -4602,6 +4602,7 @@ class TestWatchConfigValidation:
         config = Config.load(tmp_path)
         assert config.autonomous_verify_timeout_seconds == 120
         assert config.review_verify_timeout_grace_seconds == 5
+        assert config.main_integration_verify_red_ttl_minutes == 30
         assert config.max_noop_improve_cycles == 1
         assert config.recommend_rebase_behind_commits == 1
 
@@ -4613,11 +4614,13 @@ class TestWatchConfigValidation:
             tmp_path,
             "autonomous_verify_timeout_seconds: 240\n"
             "review_verify_timeout_grace_seconds: 7.5\n"
+            "main_integration_verify_red_ttl_minutes: 45\n"
             "recommend_rebase_behind_commits: 0\n",
         )
         config = Config.load(tmp_path)
         assert config.autonomous_verify_timeout_seconds == 240
         assert config.review_verify_timeout_grace_seconds == 7.5
+        assert config.main_integration_verify_red_ttl_minutes == 45
         assert config.recommend_rebase_behind_commits == 0
 
     @pytest.mark.parametrize(
@@ -4686,6 +4689,10 @@ class TestWatchConfigValidation:
             ("review_verify_timeout_grace_seconds", "0", "'review_verify_timeout_grace_seconds' must be at least 1 second"),
             ("review_verify_timeout_grace_seconds", "0.5", "'review_verify_timeout_grace_seconds' must be at least 1 second"),
             ("review_verify_timeout_grace_seconds", "7.5", ""),
+            ("main_integration_verify_red_ttl_minutes", "nope", "'main_integration_verify_red_ttl_minutes' must be an integer"),
+            ("main_integration_verify_red_ttl_minutes", "true", "'main_integration_verify_red_ttl_minutes' must be an integer"),
+            ("main_integration_verify_red_ttl_minutes", "0", "'main_integration_verify_red_ttl_minutes' must be positive"),
+            ("main_integration_verify_red_ttl_minutes", "-1", "'main_integration_verify_red_ttl_minutes' must be positive"),
             ("recommend_rebase_behind_commits", "nope", "'recommend_rebase_behind_commits' must be an integer"),
             ("recommend_rebase_behind_commits", "-1", "'recommend_rebase_behind_commits' must be non-negative"),
         ],

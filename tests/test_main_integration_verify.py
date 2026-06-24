@@ -50,6 +50,7 @@ def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
 
     git = MagicMock()
     git.repo_dir = tmp_path
@@ -118,6 +119,7 @@ def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
 
     git = MagicMock()
     git.default_branch.return_value = "main"
@@ -133,3 +135,154 @@ def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_
     assert alert.alert_message == (
         "main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"
     )
+
+
+def test_check_main_integration_verify_reuses_same_tree_green_checkpoint_without_rerun(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="passed",
+        verify_exit_status="0",
+        failure="",
+        alert_message="",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test",
+        )
+
+    run_verify.assert_not_called()
+    assert check.performed_verify is False
+    assert check.is_current is True
+    assert check.merges_halted is False
+    assert check.state.verify_status == "passed"
+
+
+def test_check_main_integration_verify_reuses_fresh_same_tree_red_checkpoint_before_ttl(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    frozen_now = datetime(2026, 6, 23, 0, 29, tzinfo=UTC)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+        patch("gza.main_integration_verify.datetime") as mocked_datetime,
+    ):
+        mocked_datetime.now.return_value = frozen_now
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test-red-fresh",
+        )
+
+    run_verify.assert_not_called()
+    assert check.performed_verify is False
+    assert check.is_current is True
+    assert check.merges_halted is True
+    assert check.state.verify_status == "failed"
+
+
+def test_check_main_integration_verify_reruns_expired_same_tree_red_checkpoint(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 1, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    frozen_now = datetime(2026, 6, 23, 1, 31, tzinfo=UTC)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified"]),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+        patch("gza.main_integration_verify.datetime") as mocked_datetime,
+    ):
+        mocked_datetime.now.return_value = frozen_now
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test-red-ttl",
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.merges_halted is False
+    assert check.state.verify_status == "passed"

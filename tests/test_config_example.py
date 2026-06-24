@@ -80,6 +80,20 @@ def test_full_config_example_groups_review_verify_timeout_grace_under_review() -
     assert not other_header or grace_key not in other_section
 
 
+def test_full_config_example_groups_main_integration_verify_red_ttl_under_review() -> None:
+    rendered = render_config_example()
+
+    review_start = rendered.index("# --- Review ---")
+    learnings_start = rendered.index("# --- Learnings ---")
+    ttl_key = "# main_integration_verify_red_ttl_minutes: 30"
+
+    ttl_index = rendered.index(ttl_key)
+
+    assert review_start < ttl_index < learnings_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or ttl_key not in other_section
+
+
 def test_full_config_example_groups_failed_plan_review_retries_under_lifecycle() -> None:
     rendered = render_config_example()
 

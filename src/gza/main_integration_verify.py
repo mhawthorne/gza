@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import Config
@@ -307,6 +307,7 @@ def _coerce_result_to_freshness_unavailable(
 def _checkpoint_is_current(
     state: MainIntegrationVerifyState,
     *,
+    config: Config,
     current_gate: MainIntegrationVerifyGateIdentity,
     current_tree_fingerprint: str | None,
     current_head_sha: str | None,
@@ -314,6 +315,12 @@ def _checkpoint_is_current(
     if not _gate_identity_matches(state, current_gate):
         return False
     if state.gate_enabled:
+        if _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
+            captured_at = state.captured_at
+            if captured_at is None:
+                return False
+            if datetime.now(UTC) - captured_at >= timedelta(minutes=config.main_integration_verify_red_ttl_minutes):
+                return False
         return bool(
             current_tree_fingerprint
             and state.tree_fingerprint
@@ -421,6 +428,7 @@ def check_main_integration_verify(
     state = load_main_integration_verify_state(store)
     if state is not None and _checkpoint_is_current(
         state,
+        config=config,
         current_gate=current_gate,
         current_tree_fingerprint=current_tree_fingerprint,
         current_head_sha=current_head_sha,

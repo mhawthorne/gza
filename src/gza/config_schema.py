@@ -170,6 +170,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         5,
         "Grace period in seconds after SIGTERM before autonomous review verification escalates to SIGKILL.",
     ),
+    ConfigKeySpec(
+        "main_integration_verify_red_ttl_minutes",
+        "int",
+        30,
+        "Maximum age of a failed/unavailable local-target integration verify checkpoint before automation reruns it even when the tree fingerprint is unchanged.",
+    ),
     ConfigKeySpec("recommend_rebase_behind_commits", "int", 1, "Deprecated compatibility key; accepted but ignored."),
     ConfigKeySpec("review_diff_medium_threshold", "int", 2000, "Medium diff threshold for review prompt shaping."),
     ConfigKeySpec("review_diff_small_threshold", "int", 500, "Small diff threshold for full inline review diffs."),

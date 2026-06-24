@@ -285,6 +285,71 @@ def test_same_tree_red_checkpoint_reruns_when_verify_command_changes_and_recover
     assert current_main_integration_verify_alert(store, git, config) is None
 
 
+def test_same_tree_red_checkpoint_reruns_after_ttl_and_recovers(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.main_integration_verify_red_ttl_minutes = 30
+    git = init_basic_repo(tmp_path)
+    head_sha = git.rev_parse("HEAD")
+
+    red_captured_at = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    with patch(
+        "gza.main_integration_verify._run_review_verify_command",
+        return_value=_make_review_verify_result(
+            config.verify_command,
+            status="failed",
+            exit_status="failed",
+            captured_at=red_captured_at,
+            reviewed_branch=git.current_branch(),
+            reviewed_head_sha=head_sha,
+            working_directory=str(git.repo_dir),
+            failure="tests failed",
+        ),
+    ) as first_verify:
+        seeded = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="seed-red-ttl",
+        )
+
+    first_verify.assert_called_once()
+    assert seeded.merges_halted is True
+    original_fingerprint = seeded.state.tree_fingerprint
+
+    green_captured_at = datetime(2026, 6, 23, 12, 31, tzinfo=UTC)
+    with (
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=_make_review_verify_result(
+            config.verify_command,
+            status="passed",
+            exit_status="0",
+            captured_at=green_captured_at,
+            reviewed_branch=git.current_branch(),
+            reviewed_head_sha=head_sha,
+            working_directory=str(git.repo_dir),
+        )) as second_verify,
+        patch("gza.main_integration_verify.datetime") as mocked_datetime,
+    ):
+        mocked_datetime.now.return_value = green_captured_at
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        recovered = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="red-ttl-refresh",
+        )
+
+    second_verify.assert_called_once()
+    assert recovered.performed_verify is True
+    assert recovered.merges_halted is False
+    assert recovered.state.verify_status == "passed"
+    assert original_fingerprint is not None
+    assert recovered.state.tree_fingerprint is not None
+    assert current_main_integration_verify_alert(store, git, config) is None
+
+
 def test_current_main_integration_verify_alert_suppresses_same_head_red_checkpoint_when_gate_removed(
     tmp_path,
 ) -> None:

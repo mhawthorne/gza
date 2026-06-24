@@ -83,12 +83,15 @@ Each watch cycle MUST execute these phases in order:
    identity changes on the same tree, and after each successful merge onto that target,
    watch MUST rerun the configured verify gate against the local target tree. Freshness is
    keyed at least by the normalized `verify_command` plus gate-enabled/no-gate state, and
-   the current implementation also includes the resolved automation timeout settings. If
-   the current default-branch checkout cannot produce an exact tree fingerprint before or
-   after that verify, watch MUST treat freshness as unproven instead of reusing `HEAD`
-   equality alone; it MUST halt further merges for the current cycle and surface one
-   visible durable attention row explaining that exact-tree freshness could not be proven.
-   More generally, if that verify is not `passed`, watch MUST halt further merges for the
+   the current implementation also includes the resolved automation timeout settings.
+   Independently of tree change, a configured-gate checkpoint that is not `passed` MUST
+   expire after a bounded configured TTL and be rerun on that cadence so red/unavailable
+   results cannot persist indefinitely on an unchanged target tree. If the current
+   default-branch checkout cannot produce an exact tree fingerprint before or after that
+   verify, watch MUST treat freshness as unproven instead of reusing `HEAD` equality
+   alone; it MUST halt further merges for the current cycle and surface one visible
+   durable attention row explaining that exact-tree freshness could not be proven. More
+   generally, if that verify is not `passed`, watch MUST halt further merges for the
    current cycle and emit one visible durable attention row with reason
    `main-integration-verify-red` naming the failing target SHA and, when structured phase
    output exists, the failing phase. The convergence requirements for how that red state

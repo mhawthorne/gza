@@ -129,6 +129,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "review_context_file_limit",
             "autonomous_verify_timeout_seconds",
             "review_verify_timeout_grace_seconds",
+            "main_integration_verify_red_ttl_minutes",
             "recommend_rebase_behind_commits",
         ),
     ),

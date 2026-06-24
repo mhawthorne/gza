@@ -105,6 +105,7 @@ DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
 DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS = 120
 DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS = 5
+DEFAULT_MAIN_INTEGRATION_VERIFY_RED_TTL_MINUTES = 30
 REVIEW_VERIFY_TIMEOUT_GRACE_MINIMUM_ERROR = (
     "'review_verify_timeout_grace_seconds' must be at least 1 second"
 )
@@ -132,7 +133,7 @@ VALID_CONFIG_FIELDS = {
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
-    "review_verify_timeout_grace_seconds",
+    "review_verify_timeout_grace_seconds", "main_integration_verify_red_ttl_minutes",
     "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
     "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
     "code_task_diff_timeout_cap_minutes",
@@ -238,6 +239,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "review_context_file_limit": None,
     "autonomous_verify_timeout_seconds": None,
     "review_verify_timeout_grace_seconds": None,
+    "main_integration_verify_red_ttl_minutes": None,
     "code_task_diff_timeout_medium_threshold": None,
     "code_task_diff_timeout_large_threshold": None,
     "code_task_diff_timeout_medium_minutes": None,
@@ -348,6 +350,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "review_context_file_limit": None,
     "autonomous_verify_timeout_seconds": None,
     "review_verify_timeout_grace_seconds": None,
+    "main_integration_verify_red_ttl_minutes": None,
     "code_task_diff_timeout_medium_threshold": None,
     "code_task_diff_timeout_large_threshold": None,
     "code_task_diff_timeout_medium_minutes": None,
@@ -996,6 +999,7 @@ class Config:
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
     autonomous_verify_timeout_seconds: int = DEFAULT_AUTONOMOUS_VERIFY_TIMEOUT_SECONDS
     review_verify_timeout_grace_seconds: float = DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS
+    main_integration_verify_red_ttl_minutes: int = DEFAULT_MAIN_INTEGRATION_VERIFY_RED_TTL_MINUTES
     code_task_diff_timeout_medium_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_THRESHOLD
     code_task_diff_timeout_large_threshold: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_LARGE_THRESHOLD
     code_task_diff_timeout_medium_minutes: int = DEFAULT_CODE_TASK_DIFF_TIMEOUT_MEDIUM_MINUTES
@@ -2127,6 +2131,13 @@ class Config:
         )
         if not math.isfinite(review_verify_timeout_grace_seconds) or review_verify_timeout_grace_seconds < 1:
             raise ConfigError(REVIEW_VERIFY_TIMEOUT_GRACE_MINIMUM_ERROR)
+        main_integration_verify_red_ttl_minutes = _load_strict_int_field(
+            data,
+            "main_integration_verify_red_ttl_minutes",
+            DEFAULT_MAIN_INTEGRATION_VERIFY_RED_TTL_MINUTES,
+        )
+        if main_integration_verify_red_ttl_minutes < 1:
+            raise ConfigError("'main_integration_verify_red_ttl_minutes' must be positive")
 
         resolved_code_task_timeout_scaling = _resolve_code_task_timeout_scaling_fields(data)
         assert resolved_code_task_timeout_scaling is not None
@@ -2307,6 +2318,7 @@ class Config:
             review_context_file_limit=review_context_file_limit,
             autonomous_verify_timeout_seconds=autonomous_verify_timeout_seconds,
             review_verify_timeout_grace_seconds=review_verify_timeout_grace_seconds,
+            main_integration_verify_red_ttl_minutes=main_integration_verify_red_ttl_minutes,
             code_task_diff_timeout_medium_threshold=code_task_diff_timeout_medium_threshold,
             code_task_diff_timeout_large_threshold=code_task_diff_timeout_large_threshold,
             code_task_diff_timeout_medium_minutes=code_task_diff_timeout_medium_minutes,
@@ -2726,6 +2738,11 @@ class Config:
                 errors.append(REVIEW_VERIFY_TIMEOUT_GRACE_MINIMUM_ERROR)
             elif float(data["review_verify_timeout_grace_seconds"]) < 1:
                 errors.append(REVIEW_VERIFY_TIMEOUT_GRACE_MINIMUM_ERROR)
+        if "main_integration_verify_red_ttl_minutes" in data:
+            if not _is_strict_int(data["main_integration_verify_red_ttl_minutes"]):
+                errors.append("'main_integration_verify_red_ttl_minutes' must be an integer")
+            elif data["main_integration_verify_red_ttl_minutes"] <= 0:
+                errors.append("'main_integration_verify_red_ttl_minutes' must be positive")
 
         _resolve_code_task_timeout_scaling_fields(data, errors=errors)
 

@@ -356,11 +356,14 @@ failure *and* actionable merge/review work remains eligible for the latter.
   becomes stale when the configured gate identity changes on the same tree: at minimum the
   normalized `verify_command` and the gate-enabled/no-gate state are part of freshness, and
   the current implementation also keys freshness on the resolved automation timeout
-  settings. If the live local-target checkout cannot produce an exact tree fingerprint for
-  that freshness proof, automation MUST fail closed instead of reusing `HEAD` equality
-  alone: it MUST rerun the verify gate, and if exact-tree freshness still cannot be
-  established it MUST persist an operator-visible unavailable proof state that halts
-  merges for the cycle. More generally, if that target-level verify is not `passed`,
+  settings. Independently of tree change, configured-gate checkpoints that are not
+  `passed` MUST also expire after a bounded configured TTL and be rerun on that cadence so
+  a stale red/unavailable result cannot park merges indefinitely on an unchanged tree. If
+  the live local-target checkout cannot produce an exact tree fingerprint for that
+  freshness proof, automation MUST fail closed instead of reusing `HEAD` equality alone:
+  it MUST rerun the verify gate, and if exact-tree freshness still cannot be established
+  it MUST persist an operator-visible unavailable proof state that halts merges for the
+  cycle. More generally, if that target-level verify is not `passed`,
   automation MUST halt further merges for the cycle and surface one durable
   needs-attention signal with reason `main-integration-verify-red` that names the failing
   local target SHA and, when structured phase output exists, the failing phase. Projects
