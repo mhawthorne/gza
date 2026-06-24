@@ -1,6 +1,11 @@
 """Functional tests for watch flows that require a real git repo."""
 
+import os
+import shlex
+import shutil
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +16,50 @@ from gza.config import Config
 from tests.cli.conftest import make_store, setup_config
 
 from tests_functional.git_helpers import init_basic_repo, setup_git_repo_with_task_branch
+
+
+def _install_counting_git_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    real_git = shutil.which("git")
+    assert real_git is not None
+
+    counter_path = tmp_path / "git-count.log"
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim_path = shim_dir / "git"
+    shim_path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(counter_path))}\n"
+        f"exec {shlex.quote(real_git)} \"$@\"\n"
+    )
+    shim_path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+    return counter_path
+
+
+def _seed_watch_analysis_fixture(tmp_path: Path, *, branch_count: int) -> tuple[object, object]:
+    store = make_store(tmp_path)
+    git = init_basic_repo(tmp_path)
+
+    for index in range(branch_count):
+        branch = f"feature/watch-cache-{index}"
+        task = store.add(f"Watch cache task {index}", task_type="implement")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = True
+        task.merge_status = "unmerged"
+        store.update(task)
+
+        git._run("checkout", "-b", branch)
+        (tmp_path / f"watch-cache-{index}.txt").write_text(f"{index}\n")
+        git._run("add", f"watch-cache-{index}.txt")
+        git._run("commit", "-m", f"Watch cache commit {index}")
+        branch_sha = git.rev_parse("HEAD")
+        git._run("checkout", "main")
+        git._run("update-ref", f"refs/remotes/origin/{branch}", branch_sha)
+
+    return store, git
 
 
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) -> None:
@@ -148,3 +197,45 @@ def test_watch_cycle_real_git_dedupes_attention_and_emits_single_task_scoped_rep
         if " REPAIR " in line and diverged.id in line and diverged.branch in line
     ]
     assert len(repair_lines) == 1
+
+
+@pytest.mark.functional
+def test_watch_cycle_analysis_uses_cached_git_reads_for_repeated_branch_probes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    branch_count = 8
+    store, _git = _seed_watch_analysis_fixture(tmp_path, branch_count=branch_count)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    counter_path = _install_counting_git_shim(tmp_path, monkeypatch)
+    counter_path.write_text("")
+
+    no_verify_result = SimpleNamespace(
+        merges_halted=False,
+        state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=no_verify_result),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=True,
+            log=log,
+        )
+
+    git_invocations = len(counter_path.read_text().splitlines())
+    max_allowed_invocations = 80 + (20 * branch_count)
+
+    assert result.work_done is True
+    # Keep this budget loose enough for unrelated fixed-cost probes while still
+    # failing if watch falls back to roughly-per-branch uncached git reads.
+    assert git_invocations < max_allowed_invocations
