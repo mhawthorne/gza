@@ -3206,6 +3206,81 @@ def test_two_consecutive_noop_improves_return_needs_discussion(tmp_path: Path, m
     assert "2 consecutive no-op improves" in action["description"]
 
 
+def test_disputed_noop_improve_routes_to_review_blocker_adjudication(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    assert improve.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "create_review_adjudication"
+    candidate = action["review_blocker_adjudication_candidate"]
+    assert candidate.finding.id == "B1"
+    assert action["review_task"].id == review.id
+
+
 def test_noop_improve_subject_is_implement_when_evaluated_from_improve_leaf(tmp_path: Path, monkeypatch) -> None:
     """When watch.py calls evaluate_advance_rules with the improve leaf as the task,
     the needs-attention subject_task_id must still point to the implement owner."""
@@ -6939,6 +7014,8 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         max_noop_improve_cycles=2,
         noop_improve_trigger="comments",
         noop_improve_verify_probe_warning=None,
+        review_blocker_adjudication_candidate=None,
+        active_review_blocker_adjudication=None,
         duplicate_blocker_streak=SimpleNamespace(
             cycles=3,
             title="Repeated blocker",

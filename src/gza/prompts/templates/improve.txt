@@ -26,6 +26,25 @@ Before finishing, verify that every blocking item has an explicit closure condit
 - Any docs/help/operator-facing text you updated, if applicable
 
 If a Blocker (review Must-Fix item) or comment no longer applies because the code already satisfies it or the feedback was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
+When a non-verify CODE Blocker is invalid and the correct outcome is a no-op improve, you
+may emit a structured `## Disputed Blockers` section in your final report instead of
+inventing a code change. Use this only when the current code or scope actually disproves
+the blocker. Keep one entry per disputed blocker and use this shape:
+
+```markdown
+## Disputed Blockers
+
+### B1
+Finding: <review blocker id/title>
+Reason: unreproducible | already_satisfied | stale | out_of_scope | review_error
+Evidence: <current-state proof>
+Current-state citation: <path:line or path:start-end>
+Scope citation: <optional scope/spec citation>
+Downstream task: <optional full prefixed task id if the work belongs elsewhere>
+```
+
+If you emit `## Disputed Blockers`, make the rest of the report explicit about why no
+code change was required and which current code/tests prove the blocker is not open.
 
 Do not leave blocking feedback items partially addressed. The goal is to resolve all gating feedback in a single pass without creating extra scope.
 Treat a cited path or line range as an instance of a class of issue, not the full scope of the fix. If a blocker calls out one path for a broader issue, audit every analogous path for the same problem and fix them in this pass. When multiple sites share the same fix shape, prefer a centralized helper or shared code path over per-call-site patches. "Extra scope" means unrelated changes, not other instances of the same blocker class.

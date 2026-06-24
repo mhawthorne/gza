@@ -104,6 +104,7 @@ from ._common import (
     _create_rebase_task,
     _create_resume_task,
     _create_retry_task,
+    _create_review_adjudication_task,
     _create_review_task,
     _materialize_plan_review_slices,
     _plan_review_timeout_budget_minutes,
@@ -4141,6 +4142,63 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     None,
                 )
 
+            if action_type == "create_review_adjudication":
+                review_task = initial_action.get("review_task")
+                candidate = initial_action.get("review_blocker_adjudication_candidate")
+                if not isinstance(review_task, DbTask) or candidate is None:
+                    return None, None
+                permit = _reserve_iterate_launch()
+                if permit is False:
+                    return None, 1
+                action_task = _create_review_adjudication_task(
+                    store,
+                    iterate_task,
+                    review_task,
+                    candidate.finding,
+                    dispute_metadata=dict(getattr(candidate.dispute_artifact, "metadata", {}) or {}),
+                    trigger_source="auto-recovery",
+                )
+                prepared_task = _prepare_reserved_iterate_task(
+                    action_task,
+                    permit=permit,
+                    rollback_on_failure=True,
+                )
+                if prepared_task is None:
+                    return None, 1
+                return (
+                    _PreparedIterateStart(
+                        task=prepared_task,
+                        initial_resume=False,
+                        phase="iteration",
+                        action_type="create_review_adjudication",
+                    ),
+                    None,
+                )
+
+            if action_type == "run_review_adjudication":
+                adjudication_task = initial_action.get("review_adjudication_task")
+                if not isinstance(adjudication_task, DbTask):
+                    return None, None
+                permit = _reserve_iterate_launch()
+                if permit is False:
+                    return None, 1
+                prepared_task = _prepare_reserved_iterate_task(
+                    adjudication_task,
+                    permit=permit,
+                    rollback_on_failure=False,
+                )
+                if prepared_task is None:
+                    return None, 1
+                return (
+                    _PreparedIterateStart(
+                        task=prepared_task,
+                        initial_resume=False,
+                        phase="iteration",
+                        action_type="run_review_adjudication",
+                    ),
+                    None,
+                )
+
             if action_type == "needs_rebase":
                 if not iterate_task.branch:
                     return None, None
@@ -4679,7 +4737,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     if not isinstance(initial_action_description, str) or not initial_action_description:
         initial_action_description = initial_action_type
 
-    iteration_actions = {"create_review", "run_review", "improve", "run_improve"}
+    iteration_actions = {
+        "create_review",
+        "run_review",
+        "create_review_adjudication",
+        "run_review_adjudication",
+        "improve",
+        "run_improve",
+    }
 
     if dry_run:
         print(f"[dry-run] Would iterate implementation {impl_task.id} (max {max_iterations} iterations)")
@@ -5279,6 +5344,60 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 action_task = maybe_action_task
             assert action_task.id is not None
             print(f"  Running pending review {action_task.id}...")
+        elif action_type == "create_review_adjudication":
+            if isinstance(prepared_action_task, DbTask):
+                action_task = prepared_action_task
+            else:
+                maybe_review_task = action.get("review_task")
+                candidate = action.get("review_blocker_adjudication_candidate")
+                assert isinstance(maybe_review_task, DbTask)
+                finding = getattr(candidate, "finding", None)
+                dispute_artifact = getattr(candidate, "dispute_artifact", None)
+                assert finding is not None
+                permit_candidate = _reserve_iterate_launch()
+                if permit_candidate is False:
+                    final_status = "blocked"
+                    final_stop_reason = "review_adjudication_failed"
+                    break
+                created_task = _create_review_adjudication_task(
+                    store,
+                    impl_task,
+                    maybe_review_task,
+                    finding,
+                    dispute_metadata=dict(getattr(dispute_artifact, "metadata", {}) or {}),
+                    trigger_source="manual",
+                )
+                if isinstance(permit_candidate, LaunchPermit):
+                    prepared_internal_task = _prepare_reserved_iterate_task(
+                        created_task,
+                        permit=permit_candidate,
+                        rollback_on_failure=True,
+                    )
+                    if prepared_internal_task is None:
+                        final_status = "blocked"
+                        final_stop_reason = "review_adjudication_failed"
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="review_adjudication",
+                            task=None,
+                            status="failed",
+                        )
+                        break
+                    action_task = prepared_internal_task
+                else:
+                    action_task = created_task
+            assert action_task.id is not None
+            print(f"  Running adjudication {action_task.id}...")
+        elif action_type == "run_review_adjudication":
+            if isinstance(prepared_action_task, DbTask):
+                action_task = prepared_action_task
+            else:
+                maybe_action_task = action.get("review_adjudication_task")
+                assert isinstance(maybe_action_task, DbTask)
+                action_task = maybe_action_task
+            assert action_task.id is not None
+            print(f"  Running pending adjudication {action_task.id}...")
         elif action_type == "improve":
             if isinstance(prepared_action_task, DbTask):
                 action_task = prepared_action_task
@@ -5482,6 +5601,8 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             task_type = (
                 "review"
                 if action_type in {"create_review", "run_review"}
+                else "review_adjudication"
+                if action_type in {"create_review_adjudication", "run_review_adjudication"}
                 else "improve" if action_type in {"improve", "run_improve"} else action_type
             )
             attention_result = None
@@ -5548,7 +5669,14 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 final_stop_reason = "needs_discussion" if verdict == "NEEDS_DISCUSSION" else "no_verdict"
                 break
         else:
-            task_type = "improve" if action_type in {"improve", "run_improve"} else action_type
+            verdict = None
+            task_type = (
+                "improve"
+                if action_type in {"improve", "run_improve"}
+                else "review_adjudication"
+                if action_type in {"create_review_adjudication", "run_review_adjudication"}
+                else action_type
+            )
             _append_summary_row(
                 summary_rows,
                 iteration_index=iteration,

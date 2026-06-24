@@ -131,11 +131,15 @@ These hold across the whole machine; the detailed rules in
 3. **Review is the universal pre-merge checkpoint** (policy `require_review_before_merge`,
    default on). When on, an implementation work unit MUST have a current, valid review
    *whose verdict permits merge* before it can merge. The **verdict is the gate**:
-   `CHANGES_REQUESTED` blocks; `APPROVED` and `APPROVED_WITH_FOLLOWUPS` permit merge — the
-   latter meaning the reviewer judged the code mergeable now, with the follow-ups as
-   non-blocking later work. When a verdict carries follow-ups, those follow-ups MUST be
-   durably recorded as tracked work *before* the merge completes, so nothing is lost.
-   This is the one human-or-agent quality gate the whole pipeline is built around.
+   `CHANGES_REQUESTED` blocks unless every current blocker is later cleared by a valid
+   derived path (for example a later review, verify-only provenance clearing, superseding
+   review output, or adjudication marking a disputed blocker `INVALID` for lifecycle
+   purposes). That clearance is derived state, not a historical verdict rewrite or merge
+   bypass. `APPROVED` and `APPROVED_WITH_FOLLOWUPS` permit merge — the latter meaning the
+   reviewer judged the code mergeable now, with the follow-ups as non-blocking later
+   work. When a verdict carries follow-ups, those follow-ups MUST be durably recorded as
+   tracked work *before* the merge completes, so nothing is lost. This is the one
+   human-or-agent quality gate the whole pipeline is built around.
 4. **The local target branch is canonical.** Merge-ness MUST be proven against the local
    target branch, never against `origin/<target>`. The engine MUST NOT push the target
    branch as a side effect of merging.
@@ -174,8 +178,9 @@ time, so each row names what would let us remove it.
 | `needs_discussion` — inconsistent review | Verdict `APPROVED_WITH_FOLLOWUPS` but zero parsed follow-ups (self-contradictory output). | Re-review / correct the review output. | More reliable verdict extraction. |
 | `needs_discussion` — verify-blocked | Review keeps failing only because the verify step times out, not on code issues, once timeout-only reviews hit the threshold and no runner-owned review-fail → no-op-improve-pass transition at the same branch head has already cleared the review. | Fix the environment/verify config, then re-advance. | Separate "verify infra failed" from "code rejected." |
 | `max_cycles_reached` — review churn | Review→improve cycles hit the bound (`max_review_cycles`). | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |
+| `needs_discussion` — blocker adjudication needed | A disputed non-verify CODE blocker reached independent adjudication, but the adjudicator returned `NEEDS_HUMAN`, failed, or produced an unsafe/unparseable result. | Review the blocker, the dispute evidence, and the adjudication output; then fix, override, or restate the blocker explicitly. | Reliable adjudication worker plus durable blocker-resolution state. |
 | `needs_discussion` — duplicate blocker | The same primary blocker repeats across cycles (default bound) with no progress. | Resolve the underlying issue the agent keeps missing. | Detect and break the repeat earlier. |
-| `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). A verify-origin review does not park when runner-owned verify evidence shows the review FAILED and the no-op improve later PASSED at the same branch head, including after a review-preserved rebase that refreshes that evidence onto the rewritten head; all other no-op cases still park. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |
+| `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). A verify-origin review does not park when runner-owned verify evidence shows the review FAILED and the no-op improve later PASSED at the same branch head, including after a review-preserved rebase that refreshes that evidence onto the rewritten head. Disputed non-verify CODE blockers instead route to adjudication first; remaining no-op cases still park. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |
 | `needs_discussion` — unknown verdict | The review verdict could not be classified. | Re-review or correct the output. | More reliable verdict extraction. |
 | `HumanParked` — recovery exhausted | Automatic resume/retry hit its limit or the recovery situation is ambiguous. | Diagnose the failure; resume, redirect, or drop. | Better failure classification & recovery. |
 

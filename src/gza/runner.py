@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -54,6 +54,7 @@ from .db import (
     TASK_COMMENT_KIND_FEEDBACK,
     SqliteTaskStore,
     Task,
+    TaskArtifact,
     TaskStats,
     extract_failure_reason as _extract_failure_reason,
     task_id_numeric_key,
@@ -117,12 +118,22 @@ from .rebase_diff import (
 )
 from .rebase_publish import publish_rebased_branch
 from .review_scope import resolve_review_scope_for_impl
-from .review_tasks import DuplicateReviewError, create_review_task, extract_followup_prompt_parts
+from .review_tasks import (
+    DuplicateReviewError,
+    create_review_task,
+    extract_followup_prompt_parts,
+    extract_review_blocker_adjudication_prompt_parts,
+)
 from .review_verdict import (
+    ReviewFinding,
+    classify_review_blocker_finding,
     compute_review_score,
     get_review_content,
+    get_review_finding_fingerprint,
     is_verify_blocked_only_review,
     is_verify_timeout_only_review,
+    parse_disputed_blockers,
+    parse_review_blocker_adjudication,
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
@@ -138,6 +149,9 @@ from .task_slug import (
 from .worktree_roots import managed_worktree_root_paths
 
 logger = logging.getLogger(__name__)
+
+REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND = "review_blocker_resolution"
+REVIEW_BLOCKER_RESOLUTION_ARTIFACT_SCHEMA_VERSION = 1
 
 # Keep the legacy patch target available for extraction tests that stub the
 # fallback parser on ``gza.runner``.
@@ -2688,8 +2702,323 @@ def _capture_review_verify_result(
                 "review_verify_cwd": result.working_directory,
                 "review_verify_artifact_file": artifact_file,
             },
-        )
+    )
     return artifact_file or ""
+
+
+def _review_blocker_resolution_artifact_key(metadata: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    fingerprint = metadata.get("finding_fingerprint")
+    fingerprint_title = fingerprint.get("title") if isinstance(fingerprint, dict) else None
+    fingerprint_anchor = fingerprint.get("anchor") if isinstance(fingerprint, dict) else None
+    return (
+        metadata.get("state") if isinstance(metadata.get("state"), str) else None,
+        metadata.get("source_task_id") if isinstance(metadata.get("source_task_id"), str) else None,
+        metadata.get("finding_id") if isinstance(metadata.get("finding_id"), str) else None,
+        fingerprint_title if isinstance(fingerprint_title, str) else None,
+        fingerprint_anchor if isinstance(fingerprint_anchor, str) else None,
+    )
+
+
+def _format_review_blocker_resolution_artifact_output(
+    *,
+    state: str,
+    impl_task_id: str,
+    review_task_id: str,
+    source_task_id: str,
+    source_task_type: str,
+    finding_id: str,
+    reason: str | None,
+    evidence: str | None,
+    current_state_citation: str | None,
+    scope_citation: str | None,
+    downstream_task_id: str | None,
+    finding_fingerprint: tuple[str, str],
+    source_branch: str | None,
+    head_sha: str | None,
+) -> str:
+    lines = [
+        "## Review Blocker Resolution",
+        "",
+        f"State: {state}",
+        f"Implementation task: {impl_task_id}",
+        f"Review task: {review_task_id}",
+        f"Source task: {source_task_id} ({source_task_type})",
+        f"Finding: {finding_id}",
+        f"Finding fingerprint title: {finding_fingerprint[0]}",
+        f"Finding fingerprint anchor: {finding_fingerprint[1]}",
+    ]
+    if source_branch:
+        lines.append(f"Source branch: {source_branch}")
+    if head_sha:
+        lines.append(f"Head SHA: {head_sha}")
+    if reason:
+        lines.append(f"Reason: {reason}")
+    if evidence:
+        lines.append(f"Evidence: {evidence}")
+    if current_state_citation:
+        lines.append(f"Current-state citation: {current_state_citation}")
+    if scope_citation:
+        lines.append(f"Scope citation: {scope_citation}")
+    if downstream_task_id:
+        lines.append(f"Downstream task: {downstream_task_id}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _persist_review_blocker_resolution_artifact(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    review_task: Task,
+    impl_task: Task,
+    source_task: Task,
+    state: str,
+    finding: ReviewFinding,
+    finding_fingerprint: tuple[str, str],
+    head_sha: str | None,
+    reason: str | None = None,
+    evidence: str | None = None,
+    current_state_citation: str | None = None,
+    scope_citation: str | None = None,
+    downstream_task_id: str | None = None,
+    created_at: datetime | None = None,
+    source_branch: str | None = None,
+) -> bool:
+    if review_task.id is None or impl_task.id is None or source_task.id is None:
+        return False
+
+    metadata: dict[str, Any] = {
+        "schema_version": REVIEW_BLOCKER_RESOLUTION_ARTIFACT_SCHEMA_VERSION,
+        "state": state,
+        "review_task_id": review_task.id,
+        "impl_task_id": impl_task.id,
+        "source_task_id": source_task.id,
+        "source_task_type": source_task.task_type,
+        "finding_id": finding.id,
+        "finding_fingerprint": {
+            "title": finding_fingerprint[0],
+            "anchor": finding_fingerprint[1],
+        },
+    }
+    resolved_source_branch = source_branch if source_branch is not None else source_task.branch
+    if resolved_source_branch is not None:
+        metadata["source_branch"] = resolved_source_branch
+    if reason is not None:
+        metadata["reason"] = reason
+    if evidence is not None:
+        metadata["evidence"] = evidence
+    if current_state_citation is not None:
+        metadata["current_state_citation"] = current_state_citation
+    if scope_citation is not None:
+        metadata["scope_citation"] = scope_citation
+    if downstream_task_id is not None:
+        metadata["downstream_task_id"] = downstream_task_id
+
+    artifact_key = _review_blocker_resolution_artifact_key(metadata)
+    existing_artifact_keys = {
+        _review_blocker_resolution_artifact_key(artifact.metadata or {})
+        for artifact in store.list_artifacts(review_task.id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+    }
+    if artifact_key in existing_artifact_keys:
+        return False
+
+    output = _format_review_blocker_resolution_artifact_output(
+        state=state,
+        impl_task_id=impl_task.id,
+        review_task_id=review_task.id,
+        source_task_id=source_task.id,
+        source_task_type=source_task.task_type,
+        finding_id=finding.id,
+        reason=reason,
+        evidence=evidence,
+        current_state_citation=current_state_citation,
+        scope_citation=scope_citation,
+        downstream_task_id=downstream_task_id,
+        finding_fingerprint=finding_fingerprint,
+        source_branch=resolved_source_branch,
+        head_sha=head_sha,
+    )
+    store_command_output_artifact(
+        store,
+        review_task,
+        config,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        producer="review_blocker_resolution",
+        label=f"{state}-{finding.id}",
+        output=output,
+        status=state,
+        exit_status=reason or state,
+        head_sha=head_sha,
+        metadata=metadata,
+        created_at=created_at,
+    )
+    return True
+
+
+def _resolution_fingerprint_tuple(metadata: Mapping[str, Any]) -> tuple[str, str] | None:
+    fingerprint = metadata.get("finding_fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        return None
+    title = fingerprint.get("title")
+    anchor = fingerprint.get("anchor")
+    if not isinstance(title, str) or not isinstance(anchor, str) or not title or not anchor:
+        return None
+    return (title, anchor)
+
+
+def _find_latest_review_blocker_resolution_artifact(
+    store: SqliteTaskStore,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    state: str,
+    finding_id: str,
+    finding_fingerprint: tuple[str, str],
+) -> TaskArtifact | None:
+    for artifact in reversed(
+        store.list_artifacts(review_task_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+    ):
+        metadata = artifact.metadata or {}
+        if metadata.get("state") != state:
+            continue
+        if metadata.get("impl_task_id") != impl_task_id:
+            continue
+        if metadata.get("finding_id") != finding_id:
+            continue
+        if _resolution_fingerprint_tuple(metadata) != finding_fingerprint:
+            continue
+        return artifact
+    return None
+
+
+def _persist_review_blocker_resolution_artifacts_for_completed_task(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    completed_task: Task,
+    review_task: Task,
+    impl_task: Task,
+    head_sha: str | None,
+) -> None:
+    if completed_task.id is None or review_task.id is None or impl_task.id is None:
+        return
+
+    disputes = parse_disputed_blockers(_get_task_output(completed_task, Path(config.project_dir)))
+    if not disputes:
+        return
+
+    review_report = parse_review_report(_get_task_output(review_task, Path(config.project_dir)))
+    if review_report.verdict != "CHANGES_REQUESTED":
+        return
+
+    blockers_by_id = {
+        finding.id: finding
+        for finding in review_report.findings
+        if finding.severity == "BLOCKER"
+    }
+    for dispute in disputes:
+        finding = blockers_by_id.get(dispute.finding_id)
+        if finding is None:
+            continue
+        if classify_review_blocker_finding(finding) != "code":
+            continue
+
+        finding_fingerprint = get_review_finding_fingerprint(finding)
+        if finding_fingerprint is None:
+            continue
+
+        _persist_review_blocker_resolution_artifact(
+            store=store,
+            config=config,
+            review_task=review_task,
+            impl_task=impl_task,
+            source_task=completed_task,
+            state="disputed",
+            finding=finding,
+            finding_fingerprint=finding_fingerprint,
+            head_sha=head_sha,
+            reason=dispute.reason,
+            evidence=dispute.evidence,
+            current_state_citation=dispute.current_state_citation,
+            scope_citation=dispute.scope_citation,
+            downstream_task_id=dispute.downstream_task_id,
+            created_at=completed_task.completed_at,
+        )
+
+
+def _persist_review_blocker_adjudication_for_completed_task(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    completed_task: Task,
+) -> None:
+    prompt_parts = extract_review_blocker_adjudication_prompt_parts(completed_task.prompt)
+    if prompt_parts is None or completed_task.id is None:
+        return
+
+    finding_id, review_task_id, impl_task_id = prompt_parts
+    review_task = store.get(review_task_id)
+    impl_task = store.get(impl_task_id)
+    if review_task is None or impl_task is None:
+        return
+    if review_task.id is None or impl_task.id is None:
+        return
+
+    adjudication = parse_review_blocker_adjudication(
+        _get_task_output(completed_task, Path(config.project_dir))
+    )
+    if adjudication is None:
+        return
+
+    review_report = parse_review_report(_get_task_output(review_task, Path(config.project_dir)))
+    if review_report.verdict != "CHANGES_REQUESTED":
+        return
+
+    finding = next(
+        (
+            candidate
+            for candidate in review_report.findings
+            if candidate.severity == "BLOCKER" and candidate.id == finding_id
+        ),
+        None,
+    )
+    if finding is None:
+        return
+
+    finding_fingerprint = get_review_finding_fingerprint(finding)
+    if finding_fingerprint is None:
+        return
+
+    dispute_artifact = _find_latest_review_blocker_resolution_artifact(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        state="disputed",
+        finding_id=finding.id,
+        finding_fingerprint=finding_fingerprint,
+    )
+    if dispute_artifact is None:
+        return
+
+    dispute_metadata = dispute_artifact.metadata or {}
+    _persist_review_blocker_resolution_artifact(
+        store=store,
+        config=config,
+        review_task=review_task,
+        impl_task=impl_task,
+        source_task=completed_task,
+        state=adjudication.verdict.lower(),
+        finding=finding,
+        finding_fingerprint=finding_fingerprint,
+        head_sha=dispute_artifact.head_sha,
+        reason=cast(str | None, dispute_metadata.get("reason")),
+        evidence=cast(str | None, dispute_metadata.get("evidence")),
+        current_state_citation=cast(str | None, dispute_metadata.get("current_state_citation")),
+        scope_citation=cast(str | None, dispute_metadata.get("scope_citation")),
+        downstream_task_id=cast(str | None, dispute_metadata.get("downstream_task_id")),
+        created_at=completed_task.completed_at,
+        source_branch=cast(str | None, dispute_metadata.get("source_branch")),
+    )
 
 
 def _format_review_verify_result(
@@ -6908,6 +7237,20 @@ def _post_complete_code_task(
                 console.print(
                     "[blue]Review State: cleared verify-origin blocker from persisted passing no-op improve verify evidence.[/blue]"
                 )
+            review_task = store.get(task.depends_on) if task.depends_on else None
+            if (
+                review_task is not None
+                and review_task.task_type == "review"
+                and impl_ancestor is not None
+            ):
+                _persist_review_blocker_resolution_artifacts_for_completed_task(
+                    config=config,
+                    store=store,
+                    completed_task=task,
+                    review_task=review_task,
+                    impl_task=impl_ancestor,
+                    head_sha=current_noop_head_sha,
+                )
 
     # Rebase tasks run provider-side conflict resolution in the worktree.
     # Force-push from the host runner so SSH/auth follows host environment.
@@ -6983,6 +7326,23 @@ def _post_complete_code_task(
                 )
             else:
                 _create_fix_follow_up_review_task(task, store)
+        else:
+            root_impl = _resolve_root_implementation_for_fix(task, store)
+            review_task = store.get(task.depends_on) if task.depends_on else None
+            if (
+                review_task is not None
+                and review_task.task_type == "review"
+                and root_impl is not None
+                and task.branch
+            ):
+                _persist_review_blocker_resolution_artifacts_for_completed_task(
+                    config=config,
+                    store=store,
+                    completed_task=task,
+                    review_task=review_task,
+                    impl_task=root_impl,
+                    head_sha=worktree_git.rev_parse_if_exists(branch_name),
+                )
 
     console.print("")
     if task.task_type == "improve" and improve_changed_diff is not None:
@@ -8235,6 +8595,14 @@ def _run_non_code_task(
             has_commits=False,
             stats=stats,
         )
+        if task.task_type == "internal":
+            refreshed_task = store.get(task.id)
+            if refreshed_task is not None:
+                _persist_review_blocker_adjudication_for_completed_task(
+                    config=config,
+                    store=store,
+                    completed_task=refreshed_task,
+                )
         auto_learnings = None
         if task.task_type not in ("internal", "learn") and not task.skip_learnings:
             auto_learnings = maybe_auto_regenerate_learnings(store, config)

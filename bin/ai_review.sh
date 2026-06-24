@@ -66,6 +66,8 @@ Output format (exact section order and headings):
 5. ## Verdict
 
 If Blockers/Follow-Ups/Questions are empty, write exactly: None.
+Every blocker must be falsifiable: include current-state Evidence, at least one
+current-source Open-state citation, and a concrete Required fix.
 Final line must be exactly one of:
 - Verdict: APPROVED
 - Verdict: APPROVED_WITH_FOLLOWUPS
@@ -405,4 +407,3 @@ if [[ "$USE_PAGER" == "1" || ( "$USE_PAGER" == "auto" && -t 1 ) ]]; then
 fi
 
 printf "%s" "$OUTPUT"
-

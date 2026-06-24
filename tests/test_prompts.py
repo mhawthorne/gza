@@ -24,10 +24,19 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.",
     "Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.",
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
+    "Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.",
     "Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.",
     "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
     "If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`;",
     "If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.",
+]
+
+IMPROVE_DISPUTE_CONTRACT_CLAUSES = [
+    "structured `## Disputed Blockers` section",
+    "inventing a code change",
+    "Reason: unreproducible | already_satisfied | stale | out_of_scope | review_error",
+    "Current-state citation: <path:line or path:start-end>",
+    "Downstream task: <optional full prefixed task id if the work belongs elsewhere>",
 ]
 
 REVIEW_SUMMARY_CHECKLIST_COUNT = 6
@@ -164,6 +173,7 @@ class TestPromptBuilderBuild:
         assert "Treat a cited path or line range as an instance of a class of issue" in result
         assert "reviewer-enumerated class" in result
         assert '"Extra scope" means unrelated changes, not other instances of the same blocker class.' in result
+        _assert_contains_all_clauses(result, IMPROVE_DISPUTE_CONTRACT_CLAUSES)
 
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
         self, tmp_path: Path
@@ -876,12 +886,18 @@ class TestPromptBuilderBuild:
         assert "## Blockers" in review_md_content
         assert "## Follow-Ups" in review_md_content
         assert "Verdict: APPROVED_WITH_FOLLOWUPS" in review_md_content
+        assert "Every blocker must be falsifiable" in review_md_content
+        assert "Open-state citation:" in review_md_content
+        assert "Required fix:" in review_md_content
         assert "Must-fix issues" not in review_md_content
         assert "Suggestions" not in review_md_content
 
         assert "## Blockers" in fallback_prompt
         assert "## Follow-Ups" in fallback_prompt
         assert "Verdict: APPROVED_WITH_FOLLOWUPS" in fallback_prompt
+        assert "Every blocker must be falsifiable" in fallback_prompt
+        assert "Open-state citation" in fallback_prompt
+        assert "Required fix" in fallback_prompt
         assert "Must-fix issues" not in fallback_prompt
         assert "Suggestions" not in fallback_prompt
 

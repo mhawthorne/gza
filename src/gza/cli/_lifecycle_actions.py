@@ -180,7 +180,13 @@ def plan_lifecycle_execution(
 def _advance_action_color(action_type: str) -> str:
     if action_type in {"merge", "merge_with_followups"}:
         return _colors.STATUS_COLORS.completed
-    if action_type in {"create_review", "create_plan_review", "needs_rebase", "create_improve"}:
+    if action_type in {
+        "create_review",
+        "create_review_adjudication",
+        "create_plan_review",
+        "needs_rebase",
+        "create_improve",
+    }:
         return _colors.STATUS_COLORS.in_progress
     if action_type in {"materialize_plan_slices", "create_implement", "resume", "retry", "reconcile"}:
         return _colors.STATUS_COLORS.pending

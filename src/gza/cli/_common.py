@@ -76,6 +76,7 @@ from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
+    create_or_reuse_review_blocker_adjudication_task,
     create_review_task,
 )
 from ..review_verdict import (
@@ -2088,6 +2089,27 @@ def _create_review_task(
         model=model,
         provider=provider,
     )
+
+
+def _create_review_adjudication_task(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    review_task: DbTask,
+    finding: ReviewFinding,
+    *,
+    dispute_metadata: dict[str, Any],
+    trigger_source: str,
+) -> DbTask:
+    """Create or reuse an internal adjudication task for one disputed blocker."""
+    task, _created_now = create_or_reuse_review_blocker_adjudication_task(
+        store,
+        review_task=review_task,
+        impl_task=impl_task,
+        finding=finding,
+        dispute_metadata=dispute_metadata,
+        trigger_source=trigger_source,
+    )
+    return task
 
 
 def _create_or_reuse_followup_tasks(

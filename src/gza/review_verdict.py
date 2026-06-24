@@ -10,6 +10,7 @@ from typing import Literal, cast
 from gza.db import Task
 
 ReviewSeverity = Literal["BLOCKER", "FOLLOWUP", "NIT"]
+DisputeReason = Literal["unreproducible", "already_satisfied", "stale", "out_of_scope", "review_error"]
 ReviewTemplateVerdict = Literal["APPROVED", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"]
 ReviewParseError = Literal[
     "empty_content",
@@ -44,6 +45,7 @@ _CHECKLIST_LINE_PATTERN = re.compile(
     r"^\s*(?:[-*]|\d+[.)])?\s*(yes|no)\s*[-:]\s*(.+?)\s*$",
     re.IGNORECASE,
 )
+_DISPUTED_FINDING_ID_PATTERN = re.compile(r"^(?P<id>B\d+)(?:\b|[:.)-])", re.IGNORECASE)
 _VERIFY_COMMAND_PATTERN = re.compile(r"\bverify_command\b", re.IGNORECASE)
 _VERIFY_COMMAND_SUBJECT_PATTERN = re.compile(r"(?:verify_command|(?:\./)?bin/tests)\b", re.IGNORECASE)
 _VERIFY_TIMEOUT_PATTERNS = (
@@ -95,6 +97,25 @@ class ReviewFinding:
     fix_or_followup: str | None
     tests: str | None
     open_state_citation: str | None = None
+
+
+@dataclass(frozen=True)
+class DisputedBlocker:
+    """Structured disputed blocker item parsed from a code-task summary/report."""
+
+    finding_id: str
+    reason: DisputeReason
+    evidence: str
+    current_state_citation: str
+    scope_citation: str | None = None
+    downstream_task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewBlockerAdjudication:
+    """Strict adjudication outcome for one disputed review blocker."""
+
+    verdict: Literal["VALID", "INVALID", "NEEDS_HUMAN"]
 
 
 @dataclass(frozen=True)
@@ -298,6 +319,20 @@ def _split_h3_entries(section_body: str) -> list[tuple[str, str]]:
     return entries
 
 
+def _is_valid_task_id_shape(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9]{1,12}-\d+", value.strip()))
+
+
+def _normalize_disputed_blocker_finding_id(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    matched = _DISPUTED_FINDING_ID_PATTERN.match(normalized)
+    if matched is None:
+        return normalized
+    return matched.group("id").upper()
+
+
 def _parse_finding_entries(
     section_body: str,
     *,
@@ -327,6 +362,78 @@ def _parse_finding_entries(
         )
         findings.append(finding)
     return findings
+
+
+def parse_disputed_blockers(content: str | None) -> tuple[DisputedBlocker, ...]:
+    """Parse structured disputed blocker items from a code-task summary/report."""
+    if not content:
+        return ()
+
+    section_body = _split_h2_sections(content).get("disputedblockers", "")
+    entries = _split_h3_entries(section_body)
+    if not entries:
+        return ()
+
+    disputes: list[DisputedBlocker] = []
+    for _heading, body in entries:
+        parsed = _parse_fields(
+            body,
+            labels=[
+                "Finding",
+                "Reason",
+                "Evidence",
+                "Current-state citation",
+                "Scope citation",
+                "Downstream task",
+            ],
+        )
+        finding_id = _normalize_disputed_blocker_finding_id(parsed.get("Finding") or "")
+        reason = (parsed.get("Reason") or "").strip().lower()
+        evidence = (parsed.get("Evidence") or "").strip()
+        current_state_citation = (parsed.get("Current-state citation") or "").strip()
+        scope_citation = (parsed.get("Scope citation") or "").strip() or None
+        downstream_task_id = (parsed.get("Downstream task") or "").strip() or None
+
+        if not finding_id or not reason or not evidence or not current_state_citation:
+            continue
+        if reason not in {"unreproducible", "already_satisfied", "stale", "out_of_scope", "review_error"}:
+            continue
+        if not _has_valid_open_state_citation_shape(current_state_citation):
+            continue
+        if scope_citation is not None and not _has_valid_open_state_citation_shape(scope_citation):
+            continue
+        if downstream_task_id is not None and not _is_valid_task_id_shape(downstream_task_id):
+            continue
+
+        disputes.append(
+            DisputedBlocker(
+                finding_id=finding_id,
+                reason=cast(DisputeReason, reason),
+                evidence=evidence,
+                current_state_citation=current_state_citation,
+                scope_citation=scope_citation,
+                downstream_task_id=downstream_task_id,
+            )
+        )
+
+    return tuple(disputes)
+
+
+def parse_review_blocker_adjudication(
+    content: str | None,
+) -> ReviewBlockerAdjudication | None:
+    """Parse a strict adjudication result from internal-task output."""
+    if not content:
+        return None
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+
+    verdict = lines[0].upper()
+    if verdict not in {"VALID", "INVALID", "NEEDS_HUMAN"}:
+        return None
+    return ReviewBlockerAdjudication(verdict=cast(Literal["VALID", "INVALID", "NEEDS_HUMAN"], verdict))
 
 
 def _section_is_none_literal(text: str) -> bool:
@@ -691,6 +798,63 @@ def _classify_blocker_finding(finding: ReviewFinding) -> str:
             return "code"
         return "verify_failure"
     return "code"
+
+
+def classify_review_blocker_finding(finding: ReviewFinding) -> str:
+    """Classify a blocker as code, verify failure, or verify timeout."""
+    return _classify_blocker_finding(finding)
+
+
+def normalize_review_finding_title(title: str) -> str:
+    """Normalize a review finding title for deterministic fingerprint matching."""
+    normalized = re.sub(r"`+", "", title).strip().lower()
+    normalized = re.sub(r"^#+\s*", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"^(?:[a-z]+-)?b\d+\s*[:.)-]?\s*", "", normalized)
+    return normalized.strip()
+
+
+def normalize_review_finding_anchor(value: str) -> str:
+    """Normalize a review finding anchor value for deterministic matching."""
+    normalized = re.sub(r"`+", "", value).strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def get_review_finding_fingerprint_details(
+    finding: ReviewFinding,
+) -> tuple[tuple[str, str], str, str] | None:
+    """Return normalized fingerprint plus display title/anchor for one finding."""
+    title = normalize_review_finding_title(finding.title)
+    if not title:
+        return None
+
+    raw_anchor: str | None = None
+    if finding.open_state_citation:
+        citation_tokens = [
+            token.strip()
+            for token in finding.open_state_citation.split(",")
+            if token.strip()
+        ]
+        if citation_tokens:
+            raw_anchor = citation_tokens[0]
+    if raw_anchor is None and finding.fix_or_followup:
+        raw_anchor = finding.fix_or_followup
+    if raw_anchor is None:
+        return None
+
+    anchor = normalize_review_finding_anchor(raw_anchor)
+    if not anchor:
+        return None
+    return (title, anchor), finding.title, anchor
+
+
+def get_review_finding_fingerprint(finding: ReviewFinding) -> tuple[str, str] | None:
+    """Return the normalized deterministic fingerprint for one review finding."""
+    details = get_review_finding_fingerprint_details(finding)
+    if details is None:
+        return None
+    return details[0]
 
 
 def _is_timeout_only_raw_blocker_line(line: str) -> bool:

@@ -180,8 +180,12 @@ When a current review exists for the implementation lineage:
   - An improve is `in_progress` → `wait_improve`; `pending` → `run_improve`. (See
     [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
   - No improve yet, and no bound is tripped → create an `improve` task.
-- Unresolved `feedback` comments newer than the latest completed review MUST be addressed via
-  the improve flow **before** any merge, even on an approved verdict.
+  - A completed no-op improve MAY dispute a non-verify CODE blocker only by supplying
+    structured current-state evidence that the blocker is unreproducible, stale, already
+    satisfied, out of scope, or otherwise invalid. Prior review text or task history
+    alone is not enough; the dispute MUST cite the current still-open-or-cleared state.
+- Unresolved `feedback` comments newer than the latest completed review MUST be addressed
+  via the improve flow **before** any merge, even on an approved verdict.
 - Unresolved comments of other kinds (for example `review_scope`) MUST remain visible to
   operators but MUST NOT create, reuse, resume, wait on, or freshness-block an improve task.
 - When review scope is needed for a completed or otherwise non-pending implementation, the
@@ -217,17 +221,33 @@ When a current review exists for the implementation lineage:
   only when the diff-preservation proof succeeds. Reviewer wording is corroborating only
   and MUST NOT decide this gate. The engine MUST NOT run a separate isolated
   detached-worktree verify solely to clear this condition.
+- **B. Disputed non-verify CODE blocker adjudication.** When the latest
+  `CHANGES_REQUESTED` review carries a non-verify CODE blocker and the latest completed
+  improve for that `(implementation, review)` pair is a no-op with structured dispute
+  evidence, lifecycle MUST treat the blocker as adjudication-eligible once
+  `max_noop_improve_cycles` is reached. This adjudication route MUST run before the
+  generic `improve-no-op`, `duplicate-blocker-no-progress`, and `review-max-cycles`
+  parks. The adjudication output is strict:
+  - `INVALID` clears that blocker for lifecycle purposes only; historical review output
+    is preserved.
+  - `VALID` keeps the blocker open and returns the lineage to the normal improve flow.
+  - `NEEDS_HUMAN`, failed adjudication, or unparseable adjudication output MUST park with
+    reason `review-blocker-adjudication-needed` and include the dispute/adjudication
+    evidence.
+  This lane applies only to non-verify CODE blockers. Verify-only blocker clearing
+  remains governed exclusively by rule A above.
 - Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
-  `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). If current
-  passing in-improve evidence has already cleared the review, normal merge rules apply.
-  Otherwise, if `verify_command` still fails, the evidence is absent, stale, or recorded
-  at a different branch/head, or the blocker is not verify-only, the no-op improve limit
-  MUST park rather than auto-clear. If lifecycle cannot resolve the current branch head
-  while checking that provenance, it MUST still fail closed but surface that probe
-  failure in the parked result instead of silently degrading to a generic no-op loop.
-  When the review-time runner verify PASSED, or no runner-owned review verify exists,
-  the blocker is treated as a genuine code issue and still requires a real code change
-  before merge.
+  `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). This generic
+  no-op park applies only after ruling out rule B adjudication-eligible disputed
+  non-verify CODE blockers. If current passing in-improve evidence has already cleared
+  the review, normal merge rules apply. Otherwise, if `verify_command` still fails, the
+  evidence is absent, stale, or recorded at a different branch/head, or the blocker is
+  not verify-only, the no-op improve limit MUST park rather than auto-clear. If
+  lifecycle cannot resolve the current branch head while checking that provenance, it
+  MUST still fail closed but surface that probe failure in the parked result instead of
+  silently degrading to a generic no-op loop. When the review-time runner verify PASSED,
+  or no runner-owned review verify exists, the blocker is treated as a genuine code
+  issue and still requires a real code change before merge.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the
@@ -413,6 +433,7 @@ is a spec change. The accompanying human message is free text.
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no current in-improve passing verify evidence clearing the verify-only review |
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound when current in-improve passing verify evidence did not clear the verify-only review |
+| `review-blocker-adjudication-needed` | needs_discussion | §6 adjudication for a disputed non-verify CODE blocker returned `NEEDS_HUMAN`, failed, or could not be parsed safely |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
 | `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |

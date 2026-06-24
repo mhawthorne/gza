@@ -195,6 +195,54 @@ def test_advance_workflow_has_single_noop_improve_limit_row() -> None:
     assert action in workflow
 
 
+def test_disputed_blocker_contract_is_tracked_consistently() -> None:
+    """Specs/docs should align on adjudication-first disputed-blocker routing."""
+    repo_root = Path(__file__).resolve().parents[1]
+    overview = (repo_root / "specs" / "behavior" / "00-overview.md").read_text()
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+
+    assert "adjudication marking a disputed blocker `INVALID` for lifecycle" in overview
+    assert "blocker adjudication needed" in overview
+    assert "Disputed non-verify CODE blocker adjudication" in lifecycle
+    assert "structured current-state evidence" in lifecycle
+    assert "This lane applies only to non-verify CODE blockers." in lifecycle
+    assert "review-blocker-adjudication-needed" in lifecycle
+    assert lifecycle.index("**B. Disputed non-verify CODE blocker adjudication.**") < lifecycle.index(
+        "Otherwise, consecutive no-op improves reach `max_noop_improve_cycles`"
+    )
+    assert (
+        "This generic no-op park applies only after ruling out rule B adjudication-eligible disputed "
+        "non-verify CODE blockers."
+    ) in lifecycle_flat
+
+    assert "Every `BLOCKER` must be falsifiable." in workflow
+    assert "structured `## Disputed Blockers` section" in workflow
+    assert "required lifecycle contract is adjudication before the generic `improve-no-op`," in workflow
+    assert "`duplicate-blocker-no-progress`, and `review-max-cycles` parks." in workflow
+    assert "deferred outside this workflow-doc slice" in workflow
+    assert "treat the spec as the source of truth" in workflow
+    assert "that mismatch is an implementation gap against the spec" in workflow
+
+
+def test_lifecycle_spec_preserves_typed_review_comment_contract() -> None:
+    """Lifecycle spec should keep only feedback comments improve-actionable."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+
+    assert (
+        "Unresolved `feedback` comments newer than the latest completed review MUST be "
+        "addressed via the improve flow **before** any merge, even on an approved verdict."
+    ) in lifecycle_flat
+    assert (
+        "Unresolved comments of other kinds (for example `review_scope`) MUST remain visible to "
+        "operators but MUST NOT create, reuse, resume, wait on, or freshness-block an improve task."
+    ) in lifecycle_flat
+    assert "Unresolved review comments newer than the latest completed review MUST be addressed" not in lifecycle_flat
+
+
 def test_verify_only_noop_improve_contract_does_not_claim_generic_recapture() -> None:
     """Spec/report text should stay aligned with the narrowed same-head failed-review recapture path."""
     repo_root = Path(__file__).resolve().parents[1]

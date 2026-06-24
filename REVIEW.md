@@ -44,6 +44,8 @@ Use this exact section order and headings:
 
 Section rules:
 - `## Blockers`: if none, write exactly `None.`
+- Every blocker must be falsifiable: include current-state `Evidence:`, at least one
+  current-source `Open-state citation:`, and a concrete `Required fix:`.
 - `## Follow-Ups`: if none, write exactly `None.`
 - `## Questions / Assumptions`: if none, write exactly `None.`
 

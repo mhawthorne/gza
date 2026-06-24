@@ -168,6 +168,28 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 
 When a review blocker is one instance of a repeated same-module pattern, reviewers should consolidate the affected-file gaps plus any analogous gaps in diff-touched same-module siblings into one blocker so improve can close the whole class in one pass.
 
+Tracked review/improve report contracts are stricter than the current lifecycle action
+table alone:
+
+- Every `BLOCKER` must be falsifiable. The review report must carry current-state
+  `Evidence:`, at least one current-source `Open-state citation:`, and a concrete
+  `Required fix:` that would close the blocker if implemented. Prior review prose or task
+  history is not enough on its own.
+- If an improve completes as a no-op because a non-verify CODE blocker is stale,
+  unreproducible, already satisfied, out of scope, or otherwise invalid, the improve
+  report may include a structured `## Disputed Blockers` section instead of fabricating a
+  code change. Each disputed item should identify the blocker (`Finding:`), the dispute
+  reason (`Reason:`), current-state evidence (`Evidence:`), and a current-source
+  `Current-state citation:`; `Scope citation:` and `Downstream task:` are optional.
+- Once `max_noop_improve_cycles` is reached for a disputed non-verify CODE blocker, the
+  required lifecycle contract is adjudication before the generic `improve-no-op`,
+  `duplicate-blocker-no-progress`, and `review-max-cycles` parks. The current runtime
+  plumbing now creates/runs one dedicated adjudication worker and persists its strict
+  `VALID | INVALID | NEEDS_HUMAN` outcome as a `review_blocker_resolution` artifact.
+  Follow-on lifecycle consumption of those persisted outcomes remains deferred outside this workflow-doc slice. Until
+  that lands, treat the spec as the source of truth for any remaining implementation
+  gaps rather than treating dispute evidence as no-op-only guidance.
+
 When the engine emits `improve`, the caller (iterate) delegates to `resolve_improve_action(store, impl_id, review_id, max_resume_attempts)` to pick one of:
 
 | Condition | Sub-action |
@@ -222,6 +244,13 @@ Implication for queries: **to find all improves for an (impl, review) pair, filt
 Likewise, post-completion side effects that logically target "the impl this improve belongs to" must walk up the `based_on` chain until a non-improve ancestor is found, because `task.based_on` on a retry/resume points at the previous improve, not the impl. The helper `runner._resolve_impl_ancestor()` encapsulates this walk.
 
 Completed improve tasks persist `changed_diff` to record whether the task changed the tracked aggregate review diff compared with the branch state captured immediately before the improve started. `changed_diff = 0` means the improve completed but made no tracked reviewable change, so the runner does not clear review state, resolve comments, or create a closing review. The only exception is a verify-only review blocker backed by runner-owned verify evidence on both rows. On the no-op improve path, `runner._capture_noop_improve_review_verify_result()` reruns `verify_command` in the improve's own worktree and persists `review_verify_*` evidence on the improve row. The clear remains fail-closed: the blocking review row must already persist runner-owned review-time `review_verify_status="failed"` for the current branch/head, and the completed no-op improve row must later persist `review_verify_status="passed"` for that same branch/head, captured after the review completed. Reviewer prose can corroborate the situation but does not gate the clear. Advance counts consecutive no-op improves for the latest `(implementation, review)` pair, but lifecycle no longer launches a detached fallback verify pass. When runner-owned passing verify evidence has already cleared the review at the same head, the lineage follows the normal approved/merge paths instead of parking. If that in-improve evidence is missing, stale, mismatched, or still failing, the lineage parks once `max_noop_improve_cycles` is reached; repeated genuine timeout-only reviews still use `verify-blocked-no-code-issues`. If advance cannot resolve the current branch head while validating the same-head provenance check, it still fails closed but surfaces the probe failure in the parked action so operators can distinguish a git freshness problem from an ordinary no-op loop. `NULL` is legacy/unknown and is treated as changed.
+
+No-op improves may still carry structured dispute evidence for non-verify CODE blockers
+in a `## Disputed Blockers` section. At the no-op bound, that evidence is meant to feed
+the adjudication-first contract above rather than falling straight through to the generic
+no-op, duplicate-blocker, or bounded-review-loop parks; if runtime behavior still differs,
+that mismatch is an implementation gap against the spec, not operator-facing no-op-only
+guidance.
 
 Advance also computes a generic duplicate-blocker backstop from completed review reports only. When the latest completed `CHANGES_REQUESTED` review and the two immediately preceding completed review cycles all carry the same primary blocker fingerprint (normalized blocker title plus the first open-state citation, or the normalized required-fix text when no citation exists), the engine returns `needs_discussion` with reason `duplicate-blocker-no-progress`. The streak resets across any completed same-lineage rebase between the compared reviews, on any non-`CHANGES_REQUESTED` review, on missing blocker fingerprints, or when the primary blocker changes.
 

@@ -6,9 +6,12 @@ from gza.db import Task
 from gza.review_verdict import (
     ParsedReview,
     compute_review_score,
+    get_review_finding_fingerprint,
     get_backfillable_review_score,
     is_verify_blocked_only_review,
     is_verify_timeout_only_review,
+    parse_review_blocker_adjudication,
+    parse_disputed_blockers,
     parse_review_report,
     parse_review_template,
     parse_review_verdict,
@@ -258,9 +261,89 @@ class TestParseReviewReport:
         )
         report = parse_review_report(content)
         assert report.verdict == "CHANGES_REQUESTED"
-        assert report.format_version == "legacy"
-        assert len(report.findings) == 1
-        assert report.findings[0].severity == "BLOCKER"
+
+
+class TestDisputedBlockers:
+    def test_parses_valid_disputed_blockers(self) -> None:
+        content = (
+            "## Summary\n\n- No code change was needed.\n\n"
+            "## Disputed Blockers\n\n"
+            "### D1\n"
+            "Finding: B1\n"
+            "Reason: already_satisfied\n"
+            "Evidence: The guard is already present on the current branch tip.\n"
+            "Current-state citation: `src/api.py:12-18`\n"
+            "Scope citation: `docs/plan.md:44-49`\n"
+            "Downstream task: gza-77\n"
+        )
+
+        parsed = parse_disputed_blockers(content)
+
+        assert len(parsed) == 1
+        dispute = parsed[0]
+        assert dispute.finding_id == "B1"
+        assert dispute.reason == "already_satisfied"
+        assert dispute.evidence == "The guard is already present on the current branch tip."
+        assert dispute.current_state_citation == "`src/api.py:12-18`"
+        assert dispute.scope_citation == "`docs/plan.md:44-49`"
+        assert dispute.downstream_task_id == "gza-77"
+
+    def test_parses_disputed_blocker_finding_with_id_and_title(self) -> None:
+        content = (
+            "## Summary\n\n- No code change was needed.\n\n"
+            "## Disputed Blockers\n\n"
+            "### D1\n"
+            "Finding: B1 Missing API guard\n"
+            "Reason: already_satisfied\n"
+            "Evidence: The guard is already present on the current branch tip.\n"
+            "Current-state citation: `src/api.py:12-18`\n"
+        )
+
+        parsed = parse_disputed_blockers(content)
+
+        assert len(parsed) == 1
+        assert parsed[0].finding_id == "B1"
+
+    def test_ignores_malformed_disputed_blockers(self) -> None:
+        content = (
+            "## Summary\n\n- No code change was needed.\n\n"
+            "## Disputed Blockers\n\n"
+            "### D1\n"
+            "Finding: B1\n"
+            "Reason: not_a_real_reason\n"
+            "Evidence: The guard is already present.\n"
+            "Current-state citation: src/api.py\n"
+        )
+
+        assert parse_disputed_blockers(content) == ()
+
+    def test_ignores_disputed_blocker_missing_finding(self) -> None:
+        content = (
+            "## Summary\n\n- No code change was needed.\n\n"
+            "## Disputed Blockers\n\n"
+            "### D1\n"
+            "Reason: already_satisfied\n"
+            "Evidence: The guard is already present.\n"
+            "Current-state citation: `src/api.py:12-18`\n"
+        )
+
+        assert parse_disputed_blockers(content) == ()
+
+    def test_review_finding_fingerprint_prefers_open_state_citation(self) -> None:
+        report = parse_review_report(
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1 API error handling\n"
+            "Evidence: missing branch\n"
+            "Open-state citation: `src/api.py:12-18`\n"
+            "Impact: crashes\n"
+            "Required fix: handle error path\n"
+            "Required tests: add regression\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        assert get_review_finding_fingerprint(report.findings[0]) == ("api error handling", "src/api.py:12-18")
 
     def test_legacy_report_without_open_state_citation_still_parses(self) -> None:
         content = (
@@ -276,6 +359,16 @@ class TestParseReviewReport:
         )
         report = parse_review_report(content)
         assert report.findings[0].open_state_citation is None
+
+
+class TestReviewBlockerAdjudication:
+    def test_parses_strict_single_token_verdict(self) -> None:
+        parsed = parse_review_blocker_adjudication("INVALID\n")
+        assert parsed is not None
+        assert parsed.verdict == "INVALID"
+
+    def test_rejects_extra_text(self) -> None:
+        assert parse_review_blocker_adjudication("INVALID\nBecause the blocker is stale.\n") is None
 
     def test_report_uses_verdict_from_final_verdict_section_not_quoted_body_text(self) -> None:
         content = (

@@ -104,6 +104,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 <For class-of-issue blockers, the closure condition must cover every enumerated instance across all cited paths, not just the first example.>
+<Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.>
 <Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
 <If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>

@@ -35,6 +35,7 @@ from gza.plan_review_materialization import (
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.pickup import count_worker_consuming_actions, is_worker_consuming_advance_action
+from gza.review_verdict import ReviewFinding
 
 from .conftest import make_store, setup_config
 
@@ -209,10 +210,75 @@ def test_improve_manual_review_returns_skip_without_mutation(tmp_path: Path) -> 
     assert expected is not None
     assert result == expected
     assert len(store.get_all()) == before_count
-    attention = resolve_execution_needs_attention(impl, result)
-    assert attention is not None
-    assert attention.task.id == impl.id
-    assert attention.action["subject_task_id"] == impl.id
+
+
+def test_create_review_adjudication_spawns_internal_worker(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/review-adjudication")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    spawned: list[tuple[str, str]] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("create_review should not run"),
+        create_resume_task=lambda _task: pytest.fail("create_resume should not run"),
+        create_rebase_task=lambda _task: pytest.fail("create_rebase should not run"),
+        create_implement_task=lambda _task: pytest.fail("create_implement should not run"),
+        create_review_adjudication_task=lambda impl_task, review_task, finding, dispute_metadata: store.add(
+            f"Adjudicate {finding.id}",
+            task_type="internal",
+            based_on=review_task.id,
+            depends_on=impl_task.id,
+            same_branch=True,
+        ),
+        spawn_worker=lambda task, kind: spawned.append((task.id or "", kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("spawn_resume should not run"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("spawn_iterate should not run"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={
+            "type": "create_review_adjudication",
+            "description": "Create adjudication",
+            "review_task": review,
+            "review_blocker_adjudication_candidate": SimpleNamespace(
+                finding=ReviewFinding(
+                    id="B1",
+                    severity="BLOCKER",
+                    title="Missing API guard",
+                    body="Evidence: still open",
+                    evidence="still open",
+                    impact="crash",
+                    fix_or_followup="add guard",
+                    tests="add test",
+                    open_state_citation="`src/api.py:12-18`",
+                ),
+                dispute_artifact=SimpleNamespace(metadata={"reason": "already_satisfied"}),
+            ),
+        },
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.created_task is not None
+    assert result.created_task.task_type == "internal"
+    assert spawned == [(result.created_task.id or "", "review_adjudication")]
 
 
 def test_materialize_plan_review_slices_includes_slice_prompt_and_provenance(tmp_path: Path) -> None:

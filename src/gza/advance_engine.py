@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -17,6 +16,7 @@ from gza.db import (
     TASK_COMMENT_KIND_FEEDBACK,
     SqliteTaskStore,
     Task as DbTask,
+    TaskArtifact,
     task_id_numeric_key,
     task_owns_merge_status,
 )
@@ -46,11 +46,14 @@ from gza.recovery_engine import (
 )
 from gza.recovery_read_context import RecoveryReadContext
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
+from gza.review_tasks import find_existing_review_blocker_adjudication_task
 from gza.review_verdict import (
     ParsedReviewReport,
     ReviewBlockerSummary,
     ReviewFinding,
+    classify_review_blocker_finding,
     get_review_content,
+    get_review_finding_fingerprint_details,
     get_review_report,
     is_verify_timeout_only_review,
     summarize_review_blockers,
@@ -58,6 +61,7 @@ from gza.review_verdict import (
 from gza.runner import (
     CROSS_PROJECT_TAG,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
+    REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
     _filter_owned_artifact_paths,
     _find_out_of_scope_paths,
     _project_boundary,
@@ -93,6 +97,8 @@ WORKER_CONSUMING_ACTIONS = frozenset(
         "run_plan_improve",
         "create_review",
         "run_review",
+        "create_review_adjudication",
+        "run_review_adjudication",
         "improve",
         "run_improve",
         "resume",
@@ -158,6 +164,14 @@ class PlanMaterializationState:
 
 
 @dataclass(frozen=True)
+class ReviewBlockerAdjudicationCandidate:
+    """One disputed blocker eligible for an adjudication attempt."""
+
+    finding: ReviewFinding
+    dispute_artifact: TaskArtifact
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -218,6 +232,8 @@ class AdvanceContext:
     consecutive_noop_improves: int = 0
     noop_improve_trigger: str | None = None
     noop_improve_verify_probe_warning: str | None = None
+    review_blocker_adjudication_candidate: ReviewBlockerAdjudicationCandidate | None = None
+    active_review_blocker_adjudication: DbTask | None = None
     duplicate_blocker_streak: DuplicateBlockerStreak | None = None
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
@@ -675,20 +691,6 @@ def _has_persisted_noop_improve_verify_clearance(
     )
 
 
-def _normalize_blocker_title(title: str) -> str:
-    normalized = re.sub(r"`+", "", title).strip().lower()
-    normalized = re.sub(r"^#+\s*", "", normalized)
-    normalized = re.sub(r"\s+", " ", normalized)
-    normalized = re.sub(r"^(?:[a-z]+-)?b\d+\s*[:.)-]?\s*", "", normalized)
-    return normalized.strip()
-
-
-def _normalize_blocker_anchor(value: str) -> str:
-    normalized = re.sub(r"`+", "", value).strip().lower()
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized
-
-
 def _primary_blocker_fingerprint(
     report: ParsedReviewReport,
 ) -> tuple[tuple[str, str], str, str] | None:
@@ -698,29 +700,7 @@ def _primary_blocker_fingerprint(
     )
     if primary_blocker is None:
         return None
-
-    title = _normalize_blocker_title(primary_blocker.title)
-    if not title:
-        return None
-
-    raw_anchor: str | None = None
-    if primary_blocker.open_state_citation:
-        citation_tokens = [
-            token.strip()
-            for token in primary_blocker.open_state_citation.split(",")
-            if token.strip()
-        ]
-        if citation_tokens:
-            raw_anchor = citation_tokens[0]
-    if raw_anchor is None and primary_blocker.fix_or_followup:
-        raw_anchor = primary_blocker.fix_or_followup
-    if raw_anchor is None:
-        return None
-
-    anchor = _normalize_blocker_anchor(raw_anchor)
-    if not anchor:
-        return None
-    return (title, anchor), primary_blocker.title, anchor
+    return get_review_finding_fingerprint_details(primary_blocker)
 
 
 def _completed_rebase_between(rebases: list[DbTask], older: DbTask, newer: DbTask) -> bool:
@@ -784,6 +764,74 @@ def _count_duplicate_primary_blocker_streak(
             )
 
     return None
+
+
+def _resolution_fingerprint_tuple(metadata: Mapping[str, Any]) -> tuple[str, str] | None:
+    fingerprint = metadata.get("finding_fingerprint")
+    if not isinstance(fingerprint, Mapping):
+        return None
+    title = fingerprint.get("title")
+    anchor = fingerprint.get("anchor")
+    if not isinstance(title, str) or not isinstance(anchor, str) or not title or not anchor:
+        return None
+    return (title, anchor)
+
+
+def _latest_disputed_blocker_artifact_for_review(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    latest_noop_improve: DbTask | None,
+) -> ReviewBlockerAdjudicationCandidate | None:
+    if review_task.id is None or latest_noop_improve is None or latest_noop_improve.id is None:
+        return None
+
+    findings_by_fingerprint = {
+        details[0]: finding
+        for finding in findings
+        if finding.severity == "BLOCKER"
+        and classify_review_blocker_finding(finding) == "code"
+        and (details := get_review_finding_fingerprint_details(finding)) is not None
+    }
+    if not findings_by_fingerprint:
+        return None
+
+    for artifact in store.list_artifacts(review_task.id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND):
+        metadata = artifact.metadata or {}
+        if metadata.get("state") != "disputed":
+            continue
+        if metadata.get("source_task_id") != latest_noop_improve.id:
+            continue
+        fingerprint = _resolution_fingerprint_tuple(metadata)
+        if fingerprint is None:
+            continue
+        finding = findings_by_fingerprint.get(fingerprint)
+        if finding is None:
+            continue
+        return ReviewBlockerAdjudicationCandidate(
+            finding=finding,
+            dispute_artifact=artifact,
+        )
+
+    return None
+
+
+def _resolve_review_blocker_adjudication_task(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask | None,
+    impl_task: DbTask,
+    candidate: ReviewBlockerAdjudicationCandidate | None,
+) -> DbTask | None:
+    if review_task is None or review_task.id is None or impl_task.id is None or candidate is None:
+        return None
+    return find_existing_review_blocker_adjudication_task(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        finding_id=candidate.finding.id,
+    )
 
 
 def _task_id(task: DbTask | None) -> str:
@@ -872,6 +920,20 @@ def _needs_attention_subject_id(ctx: AdvanceContext) -> str | None:
     if owner is not None and owner.id:
         return owner.id
     return ctx.task.id
+
+
+def _review_blocker_adjudication_description(ctx: AdvanceContext) -> str:
+    candidate = ctx.review_blocker_adjudication_candidate
+    finding_id = candidate.finding.id if candidate is not None else "unknown"
+    return f"Create adjudication for disputed blocker {finding_id} on review {_task_id(ctx.latest_completed_review)}"
+
+
+def _run_review_blocker_adjudication_description(adjudication_task: DbTask | None) -> str:
+    return f"Spawn worker for pending adjudication {_task_id(adjudication_task)}"
+
+
+def _wait_review_blocker_adjudication_description(adjudication_task: DbTask | None) -> str:
+    return f"SKIP: adjudication {_task_id(adjudication_task)} is in_progress"
 
 
 def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -1401,7 +1463,14 @@ def classify_advance_action(action: Mapping[str, Any]) -> str:
     if is_needs_attention_action(action):
         return "needs_attention"
     action_type = str(action.get("type", "skip"))
-    if action_type in {"skip", "wait_review", "wait_improve", "wait_plan_review", "wait_plan_improve"}:
+    if action_type in {
+        "skip",
+        "wait_review",
+        "wait_improve",
+        "wait_plan_review",
+        "wait_plan_improve",
+        "wait_review_adjudication",
+    }:
         return "skip"
     return "actionable"
 
@@ -1923,6 +1992,8 @@ def _resolve_review_state(
     int,
     str | None,
     str | None,
+    ReviewBlockerAdjudicationCandidate | None,
+    DbTask | None,
     bool,
     bool,
     DbTask | None,
@@ -1954,6 +2025,8 @@ def _resolve_review_state(
     consecutive_noop_improves = 0
     noop_improve_trigger: str | None = None
     noop_improve_verify_probe_warning: str | None = None
+    review_blocker_adjudication_candidate: ReviewBlockerAdjudicationCandidate | None = None
+    active_review_blocker_adjudication: DbTask | None = None
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
     latest_completed_code_change: DbTask | None = None
@@ -2017,6 +2090,18 @@ def _resolve_review_state(
 
         if review_verdict == "CHANGES_REQUESTED":
             completed_review_cycles = count_completed_review_cycles(store, task.id)
+            review_blocker_adjudication_candidate = _latest_disputed_blocker_artifact_for_review(
+                store,
+                review_task=latest_completed_review,
+                findings=review_report.findings,
+                latest_noop_improve=latest_noop_improve,
+            )
+            active_review_blocker_adjudication = _resolve_review_blocker_adjudication_task(
+                store,
+                review_task=latest_completed_review,
+                impl_task=task,
+                candidate=review_blocker_adjudication_candidate,
+            )
 
         verify_timeout_only_reviews: list[DbTask] = []
         for review_task in completed_reviews:
@@ -2056,6 +2141,8 @@ def _resolve_review_state(
         consecutive_noop_improves,
         noop_improve_trigger,
         noop_improve_verify_probe_warning,
+        review_blocker_adjudication_candidate,
+        active_review_blocker_adjudication,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
@@ -2565,6 +2652,8 @@ def resolve_advance_context(
         consecutive_noop_improves,
         noop_improve_trigger,
         noop_improve_verify_probe_warning,
+        review_blocker_adjudication_candidate,
+        active_review_blocker_adjudication,
         has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
@@ -2609,6 +2698,8 @@ def resolve_advance_context(
         consecutive_noop_improves=consecutive_noop_improves,
         noop_improve_trigger=noop_improve_trigger,
         noop_improve_verify_probe_warning=noop_improve_verify_probe_warning,
+        review_blocker_adjudication_candidate=review_blocker_adjudication_candidate,
+        active_review_blocker_adjudication=active_review_blocker_adjudication,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
@@ -3322,15 +3413,6 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
-        name="review_noop_improve_limit",
-        matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
-        and ctx.active_improve_running is None
-        and ctx.active_improve_pending is None,
-        action=_noop_improve_limit_action,
-    ),
-    AdvanceRule(
         name="review_wait_improve",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
@@ -3351,6 +3433,61 @@ ADVANCE_RULES: list[AdvanceRule] = [
             "description": f"Spawn worker for pending improve {_task_id(ctx.active_improve_pending)}",
             "improve_task": ctx.active_improve_pending,
         },
+    ),
+    AdvanceRule(
+        name="review_wait_blocker_adjudication",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.review_blocker_adjudication_candidate is not None
+        and ctx.active_review_blocker_adjudication is not None
+        and ctx.active_review_blocker_adjudication.status == "in_progress",
+        action=lambda ctx: {
+            "type": "wait_review_adjudication",
+            "description": _wait_review_blocker_adjudication_description(
+                ctx.active_review_blocker_adjudication
+            ),
+            "review_adjudication_task": ctx.active_review_blocker_adjudication,
+        },
+    ),
+    AdvanceRule(
+        name="review_run_pending_blocker_adjudication",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.review_blocker_adjudication_candidate is not None
+        and ctx.active_review_blocker_adjudication is not None
+        and ctx.active_review_blocker_adjudication.status == "pending",
+        action=lambda ctx: {
+            "type": "run_review_adjudication",
+            "description": _run_review_blocker_adjudication_description(
+                ctx.active_review_blocker_adjudication
+            ),
+            "review_adjudication_task": ctx.active_review_blocker_adjudication,
+        },
+    ),
+    AdvanceRule(
+        name="review_create_blocker_adjudication",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+        and ctx.active_improve_running is None
+        and ctx.active_improve_pending is None
+        and ctx.review_blocker_adjudication_candidate is not None
+        and ctx.active_review_blocker_adjudication is None,
+        action=lambda ctx: {
+            "type": "create_review_adjudication",
+            "description": _review_blocker_adjudication_description(ctx),
+            "review_task": ctx.latest_completed_review,
+            "review_blocker_adjudication_candidate": ctx.review_blocker_adjudication_candidate,
+        },
+    ),
+    AdvanceRule(
+        name="review_noop_improve_limit",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+        and ctx.active_improve_running is None
+        and ctx.active_improve_pending is None,
+        action=_noop_improve_limit_action,
     ),
     AdvanceRule(
         name="review_verify_blocked_no_code_issues",

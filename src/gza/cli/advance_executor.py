@@ -71,6 +71,7 @@ class AdvanceActionExecutionContext:
     create_retry_task: Callable[[DbTask], DbTask] | None = None
     create_plan_review_task: Callable[[DbTask], DbTask] | None = None
     create_plan_improve_task: Callable[[DbTask, DbTask], DbTask] | None = None
+    create_review_adjudication_task: Callable[[DbTask, DbTask, Any, dict[str, Any]], DbTask] | None = None
     materialize_plan_slices: Callable[[DbTask, DbTask, PlanReviewManifest], PlanReviewMaterializationResult] | None = None
     create_targeted_rebase_task: Callable[[DbTask, str], DbTask] | None = None
     reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
@@ -128,6 +129,8 @@ _WORKER_ACTIONS = frozenset(
         "materialize_plan_slices",
         "create_review",
         "run_review",
+        "create_review_adjudication",
+        "run_review_adjudication",
         "improve",
         "run_improve",
         "resume",
@@ -821,6 +824,120 @@ def execute_advance_action(
             handled_task_id=prepared_review_task.id,
             worker_label="review",
             created_task=prepared_review_task,
+        )
+
+    if action_type == "create_review_adjudication":
+        review_task = action.get("review_task")
+        candidate = action.get("review_blocker_adjudication_candidate")
+        if (
+            not isinstance(review_task, DbTask)
+            or review_task.id is None
+            or task.id is None
+            or candidate is None
+        ):
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing adjudication inputs")
+
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Create adjudication"),
+                worker_consuming=True,
+                work_done=True,
+            )
+
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="review_adjudication",
+        )
+        if blocked is not None:
+            return blocked
+        if context.create_review_adjudication_task is None:
+            if permit is not None:
+                permit.release()
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message="review adjudication creation is unavailable",
+            )
+
+        dispute_metadata = dict(getattr(candidate.dispute_artifact, "metadata", {}) or {})
+        adjudication_task = context.create_review_adjudication_task(
+            task,
+            review_task,
+            candidate.finding,
+            dispute_metadata,
+        )
+        prepared_adjudication_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=adjudication_task,
+            worker_label="review_adjudication",
+            rollback_on_failure=True,
+            permit=permit,
+        )
+        if prepared_adjudication_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_adjudication_task.id is not None
+
+        rc = context.spawn_worker(prepared_adjudication_task, "review_adjudication")
+        _release_reserved_launch_if_left(prepared_adjudication_task)
+        result = _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_adjudication_task.id,
+            worker_label="review_adjudication",
+            created_task=prepared_adjudication_task,
+        )
+        result.success_message = f"Created adjudication task {prepared_adjudication_task.id}"
+        return result
+
+    if action_type == "run_review_adjudication":
+        review_adjudication_task = action.get("review_adjudication_task")
+        if not isinstance(review_adjudication_task, DbTask) or review_adjudication_task.id is None:
+            return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing adjudication task")
+
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Run adjudication"),
+                worker_consuming=True,
+                work_done=True,
+                handled_task_id=review_adjudication_task.id,
+                created_task=review_adjudication_task,
+            )
+
+        permit, blocked = _reserve_background_launch(
+            action_type=action_type,
+            context=context,
+            worker_label="review_adjudication",
+        )
+        if blocked is not None:
+            return blocked
+        prepared_adjudication_task, prepare_error = _prepare_background_start(
+            context=context,
+            action_type=action_type,
+            task=review_adjudication_task,
+            worker_label="review_adjudication",
+            rollback_on_failure=False,
+            permit=permit,
+        )
+        if prepared_adjudication_task is None:
+            assert prepare_error is not None
+            return prepare_error
+        assert prepared_adjudication_task.id is not None
+
+        rc = context.spawn_worker(prepared_adjudication_task, "review_adjudication")
+        _release_reserved_launch_if_left(prepared_adjudication_task)
+        return _spawn_result(
+            action_type=action_type,
+            rc=rc,
+            handled_task_id=prepared_adjudication_task.id,
+            worker_label="review_adjudication",
+            created_task=prepared_adjudication_task,
         )
 
     if action_type == "improve":

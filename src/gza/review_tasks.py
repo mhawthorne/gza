@@ -1,8 +1,8 @@
-"""Shared helpers for creating review and follow-up tasks."""
+"""Shared helpers for creating review, follow-up, and adjudication tasks."""
 
 import re
-from collections.abc import Iterable
-from typing import Literal
+from collections.abc import Iterable, Mapping
+from typing import Any, Literal
 
 from .db import SqliteTaskStore, Task
 from .derived_tags import resolve_derived_task_tags
@@ -20,6 +20,9 @@ _FOLLOWUP_PROMPT_PREFIX_RE = re.compile(
 )
 _DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(
     r"^Deferred blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
+)
+_REVIEW_BLOCKER_ADJUDICATION_PROMPT_PREFIX_RE = re.compile(
+    r"^Adjudicate blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
 
 
@@ -160,6 +163,15 @@ def build_deferred_blocker_prompt_prefix(review_task_id: str, impl_task_id: str,
     return f"Deferred blocker {finding_id} from review {review_task_id} for task {impl_task_id}:"
 
 
+def build_review_blocker_adjudication_prompt_prefix(
+    review_task_id: str,
+    impl_task_id: str,
+    finding_id: str,
+) -> str:
+    """Build deterministic prompt prefix for blocker adjudication tasks."""
+    return f"Adjudicate blocker {finding_id} from review {review_task_id} for task {impl_task_id}:"
+
+
 def build_followup_prompt(
     review_task_id: str,
     impl_task_id: str,
@@ -193,6 +205,63 @@ def build_deferred_blocker_prompt(
         f"Open-state citation: {open_state_citation}\n\n"
         f"{canonical_context}"
     )
+
+
+def build_review_blocker_adjudication_prompt(
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+    dispute_metadata: Mapping[str, Any],
+) -> str:
+    """Build full prompt for a strict review-blocker adjudication task."""
+    prefix = build_review_blocker_adjudication_prompt_prefix(review_task_id, impl_task_id, finding.id)
+    tail = (finding.title or finding.id).strip()
+    heading = f"{prefix} {tail}" if tail else prefix
+    dispute_reason = str(dispute_metadata.get("reason", "")).strip() or "unknown"
+    dispute_evidence = str(dispute_metadata.get("evidence", "")).strip() or "not provided"
+    current_state_citation = str(dispute_metadata.get("current_state_citation", "")).strip() or "not provided"
+    source_task_id = str(dispute_metadata.get("source_task_id", "")).strip() or "unknown"
+    scope_citation = str(dispute_metadata.get("scope_citation", "")).strip()
+    downstream_task_id = str(dispute_metadata.get("downstream_task_id", "")).strip()
+    source_branch = str(dispute_metadata.get("source_branch", "")).strip()
+
+    lines = [
+        heading,
+        "",
+        "Return exactly one non-empty line: VALID, INVALID, or NEEDS_HUMAN.",
+        "Do not add explanation, markdown, or code fences.",
+        "Do not run tests or propose fixes. Judge only whether the disputed blocker remains a valid current blocker.",
+        "",
+        "Adjudication question:",
+        "- VALID: the review blocker is still current, in scope, and actionable.",
+        "- INVALID: the dispute evidence shows the blocker is stale, already satisfied, out of scope, or otherwise not valid.",
+        "- NEEDS_HUMAN: the evidence is ambiguous, unsafe, or insufficient.",
+        "",
+        f"Implementation task: {impl_task_id}",
+        f"Review task: {review_task_id}",
+        f"Dispute source task: {source_task_id}",
+    ]
+    if source_branch:
+        lines.append(f"Dispute source branch: {source_branch}")
+    lines.extend(
+        [
+            "",
+            "## Review blocker under dispute",
+            "",
+            format_blocker_finding_context(finding),
+            "",
+            "## Dispute evidence",
+            "",
+            f"Reason: {dispute_reason}",
+            f"Evidence: {dispute_evidence}",
+            f"Current-state citation: {current_state_citation}",
+        ]
+    )
+    if scope_citation:
+        lines.append(f"Scope citation: {scope_citation}")
+    if downstream_task_id:
+        lines.append(f"Downstream task: {downstream_task_id}")
+    return "\n".join(lines).strip()
 
 
 def _finding_heading(finding: ReviewFinding) -> str:
@@ -264,6 +333,14 @@ def extract_deferred_blocker_prompt_parts(prompt: str) -> tuple[str, str, str] |
     return match.group(1), match.group(2), match.group(3)
 
 
+def extract_review_blocker_adjudication_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
+    """Return (finding_id, review_task_id, impl_task_id) for adjudication prompts."""
+    match = _REVIEW_BLOCKER_ADJUDICATION_PROMPT_PREFIX_RE.match(prompt.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
 def find_existing_followup_task(
     store: SqliteTaskStore,
     *,
@@ -292,6 +369,23 @@ def find_existing_deferred_blocker_task(
     prefix = build_deferred_blocker_prompt_prefix(review_task_id, impl_task_id, finding_id)
     for child in store.get_based_on_children(review_task_id):
         if child.task_type != "implement":
+            continue
+        if child.prompt.strip().startswith(prefix):
+            return child
+    return None
+
+
+def find_existing_review_blocker_adjudication_task(
+    store: SqliteTaskStore,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    finding_id: str,
+) -> Task | None:
+    """Return an existing adjudication task for (review, finding), if any."""
+    prefix = build_review_blocker_adjudication_prompt_prefix(review_task_id, impl_task_id, finding_id)
+    for child in store.get_based_on_children(review_task_id):
+        if child.task_type != "internal":
             continue
         if child.prompt.strip().startswith(prefix):
             return child
@@ -379,6 +473,50 @@ def create_or_reuse_deferred_blocker_task(
         tags=resolve_derived_task_tags(impl_task),
         trigger_source=trigger_source,
         create_pr=True,
+        urgent=True,
+    )
+    return created, True
+
+
+def create_or_reuse_review_blocker_adjudication_task(
+    store: SqliteTaskStore,
+    *,
+    review_task: Task,
+    impl_task: Task,
+    finding: ReviewFinding,
+    dispute_metadata: Mapping[str, Any],
+    trigger_source: str,
+) -> tuple[Task, bool]:
+    """Create or reuse an idempotent adjudication task for one disputed blocker."""
+    if review_task.id is None:
+        raise ValueError("Cannot create adjudication for review without an ID.")
+    if impl_task.id is None:
+        raise ValueError("Cannot create adjudication for implementation without an ID.")
+
+    existing = find_existing_review_blocker_adjudication_task(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        finding_id=finding.id,
+    )
+    if existing is not None:
+        return existing, False
+
+    prompt = build_review_blocker_adjudication_prompt(
+        review_task.id,
+        impl_task.id,
+        finding,
+        dispute_metadata,
+    )
+    created = store.add(
+        prompt=prompt,
+        task_type="internal",
+        based_on=review_task.id,
+        depends_on=impl_task.id,
+        same_branch=True,
+        tags=resolve_derived_task_tags(impl_task),
+        review_scope=format_blocker_finding_context(finding),
+        trigger_source=trigger_source,
         urgent=True,
     )
     return created, True
