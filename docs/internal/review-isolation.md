@@ -8,7 +8,7 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 2. **Host runner** calls `build_prompt()` which includes:
    - Spec file content (if the implementation task has a `spec` field)
    - Ask context:
-    - `## Review scope:` when the implementation declares a gradeable review scope (structured `Task.review_scope` first, conservative prompt parsing fallback for legacy sliced tasks)
+    - `## Review scope:` when the implementation declares a gradeable review scope. Resolution order is: persisted `Task.review_scope`, latest typed `review_scope` task comment on the non-pending implementation, then conservative prompt parsing fallback for legacy sliced tasks.
     - `## Original plan context (out of scope except for the review scope):` as read-only boundary/interface context when a scoped review is plan-backed
     - Otherwise exactly one canonical whole-task ask section:
       - `## Original plan:` when a linked plan exists
@@ -38,6 +38,8 @@ Database lookups happen on the host before the worktree is even created. The wor
 ## Scoped reviews
 
 When `## Review scope:` is present, that section is the only gradeable ask. The accompanying original-plan-context section exists only to explain slice boundaries, sibling ownership, and integration contracts. Missing sibling-slice work is not a blocker unless the current diff breaks an explicit contract described in the scoped ask or context.
+
+Typed `review_scope` comments are task-attached scope data, not actionable review feedback. They can supply or override the next review's scope for a completed or otherwise non-pending implementation, but they do not appear in improve feedback context and do not participate in improve gating.
 
 Current review context logic lives in `_build_context_from_chain()` and `_build_review_diff_context()` in `src/gza/runner.py`.
 

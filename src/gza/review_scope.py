@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .db import SqliteTaskStore, Task
+from .db import TASK_COMMENT_KIND_REVIEW_SCOPE, SqliteTaskStore, Task, TaskComment
 
 _SLICE_HEADER_RE = re.compile(
     r"^Implement\s+plan\s+(?P<plan_id>\S+),\s*slice\s+(?P<slice_label>.+?)(?::\s*(?P<summary>.+))?$",
@@ -81,9 +81,35 @@ def _extract_review_scope_details_from_prompt(prompt: str) -> ReviewScope | None
     )
 
 
+def get_latest_review_scope_comment_for_impl(
+    store: SqliteTaskStore,
+    impl_task: Task,
+) -> TaskComment | None:
+    """Return the newest review-scope comment that can supply review metadata.
+
+    Only non-pending implementation tasks participate in post-hoc scope overrides.
+    """
+    if impl_task.id is None or impl_task.task_type != "implement":
+        return None
+    if impl_task.status == "pending":
+        return None
+    comment = store.get_latest_comment_by_kind(
+        impl_task.id,
+        kind=TASK_COMMENT_KIND_REVIEW_SCOPE,
+    )
+    if not isinstance(comment, TaskComment):
+        return None
+    return comment
+
+
 def resolve_review_scope_for_impl(store: SqliteTaskStore, impl_task: Task) -> ReviewScope | None:
     """Resolve the authoritative review scope for an implementation task."""
-    del store
     if impl_task.review_scope:
         return ReviewScope(summary=impl_task.review_scope.strip(), source="task_field")
+    scope_comment = get_latest_review_scope_comment_for_impl(store, impl_task)
+    if scope_comment is not None:
+        return ReviewScope(
+            summary=scope_comment.content,
+            source=f"comment:{scope_comment.id}",
+        )
     return _extract_review_scope_details_from_prompt(impl_task.prompt)

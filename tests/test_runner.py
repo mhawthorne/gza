@@ -945,6 +945,81 @@ class TestReviewContextFromChain:
         assert "- F-A3" in context
         assert "- F-B1" in context
 
+    def test_review_context_uses_comment_derived_scope_and_keeps_plan_as_background(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n**Task type:** PLAN ONLY. No implementation in this row."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement the bridge slices for the serial rerun path.",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+        store.add_comment(
+            impl_task.id,
+            "Grade only the serial-rerun bridge slice.",
+            kind="review_scope",
+        )
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert "Grade only the serial-rerun bridge slice." in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "PLAN ONLY" in context
+        assert "## Original plan:\n" not in context
+
+    def test_review_context_prefers_review_row_scope_over_later_scope_comment(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = "# Plan\n1. Build the bridge."
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement the bridge slices for the serial rerun path.",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+        store.add_comment(
+            impl_task.id,
+            "Grade only the original bridge slice.",
+            kind="review_scope",
+        )
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope="Persisted review-row scope.",
+        )
+        store.add_comment(
+            impl_task.id,
+            "Later scope comment that should not rewrite an existing review row.",
+            kind="review_scope",
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "Persisted review-row scope." in context
+        assert "Later scope comment that should not rewrite an existing review row." not in context
+
     def test_review_context_scopes_followup_review_to_finding_text(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)

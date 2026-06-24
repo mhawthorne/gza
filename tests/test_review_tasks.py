@@ -1,9 +1,11 @@
 """Tests for review_tasks helpers."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gza.db import SqliteTaskStore
 from gza.db import Task
 from gza.review_tasks import (
     DuplicateReviewError,
@@ -234,6 +236,24 @@ class TestCreateReviewTask:
         result = create_review_task(store, task, trigger_source="manual")
         assert result is not None
         store.add.assert_called_once()
+
+    def test_persists_comment_derived_review_scope(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+        store.add_comment(
+            impl_task.id,
+            "Review only the API validation slice.",
+            kind="review_scope",
+        )
+
+        review_task = create_review_task(store, impl_task, trigger_source="manual")
+        persisted = store.get(review_task.id)
+
+        assert persisted is not None
+        assert persisted.review_scope == "Review only the API validation slice."
 
     def test_auto_prompt_mode(self):
         store = self._mock_store()

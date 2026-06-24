@@ -11,6 +11,7 @@
 - Do not introduce parallel task model modules (for example, a second `Task` dataclass in another module).
 - Task data now enters the system through the canonical CLI/config flows backed by `gza.db`; do not reintroduce retired importer-specific entry points.
 - `Task.review_scope` is task metadata on the canonical model, not a second ask/task model. It records the gradeable review boundary for sliced implementation work while the linked plan or request remains the broader context source.
+- Typed task comments are a second, task-attached data channel on the same canonical model. `feedback` comments are actionable improve input; `review_scope` comments are non-actionable scope metadata that can supply the next review boundary for a non-pending implementation without rewriting the task row.
 
 ## Read vs. Write Boundary
 

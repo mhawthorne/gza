@@ -184,6 +184,11 @@ When a current review exists for the implementation lineage:
   the improve flow **before** any merge, even on an approved verdict.
 - Unresolved comments of other kinds (for example `review_scope`) MUST remain visible to
   operators but MUST NOT create, reuse, resume, wait on, or freshness-block an improve task.
+- When review scope is needed for a completed or otherwise non-pending implementation, the
+  authoritative resolution order is: persisted `review_scope` task field first, latest
+  typed `review_scope` comment next, then any conservative legacy prompt-derived fallback.
+  A created review MUST persist that resolved scope on its own row so later scope comments
+  do not silently rewrite an existing review's gradeable contract.
 - Verdict is unknown / unclassifiable → `needs_discussion` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 

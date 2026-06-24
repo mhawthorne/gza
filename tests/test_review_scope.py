@@ -1,7 +1,11 @@
 from pathlib import Path
 
 from gza.db import SqliteTaskStore
-from gza.review_scope import extract_review_scope_from_prompt, resolve_review_scope_for_impl
+from gza.review_scope import (
+    extract_review_scope_from_prompt,
+    get_latest_review_scope_comment_for_impl,
+    resolve_review_scope_for_impl,
+)
 
 
 def test_extract_review_scope_from_legacy_sliced_prompt() -> None:
@@ -49,3 +53,32 @@ def test_resolve_review_scope_returns_none_for_unsliced_prompt(tmp_path: Path) -
     resolved = resolve_review_scope_for_impl(store, impl)
 
     assert resolved is None
+
+
+def test_get_latest_review_scope_comment_for_impl_ignores_pending_tasks(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement the full plan end to end", task_type="implement")
+    assert impl.id is not None
+    store.add_comment(impl.id, "Review only the parser slice.", kind="review_scope")
+
+    assert get_latest_review_scope_comment_for_impl(store, impl) is None
+
+
+def test_resolve_review_scope_uses_latest_scope_comment_after_task_field(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement the full plan end to end", task_type="implement")
+    impl.status = "completed"
+    store.update(impl)
+    assert impl.id is not None
+
+    first = store.add_comment(impl.id, "Review only the parser slice.", kind="review_scope")
+    second = store.add_comment(impl.id, "Review only the executor slice.", kind="review_scope")
+
+    latest = get_latest_review_scope_comment_for_impl(store, impl)
+    resolved = resolve_review_scope_for_impl(store, impl)
+
+    assert latest == second
+    assert latest != first
+    assert resolved is not None
+    assert resolved.summary == "Review only the executor slice."
+    assert resolved.source == f"comment:{second.id}"
