@@ -918,7 +918,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview matching recovery candidates, lifecycle actions, and the pending pickup order. Scoped watch reports out-of-scope derived blockers but does not start them",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the matching pending pickup order, or add '--full' to also preview matching recovery candidates and lifecycle actions. Scoped watch reports out-of-scope derived blockers but does not start them",
     )
     watch_parser.add_argument(
         "--all-tags",
@@ -930,23 +930,28 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="Preview recovery, lifecycle, and pending lanes separately and manage pending-lane ordering",
-        description="Preview recovery, lifecycle, and pending lanes separately and manage pending-lane ordering.",
+        help="Preview the pending lane by default; add --full for recovery and lifecycle lanes too; manage pending-lane ordering",
+        description="Preview the pending lane by default and manage pending-lane ordering. Add --full to also show the recovery and lifecycle lanes.",
     )
     add_common_args(queue_parser)
-    queue_parser.set_defaults(limit=10, all=False)
+    queue_parser.set_defaults(limit=10, all=False, full=False)
     queue_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list recovery, lifecycle, and pending lanes matching tag filters (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. When matching lineages are blocked by out-of-scope derived children, queue reports the blocker without starting it",
+        help="Only list pending tasks matching tag filters by default (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Add --full to also show matching recovery and lifecycle lanes, plus out-of-scope derived blockers without starting them",
     )
     queue_parser.add_argument(
         "--all-tags",
         action="store_true",
         dest="all_tags",
         help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    queue_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Also show recovery and lifecycle lanes (default queue output is pending lane only)",
     )
     queue_parser.add_argument(
         "-n",

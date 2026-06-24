@@ -212,6 +212,22 @@ class _PreviewLifecycleGit(_FastUnmergedGit):
         return descendant in {ancestor, "origin/merged/already-landed", "merged/already-landed"}
 
 
+class _ExplodingQueueGit(_FastUnmergedGit):
+    def __init__(self) -> None:
+        super().__init__()
+        self.default_branch_calls = 0
+
+    def default_branch(self) -> str:
+        self.default_branch_calls += 1
+        raise AssertionError("queue default should not touch git-backed lane setup")
+
+    def local_branch_names(self) -> frozenset[str]:
+        raise AssertionError("queue default should not enumerate refs")
+
+    def _run(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("queue default should not run git subprocesses")
+
+
 class _UnavailableGitHub:
     def is_available(self) -> bool:
         return False
@@ -3537,7 +3553,7 @@ class TestQueueCommand:
         failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
         store.add("Pending queue task")
 
-        result = invoke_gza("queue", "--project", str(tmp_path))
+        result = invoke_gza("queue", "--full", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Recovery lane:" in result.stdout
@@ -3545,11 +3561,26 @@ class TestQueueCommand:
         assert f"retry {failed.id}" in " ".join(result.stdout.split())
         assert "Pending queue task" in result.stdout
 
+    def test_queue_default_shows_only_pending_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
+        store.add("Pending queue task")
+
+        result = invoke_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending lane:" in result.stdout
+        assert "Pending queue task" in result.stdout
+        assert "Recovery lane:" not in result.stdout
+        assert "Lifecycle actions:" not in result.stdout
+        assert failed.id not in result.stdout
+
     def test_queue_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
         failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -3569,7 +3600,7 @@ class TestQueueCommand:
         preview_git = _PreviewLifecycleGit(merged_branches=(merged_impl.branch or "",))
 
         with patch("gza.cli.watch.Git", return_value=preview_git):
-            result = invoke_gza("queue", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
 
         store = make_store(tmp_path)
         refreshed_impl = store.get(merged_impl.id)
@@ -3586,7 +3617,7 @@ class TestQueueCommand:
         failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -3600,6 +3631,57 @@ class TestQueueCommand:
         lifecycle_idx = result.stdout.index("Lifecycle actions:")
         pending_idx = result.stdout.index("Pending lane:")
         assert recovery_idx < lifecycle_idx < pending_idx
+
+    def test_queue_default_listing_is_git_free_but_full_mode_exercises_git_path(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending queue task")
+        assert task.id is not None
+
+        exploding_git = _ExplodingQueueGit()
+        recording_console = _RecordingConsole()
+        config = Config.load(tmp_path)
+        with (
+            patch.object(watch_cli, "console", recording_console),
+            patch.object(watch_cli.Config, "load", return_value=config),
+            patch.object(watch_cli, "Git", lambda _project_dir: exploding_git),
+        ):
+            exit_code = watch_cli.cmd_queue(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    queue_action=None,
+                    limit=10,
+                    all=False,
+                    tags=None,
+                    any_tag=False,
+                    full=False,
+                )
+            )
+
+        assert exit_code == 0
+        assert exploding_git.default_branch_calls == 0
+        rendered = "\n".join(
+            output.plain if isinstance(output, Text) else str(output)
+            for output in recording_console.outputs
+        )
+        assert "Pending lane:" in rendered
+        assert "Pending queue task" in rendered
+        assert "Recovery lane:" not in rendered
+        assert "Lifecycle actions:" not in rendered
+
+        with patch.object(watch_cli, "Git", lambda _project_dir: exploding_git):
+            with pytest.raises(AssertionError, match="should not touch git-backed lane setup"):
+                watch_cli.cmd_queue(
+                    argparse.Namespace(
+                        project_dir=tmp_path,
+                        queue_action=None,
+                        limit=10,
+                        all=False,
+                        tags=None,
+                        any_tag=False,
+                        full=True,
+                    )
+                )
 
     def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -4023,6 +4105,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4063,6 +4146,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4110,6 +4194,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4159,6 +4244,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4204,6 +4290,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4254,6 +4341,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4293,6 +4381,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4335,6 +4424,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--tag",
@@ -4381,6 +4471,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4418,6 +4509,7 @@ class TestQueueCommand:
 
         result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--project",
@@ -4492,6 +4584,7 @@ class TestQueueCommand:
 
         matching_result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--tag",
@@ -4514,6 +4607,7 @@ class TestQueueCommand:
 
         gap_result = invoke_gza(
             "queue",
+            "--full",
             "--tag",
             "202606-recovery",
             "--tag",
@@ -4863,6 +4957,7 @@ class TestQueueCommand:
                     all=True,
                     tags=None,
                     any_tag=False,
+                    full=False,
                 )
             )
 

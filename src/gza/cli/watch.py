@@ -95,6 +95,7 @@ from ._common import (
     set_task_urgency,
 )
 from ._lifecycle_actions import (
+    LifecycleActionEntry,
     collect_lifecycle_action_entries,
     format_cycle_lifecycle_action_summary,
     lifecycle_action_execution_sort_key,
@@ -3540,6 +3541,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     store = get_store(config)
     service = TaskQueryService(store)
     action = getattr(args, "queue_action", None)
+    full = bool(getattr(args, "full", False))
     try:
         tag_filters, any_tag = parse_cli_tag_filters(args)
     except ValueError as exc:
@@ -3547,16 +3549,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
         return 1
 
     normalized_tag_filters = normalize_tag_filters(tag_filters)
-    queue_git = Git(config.project_dir)
-    queue_target_branch = queue_git.default_branch()
-    scope_gaps = collect_scoped_tag_scope_gaps(
-        store,
-        tag_filters=normalized_tag_filters,
-        any_tag=any_tag,
-        config=config,
-        git=queue_git,
-        target_branch=queue_target_branch,
-    )
 
     if action in {"bump", "unbump", "move", "next", "clear"}:
         task_id = resolve_id(config, args.task_id)
@@ -3638,24 +3630,38 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"{message} (task is not currently runnable; ordering will apply once runnable)")
         return 0
 
-    recovery_entries = collect_recovery_lane_entries(
-        store,
-        tags=normalized_tag_filters,
-        any_tag=any_tag,
-        max_recovery_attempts=config.max_resume_attempts,
-        git=queue_git,
-        target_branch=queue_target_branch,
-    )
-    lifecycle_entries = collect_lifecycle_action_entries(
-        store,
-        config=config,
-        git=queue_git,
-        target_branch=queue_target_branch,
-        tags=normalized_tag_filters,
-        any_tag=any_tag,
-        max_recovery_attempts=config.max_resume_attempts,
-        persist_post_merge_rebase_state=False,
-    )
+    recovery_entries: list[RecoveryLaneEntry] = []
+    lifecycle_entries: list[LifecycleActionEntry] = []
+    scope_gaps: list[ScopedTagScopeGap] = []
+    if full:
+        queue_git = Git(config.project_dir)
+        queue_target_branch = queue_git.default_branch()
+        scope_gaps = collect_scoped_tag_scope_gaps(
+            store,
+            tag_filters=normalized_tag_filters,
+            any_tag=any_tag,
+            config=config,
+            git=queue_git,
+            target_branch=queue_target_branch,
+        )
+        recovery_entries = collect_recovery_lane_entries(
+            store,
+            tags=normalized_tag_filters,
+            any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
+            git=queue_git,
+            target_branch=queue_target_branch,
+        )
+        lifecycle_entries = collect_lifecycle_action_entries(
+            store,
+            config=config,
+            git=queue_git,
+            target_branch=queue_target_branch,
+            tags=normalized_tag_filters,
+            any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
+            persist_post_merge_rebase_state=False,
+        )
     queue_rows = [
         row
         for row in service.run(
@@ -3718,29 +3724,30 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
     widths = queue_render_widths(rendered_rows)
 
-    console.print(
-        build_queue_summary(
-            "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
+    if full:
+        console.print(
+            build_queue_summary(
+                "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
+            )
         )
-    )
-    if recovery_entries:
-        for entry in recovery_entries:
-            console.print(_format_queue_recovery_lane_detail(entry))
-    else:
-        console.print("No recovery candidates")
+        if recovery_entries:
+            for entry in recovery_entries:
+                console.print(_format_queue_recovery_lane_detail(entry))
+        else:
+            console.print("No recovery candidates")
 
-    console.print()
-    console.print(
-        build_queue_summary(
-            "Lifecycle actions: `advance` / `watch` lifecycle work visible ahead of pending pickup."
+        console.print()
+        console.print(
+            build_queue_summary(
+                "Lifecycle actions: `advance` / `watch` lifecycle work visible ahead of pending pickup."
+            )
         )
-    )
-    if lifecycle_entries:
-        print_lifecycle_action_entries(console, lifecycle_entries)
-    else:
-        console.print("No lifecycle actions")
+        if lifecycle_entries:
+            print_lifecycle_action_entries(console, lifecycle_entries)
+        else:
+            console.print("No lifecycle actions")
 
-    console.print()
+        console.print()
     console.print(
         build_queue_summary(
             "Pending lane: `gza queue` preview only. `gza work` / `watch` start from this lane."
@@ -3748,11 +3755,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
     if not runnable_pending and not blocked_pending:
         console.print("No pending tasks")
-        _print_queue_scope_gaps(
-            gaps=scope_gaps,
-            tags=normalized_tag_filters,
-            any_tag=any_tag,
-        )
+        if full:
+            _print_queue_scope_gaps(
+                gaps=scope_gaps,
+                tags=normalized_tag_filters,
+                any_tag=any_tag,
+            )
         return 0
     print_queue_rows(
         console,
@@ -3772,11 +3780,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
         [row for row in rendered_rows if row.blocked],
         widths=widths,
     )
-    _print_queue_scope_gaps(
-        gaps=scope_gaps,
-        tags=normalized_tag_filters,
-        any_tag=any_tag,
-    )
+    if full:
+        _print_queue_scope_gaps(
+            gaps=scope_gaps,
+            tags=normalized_tag_filters,
+            any_tag=any_tag,
+        )
 
     return 0
 
