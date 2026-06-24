@@ -85,3 +85,28 @@ This bridge is intentionally narrow. It is an interim run-level arbiter for
 known xdist contention artifacts, not a replacement for the durable per-test
 budgeting work. `GZA_UNIT_SERIAL_RERUN=0` disables the bridge for operator
 triage, and `GZA_UNIT_RERUN_CAP` keeps broad failure sets fail-closed.
+
+## Unit-suite per-test guards
+
+The unit suite now separates two concerns that used to be conflated by one
+short wall-clock timeout:
+
+- `GZA_UNIT_TEST_CPU_BUDGET_MS` is the strict latency bar. `tests/conftest.py`
+  measures `time.process_time()` across the test call phase and fails after the
+  fact if the test used too much in-process CPU. This is contention-proof under
+  xdist because descheduled wall time does not accrue CPU time.
+- `GZA_UNIT_TEST_HANG_TIMEOUT_MS` is the generous hang guard. The collection
+  hook still injects `pytest.mark.timeout(..., method="signal")`, but with
+  enough headroom that contention should never trip it. Its job is interruption,
+  not latency policing.
+
+Per-test overrides stay narrow:
+
+- `@pytest.mark.cpu_budget(ms=...)` raises only that test's CPU budget.
+- An explicit `@pytest.mark.timeout(...)` opts the test out of the CPU budget
+  entirely; the author owns that test's latency classification.
+
+The functional suite intentionally does not use a CPU budget. Functional tests
+legitimately spend time in child processes, and `time.process_time()` would miss
+that work. `tests_functional/conftest.py` therefore keeps only a generous 30s
+wall-clock hang guard, layered under the outer 120s verify cap.

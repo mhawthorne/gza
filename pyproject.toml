@@ -62,7 +62,7 @@ addopts = "-x"
 pythonpath = ["."]
 timeout_method = "signal"
 markers = [
-    "cpu_budget(seconds): narrow per-test override for the unit post-hoc CPU watchdog",
+    "cpu_budget: override the per-test CPU-time latency budget (kwarg ms=<int>)",
     "functional: mark test as subprocess or git-shell functional coverage",
     "integration: mark test as integration test (requires credentials and Docker)",
 ]

@@ -3,9 +3,9 @@
 import contextlib
 import fcntl
 import os
-import time
 import shlex
 import subprocess
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -14,18 +14,21 @@ from unittest.mock import patch
 import pytest
 
 from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
-from gza.pytest_timeout_diagnostics import register_sigterm_faulthandler
+from gza.pytest_timeout_diagnostics import positive_int_env, register_sigterm_faulthandler
 
 # The unit suite uses two separate guards:
 # - a generous wall-clock SIGALRM hang-guard that can still interrupt a stuck
 #   process even when it is deadlocked or blocked in C code;
 # - a post-hoc CPU-time budget that fails tests which finish after burning too
 #   much in-process CPU, without false-positiving under xdist wall contention.
-UNIT_TEST_HANG_GUARD_SECONDS = float(os.environ.get("GZA_UNIT_TEST_HANG_GUARD_SECONDS", "5"))
-UNIT_TEST_CPU_BUDGET_SECONDS = float(os.environ.get("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1.5"))
+UNIT_TEST_HANG_TIMEOUT_MS = positive_int_env("GZA_UNIT_TEST_HANG_TIMEOUT_MS", 30000)
+UNIT_TEST_HANG_TIMEOUT_SECONDS = UNIT_TEST_HANG_TIMEOUT_MS / 1000
+UNIT_TEST_CPU_BUDGET_MS = positive_int_env("GZA_UNIT_TEST_CPU_BUDGET_MS", 1000)
 UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED = (
     os.environ.get("GZA_ENABLE_UNIT_SUBPROCESS_GUARD", "1") != "0"
 )
+_CPU_DELTA_KEY: pytest.StashKey[float] = pytest.StashKey()
+_EXPLICIT_TIMEOUT_KEY: pytest.StashKey[bool] = pytest.StashKey()
 
 # Keep the runtime guard on for the default unit lane. Any future exemption
 # must stay narrow, temporary, and point at a dedicated follow-up implement
@@ -199,53 +202,55 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 def pytest_collection_modifyitems(items):
     """Apply the unit-suite watchdog unless a test sets its own timeout."""
-    unit_timeout_marker = pytest.mark.timeout(UNIT_TEST_HANG_GUARD_SECONDS, method="signal")
+    unit_timeout_marker = pytest.mark.timeout(UNIT_TEST_HANG_TIMEOUT_SECONDS, method="signal")
     for item in items:
-        if item.get_closest_marker("timeout") is not None:
+        has_explicit_timeout = item.get_closest_marker("timeout") is not None
+        item.stash[_EXPLICIT_TIMEOUT_KEY] = has_explicit_timeout
+        if has_explicit_timeout:
             continue
         item.add_marker(unit_timeout_marker)
 
 
-def _fail_if_unit_test_exceeds_cpu_budget(nodeid: str, cpu_seconds: float) -> None:
-    if cpu_seconds <= UNIT_TEST_CPU_BUDGET_SECONDS:
-        return
-    pytest.fail(
-        f"{nodeid} exceeded the unit-test CPU budget: used {cpu_seconds:.3f}s CPU "
-        f"with a {UNIT_TEST_CPU_BUDGET_SECONDS:.3f}s budget."
+def _format_cpu_violation(nodeid: str, measured_ms: float, budget_ms: int) -> str:
+    return (
+        f"CPU latency budget exceeded: {nodeid} consumed {measured_ms:.1f}ms CPU "
+        f"(budget {budget_ms}ms).\n"
+        "Unit tests must stay computationally cheap. Move heavy/subprocess work "
+        "to tests_functional/, optimize the test, or set "
+        "@pytest.mark.cpu_budget(ms=...) with justification."
     )
 
 
-def _unit_test_cpu_budget_for_item(item: pytest.Item) -> float:
+def _cpu_guard_enabled(item: pytest.Item) -> bool:
+    return not item.stash.get(_EXPLICIT_TIMEOUT_KEY, False)
+
+
+def _cpu_budget_ms(item: pytest.Item) -> int:
     marker = item.get_closest_marker("cpu_budget")
     if marker is None:
-        return UNIT_TEST_CPU_BUDGET_SECONDS
-    if len(marker.args) != 1 or not isinstance(marker.args[0], int | float):
-        raise pytest.UsageError("cpu_budget marker must be called with one numeric seconds argument")
-    return float(marker.args[0])
+        return UNIT_TEST_CPU_BUDGET_MS
+    if marker.args or set(marker.kwargs) != {"ms"} or not isinstance(marker.kwargs["ms"], int):
+        raise pytest.UsageError("cpu_budget marker must be called as @pytest.mark.cpu_budget(ms=<int>)")
+    budget_ms = marker.kwargs["ms"]
+    if budget_ms <= 0:
+        raise pytest.UsageError("cpu_budget marker ms must be a positive integer")
+    return budget_ms
 
 
-def _watch_unit_test_cpu_budget(
-    nodeid: str,
-    *,
-    cpu_budget_seconds: float = UNIT_TEST_CPU_BUDGET_SECONDS,
-):
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item):
     start_cpu_seconds = time.process_time()
-    yield
-    cpu_seconds = time.process_time() - start_cpu_seconds
-    if cpu_seconds <= cpu_budget_seconds:
-        return
-    pytest.fail(
-        f"{nodeid} exceeded the unit-test CPU budget: used {cpu_seconds:.3f}s CPU "
-        f"with a {cpu_budget_seconds:.3f}s budget."
-    )
-
-
-@pytest.fixture(autouse=True)
-def _enforce_unit_test_cpu_budget(request: pytest.FixtureRequest):
-    yield from _watch_unit_test_cpu_budget(
-        request.node.nodeid,
-        cpu_budget_seconds=_unit_test_cpu_budget_for_item(request.node),
-    )
+    try:
+        result = yield
+    finally:
+        item.stash[_CPU_DELTA_KEY] = time.process_time() - start_cpu_seconds
+    if not _cpu_guard_enabled(item):
+        return result
+    budget_ms = _cpu_budget_ms(item)
+    measured_ms = item.stash[_CPU_DELTA_KEY] * 1000
+    if measured_ms > budget_ms:
+        raise AssertionError(_format_cpu_violation(item.nodeid, measured_ms, budget_ms))
+    return result
 
 
 @pytest.fixture(autouse=True)

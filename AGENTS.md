@@ -57,7 +57,7 @@ See `docs/` for detailed documentation:
 - Do NOT use `python -m pytest` or `pip install` — always `uv run`
 - Do NOT use the `sqlite3` CLI — use `gza.db.SqliteTaskStore` programmatically
 - Do NOT modify files outside `/workspace/gza/` in Docker unless instructed
-- Do NOT remove or weaken per-test timeouts, fail-fast flags, or other load-bearing guardrails to make a failing test pass — see [docs/internal/practices.md](docs/internal/practices.md)
+- Do NOT remove or weaken the per-test CPU latency bar, 30s hang guard, fail-fast flags, or other load-bearing guardrails to make a failing test pass — see [docs/internal/practices.md](docs/internal/practices.md)
 
 ## Architecture
 

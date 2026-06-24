@@ -3,8 +3,23 @@
 from __future__ import annotations
 
 import faulthandler
+import os
 import signal
 from typing import Any
+
+
+def positive_int_env(name: str, default: int) -> int:
+    """Return a validated positive integer env override."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {raw_value!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw_value!r}")
+    return value
 
 
 def register_sigterm_faulthandler(

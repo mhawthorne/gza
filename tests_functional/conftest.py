@@ -1,13 +1,12 @@
 """Shared functional test fixtures."""
 
-import os
 from pathlib import Path
 
 import pytest
 
-from gza.pytest_timeout_diagnostics import register_sigterm_faulthandler
+from gza.pytest_timeout_diagnostics import positive_int_env, register_sigterm_faulthandler
 
-FUNCTIONAL_TEST_TIMEOUT_SECONDS = int(os.environ.get("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", "4"))
+FUNCTIONAL_TEST_TIMEOUT_SECONDS = positive_int_env("GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS", 30)
 
 register_sigterm_faulthandler()
 

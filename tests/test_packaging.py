@@ -1,9 +1,7 @@
 """Packaging configuration regression tests."""
 
 import ast
-import contextlib
 import importlib.util
-import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,6 +96,7 @@ def test_unit_test_conftest_injects_only_unit_watchdog() -> None:
         def __init__(self, *, timeout: bool = False) -> None:
             self._timeout = timeout
             self.markers: list[pytest.MarkDecorator] = []
+            self.stash: dict[object, object] = {}
 
         def get_closest_marker(self, name: str):
             if name == "timeout" and self._timeout:
@@ -115,12 +114,12 @@ def test_unit_test_conftest_injects_only_unit_watchdog() -> None:
 
     assert len(plain_unit.markers) == 1
     assert plain_unit.markers[0].mark.name == "timeout"
-    assert plain_unit.markers[0].mark.args == (module.UNIT_TEST_HANG_GUARD_SECONDS,)
+    assert plain_unit.markers[0].mark.args == (module.UNIT_TEST_HANG_TIMEOUT_SECONDS,)
     assert plain_unit.markers[0].mark.kwargs == {"method": "signal"}
 
     assert len(plain_unit_2.markers) == 1
     assert plain_unit_2.markers[0].mark.name == "timeout"
-    assert plain_unit_2.markers[0].mark.args == (module.UNIT_TEST_HANG_GUARD_SECONDS,)
+    assert plain_unit_2.markers[0].mark.args == (module.UNIT_TEST_HANG_TIMEOUT_SECONDS,)
     assert plain_unit_2.markers[0].mark.kwargs == {"method": "signal"}
 
     assert explicit_timeout.markers == []
@@ -264,13 +263,14 @@ def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
 ) -> None:
     """tests/conftest.py should still inject a watchdog when the override env is unset."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.delenv("GZA_UNIT_TEST_HANG_GUARD_SECONDS", raising=False)
-    monkeypatch.delenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("GZA_UNIT_TEST_HANG_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("GZA_UNIT_TEST_CPU_BUDGET_MS", raising=False)
     module = _load_module(conftest_path, "tests_timeout_conftest_default")
 
     class FakeItem:
         def __init__(self) -> None:
             self.markers: list[pytest.MarkDecorator] = []
+            self.stash: dict[object, object] = {}
 
         def get_closest_marker(self, _name: str):
             return None
@@ -281,22 +281,24 @@ def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
     item = FakeItem()
     module.pytest_collection_modifyitems([item])
 
-    assert module.UNIT_TEST_HANG_GUARD_SECONDS == 5
-    assert module.UNIT_TEST_CPU_BUDGET_SECONDS == 1.5
+    assert module.UNIT_TEST_HANG_TIMEOUT_MS == 30000
+    assert module.UNIT_TEST_HANG_TIMEOUT_SECONDS == 30
+    assert module.UNIT_TEST_CPU_BUDGET_MS == 1000
     assert len(item.markers) == 1
-    assert item.markers[0].mark.args == (module.UNIT_TEST_HANG_GUARD_SECONDS,)
+    assert item.markers[0].mark.args == (module.UNIT_TEST_HANG_TIMEOUT_SECONDS,)
     assert item.markers[0].mark.kwargs == {"method": "signal"}
 
 
 def test_unit_test_conftest_uses_hang_guard_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """tests/conftest.py should use the hang-guard override for the timeout marker budget."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.setenv("GZA_UNIT_TEST_HANG_GUARD_SECONDS", "7.5")
+    monkeypatch.setenv("GZA_UNIT_TEST_HANG_TIMEOUT_MS", "35000")
     module = _load_module(conftest_path, "tests_timeout_conftest_hang_override")
 
     class FakeItem:
         def __init__(self) -> None:
             self.markers: list[pytest.MarkDecorator] = []
+            self.stash: dict[object, object] = {}
 
         def get_closest_marker(self, _name: str):
             return None
@@ -307,19 +309,20 @@ def test_unit_test_conftest_uses_hang_guard_override(monkeypatch: pytest.MonkeyP
     item = FakeItem()
     module.pytest_collection_modifyitems([item])
 
-    assert module.UNIT_TEST_HANG_GUARD_SECONDS == 7.5
+    assert module.UNIT_TEST_HANG_TIMEOUT_MS == 35000
+    assert module.UNIT_TEST_HANG_TIMEOUT_SECONDS == 35
     assert len(item.markers) == 1
-    assert item.markers[0].mark.args == (7.5,)
+    assert item.markers[0].mark.args == (35,)
     assert item.markers[0].mark.kwargs == {"method": "signal"}
 
 
 def test_unit_test_conftest_uses_cpu_budget_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """tests/conftest.py should read the CPU budget override from the environment."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1.75")
+    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_MS", "1750")
     module = _load_module(conftest_path, "tests_timeout_conftest_cpu_override")
 
-    assert module.UNIT_TEST_CPU_BUDGET_SECONDS == 1.75
+    assert module.UNIT_TEST_CPU_BUDGET_MS == 1750
 
 
 def test_unit_test_conftest_uses_cpu_budget_marker_override() -> None:
@@ -328,35 +331,42 @@ def test_unit_test_conftest_uses_cpu_budget_marker_override() -> None:
     module = _load_module(conftest_path, "tests_timeout_conftest_cpu_marker_override")
 
     class FakeItem:
+        def __init__(self) -> None:
+            self.stash: dict[object, object] = {}
+
         def get_closest_marker(self, name: str):
             if name == "cpu_budget":
-                return pytest.mark.cpu_budget(2.25).mark
+                return pytest.mark.cpu_budget(ms=2250).mark
             return None
 
-    assert module._unit_test_cpu_budget_for_item(FakeItem()) == 2.25
+    assert module._cpu_budget_ms(FakeItem()) == 2250
 
 
-def test_unit_test_conftest_cpu_budget_failure_is_clear(monkeypatch: pytest.MonkeyPatch) -> None:
-    """tests/conftest.py should fail slow unit tests with a CPU-budget-specific message."""
+def test_unit_test_conftest_cpu_budget_message_is_clear() -> None:
+    """tests/conftest.py should explain CPU budget failures clearly."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "1")
     module = _load_module(conftest_path, "tests_timeout_conftest_cpu_failure")
 
-    with pytest.raises(pytest.fail.Exception, match="exceeded the unit-test CPU budget"):
-        module._fail_if_unit_test_exceeds_cpu_budget("tests/example.py::test_slow", 1.25)
+    message = module._format_cpu_violation("tests/example.py::test_slow", 1250.4, 1000)
+    assert "CPU latency budget exceeded: tests/example.py::test_slow" in message
+    assert "consumed 1250.4ms CPU" in message
+    assert "budget 1000ms" in message
+    assert "@pytest.mark.cpu_budget(ms=...)" in message
 
 
-def test_unit_test_conftest_cpu_budget_ignores_wall_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Wall-clock sleep with low CPU should not trip the post-hoc CPU budget guard."""
+def test_unit_test_conftest_validates_positive_integer_env_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tests/conftest.py should reject invalid timeout-budget env overrides."""
     conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_SECONDS", "0.05")
-    module = _load_module(conftest_path, "tests_timeout_conftest_cpu_sleep")
+    monkeypatch.setenv("GZA_UNIT_TEST_CPU_BUDGET_MS", "0")
+    with pytest.raises(ValueError, match="GZA_UNIT_TEST_CPU_BUDGET_MS must be a positive integer"):
+        _load_module(conftest_path, "tests_timeout_conftest_bad_cpu_env")
 
-    watchdog = module._watch_unit_test_cpu_budget("tests/example.py::test_sleep")
-    next(watchdog)
-    time.sleep(0.1)
-    with contextlib.suppress(StopIteration):
-        next(watchdog)
+    monkeypatch.delenv("GZA_UNIT_TEST_CPU_BUDGET_MS", raising=False)
+    monkeypatch.setenv("GZA_UNIT_TEST_HANG_TIMEOUT_MS", "abc")
+    with pytest.raises(ValueError, match="GZA_UNIT_TEST_HANG_TIMEOUT_MS must be a positive integer"):
+        _load_module(conftest_path, "tests_timeout_conftest_bad_hang_env")
 
 
 def test_unit_test_conftest_registers_sigterm_faulthandler(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,6 +409,7 @@ def test_functional_suite_conftest_injects_functional_watchdog() -> None:
         def __init__(self, *, timeout: bool = False) -> None:
             self._timeout = timeout
             self.markers: list[pytest.MarkDecorator] = []
+            self.stash: dict[object, object] = {}
 
         def get_closest_marker(self, name: str):
             if name == "timeout" and self._timeout:
@@ -460,34 +471,8 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     """tests_functional subprocess.run(timeout=N) calls must stay within the suite watchdog."""
     repo_root = Path(__file__).resolve().parents[1]
     conftest_path = repo_root / "tests_functional" / "conftest.py"
-    conftest_module = ast.parse(conftest_path.read_text(), filename=str(conftest_path))
-
-    functional_budget: int | float | None = None
-    for node in ast.walk(conftest_module):
-        if not (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "FUNCTIONAL_TEST_TIMEOUT_SECONDS"
-        ):
-            continue
-        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, float)):
-            functional_budget = node.value.value
-            continue
-        if (
-            isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "int"
-            and len(node.value.args) == 1
-            and isinstance(node.value.args[0], ast.Call)
-            and isinstance(node.value.args[0].func, ast.Attribute)
-            and node.value.args[0].func.attr == "get"
-            and len(node.value.args[0].args) == 2
-            and isinstance(node.value.args[0].args[1], ast.Constant)
-        ):
-            functional_budget = int(node.value.args[0].args[1].value)
-
-    assert functional_budget is not None, "FUNCTIONAL_TEST_TIMEOUT_SECONDS not found in tests_functional/conftest.py"
+    module = _load_module(conftest_path, "tests_functional_watchdog_budget_conftest")
+    functional_budget = module.FUNCTIONAL_TEST_TIMEOUT_SECONDS
 
     inversions: list[str] = []
     tests_root = repo_root / "tests_functional"
@@ -521,7 +506,7 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     )
 
 
-@pytest.mark.cpu_budget(2.0)
+@pytest.mark.cpu_budget(ms=2000)
 def test_unit_suite_keeps_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
     """Unit tests and test fixtures should keep subprocesses and direct shell commands out."""
     repo_root = Path(__file__).resolve().parents[1]
