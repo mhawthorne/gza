@@ -283,6 +283,12 @@ def get_active_watch_no_progress_attention(
         return None
     if observation.parked_reason != WATCH_NO_PROGRESS_BACKSTOP_REASON:
         return None
+    if _watch_no_progress_park_is_stale(store, observation=observation, candidate=candidate):
+        store.delete_watch_progress_subject(
+            subject_kind=observation.subject_kind,
+            subject_id=observation.subject_id,
+        )
+        return None
     if observation.evidence_fingerprint != candidate.evidence_fingerprint:
         return None
     return build_watch_no_progress_attention_action(
@@ -290,6 +296,59 @@ def get_active_watch_no_progress_attention(
         action_type=candidate.action_type,
         streak=observation.streak,
     )
+
+
+def _watch_no_progress_park_is_stale(
+    store: SqliteTaskStore,
+    *,
+    observation: WatchProgressObservation,
+    candidate: WatchProgressCandidate | None = None,
+) -> bool:
+    subject_task_id = candidate.subject_task_id if candidate is not None else observation.subject_task_id
+    if subject_task_id is None:
+        return True
+    subject_task = store.get(subject_task_id)
+    if subject_task is None:
+        return True
+
+    action_task_id = candidate.action_task_id if candidate is not None else observation.action_task_id
+    if action_task_id is not None:
+        action_task = store.get(action_task_id)
+        if action_task is None:
+            return True
+        if action_task.status == "pending" and action_task.started_at is None and action_task.running_pid is None:
+            return True
+
+    subject_kind = candidate.subject_kind if candidate is not None else observation.subject_kind
+    if subject_kind != "merge_unit":
+        return False
+
+    merge_unit_id = candidate.merge_unit_id if candidate is not None else observation.merge_unit_id
+    if merge_unit_id is None:
+        return True
+    merge_unit = store.get_merge_unit(merge_unit_id)
+    if merge_unit is None:
+        return True
+    if merge_unit.state not in {"unmerged", "blocked", "stale"}:
+        return True
+    return subject_task.status in {"failed", "dropped"}
+
+
+def reconcile_stale_watch_no_progress_parks(store: SqliteTaskStore) -> int:
+    """Delete persisted parked watch observations whose basis no longer holds."""
+    cleared: set[tuple[str, str]] = set()
+    for observation in store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON):
+        subject_key = (observation.subject_kind, observation.subject_id)
+        if subject_key in cleared:
+            continue
+        if not _watch_no_progress_park_is_stale(store, observation=observation):
+            continue
+        store.delete_watch_progress_subject(
+            subject_kind=observation.subject_kind,
+            subject_id=observation.subject_id,
+        )
+        cleared.add(subject_key)
+    return len(cleared)
 
 
 def _clear_other_subject_actions(

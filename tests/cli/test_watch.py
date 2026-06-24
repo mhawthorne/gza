@@ -74,6 +74,8 @@ from gza.watch_progress import (
     WatchProgressCandidate,
     build_watch_progress_candidate,
     clear_watch_progress_subject,
+    reconcile_stale_watch_no_progress_parks,
+    get_active_watch_no_progress_attention,
 )
 from gza.workers import WorkerMetadata, WorkerRegistry
 
@@ -10865,9 +10867,11 @@ def test_watch_cycle_parked_pending_recovery_child_is_excluded_from_plain_pendin
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert started_task_ids == [ordinary_pending.id]
+    assert started_task_ids == []
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+    assert observations == []
     text = log_path.read_text()
-    assert any("ATTENTION" in line and failed.id in line for line in text.splitlines())
+    assert "ATTENTION" not in text
     assert not any(parked_recovery_child.id in line and "START" in line for line in text.splitlines())
 
 
@@ -10932,6 +10936,86 @@ def test_watch_cycle_reused_pending_recovery_liveness_transition_resets_no_progr
 
     text = log_path.read_text()
     assert "ATTENTION" not in text
+
+
+def test_watch_cycle_clears_stale_never_started_pending_backstop_and_launches_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    pending = store.add("Never-started pending implement", task_type="implement")
+    assert pending.id is not None
+
+    action = {"type": "iterate", "description": "pending queue iterate"}
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=pending,
+        action=action,
+        action_task=pending,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_task_ids: list[str] = []
+
+    def record_iterate_spawn(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        assert isinstance(task_id, str)
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=record_iterate_spawn),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert started_task_ids == [pending.id]
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=pending.id)
+    assert len(observations) == 1
+    assert observations[0].parked_reason is None
+    assert observations[0].launch_evidence_fingerprint is not None
+    assert "ATTENTION" not in log_path.read_text()
 
 
 def test_watch_cycle_reused_pending_recovery_relaunch_without_terminal_outcome_does_not_tick_streak(
@@ -11041,6 +11125,160 @@ def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_pat
     assert "ATTENTION" not in text
 
 
+def test_reconcile_stale_watch_no_progress_parks_clears_residue_rows(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed merge-unit residue", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.branch = "feature/stale-failed-park"
+    failed.has_commits = True
+    failed.started_at = datetime(2026, 6, 1, 9, 0, tzinfo=UTC)
+    failed.completed_at = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+    failed.failure_reason = "MAX_TURNS"
+    store.update(failed)
+    store.set_merge_status(failed.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(failed)
+    failed_child = store.add("Completed child for failed residue", task_type="review", depends_on=failed.id)
+    assert failed_child.id is not None
+    failed_child.status = "completed"
+    failed_child.started_at = datetime(2026, 6, 1, 10, 5, tzinfo=UTC)
+    failed_child.completed_at = datetime(2026, 6, 1, 10, 10, tzinfo=UTC)
+    failed_child.branch = failed.branch
+    store.update(failed_child)
+    failed_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action={"type": "create_review", "description": "Create review (required before merge)"},
+        action_task=failed_child,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=failed_candidate.subject_kind,
+            subject_id=failed_candidate.subject_id,
+            action_type=failed_candidate.action_type,
+            action_reason=failed_candidate.action_reason,
+            subject_task_id=failed_candidate.subject_task_id,
+            action_task_id=failed_candidate.action_task_id,
+            action_task_status=failed_candidate.action_task_status,
+            action_task_started_at=failed_candidate.action_task_started_at,
+            action_task_running_pid=failed_candidate.action_task_running_pid,
+            failed_task_id=failed_candidate.failed_task_id,
+            recovery_task_id=failed_candidate.recovery_task_id,
+            merge_unit_id=failed_candidate.merge_unit_id,
+            merge_unit_state=failed_candidate.merge_unit_state,
+            merge_unit_head_sha=failed_candidate.merge_unit_head_sha,
+            evidence_fingerprint=failed_candidate.evidence_fingerprint,
+            streak=3,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    completed = store.add("Completed merged residue", task_type="implement")
+    assert completed.id is not None
+    store.mark_completed(completed, has_commits=True, branch="feature/stale-merged-park")
+    completed_unit = store.get_or_create_merge_unit_for_task(completed)
+    assert completed_unit is not None
+    store.set_merge_unit_state(completed_unit.id, "merged")
+    completed = store.get(completed.id)
+    assert completed is not None
+    completed_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=completed,
+        action={"type": "improve", "description": "Create improve task (review CHANGES_REQUESTED)"},
+        action_task=completed,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=completed_candidate.subject_kind,
+            subject_id=completed_candidate.subject_id,
+            action_type=completed_candidate.action_type,
+            action_reason=completed_candidate.action_reason,
+            subject_task_id=completed_candidate.subject_task_id,
+            action_task_id=completed_candidate.action_task_id,
+            action_task_status=completed_candidate.action_task_status,
+            action_task_started_at=completed_candidate.action_task_started_at,
+            action_task_running_pid=completed_candidate.action_task_running_pid,
+            failed_task_id=completed_candidate.failed_task_id,
+            recovery_task_id=completed_candidate.recovery_task_id,
+            merge_unit_id=completed_candidate.merge_unit_id,
+            merge_unit_state=completed_candidate.merge_unit_state,
+            merge_unit_head_sha=completed_candidate.merge_unit_head_sha,
+            evidence_fingerprint=completed_candidate.evidence_fingerprint,
+            streak=3,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    dropped = store.add("Dropped merge-unit residue", task_type="implement")
+    assert dropped.id is not None
+    dropped.status = "dropped"
+    dropped.branch = "feature/stale-dropped-park"
+    dropped.has_commits = True
+    dropped.started_at = datetime(2026, 6, 2, 9, 0, tzinfo=UTC)
+    dropped.completed_at = datetime(2026, 6, 2, 10, 0, tzinfo=UTC)
+    store.update(dropped)
+    store.set_merge_status(dropped.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(dropped)
+    dropped_child = store.add("Completed child for dropped residue", task_type="review", depends_on=dropped.id)
+    assert dropped_child.id is not None
+    dropped_child.status = "completed"
+    dropped_child.started_at = datetime(2026, 6, 2, 10, 5, tzinfo=UTC)
+    dropped_child.completed_at = datetime(2026, 6, 2, 10, 10, tzinfo=UTC)
+    dropped_child.branch = dropped.branch
+    store.update(dropped_child)
+    dropped_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=dropped,
+        action={"type": "create_review", "description": "Create review (required before merge)"},
+        action_task=dropped_child,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=dropped_candidate.subject_kind,
+            subject_id=dropped_candidate.subject_id,
+            action_type=dropped_candidate.action_type,
+            action_reason=dropped_candidate.action_reason,
+            subject_task_id=dropped_candidate.subject_task_id,
+            action_task_id=dropped_candidate.action_task_id,
+            action_task_status=dropped_candidate.action_task_status,
+            action_task_started_at=dropped_candidate.action_task_started_at,
+            action_task_running_pid=dropped_candidate.action_task_running_pid,
+            failed_task_id=dropped_candidate.failed_task_id,
+            recovery_task_id=dropped_candidate.recovery_task_id,
+            merge_unit_id=dropped_candidate.merge_unit_id,
+            merge_unit_state=dropped_candidate.merge_unit_state,
+            merge_unit_head_sha=dropped_candidate.merge_unit_head_sha,
+            evidence_fingerprint=dropped_candidate.evidence_fingerprint,
+            streak=3,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    cleared = reconcile_stale_watch_no_progress_parks(store)
+
+    assert cleared == 3
+    assert store.list_watch_progress_observations(
+        subject_kind=failed_candidate.subject_kind,
+        subject_id=failed_candidate.subject_id,
+    ) == []
+    assert store.list_watch_progress_observations(
+        subject_kind=completed_candidate.subject_kind,
+        subject_id=completed_candidate.subject_id,
+    ) == []
+    assert store.list_watch_progress_observations(
+        subject_kind=dropped_candidate.subject_kind,
+        subject_id=dropped_candidate.subject_id,
+    ) == []
+
+
 def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -11104,6 +11342,62 @@ def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path
     assert row.lineage_status == "needs_attention"
     assert row.next_action is not None
     assert row.next_action["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
+def test_get_active_watch_no_progress_attention_preserves_executed_unmerged_merge_unit_loop(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed impl with active no-op loop", task_type="implement")
+    assert impl.id is not None
+    store.mark_completed(impl, has_commits=True, branch="feature/preserve-real-loop")
+    store.set_merge_status(impl.id, "unmerged")
+    store.get_or_create_merge_unit_for_task(impl)
+    impl = store.get(impl.id)
+    assert impl is not None
+
+    review = store.add("Changes requested review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.started_at = datetime.now(UTC)
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    action = {"type": "improve", "review_task": review}
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=3,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+
+    assert attention is not None
+    assert attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
 
 
 def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path) -> None:

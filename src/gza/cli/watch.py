@@ -68,6 +68,7 @@ from ..watch_progress import (
     finalize_background_watch_execution,
     finalize_watch_progress_after_execution,
     get_active_watch_no_progress_attention,
+    reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
 )
 from ..workers import WorkerRegistry
@@ -1686,6 +1687,7 @@ def _run_cycle(
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
         reconcile_dead_pending_recovery_tasks(config)
+        reconcile_stale_watch_no_progress_parks(store)
 
     snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
     running_task_ids = list(snapshot.running_task_ids)

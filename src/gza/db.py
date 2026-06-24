@@ -5243,6 +5243,34 @@ class SqliteTaskStore:
             if (observation := self._row_to_watch_progress_observation(row)) is not None
         ]
 
+    def list_all_watch_progress_observations(
+        self,
+        *,
+        parked_reason: str | None = None,
+    ) -> list[WatchProgressObservation]:
+        """Return persisted watch observations across all subjects."""
+        if not self.supports_watch_progress_observations():
+            return []
+        query = """
+            SELECT *
+            FROM watch_progress_observations
+            WHERE project_id = ?
+        """
+        params: list[object] = [self._project_id]
+        if parked_reason is not None:
+            query += " AND parked_reason = ?"
+            params.append(parked_reason)
+        query += """
+            ORDER BY observed_at DESC, subject_kind ASC, subject_id ASC, action_type ASC, action_reason ASC
+        """
+        with self._connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [
+            observation
+            for row in rows
+            if (observation := self._row_to_watch_progress_observation(row)) is not None
+        ]
+
     def get_watch_progress_observation(
         self,
         *,

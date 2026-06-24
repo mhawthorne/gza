@@ -278,6 +278,9 @@ When the installed `gza` package fingerprint changes while watch is running:
   task reclaimable, so the next cycle legitimately re-invokes `iterate` (possibly with resume
   or retry). The backstop suppresses only repeats where the task is in the **exact same
   state** as the prior observed cycle.
+- Persisted no-progress parks MUST be lifted once their basis no longer holds. In
+  particular, watch MUST clear parks for never-started pending launches and for stale
+  residue rows whose parked merge-unit subject is no longer in an active unresolved state.
 - When the streak reaches `watch.no_progress_cycles`, watch MUST park the subject with a
   shared needs-attention reason of `watch-no-progress-backstop` and MUST stop respawning
   that unchanged no-op automatically.
