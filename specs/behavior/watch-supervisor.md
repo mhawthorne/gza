@@ -58,6 +58,12 @@ This document answers questions the engine spec intentionally does not:
   these human-required owners are visible. No failure reason, empty-branch state,
   landed-lineage state, or lack of an in-session status transition may remove a
   human-required owner from this surface. Watch MUST NOT silently stall.
+- **S7 — Watch owns bounded stateful work creation.** `watch` is not only a runner of
+  existing actions; it is the top-level stateful executor that MAY create new work, but
+  only for explicitly bounded supervisor-owned surfaces. Those surfaces currently include
+  lifecycle follow-on materialization and local-target verify remediation. When watch
+  creates such work, it MUST do so through deduped supervisor rules, not ad hoc per-pass
+  task creation.
 
 ## Core invariants
 
@@ -91,8 +97,14 @@ Each watch cycle MUST execute these phases in order:
    verify, watch MUST treat freshness as unproven instead of reusing `HEAD` equality
    alone; it MUST halt further merges for the current cycle and surface one visible
    durable attention row explaining that exact-tree freshness could not be proven. More
-   generally, if that verify is not `passed`, watch MUST halt further merges for the
-   current cycle and emit one visible durable attention row with reason
+   generally, if that verify is not `passed`, watch MUST first perform the bounded
+   rerun-before-halt sequence owned by
+   [main-verify-self-heal.md](main-verify-self-heal.md). A flaky red that turns green in
+   that sequence MUST clear the halt for the current cycle and MUST create or reuse
+   exactly one open de-flake remediation task for that failure signature. A deterministic
+   red that stays red across the full bounded sequence MUST halt further merges for the
+   current cycle, MUST create or reuse exactly one open fix-remediation task for that
+   failure signature, and MUST emit one visible durable attention row with reason
    `main-integration-verify-red` naming the failing target SHA and, when structured phase
    output exists, the failing phase. The convergence requirements for how that red state
    self-heals or escalates over time are owned by
@@ -100,6 +112,13 @@ Each watch cycle MUST execute these phases in order:
    configured for the project, that is an explicit no-gate
    exception: watch MAY record an `unavailable` checkpoint with
    `exit_status="not configured"` but MUST NOT halt merges or emit red-main attention for it.
+   For this supervisor-owned remediation lane, dedup is by failure signature and reusing
+   an existing open remediation task MUST still bump it to the front of the runnable
+   queue. If the current bounded rerun evidence changes the required remediation kind for
+   that signature (for example `deflake` to `fix`), watch MUST rewrite the reused task so
+   its prompt and purpose match the current classification before queue-bumping it.
+   `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
+   create these remediation tasks itself.
 4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
    lifecycle worker starts selected by the shared engine. Recovery allocation is not a
    pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before

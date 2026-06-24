@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from .config import Config
 from .db import SqliteTaskStore, Task
@@ -24,6 +24,7 @@ MAIN_INTEGRATION_VERIFY_PROMPT = "System alert: local main integration verify"
 MAIN_INTEGRATION_VERIFY_REASON = "main-integration-verify-red"
 MAIN_INTEGRATION_VERIFY_TAG = "system-main-verify"
 MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS = "tree fingerprint unavailable"
+MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE = "watch-main-integration-verify-remediation"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,18 @@ class MainIntegrationVerifyCheck:
     current_tree_fingerprint: str | None
     is_current: bool
     merges_halted: bool
+    remediation: MainIntegrationVerifyRemediation | None = None
+    verify_runs: int = 0
+
+
+@dataclass(frozen=True)
+class MainIntegrationVerifyRemediation:
+    """Caller-facing classification for verify failures that need follow-up work."""
+
+    kind: Literal["deflake", "fix"]
+    signature: str
+    failing_phase: str | None
+    failure: str | None
 
 
 @dataclass(frozen=True)
@@ -152,6 +165,36 @@ def _verify_tree_fingerprint(output: str | None) -> str | None:
         if isinstance(candidate, str) and candidate:
             fingerprint = candidate
     return fingerprint
+
+
+def _verify_failure_signature(
+    *,
+    failing_phase: str | None,
+    verify_status: str | None,
+    verify_exit_status: str | None,
+) -> str:
+    if failing_phase:
+        return f"phase:{failing_phase}"
+    status = verify_status or "unknown"
+    exit_status = verify_exit_status or "unknown"
+    return f"status:{status}:exit:{exit_status}"
+
+
+def _build_main_integration_verify_remediation(
+    *,
+    kind: Literal["deflake", "fix"],
+    state: MainIntegrationVerifyState,
+) -> MainIntegrationVerifyRemediation:
+    return MainIntegrationVerifyRemediation(
+        kind=kind,
+        signature=_verify_failure_signature(
+            failing_phase=state.failing_phase,
+            verify_status=state.verify_status,
+            verify_exit_status=state.verify_exit_status,
+        ),
+        failing_phase=state.failing_phase,
+        failure=state.failure,
+    )
 
 
 def _build_red_alert_message(
@@ -414,25 +457,89 @@ def run_main_integration_verify(
     return state
 
 
+def _run_main_integration_verify_with_red_reruns(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    reason: str,
+    red_reruns: int,
+    prior_red_state: MainIntegrationVerifyState | None = None,
+) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
+    """Run verify, optionally rerunning red verdicts to classify flakes vs deterministic reds."""
+    state = run_main_integration_verify(config, store, git, reason=reason)
+    verify_runs = 1
+    if red_reruns <= 0:
+        return state, None, verify_runs
+
+    reference_state = (
+        prior_red_state
+        if prior_red_state is not None
+        and _verify_result_is_red(status=prior_red_state.verify_status, gate_enabled=prior_red_state.gate_enabled)
+        else state
+    )
+    if not _verify_result_is_red(status=reference_state.verify_status, gate_enabled=reference_state.gate_enabled):
+        return state, None, verify_runs
+
+    if not _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
+        return (
+            state,
+            _build_main_integration_verify_remediation(kind="deflake", state=reference_state),
+            verify_runs,
+        )
+
+    confirmed_red_state = state
+    for attempt in range(1, red_reruns + 1):
+        rerun_state = run_main_integration_verify(
+            config,
+            store,
+            git,
+            reason=f"{reason}-rerun-{attempt}",
+        )
+        verify_runs += 1
+        if not _verify_result_is_red(status=rerun_state.verify_status, gate_enabled=rerun_state.gate_enabled):
+            return (
+                rerun_state,
+                _build_main_integration_verify_remediation(kind="deflake", state=confirmed_red_state),
+                verify_runs,
+            )
+        confirmed_red_state = rerun_state
+        state = rerun_state
+
+    return (
+        state,
+        _build_main_integration_verify_remediation(kind="fix", state=confirmed_red_state),
+        verify_runs,
+    )
+
+
 def check_main_integration_verify(
     config: Config,
     store: SqliteTaskStore,
     git: Git,
     *,
     reason: str,
+    force: bool = False,
+    red_reruns: int = 0,
 ) -> MainIntegrationVerifyCheck:
     """Reuse or refresh local-main verify state for the current tree and gate identity."""
     current_tree_fingerprint = _compute_tree_fingerprint(git)
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
     current_gate = _current_gate_identity(config)
     state = load_main_integration_verify_state(store)
-    if state is not None and _checkpoint_is_current(
+    checkpoint_is_current = state is not None and _checkpoint_is_current(
         state,
         config=config,
         current_gate=current_gate,
         current_tree_fingerprint=current_tree_fingerprint,
         current_head_sha=current_head_sha,
+    )
+    if checkpoint_is_current and not force and not (
+        state is not None
+        and red_reruns > 0
+        and _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled)
     ):
+        assert state is not None
         return MainIntegrationVerifyCheck(
             state=state,
             performed_verify=False,
@@ -444,7 +551,14 @@ def check_main_integration_verify(
             ),
         )
 
-    refreshed = run_main_integration_verify(config, store, git, reason=reason)
+    refreshed, remediation, verify_runs = _run_main_integration_verify_with_red_reruns(
+        config,
+        store,
+        git,
+        reason=reason,
+        red_reruns=red_reruns,
+        prior_red_state=state if checkpoint_is_current else None,
+    )
     return MainIntegrationVerifyCheck(
         state=refreshed,
         performed_verify=True,
@@ -454,6 +568,8 @@ def check_main_integration_verify(
             status=refreshed.verify_status,
             gate_enabled=refreshed.gate_enabled,
         ),
+        remediation=remediation,
+        verify_runs=verify_runs,
     )
 
 

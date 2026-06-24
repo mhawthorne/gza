@@ -108,14 +108,34 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "### MV3 — Red checkpoints MUST have a bounded lifetime even on an unchanged tree" in contract
     assert "### MV4 — Confirmed deterministic red MUST trigger bounded repair plus alert" in contract
     assert "### MV5 — Red merge freezes MUST NOT hard-park downstream work" in contract
+    assert "### MV6 — Operators MUST have a force-refresh escape hatch" in contract
     assert "A merge stall MUST NOT convert into a launch stall." in contract
     assert "The shared no-progress backstop MUST count only actually executed unchanged actions." in contract
+    assert "Remediation task dedup is by failure signature" in contract
+    assert "There MUST be a first-class operator command that forces a fresh local-target verify run" in contract
     assert "Future behavior-check findings against this area MUST classify implementation drift" in contract_flat
 
     assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in lifecycle
     assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in supervisor
     assert "main-integration-verify-red" in lifecycle
     assert "main-integration-verify-red" in supervisor
+    assert "S7 — Watch owns bounded stateful work creation." in supervisor
+    assert "advance` MAY surface the red-main condition from the shared state" in supervisor
+    assert "create these remediation tasks itself." in supervisor
+
+
+def test_configuration_docs_include_main_verify_escape_hatch() -> None:
+    """Canonical command docs should describe the main-verify operator escape hatch."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
+    normalized = " ".join(config_content.split())
+
+    assert "### main-verify" in config_content
+    assert "uv run gza main-verify [options]" in config_content
+    assert "`--force` | Force a fresh local main verify run now" in config_content
+    assert "uv run gza main-verify --force" in normalized
+    assert "inspect-first operator check" in normalized
+    assert "Watch still owns the automatic remediation lane" in normalized
 
 
 def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
@@ -127,7 +147,10 @@ def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
     required_snippets = [
         "- `MV` — `main-verify-self-heal.md`",
         "`MV-MV2-RERUN-BEFORE-REUSE`",
+        "`MV-MV4-REMEDIATE-DEDUP-BUMP`",
         "`MV-MV5-NO-LAUNCH-STALL`",
+        "`MV-MV6-FORCE-REFRESH`",
+        "`WS-S7-BOUNDED-WORK-CREATION`",
     ]
 
     for snippet in required_snippets:

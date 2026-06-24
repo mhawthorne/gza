@@ -74,7 +74,14 @@ the assertion inventory first. Examples:
 - `OV-INV2-BOUNDED-LOOPS` — "every loop MUST be bounded; hitting the bound escalates."
 - `LE-RC-rebase-did-not-unblock-merge` — that reason code exists and is emitted on §4.
 - `MV-MV2-RERUN-BEFORE-REUSE` — red verdicts MUST be re-verified before automation acts.
+- `MV-MV4-REMEDIATE-DEDUP-BUMP` — confirmed red verify failures MUST create or reuse
+  one remediation task per failure signature and bump it to the front of the runnable
+  queue.
 - `MV-MV5-NO-LAUNCH-STALL` — red merge freezes MUST NOT hard-park downstream work.
+- `MV-MV6-FORCE-REFRESH` — operators MUST have a first-class force-refresh rerun path
+  that ignores a cached red checkpoint and leaves behind fresh evidence.
+- `WS-S7-BOUNDED-WORK-CREATION` — watch-owned stateful work creation MUST stay bounded
+  to deduped supervisor-owned surfaces such as local-target verify remediation.
 
 List the assertions before checking them, so the report can show total coverage.
 

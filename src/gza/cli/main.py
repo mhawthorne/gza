@@ -97,7 +97,7 @@ from .query import (
     cmd_unmerged,
 )
 from .tv import cmd_tv
-from .watch import cmd_queue, cmd_watch
+from .watch import cmd_main_verify, cmd_queue, cmd_watch
 
 
 def _parse_search_last(value: str) -> int:
@@ -925,6 +925,19 @@ def main() -> int:
         action="store_true",
         dest="all_tags",
         help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+
+    # main-verify command
+    main_verify_parser = subparsers.add_parser(
+        "main-verify",
+        help="Inspect or force-refresh the local main integration verify gate",
+        description="Inspect or force-refresh the local main integration verify gate.",
+    )
+    add_common_args(main_verify_parser)
+    main_verify_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force a fresh local main verify run now, rerun reds to classify flakes, and clear a stale halt if the rerun goes green",
     )
 
     # queue command
@@ -2881,6 +2894,8 @@ def main() -> int:
             return cmd_advance(args)
         elif args.command == "watch":
             return cmd_watch(args)
+        elif args.command == "main-verify":
+            return cmd_main_verify(args)
         elif args.command == "queue":
             return cmd_queue(args)
         elif args.command == "sync":

@@ -1767,6 +1767,24 @@ for listed explore rows.
 When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
 Held completed plans use `next_action = awaiting_human` with `reason=awaiting-human-review`, plus guidance to review the plan and then either run `uv run gza implement <plan-id>` for a one-off approval or `uv run gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
 
+### main-verify
+
+Inspect the current local main integration verify gate, or force a fresh rerun of it.
+
+```bash
+uv run gza main-verify [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--force` | Force a fresh local main verify run now, rerun reds to classify flakes, and clear a stale halt if the rerun goes green |
+
+Without `--force`, `uv run gza main-verify` is an inspect-first operator check. It reuses the current checkpoint when that cached result is still fresh and prints whether merges are currently allowed or halted. A current green checkpoint exits `0`; a current red or otherwise halting checkpoint exits `1`.
+
+With `--force`, `uv run gza main-verify --force` bypasses checkpoint reuse and runs the gate again against the current local-target tree. The forced path uses the same bounded red-rerun classification as watch: a red that turns green on rerun is treated as flaky, the checkpoint is refreshed to green, and the merge halt clears without requiring a direct commit to main. A red that stays red leaves behind fresh red evidence and exits `1`.
+
+This command is the operator escape hatch for a wedged or stale main-verify halt. Watch still owns the automatic remediation lane: when watch confirms a flaky or deterministic red, it creates or reuses the corresponding remediation task, deduplicated by failure signature and bumped to the front of the runnable queue.
+
 ### iterate
 
 Run an automated implementation lifecycle loop (review/improve/resume/rebase).

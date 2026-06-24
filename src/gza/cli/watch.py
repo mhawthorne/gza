@@ -39,6 +39,9 @@ from ..lineage_query import (
 )
 from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
+    MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    MainIntegrationVerifyCheck,
+    MainIntegrationVerifyRemediation,
     check_main_integration_verify,
 )
 from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
@@ -219,6 +222,192 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
     if not description:
         description = action_type.replace("_", " ")
     return f"{task.id}: {description}"
+
+
+def _main_verify_remediation_tags(tags: tuple[str, ...] | None) -> tuple[str, ...]:
+    scope_tags = tuple(tags or ())
+    return tuple(dict.fromkeys(("system", *scope_tags)))
+
+
+def _merge_main_verify_remediation_tags(
+    existing_tags: tuple[str, ...] | None,
+    scope_tags: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*_main_verify_remediation_tags(scope_tags), *(existing_tags or ()))))
+
+
+def _main_verify_remediation_prompt(
+    remediation: MainIntegrationVerifyRemediation,
+    *,
+    head_sha: str | None,
+) -> str:
+    phase = remediation.failing_phase or remediation.signature
+    short_sha = (head_sha or "unknown")[:12]
+    if remediation.kind == "deflake":
+        heading = f"De-flake local main integration verify phase `{phase}`"
+        outcome = "The verify gate went red once, passed on rerun, and should be stabilized so watch does not keep rediscovering the flake."
+    else:
+        heading = f"Fix local main integration verify phase `{phase}`"
+        outcome = "The verify gate stayed red across bounded reruns and is currently halting merges onto local main."
+    body = [
+        heading,
+        "",
+        outcome,
+        "",
+        f"Remediation kind: {remediation.kind}",
+        f"Failure signature: {remediation.signature}",
+        f"Observed main HEAD: {short_sha}",
+    ]
+    if remediation.failure:
+        body.append(f"Verify failure: {remediation.failure}")
+    body.extend(
+        [
+            "",
+            "Required outcome:",
+            "- restore a stable green local main integration verify result for this failure signature",
+            "- add targeted regression coverage for the failing phase or flake mode",
+            "- rerun the project verify gate after the fix",
+        ]
+    )
+    return "\n".join(body)
+
+
+def _find_open_main_verify_remediation_task(
+    store: SqliteTaskStore,
+    *,
+    signature: str,
+) -> DbTask | None:
+    for task in store.get_all():
+        if task.task_type != "implement":
+            continue
+        if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
+            continue
+        if task.status in {"completed", "dropped"}:
+            continue
+        if _main_verify_remediation_signature_from_prompt(task.prompt) != signature:
+            continue
+        return task
+    return None
+
+
+def _main_verify_remediation_kind_from_prompt(prompt: str) -> str | None:
+    for line in prompt.splitlines():
+        if line.startswith("Remediation kind: "):
+            kind = line.removeprefix("Remediation kind: ").strip()
+            if kind in {"deflake", "fix"}:
+                return kind
+    if prompt.startswith("De-flake local main integration verify phase `"):
+        return "deflake"
+    if prompt.startswith("Fix local main integration verify phase `"):
+        return "fix"
+    return None
+
+
+def _main_verify_remediation_signature_from_prompt(prompt: str) -> str | None:
+    for line in prompt.splitlines():
+        if line.startswith("Failure signature: "):
+            signature = line.removeprefix("Failure signature: ").strip()
+            return signature or None
+    return None
+
+
+def _queue_main_verify_remediation_task(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> None:
+    if task.id is None:
+        return
+    if task.status == "failed":
+        task.status = "pending"
+        task.started_at = None
+        task.running_pid = None
+        task.completed_at = None
+        task.failure_reason = None
+        task.completion_reason = None
+        task.execution_mode = None
+        store.update(task)
+    set_task_urgency(store, task.id, urgent=True)
+    set_task_queue_position_scoped(
+        store,
+        task.id,
+        position=1,
+        tags=tags,
+        any_tag=any_tag,
+    )
+
+
+def _ensure_main_verify_remediation_task(
+    *,
+    store: SqliteTaskStore,
+    remediation: MainIntegrationVerifyRemediation,
+    state,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> tuple[DbTask, bool]:
+    existing = _find_open_main_verify_remediation_task(store, signature=remediation.signature)
+    if existing is not None:
+        desired_prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
+        desired_tags = _merge_main_verify_remediation_tags(existing.tags, tags)
+        if (
+            _main_verify_remediation_kind_from_prompt(existing.prompt) != remediation.kind
+            or existing.prompt != desired_prompt
+            or tuple(existing.tags or ()) != desired_tags
+        ):
+            existing.prompt = desired_prompt
+            existing.tags = desired_tags
+            store.update(existing)
+        _queue_main_verify_remediation_task(
+            store=store,
+            task=existing,
+            tags=tags,
+            any_tag=any_tag,
+        )
+        return existing, False
+
+    task = store.add(
+        _main_verify_remediation_prompt(remediation, head_sha=state.head_sha),
+        task_type="implement",
+        tags=_main_verify_remediation_tags(tags),
+        trigger_source=MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+        urgent=True,
+    )
+    _queue_main_verify_remediation_task(
+        store=store,
+        task=task,
+        tags=tags,
+        any_tag=any_tag,
+    )
+    return task, True
+
+
+def _maybe_file_main_verify_remediation(
+    *,
+    dry_run: bool,
+    store: SqliteTaskStore,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    log: "_WatchLog",
+    check: MainIntegrationVerifyCheck,
+) -> None:
+    remediation = getattr(check, "remediation", None)
+    if remediation is None or dry_run:
+        return
+    task, created_now = _ensure_main_verify_remediation_task(
+        store=store,
+        remediation=remediation,
+        state=check.state,
+        tags=tags,
+        any_tag=any_tag,
+    )
+    phase = remediation.failing_phase or remediation.signature
+    verb = "created" if created_now else "reused"
+    log.emit(
+        "REMEDY",
+        f"{task.id}: {verb} {remediation.kind} remediation for {phase}; moved to queue position 1",
+    )
 
 
 def _maybe_repair_target_already_merged_skip(
@@ -2214,7 +2403,16 @@ def _run_cycle(
                 store,
                 merge_verify_git,
                 reason="watch-main-verify",
+                red_reruns=2,
             ),
+        )
+        _maybe_file_main_verify_remediation(
+            dry_run=dry_run,
+            store=store,
+            tags=tags,
+            any_tag=any_tag,
+            log=log,
+            check=main_verify,
         )
         if main_verify.merges_halted:
             merge_halted_for_cycle = True
@@ -2394,7 +2592,16 @@ def _run_cycle(
                             store,
                             merge_execution_git,
                             reason="watch-post-merge",
+                            red_reruns=2,
                         ),
+                    )
+                    _maybe_file_main_verify_remediation(
+                        dry_run=dry_run,
+                        store=store,
+                        tags=tags,
+                        any_tag=any_tag,
+                        log=log,
+                        check=main_verify,
                     )
                     if main_verify.merges_halted:
                         merge_halted_for_cycle = True
@@ -3622,6 +3829,37 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 print(f"watch re-exec failed: {exc}", file=sys.stderr, flush=True)
             return 1
 
+    return 0
+
+
+def cmd_main_verify(args: argparse.Namespace) -> int:
+    """Force or inspect the canonical local-target integration verify gate."""
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+    git = Git(config.project_dir)
+    verify_git = git
+    if config.main_checkout_isolate:
+        target_branch = git.default_branch()
+        verify_git = ensure_watch_main_checkout(config, git, target_branch)
+
+    check = check_main_integration_verify(
+        config,
+        store,
+        verify_git,
+        reason="operator-main-verify",
+        force=bool(getattr(args, "force", False)),
+        red_reruns=2 if bool(getattr(args, "force", False)) else 0,
+    )
+    status = check.state.verify_status or "unknown"
+    phase = f" phase={check.state.failing_phase}" if check.state.failing_phase else ""
+    if check.merges_halted:
+        print(check.state.alert_message or f"main verify {status}{phase}; merges halted")
+        return 1
+    print(
+        f"main verify {status}{phase}; merges allowed"
+        if check.performed_verify
+        else f"main verify {status}{phase}; cached result still current and merges allowed"
+    )
     return 0
 
 

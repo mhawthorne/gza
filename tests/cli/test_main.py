@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.runner import _make_review_verify_result
 
 from .conftest import invoke_gza, setup_config
 
@@ -147,6 +149,7 @@ class TestHelpOutput:
         work_help = invoke_gza("work", "--help", "--project", str(tmp_path))
         advance_help = invoke_gza("advance", "--help", "--project", str(tmp_path))
         watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
+        main_verify_help = invoke_gza("main-verify", "--help", "--project", str(tmp_path))
 
         assert next_help.returncode == 0
         assert "recovery, lifecycle, and pending lanes separately" in next_help.stdout
@@ -159,6 +162,8 @@ class TestHelpOutput:
         assert "use --new to also start pending tasks" in advance_help.stdout
         assert watch_help.returncode == 0
         assert "run recovery, lifecycle, and pending pickup" in watch_help.stdout
+        assert main_verify_help.returncode == 0
+        assert "Force a fresh local main verify run now" in main_verify_help.stdout
 
     def test_history_and_search_help_list_negative_query_filters(self, tmp_path):
         """Query help should advertise the explicit negative filter flags."""
@@ -242,6 +247,69 @@ class TestHelpOutput:
 
         assert result.returncode == 0
         assert "incomplete" in result.stdout
+        assert "main-verify" in result.stdout
+
+    def test_main_verify_force_reruns_and_clears_stale_halt(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="test")
+        task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+        assert task.id is not None
+        task.status = "completed"
+        task.review_verify_command = "./bin/tests"
+        task.review_verify_status = "failed"
+        task.review_verify_exit_status = "1"
+        task.review_verify_failure = "verify_command failed"
+        task.review_verify_head_sha = "abc123"
+        task.output_content = (
+            '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
+            '"captured_at":"2026-06-23T00:00:00+00:00","failing_phase":"unit","gate_enabled":true,'
+            '"head_sha":"abc123","tree_fingerprint":"fp-verified","verify_command":"./bin/tests",'
+            '"verify_timeout_grace_seconds":5.0,"verify_timeout_seconds":120}'
+        )
+        store.update(task)
+
+        fake_git = MagicMock()
+        fake_git.repo_dir = tmp_path
+        fake_git.current_branch.return_value = "main"
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.return_value = "abc123"
+
+        green_result = _make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 24, tzinfo=UTC),
+            reviewed_branch="main",
+            reviewed_head_sha="abc123",
+            working_directory=str(tmp_path),
+            output="all good",
+        )
+
+        def capture_verify_result(_config, _store, verify_task, result, **_kwargs) -> None:
+            verify_task.review_verify_command = result.command
+            verify_task.review_verify_status = result.status
+            verify_task.review_verify_exit_status = result.exit_status
+            verify_task.review_verify_failure = result.failure
+            verify_task.review_verify_head_sha = result.reviewed_head_sha
+            verify_task.review_verify_branch = result.reviewed_branch
+            verify_task.review_verify_captured_at = result.captured_at
+            store.update(verify_task)
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified"]),
+            patch("gza.main_integration_verify._run_review_verify_command", return_value=green_result),
+            patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+        ):
+            result = invoke_gza("main-verify", "--force", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "main verify passed; merges allowed" in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.review_verify_status == "passed"
 
     def test_hidden_attach_command_is_absent_from_help_but_still_dispatches(
         self, tmp_path, monkeypatch, capsys

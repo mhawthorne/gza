@@ -56,9 +56,12 @@ durable red-main attention row, it MUST rerun the local-target verify gate again
 current canonical local-target tree.
 
 - A stale red verdict MUST NOT be reused indefinitely.
+- The rerun sequence MUST be bounded but MUST include at least one retry of a red
+  verdict before automation treats it as actionable red state.
 - A flake that passes on rerun MUST self-clear: the prior red checkpoint is replaced, the
-  merge freeze ends, and normal merge planning resumes without requiring a human to
-  manually delete or override the old red state.
+  merge freeze ends, normal merge planning resumes without requiring a human to manually
+  delete or override the old red state, and the failure is reclassified as flaky rather
+  than deterministic.
 - The rerun freshness proof MUST be against the exact current local-target tree. If exact
   tree freshness cannot be proven, automation MUST fail closed but treat that as a
   freshness problem to be refreshed again, not as permanent proof that the old red
@@ -87,6 +90,24 @@ both:
 - one bounded automatic repair path aimed at restoring a green local target or reaching a
   clear human-required stop.
 
+The repair path MUST distinguish flaky from deterministic verify failures:
+
+- A verdict that turns green during the bounded rerun sequence is **flaky**. Automation
+  MUST NOT keep merges halted for that failure, and the supervisor MUST create or reuse
+  exactly one open remediation task for that failure signature that aims to de-flake it.
+- A verdict that stays red across the full bounded rerun sequence is **deterministic**.
+  Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
+  exactly one open remediation task for that failure signature that aims to fix the
+  failing phase or gate.
+- Remediation task dedup is by failure signature, not by watch cycle. Re-observing the
+  same unresolved failure MUST reuse the existing open remediation task instead of filing
+  another copy. If the current bounded rerun evidence changes the required remediation
+  kind for that signature, the reused task MUST be updated so its prompt still matches
+  the current classification.
+- Reused or newly created remediation tasks for this gate MUST be bumped to the front of
+  the runnable queue, because a red or flaky local-target verify is pipeline-critical
+  system work.
+
 That repair path MUST itself be bounded. It MUST NOT silently freeze the merge lane
 without either making bounded repair attempts or surfacing a human-required condition.
 
@@ -105,12 +126,23 @@ because merges are currently halted.
 
 This is what prevents a merge stall from cascading into a launch stall.
 
+### MV6 — Operators MUST have a force-refresh escape hatch
+
+There MUST be a first-class operator command that forces a fresh local-target verify run
+for the gate, ignoring a cached checkpoint.
+
+- If the forced rerun goes green, it MUST replace the cached red checkpoint and clear the
+  merge freeze without requiring code edits or a direct commit to the canonical target.
+- If the forced rerun stays red, it MAY leave the freeze in place, but it MUST still
+  leave behind fresh evidence rather than the stale cached checkpoint.
+
 ## Cross-document requirements
 
 - [lifecycle-engine.md](lifecycle-engine.md) MUST own the action semantics for the
   `main-integration-verify-red` attention path without weakening MV1-MV5.
 - [watch-supervisor.md](watch-supervisor.md) MUST own the loop-level freshness checks,
-  rerun timing, and no-progress accounting without weakening MV1-MV5.
+  rerun timing, remediation-task creation/dedup/bumping, and no-progress accounting
+  without weakening MV1-MV6.
 - Future behavior-check findings against this area MUST classify implementation drift
   against **this** document as the source contract, not treat the current implementation
   as normative.
