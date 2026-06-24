@@ -191,15 +191,20 @@ When a current review exists for the implementation lineage:
 - **A. Verify-only review clear invariant.** A review whose blockers are solely
   runner-captured `verify_command` failures or timeouts MUST be cleared when the
   subsequent no-op improve captures a passing `verify_command` in that improve's own
-  worktree at the same committed branch head. The clear MUST require durable provenance
-  recorded after the review completed, with matching branch and head SHA. The runner
+  worktree at the same committed branch head. A review-preserved rebase
+  (`changed_diff = 0`) MAY refresh that persisted head provenance from the pre-rebase
+  head to the rewritten post-rebase head for the preserved review and its no-op improve
+  chain; outside that explicit preserved-rebase carry-forward, the clear MUST require
+  durable provenance recorded after the review completed, with matching branch and head
+  SHA. The runner
   MUST persist its own `verify_command` result each time it runs a review and each time
   it re-runs verify for a no-op improve that is eligible to clear a verify-only review
   blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when
   the current review row already carries runner-owned review-time failure evidence for
-  the same branch/head. Reviewer wording is corroborating only and MUST NOT decide this
-  gate. The engine MUST NOT run a separate isolated detached-worktree verify solely to
-  clear this condition.
+  the same branch/head. A preserved rebase MAY carry that key forward to the new head
+  only when the diff-preservation proof succeeds. Reviewer wording is corroborating only
+  and MUST NOT decide this gate. The engine MUST NOT run a separate isolated
+  detached-worktree verify solely to clear this condition.
 - Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
   `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). If current
   passing in-improve evidence has already cleared the review, normal merge rules apply.

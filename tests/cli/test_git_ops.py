@@ -1524,6 +1524,33 @@ def test_run_task_backed_rebase_preserves_review_state_when_diff_is_unchanged(tm
     store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
     assert parent.id is not None
 
+    review = store.add("Review feature", task_type="review", depends_on=parent.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = "feature/rebased"
+    review.review_verify_head_sha = "head-old"
+    store.update(review)
+
+    improve = store.add(
+        "No-op improve",
+        task_type="improve",
+        based_on=parent.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve.branch = "feature/rebased"
+    improve.changed_diff = False
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = "feature/rebased"
+    improve.review_verify_head_sha = "head-old"
+    improve.review_verify_captured_at = datetime(2026, 5, 10, 11, 0, 1, tzinfo=UTC)
+    store.update(improve)
+
     rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
     rebase_task.branch = "feature/rebased"
     store.update(rebase_task)
@@ -1570,6 +1597,12 @@ def test_run_task_backed_rebase_preserves_review_state_when_diff_is_unchanged(tm
     refreshed_parent = store.get(parent.id)
     assert refreshed_parent is not None
     assert refreshed_parent.review_cleared_at == parent.review_cleared_at
+    refreshed_review = store.get(review.id)
+    assert refreshed_review is not None
+    assert refreshed_review.review_verify_head_sha == "head-new"
+    refreshed_improve = store.get(improve.id)
+    assert refreshed_improve is not None
+    assert refreshed_improve.review_verify_head_sha == "head-new"
     refreshed_rebase = store.get(rebase_task.id)
     assert refreshed_rebase is not None
     assert refreshed_rebase.changed_diff is False

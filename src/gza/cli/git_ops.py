@@ -90,6 +90,7 @@ from ..review_verdict import (
     is_verify_blocked_only_review,
     summarize_review_blockers,
 )
+from ..review_verify_state import refresh_preserved_rebase_review_verify_heads
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
@@ -2036,6 +2037,14 @@ def _run_task_backed_rebase(
                 target_branch=rebase_target,
             ) == "merged":
                 store.set_merge_status(parent.id, "unmerged")
+        elif target_parent_id:
+            refresh_preserved_rebase_review_verify_heads(
+                store,
+                store.get(target_parent_id),
+                branch=branch,
+                old_head_sha=rebase_diff_baseline.old_tip,
+                new_head_sha=head_ref.sha,
+            )
 
         if target_parent_id:
             reconciliation = reconcile_task_branch_merge_truth(

@@ -127,6 +127,7 @@ from .review_verdict import (
     parse_review_verdict,
     validate_review_report_contract,
 )
+from .review_verify_state import refresh_preserved_rebase_review_verify_heads
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
     extract_task_id_suffix,
@@ -6942,6 +6943,14 @@ def _post_complete_code_task(
         )
         if rebase_comparison.changed_diff:
             store.invalidate_review_state(rebase_review_target_id)
+        else:
+            refresh_preserved_rebase_review_verify_heads(
+                store,
+                impl_ancestor,
+                branch=branch_name,
+                old_head_sha=rebase_diff_baseline.old_tip if rebase_diff_baseline is not None else None,
+                new_head_sha=worktree_git.rev_parse_if_exists(branch_name) if branch_name else None,
+            )
         parent = store.get(rebase_review_target_id)
         parent_unit = (
             store.resolve_merge_unit_for_task(parent.id) if parent and parent.id is not None else None

@@ -36,6 +36,7 @@ from gza.plan_review_materialization import (
     plan_review_manifest_digest,
 )
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from gza.review_verify_state import refresh_preserved_rebase_review_verify_heads
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG
 
@@ -3507,6 +3508,79 @@ def test_verify_only_noop_improve_with_persisted_failing_verify_evidence_stays_b
     assert ctx.review_cleared is False
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+
+
+def test_verify_only_noop_improve_stays_mergeable_after_review_preserved_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-preserved-rebase",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "pre-rebase-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "pre-rebase-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(improve)
+
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    refreshed = refresh_preserved_rebase_review_verify_heads(
+        store,
+        impl,
+        branch=impl.branch,
+        old_head_sha="pre-rebase-sha",
+        new_head_sha="rebased-sha",
+    )
+    assert refreshed == 2
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "rebased-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_cleared is True
+    assert ctx.review_preserved_by_rebase is not None
+    assert action["type"] == "merge"
 
 
 def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_availability_probe(
