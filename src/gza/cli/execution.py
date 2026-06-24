@@ -38,6 +38,7 @@ from ..config import (
 )
 from ..console import format_duration
 from ..db import (
+    TASK_COMMENT_KIND_FEEDBACK,
     InvalidTaskIdError,
     SqliteTaskStore,
     Task as DbTask,
@@ -2922,7 +2923,11 @@ def cmd_improve(args: argparse.Namespace) -> int:
     assert impl_task is not None
     assert impl_task.id is not None
 
-    unresolved_comments = store.get_comments(impl_task.id, unresolved_only=True)
+    unresolved_comments = store.get_comments(
+        impl_task.id,
+        unresolved_only=True,
+        kinds=(TASK_COMMENT_KIND_FEEDBACK,),
+    )
 
     review_id_override = getattr(args, "review_id", None)
     review_task: DbTask | None = None

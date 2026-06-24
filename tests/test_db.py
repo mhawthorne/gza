@@ -2268,6 +2268,23 @@ class TestTaskComments:
         assert [comment.content for comment in scope_comments] == ["Scope override"]
         assert store.get_latest_comment_by_kind(task.id, kind="review_scope") == review_scope
 
+    def test_resolve_comments_can_filter_by_kind(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with mixed comments", task_type="implement")
+        assert task.id is not None
+
+        store.add_comment(task.id, "Feedback comment", kind="feedback")
+        store.add_comment(task.id, "Scope comment", kind="review_scope")
+
+        store.resolve_comments(task.id, kinds=("feedback",))
+
+        unresolved_feedback = store.get_comments(task.id, unresolved_only=True, kinds=("feedback",))
+        unresolved_scope = store.get_comments(task.id, unresolved_only=True, kinds=("review_scope",))
+        assert unresolved_feedback == []
+        assert [comment.content for comment in unresolved_scope] == ["Scope comment"]
+
     def test_get_comments_rejects_unknown_kind_filter(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)

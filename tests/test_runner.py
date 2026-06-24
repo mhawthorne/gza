@@ -2688,7 +2688,7 @@ class TestReviewContextFromChain:
         assert "## Verify Timeout Guidance" not in context
 
     def test_improve_context_includes_unresolved_comments(self, tmp_path: Path):
-        """Improve context should include unresolved comments for the implementation task."""
+        """Improve context should include unresolved feedback comments for the implementation task."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -2708,7 +2708,7 @@ class TestReviewContextFromChain:
         assert review_task.id is not None
 
         store.add_comment(impl_task.id, "Please harden input validation.", source="direct", author="alice")
-        store.add_comment(impl_task.id, "nit: simplify helper", source="github")
+        store.add_comment(impl_task.id, "Scope note only", source="github", kind="review_scope")
 
         improve_task = store.add(
             prompt="Improve feature",
@@ -2721,9 +2721,8 @@ class TestReviewContextFromChain:
 
         assert "## Comments:" in context
         assert "source=direct, author=alice" in context
-        assert "source=github" in context
         assert "Please harden input validation." in context
-        assert "nit: simplify helper" in context
+        assert "Scope note only" not in context
 
     def test_improve_context_excludes_comments_added_after_improve_creation(self, tmp_path: Path):
         """Improve context should include only unresolved comments present at improve creation time."""
@@ -12630,7 +12629,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.failure_reason is None
 
     def test_run_pr_required_retry_for_improve_resolves_parent_comments(self, tmp_path: Path):
-        """Improve completion should resolve unresolved comments on the based_on implementation task."""
+        """Improve completion should resolve only unresolved feedback comments on the root implementation task."""
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
             "project_id: default\n"
@@ -12644,6 +12643,7 @@ class TestExtractedRunInnerHelpers:
         store.update(parent)
         assert parent.id is not None
         store.add_comment(parent.id, "Please tighten error handling.", source="direct")
+        store.add_comment(parent.id, "Scope note should stay open.", source="direct", kind="review_scope")
         assert store.get_comments(parent.id, unresolved_only=True)
 
         improve = store.add(
@@ -12676,7 +12676,8 @@ class TestExtractedRunInnerHelpers:
             rc = run(config, task_id=improve.id, create_pr=True)
 
         assert rc == 0
-        assert store.get_comments(parent.id, unresolved_only=True) == []
+        unresolved = store.get_comments(parent.id, unresolved_only=True)
+        assert [comment.content for comment in unresolved] == ["Scope note should stay open."]
 
     def test_run_pr_required_retry_for_improve_only_resolves_comments_in_snapshot(self, tmp_path: Path):
         """Improve completion should leave comments added after improve creation unresolved."""

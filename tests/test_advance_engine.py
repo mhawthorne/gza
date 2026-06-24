@@ -7503,6 +7503,53 @@ def test_approved_with_newer_unresolved_comment_prefers_run_improve(tmp_path: Pa
     assert action["improve_task"].id == pending_improve.id
 
 
+def test_approved_with_newer_review_scope_comment_does_not_run_improve(tmp_path: Path, monkeypatch):
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feat/approved-scope-only-comment"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+    assert task.id is not None
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id)
+    review.status = "completed"
+    review.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    store.update(review)
+    assert review.id is not None
+
+    pending_improve = store.add(
+        "Pending improve for scope-only comment",
+        task_type="improve",
+        based_on=task.id,
+        depends_on=review.id,
+    )
+    pending_improve.status = "pending"
+    pending_improve.created_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(pending_improve)
+
+    store.add_comment(task.id, "Scope clarification only.", kind="review_scope")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, r: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    assert action["type"] == "merge"
+
+
 def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tmp_path: Path, monkeypatch):
     from gza import advance_engine as advance_engine_module
     from gza.review_verdict import ReviewFinding

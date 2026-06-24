@@ -6831,8 +6831,12 @@ class SqliteTaskStore:
         task_id: str,
         *,
         created_on_or_before: datetime | None = None,
+        kinds: Iterable[str] | None = None,
     ) -> None:
         """Mark unresolved comments as resolved for a task."""
+        normalized_kinds = _normalize_comment_kinds(kinds)
+        if normalized_kinds == ():
+            return
         resolved_at = _format_db_timestamp(datetime.now(UTC))
         assert resolved_at is not None
         query = (
@@ -6841,6 +6845,10 @@ class SqliteTaskStore:
             "WHERE project_id = ? AND task_id = ? AND resolved_at IS NULL"
         )
         params: list[Any] = [resolved_at, self._project_id, task_id]
+        if normalized_kinds is not None:
+            placeholders = ", ".join("?" for _ in normalized_kinds)
+            query += f" AND kind IN ({placeholders})"
+            params.extend(normalized_kinds)
         if created_on_or_before is not None:
             cutoff = created_on_or_before
             if cutoff.tzinfo is not None:

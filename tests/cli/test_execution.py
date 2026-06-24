@@ -6067,6 +6067,25 @@ class TestImproveCommand:
         assert len(improves_after) == 1
         assert improves_after[0].id == first_improve.id
 
+    def test_improve_scope_only_comment_does_not_enable_comments_only_flow(self, tmp_path: Path):
+        """A review_scope comment alone must not trigger the comments-only improve path."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Scope clarification only.", kind="review_scope")
+
+        result = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "has no review" in result.stdout
+        assert "continuing from unresolved comments only" not in result.stdout
+
     def test_improve_comments_only_reuse_pending_applies_create_pr_override(self, tmp_path: Path):
         """Reused pending comments-only improve should honor current --pr intent."""
         setup_config(tmp_path)
@@ -6127,6 +6146,34 @@ class TestImproveCommand:
         assert newest.id != first_improve.id
         assert newest.based_on == impl_task.id
         assert newest.depends_on is None
+
+    def test_improve_comments_only_pending_task_ignores_newer_scope_only_comment(self, tmp_path: Path):
+        """A newer review_scope comment must not make a pending comments-only improve stale."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Round 1 feedback comment.")
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        pending_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert pending_improve.id is not None
+        pending_improve.created_at = datetime(2026, 1, 1, tzinfo=UTC)
+        store.update(pending_improve)
+
+        store.add_comment(impl_task.id, "Scope clarification only.", kind="review_scope")
+        second = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert second.returncode == 0, second.stdout
+        assert f"Reusing pending improve task {pending_improve.id}" in second.stdout
+
+        improves = [t for t in store.get_all() if t.task_type == "improve"]
+        assert len(improves) == 1
 
     def test_improve_comments_only_resumes_failed_task(self, tmp_path: Path):
         """Failed comments-only improve should create a resume task, not duplicate-error."""

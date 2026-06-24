@@ -40,6 +40,7 @@ from ..console import (
     truncate,
 )
 from ..db import (
+    TASK_COMMENT_KIND_FEEDBACK,
     ManualMigrationRequired,
     SqliteTaskStore,
     StoreOpenMode,
@@ -2204,7 +2205,11 @@ def resolve_comments_improve_action(
     def _time_key(task: DbTask) -> tuple[datetime, int]:
         return (_normalize_time(task.created_at), task_id_numeric_key(task.id))
 
-    unresolved_comments = store.get_comments(impl_task_id, unresolved_only=True)
+    unresolved_comments = store.get_comments(
+        impl_task_id,
+        unresolved_only=True,
+        kinds=(TASK_COMMENT_KIND_FEEDBACK,),
+    )
     latest_unresolved_comment_time: datetime | None = None
     if unresolved_comments:
         latest_unresolved_comment_time = max(
@@ -2281,7 +2286,13 @@ def _create_improve_task(
     Returns the created improve task, or raises ValueError with an error message.
     """
     assert impl_task.id is not None
-    has_comments = bool(store.get_comments(impl_task.id, unresolved_only=True))
+    has_comments = bool(
+        store.get_comments(
+            impl_task.id,
+            unresolved_only=True,
+            kinds=(TASK_COMMENT_KIND_FEEDBACK,),
+        )
+    )
     based_on_id = impl_task.id
     if review_task is not None:
         assert review_task.id is not None

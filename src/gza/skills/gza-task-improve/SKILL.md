@@ -8,7 +8,7 @@ public: true
 
 # Improve Gza Task Inline
 
-Address feedback for a gza task directly in the current conversation. Feedback can come from two sources: a completed review (Must-Fix items plus Suggestions) and/or unresolved task comments attached to the implementation. If no review exists but unresolved comments do, improve still runs — comments alone are a valid feedback source. This skill is useful when a task has reached max review/improve cycles and needs human-guided fixes, or when you want to interactively resolve feedback.
+Address feedback for a gza task directly in the current conversation. Feedback can come from two sources: a completed review (Must-Fix items plus Suggestions) and/or unresolved `feedback` task comments attached to the implementation. If no review exists but unresolved `feedback` comments do, improve still runs — comments alone are a valid feedback source. Other comment kinds such as `review_scope` remain visible to operators but are not improve-actionable and must not be resolved by this workflow. This skill is useful when a task has reached max review/improve cycles and needs human-guided fixes, or when you want to interactively resolve feedback.
 
 ## Process
 
@@ -54,8 +54,12 @@ assert impl_task.id is not None
 reviews = store.get_reviews_for_task(impl_task.id)
 latest_review = reviews[0] if reviews else None
 
-# Find unresolved task comments (comments-only improve runs when no usable review exists)
-unresolved_comments = store.get_comments(impl_task.id, unresolved_only=True)
+# Find unresolved feedback comments (comments-only improve runs when no usable review exists)
+unresolved_comments = store.get_comments(
+    impl_task.id,
+    unresolved_only=True,
+    kinds=('feedback',),
+)
 
 print(json.dumps({
     'impl_task_id': impl_task.id,
@@ -84,7 +88,7 @@ If neither a usable review nor unresolved comments exist, stop and ask the user 
 Feedback may be review-only, comments-only, or both. Read whichever sources are present:
 
 - If `review_task_id` is set, read the review report file (`review_report_file`). If the report file doesn't exist on disk, fall back to `review_output`. The review file follows a structured format with **Must-Fix/Blocker** items (M1/B1, M2/B2, etc.) as blockers, **Suggestions/Follow-Ups** (S1/F1, S2/F2, etc.) as optional improvements, and **Questions/Assumptions** that may need user input.
-- If `unresolved_comments` is non-empty, treat each comment as a blocker to address in this pass. Comments are plain prose; there is no Must-Fix/Suggestions structure.
+- If `unresolved_comments` is non-empty, treat each `feedback` comment as a blocker to address in this pass. Comments are plain prose; there is no Must-Fix/Suggestions structure.
 - If both are present, address both.
 
 Present a summary of the items to address (must-fix items plus unresolved comments) to the user before proceeding. If only comments exist, say so explicitly — the run is a comments-only improve and does not require a review.
@@ -158,7 +162,7 @@ If the branch already has an upstream, a plain `git push` is fine. If the push f
 
 After a successful commit and push, always create a completed improve task row and summary artifact, then clear review state for the implementation task.
 
-Use the `review_task_id` already resolved in Step 1 (pass `None` for `depends_on` when this was a comments-only improve), then compute the canonical `summary_path` via `get_task_output_paths(created, config.project_dir)`, write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`. Also call `store.resolve_comments(<IMPL_TASK_ID>)` so the unresolved comments you addressed are marked resolved. If any persistence step after `store.add(...)` fails, mark the created improve task as `dropped` before re-raising so no runnable orphan stays `pending`.
+Use the `review_task_id` already resolved in Step 1 (pass `None` for `depends_on` when this was a comments-only improve), then compute the canonical `summary_path` via `get_task_output_paths(created, config.project_dir)`, write the summary there with an origin header, persist `report_file` + `output_content`, and call `store.clear_review_state(<IMPL_TASK_ID>)`. Also call `store.resolve_comments(<IMPL_TASK_ID>, kinds=('feedback',))` so only the unresolved `feedback` comments you addressed are marked resolved. Leave other comment kinds, such as `review_scope`, visible and unresolved. If any persistence step after `store.add(...)` fails, mark the created improve task as `dropped` before re-raising so no runnable orphan stays `pending`.
 
 ```bash
 uv run python -c "
@@ -221,7 +225,7 @@ except Exception:
     raise
 
 store.clear_review_state('<IMPL_TASK_ID>')
-store.resolve_comments('<IMPL_TASK_ID>')
+store.resolve_comments('<IMPL_TASK_ID>', kinds=('feedback',))
 print(f'Improve saved as task #{created.id} ({created.report_file}); review state cleared')
 "
 ```
@@ -244,7 +248,7 @@ If the restore fails, stop and tell the user exactly what checkout you left them
 
 ## Important notes
 
-- **Feedback sources** — improve may run from a review, from unresolved task comments, or from both. Comments-only improve is a valid flow when no review exists; do not require Must-Fix structure in that case.
+- **Feedback sources** — improve may run from a review, from unresolved `feedback` task comments, or from both. Comments-only improve is a valid flow when no review exists; do not require Must-Fix structure in that case.
 - **Must-fix items and comments are the priority** — address every Must-Fix item (when a review exists) and every unresolved comment before considering review Suggestions.
 - **Read before editing** — always read the source files before making changes, even if the review or comment quotes code. The code may have changed since the feedback was written.
 - **Verify the feedback's claims** — review items and comments can be wrong or stale. If a feedback item doesn't match the current code state (e.g., the import already exists), skip it and note that to the user.

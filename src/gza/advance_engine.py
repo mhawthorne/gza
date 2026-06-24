@@ -13,7 +13,13 @@ from typing import Any
 from gza.branch_resolution import resolve_rebase_target_task
 from gza.config import DEFAULT_MAX_NOOP_IMPROVE_CYCLES
 from gza.console import prompt_available_width, shorten_prompt
-from gza.db import SqliteTaskStore, Task as DbTask, task_id_numeric_key, task_owns_merge_status
+from gza.db import (
+    TASK_COMMENT_KIND_FEEDBACK,
+    SqliteTaskStore,
+    Task as DbTask,
+    task_id_numeric_key,
+    task_owns_merge_status,
+)
 from gza.git import ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import walk_ancestors, walk_based_on_descendants
@@ -1764,7 +1770,11 @@ def _count_rebase_failure_streak(
 
 
 def _latest_unresolved_comment_time(store: SqliteTaskStore, task_id: str) -> datetime | None:
-    unresolved_comments = store.get_comments(task_id, unresolved_only=True)
+    unresolved_comments = store.get_comments(
+        task_id,
+        unresolved_only=True,
+        kinds=(TASK_COMMENT_KIND_FEEDBACK,),
+    )
     if not unresolved_comments:
         return None
     return max(_normalize_time(comment.created_at) for comment in unresolved_comments)

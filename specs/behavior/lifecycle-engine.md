@@ -180,8 +180,10 @@ When a current review exists for the implementation lineage:
   - An improve is `in_progress` → `wait_improve`; `pending` → `run_improve`. (See
     [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
   - No improve yet, and no bound is tripped → create an `improve` task.
-- Unresolved review comments newer than the latest completed review MUST be addressed via
+- Unresolved `feedback` comments newer than the latest completed review MUST be addressed via
   the improve flow **before** any merge, even on an approved verdict.
+- Unresolved comments of other kinds (for example `review_scope`) MUST remain visible to
+  operators but MUST NOT create, reuse, resume, wait on, or freshness-block an improve task.
 - Verdict is unknown / unclassifiable → `needs_discussion` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 

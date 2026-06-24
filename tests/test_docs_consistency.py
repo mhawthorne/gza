@@ -1,5 +1,6 @@
 """Regression checks for canonical operator docs."""
 
+import re
 from pathlib import Path
 
 
@@ -943,6 +944,15 @@ def test_improve_related_skills_describe_comments_as_feedback_source() -> None:
     assert "unresolved task comments" in improve_skill_content
     assert "comments-only" in improve_skill_content
     assert "resolve_comments" in improve_skill_content
+    assert "kinds=('feedback',)" in improve_skill_content
+    assert not re.search(
+        r"store\.get_comments\(\s*impl_task\.id,\s*unresolved_only=True\s*\)",
+        improve_skill_content,
+    )
+    assert not re.search(
+        r"store\.resolve_comments\(\s*'<IMPL_TASK_ID>'\s*\)",
+        improve_skill_content,
+    )
 
     add_skill_content = (
         repo_root / "src" / "gza" / "skills" / "gza-task-add" / "SKILL.md"

@@ -51,6 +51,7 @@ from .console import (
     task_header,
 )
 from .db import (
+    TASK_COMMENT_KIND_FEEDBACK,
     SqliteTaskStore,
     Task,
     TaskStats,
@@ -3679,6 +3680,7 @@ def _build_context_from_chain(
                 impl_ancestor.id,
                 unresolved_only=True,
                 created_on_or_before=task.created_at,
+                kinds=(TASK_COMMENT_KIND_FEEDBACK,),
             )
             if unresolved_comments:
                 context_parts.append("## Comments:\n")
@@ -6873,6 +6875,7 @@ def _post_complete_code_task(
                 store.resolve_comments(
                     impl_ancestor.id,
                     created_on_or_before=task.created_at,
+                    kinds=(TASK_COMMENT_KIND_FEEDBACK,),
                 )
         else:
             current_noop_head_sha = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
