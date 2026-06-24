@@ -125,8 +125,8 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec(
         "max_concurrent",
         "int",
-        "explicit watch.batch or 5",
-        "Hard global ceiling on concurrently running task-executing processes across all commands. Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5`.",
+        "effective watch batch or 5",
+        "Hard global ceiling on concurrently running task-executing processes across all commands. Explicit `max_concurrent` wins; when it is unset, `gza watch` derives its runtime cap from the effective watch batch (including `--batch`), while other commands keep the loaded fallback (`watch.batch` if configured, otherwise `5`).",
         example_value=5,
     ),
     ConfigKeySpec("max_steps", "int", 50, "Global default step budget."),

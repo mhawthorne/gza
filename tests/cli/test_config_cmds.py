@@ -1509,10 +1509,10 @@ class TestLocalConfigOverrides:
         assert "Deprecated alias for `watch.recovery_slots`." in result.stdout
         assert "Seconds before watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`." in result.stdout
         assert (
-            "Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5`."
+            "Explicit `max_concurrent` wins; when it is unset, `gza watch` derives its runtime cap from the effective watch batch (including `--batch`), while other commands keep the loaded fallback (`watch.batch` if configured, otherwise `5`)."
             in result.stdout
         )
-        assert "explicit watch.batch or 5" in result.stdout
+        assert "effective watch batch or 5" in result.stdout
         assert (
             "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
             in result.stdout
@@ -1550,14 +1550,15 @@ class TestLocalConfigOverrides:
         assert keyed_entries["watch.restart_failed_batch"]["type"] == "int"
         assert keyed_entries["watch.no_activity_timeout"]["type"] == "int"
         assert keyed_entries["max_concurrent"]["type"] == "int"
-        assert keyed_entries["max_concurrent"]["default"] == "explicit watch.batch or 5"
+        assert keyed_entries["max_concurrent"]["default"] == "effective watch batch or 5"
         assert "Default concurrent worker target" in keyed_entries["watch.batch"]["description"]
         assert "reserved for worker-consuming failed-task recovery" in keyed_entries["watch.recovery_slots"]["description"]
         assert "pending-only" in keyed_entries["watch.recovery_slots"]["description"]
         assert "Deprecated alias" in keyed_entries["watch.restart_failed_batch"]["description"]
         assert "silent registered worker for a pending or in-progress task" in keyed_entries["watch.no_activity_timeout"]["description"]
-        assert "explicitly configured `watch.batch` becomes the cap" in keyed_entries["max_concurrent"]["description"]
-        assert "fallback remains `5`" in keyed_entries["max_concurrent"]["description"]
+        assert "effective watch batch" in keyed_entries["max_concurrent"]["description"]
+        assert "including `--batch`" in keyed_entries["max_concurrent"]["description"]
+        assert "other commands keep the loaded fallback" in keyed_entries["max_concurrent"]["description"]
         assert "fixed bounded resume/retry policy" in keyed_entries["max_resume_attempts"]["description"]
 
     def test_config_example_stdout_matches_committed_full_example(self, tmp_path: Path):
@@ -1601,9 +1602,10 @@ class TestLocalConfigOverrides:
 
         assert rendered.returncode == 0
         assert '"watch.batch or 5"' not in rendered.stdout
-        assert '"explicit watch.batch or 5"' not in rendered.stdout
-        assert "# Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the" in rendered.stdout
-        assert "# cap; if `watch.batch` is omitted, the fallback remains `5`." in rendered.stdout
+        assert '"effective watch batch or 5"' not in rendered.stdout
+        assert "# Explicit `max_concurrent` wins; when it is unset, `gza watch` derives its runtime cap" in rendered.stdout
+        assert "# effective watch batch (including `--batch`), while other commands keep the loaded fallback" in rendered.stdout
+        assert "# (`watch.batch` if configured, otherwise `5`)." in rendered.stdout
         assert "# max_concurrent: 5" in rendered.stdout
         assert rendered.stdout == Path(f"src/gza/{artifact_name}").read_text(encoding="utf-8")
 

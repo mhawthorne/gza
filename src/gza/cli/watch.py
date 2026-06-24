@@ -10,7 +10,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -3217,10 +3217,13 @@ def _run_cycle(
     )
 
 
+def _has_explicit_max_concurrent(config: Config) -> bool:
+    return "max_concurrent" in config.source_map
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Run continuous scheduler loop that maintains N concurrent workers."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
 
     batch = args.batch if args.batch is not None else config.watch.batch
     poll = args.poll if args.poll is not None else config.watch.poll
@@ -3282,7 +3285,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print("Error: watch.failure_halt_after must be null or a positive integer")
         return 1
 
+    startup_cap_warning: str | None = None
+    if not _has_explicit_max_concurrent(config):
+        config = replace(config, max_concurrent=batch)
+    elif batch > config.max_concurrent:
+        source = config.source_map.get("max_concurrent")
+        startup_cap_warning = (
+            f"requested batch={batch} capped to {config.max_concurrent} by max_concurrent"
+            + (f" from {source}" if source else "")
+        )
+
+    store = get_store(config)
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
+    if startup_cap_warning is not None:
+        log.emit("WARN", startup_cap_warning)
     installed_package_drift = _InstalledPackageDriftState(
         startup_fingerprint=_installed_gza_package_fingerprint()
     )

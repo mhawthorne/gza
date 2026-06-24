@@ -12010,6 +12010,110 @@ def test_cmd_watch_first_start_preserves_confirmation_prompt(tmp_path: Path) -> 
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
 
+def test_cmd_watch_cli_batch_derives_runtime_cap_when_max_concurrent_unset(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  batch: 1\n")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    def assert_runtime_cap(**kwargs) -> _CycleResult:
+        assert kwargs["config"].max_concurrent == 2
+        assert kwargs["batch"] == 2
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=assert_runtime_cap) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert " WARN " not in log_text
+
+
+def test_cmd_watch_warns_once_when_explicit_max_concurrent_caps_requested_batch(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "max_concurrent: 2\nwatch:\n  batch: 1\n")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=4,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    def assert_explicit_cap(**kwargs) -> _CycleResult:
+        assert kwargs["config"].max_concurrent == 2
+        assert kwargs["batch"] == 4
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=assert_explicit_cap) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    log_lines = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8").splitlines()
+    warn_lines = [line for line in log_lines if " WARN " in line]
+    assert len(warn_lines) == 1
+    assert "requested batch=4" in warn_lines[0]
+    assert "capped to 2" in warn_lines[0]
+    assert "max_concurrent" in warn_lines[0]
+
+
+def test_cmd_watch_keeps_explicit_max_concurrent_without_warning_when_batch_within_cap(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "max_concurrent: 4\nwatch:\n  batch: 2\n")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=None,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    def assert_no_override(**kwargs) -> _CycleResult:
+        assert kwargs["config"].max_concurrent == 4
+        assert kwargs["batch"] == 2
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=assert_no_override) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert " WARN " not in log_text
+
+
 def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None:
     """Watch should re-exec itself on the first pass boundary where drift is detected."""
     setup_config(tmp_path)

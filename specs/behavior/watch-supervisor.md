@@ -157,7 +157,12 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   explicitly associated with a registered running-status worker entry. A plain pending
   queue item with no registered worker remains runnable and MUST NOT be reaped just
   because it has no process metadata.
-- `slots` MUST equal `max(0, batch - running)`.
+- The effective watch worker target for a pass MUST be `min(batch, max_concurrent)`.
+  When `max_concurrent` is unset, `gza watch` MUST derive the runtime cap from the
+  effective watch batch for that run, including any CLI `--batch` override.
+- `slots` MUST equal `max(0, min(batch, max_concurrent) - running)`.
+- If the requested `batch` exceeds an explicit `max_concurrent`, watch MUST emit one
+  startup warning that the requested batch was capped by the global ceiling.
 - `watch.recovery_slots` (default `1`) MUST reserve that many worker slots per cycle for
   actionable failed-task recovery before pending pickup, capped by available slots and
   actionable in-scope worker-consuming recovery count.
@@ -315,6 +320,7 @@ The existence of these knobs is contract; their values are operator policy.
 | Knob | Governs |
 |------|---------|
 | `watch.batch` | Maximum concurrent detached worker processes the supervisor maintains |
+| `max_concurrent` | Global hard ceiling applied to detached worker launches across commands; watch clamps batch to this when explicit |
 | `watch.poll` | Delay between completed cycles |
 | `watch.max_idle` | Consecutive idle loop time before clean exit |
 | `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch |
