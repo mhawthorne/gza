@@ -2788,6 +2788,62 @@ def test_missing_reviewed_head_sha_does_not_infer_stale_review(tmp_path: Path, m
     assert action["needs_attention_reason"] == "review-max-cycles-reached"
 
 
+def test_current_head_review_still_parks_at_max_cycles_when_head_unchanged(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_review_cycles = 1
+    config.max_noop_improve_cycles = 2
+    config.max_noop_improve_cycles = 2
+    config.max_noop_improve_cycles = 2
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/current-head-max-cycles-unchanged",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_invalidated_by_progress is False
+    assert ctx.completed_review_cycles == 1
+    assert ctx.review_cycle_boundary_task_id == review.id
+    assert ctx.review_cycle_boundary_reason == "reviewed_head_epoch"
+    assert action["type"] == "max_cycles_reached"
+    assert action["needs_attention_reason"] == "review-max-cycles-reached"
+
+
 def test_current_head_epoch_resets_review_cycle_cap(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 
@@ -2836,8 +2892,85 @@ def test_current_head_epoch_resets_review_cycle_cap(tmp_path: Path, monkeypatch)
 
     assert ctx.review_invalidated_by_progress is False
     assert ctx.completed_review_cycles == 0
+    assert ctx.review_cycle_boundary_task_id == review2.id
+    assert ctx.review_cycle_boundary_reason == "reviewed_head_epoch"
     assert action["type"] == "improve"
     assert action.get("needs_attention_reason") != "review-max-cycles-reached"
+
+
+def test_refresh_review_at_current_head_returns_to_normal_max_cycle_behavior(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_review_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/current-head-refresh-review-cap",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    stale_review.review_verify_head_sha = "old-sha"
+    stale_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(stale_review)
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    first_current_head_review = _add_completed_review(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+    )
+    first_current_head_review.review_verify_head_sha = "current-sha"
+    first_current_head_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(first_current_head_review)
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        first_current_head_review,
+        when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    refresh_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 14, 0, tzinfo=UTC))
+    refresh_review.review_verify_head_sha = "current-sha"
+    refresh_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_invalidated_by_progress is False
+    assert ctx.latest_reviewed_head_sha == "current-sha"
+    assert ctx.current_review_head_sha == "current-sha"
+    assert ctx.completed_review_cycles == 1
+    assert ctx.review_cycle_boundary_task_id == first_current_head_review.id
+    assert ctx.review_cycle_boundary_reason == "reviewed_head_epoch"
+    assert action["type"] == "max_cycles_reached"
+    assert action["needs_attention_reason"] == "review-max-cycles-reached"
 
 
 def test_preserved_noop_rebase_only_refreshes_when_head_advances_independently(

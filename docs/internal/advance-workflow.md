@@ -56,7 +56,7 @@ Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
 | `require_review_before_merge` | `true` | Implement tasks must have a valid current review before merge |
 | `advance_create_reviews` | `true` | Auto-create review tasks for implements when review gating still requires them; otherwise lifecycle parks for manual attention instead of creating reviews. |
 | `max_resume_attempts` | `1` | Shared automatic failed-task recovery toggle (`0` disables; any positive value enables the fixed bounded resume/retry policy) |
-| `max_review_cycles` | `3` | Max review→improve cycles before flagging for manual intervention |
+| `max_review_cycles` | `3` | Max review→improve cycles within one durable-progress epoch before flagging for manual intervention |
 | `max_noop_improve_cycles` | `1` | Max consecutive no-op improves before lifecycle automation stops for discussion |
 | `autonomous_verify_timeout_seconds` | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
 | `review_verify_timeout_grace_seconds` | `5` | Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; accepts float values >= 1 second |
@@ -165,7 +165,7 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 | Consecutive completed no-op improves for the latest `(impl, review)` pair >= `max_noop_improve_cycles` | `needs_discussion` — reason=`improve-no-op`; stop repeated no-op improve loops unless runner-owned current passing verify evidence already cleared the review before lifecycle evaluation. This row applies only when the lineage is not tagged `allow-noop-improve`. If the evidence is absent, stale, branch/head mismatched, the fresh in-improve verify still fails, or the blocker is not verify-only, lifecycle parks instead of auto-clearing. If the branch-head freshness probe itself fails, lifecycle still parks but the action description carries that probe failure instead of a generic no-op message |
 | Verdict = `CHANGES_REQUESTED` AND the same primary blocker repeats for 3 consecutive completed review cycles with no completed rebase boundary between them | `needs_discussion` — reason `duplicate-blocker-no-progress`; stop the generic review/improve loop and require manual intervention |
 | Live branch-head probe fails while checking whether the latest completed review is still current | `needs_discussion` — reason=`review-freshness-unverified`; fail closed, surface the probe warning, and do not treat cached merge-unit head metadata as proof the review is current |
-| Verdict = `CHANGES_REQUESTED` AND current-head cycles >= `max_review_cycles` with no stale-review refresh path | `max_cycles_reached` — manual intervention |
+| Verdict = `CHANGES_REQUESTED` AND durable-progress-epoch cycles >= `max_review_cycles` with no stale-review refresh path | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
 | Verdict = unknown | `needs_discussion` — manual intervention |
 

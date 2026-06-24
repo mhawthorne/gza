@@ -173,6 +173,10 @@ changed.
 - Missing `review_verify_head_sha` evidence MUST fail closed for freshness: the engine
   MUST NOT infer stale branch-head advancement from absence alone.
 - Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
+- `max_review_cycles` MUST count only completed review/improve cycles inside the current
+  durable-progress epoch. The epoch resets only when persisted evidence shows a new
+  reviewed head or other durable branch progress boundary; historical pre-boundary churn
+  MUST NOT keep poisoning the lineage after that progress.
 
 ### §6 — Review state
 
@@ -216,7 +220,7 @@ When a current review exists for the implementation lineage:
 **Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
 - Review→improve cycles reach `max_review_cycles` within the current durable-progress
-  head epoch → `max_cycles_reached`.
+  epoch → `max_cycles_reached`.
 - **A. Verify-only review clear invariant.** A review whose blockers are solely
   runner-captured `verify_command` failures or timeouts MUST be cleared when the
   subsequent no-op improve captures a passing `verify_command` in that improve's own
