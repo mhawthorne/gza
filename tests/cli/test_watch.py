@@ -1,6 +1,7 @@
 """Tests for `gza watch` scheduler behavior."""
 
 import argparse
+import contextlib
 import io
 import json
 import re
@@ -15652,3 +15653,354 @@ def test_watch_run_does_not_call_load_merge_context_when_git_provided(
 
     # The run completed without triggering the ambient _load_merge_context path.
     assert result is not None
+
+
+def test_watch_cycle_uses_git_cache_for_analysis_only_before_lifecycle_execution(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    review_owner = store.add("Needs review before merge", task_type="implement")
+    assert review_owner.id is not None
+    review_owner.status = "completed"
+    review_owner.completed_at = datetime.now(UTC)
+    review_owner.branch = "feature/watch-analysis-cache"
+    review_owner.has_commits = True
+    review_owner.merge_status = "unmerged"
+    store.update(review_owner)
+
+    row = LineageOwnerRow(
+        owner_task=review_owner,
+        members=(review_owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="review",
+        unresolved_tasks=(review_owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=review_owner,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+    git = _make_watch_git()
+    cache_state = {"active": False}
+    phases: list[str] = []
+    pending_reads = {"count": 0}
+    pending_reads = {"count": 0}
+
+    @contextlib.contextmanager
+    def _tracked_cached():
+        assert cache_state["active"] is False
+        cache_state["active"] = True
+        git._cache = {}
+        phases.append("cache-enter")
+        try:
+            yield git
+        finally:
+            phases.append("cache-exit")
+            cache_state["active"] = False
+            git._cache = None
+
+    git.cached = _tracked_cached  # type: ignore[method-assign]
+
+    def _assert_cached_read(*_args, **_kwargs):
+        assert cache_state["active"] is True
+        return []
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        assert cache_state["active"] is True
+        assert task.id == review_owner.id
+        phases.append("determine-next-action")
+        return {"type": "create_review", "description": "Create review before merge"}
+
+    def _fake_execute_advance_action(*, task, action, context):
+        assert cache_state["active"] is False
+        assert task.id == review_owner.id
+        assert action["type"] == "create_review"
+        phases.append("execute-advance-action")
+        return AdvanceActionExecutionResult(
+            action_type="create_review",
+            status="dry_run",
+            message="Would create_review",
+            worker_label="worker",
+            worker_consuming=True,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", side_effect=_assert_cached_read),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", side_effect=_assert_cached_read),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[]),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        )
+
+    assert phases == [
+        "cache-enter",
+        "determine-next-action",
+        "cache-exit",
+        "execute-advance-action",
+    ]
+
+
+def test_watch_cycle_cleans_stale_recovery_no_progress_park_only_after_cached_analysis_exits(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implement for stale park cleanup", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    recovery_child = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    store.update(recovery_child)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=config.max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=recovery_child,
+        failed_task=failed,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    git = _make_watch_git()
+    cache_state = {"active": False}
+    phases: list[str] = []
+    real_delete_watch_progress_subject = store.delete_watch_progress_subject
+
+    @contextlib.contextmanager
+    def _tracked_cached():
+        assert cache_state["active"] is False
+        cache_state["active"] = True
+        git._cache = {}
+        phases.append("cache-enter")
+        try:
+            yield git
+        finally:
+            phases.append("cache-exit")
+            cache_state["active"] = False
+            git._cache = None
+
+    def _tracked_delete_watch_progress_subject(*args, **kwargs):
+        phases.append("delete-stale-observation")
+        assert cache_state["active"] is False
+        return real_delete_watch_progress_subject(*args, **kwargs)
+
+    git.cached = _tracked_cached  # type: ignore[method-assign]
+    store.delete_watch_progress_subject = _tracked_delete_watch_progress_subject  # type: ignore[method-assign]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=1),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert phases == ["cache-enter", "cache-exit", "delete-stale-observation"]
+    assert store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    ) is None
+
+
+def test_watch_cycle_recomputes_pending_tasks_after_lifecycle_execution_outside_git_cache(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    pending = store.add("Pending implement unblocked by lifecycle work", task_type="implement")
+    assert pending.id is not None
+
+    review_owner = store.add("Lifecycle work that unblocks pending", task_type="implement")
+    assert review_owner.id is not None
+    review_owner.status = "completed"
+    review_owner.completed_at = datetime.now(UTC)
+    review_owner.branch = "feature/watch-pending-refresh"
+    review_owner.has_commits = True
+    review_owner.merge_status = "unmerged"
+    store.update(review_owner)
+
+    row = LineageOwnerRow(
+        owner_task=review_owner,
+        members=(review_owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="reconcile_branch_divergence",
+        unresolved_tasks=(review_owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=review_owner,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    git = _make_watch_git()
+    cache_state = {"active": False}
+    phases: list[str] = []
+    pending_reads = {"count": 0}
+    lifecycle_executed = {"done": False}
+
+    @contextlib.contextmanager
+    def _tracked_cached():
+        assert cache_state["active"] is False
+        cache_state["active"] = True
+        git._cache = {}
+        phases.append("cache-enter")
+        try:
+            yield git
+        finally:
+            phases.append("cache-exit")
+            cache_state["active"] = False
+            git._cache = None
+
+    git.cached = _tracked_cached  # type: ignore[method-assign]
+
+    def _fake_pending_tasks(*_args, **_kwargs):
+        pending_reads["count"] += 1
+        if cache_state["active"]:
+            phases.append("read-pending-analysis")
+        elif lifecycle_executed["done"]:
+            phases.append("read-pending-post-lifecycle")
+            return [pending]
+        else:
+            phases.append("read-pending-prewake")
+        return []
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        assert cache_state["active"] is True
+        assert task.id == review_owner.id
+        phases.append("determine-next-action")
+        return {
+            "type": "reconcile_branch_divergence",
+            "description": "Reconcile branch publication before queue pickup",
+        }
+
+    def _fake_execute_advance_action(*, task, action, context):
+        assert cache_state["active"] is False
+        assert task.id == review_owner.id
+        assert action["type"] == "reconcile_branch_divergence"
+        lifecycle_executed["done"] = True
+        phases.append("execute-advance-action")
+        return AdvanceActionExecutionResult(
+            action_type="reconcile_branch_divergence",
+            status="success",
+            message="Reconciled branch publication",
+            success_message="Reconciled branch publication",
+            worker_label="worker",
+            worker_consuming=False,
+        )
+
+    def _fake_prepare(_config, task, **_kwargs):
+        assert cache_state["active"] is False
+        assert task.id == pending.id
+        assert lifecycle_executed["done"] is True
+        phases.append("prepare-pending")
+        return task
+
+    def _fake_spawn_iterate(*_args, **_kwargs):
+        assert cache_state["active"] is False
+        phases.append("spawn-iterate")
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", side_effect=_fake_pending_tasks),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=_fake_prepare),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=_fake_spawn_iterate),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        )
+
+    assert result.work_done is True
+    assert pending_reads["count"] >= 2
+    assert "read-pending-analysis" not in phases
+    assert phases[:5] == [
+        "read-pending-prewake",
+        "cache-enter",
+        "determine-next-action",
+        "cache-exit",
+        "execute-advance-action",
+    ]
+    assert phases[5:8] == [
+        "read-pending-post-lifecycle",
+        "prepare-pending",
+        "spawn-iterate",
+    ]
