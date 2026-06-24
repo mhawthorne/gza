@@ -62,6 +62,7 @@ as confidence grows.
 |------|---------|---------|
 | `require_review_before_merge` | on | Whether an implementation unit needs a valid review before merge (§4, §8). |
 | `advance_create_reviews` | on | Whether the engine auto-creates needed reviews, vs parking for a manual review (§4, §8). |
+| `advance_off_topic_verify_unblock` | off | Whether verify-only review blockers MAY clear through the audited off-topic-failure contract instead of parking on a fresh red reverify (§6, [off-topic-verify-failures.md](off-topic-verify-failures.md)). |
 | `auto_implement` (per lineage) | — | Whether a completed plan auto-creates its implement, vs holding for a human (§1). |
 | `max_review_cycles` | 3 | Bound on review→improve cycles before escalation (§6). |
 | `max_noop_improve_cycles` | 1 | Bound on consecutive improves that change nothing (§6). |
@@ -71,10 +72,14 @@ as confidence grows.
 | recovery attempts | bounded | Automatic resume/retry budget before escalation (§7). |
 | `merge_squash_threshold` | off | Auto-squash branches at/above N commits on merge (§8). |
 
-The *values* above are non-normative defaults. Only the **existence and enforcement** of
-each corresponding bound/gate is contract (see
+The *values* above are generally non-normative defaults. Only the **existence and
+enforcement** of each corresponding bound/gate is contract (see
 [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2); an
-operator changing a value is configuration, not a spec violation.
+operator changing a value is configuration, not a spec violation. The exception is any
+knob whose focused contract explicitly makes its default part of the safety boundary. In
+this table, `advance_off_topic_verify_unblock` is one such exception because
+[off-topic-verify-failures.md](off-topic-verify-failures.md) requires the knob to exist
+and default to **off**.
 
 ## The rules, in order
 
@@ -243,6 +248,22 @@ When a current review exists for the implementation lineage:
   verify-only before same-head runner-owned evidence can clear it; prose alone MUST NOT
   decide stale/non-stale provenance. The engine MUST NOT run a separate isolated
   detached-worktree verify solely to clear this condition.
+- **A2. Off-topic verify unblock contract.** When rule A does not clear a verify-only
+  review blocker because the later no-op-improve-side verify is still red, lifecycle MAY
+  consult [off-topic-verify-failures.md](off-topic-verify-failures.md) only if the latest
+  review is verify-only blocked and current trusted green verify evidence already exists
+  for the exact reviewed head SHA and exact tree fingerprint now under consideration.
+  With `advance_off_topic_verify_unblock` off, lifecycle MUST keep the blocker and follow
+  the ordinary park behavior. With the knob on, lifecycle MAY clear the blocker only when
+  the off-topic contract fully succeeds: the full failing-node set was enumerated,
+  every enumerated node classified off-topic, the result remained bound to that same
+  reviewed head SHA and exact tree fingerprint, and the required non-blocking
+  `REPRODUCE-OR-RECORD` investigation record was durably created or reused. Deterministic
+  and intermittent off-topic branches, branch-introduced failures, shared/global fail
+  closed cases, and investigation dedup rules are owned by
+  [off-topic-verify-failures.md](off-topic-verify-failures.md). If lifecycle cannot prove
+  any of those preconditions, classification steps, or audit/persistence requirements, it
+  MUST fail closed and keep the review blocking.
 - **B. Disputed non-verify CODE blocker adjudication.** When the latest
   `CHANGES_REQUESTED` review carries a non-verify CODE blocker and the latest completed
   improve for that `(implementation, review)` pair is a no-op with structured dispute
@@ -257,7 +278,8 @@ When a current review exists for the implementation lineage:
     reason `review-blocker-adjudication-needed` and include the dispute/adjudication
     evidence.
   This lane applies only to non-verify CODE blockers. Verify-only blocker clearing
-  remains governed exclusively by rule A above.
+  remains governed by the verify-only rules above: rule A for same-head runner-owned
+  green recapture and rule A2 for the audited off-topic unblock contract.
 - Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
   `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). This generic
   no-op park applies only after ruling out rule B adjudication-eligible disputed

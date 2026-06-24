@@ -62,6 +62,7 @@ Current tracked behavior-spec prefixes:
 
 - `OV` — `00-overview.md`
 - `LE` — `lifecycle-engine.md`
+- `OTV` — `off-topic-verify-failures.md`
 - `WS` — `watch-supervisor.md`
 - `MV` — `main-verify-self-heal.md`
 

@@ -122,6 +122,80 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "main-integration-verify-red" in lifecycle
 
 
+def test_off_topic_verify_contract_is_indexed_and_cross_linked() -> None:
+    """The off-topic verify unblock contract should stay discoverable and linked from lifecycle."""
+    repo_root = Path(__file__).resolve().parents[1]
+    behavior_readme = (repo_root / "specs" / "behavior" / "README.md").read_text()
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    contract = (repo_root / "specs" / "behavior" / "off-topic-verify-failures.md").read_text()
+    contract_flat = " ".join(contract.split())
+
+    assert "[off-topic-verify-failures.md](off-topic-verify-failures.md)" in behavior_readme
+    assert "Verify-only off-topic unblock contract" in behavior_readme
+
+    assert "[off-topic-verify-failures.md](off-topic-verify-failures.md)" in lifecycle
+    assert "`advance_off_topic_verify_unblock`" in lifecycle
+    assert "With `advance_off_topic_verify_unblock` off, lifecycle MUST keep the blocker" in lifecycle
+    assert "the full failing-node set was enumerated" in lifecycle
+    assert "exact reviewed head SHA and exact tree fingerprint" in lifecycle
+    assert "`REPRODUCE-OR-RECORD` investigation record" in lifecycle
+
+    required_contract_snippets = [
+        "The lifecycle policy knob `advance_off_topic_verify_unblock` MUST exist and MUST default to **off**.",
+        "Lifecycle MUST enumerate the full failing-node set before classifying a red verify result as off-topic.",
+        "A failing node is deterministic off-topic only when the same node also fails on the canonical local merge target",
+        "A failing node is intermittent off-topic only when all of the following are true:",
+        "One branch-introduced or unknown node keeps the entire review blocking",
+        "the clearance MUST be bound to the exact reviewed head SHA and exact tree fingerprint",
+        "Every off-topic clearance MUST create or reuse exactly one non-blocking investigation",
+        "The investigation contract is `REPRODUCE-OR-RECORD`",
+    ]
+    for snippet in required_contract_snippets:
+        assert snippet in contract_flat
+
+    assert "Trusted green evidence MUST be runner-owned or otherwise durably recorded lifecycle evidence." in contract_flat
+    assert "If exact reviewed-head or exact tree-fingerprint matching cannot be established" in contract_flat
+    assert "If lifecycle cannot durably create or reuse the required investigation record, it MUST fail closed" in contract_flat
+    assert (
+        "the target-side stress baseline is conclusive only when it reproduces the same normalized "
+        "failing-node identity plus the same normalized failure signature"
+    ) in contract_flat
+    assert "The stress baseline is inconclusive and MUST keep the review blocking when the local target stays green" in contract_flat
+    assert "reproduces a different node identity or failure signature" in contract_flat
+    assert "times out without parseable same-signature evidence" in contract_flat
+    assert "otherwise yields unparseable or ambiguous results" in contract_flat
+    assert "fail closed" in contract_flat
+
+
+def test_off_topic_verify_lifecycle_wording_stays_reconciled_with_focused_contract() -> None:
+    """Lifecycle wording should not contradict the focused off-topic verify contract."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+    contract = (repo_root / "specs" / "behavior" / "off-topic-verify-failures.md").read_text()
+    contract_flat = " ".join(contract.split())
+
+    assert (
+        "The exception is any knob whose focused contract explicitly makes its default part of the "
+        "safety boundary."
+    ) in lifecycle_flat
+    assert (
+        "`advance_off_topic_verify_unblock` is one such exception because "
+        "[off-topic-verify-failures.md](off-topic-verify-failures.md) requires the knob to exist "
+        "and default to **off**."
+    ) in lifecycle_flat
+    assert "The *values* above are non-normative defaults." not in lifecycle_flat
+
+    assert (
+        "Verify-only blocker clearing remains governed by the verify-only rules above: rule A "
+        "for same-head runner-owned green recapture and rule A2 for the audited off-topic "
+        "unblock contract."
+    ) in lifecycle_flat
+    assert "Verify-only blocker clearing remains governed exclusively by rule A above." not in lifecycle_flat
+
+    assert "The lifecycle policy knob `advance_off_topic_verify_unblock` MUST exist and MUST default to **off**." in contract_flat
+
+
 def test_main_verify_remediation_identity_docs_match_fingerprint_aware_runtime_contract() -> None:
     """Specs and operator docs should describe fingerprint-aware remediation dedup consistently."""
     repo_root = Path(__file__).resolve().parents[1]
