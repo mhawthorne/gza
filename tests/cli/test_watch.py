@@ -39,6 +39,7 @@ from gza.cli.watch import (
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
     _finalize_watch_no_progress_after_execution,
+    _maybe_repair_target_already_merged_skip,
     _maybe_park_watch_no_progress,
     _maybe_finalize_watch_no_progress_for_background_action,
     _query_owner_rows_with_context,
@@ -5799,22 +5800,30 @@ def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_f
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
 
-    repo_git = MagicMock()
-    repo_git.current_branch.return_value = "main"
-    repo_git.default_branch.return_value = "main"
-    repaired_result = SimpleNamespace(ok=True, merge_status="merged")
-    skip_action = {
-        "type": "skip",
-        "description": "SKIP: target implementation already merged (merge-unit-merged)",
-        "advance_reason": "target-already-merged",
-    }
-
+    repo_git = SimpleNamespace(
+        current_branch=MagicMock(return_value="main"),
+        default_branch=MagicMock(return_value="main"),
+        ref_exists=MagicMock(
+            side_effect=lambda ref: ref == "origin/feature/watch-target-already-merged"
+        ),
+        is_merged=MagicMock(return_value=True),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: {
+                "origin/feature/watch-target-already-merged": "head-watch-target-already-merged",
+                "main": "base-watch-target-already-merged",
+            }.get(ref)
+        ),
+        count_commits_ahead_checked=MagicMock(return_value=1),
+        get_diff_name_status=MagicMock(return_value=""),
+    )
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
-        patch("gza.cli.watch.reconcile_task_branch_merge_truth", return_value=repaired_result) as reconcile_branch,
-        patch("gza.cli.watch.determine_next_action", return_value=skip_action),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False),
+        ),
     ):
         result = _run_cycle(
             config=config,
@@ -5825,18 +5834,93 @@ def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_f
             log=log,
         )
 
-    assert result.work_done is True
-    reconcile_branch.assert_called_once_with(
-        store,
-        repo_git,
-        str(owner.id),
-        target_branch="main",
-        include_diff_stats=True,
-        persist=True,
-    )
+    assert result.work_done is False
     owner_unit = store.resolve_merge_unit_for_task(owner.id)
+    follow_up_unit = store.resolve_merge_unit_for_task(follow_up.id)
     assert owner_unit is not None
-    assert owner_unit.state == "unmerged"
+    assert follow_up_unit is not None
+    assert owner_unit.id == follow_up_unit.id
+    assert owner_unit.state == "merged"
+    assert owner_unit.merged_by_task_id == owner.id
+    refreshed_owner = store.get(owner.id)
+    refreshed_follow_up = store.get(follow_up.id)
+    assert refreshed_owner is not None
+    assert refreshed_follow_up is not None
+    assert refreshed_owner.merge_status == "merged"
+    assert refreshed_follow_up.merge_status is None
+    assert repo_git.ref_exists.call_args_list
+    repo_git.is_merged.assert_called_once_with(
+        "origin/feature/watch-target-already-merged",
+        "main",
+    )
+    log_text = log_path.read_text()
+    assert f"{owner.id}: already merged into target branch" in log_text
+
+
+def test_watch_target_already_merged_skip_repairs_owner_unit_via_shared_reconcile(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Watch implement owner", task_type="implement")
+    store.mark_completed(owner, has_commits=True, branch="feature/watch-target-already-merged")
+    assert owner.id is not None
+    store.set_merge_status(owner.id, "unmerged")
+
+    follow_up = store.add(
+        "Watch improve descendant",
+        task_type="improve",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    store.mark_completed(follow_up, has_commits=True, branch="feature/watch-target-already-merged")
+    assert follow_up.id is not None
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    repo_git = SimpleNamespace(
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=True),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: {
+                "feature/watch-target-already-merged": "head-watch-target-already-merged",
+                "main": "base-watch-target-already-merged",
+            }.get(ref)
+        ),
+        count_commits_ahead_checked=MagicMock(return_value=1),
+    )
+    skip_action = {
+        "type": "skip",
+        "description": "SKIP: target implementation already merged (merge-unit-merged)",
+        "advance_reason": "target-already-merged",
+    }
+
+    repaired = _maybe_repair_target_already_merged_skip(
+        store=store,
+        git=repo_git,
+        task=owner,
+        display_task=owner,
+        action=skip_action,
+        target_branch="main",
+        dry_run=False,
+        log=log,
+    )
+
+    assert repaired is True
+    owner_unit = store.resolve_merge_unit_for_task(owner.id)
+    follow_up_unit = store.resolve_merge_unit_for_task(follow_up.id)
+    assert owner_unit is not None
+    assert follow_up_unit is not None
+    assert owner_unit.id == follow_up_unit.id
+    assert owner_unit.state == "merged"
+    assert owner_unit.merged_by_task_id == owner.id
+    refreshed_owner = store.get(owner.id)
+    refreshed_follow_up = store.get(follow_up.id)
+    assert refreshed_owner is not None
+    assert refreshed_follow_up is not None
+    assert refreshed_owner.merge_status == "merged"
+    assert refreshed_follow_up.merge_status is None
+    repo_git.branch_exists.assert_called_once_with("feature/watch-target-already-merged")
+    repo_git.is_merged.assert_called_once_with("feature/watch-target-already-merged", into="main")
     log_text = log_path.read_text()
     assert f"{owner.id}: marked merged after shared reconciliation against main" in log_text
 
