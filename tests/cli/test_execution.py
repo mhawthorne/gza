@@ -7526,7 +7526,7 @@ class TestCommentCommand:
         )
 
         assert result.returncode == 0
-        assert "Added comment" in result.stdout
+        assert f"Added feedback comment 1 to task {task.id}" in result.stdout
         comments = store.get_comments(task.id)
         assert len(comments) == 1
         assert comments[0].source == "direct"
@@ -7549,14 +7549,20 @@ class TestCommentCommand:
             "review_scope",
             "--project",
             str(tmp_path),
-            env={"FORCE_COLOR": ""},
         )
 
         assert result.returncode == 0
-        assert "Added comment" in result.stdout
+        assert f"Added review_scope comment 1 to task {task.id}" in result.stdout
         comments = store.get_comments(task.id)
         assert len(comments) == 1
         assert comments[0].kind == "review_scope"
+
+        show_result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert show_result.returncode == 0
+        assert "Comments:" in show_result.stdout
+        assert "kind=review_scope" in show_result.stdout
+        assert "Grade only the API validation slice." in show_result.stdout
 
 
 class TestReviewCommand:

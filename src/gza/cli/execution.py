@@ -3277,7 +3277,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
 
-    print(f"✓ Added comment {comment.id} to task {task_id}")
+    print(f"✓ Added {comment.kind} comment {comment.id} to task {task_id}")
     return 0
 
 

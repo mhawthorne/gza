@@ -539,6 +539,22 @@ class TestHelpOutput:
             assert expected in normalized_help
             assert expected in docs_text
 
+    def test_comment_kind_help_and_docs_are_aligned(self, tmp_path: Path) -> None:
+        """`comment --kind` should document the supported kinds and default behavior."""
+        setup_config(tmp_path)
+
+        help_result = invoke_gza("comment", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+
+        normalized_help = " ".join(help_result.stdout.split()).lower()
+        docs_text = _normalized_markdown_section(Path("docs/configuration.md"), "comment").lower()
+
+        assert "--kind {feedback,review_scope}" in normalized_help
+        assert "default: feedback" in normalized_help
+        assert "--kind feedback\\|review_scope" in docs_text
+        assert "default improve-actionable comment kind" in docs_text
+        assert "operator-supplied review-scope metadata" in docs_text
+
     def test_sync_help_and_docs_describe_explicit_branch_and_pr_reconciliation(self, tmp_path):
         """`sync --help` and docs should keep sync as the broader explicit maintenance surface."""
         setup_config(tmp_path)

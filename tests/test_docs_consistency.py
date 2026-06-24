@@ -392,6 +392,8 @@ def test_configuration_docs_include_comment_command_reference() -> None:
         "### comment",
         "gza comment <task_id> <text> [options]",
         "| `task_id` | Full prefixed task ID to comment on",
+        "`feedback` remains the default improve-actionable comment kind",
+        "`--kind review_scope`",
         "When task comments exist, `gza show` also includes a `Comments:` section",
         "When tasks have comments, `gza history` includes a `comments: N` indicator",
     ]
