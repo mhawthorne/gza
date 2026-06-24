@@ -3,7 +3,9 @@
 from dataclasses import fields
 from pathlib import Path
 
-from gza.config import Config
+import pytest
+
+from gza.config import Config, ConfigError
 from gza.config_schema import (
     CONFIG_KEY_REGISTRY,
     NON_CONFIG_ROOT_KEYS,
@@ -106,3 +108,52 @@ def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path)
 
     assert config.plan_slice_target_timeout_minutes is None
     assert config.get_plan_slice_target_timeout_minutes() == 62
+
+
+def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
+    """docker_startup_timeout should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "docker_startup_timeout: 60\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.docker_startup_timeout == 60
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", '"60"'])
+def test_config_load_rejects_invalid_docker_startup_timeout(tmp_path, value: str) -> None:
+    """Load should reject non-positive and non-integer docker_startup_timeout values."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        f"docker_startup_timeout: {value}\n"
+    )
+
+    expected = (
+        "'docker_startup_timeout' must be positive"
+        if value in {"0", "-1"}
+        else "'docker_startup_timeout' must be an integer"
+    )
+    with pytest.raises(ConfigError, match=expected):
+        Config.load(tmp_path)
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("0", "'docker_startup_timeout' must be positive"),
+    ("-1", "'docker_startup_timeout' must be positive"),
+    ("1.5", "'docker_startup_timeout' must be an integer"),
+    ('"60"', "'docker_startup_timeout' must be an integer"),
+])
+def test_config_validate_rejects_invalid_docker_startup_timeout(tmp_path, value: str, expected: str) -> None:
+    """Validate should report shared positive-int wording for docker_startup_timeout."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        f"docker_startup_timeout: {value}\n"
+    )
+
+    is_valid, errors, warnings = Config.validate(tmp_path)
+
+    assert not is_valid
+    assert expected in errors
+    assert warnings == []

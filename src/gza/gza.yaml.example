@@ -53,6 +53,10 @@ project_name: my-project
 # Default: ""
 # docker_setup_command: ""
 
+# Seconds to wait for Docker daemon startup or wake-up before treating Docker as unavailable.
+# Default: 60
+# docker_startup_timeout: 60
+
 # Extra Docker volume mounts (`source:dest[:mode]`).
 # Default: []
 # docker_volumes: []

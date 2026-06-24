@@ -56,6 +56,7 @@ _SECTIONS: tuple[_Section, ...] = (
         "Execution",
         (
             "use_docker",
+            "docker_startup_timeout",
             "docker_image",
             "docker_volumes",
             "docker_setup_command",

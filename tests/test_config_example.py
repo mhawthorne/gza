@@ -66,6 +66,20 @@ def test_full_config_example_groups_code_task_diff_timeout_keys_under_execution(
     assert not other_header or timeout_key not in other_section
 
 
+def test_full_config_example_groups_docker_startup_timeout_under_execution() -> None:
+    rendered = render_config_example()
+
+    execution_start = rendered.index("# --- Execution ---")
+    branching_start = rendered.index("# --- Branching ---")
+    timeout_key = "# docker_startup_timeout: 60"
+
+    timeout_index = rendered.index(timeout_key)
+
+    assert execution_start < timeout_index < branching_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or timeout_key not in other_section
+
+
 def test_full_config_example_groups_review_verify_timeout_grace_under_review() -> None:
     rendered = render_config_example()
 

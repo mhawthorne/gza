@@ -91,6 +91,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("docker_volumes", "list[str]", [], "Extra Docker volume mounts (`source:dest[:mode]`)."),
     ConfigKeySpec("db_path", "str", ".gza/gza.db", "SQLite database path."),
+    ConfigKeySpec(
+        "docker_startup_timeout",
+        "int",
+        60,
+        "Seconds to wait for Docker daemon startup or wake-up before treating Docker as unavailable.",
+    ),
     ConfigKeySpec("inner_verify_command", "str", "", "Optional fast inner-loop verification command for code tasks; `verify_command` remains the required final gate."),
     ConfigKeySpec("interactive_worktree_dir", "str", "", "Base path for interactive worktree operations."),
     ConfigKeySpec("iterate_max_iterations", "int", 3, "Default iteration budget for `gza iterate`."),

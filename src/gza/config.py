@@ -52,6 +52,7 @@ DEFAULT_WORKERS_DIR = f".{APP_NAME}/workers"
 DEFAULT_TIMEOUT_MINUTES = 10
 DEFAULT_INNER_VERIFY_COMMAND = ""
 DEFAULT_USE_DOCKER = True
+DEFAULT_DOCKER_STARTUP_TIMEOUT = 60
 DEFAULT_ENFORCE_PROJECT_SCOPE = True
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
 DEFAULT_MAX_STEPS = 50
@@ -120,6 +121,7 @@ DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
 VALID_CONFIG_FIELDS = {
     "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
+    "docker_startup_timeout",
     "enforce_project_scope",
     "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps",
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
@@ -143,6 +145,7 @@ VALID_CONFIG_FIELDS = {
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
     "use_docker": None,
+    "docker_startup_timeout": None,
     "enforce_project_scope": None,
     "docker_image": None,
     "docker_volumes": None,
@@ -255,6 +258,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
 USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
     "use_docker": None,
+    "docker_startup_timeout": None,
     "enforce_project_scope": None,
     "docker_image": None,
     "docker_volumes": None,
@@ -952,6 +956,7 @@ class Config:
     tasks_file: str = DEFAULT_TASKS_FILE
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
+    docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT
     enforce_project_scope: bool = DEFAULT_ENFORCE_PROJECT_SCOPE
     docker_image: str = ""
     docker_volumes: list[str] = field(default_factory=list)
@@ -1453,6 +1458,11 @@ class Config:
         defaults = data.get("defaults", {})
 
         use_docker = data.get("use_docker", DEFAULT_USE_DOCKER)
+        docker_startup_timeout = _validate_optional_positive_int_field(
+            data.get("docker_startup_timeout", DEFAULT_DOCKER_STARTUP_TIMEOUT),
+            "docker_startup_timeout",
+        )
+        assert docker_startup_timeout is not None
         timeout_minutes = _validate_optional_positive_int_field(
             data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES),
             "timeout_minutes",
@@ -2271,6 +2281,7 @@ class Config:
             log_dir=data.get("log_dir", DEFAULT_LOG_DIR),
             db_path_value=db_path_raw or "",
             use_docker=use_docker,
+            docker_startup_timeout=docker_startup_timeout,
             enforce_project_scope=enforce_project_scope,
             docker_image=data.get("docker_image", ""),
             docker_volumes=docker_volumes,
@@ -2483,6 +2494,12 @@ class Config:
 
         if "use_docker" in data and not isinstance(data["use_docker"], bool):
             errors.append("'use_docker' must be a boolean (true/false)")
+        if "docker_startup_timeout" in data:
+            _validate_optional_positive_int_field(
+                data["docker_startup_timeout"],
+                "docker_startup_timeout",
+                errors=errors,
+            )
 
         if "enforce_project_scope" in data and not isinstance(data["enforce_project_scope"], bool):
             errors.append("'enforce_project_scope' must be a boolean (true/false)")

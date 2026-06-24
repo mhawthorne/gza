@@ -28,6 +28,7 @@ Gza reads configuration from three YAML layers:
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
+| `docker_startup_timeout` | Integer | `60` | Seconds to wait for Docker daemon startup or wake-up before treating Docker as unavailable |
 | `enforce_project_scope` | Boolean | `true` | Fail code-task commits that stage paths outside the project subtree or declared in-repo local deps. Tasks tagged `cross-project` may span multiple discovered project roots, including new roots declared by changed `gza.yaml` files on the branch, but still fail if they touch paths outside all discovered or branch-declared project roots. |
 | `docker_image` | String | `{project_name}-gza` | Custom Docker image name |
 | `docker_setup_command` | String | `""` | Pre-warm hook run synchronously in Docker before provider CLI starts |
@@ -108,7 +109,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -138,6 +139,7 @@ Example:
 ```yaml
 # gza.local.yaml
 use_docker: false
+docker_startup_timeout: 90
 timeout_minutes: 30
 inner_verify_command: ./bin/tests --quick
 docker_volumes:
