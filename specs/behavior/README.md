@@ -40,6 +40,7 @@ Additional rules for authors:
 |------|------|
 | [00-overview.md](00-overview.md) | Shared model for the whole set: vocabulary, system-wide invariants, lifecycle diagram, and the consolidated human-escalation table. |
 | [lifecycle-engine.md](lifecycle-engine.md) | Engine-only decision rules: ordered rule set, policy knobs, parked reason codes, and ratified decisions. |
+| [main-verify-self-heal.md](main-verify-self-heal.md) | North-star convergence contract for red local-target integration verify: rerun-before-reuse, bounded red lifetime, deterministic-red repair, and no merge-stall-to-launch-stall cascade. |
 | [lineage.md](lineage.md) | Task-graph operations: dependency satisfaction, owner/merge-unit resolution, latest-node resolution, and recovery-target attachment. |
 | [recovery.md](recovery.md) | Failed-task recovery policy: moot vs recoverable terminal no-work (`empty`/`redundant`) states, resume vs retry vs manual stop. |
 | [watch-supervisor.md](watch-supervisor.md) | Runtime loop contract for `gza watch`: cycle order, slot accounting, adoption, restart, and stop/backoff behavior. |

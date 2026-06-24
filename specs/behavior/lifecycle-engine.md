@@ -364,6 +364,9 @@ failure *and* actionable merge/review work remains eligible for the latter.
   automation MUST halt further merges for the cycle and surface one durable
   needs-attention signal with reason `main-integration-verify-red` that names the failing
   local target SHA and, when structured phase output exists, the failing phase. Projects
+  must apply the convergence contract in
+  [main-verify-self-heal.md](main-verify-self-heal.md) when that red state is reused,
+  refreshed, repaired, or escalated. Projects
   with no configured
   `verify_command` are an explicit no-gate exception: they MAY persist an `unavailable`
   checkpoint with `exit_status="not configured"` for visibility, but that checkpoint MUST

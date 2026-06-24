@@ -91,6 +91,56 @@ def test_behavior_specs_cross_link_watch_supervisor_boundary() -> None:
     assert "Installed-code drift triggers re-exec at the next" in supervisor
 
 
+def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
+    """The red-main convergence contract should stay indexed and cross-linked into the runtime specs."""
+    repo_root = Path(__file__).resolve().parents[1]
+    behavior_readme = (repo_root / "specs" / "behavior" / "README.md").read_text()
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
+    contract = (repo_root / "specs" / "behavior" / "main-verify-self-heal.md").read_text()
+    contract_flat = " ".join(contract.split())
+
+    assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in behavior_readme
+    assert "North-star convergence contract for red local-target integration verify" in behavior_readme
+
+    assert "### MV1 — Red verify state MUST converge" in contract
+    assert "### MV2 — Red verdicts MUST be re-verified before automation acts on them" in contract
+    assert "### MV3 — Red checkpoints MUST have a bounded lifetime even on an unchanged tree" in contract
+    assert "### MV4 — Confirmed deterministic red MUST trigger bounded repair plus alert" in contract
+    assert "### MV5 — Red merge freezes MUST NOT hard-park downstream work" in contract
+    assert "A merge stall MUST NOT convert into a launch stall." in contract
+    assert "The shared no-progress backstop MUST count only actually executed unchanged actions." in contract
+    assert "Future behavior-check findings against this area MUST classify implementation drift" in contract_flat
+
+    assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in lifecycle
+    assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in supervisor
+    assert "main-integration-verify-red" in lifecycle
+    assert "main-integration-verify-red" in supervisor
+
+
+def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
+    """Behavior-check instructions should define a stable namespace for the red-main contract."""
+    repo_root = Path(__file__).resolve().parents[1]
+    behavior_check = (repo_root / "src" / "gza" / "skills" / "gza-behavior-check" / "SKILL.md").read_text()
+    behavior_check_flat = " ".join(behavior_check.split())
+
+    required_snippets = [
+        "- `MV` — `main-verify-self-heal.md`",
+        "`MV-MV2-RERUN-BEFORE-REUSE`",
+        "`MV-MV5-NO-LAUNCH-STALL`",
+    ]
+
+    for snippet in required_snippets:
+        assert snippet in behavior_check
+
+    assert "Current tracked behavior-spec prefixes:" in behavior_check
+    assert "stable short prefix for the source behavior spec" in behavior_check_flat
+    assert (
+        "If a new behavior spec is added, assign it a stable doc prefix before reporting findings "
+        "from it."
+    ) in behavior_check_flat
+
+
 def test_watch_feature_spec_distinguishes_worker_consuming_capacity_from_direct_recovery() -> None:
     """Feature spec should match the watch scheduler contract for recovery slot usage."""
     repo_root = Path(__file__).resolve().parents[1]

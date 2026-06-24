@@ -54,14 +54,27 @@ an atomic, checkable assertion. Normative statements are:
   *value* is not).
 
 Give each assertion a **stable ID** derived from its location, so findings are traceable
-and re-runs are diffable. Scheme: `<DOC>-<SECTION>-<SLUG>`, where `DOC` is `OV`
-(00-overview) or `LE` (lifecycle-engine), `SECTION` is the anchor (`INV3`, `P4`, `§6`,
-`RC`, `KNOB`), and `SLUG` is a few-word kebab tag. Examples:
+and re-runs are diffable. Scheme: `<DOC>-<SECTION>-<SLUG>`, where `DOC` is a stable
+short prefix for the source behavior spec, `SECTION` is the local anchor (`INV3`, `P4`,
+`§6`, `MV2`, `RC`, `KNOB`), and `SLUG` is a few-word kebab tag.
+
+Current tracked behavior-spec prefixes:
+
+- `OV` — `00-overview.md`
+- `LE` — `lifecycle-engine.md`
+- `WS` — `watch-supervisor.md`
+- `MV` — `main-verify-self-heal.md`
+
+If a new behavior spec is added, assign it a stable doc prefix before reporting findings
+from it. Do not reuse or silently invent prefixes mid-report; list the chosen mapping in
+the assertion inventory first. Examples:
 
 - `LE-§6-IMPROVE-CHAIN` — "queries MUST follow the review link, not the impl link."
 - `LE-P4-LOCAL-TARGET` — "merge-ness MUST be proven against the local target, never origin."
 - `OV-INV2-BOUNDED-LOOPS` — "every loop MUST be bounded; hitting the bound escalates."
 - `LE-RC-rebase-did-not-unblock-merge` — that reason code exists and is emitted on §4.
+- `MV-MV2-RERUN-BEFORE-REUSE` — red verdicts MUST be re-verified before automation acts.
+- `MV-MV5-NO-LAUNCH-STALL` — red merge freezes MUST NOT hard-park downstream work.
 
 List the assertions before checking them, so the report can show total coverage.
 

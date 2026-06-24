@@ -91,8 +91,10 @@ Each watch cycle MUST execute these phases in order:
    More generally, if that verify is not `passed`, watch MUST halt further merges for the
    current cycle and emit one visible durable attention row with reason
    `main-integration-verify-red` naming the failing target SHA and, when structured phase
-   output exists, the failing phase. If no `verify_command` is configured for the project,
-   that is an explicit no-gate
+   output exists, the failing phase. The convergence requirements for how that red state
+   self-heals or escalates over time are owned by
+   [main-verify-self-heal.md](main-verify-self-heal.md). If no `verify_command` is
+   configured for the project, that is an explicit no-gate
    exception: watch MAY record an `unavailable` checkpoint with
    `exit_status="not configured"` but MUST NOT halt merges or emit red-main attention for it.
 4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
