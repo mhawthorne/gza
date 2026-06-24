@@ -172,6 +172,15 @@ class ReviewBlockerAdjudicationCandidate:
 
 
 @dataclass(frozen=True)
+class ReviewBlockerResolutionStatus:
+    """Latest persisted resolution state for one current review blocker."""
+
+    finding: ReviewFinding
+    latest_artifact: TaskArtifact | None = None
+    state: str | None = None
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -232,6 +241,11 @@ class AdvanceContext:
     consecutive_noop_improves: int = 0
     noop_improve_trigger: str | None = None
     noop_improve_verify_probe_warning: str | None = None
+    review_blocker_resolution_statuses: tuple[ReviewBlockerResolutionStatus, ...] = ()
+    review_blockers_invalidated: bool = False
+    review_blockers_revalidated: bool = False
+    review_blocker_adjudication_needed: bool = False
+    review_blocker_adjudication_needed_task: DbTask | None = None
     review_blocker_adjudication_candidate: ReviewBlockerAdjudicationCandidate | None = None
     active_review_blocker_adjudication: DbTask | None = None
     duplicate_blocker_streak: DuplicateBlockerStreak | None = None
@@ -691,6 +705,37 @@ def _has_persisted_noop_improve_verify_clearance(
     )
 
 
+def _review_has_current_verify_blocker_clearance(
+    *,
+    project_dir: Path,
+    review_task: DbTask,
+    current_branch: str | None,
+    current_head_sha: str | None,
+    improve_tasks: list[DbTask],
+) -> bool:
+    """Return whether runner-owned same-head evidence clears current verify blockers."""
+    if review_task.review_verify_status != "failed":
+        return False
+    if not current_branch or review_task.review_verify_branch != current_branch:
+        return False
+    if not current_head_sha or review_task.review_verify_head_sha != current_head_sha:
+        return False
+    blocker_summary = summarize_review_blockers(get_review_content(project_dir, review_task))
+    if blocker_summary.verify_failure_count + blocker_summary.verify_timeout_count == 0:
+        return False
+    return any(
+        improve.status == "completed"
+        and improve.changed_diff is False
+        and _task_has_current_passing_review_verify_evidence(
+            task=improve,
+            review_task=review_task,
+            current_branch=current_branch,
+            current_head_sha=current_head_sha,
+        )
+        for improve in improve_tasks
+    )
+
+
 def _primary_blocker_fingerprint(
     report: ParsedReviewReport,
 ) -> tuple[tuple[str, str], str, str] | None:
@@ -780,41 +825,135 @@ def _resolution_fingerprint_tuple(metadata: Mapping[str, Any]) -> tuple[str, str
 def _latest_disputed_blocker_artifact_for_review(
     store: SqliteTaskStore,
     *,
-    review_task: DbTask,
-    findings: tuple[ReviewFinding, ...],
+    resolution_statuses: tuple[ReviewBlockerResolutionStatus, ...],
     latest_noop_improve: DbTask | None,
 ) -> ReviewBlockerAdjudicationCandidate | None:
-    if review_task.id is None or latest_noop_improve is None or latest_noop_improve.id is None:
+    if latest_noop_improve is None or latest_noop_improve.id is None:
         return None
 
-    findings_by_fingerprint = {
-        details[0]: finding
-        for finding in findings
-        if finding.severity == "BLOCKER"
-        and classify_review_blocker_finding(finding) == "code"
-        and (details := get_review_finding_fingerprint_details(finding)) is not None
-    }
-    if not findings_by_fingerprint:
-        return None
-
-    for artifact in store.list_artifacts(review_task.id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND):
-        metadata = artifact.metadata or {}
-        if metadata.get("state") != "disputed":
+    for status in resolution_statuses:
+        artifact = status.latest_artifact
+        metadata = artifact.metadata if artifact is not None else None
+        if status.state != "disputed" or artifact is None or metadata is None:
             continue
         if metadata.get("source_task_id") != latest_noop_improve.id:
             continue
-        fingerprint = _resolution_fingerprint_tuple(metadata)
-        if fingerprint is None:
-            continue
-        finding = findings_by_fingerprint.get(fingerprint)
-        if finding is None:
-            continue
         return ReviewBlockerAdjudicationCandidate(
-            finding=finding,
+            finding=status.finding,
             dispute_artifact=artifact,
         )
 
     return None
+
+
+def _latest_review_blocker_resolution_statuses(
+    store: SqliteTaskStore,
+    *,
+    git: Any,
+    project_dir: Path,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    improve_tasks: list[DbTask],
+) -> tuple[ReviewBlockerResolutionStatus, ...]:
+    if review_task.id is None or impl_task.id is None:
+        return ()
+
+    branch_head = _resolve_branch_head_sha(git, impl_task.branch)
+    current_head_sha = branch_head.head_sha
+    verify_blockers_cleared = (
+        _review_has_current_verify_blocker_clearance(
+            project_dir=project_dir,
+            review_task=review_task,
+            current_branch=impl_task.branch,
+            current_head_sha=current_head_sha,
+            improve_tasks=improve_tasks,
+        )
+        if current_head_sha is not None
+        else False
+    )
+
+    blockers: list[tuple[ReviewFinding, str, tuple[str, str] | None]] = []
+    for finding in findings:
+        if finding.severity != "BLOCKER":
+            continue
+        finding_kind = classify_review_blocker_finding(finding)
+        fingerprint_details = (
+            get_review_finding_fingerprint_details(finding) if finding_kind == "code" else None
+        )
+        blockers.append(
+            (
+                finding,
+                finding_kind,
+                fingerprint_details[0] if fingerprint_details is not None else None,
+            )
+        )
+    if not blockers:
+        return ()
+
+    artifacts_by_key: dict[tuple[str, tuple[str, str]], list[TaskArtifact]] = {}
+    for artifact in store.list_artifacts(review_task.id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND):
+        metadata = artifact.metadata or {}
+        if metadata.get("impl_task_id") != impl_task.id:
+            continue
+        finding_id = metadata.get("finding_id")
+        fingerprint = _resolution_fingerprint_tuple(metadata)
+        if not isinstance(finding_id, str) or fingerprint is None:
+            continue
+        key = (finding_id, fingerprint)
+        artifacts_by_key.setdefault(key, []).append(artifact)
+
+    statuses: list[ReviewBlockerResolutionStatus] = []
+    for finding, finding_kind, fingerprint in blockers:
+        latest_artifact: TaskArtifact | None = None
+        state: str | None = None
+        if finding_kind == "code" and fingerprint is not None:
+            relevant_artifacts = sorted(
+                artifacts_by_key.get((finding.id, fingerprint), []),
+                key=lambda artifact: _normalize_time(artifact.created_at),
+            )
+            latest_dispute = next(
+                (
+                    artifact
+                    for artifact in reversed(relevant_artifacts)
+                    if (artifact.metadata or {}).get("state") == "disputed"
+                ),
+                None,
+            )
+            if latest_dispute is not None:
+                latest_dispute_metadata = latest_dispute.metadata or {}
+                dispute_source_task_id = latest_dispute_metadata.get("source_task_id")
+                dispute_head_sha = latest_dispute.head_sha
+                latest_artifact = latest_dispute
+                state = "disputed"
+                for artifact in reversed(relevant_artifacts):
+                    metadata = artifact.metadata or {}
+                    raw_state = metadata.get("state")
+                    if raw_state not in {"invalid", "valid", "needs_human"}:
+                        continue
+                    if metadata.get("dispute_source_task_id") != dispute_source_task_id:
+                        continue
+                    if dispute_head_sha != artifact.head_sha:
+                        continue
+                    latest_artifact = artifact
+                    state = raw_state
+                    break
+            elif relevant_artifacts:
+                latest_artifact = relevant_artifacts[-1]
+                metadata = latest_artifact.metadata or {}
+                raw_state = metadata.get("state")
+                if isinstance(raw_state, str) and raw_state:
+                    state = raw_state
+        elif finding_kind != "code" and verify_blockers_cleared:
+            state = "verify_cleared"
+        statuses.append(
+            ReviewBlockerResolutionStatus(
+                finding=finding,
+                latest_artifact=latest_artifact,
+                state=state,
+            )
+        )
+    return tuple(statuses)
 
 
 def _resolve_review_blocker_adjudication_task(
@@ -826,12 +965,23 @@ def _resolve_review_blocker_adjudication_task(
 ) -> DbTask | None:
     if review_task is None or review_task.id is None or impl_task.id is None or candidate is None:
         return None
+    dispute_metadata = candidate.dispute_artifact.metadata or {}
+    dispute_source_task_id = (
+        str(dispute_metadata.get("source_task_id", "")).strip() or None
+    )
+    dispute_head_sha = str(dispute_metadata.get("head_sha", "")).strip() or None
     return find_existing_review_blocker_adjudication_task(
         store,
         review_task_id=review_task.id,
         impl_task_id=impl_task.id,
         finding_id=candidate.finding.id,
+        dispute_source_task_id=dispute_source_task_id,
+        dispute_head_sha=dispute_head_sha,
     )
+
+
+def _review_blocker_status_clears_current_blocker(status: ReviewBlockerResolutionStatus) -> bool:
+    return status.state in {"invalid", "verify_cleared"}
 
 
 def _task_id(task: DbTask | None) -> str:
@@ -908,6 +1058,12 @@ def _merge_review_description(verdict: str, preserved_rebase: DbTask | None) -> 
     return f"Merge (review {verdict}, preserved across rebase {_task_id(preserved_rebase)})"
 
 
+def _merge_review_cleared_description(ctx: AdvanceContext) -> str:
+    if getattr(ctx, "review_blockers_invalidated", False):
+        return "Merge (review-blocker-invalid: disputed blocker invalidated by adjudication)"
+    return "Merge (previous review addressed)"
+
+
 def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
     if ctx.latest_noop_improve is None or ctx.consecutive_noop_improves <= 0:
         return ""
@@ -925,15 +1081,42 @@ def _needs_attention_subject_id(ctx: AdvanceContext) -> str | None:
 def _review_blocker_adjudication_description(ctx: AdvanceContext) -> str:
     candidate = ctx.review_blocker_adjudication_candidate
     finding_id = candidate.finding.id if candidate is not None else "unknown"
-    return f"Create adjudication for disputed blocker {finding_id} on review {_task_id(ctx.latest_completed_review)}"
+    return (
+        "Create review-blocker-disputed adjudication for blocker "
+        f"{finding_id} on review {_task_id(ctx.latest_completed_review)}"
+    )
 
 
 def _run_review_blocker_adjudication_description(adjudication_task: DbTask | None) -> str:
-    return f"Spawn worker for pending adjudication {_task_id(adjudication_task)}"
+    return f"Spawn worker for review-blocker-disputed adjudication {_task_id(adjudication_task)}"
 
 
 def _wait_review_blocker_adjudication_description(adjudication_task: DbTask | None) -> str:
-    return f"SKIP: adjudication {_task_id(adjudication_task)} is in_progress"
+    return f"SKIP: review-blocker-disputed adjudication {_task_id(adjudication_task)} is in_progress"
+
+
+def _review_blocker_adjudication_needed_action(ctx: AdvanceContext) -> dict[str, Any]:
+    adjudication_task = getattr(ctx, "review_blocker_adjudication_needed_task", None)
+    task_id = _task_id(adjudication_task)
+    status = adjudication_task.status if adjudication_task is not None else "unknown"
+    if status == "completed":
+        detail = "completed with an unparseable or unsafe result"
+    elif status == "failed":
+        detail = "failed"
+    else:
+        detail = f"returned {status}"
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                "SKIP: review-blocker-adjudication-needed; adjudication "
+                f"{task_id} {detail}. Review the dispute evidence and resolve the blocker manually."
+            ),
+            "review_adjudication_task": adjudication_task,
+        },
+        reason="review-blocker-adjudication-needed",
+        subject_task_id=_needs_attention_subject_id(ctx),
+    )
 
 
 def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -1992,6 +2175,11 @@ def _resolve_review_state(
     int,
     str | None,
     str | None,
+    tuple[ReviewBlockerResolutionStatus, ...],
+    bool,
+    bool,
+    bool,
+    DbTask | None,
     ReviewBlockerAdjudicationCandidate | None,
     DbTask | None,
     bool,
@@ -2025,6 +2213,11 @@ def _resolve_review_state(
     consecutive_noop_improves = 0
     noop_improve_trigger: str | None = None
     noop_improve_verify_probe_warning: str | None = None
+    review_blocker_resolution_statuses: tuple[ReviewBlockerResolutionStatus, ...] = ()
+    review_blockers_invalidated = False
+    review_blockers_revalidated = False
+    review_blocker_adjudication_needed = False
+    review_blocker_adjudication_needed_task: DbTask | None = None
     review_blocker_adjudication_candidate: ReviewBlockerAdjudicationCandidate | None = None
     active_review_blocker_adjudication: DbTask | None = None
     has_improve_after_review = False
@@ -2090,10 +2283,33 @@ def _resolve_review_state(
 
         if review_verdict == "CHANGES_REQUESTED":
             completed_review_cycles = count_completed_review_cycles(store, task.id)
+            review_blocker_resolution_statuses = _latest_review_blocker_resolution_statuses(
+                store,
+                git=git,
+                project_dir=Path(config.project_dir),
+                review_task=latest_completed_review,
+                impl_task=task,
+                findings=review_report.findings,
+                improve_tasks=improve_tasks,
+            )
+            all_current_review_blockers_cleared = bool(review_blocker_resolution_statuses) and all(
+                _review_blocker_status_clears_current_blocker(status)
+                for status in review_blocker_resolution_statuses
+            )
+            review_blockers_invalidated = all_current_review_blockers_cleared and any(
+                status.state == "invalid" for status in review_blocker_resolution_statuses
+            )
+            review_blockers_revalidated = any(
+                status.state == "valid" for status in review_blocker_resolution_statuses
+            )
+            if all_current_review_blockers_cleared:
+                review_cleared = True
+            if review_blockers_revalidated:
+                consecutive_noop_improves = 0
+                latest_noop_improve = None
             review_blocker_adjudication_candidate = _latest_disputed_blocker_artifact_for_review(
                 store,
-                review_task=latest_completed_review,
-                findings=review_report.findings,
+                resolution_statuses=review_blocker_resolution_statuses,
                 latest_noop_improve=latest_noop_improve,
             )
             active_review_blocker_adjudication = _resolve_review_blocker_adjudication_task(
@@ -2102,6 +2318,22 @@ def _resolve_review_state(
                 impl_task=task,
                 candidate=review_blocker_adjudication_candidate,
             )
+            needs_human_status = next(
+                (status for status in review_blocker_resolution_statuses if status.state == "needs_human"),
+                None,
+            )
+            if needs_human_status is not None:
+                review_blocker_adjudication_needed = True
+                source_task_id = (needs_human_status.latest_artifact.metadata or {}).get("source_task_id") if needs_human_status.latest_artifact is not None else None
+                if isinstance(source_task_id, str):
+                    review_blocker_adjudication_needed_task = store.get(source_task_id)
+            elif active_review_blocker_adjudication is not None and active_review_blocker_adjudication.status in {
+                "completed",
+                "failed",
+            }:
+                if not review_blockers_invalidated and not review_blockers_revalidated:
+                    review_blocker_adjudication_needed = True
+                    review_blocker_adjudication_needed_task = active_review_blocker_adjudication
 
         verify_timeout_only_reviews: list[DbTask] = []
         for review_task in completed_reviews:
@@ -2141,6 +2373,11 @@ def _resolve_review_state(
         consecutive_noop_improves,
         noop_improve_trigger,
         noop_improve_verify_probe_warning,
+        review_blocker_resolution_statuses,
+        review_blockers_invalidated,
+        review_blockers_revalidated,
+        review_blocker_adjudication_needed,
+        review_blocker_adjudication_needed_task,
         review_blocker_adjudication_candidate,
         active_review_blocker_adjudication,
         has_improve_after_review,
@@ -2652,6 +2889,11 @@ def resolve_advance_context(
         consecutive_noop_improves,
         noop_improve_trigger,
         noop_improve_verify_probe_warning,
+        review_blocker_resolution_statuses,
+        review_blockers_invalidated,
+        review_blockers_revalidated,
+        review_blocker_adjudication_needed,
+        review_blocker_adjudication_needed_task,
         review_blocker_adjudication_candidate,
         active_review_blocker_adjudication,
         has_improve_after_review,
@@ -2698,6 +2940,11 @@ def resolve_advance_context(
         consecutive_noop_improves=consecutive_noop_improves,
         noop_improve_trigger=noop_improve_trigger,
         noop_improve_verify_probe_warning=noop_improve_verify_probe_warning,
+        review_blocker_resolution_statuses=review_blocker_resolution_statuses,
+        review_blockers_invalidated=review_blockers_invalidated,
+        review_blockers_revalidated=review_blockers_revalidated,
+        review_blocker_adjudication_needed=review_blocker_adjudication_needed,
+        review_blocker_adjudication_needed_task=review_blocker_adjudication_needed_task,
         review_blocker_adjudication_candidate=review_blocker_adjudication_candidate,
         active_review_blocker_adjudication=active_review_blocker_adjudication,
         has_improve_after_review=has_improve_after_review,
@@ -3435,6 +3682,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="review_blocker_adjudication_needed",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.review_blocker_adjudication_needed,
+        action=_review_blocker_adjudication_needed_action,
+    ),
+    AdvanceRule(
         name="review_wait_blocker_adjudication",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
@@ -3549,7 +3803,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and has_valid_review_for_merge(ctx)
         and ctx.review_cleared
         and ctx.latest_completed_review is not None,
-        action=lambda ctx: {"type": "merge", "description": "Merge (previous review addressed)"},
+        action=lambda ctx: {"type": "merge", "description": _merge_review_cleared_description(ctx)},
     ),
     AdvanceRule(
         name="non_implement_no_review",

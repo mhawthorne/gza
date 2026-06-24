@@ -13103,6 +13103,69 @@ class TestIterateCommand:
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
+    def test_iterate_surfaces_review_blocker_adjudication_needed_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={
+                    "type": "needs_discussion",
+                    "description": "SKIP: review-blocker-adjudication-needed; adjudication gza-999 completed with an unparseable or unsafe result.",
+                    "needs_attention_reason": "review-blocker-adjudication-needed",
+                    "subject_task_id": impl.id,
+                },
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        assert "Needs attention:" in output
+        assert "reason=review-blocker-adjudication-needed" in output
+        assert "review-blocker-adjudication-needed" in output
+
     def test_iterate_failed_improve_attention_uses_shortened_single_line_prompt(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

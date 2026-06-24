@@ -3276,9 +3276,736 @@ def test_disputed_noop_improve_routes_to_review_blocker_adjudication(tmp_path: P
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
     assert action["type"] == "create_review_adjudication"
+    assert "review-blocker-disputed" in action["description"]
     candidate = action["review_blocker_adjudication_candidate"]
     assert candidate.finding.id == "B1"
     assert action["review_task"].id == review.id
+
+
+def test_invalid_adjudication_clears_review_and_surfaces_invalid_status(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-invalid",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    adjudication = store.add(
+        f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+        f"Dispute source task: {improve.id}\n",
+        task_type="internal",
+        based_on=review.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    store.update(adjudication)
+    assert improve.id is not None
+    assert adjudication.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="invalid-B1",
+        path=".gza/artifacts/invalid-b1.txt",
+        byte_size=0,
+        sha256="1" * 64,
+        status="invalid",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "invalid",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": adjudication.id,
+            "source_task_type": "internal",
+            "finding_id": "B1",
+            "dispute_source_task_id": improve.id,
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=adjudication.completed_at,
+    )
+
+    ctx = resolve_advance_context(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert ctx.review_cleared is True
+    assert ctx.review_blockers_invalidated is True
+    assert action["type"] == "merge"
+    assert "review-blocker-invalid" in action["description"]
+
+
+def test_invalid_code_adjudication_does_not_clear_mixed_review_without_current_verify_provenance(
+    tmp_path: Path,
+) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-mixed-review-still-blocked",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- One code blocker was disputed, but verify still fails.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "### B2 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    adjudication = store.add(
+        f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+        f"Dispute source task: {improve.id}\n",
+        task_type="internal",
+        based_on=review.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    store.update(adjudication)
+    assert improve.id is not None
+    assert adjudication.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        head_sha="current-sha",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "head_sha": "current-sha",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="invalid-B1",
+        path=".gza/artifacts/invalid-b1.txt",
+        byte_size=0,
+        sha256="1" * 64,
+        status="invalid",
+        exit_status="already_satisfied",
+        head_sha="current-sha",
+        metadata={
+            "schema_version": 1,
+            "state": "invalid",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": adjudication.id,
+            "source_task_type": "internal",
+            "head_sha": "current-sha",
+            "finding_id": "B1",
+            "dispute_source_task_id": improve.id,
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=adjudication.completed_at,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_cleared is False
+    assert ctx.review_blockers_invalidated is False
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert "review-blocker-invalid" not in action["description"]
+
+
+def test_invalid_code_adjudication_clears_mixed_review_once_current_verify_provenance_exists(
+    tmp_path: Path,
+) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-mixed-review-cleared",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- One code blocker was disputed, but verify still fails.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "### B2 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "current-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(improve)
+    adjudication = store.add(
+        f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+        f"Dispute source task: {improve.id}\n",
+        task_type="internal",
+        based_on=review.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    store.update(adjudication)
+    assert improve.id is not None
+    assert adjudication.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        head_sha="current-sha",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "head_sha": "current-sha",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="invalid-B1",
+        path=".gza/artifacts/invalid-b1.txt",
+        byte_size=0,
+        sha256="1" * 64,
+        status="invalid",
+        exit_status="already_satisfied",
+        head_sha="current-sha",
+        metadata={
+            "schema_version": 1,
+            "state": "invalid",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": adjudication.id,
+            "source_task_type": "internal",
+            "head_sha": "current-sha",
+            "finding_id": "B1",
+            "dispute_source_task_id": improve.id,
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=adjudication.completed_at,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_cleared is True
+    assert ctx.review_blockers_invalidated is True
+    assert action["type"] == "merge"
+    assert "review-blocker-invalid" in action["description"]
+
+
+def test_valid_adjudication_returns_to_normal_improve(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-valid",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    adjudication = store.add(
+        (
+            f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+            f"Dispute source task: {improve.id}\n"
+        ),
+        task_type="internal",
+        based_on=review.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    store.update(adjudication)
+    assert improve.id is not None
+    assert adjudication.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="valid-B1",
+        path=".gza/artifacts/valid-b1.txt",
+        byte_size=0,
+        sha256="2" * 64,
+        status="valid",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "valid",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": adjudication.id,
+            "source_task_type": "internal",
+            "finding_id": "B1",
+            "dispute_source_task_id": improve.id,
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=adjudication.completed_at,
+    )
+
+    ctx = resolve_advance_context(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert ctx.review_blockers_revalidated is True
+    assert ctx.consecutive_noop_improves == 0
+    assert action["type"] == "improve"
+    assert "review-blocker-disputed" not in action["description"]
+
+
+def test_unparseable_adjudication_parks_with_specific_attention_reason(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-unparseable",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    adjudication = store.add(
+        (
+            f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+            f"Dispute source task: {improve.id}\n"
+        ),
+        task_type="internal",
+        based_on=review.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    store.update(adjudication)
+    assert improve.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+
+    ctx = resolve_advance_context(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert ctx.review_blocker_adjudication_needed is True
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-blocker-adjudication-needed"
+    assert "review-blocker-adjudication-needed" in action["description"]
+
+
+def test_stale_completed_adjudication_does_not_suppress_newer_dispute(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/disputed-blocker-fresh-dispute",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    old_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    stale_adjudication = store.add(
+        f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+        f"Dispute source task: {old_improve.id}\n"
+        "Dispute source head SHA: old-sha\n",
+        task_type="internal",
+        based_on=review.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    stale_adjudication.status = "completed"
+    stale_adjudication.completed_at = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    store.update(stale_adjudication)
+
+    new_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    assert old_improve.id is not None
+    assert new_improve.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1-old",
+        path=".gza/artifacts/disputed-b1-old.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        head_sha="old-sha",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": old_improve.id,
+            "source_task_type": "improve",
+            "head_sha": "old-sha",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "Old dispute evidence.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=old_improve.completed_at,
+    )
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1-new",
+        path=".gza/artifacts/disputed-b1-new.txt",
+        byte_size=0,
+        sha256="1" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        head_sha="new-sha",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": new_improve.id,
+            "source_task_type": "improve",
+            "head_sha": "new-sha",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "New dispute evidence.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=new_improve.completed_at,
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "create_review_adjudication"
+    assert action["review_blocker_adjudication_candidate"].dispute_artifact.label == "disputed-B1-new"
 
 
 def test_noop_improve_subject_is_implement_when_evaluated_from_improve_leaf(tmp_path: Path, monkeypatch) -> None:
@@ -3504,6 +4231,90 @@ def test_verify_only_noop_improve_with_persisted_green_verify_evidence_becomes_m
     assert ctx.review_cleared is True
     assert action["type"] == "merge"
     assert "improve-no-op" not in action["description"]
+
+
+def test_verify_only_noop_improve_does_not_enter_code_adjudication_lane(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-no-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    assert improve.id is not None
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": improve.id,
+            "source_task_type": "improve",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The verify lane was already green on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "verify_command failure: flaky unit lane",
+                "anchor": "rerun verify_command on the current tip.",
+            },
+        },
+        created_at=improve.completed_at,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_blocker_adjudication_candidate is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_verify_failure_only_noop_improve_with_same_head_green_evidence_merges(
@@ -7087,11 +7898,12 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "already_rebased_but_lineage_incomplete",
         "stale_review_needs_manual_refresh",
         "failed_rebase_without_successful_review",
-        "closing_review_invariant",
-        "fresh_comments_noop_improve_limit",
-        "review_verify_blocked_no_code_issues",
-        "review_noop_improve_limit",
-        "review_duplicate_blocker_no_progress",
+            "closing_review_invariant",
+            "fresh_comments_noop_improve_limit",
+            "review_blocker_adjudication_needed",
+            "review_verify_blocked_no_code_issues",
+            "review_noop_improve_limit",
+            "review_duplicate_blocker_no_progress",
         "review_max_cycles",
         "review_unknown_verdict",
         "implement_needs_manual_review",

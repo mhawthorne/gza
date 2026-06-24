@@ -9782,6 +9782,78 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
     ) == []
 
 
+def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path: Path) -> None:
+    from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-dispute-progress"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing API guard\n"
+        "Evidence: the current code still accepts empty IDs.\n"
+        "Open-state citation: `src/api.py:12-18`\n"
+        "Impact: invalid requests can crash the handler.\n"
+        "Required fix: reject empty IDs before calling the service.\n"
+        "Required tests: add regression coverage for empty IDs.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    action = {
+        "type": "create_review_adjudication",
+        "description": "Create review-blocker-disputed adjudication for blocker B1",
+    }
+    before = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=review)
+
+    store.add_artifact(
+        review.id,
+        kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+        label="disputed-B1",
+        path=".gza/artifacts/disputed-b1.txt",
+        byte_size=0,
+        sha256="0" * 64,
+        status="disputed",
+        exit_status="already_satisfied",
+        metadata={
+            "schema_version": 1,
+            "state": "disputed",
+            "review_task_id": review.id,
+            "impl_task_id": impl.id,
+            "source_task_id": impl.id,
+            "source_task_type": "improve",
+            "finding_id": "B1",
+            "reason": "already_satisfied",
+            "evidence": "The guard already exists on the current branch tip.",
+            "current_state_citation": "`src/api.py:12-18`",
+            "finding_fingerprint": {
+                "title": "missing api guard",
+                "anchor": "src/api.py:12-18",
+            },
+        },
+        created_at=datetime.now(UTC),
+    )
+
+    after = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=review)
+
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+
+
 def test_watch_cycle_pending_dispatch_parks_repeated_identical_no_progress_across_restart(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")

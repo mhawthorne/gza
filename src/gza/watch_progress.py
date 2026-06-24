@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .db import SqliteTaskStore, Task as DbTask, WatchProgressObservation, task_id_numeric_key
+from .runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
 
 WATCH_NO_PROGRESS_BACKSTOP_REASON = "watch-no-progress-backstop"
 
@@ -114,6 +115,78 @@ def _resolve_subject(
     return ("lineage", root.id, None, None, None)
 
 
+def _resolve_impl_for_review_progress(store: SqliteTaskStore, *, subject_task: DbTask, action_task: DbTask | None) -> DbTask | None:
+    if subject_task.task_type == "implement" and subject_task.id is not None:
+        return subject_task
+    if action_task is not None:
+        if action_task.task_type == "review" and action_task.depends_on:
+            candidate = store.get(action_task.depends_on)
+            if candidate is not None and candidate.task_type == "implement":
+                return candidate
+        if action_task.task_type == "internal" and action_task.depends_on:
+            candidate = store.get(action_task.depends_on)
+            if candidate is not None and candidate.task_type == "implement":
+                return candidate
+    current = subject_task
+    visited: set[str] = set()
+    while current.based_on:
+        if current.id is not None:
+            if current.id in visited:
+                break
+            visited.add(current.id)
+        parent = store.get(current.based_on)
+        if parent is None:
+            break
+        if parent.task_type == "implement":
+            return parent
+        current = parent
+    return None
+
+
+def _latest_review_resolution_progress_marker(
+    store: SqliteTaskStore,
+    *,
+    subject_task: DbTask,
+    action_task: DbTask | None,
+) -> dict[str, object | None] | None:
+    impl_task = _resolve_impl_for_review_progress(store, subject_task=subject_task, action_task=action_task)
+    if impl_task is None or impl_task.id is None:
+        return None
+    reviews = [
+        review
+        for review in store.get_reviews_for_task(impl_task.id)
+        if review.status == "completed" and review.id is not None
+    ]
+    if not reviews:
+        return None
+    latest_review = max(
+        reviews,
+        key=lambda review: (_normalize_time(review.completed_at or review.created_at), task_id_numeric_key(review.id)),
+    )
+    review_task_id = latest_review.id
+    if review_task_id is None:
+        return None
+    artifacts = store.list_artifacts(review_task_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+    if not artifacts:
+        return {"review_task_id": review_task_id, "resolution_state": None, "resolution_task_id": None}
+    latest_artifact = max(
+        artifacts,
+        key=lambda artifact: (
+            _normalize_time(artifact.created_at),
+            artifact.label or "",
+            artifact.path,
+        ),
+    )
+    metadata = latest_artifact.metadata or {}
+    return {
+        "review_task_id": review_task_id,
+        "resolution_state": metadata.get("state"),
+        "resolution_task_id": metadata.get("source_task_id"),
+        "resolution_finding_id": metadata.get("finding_id"),
+        "resolution_created_at": _normalize_time(latest_artifact.created_at).isoformat(),
+    }
+
+
 def build_watch_progress_candidate(
     store: SqliteTaskStore,
     *,
@@ -138,7 +211,7 @@ def build_watch_progress_candidate(
     action_task_started_at = action_task.started_at if action_task is not None else None
     action_task_running_pid = action_task.running_pid if action_task is not None else None
     failed_task_id = failed_task.id if failed_task is not None else None
-    evidence = {
+    evidence: dict[str, Any] = {
         "subject_task_id": subject_task.id,
         "action_task_id": action_task_id,
         "action_task_status": action_task_status,
@@ -154,6 +227,13 @@ def build_watch_progress_candidate(
         "action_type": action_type,
         "action_reason": action_reason,
     }
+    review_resolution_marker = _latest_review_resolution_progress_marker(
+        store,
+        subject_task=subject_task,
+        action_task=action_task,
+    )
+    if review_resolution_marker is not None:
+        evidence["review_resolution_marker"] = review_resolution_marker
     return WatchProgressCandidate(
         subject_kind=subject_kind,
         subject_id=subject_id,

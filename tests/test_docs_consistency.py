@@ -202,6 +202,7 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
     lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
     workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
     lifecycle_flat = " ".join(lifecycle.split())
+    workflow_flat = " ".join(workflow.split())
 
     assert "adjudication marking a disputed blocker `INVALID` for lifecycle" in overview
     assert "blocker adjudication needed" in overview
@@ -221,9 +222,12 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
     assert "structured `## Disputed Blockers` section" in workflow
     assert "required lifecycle contract is adjudication before the generic `improve-no-op`," in workflow
     assert "`duplicate-blocker-no-progress`, and `review-max-cycles` parks." in workflow
-    assert "deferred outside this workflow-doc slice" in workflow
-    assert "treat the spec as the source of truth" in workflow
-    assert "that mismatch is an implementation gap against the spec" in workflow
+    assert "lifecycle consumes those persisted outcomes immediately" in workflow
+    assert "`NEEDS_HUMAN` parks with `review-blocker-adjudication-needed`" in workflow
+    assert (
+        "Verify-only blockers remain governed by runner-owned same-branch, same-head verify provenance."
+        in workflow_flat
+    )
 
 
 def test_lifecycle_spec_preserves_typed_review_comment_contract() -> None:

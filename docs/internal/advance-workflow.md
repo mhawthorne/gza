@@ -185,10 +185,11 @@ table alone:
   required lifecycle contract is adjudication before the generic `improve-no-op`,
   `duplicate-blocker-no-progress`, and `review-max-cycles` parks. The current runtime
   plumbing now creates/runs one dedicated adjudication worker and persists its strict
-  `VALID | INVALID | NEEDS_HUMAN` outcome as a `review_blocker_resolution` artifact.
-  Follow-on lifecycle consumption of those persisted outcomes remains deferred outside this workflow-doc slice. Until
-  that lands, treat the spec as the source of truth for any remaining implementation
-  gaps rather than treating dispute evidence as no-op-only guidance.
+  `VALID | INVALID | NEEDS_HUMAN` outcome as a `review_blocker_resolution` artifact,
+  and lifecycle consumes those persisted outcomes immediately: `INVALID` clears only
+  the matching disputed CODE blocker, `VALID` re-opens the normal improve lane, and
+  `NEEDS_HUMAN` parks with `review-blocker-adjudication-needed`. Verify-only blockers
+  remain governed by runner-owned same-branch, same-head verify provenance.
 
 When the engine emits `improve`, the caller (iterate) delegates to `resolve_improve_action(store, impl_id, review_id, max_resume_attempts)` to pick one of:
 

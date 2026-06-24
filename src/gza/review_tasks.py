@@ -24,6 +24,14 @@ _DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(
 _REVIEW_BLOCKER_ADJUDICATION_PROMPT_PREFIX_RE = re.compile(
     r"^Adjudicate blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
+_REVIEW_BLOCKER_ADJUDICATION_SOURCE_TASK_RE = re.compile(
+    r"^Dispute source task:\s*(\S+)\s*$",
+    re.MULTILINE,
+)
+_REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE = re.compile(
+    r"^Dispute source head SHA:\s*(\S+)\s*$",
+    re.MULTILINE,
+)
 
 
 class DuplicateReviewError(ValueError):
@@ -221,6 +229,7 @@ def build_review_blocker_adjudication_prompt(
     dispute_evidence = str(dispute_metadata.get("evidence", "")).strip() or "not provided"
     current_state_citation = str(dispute_metadata.get("current_state_citation", "")).strip() or "not provided"
     source_task_id = str(dispute_metadata.get("source_task_id", "")).strip() or "unknown"
+    source_head_sha = str(dispute_metadata.get("head_sha", "")).strip()
     scope_citation = str(dispute_metadata.get("scope_citation", "")).strip()
     downstream_task_id = str(dispute_metadata.get("downstream_task_id", "")).strip()
     source_branch = str(dispute_metadata.get("source_branch", "")).strip()
@@ -243,6 +252,8 @@ def build_review_blocker_adjudication_prompt(
     ]
     if source_branch:
         lines.append(f"Dispute source branch: {source_branch}")
+    if source_head_sha:
+        lines.append(f"Dispute source head SHA: {source_head_sha}")
     lines.extend(
         [
             "",
@@ -341,6 +352,17 @@ def extract_review_blocker_adjudication_prompt_parts(prompt: str) -> tuple[str, 
     return match.group(1), match.group(2), match.group(3)
 
 
+def extract_review_blocker_adjudication_dispute_identity(
+    prompt: str,
+) -> tuple[str | None, str | None]:
+    """Return (source_task_id, head_sha) embedded in an adjudication prompt."""
+    source_task_match = _REVIEW_BLOCKER_ADJUDICATION_SOURCE_TASK_RE.search(prompt)
+    head_sha_match = _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE.search(prompt)
+    source_task_id = source_task_match.group(1) if source_task_match is not None else None
+    head_sha = head_sha_match.group(1) if head_sha_match is not None else None
+    return source_task_id, head_sha
+
+
 def find_existing_followup_task(
     store: SqliteTaskStore,
     *,
@@ -381,6 +403,8 @@ def find_existing_review_blocker_adjudication_task(
     review_task_id: str,
     impl_task_id: str,
     finding_id: str,
+    dispute_source_task_id: str | None = None,
+    dispute_head_sha: str | None = None,
 ) -> Task | None:
     """Return an existing adjudication task for (review, finding), if any."""
     prefix = build_review_blocker_adjudication_prompt_prefix(review_task_id, impl_task_id, finding_id)
@@ -388,6 +412,13 @@ def find_existing_review_blocker_adjudication_task(
         if child.task_type != "internal":
             continue
         if child.prompt.strip().startswith(prefix):
+            prompt_source_task_id, prompt_head_sha = (
+                extract_review_blocker_adjudication_dispute_identity(child.prompt)
+            )
+            if dispute_source_task_id is not None and prompt_source_task_id != dispute_source_task_id:
+                continue
+            if dispute_head_sha is not None and prompt_head_sha != dispute_head_sha:
+                continue
             return child
     return None
 
@@ -493,11 +524,15 @@ def create_or_reuse_review_blocker_adjudication_task(
     if impl_task.id is None:
         raise ValueError("Cannot create adjudication for implementation without an ID.")
 
+    dispute_source_task_id = str(dispute_metadata.get("source_task_id", "")).strip() or None
+    dispute_head_sha = str(dispute_metadata.get("head_sha", "")).strip() or None
     existing = find_existing_review_blocker_adjudication_task(
         store,
         review_task_id=review_task.id,
         impl_task_id=impl_task.id,
         finding_id=finding.id,
+        dispute_source_task_id=dispute_source_task_id,
+        dispute_head_sha=dispute_head_sha,
     )
     if existing is not None:
         return existing, False

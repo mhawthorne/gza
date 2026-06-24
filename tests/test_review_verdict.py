@@ -367,6 +367,16 @@ class TestReviewBlockerAdjudication:
         assert parsed is not None
         assert parsed.verdict == "INVALID"
 
+    def test_parses_valid_verdict(self) -> None:
+        parsed = parse_review_blocker_adjudication("VALID\n")
+        assert parsed is not None
+        assert parsed.verdict == "VALID"
+
+    def test_parses_needs_human_verdict(self) -> None:
+        parsed = parse_review_blocker_adjudication("NEEDS_HUMAN\n")
+        assert parsed is not None
+        assert parsed.verdict == "NEEDS_HUMAN"
+
     def test_rejects_extra_text(self) -> None:
         assert parse_review_blocker_adjudication("INVALID\nBecause the blocker is stale.\n") is None
 
