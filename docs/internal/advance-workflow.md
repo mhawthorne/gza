@@ -12,6 +12,12 @@ The shared rule engine introduced for `advance` is also the decision source for 
 
 As a result, this change set includes iterate-facing contract alignment where needed (status wording, help text, and regressions) in the same patch as the engine migration, rather than splitting into a separate task with duplicated decision logic changes.
 
+Manual `gza merge` has one deliberate operator-only escape hatch that `advance`/`watch`
+do not share: it can defer review blockers into urgent PR-required follow-up tasks when a
+human explicitly invokes merge (or when the latest blocked review is verify-only). The
+automated lifecycle remains stricter and does not merge `CHANGES_REQUESTED` reviews by
+deferring blockers.
+
 ## Usage
 
 ```bash

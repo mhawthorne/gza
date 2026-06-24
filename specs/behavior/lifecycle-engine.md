@@ -291,6 +291,21 @@ failure *and* actionable merge/review work remains eligible for the latter.
   mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
   MUST reject merge representatives whose execution status is not `completed` or
   `unmerged`.
+- Manual `gza merge` retains a narrower human-override path than automation. Automated
+  lifecycle actions (`advance`/`watch`) MUST still merge only review-cleared work under
+  the rules above; they MUST NOT auto-merge `CHANGES_REQUESTED` reviews by deferring
+  blockers. Manual `gza merge` MUST refuse a latest completed `CHANGES_REQUESTED` review
+  that still has any open non-verify `BLOCKER` finding unless the operator passes
+  `--defer-blockers`.
+- For manual `gza merge`, when the latest completed `CHANGES_REQUESTED` review is blocked
+  only by verify failures/timeouts, the command MAY auto-defer those blockers without a
+  flag. Every blocker bypassed by either the verify-only path or `--defer-blockers` MUST
+  create or reuse a persisted deferred-blocker `implement` task before merge success or
+  `--mark-only` merged-state mutation is recorded. If that persistence fails, the merge
+  MUST fail closed.
+- Manual `gza merge --no-followups` remains scoped to ordinary `FOLLOWUP` findings only.
+  It MUST NOT suppress mandatory deferred-blocker tasks created for bypassed `BLOCKER`
+  findings.
 - After a merge lands on the canonical local target, and whenever automation can prove the
   local target's HEAD changed since the last successful or failed target-level verify
   fingerprint, watch/advance MUST rerun the configured verify gate against that local

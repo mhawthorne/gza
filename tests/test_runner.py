@@ -10582,6 +10582,98 @@ class TestExtractedRunInnerHelpers:
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
 
+    def test_post_complete_noop_improve_clears_report_file_verify_only_review_block_with_current_green_verify_evidence(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with verify-only review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-verify-only-clear-report-file"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before no-op improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        report_path = tmp_path / "reports" / "verify-only-review.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n",
+            encoding="utf-8",
+        )
+        review.report_file = str(report_path.relative_to(tmp_path))
+        review.review_verify_status = "failed"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "abc1234"
+        store.update(review)
+
+        improve = store.add(
+            prompt="No-op improve after verify-only review",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        improve.review_verify_status = "passed"
+        improve.review_verify_branch = impl.branch
+        improve.review_verify_head_sha = "abc1234"
+        improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        sync_branch.assert_not_called()
+        run_review.assert_not_called()
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.review_cleared_at >= review.completed_at
+        output = capsys.readouterr().out
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+
     def test_post_complete_noop_improve_keeps_current_green_verify_evidence_when_recapture_would_overwrite_it(
         self,
         tmp_path: Path,

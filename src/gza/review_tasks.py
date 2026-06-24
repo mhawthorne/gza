@@ -18,6 +18,9 @@ from .task_slug import (
 _FOLLOWUP_PROMPT_PREFIX_RE = re.compile(
     r"^Follow-up\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
+_DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(
+    r"^Deferred blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
+)
 
 
 class DuplicateReviewError(ValueError):
@@ -152,6 +155,11 @@ def build_followup_prompt_prefix(review_task_id: str, impl_task_id: str, finding
     return f"Follow-up {finding_id} from review {review_task_id} for task {impl_task_id}:"
 
 
+def build_deferred_blocker_prompt_prefix(review_task_id: str, impl_task_id: str, finding_id: str) -> str:
+    """Build deterministic prompt prefix for auto-created deferred blocker tasks."""
+    return f"Deferred blocker {finding_id} from review {review_task_id} for task {impl_task_id}:"
+
+
 def build_followup_prompt(
     review_task_id: str,
     impl_task_id: str,
@@ -164,28 +172,93 @@ def build_followup_prompt(
     return f"{heading}\n\n## Follow-up finding to implement:\n\n{format_followup_finding_context(finding)}"
 
 
+def build_deferred_blocker_prompt(
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+) -> str:
+    """Build full prompt for an auto-created deferred blocker implementation task."""
+    prefix = build_deferred_blocker_prompt_prefix(review_task_id, impl_task_id, finding.id)
+    tail = (finding.fix_or_followup or finding.title or "").strip()
+    heading = f"{prefix} {tail}" if tail else prefix
+    open_state_citation = finding.open_state_citation or "not provided by review"
+    canonical_context = format_blocker_finding_context(finding)
+    return (
+        f"{heading}\n\n"
+        "## Deferred blocker to resolve\n\n"
+        "This task was created because `gza merge` bypassed a BLOCKER-severity review finding "
+        "during a manual merge override attempt.\n\n"
+        f"Original implementation: {impl_task_id}\n"
+        f"Review: {review_task_id}\n"
+        f"Open-state citation: {open_state_citation}\n\n"
+        f"{canonical_context}"
+    )
+
+
+def _finding_heading(finding: ReviewFinding) -> str:
+    title = f" {finding.title}" if finding.title and finding.title != finding.id else ""
+    return f"### {finding.id}{title}"
+
+
+def _finding_structured_body(
+    finding: ReviewFinding,
+    *,
+    fix_label: str,
+    tests_label: str,
+) -> str:
+    lines: list[str] = []
+    if finding.evidence:
+        lines.append(f"Evidence: {finding.evidence}")
+    if finding.impact:
+        lines.append(f"Impact: {finding.impact}")
+    if finding.fix_or_followup:
+        lines.append(f"{fix_label}: {finding.fix_or_followup}")
+    if finding.tests:
+        lines.append(f"{tests_label}: {finding.tests}")
+    if finding.open_state_citation:
+        lines.append(f"Open-state citation: {finding.open_state_citation}")
+    return "\n".join(lines)
+
+
 def format_followup_finding_context(finding: ReviewFinding) -> str:
     """Format canonical finding context for follow-up implementation tasks."""
-    title = f" {finding.title}" if finding.title and finding.title != finding.id else ""
     if finding.body.strip():
         body = finding.body.strip()
     else:
-        lines: list[str] = []
-        if finding.evidence:
-            lines.append(f"Evidence: {finding.evidence}")
-        if finding.impact:
-            lines.append(f"Impact: {finding.impact}")
-        if finding.fix_or_followup:
-            lines.append(f"Recommended follow-up: {finding.fix_or_followup}")
-        if finding.tests:
-            lines.append(f"Recommended tests: {finding.tests}")
-        body = "\n".join(lines)
-    return f"### {finding.id}{title}\n{body}".strip()
+        body = _finding_structured_body(
+            finding,
+            fix_label="Recommended follow-up",
+            tests_label="Recommended tests",
+        )
+    return f"{_finding_heading(finding)}\n{body}".strip()
+
+
+def format_blocker_finding_context(finding: ReviewFinding) -> str:
+    """Format canonical finding context for deferred blocker implementation tasks."""
+    parts: list[str] = [_finding_heading(finding)]
+    if finding.body.strip():
+        parts.append(finding.body.strip())
+    structured = _finding_structured_body(
+        finding,
+        fix_label="Required fix",
+        tests_label="Required tests",
+    )
+    if structured:
+        parts.append(structured)
+    return "\n".join(part for part in parts if part).strip()
 
 
 def extract_followup_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
     """Return (finding_id, review_task_id, impl_task_id) for follow-up prompts."""
     match = _FOLLOWUP_PROMPT_PREFIX_RE.match(prompt.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def extract_deferred_blocker_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
+    """Return (finding_id, review_task_id, impl_task_id) for deferred blocker prompts."""
+    match = _DEFERRED_BLOCKER_PROMPT_PREFIX_RE.match(prompt.strip())
     if match is None:
         return None
     return match.group(1), match.group(2), match.group(3)
@@ -200,6 +273,23 @@ def find_existing_followup_task(
 ) -> Task | None:
     """Return an existing auto-created follow-up task for (review, finding), if any."""
     prefix = build_followup_prompt_prefix(review_task_id, impl_task_id, finding_id)
+    for child in store.get_based_on_children(review_task_id):
+        if child.task_type != "implement":
+            continue
+        if child.prompt.strip().startswith(prefix):
+            return child
+    return None
+
+
+def find_existing_deferred_blocker_task(
+    store: SqliteTaskStore,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    finding_id: str,
+) -> Task | None:
+    """Return an existing auto-created deferred blocker task for (review, finding), if any."""
+    prefix = build_deferred_blocker_prompt_prefix(review_task_id, impl_task_id, finding_id)
     for child in store.get_based_on_children(review_task_id):
         if child.task_type != "implement":
             continue
@@ -248,5 +338,47 @@ def create_or_reuse_followup_task(
         review_scope=format_followup_finding_context(finding),
         tags=resolve_derived_task_tags(impl_task),
         trigger_source=trigger_source,
+    )
+    return created, True
+
+
+def create_or_reuse_deferred_blocker_task(
+    store: SqliteTaskStore,
+    *,
+    review_task: Task,
+    impl_task: Task,
+    finding: ReviewFinding,
+    trigger_source: str,
+) -> tuple[Task, bool]:
+    """Create or reuse an idempotent deferred blocker task for a parsed BLOCKER finding."""
+    if review_task.id is None:
+        raise ValueError("Cannot create deferred blocker for review without an ID.")
+    if impl_task.id is None:
+        raise ValueError("Cannot create deferred blocker for implementation without an ID.")
+
+    existing = find_existing_deferred_blocker_task(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        finding_id=finding.id,
+    )
+    if existing is not None:
+        return existing, False
+
+    prompt = build_deferred_blocker_prompt(
+        review_task.id,
+        impl_task.id,
+        finding,
+    )
+    created = store.add(
+        prompt=prompt,
+        task_type="implement",
+        based_on=review_task.id,
+        depends_on=impl_task.id,
+        review_scope=format_blocker_finding_context(finding),
+        tags=resolve_derived_task_tags(impl_task),
+        trigger_source=trigger_source,
+        create_pr=True,
+        urgent=True,
     )
     return created, True

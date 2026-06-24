@@ -73,6 +73,7 @@ from ..recovery_engine import FailedRecoveryDecision, classify_recovery_row, dec
 from ..review_scope import extract_review_scope_from_prompt
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
+    create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_review_task,
 )
@@ -2105,6 +2106,32 @@ def _create_or_reuse_followup_tasks(
     reused: list[DbTask] = []
     for finding in findings:
         task, created_now = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            trigger_source=trigger_source,
+        )
+        if created_now:
+            created.append(task)
+        else:
+            reused.append(task)
+    return created, reused
+
+
+def _create_or_reuse_deferred_blocker_tasks(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    trigger_source: str,
+) -> tuple[list[DbTask], list[DbTask]]:
+    """Create/reuse deferred-blocker implement tasks for parsed BLOCKER findings."""
+    created: list[DbTask] = []
+    reused: list[DbTask] = []
+    for finding in findings:
+        task, created_now = create_or_reuse_deferred_blocker_task(
             store,
             review_task=review_task,
             impl_task=impl_task,

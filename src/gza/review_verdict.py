@@ -829,19 +829,27 @@ def format_review_outcome(outcome: ReviewOutcome, *, unknown_label: str = "UNKNO
     return f"{verdict} [follow-ups: {finding_ids}]"
 
 
-def get_review_report(project_dir: Path, review_task: Task) -> ParsedReviewReport:
-    """Extract parsed review report from cached output or the report file."""
+def get_review_content(project_dir: Path, review_task: Task) -> str | None:
+    """Return the canonical raw review markdown from cached output or report file."""
     if review_task.output_content:
-        return parse_review_report(review_task.output_content)
+        return review_task.output_content
 
     if not review_task.report_file:
-        return ParsedReviewReport(verdict=None, findings=(), format_version="unknown")
+        return None
 
     review_path = project_dir / review_task.report_file
     if not review_path.exists():
-        return ParsedReviewReport(verdict=None, findings=(), format_version="unknown")
+        return None
 
-    return parse_review_report(review_path.read_text())
+    return review_path.read_text()
+
+
+def get_review_report(project_dir: Path, review_task: Task) -> ParsedReviewReport:
+    """Extract parsed review report from cached output or the report file."""
+    content = get_review_content(project_dir, review_task)
+    if content is None:
+        return ParsedReviewReport(verdict=None, findings=(), format_version="unknown")
+    return parse_review_report(content)
 
 
 def get_review_verdict(project_dir: Path, review_task: Task) -> str | None:
@@ -859,17 +867,10 @@ def get_review_score(project_dir: Path, review_task: Task) -> int | None:
 
     Returns ``None`` when no score source exists (no output content and no readable report).
     """
-    if review_task.output_content:
-        return compute_review_score(parse_review_template(review_task.output_content))
-
-    if not review_task.report_file:
+    content = get_review_content(project_dir, review_task)
+    if content is None:
         return None
-
-    review_path = project_dir / review_task.report_file
-    if not review_path.exists():
-        return None
-
-    return compute_review_score(parse_review_template(review_path.read_text()))
+    return compute_review_score(parse_review_template(content))
 
 
 def get_backfillable_review_score(project_dir: Path, review_task: Task) -> int | None:
@@ -878,14 +879,7 @@ def get_backfillable_review_score(project_dir: Path, review_task: Task) -> int |
     Unlike ``get_review_score()``, this skips malformed legacy content instead of
     persisting a synthetic zero score for it.
     """
-    if review_task.output_content:
-        return _compute_backfillable_review_score(review_task.output_content)
-
-    if not review_task.report_file:
+    content = get_review_content(project_dir, review_task)
+    if content is None:
         return None
-
-    review_path = project_dir / review_task.report_file
-    if not review_path.exists():
-        return None
-
-    return _compute_backfillable_review_score(review_path.read_text())
+    return _compute_backfillable_review_score(content)

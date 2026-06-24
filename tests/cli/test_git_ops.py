@@ -30,6 +30,7 @@ from gza.config import Config
 from gza.git import Git, GitError, ResolvedGitRef, ResolvedMergeSourceRef
 from gza.lineage_query import LineageOwnerRow
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
+from gza.review_verdict import ReviewFinding
 from gza.worktree_roots import managed_worktree_root_paths
 
 from .conftest import make_store, invoke_gza, setup_config
@@ -163,6 +164,95 @@ def _assert_scoped_preload_refs(
         assert branch not in preloaded_branches
         assert branch not in preloaded_refs
         assert f"origin/{branch}" not in preloaded_refs
+
+
+def _write_review_report(tmp_path: Path, *, name: str, content: str) -> str:
+    report_path = tmp_path / "reviews" / name
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(content, encoding="utf-8")
+    return str(report_path.relative_to(tmp_path))
+
+
+def _changes_requested_review_with_blocker(
+    *,
+    title: str,
+    evidence: str,
+    required_fix: str,
+    open_state_citation: str | None = None,
+) -> str:
+    citation_line = (
+        f"Open-state citation: {open_state_citation}\n"
+        if open_state_citation is not None
+        else ""
+    )
+    return (
+        "## Summary\n\n- Review summary.\n\n"
+        "## Blockers\n\n"
+        f"### B1 {title}\n"
+        f"Evidence: {evidence}\n"
+        "Impact: merge should stay blocked until handled.\n"
+        f"Required fix: {required_fix}\n"
+        "Required tests: add focused coverage.\n"
+        f"{citation_line}\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _add_same_merge_unit_owner_representative_with_review(
+    tmp_path: Path,
+    store,
+    *,
+    review_content: str,
+) -> tuple[Any, Any, Any]:
+    owner = store.add("Historic merge-unit owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 6, 20, 9, 0, tzinfo=UTC)
+    owner.branch = "feature/merge-unit-blockers"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    representative = store.add(
+        "Actionable merge-unit representative",
+        task_type="improve",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    assert representative.id is not None
+    representative.status = "completed"
+    representative.completed_at = datetime(2026, 6, 20, 10, 0, tzinfo=UTC)
+    representative.branch = owner.branch
+    representative.has_commits = True
+    representative.merge_status = "unmerged"
+    store.update(representative)
+
+    unit = store.get_or_create_merge_unit_for_task(representative)
+    assert unit is not None
+    assert unit.owner_task_id == owner.id
+
+    review = store.add(
+        f"Review {representative.id}",
+        task_type="review",
+        depends_on=representative.id,
+        based_on=representative.id,
+    )
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 20, 11, 0, tzinfo=UTC)
+    review.report_file = _write_review_report(
+        tmp_path,
+        name=f"{representative.id}-merge-unit-review.md",
+        content=review_content,
+    )
+    store.update(review)
+
+    attached_unit = store.get_or_create_merge_unit_for_task(review)
+    assert attached_unit is not None
+    assert attached_unit.id == unit.id
+    return owner, representative, review
 
 
 def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -> None:
@@ -392,6 +482,770 @@ def test_merge_single_task_quiet_mechanics_keeps_squash_reconcile_warning_output
     assert "✓ Reconciled origin/feature/quiet-squash-merge-output to the squash merge commit" not in output
     assert "could not be updated" in output
     assert "git fetch origin +refs/heads/feature/quiet-squash-merge-output:refs/remotes/origin/feature/quiet-squash-merge-output" in output
+
+
+def test_merge_single_task_auto_defers_verify_only_blockers_without_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement verify-only blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/verify-only-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B1",
+        severity="BLOCKER",
+        title="Verify timed out",
+        body="",
+        evidence="./bin/tests timed out",
+        impact="Flaky verify evidence would be lost",
+        fix_or_followup="stabilize verify",
+        tests="add regression coverage",
+        open_state_citation="status: open",
+    )
+    deferred_task = store.add("Deferred blocker B1", task_type="implement", based_on=review.id, depends_on=task.id)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops.is_verify_blocked_only_review", return_value=True),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])) as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    git.merge.assert_called_once_with("feature/verify-only-blocker", squash=False, commit_message=None)
+    materialize.assert_called_once()
+    output = capsys.readouterr().out
+    assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
+
+
+def test_merge_single_task_auto_defers_verify_only_report_file_blockers_without_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement report-file verify-only blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/report-file-verify-only-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.report_file = _write_review_report(
+        tmp_path,
+        name="verify-only-review.md",
+        content=_changes_requested_review_with_blocker(
+            title="verify_command failure: command exited nonzero",
+            evidence="verify_command failed while running `./bin/tests`; the assertion failure is in the verify output.",
+            required_fix="rerun verify_command on the current tip.",
+        ),
+    )
+    store.update(review)
+
+    deferred_task = store.add("Deferred blocker B1", task_type="implement", based_on=review.id, depends_on=task.id)
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with patch(
+        "gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks",
+        return_value=([deferred_task], []),
+    ) as materialize:
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    git.merge.assert_called_once_with(
+        "feature/report-file-verify-only-blocker",
+        squash=False,
+        commit_message=None,
+    )
+    materialize.assert_called_once()
+    assert materialize.call_args.kwargs["findings"][0].id == "B1"
+    output = capsys.readouterr().out
+    assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
+
+
+def test_merge_single_task_refuses_non_verify_blockers_without_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement blocked merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/non-verify-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B2",
+        severity="BLOCKER",
+        title="Missing data migration",
+        body="Canonical blocker context.",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add migration",
+        tests=None,
+        open_state_citation="finding remains open",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops.is_verify_blocked_only_review", return_value=False),
+        patch(
+            "gza.cli.git_ops.summarize_review_blockers",
+            return_value=SimpleNamespace(
+                blocker_count=1,
+                verify_timeout_count=0,
+                verify_failure_count=0,
+                unknown_or_code_count=1,
+            ),
+        ),
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    output = capsys.readouterr().out
+    assert f"Error: Task {task.id} has open BLOCKER findings in review {review.id}." in output
+    assert "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks." in output
+
+
+def test_merge_single_task_refuses_non_verify_report_file_blockers_with_normal_hint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement report-file non-verify blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/report-file-non-verify-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.report_file = _write_review_report(
+        tmp_path,
+        name="non-verify-review.md",
+        content=_changes_requested_review_with_blocker(
+            title="Missing data migration",
+            evidence="The branch adds a new column without a migration.",
+            required_fix="add the migration and backfill path.",
+        ),
+    )
+    store.update(review)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    output = capsys.readouterr().out
+    assert f"Error: Task {task.id} has open BLOCKER findings in review {review.id}." in output
+    assert "blocker classification did not match the parsed blocker set" not in output
+    assert "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks." in output
+
+
+def test_merge_single_task_defer_blockers_flag_materializes_and_proceeds(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement deferred blocker merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/defer-blockers"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blockers = (
+        ReviewFinding(
+            id="B3",
+            severity="BLOCKER",
+            title="Missing migration",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add migration",
+            tests=None,
+            open_state_citation="citation",
+        ),
+        ReviewFinding(
+            id="B4",
+            severity="BLOCKER",
+            title="Missing cleanup",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add cleanup",
+            tests=None,
+            open_state_citation="citation",
+        ),
+    )
+    deferred_task = store.add("Deferred blocker B3", task_type="implement", based_on=review.id, depends_on=task.id)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=blockers, format_version="v2"),
+        ),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])) as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    git.merge.assert_called_once()
+    materialize.assert_called_once()
+    assert materialize.call_args.kwargs["findings"] == blockers
+    output = capsys.readouterr().out
+    assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
+
+
+def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement mark-only blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/mark-only-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B5",
+        severity="BLOCKER",
+        title="Missing guard",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add guard",
+        tests=None,
+        open_state_citation="citation",
+    )
+    deferred_task = store.add("Deferred blocker B5", task_type="implement", based_on=review.id, depends_on=task.id)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+    order: list[str] = []
+    original_set_merge_status = store.set_merge_status
+    original_set_merge_unit_state = store.set_merge_unit_state
+
+    def _record_set_merge_status(*call_args, **call_kwargs):
+        order.append("mark")
+        return original_set_merge_status(*call_args, **call_kwargs)
+
+    def _record_set_merge_unit_state(*call_args, **call_kwargs):
+        order.append("mark")
+        return original_set_merge_unit_state(*call_args, **call_kwargs)
+
+    store.set_merge_status = MagicMock(side_effect=_record_set_merge_status)  # type: ignore[method-assign]
+    store.set_merge_unit_state = MagicMock(side_effect=_record_set_merge_unit_state)  # type: ignore[method-assign]
+
+    with (
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch(
+            "gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks",
+            side_effect=lambda *a, **k: (order.append("defer") or ([deferred_task], [])),
+        ),
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    assert order == ["defer", "mark"]
+
+
+def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement no-followups blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/no-followups-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B6",
+        severity="BLOCKER",
+        title="Missing invariant",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add invariant",
+        tests=None,
+        open_state_citation="citation",
+    )
+    deferred_task = store.add("Deferred blocker B6", task_type="implement", based_on=review.id, depends_on=task.id)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=True,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])),
+        patch("gza.cli.git_ops._materialize_merge_followups") as materialize_followups,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    materialize_followups.assert_not_called()
+    output = capsys.readouterr().out
+    assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
+
+
+def test_merge_single_task_mark_only_reuses_existing_deferred_blocker_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement idempotent mark-only blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/idempotent-mark-only-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B7",
+        severity="BLOCKER",
+        title="Verify timed out",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="stabilize verify",
+        tests=None,
+        open_state_citation="citation",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops.is_verify_blocked_only_review", return_value=True),
+    ):
+        first = _merge_single_task(task.id, config, store, git, args, "main")
+        store.set_merge_status(task.id, "unmerged")
+        second = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert first.rc == 0
+    assert second.rc == 0
+    children = [
+        child for child in store.get_based_on_children(review.id)
+        if child.prompt.startswith(f"Deferred blocker {blocker.id} from review {review.id} for task {task.id}:")
+    ]
+    assert len(children) == 1
+
+
+def test_merge_single_task_same_merge_unit_review_on_representative_refuses_without_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="Missing data migration",
+            evidence="The representative branch adds a new column without a migration.",
+            required_fix="add the migration and backfill path.",
+        ),
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    assert store.get_reviews_for_task(owner.id) == []
+    output = capsys.readouterr().out
+    assert f"Error: Task {owner.id} has open BLOCKER findings in review {review.id}." in output
+    assert "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks." in output
+
+
+def test_merge_single_task_same_merge_unit_review_on_representative_defer_flag_materializes_before_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="Missing data migration",
+            evidence="The representative branch adds a new column without a migration.",
+            required_fix="add the migration and backfill path.",
+        ),
+    )
+
+    merge_order: list[str] = []
+
+    def _assert_deferred_before_merge(*_args, **_kwargs):
+        blockers = [
+            child for child in store.get_based_on_children(review.id)
+            if child.prompt.startswith(
+                f"Deferred blocker B1 from review {review.id} for task {owner.id}:"
+            )
+        ]
+        assert len(blockers) == 1
+        merge_order.append("merge")
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=_assert_deferred_before_merge),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    assert merge_order == ["merge"]
+    blockers = [
+        child for child in store.get_based_on_children(review.id)
+        if child.prompt.startswith(f"Deferred blocker B1 from review {review.id} for task {owner.id}:")
+    ]
+    assert len(blockers) == 1
+
+
+def test_merge_single_task_same_merge_unit_verify_only_review_on_representative_mark_only_materializes_before_mark(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="verify_command failure: command exited nonzero",
+            evidence="verify_command failed while running `./bin/tests`; the assertion failure is in the verify output.",
+            required_fix="rerun verify_command on the current tip.",
+        ),
+    )
+
+    order: list[str] = []
+    original_set_merge_status = store.set_merge_status
+    original_set_merge_unit_state = store.set_merge_unit_state
+
+    def _record_set_merge_status(*call_args, **call_kwargs):
+        order.append("mark")
+        return original_set_merge_status(*call_args, **call_kwargs)
+
+    def _record_set_merge_unit_state(*call_args, **call_kwargs):
+        blockers = [
+            child for child in store.get_based_on_children(review.id)
+            if child.prompt.startswith(
+                f"Deferred blocker B1 from review {review.id} for task {owner.id}:"
+            )
+        ]
+        assert len(blockers) == 1
+        order.append("mark")
+        return original_set_merge_unit_state(*call_args, **call_kwargs)
+
+    store.set_merge_status = MagicMock(side_effect=_record_set_merge_status)  # type: ignore[method-assign]
+    store.set_merge_unit_state = MagicMock(side_effect=_record_set_merge_unit_state)  # type: ignore[method-assign]
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = SimpleNamespace(project_dir=tmp_path)
+
+    result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    assert order == ["mark"]
+    blockers = [
+        child for child in store.get_based_on_children(review.id)
+        if child.prompt.startswith(f"Deferred blocker B1 from review {review.id} for task {owner.id}:")
+    ]
+    assert len(blockers) == 1
 
 
 def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> None:

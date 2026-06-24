@@ -44,6 +44,7 @@ from gza.review_verdict import (
     ParsedReviewReport,
     ReviewBlockerSummary,
     ReviewFinding,
+    get_review_content,
     get_review_report,
     is_verify_timeout_only_review,
     summarize_review_blockers,
@@ -630,6 +631,7 @@ def _resolve_branch_head_sha(git: Any, branch: str | None) -> BranchHeadResoluti
 def _has_persisted_noop_improve_verify_clearance(
     *,
     git: Any,
+    project_dir: Path,
     task: DbTask,
     latest_completed_review: DbTask | None,
     improve_tasks: list[DbTask],
@@ -644,6 +646,7 @@ def _has_persisted_noop_improve_verify_clearance(
 
     current_head_sha = branch_head.head_sha
     if not _review_is_verify_only_blocked_at_head(
+        project_dir=project_dir,
         review_task=latest_completed_review,
         current_branch=task.branch,
         current_head_sha=current_head_sha,
@@ -1822,13 +1825,7 @@ def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
 
 
 def _get_review_output_content(config: Any, review_task: DbTask) -> str | None:
-    if review_task.output_content:
-        return review_task.output_content
-    if review_task.report_file:
-        report_path = Path(config.project_dir) / review_task.report_file
-        if report_path.exists():
-            return report_path.read_text()
-    return None
+    return get_review_content(Path(config.project_dir), review_task)
 
 
 def _resolve_review_state(
@@ -1924,6 +1921,7 @@ def _resolve_review_state(
         if not review_cleared:
             review_cleared, noop_improve_verify_probe_warning = _has_persisted_noop_improve_verify_clearance(
                 git=git,
+                project_dir=Path(config.project_dir),
                 task=task,
                 latest_completed_review=latest_completed_review,
                 improve_tasks=improve_tasks,

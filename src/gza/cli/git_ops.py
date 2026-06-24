@@ -13,7 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import gza.colors as _colors
-from gza.query import get_base_task_slug as _get_base_task_slug
+from gza.query import (
+    get_base_task_slug as _get_base_task_slug,
+    get_reviews_for_root as _get_reviews_for_root,
+)
 
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..branch_publication import load_branch_publication_state
@@ -79,7 +82,13 @@ from ..recovery_engine import (
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
-from ..review_verdict import get_review_report
+from ..review_verdict import (
+    ReviewFinding,
+    get_review_content,
+    get_review_report,
+    is_verify_blocked_only_review,
+    summarize_review_blockers,
+)
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
@@ -107,6 +116,7 @@ from ..worktree_roots import managed_worktree_root_paths
 from ._common import (
     DuplicateReviewError,
     _create_implementation_task_from_source,
+    _create_or_reuse_deferred_blocker_tasks,
     _create_or_reuse_followup_tasks,
     _create_plan_improve_task,
     _create_plan_review_task,
@@ -161,22 +171,21 @@ class _ResolvedMergeSubject:
     merge_source_warning: str | None
 
 
+@dataclass(frozen=True)
+class _MergeDeferredBlockerDecision:
+    review_task: DbTask | None
+    blockers: tuple[ReviewFinding, ...]
+    should_materialize: bool
+    refusal_message: str | None = None
+
+
 def _materialize_merge_followups(
     store: SqliteTaskStore,
     config: Config,
     merge_subject: DbTask,
 ) -> tuple[list[DbTask], list[DbTask]]:
     """Create or reuse FOLLOWUP tasks for the latest completed review on a merged task."""
-    if merge_subject.id is None:
-        return ([], [])
-    review_task = next(
-        (
-            review
-            for review in store.get_reviews_for_task(merge_subject.id)
-            if review.status == "completed" and review.completed_at is not None
-        ),
-        None,
-    )
+    review_task = _latest_completed_review_for_merge_subject(store, merge_subject)
     if review_task is None:
         return ([], [])
     report = get_review_report(config.project_dir, review_task)
@@ -188,6 +197,125 @@ def _materialize_merge_followups(
         review_task=review_task,
         impl_task=merge_subject,
         findings=findings,
+        trigger_source="manual",
+    )
+
+
+def _latest_completed_review_for_merge_subject(
+    store: SqliteTaskStore,
+    merge_subject: DbTask,
+) -> DbTask | None:
+    if merge_subject.id is None:
+        return None
+    return next(
+        (
+            review
+            for review in _get_reviews_for_root(store, merge_subject)
+            if review.status == "completed" and review.completed_at is not None
+        ),
+        None,
+    )
+
+
+def _classify_manual_merge_blockers(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    merge_subject: DbTask,
+    defer_blockers: bool,
+) -> _MergeDeferredBlockerDecision:
+    review_task = _latest_completed_review_for_merge_subject(store, merge_subject)
+    if review_task is None:
+        return _MergeDeferredBlockerDecision(
+            review_task=None,
+            blockers=(),
+            should_materialize=False,
+        )
+
+    report = get_review_report(config.project_dir, review_task)
+    review_content = get_review_content(config.project_dir, review_task)
+    if report.verdict != "CHANGES_REQUESTED":
+        return _MergeDeferredBlockerDecision(
+            review_task=review_task,
+            blockers=(),
+            should_materialize=False,
+        )
+
+    blockers = tuple(finding for finding in report.findings if finding.severity == "BLOCKER")
+    if not blockers:
+        assert merge_subject.id is not None
+        assert review_task.id is not None
+        return _MergeDeferredBlockerDecision(
+            review_task=review_task,
+            blockers=(),
+            should_materialize=False,
+            refusal_message=(
+                f"Error: Task {merge_subject.id} has CHANGES_REQUESTED review {review_task.id}, "
+                "but no parsed BLOCKER findings were available to defer. Refusing to guess."
+            ),
+        )
+
+    if defer_blockers:
+        return _MergeDeferredBlockerDecision(
+            review_task=review_task,
+            blockers=blockers,
+            should_materialize=True,
+        )
+
+    if is_verify_blocked_only_review(review_content):
+        return _MergeDeferredBlockerDecision(
+            review_task=review_task,
+            blockers=blockers,
+            should_materialize=True,
+        )
+
+    assert merge_subject.id is not None
+    assert review_task.id is not None
+    summary = summarize_review_blockers(review_content)
+    if summary.blocker_count != len(blockers):
+        return _MergeDeferredBlockerDecision(
+            review_task=review_task,
+            blockers=(),
+            should_materialize=False,
+            refusal_message=(
+                f"Error: Task {merge_subject.id} has CHANGES_REQUESTED review {review_task.id}, "
+                "but blocker classification did not match the parsed blocker set. Refusing to guess."
+            ),
+        )
+    return _MergeDeferredBlockerDecision(
+        review_task=review_task,
+        blockers=blockers,
+        should_materialize=False,
+        refusal_message=(
+            f"Error: Task {merge_subject.id} has open BLOCKER findings in review {review_task.id}.\n"
+            "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks."
+        ),
+    )
+
+
+def _materialize_merge_deferred_blockers(
+    store: SqliteTaskStore,
+    config: Config,
+    merge_subject: DbTask,
+    *,
+    defer_blockers: bool,
+) -> tuple[list[DbTask], list[DbTask]] | None:
+    decision = _classify_manual_merge_blockers(
+        store=store,
+        config=config,
+        merge_subject=merge_subject,
+        defer_blockers=defer_blockers,
+    )
+    if decision.refusal_message is not None:
+        print(decision.refusal_message)
+        return None
+    if not decision.should_materialize or decision.review_task is None or not decision.blockers:
+        return ([], [])
+    return _create_or_reuse_deferred_blocker_tasks(
+        store,
+        review_task=decision.review_task,
+        impl_task=merge_subject,
+        findings=decision.blockers,
         trigger_source="manual",
     )
 
@@ -1186,6 +1314,20 @@ def _merge_single_task(
             print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
             return _MergeSingleTaskResult(rc=1)
 
+        deferred_blockers = _materialize_merge_deferred_blockers(
+            store,
+            config,
+            merge_subject,
+            defer_blockers=getattr(args, "defer_blockers", False),
+        )
+        if deferred_blockers is None:
+            return _MergeSingleTaskResult(rc=1)
+        created_deferred_blockers, reused_deferred_blockers = deferred_blockers
+        for blocker_task in created_deferred_blockers:
+            print(f"DEFERRED-BLOCKER {blocker_task.id} created from {merge_subject.id}")
+        for blocker_task in reused_deferred_blockers:
+            print(f"DEFERRED-BLOCKER {blocker_task.id} reused from {merge_subject.id}")
+
         if merge_unit_id is not None:
             store.set_merge_unit_state(
                 merge_unit_id,
@@ -1248,6 +1390,20 @@ def _merge_single_task(
         print(f"Run: uv run gza rebase {merge_subject.id} --resolve")
         print(f"Or preview the lifecycle action with: uv run gza advance {merge_subject.id} --dry-run")
         return _MergeSingleTaskResult(rc=1)
+
+    deferred_blockers = _materialize_merge_deferred_blockers(
+        store,
+        config,
+        merge_subject,
+        defer_blockers=getattr(args, "defer_blockers", False),
+    )
+    if deferred_blockers is None:
+        return _MergeSingleTaskResult(rc=1)
+    created_deferred_blockers, reused_deferred_blockers = deferred_blockers
+    for blocker_task in created_deferred_blockers:
+        print(f"DEFERRED-BLOCKER {blocker_task.id} created from {merge_subject.id}")
+    for blocker_task in reused_deferred_blockers:
+        print(f"DEFERRED-BLOCKER {blocker_task.id} reused from {merge_subject.id}")
 
     # Perform the merge or rebase
     try:

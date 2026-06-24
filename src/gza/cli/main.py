@@ -1094,7 +1094,18 @@ def main() -> int:
     merge_parser.add_argument(
         "--no-followups",
         action="store_true",
-        help="Do not materialize review FOLLOWUP tasks after a successful merge or --mark-only",
+        help=(
+            "Do not materialize review FOLLOWUP tasks after a successful merge or --mark-only. "
+            "Does not suppress mandatory deferred-blocker tasks."
+        ),
+    )
+    merge_parser.add_argument(
+        "--defer-blockers",
+        action="store_true",
+        help=(
+            "Allow manual merge over open review BLOCKER findings by creating urgent "
+            "PR-required deferred-blocker follow-up tasks first"
+        ),
     )
     merge_parser.add_argument(
         "--resolve",
