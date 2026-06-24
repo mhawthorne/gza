@@ -94,6 +94,42 @@ from gza.runner import (
 from gza.worktree_roots import managed_worktree_root_paths
 
 
+def _runner_verify_failure_only_review_report() -> str:
+    return (
+        "## Summary\n\n- Implementation matches the requested shape; verify failed at the current tip.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: failed root resume attention regression\n"
+        "Evidence: `tests/cli/test_execution.py::test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention` failed at the current branch head.\n"
+        "Impact: autonomous verify failed even though the review found no code defect.\n"
+        "Required fix: rerun verify_command at the same head and keep only durable runner-owned verify evidence.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _runner_verify_failure_plus_code_blocker_review_report() -> str:
+    return (
+        "## Summary\n\n- verify_command failed, and the review still sees a product-code defect.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: failed root resume attention regression\n"
+        "Evidence: `tests/cli/test_execution.py::test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention` failed at the current branch head.\n"
+        "Impact: autonomous verify failed.\n"
+        "Required fix: rerun verify_command at the same head.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "### B2 Missing stale-review guard\n"
+        "Evidence: `src/gza/advance_engine.py:1994` still allows the stale path to surface.\n"
+        "Open-state citation: `src/gza/advance_engine.py:1994`\n"
+        "Impact: the merge path can still park or merge from the wrong state.\n"
+        "Required fix: guard the stale branch before merge.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
 class TestGetTaskOutputPaths:
     """Tests for get_task_output_paths function."""
 
@@ -11377,18 +11413,7 @@ class TestExtractedRunInnerHelpers:
         )
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
-        review.output_content = (
-            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
-            "## Blockers\n\n"
-            "### B1 verify_command failure: mypy error\n"
-            "Evidence: verify_command failed with exit status 1.\n"
-            "Impact: autonomous verify fails.\n"
-            "Required fix: rerun verify_command on the current tip.\n"
-            "Required tests: rerun verify_command.\n\n"
-            "## Follow-Ups\n\nNone.\n\n"
-            "## Questions / Assumptions\n\nNone.\n\n"
-            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-        )
+        review.output_content = _runner_verify_failure_only_review_report()
         review.review_verify_status = "failed"
         review.review_verify_branch = impl.branch
         review.review_verify_head_sha = "abc1234"
@@ -11443,6 +11468,173 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl.review_cleared_at >= review.completed_at
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+
+    @pytest.mark.parametrize(
+        ("label", "review_report", "review_status", "review_branch", "review_head_sha", "improve_branch", "improve_head_sha", "captured_offset_seconds"),
+        [
+            (
+                "mixed_code_blocker",
+                _runner_verify_failure_plus_code_blocker_review_report(),
+                "failed",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                1,
+            ),
+            (
+                "review_branch_mismatch",
+                _runner_verify_failure_only_review_report(),
+                "failed",
+                "feature/other-branch",
+                "abc1234",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                1,
+            ),
+            (
+                "review_head_mismatch",
+                _runner_verify_failure_only_review_report(),
+                "failed",
+                "feature/noop-verify-failure-guardrail",
+                "deadbeef",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                1,
+            ),
+            (
+                "improve_captured_before_review_completed",
+                _runner_verify_failure_only_review_report(),
+                "failed",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                -1,
+            ),
+            (
+                "improve_branch_mismatch",
+                _runner_verify_failure_only_review_report(),
+                "failed",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                "feature/other-branch",
+                "abc1234",
+                1,
+            ),
+            (
+                "improve_head_mismatch",
+                _runner_verify_failure_only_review_report(),
+                "failed",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                "feature/noop-verify-failure-guardrail",
+                "deadbeef",
+                1,
+            ),
+            (
+                "review_verify_was_passed",
+                _runner_verify_failure_only_review_report(),
+                "passed",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                "feature/noop-verify-failure-guardrail",
+                "abc1234",
+                1,
+            ),
+        ],
+    )
+    def test_post_complete_noop_improve_verify_failure_evidence_mismatches_do_not_clear_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        label: str,
+        review_report: str,
+        review_status: str,
+        review_branch: str,
+        review_head_sha: str,
+        improve_branch: str,
+        improve_head_sha: str,
+        captured_offset_seconds: int,
+    ) -> None:
+        db_path = tmp_path / f"{label}.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with verify-only review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-verify-failure-guardrail"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt=f"Review before no-op improve {label}",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+        review.output_content = review_report
+        review.review_verify_status = review_status
+        review.review_verify_branch = review_branch
+        review.review_verify_head_sha = review_head_sha
+        store.update(review)
+
+        improve = store.add(
+            prompt="No-op improve after verify-only review",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        improve.review_verify_status = "passed"
+        improve.review_verify_branch = improve_branch
+        improve.review_verify_head_sha = improve_head_sha
+        improve.review_verify_captured_at = review.completed_at + timedelta(seconds=captured_offset_seconds)
+        store.update(improve)
+
+        config = self._make_config(tmp_path)
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch(
+                "gza.runner._capture_noop_improve_review_verify_result",
+                wraps=_capture_noop_improve_review_verify_result,
+            ) as capture_verify,
+            patch("gza.runner._run_review_verify_command") as run_verify,
+            patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0, label
+        capture_verify.assert_called_once()
+        run_verify.assert_not_called()
+        sync_branch.assert_not_called()
+        run_review.assert_not_called()
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert refreshed_impl.review_cleared_at is None, label
+
+        output = capsys.readouterr().out
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
     def test_post_complete_noop_improve_clears_report_file_verify_only_review_block_with_current_green_verify_evidence(
         self,
