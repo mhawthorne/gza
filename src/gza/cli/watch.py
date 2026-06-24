@@ -47,6 +47,7 @@ from ..main_integration_verify import (
 from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
+from ..providers.base import wait_for_docker_ready
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
@@ -3537,6 +3538,12 @@ def _has_explicit_max_concurrent(config: Config) -> bool:
     return "max_concurrent" in config.source_map
 
 
+def _system_can_run_tasks(config: Config) -> bool:
+    if not config.use_docker:
+        return True
+    return wait_for_docker_ready(config.docker_startup_timeout)
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Run continuous scheduler loop that maintains N concurrent workers."""
     config = Config.load(args.project_dir)
@@ -3642,6 +3649,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         idle_seconds = 0
         failure_streak = 0
         previous_snapshot = _task_snapshot(store)
+        system_hold_active = False
 
         # Preview the first watch pass and ask for confirmation before executing
         if recovery_mode == "recovery-only" and dry_run:
@@ -3697,6 +3705,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
         while True:
             if stop_requested:
                 break
+
+            if not _system_can_run_tasks(config):
+                pending_count = len(_pending_runnable_tasks(store, tags=tag_filters, any_tag=any_tag))
+                log.emit(
+                    "HOLD",
+                    (
+                        "System unavailable: Docker daemon unreachable - "
+                        f"holding queue ({pending_count} pending), nothing started/failed"
+                    ),
+                )
+                system_hold_active = True
+                if stop_requested:
+                    break
+                _sleep_interruptibly(poll, lambda: stop_requested)
+                continue
+
+            if system_hold_active:
+                log.emit("RESUME", "Docker available again - resuming")
+                system_hold_active = False
 
             pre_cycle_snapshot = _task_snapshot(store)
             _emit_transition_events(

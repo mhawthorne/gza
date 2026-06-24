@@ -142,6 +142,18 @@ state to win over already-mergeable fresh code.
 
 ### 2. Cadence and sleep are policy, but cycle boundaries are real
 
+- Before phase 1 begins, watch MAY evaluate supervisor-owned system preconditions required
+  to start task work for that cycle.
+- When `use_docker` is false, watch MUST treat Docker as not required for that precondition
+  check and MUST NOT probe Docker readiness before continuing.
+- When Docker is required and unavailable after waiting up to the configured startup/wake
+  budget, watch MUST emit a visible `HOLD` signal, start no tasks, fail no tasks, skip
+  the rest of the cycle entirely, and sleep interruptibly until the next poll boundary.
+- While held for this system precondition, watch MUST NOT mutate failure-backoff or
+  failure-halt state, idle accounting, transition snapshots, or any per-task recovery
+  state derived from a normal cycle. A held pass is not a partial cycle.
+- When the required precondition becomes available again after one or more held passes,
+  watch MUST emit a visible `RESUME` signal and then proceed with the next normal cycle.
 - `watch.poll` / `--poll` define the steady-state delay between completed cycles.
 - The supervisor MUST sleep only *between* cycles, never in the middle of a partially
   evaluated cycle.
@@ -253,6 +265,8 @@ When the installed `gza` package fingerprint changes while watch is running:
 
 ### 7. Failure backoff is bounded and visible
 
+- This lane is distinct from the system-precondition hold/resume path in section 2.
+  Required-Docker unavailability is a supervisor hold condition, not a task failure.
 - Newly observed failures that the shared recovery policy does not auto-resume/retry MUST
   increment the watch failure streak.
 - The sleep before starting more work MUST use the configured exponential backoff policy

@@ -46,6 +46,7 @@ from gza.cli.watch import (
     _query_owner_rows_with_context,
     _resolve_watch_attention_display_task,
     _run_cycle,
+    _system_can_run_tasks,
     _find_open_main_verify_remediation_task,
     _should_reexec_watch,
     _task_snapshot,
@@ -199,6 +200,12 @@ def _patch_watch_git_runtime() -> object:
         ) as load_merge_context,
     ):
         yield watch_git_cls, runner_git_cls, load_merge_context
+
+
+@pytest.fixture(autouse=True)
+def _patch_watch_system_readiness() -> object:
+    with patch("gza.cli.watch.wait_for_docker_ready", return_value=True):
+        yield
 
 
 def test_watch_attention_uses_declared_subject_for_held_plan(tmp_path: Path) -> None:
@@ -13520,7 +13527,7 @@ def test_cmd_watch_resumed_reexec_skips_first_pass_confirmation_and_logs_auto_re
         project_dir=tmp_path,
         batch=1,
         poll=5,
-        max_idle=5,
+        max_idle=10,
         max_iterations=10,
         dry_run=False,
         quiet=True,
@@ -13528,15 +13535,26 @@ def test_cmd_watch_resumed_reexec_skips_first_pass_confirmation_and_logs_auto_re
         resumed_reexec=True,
     )
 
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
     with (
         patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
         patch("builtins.input") as input_mock,
-        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
-        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
     ):
         rc = cmd_watch(args)
 
-    assert rc == 0
+    assert rc == 128 + signal.SIGTERM
     assert run_cycle.call_count == 1
     input_mock.assert_not_called()
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
@@ -15450,6 +15468,161 @@ def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:
     assert _compute_failure_backoff_seconds(config, 2) == 120
     assert _compute_failure_backoff_seconds(config, 3) == 240
     assert _compute_failure_backoff_seconds(config, 4) == 300
+
+
+def test_system_can_run_tasks_skips_docker_probe_when_not_required(tmp_path: Path) -> None:
+    config = Config(project_dir=tmp_path, project_name="test-project", use_docker=False)
+
+    with patch("gza.cli.watch.wait_for_docker_ready") as mock_wait:
+        assert _system_can_run_tasks(config) is True
+
+    mock_wait.assert_not_called()
+
+
+def test_system_can_run_tasks_waits_for_docker_when_required(tmp_path: Path) -> None:
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        use_docker=True,
+        docker_startup_timeout=17,
+    )
+
+    with patch("gza.cli.watch.wait_for_docker_ready", return_value=False) as mock_wait:
+        assert _system_can_run_tasks(config) is False
+
+    mock_wait.assert_called_once_with(17)
+
+
+def test_cmd_watch_holds_until_docker_returns_then_resumes(tmp_path: Path) -> None:
+    """Required-Docker watch should hold outside the normal pass and resume without backoff."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "use_docker: true\n"
+        "docker_startup_timeout: 1\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 10\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Pending plan", task_type="plan")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+    sleeps: list[int] = []
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            handler = signal_handlers[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch._system_can_run_tasks", side_effect=[False, True]),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 1)) as run_cycle,
+        patch("gza.cli.watch._emit_transition_events") as emit_transition_events,
+        patch(
+            "gza.cli.watch._task_snapshot",
+            return_value={str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None}},
+        ),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert sleeps == [5, 5]
+    assert run_cycle.call_count == 1
+    assert emit_transition_events.call_count == 2
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
+    assert "holding queue (1 pending)" in log_text
+    assert "RESUME" in log_text
+    assert "BACKOFF" not in log_text
+    assert "failure halt threshold reached" not in log_text
+
+
+def test_cmd_watch_no_docker_bypasses_system_probe(tmp_path: Path) -> None:
+    """No-Docker watch should proceed without probing Docker readiness."""
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "use_docker: false\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Pending plan", task_type="plan")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+    sleeps: list[int] = []
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch(
+            "gza.cli.watch.wait_for_docker_ready",
+            side_effect=AssertionError("docker probe should be bypassed when use_docker=false"),
+        ),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 1)) as run_cycle,
+        patch(
+            "gza.cli.watch._task_snapshot",
+            return_value={str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None}},
+        ),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert sleeps == [5]
+    assert run_cycle.call_count == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" not in log_text
 
 
 def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
