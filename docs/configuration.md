@@ -1003,6 +1003,7 @@ code_task_diff_timeout_cap_minutes
 watch.batch
 watch.failure_backoff_initial
 watch.failure_backoff_max
+watch.transient_recovery_backoff_max
 watch.failure_halt_after
 watch.max_idle
 watch.no_activity_timeout
@@ -1864,6 +1865,8 @@ watch:
 `watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY` because its task log or startup evidence has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
+
+`watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule used by watch recovery backoff state. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO      scope: tags=<comma-separated-tags> mode=any|all`.

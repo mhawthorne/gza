@@ -1817,6 +1817,7 @@ def _config_to_effective_dict(config: Config) -> dict:
             "recovery_slots": config.watch.recovery_slots,
             "failure_backoff_initial": config.watch.failure_backoff_initial,
             "failure_backoff_max": config.watch.failure_backoff_max,
+            "transient_recovery_backoff_max": config.watch.transient_recovery_backoff_max,
             "failure_halt_after": config.watch.failure_halt_after,
         },
         "provider": config.provider,

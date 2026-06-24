@@ -22,6 +22,7 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
+    WatchRecoveryBackoff,
     WatchProgressObservation,
     _ClosingSqliteConnection,
     _is_readonly_operational_error,
@@ -7029,6 +7030,49 @@ def _drop_watch_progress_observations_column(db_path: Path, column_name: str) ->
     conn.close()
 
 
+def _drop_watch_recovery_backoffs_column(db_path: Path, column_name: str) -> None:
+    """Rebuild watch_recovery_backoffs without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE watch_recovery_backoffs RENAME TO watch_recovery_backoffs_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(watch_recovery_backoffs_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(watch_recovery_backoffs_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(name for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE watch_recovery_backoffs ({', '.join(col_defs)})")
+    conn.execute(
+        "INSERT INTO watch_recovery_backoffs "
+        f"({cols_str}) SELECT {cols_str} FROM watch_recovery_backoffs_old"
+    )
+    conn.execute("DROP TABLE watch_recovery_backoffs_old")
+    if "next_retry_at" in kept_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_watch_recovery_backoffs_due "
+            "ON watch_recovery_backoffs(project_id, next_retry_at)"
+        )
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -9274,6 +9318,152 @@ class TestSharedDbIsolationAndImportGating:
         assert observation.action_task_running_pid is None
         assert observation.observed_at == observed_at
         assert any("watch-progress liveness columns" in warning for warning in query_store.startup_warnings())
+
+    def test_auto_migration_v55_to_v56_adds_watch_recovery_backoffs_table(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_watch_recovery_backoffs_due")
+            conn.execute("DROP TABLE IF EXISTS watch_recovery_backoffs")
+            conn.execute("UPDATE schema_version SET version = 55")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            indexes = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+            }
+
+        assert version == SCHEMA_VERSION
+        assert "watch_recovery_backoffs" in tables
+        assert "idx_watch_recovery_backoffs_due" in indexes
+
+    def test_watch_recovery_backoff_round_trip_and_delete(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        next_retry_at = datetime(2026, 6, 24, 22, 0, tzinfo=UTC)
+        updated_at = datetime(2026, 6, 24, 21, 59, tzinfo=UTC)
+        store.upsert_watch_recovery_backoff(
+            WatchRecoveryBackoff(
+                subject_kind="lineage",
+                subject_id="gza-100",
+                action_type="retry",
+                action_reason="transient-provider-failure",
+                subject_task_id="gza-90",
+                last_failure_task_id="gza-101",
+                last_failure_reason="PROVIDER_UNAVAILABLE",
+                last_failure_fingerprint="fp-transient-1",
+                streak=3,
+                next_retry_at=next_retry_at,
+                updated_at=updated_at,
+            )
+        )
+
+        reloaded = store.get_watch_recovery_backoff(
+            subject_kind="lineage",
+            subject_id="gza-100",
+            action_type="retry",
+            action_reason="transient-provider-failure",
+        )
+
+        assert reloaded is not None
+        assert reloaded.subject_task_id == "gza-90"
+        assert reloaded.last_failure_task_id == "gza-101"
+        assert reloaded.last_failure_reason == "PROVIDER_UNAVAILABLE"
+        assert reloaded.last_failure_fingerprint == "fp-transient-1"
+        assert reloaded.streak == 3
+        assert reloaded.next_retry_at == next_retry_at
+        assert reloaded.updated_at == updated_at
+
+        store.delete_watch_recovery_backoff_subject(subject_kind="lineage", subject_id="gza-100")
+
+        assert (
+            store.get_watch_recovery_backoff(
+                subject_kind="lineage",
+                subject_id="gza-100",
+                action_type="retry",
+                action_reason="transient-provider-failure",
+            )
+            is None
+        )
+
+    def test_query_only_open_pre_v56_missing_watch_recovery_backoffs_degrades_safely(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_watch_recovery_backoffs_due")
+            conn.execute("DROP TABLE IF EXISTS watch_recovery_backoffs")
+            conn.execute("UPDATE schema_version SET version = 55")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            supported = query_store.supports_watch_recovery_backoffs()
+            backoff = query_store.get_watch_recovery_backoff(
+                subject_kind="lineage",
+                subject_id="gza-100",
+                action_type="retry",
+                action_reason="transient-provider-failure",
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert supported is False
+        assert backoff is None
+        assert any(
+            "missing required table watch_recovery_backoffs" in warning
+            for warning in query_store.startup_warnings()
+        )
+
+    def test_query_only_open_pre_v56_incomplete_watch_recovery_backoffs_warns_and_degrades(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_watch_recovery_backoffs_column(db_path, "next_retry_at")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 55")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            supported = query_store.supports_watch_recovery_backoffs()
+            backoff = query_store.get_watch_recovery_backoff(
+                subject_kind="lineage",
+                subject_id="gza-100",
+                action_type="retry",
+                action_reason="transient-provider-failure",
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert supported is False
+        assert backoff is None
+        assert any(
+            "incomplete watch_recovery_backoffs schema" in warning
+            for warning in query_store.startup_warnings()
+        )
 
     def test_query_only_open_pre_v43_db_missing_changed_diff_reads_with_null(
         self, tmp_path: Path

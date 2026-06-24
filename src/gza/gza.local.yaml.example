@@ -326,6 +326,9 @@
 #   Deprecated alias for `watch.recovery_slots`.
 #   Default: 1
 #   restart_failed_batch: 1
+#   Maximum cooldown for transient watch recovery retries after the bounded schedule ramps up.
+#   Default: 1800
+#   transient_recovery_backoff_max: 1800
 
 # --- Review ---
 

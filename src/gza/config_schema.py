@@ -210,6 +210,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("watch.batch", "int", 2, "Default concurrent worker target for `gza watch`."),
     ConfigKeySpec("watch.failure_backoff_initial", "int", 60, "Initial cooldown after a non-auto-resumable watch failure."),
     ConfigKeySpec("watch.failure_backoff_max", "int", 3600, "Maximum cooldown after consecutive non-auto-resumable watch failures."),
+    ConfigKeySpec(
+        "watch.transient_recovery_backoff_max",
+        "int",
+        1800,
+        "Maximum cooldown for transient watch recovery retries after the bounded schedule ramps up.",
+    ),
     ConfigKeySpec("watch.failure_halt_after", "int | null", 10, "Exit `gza watch` after this many consecutive non-auto-resumable failures."),
     ConfigKeySpec("watch.no_progress_cycles", "int", 3, "Repeated unchanged watch-action cycles before the subject is parked for manual attention."),
     ConfigKeySpec("watch.max_idle", "int | null", None, "Idle timeout seconds for `gza watch` loop exit."),

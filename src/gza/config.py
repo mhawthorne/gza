@@ -93,6 +93,7 @@ DEFAULT_WATCH_MAX_IDLE: int | None = None
 DEFAULT_WATCH_MAX_ITERATIONS = 10
 DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL = 60
 DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
+DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX = 1800
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
 DEFAULT_WATCH_RECOVERY_SLOTS = 1
@@ -229,6 +230,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "restart_failed_batch": None,
         "failure_backoff_initial": None,
         "failure_backoff_max": None,
+        "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
         "no_progress_cycles": None,
     },
@@ -333,6 +335,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "restart_failed_batch": None,
         "failure_backoff_initial": None,
         "failure_backoff_max": None,
+        "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
     },
     "iterate_max_iterations": None,
@@ -528,6 +531,24 @@ def _validate_optional_positive_int_field(
     validated_value = cast(int, value)
     if validated_value <= 0:
         _record_error(f"'{field_name}' must be positive")
+        return None
+    return validated_value
+
+
+def _validate_positive_int_field(
+    value: object,
+    field_name: str,
+    *,
+    errors: list[str] | None = None,
+) -> int | None:
+    """Validate a required positive integer field with shared load/validate errors."""
+    if value is None:
+        if errors is None:
+            raise ConfigError(f"'{field_name}' must be a positive integer")
+        errors.append(f"'{field_name}' must be a positive integer")
+        return None
+    validated_value = _validate_optional_positive_int_field(value, field_name, errors=errors)
+    if validated_value is None:
         return None
     return validated_value
 
@@ -909,6 +930,7 @@ class WatchConfig:
     recovery_slots: int = DEFAULT_WATCH_RECOVERY_SLOTS
     failure_backoff_initial: int = DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL
     failure_backoff_max: int = DEFAULT_WATCH_FAILURE_BACKOFF_MAX
+    transient_recovery_backoff_max: int = DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
     no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
 
@@ -2025,24 +2047,29 @@ class Config:
             watch_recovery_slots = DEFAULT_WATCH_RECOVERY_SLOTS
         if watch_recovery_slots < 0:
             raise ConfigError("watch.recovery_slots must be a non-negative integer")
-        try:
-            watch_failure_backoff_initial = int(
-                watch_data.get("failure_backoff_initial", DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL)
-            )
-        except (TypeError, ValueError):
+        watch_failure_backoff_initial = _validate_positive_int_field(
+            watch_data.get("failure_backoff_initial", DEFAULT_WATCH_FAILURE_BACKOFF_INITIAL),
+            "watch.failure_backoff_initial",
+        )
+        if watch_failure_backoff_initial is None:
             raise ConfigError("watch.failure_backoff_initial must be a positive integer")
-        if watch_failure_backoff_initial < 1:
-            raise ConfigError("watch.failure_backoff_initial must be a positive integer")
-        try:
-            watch_failure_backoff_max = int(
-                watch_data.get("failure_backoff_max", DEFAULT_WATCH_FAILURE_BACKOFF_MAX)
-            )
-        except (TypeError, ValueError):
-            raise ConfigError("watch.failure_backoff_max must be a positive integer")
-        if watch_failure_backoff_max < 1:
+        watch_failure_backoff_max = _validate_positive_int_field(
+            watch_data.get("failure_backoff_max", DEFAULT_WATCH_FAILURE_BACKOFF_MAX),
+            "watch.failure_backoff_max",
+        )
+        if watch_failure_backoff_max is None:
             raise ConfigError("watch.failure_backoff_max must be a positive integer")
         if watch_failure_backoff_max < watch_failure_backoff_initial:
             raise ConfigError("watch.failure_backoff_max must be >= watch.failure_backoff_initial")
+        watch_transient_recovery_backoff_max = _validate_positive_int_field(
+            watch_data.get(
+                "transient_recovery_backoff_max",
+                DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX,
+            ),
+            "watch.transient_recovery_backoff_max",
+        )
+        if watch_transient_recovery_backoff_max is None:
+            raise ConfigError("watch.transient_recovery_backoff_max must be a positive integer")
         watch_failure_halt_after_raw = watch_data.get(
             "failure_halt_after", DEFAULT_WATCH_FAILURE_HALT_AFTER
         )
@@ -2073,6 +2100,7 @@ class Config:
             recovery_slots=watch_recovery_slots,
             failure_backoff_initial=watch_failure_backoff_initial,
             failure_backoff_max=watch_failure_backoff_max,
+            transient_recovery_backoff_max=watch_transient_recovery_backoff_max,
             failure_halt_after=watch_failure_halt_after,
             no_progress_cycles=watch_no_progress_cycles,
         )
@@ -2617,25 +2645,31 @@ class Config:
                         "watch.recovery_slots and deprecated watch.restart_failed_batch must not conflict"
                     )
                 if "failure_backoff_initial" in watch_data:
-                    if (
-                        not isinstance(watch_data["failure_backoff_initial"], int)
-                        or watch_data["failure_backoff_initial"] < 1
-                    ):
-                        errors.append("watch.failure_backoff_initial must be a positive integer")
+                    _validate_positive_int_field(
+                        watch_data["failure_backoff_initial"],
+                        "watch.failure_backoff_initial",
+                        errors=errors,
+                    )
                 if "failure_backoff_max" in watch_data:
-                    if (
-                        not isinstance(watch_data["failure_backoff_max"], int)
-                        or watch_data["failure_backoff_max"] < 1
-                    ):
-                        errors.append("watch.failure_backoff_max must be a positive integer")
+                    _validate_positive_int_field(
+                        watch_data["failure_backoff_max"],
+                        "watch.failure_backoff_max",
+                        errors=errors,
+                    )
+                if "transient_recovery_backoff_max" in watch_data:
+                    _validate_positive_int_field(
+                        watch_data["transient_recovery_backoff_max"],
+                        "watch.transient_recovery_backoff_max",
+                        errors=errors,
+                    )
                 initial_raw = watch_data.get("failure_backoff_initial")
                 max_raw = watch_data.get("failure_backoff_max")
                 if (
-                    isinstance(initial_raw, int)
-                    and initial_raw >= 1
-                    and isinstance(max_raw, int)
-                    and max_raw >= 1
-                    and max_raw < initial_raw
+                    _is_strict_int(initial_raw)
+                    and cast(int, initial_raw) >= 1
+                    and _is_strict_int(max_raw)
+                    and cast(int, max_raw) >= 1
+                    and cast(int, max_raw) < cast(int, initial_raw)
                 ):
                     errors.append("watch.failure_backoff_max must be >= watch.failure_backoff_initial")
                 if "failure_halt_after" in watch_data and watch_data["failure_halt_after"] is not None:

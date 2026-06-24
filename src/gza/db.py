@@ -44,6 +44,7 @@ __all__ = [
     "TaskArtifact",
     "MergeUnit",
     "WatchProgressObservation",
+    "WatchRecoveryBackoff",
     "TaskComment",
     "TaskStats",
     "SqliteTaskStore",
@@ -633,6 +634,23 @@ class WatchProgressObservation:
     observed_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class WatchRecoveryBackoff:
+    """Persisted transient watch recovery cooldown for one subject/action pair."""
+
+    subject_kind: str
+    subject_id: str
+    action_type: str
+    action_reason: str
+    subject_task_id: str | None = None
+    last_failure_task_id: str | None = None
+    last_failure_reason: str | None = None
+    last_failure_fingerprint: str = ""
+    streak: int = 1
+    next_retry_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
@@ -658,6 +676,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "merge_unit_tasks": ("attached_at",),
     "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
+    "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
     column for columns in _DB_TIMESTAMP_COLUMNS.values() for column in columns
@@ -971,8 +990,29 @@ MIGRATION_V54_TO_V55 = """
 ALTER TABLE watch_progress_observations ADD COLUMN launch_evidence_fingerprint TEXT;
 """
 
+# Migration from v55 to v56: durable watch transient recovery cooldowns
+MIGRATION_V55_TO_V56 = """
+CREATE TABLE IF NOT EXISTS watch_recovery_backoffs (
+    project_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_reason TEXT NOT NULL,
+    subject_task_id TEXT,
+    last_failure_task_id TEXT,
+    last_failure_reason TEXT,
+    last_failure_fingerprint TEXT NOT NULL,
+    streak INTEGER NOT NULL DEFAULT 1,
+    next_retry_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, subject_kind, subject_id, action_type, action_reason)
+);
+CREATE INDEX IF NOT EXISTS idx_watch_recovery_backoffs_due
+    ON watch_recovery_backoffs(project_id, next_retry_at);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 55
+SCHEMA_VERSION = 56
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1677,6 +1717,20 @@ _QUERY_ONLY_OPTIONAL_WATCH_PROGRESS_COLUMNS: tuple[str, ...] = (
     "action_task_running_pid",
     "launch_evidence_fingerprint",
 )
+_QUERY_ONLY_REQUIRED_WATCH_RECOVERY_BACKOFF_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "subject_kind",
+    "subject_id",
+    "action_type",
+    "action_reason",
+    "subject_task_id",
+    "last_failure_task_id",
+    "last_failure_reason",
+    "last_failure_fingerprint",
+    "streak",
+    "next_retry_at",
+    "updated_at",
+)
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
     "id",
@@ -1736,7 +1790,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -1982,6 +2036,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         52: ("tasks", "review_verify_artifact_file"),
         53: ("watch_progress_observations", "action_task_running_pid"),
         54: ("task_comments", "kind"),
+        56: ("watch_recovery_backoffs", "updated_at"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -2034,6 +2089,16 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                     "Auto-migration to v53 incomplete: missing required column "
                     f"watch_progress_observations.{column}"
                 )
+    if target_version >= 56:
+        if not _table_exists(conn, "watch_recovery_backoffs"):
+            raise RuntimeError(
+                "Auto-migration to v56 incomplete: missing required table watch_recovery_backoffs"
+            )
+        if not _index_exists(conn, "idx_watch_recovery_backoffs_due"):
+            raise RuntimeError(
+                "Auto-migration to v56 incomplete: missing required index "
+                "idx_watch_recovery_backoffs_due"
+            )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -2352,6 +2417,56 @@ def _ensure_required_auto_migration_artifacts(
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required index "
                     "idx_watch_progress_subject: use a writable database."
+                ) from exc
+    if target_version >= 56:
+        if not _table_exists(conn, "watch_recovery_backoffs"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS watch_recovery_backoffs (
+                        project_id TEXT NOT NULL,
+                        subject_kind TEXT NOT NULL,
+                        subject_id TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        action_reason TEXT NOT NULL,
+                        subject_task_id TEXT,
+                        last_failure_task_id TEXT,
+                        last_failure_reason TEXT,
+                        last_failure_fingerprint TEXT NOT NULL,
+                        streak INTEGER NOT NULL DEFAULT 1,
+                        next_retry_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, subject_kind, subject_id, action_type, action_reason)
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table watch_recovery_backoffs; "
+                        "use a writable database to complete migration to v56, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "watch_recovery_backoffs: use a writable database."
+                ) from exc
+        if not _index_exists(conn, "idx_watch_recovery_backoffs_due"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_watch_recovery_backoffs_due
+                        ON watch_recovery_backoffs(project_id, next_retry_at)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required index idx_watch_recovery_backoffs_due; "
+                        "use a writable database to complete migration to v56, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_watch_recovery_backoffs_due: use a writable database."
                 ) from exc
 
 SCHEMA = """
@@ -2904,6 +3019,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (53, MIGRATION_V52_TO_V53),
     (54, MIGRATION_V53_TO_V54),
     (55, MIGRATION_V54_TO_V55),
+    (56, MIGRATION_V55_TO_V56),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3138,6 +3254,13 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "watch_progress_observations")
 
+    def supports_watch_recovery_backoffs(self) -> bool:
+        """Return whether transient watch recovery cooldown storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_supports_watch_recovery_backoffs()
+        with self._connect() as conn:
+            return _table_exists(conn, "watch_recovery_backoffs")
+
     def supports_task_artifacts(self) -> bool:
         """Return whether task artifact storage is available."""
         if self._open_mode == "query_only":
@@ -3327,6 +3450,7 @@ class SqliteTaskStore:
             "merge_unit_tasks",
             "task_artifacts",
             "watch_progress_observations",
+            "watch_recovery_backoffs",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -3430,6 +3554,17 @@ class SqliteTaskStore:
                     "Query-only DB open detected missing optional watch-progress liveness columns; "
                     "action-task started_at/running_pid evidence will be unavailable."
                 )
+        if not self._query_only_supports_watch_recovery_backoffs():
+            if self._query_only_table_exists.get("watch_recovery_backoffs", False):
+                self._startup_warnings.append(
+                    "Query-only DB open detected incomplete watch_recovery_backoffs schema; "
+                    "watch transient-recovery cooldowns will be unavailable."
+                )
+            else:
+                self._startup_warnings.append(
+                    "Query-only DB open detected missing required table watch_recovery_backoffs; "
+                    "watch transient-recovery cooldowns will be unavailable."
+                )
         run_steps_issue = self._query_only_run_steps_warning()
         if run_steps_issue is not None:
             self._startup_warnings.append(run_steps_issue)
@@ -3485,6 +3620,15 @@ class SqliteTaskStore:
         return self._query_only_table_exists.get("watch_progress_observations", False) and all(
             self._query_only_has_column("watch_progress_observations", column)
             for column in _QUERY_ONLY_REQUIRED_WATCH_PROGRESS_COLUMNS
+        )
+
+    def _query_only_supports_watch_recovery_backoffs(self) -> bool:
+        """Return True when query-only reads can safely use watch recovery backoff artifacts."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("watch_recovery_backoffs", False) and all(
+            self._query_only_has_column("watch_recovery_backoffs", column)
+            for column in _QUERY_ONLY_REQUIRED_WATCH_RECOVERY_BACKOFF_COLUMNS
         )
 
     def _query_only_supports_run_steps(self) -> bool:
@@ -4884,6 +5028,27 @@ class SqliteTaskStore:
             observed_at=_parse_db_timestamp(row["observed_at"]),
         )
 
+    def _row_to_watch_recovery_backoff(self, row: sqlite3.Row | None) -> WatchRecoveryBackoff | None:
+        if row is None:
+            return None
+        return WatchRecoveryBackoff(
+            subject_kind=str(row["subject_kind"]),
+            subject_id=str(row["subject_id"]),
+            action_type=str(row["action_type"]),
+            action_reason=str(row["action_reason"]),
+            subject_task_id=str(row["subject_task_id"]) if row["subject_task_id"] is not None else None,
+            last_failure_task_id=(
+                str(row["last_failure_task_id"]) if row["last_failure_task_id"] is not None else None
+            ),
+            last_failure_reason=(
+                str(row["last_failure_reason"]) if row["last_failure_reason"] is not None else None
+            ),
+            last_failure_fingerprint=str(row["last_failure_fingerprint"]),
+            streak=int(row["streak"]) if row["streak"] is not None else 1,
+            next_retry_at=_parse_db_timestamp(row["next_retry_at"]),
+            updated_at=_parse_db_timestamp(row["updated_at"]),
+        )
+
     def _row_to_task_artifact(self, row: sqlite3.Row | None) -> TaskArtifact | None:
         if row is None:
             return None
@@ -5310,6 +5475,99 @@ class SqliteTaskStore:
                   AND subject_id = ?
                 """,
                 (self._project_id, subject_kind, subject_id),
+            )
+
+    def get_watch_recovery_backoff(
+        self,
+        *,
+        subject_kind: str,
+        subject_id: str,
+        action_type: str,
+        action_reason: str,
+    ) -> WatchRecoveryBackoff | None:
+        """Fetch one persisted watch transient-recovery cooldown row."""
+        if not self.supports_watch_recovery_backoffs():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM watch_recovery_backoffs
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                  AND action_type = ?
+                  AND action_reason = ?
+                """,
+                (self._project_id, subject_kind, subject_id, action_type, action_reason),
+            ).fetchone()
+        return self._row_to_watch_recovery_backoff(row)
+
+    def delete_watch_recovery_backoff_subject(self, *, subject_kind: str, subject_id: str) -> None:
+        """Clear persisted watch transient-recovery cooldowns for one subject."""
+        if not self.supports_watch_recovery_backoffs():
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM watch_recovery_backoffs
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                """,
+                (self._project_id, subject_kind, subject_id),
+            )
+
+    def upsert_watch_recovery_backoff(self, backoff: WatchRecoveryBackoff) -> None:
+        """Insert or replace one persisted watch transient-recovery cooldown row."""
+        if not self.supports_watch_recovery_backoffs():
+            return
+        next_retry_at = _format_db_timestamp(backoff.next_retry_at or datetime.now(UTC))
+        updated_at = _format_db_timestamp(backoff.updated_at or datetime.now(UTC))
+        assert next_retry_at is not None
+        assert updated_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watch_recovery_backoffs(
+                    project_id,
+                    subject_kind,
+                    subject_id,
+                    action_type,
+                    action_reason,
+                    subject_task_id,
+                    last_failure_task_id,
+                    last_failure_reason,
+                    last_failure_fingerprint,
+                    streak,
+                    next_retry_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, subject_kind, subject_id, action_type, action_reason)
+                DO UPDATE SET
+                    subject_task_id = excluded.subject_task_id,
+                    last_failure_task_id = excluded.last_failure_task_id,
+                    last_failure_reason = excluded.last_failure_reason,
+                    last_failure_fingerprint = excluded.last_failure_fingerprint,
+                    streak = excluded.streak,
+                    next_retry_at = excluded.next_retry_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self._project_id,
+                    backoff.subject_kind,
+                    backoff.subject_id,
+                    backoff.action_type,
+                    backoff.action_reason,
+                    backoff.subject_task_id,
+                    backoff.last_failure_task_id,
+                    backoff.last_failure_reason,
+                    backoff.last_failure_fingerprint,
+                    backoff.streak,
+                    next_retry_at,
+                    updated_at,
+                ),
             )
 
     def upsert_watch_progress_observation(self, observation: WatchProgressObservation) -> None:

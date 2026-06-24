@@ -1044,6 +1044,30 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["watch"]["no_activity_timeout"] == 120
         assert payload["sources"]["watch.no_activity_timeout"] == "base"
 
+    def test_config_command_includes_transient_watch_backoff_max_json_and_source(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """gza config --json should expose watch.transient_recovery_backoff_max with source attribution."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  transient_recovery_backoff_max: 240\n"
+        )
+
+        result = invoke_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["watch"]["transient_recovery_backoff_max"] == 240
+        assert payload["sources"]["watch.transient_recovery_backoff_max"] == "base"
+
     def test_config_command_includes_main_checkout_isolate_text_and_source(self, tmp_path: Path):
         """gza config should render main_checkout_isolate rows with false values and sources."""
 
@@ -1062,6 +1086,31 @@ class TestLocalConfigOverrides:
         assert result.returncode == 0
         assert re.search(
             r"^main_checkout_isolate\s+false\s+\[local\]$",
+            result.stdout,
+            re.MULTILINE,
+        )
+
+    def test_config_command_text_reports_transient_watch_backoff_max_source(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Text output should render watch.transient_recovery_backoff_max with its source marker."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  transient_recovery_backoff_max: 240\n"
+        )
+
+        result = invoke_gza(
+            "config",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert re.search(
+            r"^watch\.transient_recovery_backoff_max\s+240\s+\[base\]$",
             result.stdout,
             re.MULTILINE,
         )
@@ -4337,6 +4386,7 @@ class TestWatchConfigValidation:
             ("batch", "bad"),
             ("failure_backoff_initial", "bad"),
             ("failure_backoff_max", "bad"),
+            ("transient_recovery_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
             ("no_progress_cycles", "bad"),
             ("no_activity_timeout", "bad"),
@@ -4359,6 +4409,7 @@ class TestWatchConfigValidation:
             "batch",
             "failure_backoff_initial",
             "failure_backoff_max",
+            "transient_recovery_backoff_max",
             "failure_halt_after",
             "no_progress_cycles",
             "no_activity_timeout",
@@ -4385,6 +4436,7 @@ class TestWatchConfigValidation:
             "  batch: 7\n"
             "  failure_backoff_initial: 30\n"
             "  failure_backoff_max: 900\n"
+            "  transient_recovery_backoff_max: 1200\n"
             "  failure_halt_after: 6\n"
             "  no_progress_cycles: 4\n"
             "  no_activity_timeout: 75\n"
@@ -4396,6 +4448,7 @@ class TestWatchConfigValidation:
         assert config.watch.batch == 7
         assert config.watch.failure_backoff_initial == 30
         assert config.watch.failure_backoff_max == 900
+        assert config.watch.transient_recovery_backoff_max == 1200
         assert config.watch.failure_halt_after == 6
         assert config.watch.no_progress_cycles == 4
         assert config.watch.no_activity_timeout == 75
@@ -4740,6 +4793,7 @@ class TestWatchConfigValidation:
             ("batch", "bad"),
             ("failure_backoff_initial", "bad"),
             ("failure_backoff_max", "bad"),
+            ("transient_recovery_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
             ("no_activity_timeout", "bad"),
             ("poll", "bad"),
@@ -4762,6 +4816,7 @@ class TestWatchConfigValidation:
             "batch",
             "failure_backoff_initial",
             "failure_backoff_max",
+            "transient_recovery_backoff_max",
             "failure_halt_after",
             "no_activity_timeout",
             "poll",
@@ -4791,6 +4846,48 @@ class TestWatchConfigValidation:
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
         assert "watch.failure_backoff_max must be >= watch.failure_backoff_initial" in "\n".join(errors)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "failure_backoff_initial",
+            "failure_backoff_max",
+            "transient_recovery_backoff_max",
+        ],
+    )
+    def test_validate_watch_backoff_fields_reject_boolean_values(self, tmp_path: Path, field: str) -> None:
+        """Config.validate should match Config.load strict-int rejection for watch backoff booleans."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"watch:\n  {field}: true\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert f"watch.{field}" in "\n".join(errors)
+
+        with pytest.raises(ConfigError, match=re.escape(f"'watch.{field}' must be an integer")):
+            Config.load(tmp_path)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "failure_backoff_initial",
+            "failure_backoff_max",
+            "transient_recovery_backoff_max",
+        ],
+    )
+    def test_validate_watch_backoff_fields_reject_null_values(self, tmp_path: Path, field: str) -> None:
+        """Config.validate should reject explicit null for required watch backoff fields."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, f"watch:\n  {field}: null\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert f"'watch.{field}' must be a positive integer" in errors
+
+        with pytest.raises(ConfigError, match=re.escape(f"'watch.{field}' must be a positive integer")):
+            Config.load(tmp_path)
 
 
 class TestIterateMaxIterationsConfigValidation:
