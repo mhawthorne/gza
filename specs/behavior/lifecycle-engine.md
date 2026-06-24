@@ -153,14 +153,26 @@ rebase. If changed (or equivalence cannot be proven), prior review evidence MUST
 treated as stale (§5). Recovered/resumed rebases MUST fail closed and be treated as
 changed.
 
-### §5 — Post-rebase review invalidation
+### §5 — Stale review invalidation
 
 - If `require_review_before_merge` is off → fall through to the no-review merge path; the
   engine MUST NOT create or wait on a refresh review.
 - A rebase that changed code and is newer than the latest review, with
   `advance_create_reviews` on → `create_review`.
-- Same condition with `advance_create_reviews` off → `needs_discussion` (park for a manual
-  review refresh before merge).
+- The current implementation branch/merge-unit head differs from the latest completed
+  review's recorded `review_verify_head_sha`, when both SHAs are known, with
+  `advance_create_reviews` on → `create_review`.
+- If the live branch-head probe fails while checking that freshness, the engine MUST fail
+  closed: it MUST NOT treat cached merge-unit head metadata as proof that the latest
+  completed review is current, and it MUST surface a stop-for-human action instead of
+  merge, stale-refresh, or `review_max_cycles` decisions that assume freshness is known.
+- If both stale-review sources are true, operator-facing stale-review descriptions MUST
+  prefer the rebase-specific reason over the generic branch-head-advanced wording.
+- Either stale-review condition with `advance_create_reviews` off → `needs_discussion`
+  (park for a manual review refresh before merge).
+- Missing `review_verify_head_sha` evidence MUST fail closed for freshness: the engine
+  MUST NOT infer stale branch-head advancement from absence alone.
+- Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
 
 ### §6 — Review state
 
@@ -203,7 +215,8 @@ When a current review exists for the implementation lineage:
 
 **Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
-- Review→improve cycles reach `max_review_cycles` → `max_cycles_reached`.
+- Review→improve cycles reach `max_review_cycles` within the current durable-progress
+  head epoch → `max_cycles_reached`.
 - **A. Verify-only review clear invariant.** A review whose blockers are solely
   runner-captured `verify_command` failures or timeouts MUST be cleared when the
   subsequent no-op improve captures a passing `verify_command` in that improve's own
@@ -441,13 +454,14 @@ is a spec change. The accompanying human message is free text.
 | `rebase-did-not-unblock-merge` | HumanParked | §4 rebase completed, still conflicts |
 | `rebase-failure-circuit-breaker` | HumanParked | §4 repeated rebase failures, no progress |
 | `branch-already-rebased-lineage-incomplete` | needs_discussion | §4 branch contains target tip, lineage unresolved |
-| `stale-review-needs-manual-refresh` | needs_discussion | §5 rebase invalidated review, `advance_create_reviews` off |
+| `stale-review-needs-manual-refresh` | needs_discussion | §5 rebase-changed or branch-head-advanced stale review, `advance_create_reviews` off |
+| `review-freshness-unverified` | needs_discussion | §5 live branch-head probe failed while checking whether the latest completed review is still current |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no current in-improve passing verify evidence clearing the verify-only review |
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound when current in-improve passing verify evidence did not clear the verify-only review |
 | `review-blocker-adjudication-needed` | needs_discussion | §6 adjudication for a disputed non-verify CODE blocker returned `NEEDS_HUMAN`, failed, or could not be parsed safely |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
-| `review-max-cycles-reached` | max_cycles_reached | §6 review→improve cycles ≥ `max_review_cycles` |
+| `review-max-cycles-reached` | max_cycles_reached | §6 current-head review→improve cycles ≥ `max_review_cycles` with no stale-review refresh available |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `main-integration-verify-red` | needs_discussion | §8 local target verify failed after target HEAD changed; halt further merges until it is green again |

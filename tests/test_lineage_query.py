@@ -3414,6 +3414,134 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     assert "main verify RED at `abc123` - merges halted; phase `unit` failing" in row.next_action["description"]
 
 
+def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_attention(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_review_cycles = 1
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/owner-row-stale-review-refresh"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    review.review_verify_head_sha = "reviewed-sha"
+    store.update(review)
+
+    improve = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    improve.changed_diff = True
+    store.update(improve)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.can_merge.return_value = True
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
+    git.rev_parse_if_exists.side_effect = lambda ref: "current-sha" if ref == impl.branch else None
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    row = next(r for r in rows if r.owner_task.id == impl.id)
+    assert row.next_action is not None
+    assert row.next_action["type"] == "create_review"
+    assert row.next_action.get("needs_attention_reason") is None
+
+
+def test_query_lineage_owner_rows_surfaces_cleared_review_probe_failure_attention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.review_verdict import ParsedReviewReport
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/owner-row-cleared-review-probe-failure"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    review = store.add("Review round 1", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    review.review_verify_head_sha = "reviewed-sha"
+    store.update(review)
+
+    improve = store.add("Improve round 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
+    improve.changed_diff = True
+    store.update(improve)
+
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    store.refresh_merge_unit_head(unit.id, head_sha="reviewed-sha")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.can_merge.return_value = True
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
+    git.rev_parse_if_exists.side_effect = GitError("probe blew up")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    row = next(r for r in rows if r.owner_task.id == impl.id)
+    assert row.next_action is not None
+    assert row.next_action["type"] == "needs_discussion"
+    assert row.next_action["needs_attention_reason"] == "review-freshness-unverified"
+    assert "branch-head probe failed" in row.next_action["description"]
+
+
 def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_when_gate_removed(
     tmp_path: Path,
 ) -> None:

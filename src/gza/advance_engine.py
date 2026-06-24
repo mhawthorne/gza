@@ -223,8 +223,13 @@ class AdvanceContext:
     latest_completed_rebase: DbTask | None = None
     rebase_failure_streak: RebaseFailureStreak | None = None
     rebase_invalidates_review: bool = False
+    review_invalidated_by_progress: bool = False
+    review_invalidation_reason: str | None = None
     review_preserved_by_rebase: DbTask | None = None
     review_invalidated_by_rebase: DbTask | None = None
+    current_review_head_sha: str | None = None
+    current_review_head_probe_warning: str | None = None
+    latest_reviewed_head_sha: str | None = None
 
     reviews: list[DbTask] | None = None
     review_root_task: DbTask | None = None
@@ -618,6 +623,35 @@ def is_resumable_failed_task(task: Any) -> bool:
 def count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
     improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
     return sum(1 for t in improve_tasks if t.status == "completed")
+
+
+def count_completed_review_cycles_for_current_epoch(
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    *,
+    completed_reviews: list[DbTask],
+    latest_completed_review: DbTask | None,
+) -> int:
+    """Count completed improves in the latest reviewed-head epoch."""
+    if latest_completed_review is None:
+        return 0
+
+    latest_reviewed_head_sha = latest_completed_review.review_verify_head_sha
+    if not latest_reviewed_head_sha:
+        return count_completed_review_cycles(store, impl_task_id)
+
+    boundary_time = _task_event_time(latest_completed_review)
+    for review in completed_reviews[1:]:
+        if review.review_verify_head_sha != latest_reviewed_head_sha:
+            break
+        boundary_time = _task_event_time(review)
+
+    improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
+    return sum(
+        1
+        for task in improve_tasks
+        if task.status == "completed" and _task_event_time(task) > boundary_time
+    )
 
 
 def _has_tag(task: DbTask | None, tag: str) -> bool:
@@ -1047,6 +1081,39 @@ def _rebase_pending_review_description(review_task: DbTask | None, rebase_task: 
 
 def _rebase_wait_review_description(review_task: DbTask | None, rebase_task: DbTask | None) -> str:
     return f"SKIP: review {_task_id(review_task)} in progress (rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+
+
+def _stale_review_create_review_description(ctx: AdvanceContext) -> str:
+    if ctx.review_invalidation_reason == "branch_head_advanced":
+        return "Create review (branch head advanced after latest review)"
+    return _rebase_create_review_description(ctx.review_invalidated_by_rebase)
+
+
+def _stale_review_pending_review_description(ctx: AdvanceContext) -> str:
+    if ctx.review_invalidation_reason == "branch_head_advanced":
+        return (
+            f"Run pending review {_task_id(ctx.active_review)} "
+            "(branch head advanced after latest review)"
+        )
+    return _rebase_pending_review_description(ctx.active_review, ctx.review_invalidated_by_rebase)
+
+
+def _stale_review_wait_review_description(ctx: AdvanceContext) -> str:
+    if ctx.review_invalidation_reason == "branch_head_advanced":
+        return (
+            f"SKIP: review {_task_id(ctx.active_review)} in progress "
+            "(branch head advanced after latest review)"
+        )
+    return _rebase_wait_review_description(ctx.active_review, ctx.review_invalidated_by_rebase)
+
+
+def _review_freshness_probe_failed_description(ctx: AdvanceContext) -> str:
+    if ctx.current_review_head_probe_warning is None:
+        return "SKIP: latest review freshness could not be verified"
+    return (
+        "SKIP: latest review freshness could not be verified because "
+        f"{ctx.current_review_head_probe_warning}"
+    )
 
 
 def _no_branch_description(ctx: AdvanceContext) -> str:
@@ -2323,7 +2390,12 @@ def _resolve_review_state(
             noop_improve_trigger = "review"
 
         if review_verdict == "CHANGES_REQUESTED":
-            completed_review_cycles = count_completed_review_cycles(store, task.id)
+            completed_review_cycles = count_completed_review_cycles_for_current_epoch(
+                store,
+                task.id,
+                completed_reviews=completed_reviews,
+                latest_completed_review=latest_completed_review,
+            )
             review_blocker_resolution_statuses = _latest_review_blocker_resolution_statuses(
                 store,
                 git=git,
@@ -2462,11 +2534,13 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
         return True
     if not ctx.requires_review:
         return True
-    if ctx.rebase_invalidates_review:
+    if ctx.review_invalidated_by_progress:
         return False
     if ctx.closing_review_action is not None:
         return False
     if ctx.latest_completed_review is None:
+        return False
+    if ctx.current_review_head_probe_warning is not None and ctx.latest_reviewed_head_sha is not None:
         return False
     if ctx.review_cleared:
         return True
@@ -2484,9 +2558,9 @@ def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:
     return True
 
 
-def _stale_rebase_review_refresh_required(ctx: AdvanceContext) -> bool:
-    """Whether a stale post-rebase review must still be refreshed before merge."""
-    if not ctx.rebase_invalidates_review:
+def _stale_review_refresh_required(ctx: AdvanceContext) -> bool:
+    """Whether a stale implementation review must still be refreshed before merge."""
+    if not ctx.review_invalidated_by_progress:
         return False
     if not _is_implementation_owned_lineage(ctx):
         return False
@@ -2499,7 +2573,28 @@ def _active_review_requires_automation(ctx: AdvanceContext) -> bool:
     """Whether an active review should still block merge automation."""
     if ctx.review_cleared or ctx.active_review is None:
         return False
-    if ctx.rebase_invalidates_review and _is_implementation_owned_lineage(ctx) and not ctx.requires_review:
+    if (
+        ctx.review_invalidated_by_progress
+        and _is_implementation_owned_lineage(ctx)
+        and not ctx.requires_review
+    ):
+        return False
+    return True
+
+
+def _review_freshness_probe_failed(ctx: AdvanceContext) -> bool:
+    """Whether review freshness must fail closed because live branch-head probing failed."""
+    if ctx.current_review_head_probe_warning is None:
+        return False
+    if ctx.latest_reviewed_head_sha is None:
+        return False
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not ctx.requires_review:
+        return False
+    if ctx.latest_completed_review is None:
+        return False
+    if ctx.active_review is not None:
         return False
     return True
 
@@ -2654,6 +2749,19 @@ def _resolve_pre_closing_review_git_context(
     if review_root_task is None:
         raise AssertionError("git phase requires review_root_task")
 
+    def _resolve_current_review_head_state() -> tuple[str | None, str | None]:
+        branch_name = review_root_task.branch or task.branch
+        branch_head = _resolve_branch_head_sha(git, branch_name)
+        if branch_head.warning is not None:
+            return None, branch_head.warning
+        if isinstance(branch_head.head_sha, str) and branch_head.head_sha:
+            return branch_head.head_sha, None
+        if review_root_task.id is not None:
+            merge_unit = store.resolve_merge_unit_for_task(review_root_task.id)
+            if merge_unit is not None and isinstance(merge_unit.head_sha, str) and merge_unit.head_sha:
+                return merge_unit.head_sha, None
+        return None, None
+
     merge_source = _resolve_current_merge_source(git, task.branch or "")
     if persist_post_merge_rebase_state:
         post_merge_rebase_state = _resolve_and_persist_post_merge_rebase_state(
@@ -2710,8 +2818,19 @@ def _resolve_pre_closing_review_git_context(
         latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
 
     rebase_invalidates_review = False
+    review_invalidated_by_progress = False
+    review_invalidation_reason: str | None = None
     review_preserved_by_rebase: DbTask | None = None
     review_invalidated_by_rebase: DbTask | None = None
+    latest_reviewed_head_sha = (
+        ctx.latest_completed_review.review_verify_head_sha
+        if ctx.latest_completed_review is not None
+        else None
+    )
+    current_review_head_sha: str | None = None
+    current_review_head_probe_warning: str | None = None
+    if ctx.latest_completed_review is not None and latest_reviewed_head_sha is not None:
+        current_review_head_sha, current_review_head_probe_warning = _resolve_current_review_head_state()
     if (
         latest_completed_rebase is not None
         and ctx.latest_completed_review is not None
@@ -2723,7 +2842,18 @@ def _resolve_pre_closing_review_git_context(
             review_preserved_by_rebase = latest_completed_rebase
         else:
             rebase_invalidates_review = True
+            review_invalidated_by_progress = True
+            review_invalidation_reason = "rebase_changed_diff"
             review_invalidated_by_rebase = latest_completed_rebase
+    if (
+        ctx.latest_completed_review is not None
+        and latest_reviewed_head_sha is not None
+        and current_review_head_sha is not None
+        and latest_reviewed_head_sha != current_review_head_sha
+    ):
+        review_invalidated_by_progress = True
+        if review_invalidation_reason is None:
+            review_invalidation_reason = "branch_head_advanced"
 
     rebase_failure_streak = _count_rebase_failure_streak(
         task=task,
@@ -2748,8 +2878,13 @@ def _resolve_pre_closing_review_git_context(
         latest_completed_rebase=latest_completed_rebase,
         rebase_failure_streak=rebase_failure_streak,
         rebase_invalidates_review=rebase_invalidates_review,
+        review_invalidated_by_progress=review_invalidated_by_progress,
+        review_invalidation_reason=review_invalidation_reason,
         review_preserved_by_rebase=review_preserved_by_rebase,
         review_invalidated_by_rebase=review_invalidated_by_rebase,
+        current_review_head_sha=current_review_head_sha,
+        current_review_head_probe_warning=current_review_head_probe_warning,
+        latest_reviewed_head_sha=latest_reviewed_head_sha,
     )
 
 
@@ -3530,44 +3665,61 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=_already_rebased_but_lineage_incomplete_action,
     ),
     AdvanceRule(
-        name="post_rebase_run_pending_review",
+        name="stale_review_run_pending_review",
         matches=lambda ctx: (
-            _stale_rebase_review_refresh_required(ctx)
+            _stale_review_refresh_required(ctx)
             and ctx.create_reviews
             and ctx.active_review is not None
             and ctx.active_review.status == "pending"
         ),
         action=lambda ctx: {
             "type": "run_review",
-            "description": _rebase_pending_review_description(ctx.active_review, ctx.review_invalidated_by_rebase),
+            "description": _stale_review_pending_review_description(ctx),
             "review_task": ctx.active_review,
         },
     ),
     AdvanceRule(
-        name="post_rebase_wait_review",
+        name="review_freshness_probe_failed",
+        matches=_review_freshness_probe_failed,
+        action=lambda ctx: with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": _review_freshness_probe_failed_description(ctx),
+                "probe_warning": ctx.current_review_head_probe_warning,
+            },
+            reason="review-freshness-unverified",
+            subject_task_id=(
+                ctx.task.id
+                if getattr(ctx, "review_root_task", None) is None
+                else getattr(ctx.review_root_task, "id", ctx.task.id)
+            ),
+        ),
+    ),
+    AdvanceRule(
+        name="stale_review_wait_review",
         matches=lambda ctx: (
-            _stale_rebase_review_refresh_required(ctx)
+            _stale_review_refresh_required(ctx)
             and ctx.create_reviews
             and ctx.active_review is not None
             and ctx.active_review.status == "in_progress"
         ),
         action=lambda ctx: {
             "type": "wait_review",
-            "description": _rebase_wait_review_description(ctx.active_review, ctx.review_invalidated_by_rebase),
+            "description": _stale_review_wait_review_description(ctx),
             "review_task": ctx.active_review,
         },
     ),
     AdvanceRule(
-        name="post_rebase_create_review",
-        matches=lambda ctx: _stale_rebase_review_refresh_required(ctx) and ctx.create_reviews,
+        name="stale_review_create_review",
+        matches=lambda ctx: _stale_review_refresh_required(ctx) and ctx.create_reviews,
         action=lambda ctx: {
             "type": "create_review",
-            "description": _rebase_create_review_description(ctx.review_invalidated_by_rebase),
+            "description": _stale_review_create_review_description(ctx),
         },
     ),
     AdvanceRule(
         name="stale_review_needs_manual_refresh",
-        matches=lambda ctx: _stale_rebase_review_refresh_required(ctx) and not ctx.create_reviews,
+        matches=lambda ctx: _stale_review_refresh_required(ctx) and not ctx.create_reviews,
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",
