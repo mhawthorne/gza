@@ -34,6 +34,7 @@ from gza.providers.base import (
     classify_provider_api_error,
     ensure_docker_image,
     is_docker_running,
+    wait_for_docker_ready,
     verify_docker_credentials,
 )
 from gza.providers.claude import (
@@ -223,6 +224,7 @@ class TestDockerConfig:
         assert config.cli_command == "claude"
         assert config.config_dir == ".claude"
         assert "ANTHROPIC_API_KEY" in config.env_vars
+        assert config.docker_startup_timeout == 60
 
     def test_gemini_docker_config(self, tmp_path):
         """Gemini should have correct Docker config."""
@@ -237,6 +239,7 @@ class TestDockerConfig:
         assert "GEMINI_API_KEY" in config.env_vars
         assert "GOOGLE_API_KEY" in config.env_vars
         assert "GOOGLE_APPLICATION_CREDENTIALS" in config.env_vars
+        assert config.docker_startup_timeout == 60
 
     def test_claude_provider_uses_per_provider_image_tag(self, tmp_path):
         """ClaudeProvider should append '-claude' to docker_image for its image tag."""
@@ -256,7 +259,10 @@ class TestDockerConfig:
             mock_get_cfg.return_value = MagicMock(image_name="myproj-gza-claude", cli_command="claude", env_vars=[])
             provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
 
-        mock_get_cfg.assert_called_once_with("myproj-gza-claude")
+        mock_get_cfg.assert_called_once_with(
+            "myproj-gza-claude",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
     def test_codex_provider_uses_per_provider_image_tag(self, tmp_path):
         """CodexProvider should append '-codex' to docker_image for its image tag."""
@@ -276,7 +282,10 @@ class TestDockerConfig:
             mock_get_cfg.return_value = MagicMock(image_name="myproj-gza-codex", cli_command="codex", env_vars=[])
             provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
 
-        mock_get_cfg.assert_called_once_with("myproj-gza-codex")
+        mock_get_cfg.assert_called_once_with(
+            "myproj-gza-codex",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
     def test_gemini_provider_uses_per_provider_image_tag(self, tmp_path):
         """GeminiProvider should append '-gemini' to docker_image for its image tag."""
@@ -296,7 +305,10 @@ class TestDockerConfig:
             mock_get_cfg.return_value = MagicMock(image_name="myproj-gza-gemini", cli_command="gemini", env_vars=[])
             provider._run_docker(config, "prompt", tmp_path / "log.txt", tmp_path)
 
-        mock_get_cfg.assert_called_once_with("myproj-gza-gemini")
+        mock_get_cfg.assert_called_once_with(
+            "myproj-gza-gemini",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
 
 def test_claude_rate_limit_message_keeps_provider_utc_timestamp_stable(monkeypatch) -> None:
@@ -1538,6 +1550,66 @@ class TestDockerDaemonCheck:
             mock_run.side_effect = FileNotFoundError()
             assert is_docker_running() is False
 
+    def test_wait_for_docker_ready_retries_until_probe_succeeds(self):
+        """Should retry failed probes until docker info eventually succeeds."""
+        now = {"value": 0.0}
+
+        def fake_monotonic() -> float:
+            return now["value"]
+
+        def fake_sleep(seconds: float) -> None:
+            now["value"] += seconds
+
+        with (
+            patch("gza.providers.base.time.monotonic", side_effect=fake_monotonic),
+            patch("gza.providers.base.time.sleep", side_effect=fake_sleep),
+            patch("gza.providers.base.subprocess.run") as mock_run,
+        ):
+            mock_run.side_effect = [
+                MagicMock(returncode=1),
+                MagicMock(returncode=0),
+            ]
+
+            assert wait_for_docker_ready(3, probe_timeout=2) is True
+
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[0].kwargs["timeout"] == 2
+        assert mock_run.call_args_list[1].kwargs["timeout"] == 2
+
+    def test_wait_for_docker_ready_returns_false_after_timeout_budget(self):
+        """Should stop retrying once the total timeout budget is exhausted."""
+        now = {"value": 0.0}
+
+        def fake_monotonic() -> float:
+            return now["value"]
+
+        def fake_sleep(seconds: float) -> None:
+            now["value"] += seconds
+
+        with (
+            patch("gza.providers.base.time.monotonic", side_effect=fake_monotonic),
+            patch("gza.providers.base.time.sleep", side_effect=fake_sleep),
+            patch(
+                "gza.providers.base.subprocess.run",
+                return_value=MagicMock(returncode=1),
+            ) as mock_run,
+        ):
+            assert wait_for_docker_ready(2, probe_timeout=5) is False
+
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[0].kwargs["timeout"] == 2
+        assert mock_run.call_args_list[1].kwargs["timeout"] == 1.0
+
+    def test_wait_for_docker_ready_returns_false_immediately_when_docker_missing(self):
+        """Should not retry or sleep when the docker CLI is unavailable."""
+        with (
+            patch("gza.providers.base.time.sleep") as mock_sleep,
+            patch("gza.providers.base.subprocess.run", side_effect=FileNotFoundError()),
+        ):
+            assert wait_for_docker_ready(30) is False
+
+        mock_sleep.assert_not_called()
+
     def test_verify_docker_credentials_fails_when_docker_not_running(self, capsys):
         """Should fail immediately with message when Docker daemon is not running."""
         docker_config = DockerConfig(
@@ -1548,7 +1620,7 @@ class TestDockerDaemonCheck:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=False):
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=False) as mock_wait:
             result = verify_docker_credentials(
                 docker_config=docker_config,
                 version_cmd=["testcli", "--version"],
@@ -1557,6 +1629,7 @@ class TestDockerDaemonCheck:
             )
 
         assert result.ok is False
+        mock_wait.assert_called_once_with(docker_config.docker_startup_timeout)
         assert result.failure_reason == "INFRASTRUCTURE_ERROR"
         assert result.message == "Preflight failed: Docker daemon is not running"
         captured = capsys.readouterr()
@@ -1573,7 +1646,7 @@ class TestDockerDaemonCheck:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=True):
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(
                     returncode=0,
@@ -3697,11 +3770,12 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=False):
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=False) as mock_wait:
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is False
+        mock_wait.assert_called_once_with(docker_config.docker_startup_timeout)
         mock_run.assert_not_called()
 
     def test_logs_daemon_unavailable_to_task_log(self, tmp_path):
@@ -3716,7 +3790,7 @@ class TestEnsureDockerImage:
         log_file = tmp_path / "task.log"
         log_file.touch()
 
-        with patch("gza.providers.base.is_docker_running", return_value=False):
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=False):
             result = ensure_docker_image(
                 docker_config,
                 tmp_path,
@@ -3754,7 +3828,7 @@ class TestEnsureDockerImage:
         dockerfile = etc_dir / "Dockerfile.testcli"
         dockerfile.write_text("FROM node:20-slim")
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=1.0), \
              patch("gza.providers.base._get_image_label", return_value=_get_file_sha256(dockerfile)):
             with patch("gza.providers.base.subprocess.run") as mock_run:
@@ -3780,7 +3854,7 @@ class TestEnsureDockerImage:
         dockerfile = etc_dir / "Dockerfile.testcli"
         dockerfile.write_text("FROM node:20-slim")
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=1.0), \
              patch("gza.providers.base._get_image_label", return_value="old-digest"):
             with patch("gza.providers.base.subprocess.run") as mock_run:
@@ -3805,7 +3879,7 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=1.0), \
              patch("gza.providers.base._get_image_label", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
@@ -3826,7 +3900,7 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
@@ -3852,7 +3926,7 @@ class TestEnsureDockerImage:
         custom_content = "FROM python:3.12\nRUN pip install pytest"
         dockerfile.write_text(custom_content)
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
@@ -3871,7 +3945,7 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
@@ -3893,7 +3967,7 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0)
@@ -3912,7 +3986,7 @@ class TestEnsureDockerImage:
             env_vars=[],
         )
 
-        with patch("gza.providers.base.is_docker_running", return_value=True), \
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True), \
              patch("gza.providers.base._get_image_created_time", return_value=None):
             with patch("gza.providers.base.subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=1)
@@ -3939,7 +4013,7 @@ class TestEnsureDockerImage:
         )
 
         with (
-            patch("gza.providers.base.is_docker_running", return_value=True),
+            patch("gza.providers.base.wait_for_docker_ready", return_value=True),
             patch("gza.providers.base._get_image_created_time", return_value=None),
             patch("gza.providers.base.subprocess.run", return_value=failed_build),
         ):

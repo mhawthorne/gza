@@ -677,7 +677,7 @@ def sync_keychain_credentials() -> bool:
     return True
 
 
-def _get_docker_config(image_name: str) -> DockerConfig:
+def _get_docker_config(image_name: str, *, docker_startup_timeout: int = 60) -> DockerConfig:
     """Get Docker configuration for Claude."""
     return DockerConfig(
         image_name=image_name,
@@ -685,6 +685,7 @@ def _get_docker_config(image_name: str) -> DockerConfig:
         cli_command="claude",
         config_dir=".claude",
         env_vars=["ANTHROPIC_API_KEY"],
+        docker_startup_timeout=docker_startup_timeout,
     )
 
 
@@ -722,7 +723,10 @@ class ClaudeProvider(Provider):
         """Verify credentials work in Docker."""
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
-        docker_config = _get_docker_config(f"{config.docker_image}-claude")
+        docker_config = _get_docker_config(
+            f"{config.docker_image}-claude",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
         if not ensure_docker_image(
             docker_config,
             config.project_dir,
@@ -970,7 +974,10 @@ class ClaudeProvider(Provider):
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
-        docker_config = _get_docker_config(f"{config.docker_image}-claude")
+        docker_config = _get_docker_config(
+            f"{config.docker_image}-claude",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")
@@ -1044,7 +1051,10 @@ class ClaudeProvider(Provider):
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         if config.claude.fetch_auth_token_from_keychain:
             sync_keychain_credentials()
-        docker_config = _get_docker_config(f"{config.docker_image}-claude")
+        docker_config = _get_docker_config(
+            f"{config.docker_image}-claude",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")

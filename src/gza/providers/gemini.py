@@ -247,7 +247,7 @@ class GeminiLogRenderer:
         return RenderedLines(log_lines=lines)
 
 
-def _get_docker_config(image_name: str) -> DockerConfig:
+def _get_docker_config(image_name: str, *, docker_startup_timeout: int = 60) -> DockerConfig:
     """Get Docker configuration for Gemini."""
     return DockerConfig(
         image_name=image_name,
@@ -255,6 +255,7 @@ def _get_docker_config(image_name: str) -> DockerConfig:
         cli_command="gemini",
         config_dir=None,  # Use API key auth, no need to mount ~/.gemini
         env_vars=["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
+        docker_startup_timeout=docker_startup_timeout,
     )
 
 
@@ -300,7 +301,10 @@ class GeminiProvider(Provider):
     def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         image_name = f"{config.docker_image}-gemini"
-        docker_config = _get_docker_config(image_name)
+        docker_config = _get_docker_config(
+            image_name,
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
         if not ensure_docker_image(
             docker_config,
             config.project_dir,
@@ -452,7 +456,10 @@ class GeminiProvider(Provider):
         if ops_log_file is None:
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
         image_name = f"{config.docker_image}-gemini"
-        docker_config = _get_docker_config(image_name)
+        docker_config = _get_docker_config(
+            image_name,
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")

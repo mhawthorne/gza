@@ -665,7 +665,7 @@ def _has_api_key() -> bool:
     return bool(os.getenv("CODEX_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
 
-def _get_docker_config(image_name: str) -> DockerConfig:
+def _get_docker_config(image_name: str, *, docker_startup_timeout: int = 60) -> DockerConfig:
     """Get Docker configuration for Codex.
 
     Auth priority: API key (CODEX_API_KEY / OPENAI_API_KEY) takes precedence
@@ -685,6 +685,7 @@ def _get_docker_config(image_name: str) -> DockerConfig:
             cli_command="codex",
             config_dir=None,
             env_vars=env_vars,
+            docker_startup_timeout=docker_startup_timeout,
         )
     elif _has_codex_oauth():
         # Fall back to OAuth — mount ~/.codex into the container.
@@ -694,6 +695,7 @@ def _get_docker_config(image_name: str) -> DockerConfig:
             cli_command="codex",
             config_dir=".codex",
             env_vars=[],
+            docker_startup_timeout=docker_startup_timeout,
         )
     else:
         # No credentials found; default to API key mode (will fail at runtime
@@ -704,6 +706,7 @@ def _get_docker_config(image_name: str) -> DockerConfig:
             cli_command="codex",
             config_dir=None,
             env_vars=["CODEX_API_KEY"],
+            docker_startup_timeout=docker_startup_timeout,
         )
 
 
@@ -742,7 +745,10 @@ class CodexProvider(Provider):
 
     def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
-        docker_config = _get_docker_config(f"{config.docker_image}-codex")
+        docker_config = _get_docker_config(
+            f"{config.docker_image}-codex",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
         if not ensure_docker_image(
             docker_config,
             config.project_dir,
@@ -890,7 +896,10 @@ class CodexProvider(Provider):
         conversation_log_file = log_file
         if ops_log_file is None:
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
-        docker_config = _get_docker_config(f"{config.docker_image}-codex")
+        docker_config = _get_docker_config(
+            f"{config.docker_image}-codex",
+            docker_startup_timeout=config.docker_startup_timeout,
+        )
 
         if not ensure_docker_image(docker_config, config.project_dir):
             print("Error: Failed to build Docker image")

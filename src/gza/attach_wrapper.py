@@ -66,7 +66,10 @@ def _build_docker_interactive_cmd(
     """
     if config.claude.fetch_auth_token_from_keychain:
         sync_keychain_credentials()
-    docker_config = _get_docker_config(f"{config.docker_image}-claude")
+    docker_config = _get_docker_config(
+        f"{config.docker_image}-claude",
+        docker_startup_timeout=config.docker_startup_timeout,
+    )
     work_dir = _resolve_work_dir(config, task)
     if not ensure_docker_image(docker_config, config.project_dir):
         raise RuntimeError("failed to build Docker image for interactive attach")

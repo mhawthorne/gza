@@ -112,6 +112,7 @@ class DockerConfig:
     cli_command: str
     config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+    docker_startup_timeout: int = 60
 
 
 def classify_provider_api_error(*, status: int | None, error_type: str | None, message: str | None) -> str | None:
@@ -275,7 +276,7 @@ def ensure_docker_image(
     Returns:
         True if image is available, False on failure
     """
-    if not is_docker_running():
+    if not wait_for_docker_ready(docker_config.docker_startup_timeout):
         print("Error: Docker daemon is not running")
         print("  Start Docker Desktop or use --no-docker flag")
         write_preflight_entry(
@@ -469,6 +470,33 @@ def is_docker_running() -> bool:
         return False
 
 
+def wait_for_docker_ready(total_timeout: int, *, probe_timeout: int = 5) -> bool:
+    """Wait for Docker to become responsive within a bounded timeout budget."""
+    deadline = time.monotonic() + max(total_timeout, 0)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=min(probe_timeout, remaining),
+            )
+        except FileNotFoundError:
+            return False
+        except subprocess.TimeoutExpired:
+            result = None
+
+        if result is not None and result.returncode == 0:
+            return True
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(1.0, remaining))
+
+
 def _looks_like_docker_crash(
     exit_code: int | None,
     ops_log_file: Path | None,
@@ -590,7 +618,7 @@ def verify_docker_credentials(
     Returns:
         Structured result describing whether preflight succeeded
     """
-    if not is_docker_running():
+    if not wait_for_docker_ready(docker_config.docker_startup_timeout):
         write_preflight_entry(
             log_file,
             event="docker_daemon_missing",
