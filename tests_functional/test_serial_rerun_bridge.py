@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 
 
+_TEST_UNIT_SUBPROCESS_TIMEOUT_SECONDS = 15
+
+
 def _repo_env() -> dict[str, str]:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
@@ -24,7 +27,7 @@ def _run_test_unit(
     *extra_args: str,
     env_updates: dict[str, str] | None = None,
     use_verify_phase: bool = False,
-    timeout_seconds: float = 4,
+    timeout_seconds: float = _TEST_UNIT_SUBPROCESS_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     env = _repo_env()
     if env_updates:
@@ -74,10 +77,10 @@ def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_un
     )
 
     # This subprocess performs two pytest invocations (parallel pass + serial rerun).
-    # Under full-suite xdist contention that can exceed the functional suite's 4s
-    # default, so keep the subprocess bounded but give it headroom well below the
-    # test's explicit 60s watchdog.
-    result = _run_test_unit(suite_dir, use_verify_phase=True, timeout_seconds=15)
+    # Under full-suite xdist contention that can exceed a brittle 4s child timeout,
+    # so keep the subprocess bounded but give it headroom well below the test's
+    # explicit 60s watchdog.
+    result = _run_test_unit(suite_dir, use_verify_phase=True)
 
     assert result.returncode == 0, result.stderr
     assert "gza-verify phase=passed name=unit duration_seconds=" in result.stdout
