@@ -5313,6 +5313,77 @@ def test_verify_failure_only_noop_improve_does_not_clear_from_older_pass_when_ne
     assert action["needs_attention_reason"] == "improve-no-op", label
 
 
+def test_verify_failure_only_noop_improve_uses_newest_candidate_when_created_at_ties(
+    tmp_path: Path,
+) -> None:
+    fixed_now = datetime(2026, 6, 24, 16, 0, tzinfo=UTC)
+    with patch("gza.db.datetime", wraps=datetime) as mock_datetime:
+        mock_datetime.now.return_value = fixed_now
+
+        store = _make_store(tmp_path)
+        config = Config.load(tmp_path)
+
+        impl = _make_completed_unmerged_impl(
+            store,
+            branch="feat/gza-5838-created-at-tie",
+            when=datetime(2026, 6, 23, 9, 0, tzinfo=UTC),
+        )
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+        review.output_content = _verify_failure_only_review_report()
+        review.review_verify_status = "failed"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "same-head-sha"
+        store.update(review)
+
+        older_improve = _add_completed_improve_for_review(
+            store,
+            impl,
+            review,
+            when=datetime(2026, 6, 23, 11, 0, tzinfo=UTC),
+            changed_diff=False,
+        )
+        older_improve.review_verify_status = "passed"
+        older_improve.review_verify_branch = impl.branch
+        older_improve.review_verify_head_sha = "same-head-sha"
+        older_improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+        store.update(older_improve)
+
+        newer_improve = store.add(
+            "Improve retry",
+            task_type="improve",
+            based_on=older_improve.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert newer_improve.id is not None
+        newer_improve.status = "completed"
+        newer_improve.completed_at = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+        newer_improve.branch = impl.branch
+        newer_improve.changed_diff = False
+        store.update(newer_improve)
+
+        improve_tasks = store.get_improve_tasks_for(impl.id, review.id)
+
+    assert [task.id for task in improve_tasks] == [newer_improve.id, older_improve.id]
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    stored_impl = store.get(impl.id)
+
+    assert ctx.review_cleared is False
+    assert stored_impl is not None
+    assert stored_impl.review_cleared_at is None
+
+
 def test_read_only_verify_failure_only_noop_improve_merge_does_not_persist_review_clearance(
     tmp_path: Path,
 ) -> None:

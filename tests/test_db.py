@@ -2250,6 +2250,36 @@ class TestTaskComments:
         scoped = store.get_comments(task.id, created_on_or_before=first.created_at)
         assert [comment.content for comment in scoped] == ["First comment"]
 
+    def test_get_improve_tasks_for_breaks_created_at_ties_by_newer_task_id(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+
+        repeated_now = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=UTC)
+        with patch("gza.db.datetime", wraps=datetime) as mock_datetime:
+            mock_datetime.now.return_value = repeated_now
+            older = store.add(
+                "Improve older",
+                task_type="improve",
+                based_on=impl.id,
+                depends_on=review.id,
+                same_branch=True,
+            )
+            newer = store.add(
+                "Improve newer",
+                task_type="improve",
+                based_on=older.id,
+                depends_on=review.id,
+                same_branch=True,
+            )
+
+        improves = store.get_improve_tasks_for(impl.id, review.id)
+        assert [task.id for task in improves] == [newer.id, older.id]
+
     def test_get_comments_can_filter_by_kind(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)

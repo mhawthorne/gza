@@ -6678,7 +6678,12 @@ class SqliteTaskStore:
                     self._project_id,
                 ),
             )
-            return self._rows_to_tasks(conn, cur.fetchall())
+            tasks = self._rows_to_tasks(conn, cur.fetchall())
+            tasks.sort(
+                key=lambda task: (_coalesce_task_timestamp(task.created_at), task_id_numeric_key(task.id)),
+                reverse=True,
+            )
+            return tasks
 
     def get_improve_tasks_by_root(self, root_task_id: str) -> list[Task]:
         """Get all improve tasks transitively rooted at the given implementation.
