@@ -256,6 +256,7 @@ def _main_verify_remediation_prompt(
         "",
         f"Remediation kind: {remediation.kind}",
         f"Failure signature: {remediation.signature}",
+        f"Tree fingerprint: {remediation.tree_fingerprint or 'unavailable'}",
         f"Observed main HEAD: {short_sha}",
     ]
     if remediation.failure:
@@ -276,6 +277,7 @@ def _find_open_main_verify_remediation_task(
     store: SqliteTaskStore,
     *,
     signature: str,
+    tree_fingerprint: str | None,
 ) -> DbTask | None:
     for task in store.get_all():
         if task.task_type != "implement":
@@ -286,7 +288,11 @@ def _find_open_main_verify_remediation_task(
             continue
         if _main_verify_remediation_signature_from_prompt(task.prompt) != signature:
             continue
-        return task
+        existing_tree_fingerprint = _main_verify_remediation_tree_fingerprint_from_prompt(task.prompt)
+        if tree_fingerprint is None:
+            return task
+        if existing_tree_fingerprint == tree_fingerprint:
+            return task
     return None
 
 
@@ -308,6 +314,14 @@ def _main_verify_remediation_signature_from_prompt(prompt: str) -> str | None:
         if line.startswith("Failure signature: "):
             signature = line.removeprefix("Failure signature: ").strip()
             return signature or None
+    return None
+
+
+def _main_verify_remediation_tree_fingerprint_from_prompt(prompt: str) -> str | None:
+    for line in prompt.splitlines():
+        if line.startswith("Tree fingerprint: "):
+            fingerprint = line.removeprefix("Tree fingerprint: ").strip()
+            return None if fingerprint == "unavailable" else fingerprint or None
     return None
 
 
@@ -347,7 +361,11 @@ def _ensure_main_verify_remediation_task(
     tags: tuple[str, ...] | None,
     any_tag: bool,
 ) -> tuple[DbTask, bool]:
-    existing = _find_open_main_verify_remediation_task(store, signature=remediation.signature)
+    existing = _find_open_main_verify_remediation_task(
+        store,
+        signature=remediation.signature,
+        tree_fingerprint=remediation.tree_fingerprint,
+    )
     if existing is not None:
         desired_prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
         desired_tags = _merge_main_verify_remediation_tags(existing.tags, tags)

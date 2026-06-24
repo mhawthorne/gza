@@ -94,16 +94,23 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 
 - A verdict that turns green during the bounded rerun sequence is **flaky**. Automation
   MUST NOT keep merges halted for that failure, and the supervisor MUST create or reuse
-  exactly one open remediation task for that failure signature that aims to de-flake it.
+  exactly one open remediation task for that failure identity that aims to de-flake it.
 - A verdict that stays red across the full bounded rerun sequence is **deterministic**.
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
-  exactly one open remediation task for that failure signature that aims to fix the
+  exactly one open remediation task for that failure identity that aims to fix the
   failing phase or gate.
-- Remediation task dedup is by failure signature, not by watch cycle. Re-observing the
-  same unresolved failure MUST reuse the existing open remediation task instead of filing
-  another copy. If the current bounded rerun evidence changes the required remediation
-  kind for that signature, the reused task MUST be updated so its prompt still matches
-  the current classification.
+- Remediation task dedup is by failure identity, not by watch cycle. That identity is
+  the failure signature plus the exact local-target tree fingerprint from the bounded
+  rerun evidence. Re-observing the same unresolved signature on the same fingerprint
+  MUST reuse the existing open remediation task instead of filing another copy. If the
+  current bounded rerun evidence changes the required remediation kind for that same
+  identity, the reused task MUST be updated so its prompt still matches the current
+  classification.
+- If the current bounded rerun evidence cannot produce a tree fingerprint, the
+  supervisor MUST fall back to signature-only reuse for that remediation task because
+  exact-tree identity is unavailable. A later observation with a concrete fingerprint MAY
+  create a distinct remediation task for that same signature if its fingerprint does not
+  match the fallback task's unknown identity.
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.

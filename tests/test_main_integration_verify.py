@@ -355,6 +355,7 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_flake_without_
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
     assert check.remediation.signature == "phase:unit"
+    assert check.remediation.tree_fingerprint == "fp-verified"
     assert check.remediation.failing_phase == "unit"
 
 
@@ -426,6 +427,7 @@ def test_check_main_integration_verify_watch_red_rerun_retries_fresh_red_and_cla
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
     assert check.remediation.signature == "phase:functional"
+    assert check.remediation.tree_fingerprint == "fp-live"
     assert check.remediation.failing_phase == "functional"
 
 
@@ -498,6 +500,7 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_
     assert check.remediation is not None
     assert check.remediation.kind == "fix"
     assert check.remediation.signature == "phase:functional"
+    assert check.remediation.tree_fingerprint == "fp-live"
     assert check.remediation.failing_phase == "functional"
 
 
@@ -579,5 +582,6 @@ def test_check_main_integration_verify_deterministic_red_uses_confirmed_current_
     assert check.remediation is not None
     assert check.remediation.kind == "fix"
     assert check.remediation.signature == "phase:functional"
+    assert check.remediation.tree_fingerprint == "fp-verified"
     assert check.remediation.failing_phase == "functional"
     assert check.remediation.failure == "fresh verify_command failed again"

@@ -1785,7 +1785,7 @@ Without `--force`, `uv run gza main-verify` is an inspect-first operator check. 
 
 With `--force`, `uv run gza main-verify --force` bypasses checkpoint reuse and runs the gate again against the current local-target tree. The forced path uses the same bounded red-rerun classification as watch: a red that turns green on rerun is treated as flaky, the checkpoint is refreshed to green, and the merge halt clears without requiring a direct commit to main. A red that stays red leaves behind fresh red evidence and exits `1`.
 
-This command is the operator escape hatch for a wedged or stale main-verify halt. Watch still owns the automatic remediation lane: when watch confirms a flaky or deterministic red, it creates or reuses the corresponding remediation task, deduplicated by failure signature and bumped to the front of the runnable queue.
+This command is the operator escape hatch for a wedged or stale main-verify halt. Watch still owns the automatic remediation lane: when watch confirms a flaky or deterministic red, it creates or reuses the corresponding remediation task, deduplicated by failure signature plus tree fingerprint when that fingerprint is available from the bounded rerun evidence, and bumped to the front of the runnable queue. If the tree fingerprint is unavailable, watch falls back to signature-only reuse for that remediation task.
 
 ### iterate
 

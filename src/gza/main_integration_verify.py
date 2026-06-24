@@ -65,6 +65,7 @@ class MainIntegrationVerifyRemediation:
 
     kind: Literal["deflake", "fix"]
     signature: str
+    tree_fingerprint: str | None
     failing_phase: str | None
     failure: str | None
 
@@ -192,6 +193,7 @@ def _build_main_integration_verify_remediation(
             verify_status=state.verify_status,
             verify_exit_status=state.verify_exit_status,
         ),
+        tree_fingerprint=state.tree_fingerprint,
         failing_phase=state.failing_phase,
         failure=state.failure,
     )

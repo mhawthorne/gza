@@ -111,13 +111,34 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "### MV6 — Operators MUST have a force-refresh escape hatch" in contract
     assert "A merge stall MUST NOT convert into a launch stall." in contract
     assert "The shared no-progress backstop MUST count only actually executed unchanged actions." in contract
-    assert "Remediation task dedup is by failure signature" in contract
+    assert "Remediation task dedup is by failure identity" in contract
+    assert "failure signature plus the exact local-target tree fingerprint" in contract
+    assert "fall back to signature-only reuse" in contract
     assert "There MUST be a first-class operator command that forces a fresh local-target verify run" in contract
     assert "Future behavior-check findings against this area MUST classify implementation drift" in contract_flat
 
     assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in lifecycle
     assert "[main-verify-self-heal.md](main-verify-self-heal.md)" in supervisor
     assert "main-integration-verify-red" in lifecycle
+
+
+def test_main_verify_remediation_identity_docs_match_fingerprint_aware_runtime_contract() -> None:
+    """Specs and operator docs should describe fingerprint-aware remediation dedup consistently."""
+    repo_root = Path(__file__).resolve().parents[1]
+    contract = (repo_root / "specs" / "behavior" / "main-verify-self-heal.md").read_text()
+    supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+
+    assert "failure signature plus the exact local-target tree fingerprint" in contract
+    assert "fall back to signature-only reuse" in contract
+
+    assert "dedup is by failure identity: failure" in supervisor
+    assert "signature plus exact local-target tree fingerprint" in supervisor
+    assert "If the tree fingerprint is unavailable, watch MUST" in supervisor
+    assert "fall back to signature-only reuse" in supervisor
+
+    assert "deduplicated by failure signature plus tree fingerprint" in config_docs
+    assert "If the tree fingerprint is unavailable, watch falls back to signature-only reuse" in config_docs
     assert "main-integration-verify-red" in supervisor
     assert "S7 — Watch owns bounded stateful work creation." in supervisor
     assert "advance` MAY surface the red-main condition from the shared state" in supervisor
