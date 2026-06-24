@@ -61,6 +61,7 @@ from ..git import (
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
+    apply_deferred_lineage_query_reconciliations,
     query_lineage_owner_rows,
 )
 from ..log_paths import resolve_ops_log_path
@@ -3120,32 +3121,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ) == "merged":
                     print(f"Task {task_id} is already merged")
                     return 0
-            owner_rows = list(
-                query_lineage_owner_rows(
-                    store,
-                    LineageOwnerQuery(
-                        limit=None,
-                        task_types=(advance_type,) if advance_type else None,
-                        include_skipped=True,
-                        exclude_dropped_from_planning=True,
-                        max_recovery_attempts=max_resume_attempts,
-                        task_ids=(task.id,) if task.id is not None else None,
-                    ),
-                    config=config,
-                    git=git,
-                    target_branch=target_branch,
-                )
-            )
-            dropped_owner_lineage = False
-            if not owner_rows and task.status != "dropped":
-                dropped_owner_rows = [
-                    row
-                    for row in query_lineage_owner_rows(
+            with store.read_session():
+                owner_rows = list(
+                    query_lineage_owner_rows(
                         store,
                         LineageOwnerQuery(
                             limit=None,
                             task_types=(advance_type,) if advance_type else None,
                             include_skipped=True,
+                            exclude_dropped_from_planning=True,
                             max_recovery_attempts=max_resume_attempts,
                             task_ids=(task.id,) if task.id is not None else None,
                         ),
@@ -3153,10 +3137,29 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         git=git,
                         target_branch=target_branch,
                     )
-                    if row.owner_task.status == "dropped"
-                ]
-                if dropped_owner_rows:
-                    dropped_owner_lineage = True
+                )
+                dropped_owner_lineage = False
+                if not owner_rows and task.status != "dropped":
+                    dropped_owner_rows = [
+                        row
+                        for row in query_lineage_owner_rows(
+                            store,
+                            LineageOwnerQuery(
+                                limit=None,
+                                task_types=(advance_type,) if advance_type else None,
+                                include_skipped=True,
+                                max_recovery_attempts=max_resume_attempts,
+                                task_ids=(task.id,) if task.id is not None else None,
+                            ),
+                            config=config,
+                            git=git,
+                            target_branch=target_branch,
+                        )
+                        if row.owner_task.status == "dropped"
+                    ]
+                    if dropped_owner_rows:
+                        dropped_owner_lineage = True
+            apply_deferred_lineage_query_reconciliations(store)
             if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
                 planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
                 owner_rows = [
@@ -3176,32 +3179,34 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ]
         else:
             target_branch = _resolve_advance_target_branch(store, git, task=None)
-            branch_names = [
-                task.branch
-                for task in store.get_all()
-                if task.branch and task.status in {"completed", "failed", "unmerged", "dropped"}
-            ]
-            prime_advance_planning_refs(
-                git,
-                branch_names=branch_names,
-                target_branch=target_branch,
-                warning_logger=logger,
-            )
-            owner_rows = list(
-                query_lineage_owner_rows(
-                    store,
-                    LineageOwnerQuery(
-                        limit=None,
-                        task_types=(advance_type,) if advance_type else None,
-                        include_skipped=True,
-                        exclude_dropped_from_planning=True,
-                        max_recovery_attempts=max_resume_attempts,
-                    ),
-                    config=config,
-                    git=git,
+            with store.read_session():
+                branch_names = [
+                    task.branch
+                    for task in store.get_all()
+                    if task.branch and task.status in {"completed", "failed", "unmerged", "dropped"}
+                ]
+                prime_advance_planning_refs(
+                    git,
+                    branch_names=branch_names,
                     target_branch=target_branch,
+                    warning_logger=logger,
                 )
-            )
+                owner_rows = list(
+                    query_lineage_owner_rows(
+                        store,
+                        LineageOwnerQuery(
+                            limit=None,
+                            task_types=(advance_type,) if advance_type else None,
+                            include_skipped=True,
+                            exclude_dropped_from_planning=True,
+                            max_recovery_attempts=max_resume_attempts,
+                        ),
+                        config=config,
+                        git=git,
+                        target_branch=target_branch,
+                    )
+                )
+            apply_deferred_lineage_query_reconciliations(store)
             if not no_resume_failed:
                 list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings, git=git, target_branch=target_branch)
             if no_resume_failed:

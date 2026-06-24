@@ -980,7 +980,7 @@ def query_lineage_owner_rows(
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
 ) -> tuple[LineageOwnerRow, ...]:
-    rows, _read_context = _query_lineage_owner_rows_with_context(
+    rows, read_context = _query_lineage_owner_rows_with_context(
         store,
         query,
         config=config,
@@ -988,7 +988,31 @@ def query_lineage_owner_rows(
         target_branch=target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
     )
+    if not read_context.allow_reconcile_mutation:
+        _record_pending_recovery_reconciliation_context(store, read_context)
     return rows
+
+
+def _record_pending_recovery_reconciliation_context(
+    store: SqliteTaskStore,
+    read_context: RecoveryReadContext,
+) -> None:
+    pending = getattr(store, "_lineage_query_pending_reconciliation_contexts", None)
+    if pending is None:
+        pending = []
+        setattr(store, "_lineage_query_pending_reconciliation_contexts", pending)
+    pending.append(read_context)
+
+
+def apply_deferred_lineage_query_reconciliations(store: SqliteTaskStore) -> None:
+    from .recovery_engine import apply_pending_recovery_reconciliations
+
+    pending = getattr(store, "_lineage_query_pending_reconciliation_contexts", None)
+    if not pending:
+        return
+    setattr(store, "_lineage_query_pending_reconciliation_contexts", [])
+    for read_context in pending:
+        apply_pending_recovery_reconciliations(store, read_context=read_context)
 
 
 def query_lineage_owner_rows_in_read_session(
@@ -1468,6 +1492,7 @@ __all__ = [
     "collect_stale_unmerged_sweep_candidates",
     "filter_display_unresolved_tasks_for_incomplete",
     "is_lineage_resolved",
+    "apply_deferred_lineage_query_reconciliations",
     "query_lineage_owner_rows_in_read_session",
     "query_lineage_owner_rows",
     "resolve_lineage_owner_task_id",

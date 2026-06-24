@@ -285,6 +285,50 @@ def test_collect_scoped_tag_scope_gaps_reports_out_of_scope_blocking_child(tmp_p
     ]
 
 
+def test_collect_scoped_tag_scope_gaps_uses_one_read_session_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add(
+        "Scoped owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Out of scope child",
+        task_type="implement",
+        based_on=plan.id,
+        tags=("v0.5.0",),
+    )
+    assert child.id is not None
+
+    opened_connections: list[tuple[bool, object]] = []
+    original_open_connection = store._open_connection
+
+    def _tracking_open_connection(*, close_on_exit: bool):
+        conn = original_open_connection(close_on_exit=close_on_exit)
+        opened_connections.append((close_on_exit, conn))
+        return conn
+
+    monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+
+    gaps = collect_scoped_tag_scope_gaps(
+        store,
+        tag_filters=("202606-recovery",),
+        any_tag=False,
+    )
+
+    assert len(gaps) == 1
+    assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
+
+
 def test_collect_scoped_tag_scope_gaps_any_tag_suggests_single_matching_tag(tmp_path: Path) -> None:
     store = _store(tmp_path)
     plan = store.add(
