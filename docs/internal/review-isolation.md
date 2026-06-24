@@ -8,8 +8,8 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
 2. **Host runner** calls `build_prompt()` which includes:
    - Spec file content (if the implementation task has a `spec` field)
    - Ask context:
-    - `## Review scope:` when the implementation declares a gradeable review scope. Resolution order is: persisted `Task.review_scope`, latest typed `review_scope` task comment on the non-pending implementation, then conservative prompt parsing fallback for legacy sliced tasks.
-    - `## Original plan context (out of scope except for the review scope):` as read-only boundary/interface context when a scoped review is plan-backed
+    - `## Review scope:` when the implementation declares or can derive a gradeable review scope. Resolution order is: persisted `Task.review_scope`, latest typed `review_scope` task comment on the non-pending implementation, then legacy sliced-prompt parsing for older slice prompts, then a conservative plan-backed fallback derived from the linked plan identity plus the implementation prompt metadata.
+    - `## Original plan context (out of scope except for the review scope):` as read-only boundary/interface context when a scoped review also has linked plan context
     - Otherwise exactly one canonical whole-task ask section:
       - `## Original plan:` when a linked plan exists
       - `## Original request:` fallback when no linked plan exists

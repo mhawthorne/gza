@@ -812,8 +812,8 @@ class TestWorkerLifecycleLogging:
 class TestReviewContextFromChain:
     """Tests for self-contained review context generation."""
 
-    def test_review_context_includes_original_plan_when_available(self, tmp_path: Path):
-        """Plan-driven reviews include the original plan and exclude original request."""
+    def test_review_context_derives_scope_for_plan_backed_completed_implementation(self, tmp_path: Path):
+        """Plan-backed completed implementations derive a scoped review ask."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -837,7 +837,11 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(review_task, store, tmp_path, git=None)
 
-        assert "## Original plan:" in context
+        assert "## Review scope:" in context
+        assert f"Plan-backed implementation scope from {plan_task.id}." in context
+        assert "Implementation request: Implement task gza-1" in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
         assert "Use width 6 zero padding." in context
         assert "## Original request:" not in context
 
@@ -866,7 +870,10 @@ class TestReviewContextFromChain:
         with patch("gza.runner._get_task_output", return_value=None):
             context = _build_context_from_chain(review_task, store, tmp_path, git=None)
 
-        assert "## Original plan:" in context
+        assert "## Review scope:" in context
+        assert f"Plan-backed implementation scope from {plan_task.id}." in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "## Original plan:\n" not in context
         assert f"plan task {plan_task.id} exists but content unavailable" in context
         assert "flag as blocker" in context
         assert "## Original request:" not in context
@@ -980,6 +987,45 @@ class TestReviewContextFromChain:
         assert "## Original plan context (out of scope except for the review scope):" in context
         assert "PLAN ONLY" in context
         assert "## Original plan:\n" not in context
+
+    def test_review_context_derives_scope_for_plan_backed_unsliced_prompt(
+        self,
+        tmp_path: Path,
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        plan_task = store.add(prompt="Plan migration", task_type="plan")
+        plan_task.output_content = (
+            "# Plan\n"
+            "**Task type:** PLAN ONLY. No implementation in this row.\n"
+            "- Background constraints for the bridge."
+        )
+        store.update(plan_task)
+
+        impl_task = store.add(
+            prompt="Implement the bridge slices for the serial rerun path.",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Review scope:" in context
+        assert f"Plan-backed implementation scope from {plan_task.id}." in context
+        assert "Implementation request: Implement the bridge slices for the serial rerun path." in context
+        assert "## Original plan context (out of scope except for the review scope):" in context
+        assert "PLAN ONLY" in context
+        assert "## Original plan:\n" not in context
+        assert "## Original request:\n" not in context
 
     def test_review_context_prefers_review_row_scope_over_later_scope_comment(self, tmp_path: Path):
         db_path = tmp_path / "test.db"

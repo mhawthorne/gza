@@ -255,6 +255,27 @@ class TestCreateReviewTask:
         assert persisted is not None
         assert persisted.review_scope == "Review only the API validation slice."
 
+    def test_persists_derived_scope_for_plan_backed_unsliced_implementation(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add("Plan bridge slices", task_type="plan")
+        impl_task = store.add(
+            "Implement the bridge slices for the serial rerun path.",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = create_review_task(store, impl_task, trigger_source="manual")
+        persisted = store.get(review_task.id)
+
+        assert persisted is not None
+        assert persisted.review_scope is not None
+        assert persisted.review_scope.startswith(
+            f"Plan-backed implementation scope from {plan_task.id}."
+        )
+        assert "Implementation request: Implement the bridge slices for the serial rerun path." in persisted.review_scope
+
     def test_auto_prompt_mode(self):
         store = self._mock_store()
         store.get.return_value = None

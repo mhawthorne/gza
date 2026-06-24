@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from .db import TASK_COMMENT_KIND_REVIEW_SCOPE, SqliteTaskStore, Task, TaskComment
+from .lineage import get_plan_for_task
 
 _SLICE_HEADER_RE = re.compile(
     r"^Implement\s+plan\s+(?P<plan_id>\S+),\s*slice\s+(?P<slice_label>.+?)(?::\s*(?P<summary>.+))?$",
@@ -81,6 +82,45 @@ def _extract_review_scope_details_from_prompt(prompt: str) -> ReviewScope | None
     )
 
 
+def _summarize_implementation_prompt(prompt: str) -> str | None:
+    for raw_line in prompt.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("## "):
+            continue
+        line = re.sub(r"^[*\-+]\s+", "", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
+        normalized = line.strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _derive_plan_backed_review_scope(
+    store: SqliteTaskStore,
+    impl_task: Task,
+) -> ReviewScope | None:
+    plan_task = get_plan_for_task(store, impl_task)
+    if plan_task is None or plan_task.id is None:
+        return None
+
+    prompt_summary = _summarize_implementation_prompt(impl_task.prompt)
+    summary_lines = [f"Plan-backed implementation scope from {plan_task.id}."]
+    if prompt_summary is not None:
+        summary_lines.extend(("", f"Implementation request: {prompt_summary}"))
+    summary_lines.extend(
+        (
+            "",
+            "Treat the linked plan as background context, not as implementation instructions.",
+        )
+    )
+    return ReviewScope(
+        summary="\n".join(summary_lines),
+        source=f"plan_fallback:{plan_task.id}",
+    )
+
+
 def get_latest_review_scope_comment_for_impl(
     store: SqliteTaskStore,
     impl_task: Task,
@@ -112,4 +152,7 @@ def resolve_review_scope_for_impl(store: SqliteTaskStore, impl_task: Task) -> Re
             summary=scope_comment.content,
             source=f"comment:{scope_comment.id}",
         )
-    return _extract_review_scope_details_from_prompt(impl_task.prompt)
+    prompt_scope = _extract_review_scope_details_from_prompt(impl_task.prompt)
+    if prompt_scope is not None:
+        return prompt_scope
+    return _derive_plan_backed_review_scope(store, impl_task)

@@ -186,9 +186,14 @@ When a current review exists for the implementation lineage:
   operators but MUST NOT create, reuse, resume, wait on, or freshness-block an improve task.
 - When review scope is needed for a completed or otherwise non-pending implementation, the
   authoritative resolution order is: persisted `review_scope` task field first, latest
-  typed `review_scope` comment next, then any conservative legacy prompt-derived fallback.
+  typed `review_scope` comment next, then legacy sliced-prompt parsing, then a
+  conservative plan-backed fallback derived from the linked plan identity plus the
+  implementation prompt metadata.
   A created review MUST persist that resolved scope on its own row so later scope comments
   do not silently rewrite an existing review's gradeable contract.
+- When a resolved review scope exists, that scope is the only gradeable ask for review.
+  Linked plan text MUST be rendered only as labeled background context and MUST NOT
+  widen the contract beyond the resolved review scope.
 - Verdict is unknown / unclassifiable → `needs_discussion` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 

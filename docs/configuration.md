@@ -1456,7 +1456,8 @@ gza comment <task_id> <text> [options]
 
 `feedback` remains the default improve-actionable comment kind, so `gza comment <task_id> <text>` keeps the existing behavior.
 Use `--kind review_scope` for operator-supplied review-scope metadata that should stay visibly distinct from actionable feedback.
-During review creation, scope resolution checks the task's persisted `review_scope` first, then the latest `review_scope` comment, then legacy sliced-prompt parsing.
+During review creation, scope resolution checks the task's persisted `review_scope` first, then the latest `review_scope` comment, then legacy sliced-prompt parsing, then a conservative plan-backed fallback derived from the linked plan identity plus the implementation prompt metadata.
+When that resolved or persisted scope exists, review prompts render it under `## Review scope:` and treat any linked plan text only as `## Original plan context (out of scope except for the review scope):` background.
 When task comments exist, `gza show` also includes a `Comments:` section with source, kind, timestamps, and resolution state.
 When tasks have comments, `gza history` includes a `comments: N` indicator.
 

@@ -2268,6 +2268,26 @@ class TestTaskComments:
         assert [comment.content for comment in scope_comments] == ["Scope override"]
         assert store.get_latest_comment_by_kind(task.id, kind="review_scope") == review_scope
 
+    def test_get_latest_comment_by_kind_returns_newest_matching_comment(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add("Task with interleaved comment kinds", task_type="implement")
+        assert task.id is not None
+
+        store.add_comment(task.id, "Feedback 1", kind="feedback")
+        first_scope = store.add_comment(task.id, "Scope override 1", kind="review_scope")
+        store.add_comment(task.id, "Feedback 2", kind="feedback")
+        second_scope = store.add_comment(task.id, "Scope override 2", kind="review_scope")
+
+        latest_feedback = store.get_latest_comment_by_kind(task.id, kind="feedback")
+        latest_scope = store.get_latest_comment_by_kind(task.id, kind="review_scope")
+
+        assert latest_feedback is not None
+        assert latest_feedback.content == "Feedback 2"
+        assert latest_scope == second_scope
+        assert latest_scope != first_scope
+
     def test_resolve_comments_can_filter_by_kind(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
@@ -9382,7 +9402,14 @@ class TestSharedDbIsolationAndImportGating:
         store = SqliteTaskStore(db_path, prefix="gza")
         task = store.add("Task with query-only comment kind damage")
         assert task.id is not None
-        store.add_comment(task.id, "Existing comment", source="direct")
+        store.add_comment(task.id, "Resolved legacy comment", source="direct")
+        snapshot = datetime.now(UTC)
+        store.add_comment(task.id, "Unresolved legacy comment", source="direct")
+        store.resolve_comments(
+            task.id,
+            created_on_or_before=snapshot,
+            kinds=("feedback",),
+        )
 
         _drop_task_comments_column(db_path, "kind")
 
@@ -9391,19 +9418,33 @@ class TestSharedDbIsolationAndImportGating:
             query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
             comments = query_store.get_comments(task.id)
             feedback_comments = query_store.get_comments(task.id, kinds=("feedback",))
+            unresolved_feedback_comments = query_store.get_comments(
+                task.id,
+                unresolved_only=True,
+                kinds=("feedback",),
+            )
             review_scope_comments = query_store.get_comments(task.id, kinds=("review_scope",))
             latest_feedback = query_store.get_latest_comment_by_kind(task.id, kind="feedback")
             latest_review_scope = query_store.get_latest_comment_by_kind(task.id, kind="review_scope")
         finally:
             db_path.chmod(0o644)
 
-        assert len(comments) == 1
-        assert comments[0].kind == "feedback"
-        assert [comment.kind for comment in feedback_comments] == ["feedback"]
+        assert [comment.content for comment in comments] == [
+            "Resolved legacy comment",
+            "Unresolved legacy comment",
+        ]
+        assert [comment.kind for comment in comments] == ["feedback", "feedback"]
+        assert [comment.content for comment in feedback_comments] == [
+            "Resolved legacy comment",
+            "Unresolved legacy comment",
+        ]
+        assert [comment.content for comment in unresolved_feedback_comments] == [
+            "Unresolved legacy comment"
+        ]
         assert review_scope_comments == []
         assert latest_feedback is not None
         assert latest_feedback.kind == "feedback"
-        assert latest_feedback.content == "Existing comment"
+        assert latest_feedback.content == "Unresolved legacy comment"
         assert latest_review_scope is None
         assert any("task_comments.kind" in warning for warning in query_store.startup_warnings())
 

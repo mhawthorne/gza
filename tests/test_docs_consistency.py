@@ -402,6 +402,29 @@ def test_configuration_docs_include_comment_command_reference() -> None:
         assert snippet in config_content
 
 
+def test_review_scope_resolution_order_docs_and_spec_stay_aligned() -> None:
+    """Review-scope docs/spec must advertise the same fallback order and plan-context role."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
+    review_isolation = (repo_root / "docs" / "internal" / "review-isolation.md").read_text()
+    lifecycle_spec = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+
+    required_snippets = [
+        "persisted `review_scope`",
+        "latest typed `review_scope` task comment",
+        "legacy sliced-prompt parsing",
+        "implementation prompt metadata",
+        "`## Original plan context (out of scope except for the review scope):`",
+    ]
+    for snippet in required_snippets:
+        assert snippet in config_content or snippet in review_isolation or snippet in lifecycle_spec
+
+    assert "persisted `Task.review_scope`, latest typed `review_scope` task comment" in review_isolation
+    assert "then legacy sliced-prompt parsing, then a conservative plan-backed fallback" in config_content
+    assert "then legacy sliced-prompt parsing, then a" in lifecycle_spec
+    assert "MUST be rendered only as labeled background context" in lifecycle_spec
+
+
 def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
     """run-inline docs additions must not replace existing fix/comment operator docs."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

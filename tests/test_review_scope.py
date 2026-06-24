@@ -82,3 +82,22 @@ def test_resolve_review_scope_uses_latest_scope_comment_after_task_field(tmp_pat
     assert resolved is not None
     assert resolved.summary == "Review only the executor slice."
     assert resolved.source == f"comment:{second.id}"
+
+
+def test_resolve_review_scope_derives_plan_backed_scope_for_unsliced_prompt(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    plan = store.add("Plan bridge slices", task_type="plan")
+    impl = store.add(
+        "Implement the bridge slices for the serial rerun path.",
+        task_type="implement",
+        based_on=plan.id,
+    )
+
+    resolved = resolve_review_scope_for_impl(store, impl)
+
+    assert plan.id is not None
+    assert resolved is not None
+    assert resolved.summary.startswith(f"Plan-backed implementation scope from {plan.id}.")
+    assert "Implementation request: Implement the bridge slices for the serial rerun path." in resolved.summary
+    assert "Treat the linked plan as background context" in resolved.summary
+    assert resolved.source == f"plan_fallback:{plan.id}"
