@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -131,10 +132,12 @@ from ._queue_render import (
 )
 from ._recovery_lane import RecoveryLaneEntry, collect_recovery_lane_entries
 from .advance_engine import (
+    _resolve_subject_fallback_task,
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
     format_needs_attention_lifecycle,
+    get_action_subject_task_id,
     resolve_advance_context,
     resolve_subject_task,
 )
@@ -1688,8 +1691,11 @@ def _normalize_incomplete_result_rows(
 
         owner_task = _resolve_incomplete_owner_task(store, row)
         action = row.next_action_data
+        stale_fallback_action = False
         if action is not None and classify_advance_action(action) == "needs_attention":
+            explicit_subject = _resolve_incomplete_explicit_subject_task(store, action, row)
             owner_task = resolve_subject_task(store, action, row, fallback_task=owner_task)
+            stale_fallback_action = owner_task.id != row.owner_task.id and explicit_subject is None
         merge_units_by_task_id: dict[str, MergeUnit] = {}
         for task in (owner_task, *row.members, *row.unresolved_tasks):
             if task is None or task.id is None or task.id in merge_units_by_task_id:
@@ -1741,9 +1747,9 @@ def _normalize_incomplete_result_rows(
                     recovery_action_task=row.recovery_action_task,
                     recovery_leaf_task=row.recovery_leaf_task,
                     lineage_status=row.lineage_status,
-            next_action_data=row.next_action_data,
-        ),
-        result.query,
+                    next_action_data=None if stale_fallback_action else row.next_action_data,
+                ),
+                result.query,
                 config=config,
                 git=git,
                 target_branch=target_branch,
@@ -1753,6 +1759,48 @@ def _normalize_incomplete_result_rows(
     if not changed:
         return result
     return _TaskQueryResult(query=result.query, rows=tuple(normalized_rows), total_count=result.total_count)
+
+
+def _resolve_incomplete_explicit_subject_task(
+    store: SqliteTaskStore,
+    action: object,
+    row: _LineageRow,
+) -> DbTask | None:
+    """Return the action's explicit subject when it still resolves within the row lineage."""
+
+    if not isinstance(action, Mapping):
+        return None
+    action_mapping = cast("Mapping[str, object]", action)
+    subject_task_id = get_action_subject_task_id(action_mapping)
+    if subject_task_id is None:
+        return None
+    subject_task = store.get(subject_task_id)
+    if subject_task is None or subject_task.id != subject_task_id:
+        return None
+    candidate_ids: set[str] = {
+        task.id
+        for task in (
+            row.owner_task,
+            *row.members,
+            *row.unresolved_tasks,
+            row.lifecycle_action_task,
+            row.recovery_action_task,
+            row.recovery_leaf_task,
+        )
+        if isinstance(task, DbTask) and task.id is not None
+    }
+    if subject_task.id not in candidate_ids:
+        subject_root_id = _resolve_lineage_root_task(store, subject_task).id
+        if subject_root_id is None:
+            return None
+        if not any(
+            (candidate := store.get(candidate_id)) is not None
+            and candidate.id is not None
+            and _resolve_lineage_root_task(store, candidate).id == subject_root_id
+            for candidate_id in candidate_ids
+        ):
+            return None
+    return subject_task
 
 
 def _resolve_incomplete_owner_task(store: SqliteTaskStore, row: _LineageRow) -> DbTask:
@@ -1782,12 +1830,12 @@ def _resolve_incomplete_owner_task(store: SqliteTaskStore, row: _LineageRow) -> 
     for candidate in candidates:
         owner_task = _resolve_lineage_owner_task(store, candidate)
         if owner_task.task_type == "implement" and owner_task.branch:
-            return owner_task
+            return _resolve_subject_fallback_task(store, row, fallback_task=owner_task)
     for candidate in candidates:
         owner_task = _resolve_lineage_owner_task(store, candidate)
         if owner_task.task_type == "implement":
-            return owner_task
-    return row.owner_task
+            return _resolve_subject_fallback_task(store, row, fallback_task=owner_task)
+    return _resolve_subject_fallback_task(store, row, fallback_task=row.owner_task)
 
 
 def _format_review_verdict_label(review_verdict: str | None) -> str | None:

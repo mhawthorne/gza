@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -15033,10 +15034,19 @@ class TestIncompleteCommand:
                 side_effect=lambda _self, refs: {str(ref): False for ref in refs},
             ),
         ):
+            git = _mock_unmerged_git()
             result = service.run(
                 query_cli._TaskQueryPresets.incomplete(limit=None),
                 config=config,
-                git=_mock_unmerged_git(),
+                git=git,
+                target_branch="main",
+            )
+            result = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
+                result,
+                service=service,
+                store=store,
+                config=config,
+                git=git,
                 target_branch="main",
             )
 
@@ -15047,6 +15057,163 @@ class TestIncompleteCommand:
         assert row.lifecycle_action_task.id == completed_retry.id
         assert row.recovery_action_task is None
         assert {task.id for task in row.unresolved_tasks} == {completed_retry.id}
+
+    def test_incomplete_same_branch_completed_recovery_re_roots_owner_on_live_carrier(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed recovery owner", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "TIMEOUT"
+        failed.completed_at = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        failed.branch = "feature/recovery-owner"
+        failed.has_commits = True
+        store.update(failed)
+
+        completed_retry = store.add(
+            "Completed retry on same branch",
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert completed_retry.id is not None
+        completed_retry.status = "completed"
+        completed_retry.completed_at = datetime(2026, 5, 11, 11, 0, tzinfo=UTC)
+        completed_retry.branch = failed.branch
+        completed_retry.has_commits = True
+        completed_retry.merge_status = "unmerged"
+        store.update(completed_retry)
+
+        config = query_cli.Config.load(tmp_path)
+        service = query_cli._TaskQueryService(store)
+        with (
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+        ):
+            git = _mock_unmerged_git()
+            result = service.run(
+                query_cli._TaskQueryPresets.incomplete(limit=None),
+                config=config,
+                git=git,
+                target_branch="main",
+            )
+            result = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
+                result,
+                service=service,
+                store=store,
+                config=config,
+                git=git,
+                target_branch="main",
+            )
+
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        assert row.owner_task.id == completed_retry.id
+        assert row.lifecycle_action_task is not None
+        assert row.lifecycle_action_task.id == completed_retry.id
+        assert {task.id for task in row.unresolved_tasks} == {completed_retry.id}
+
+    def test_incomplete_same_branch_re_root_recomputes_stale_needs_attention_reason_from_live_carrier(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed recovery owner", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "TIMEOUT"
+        failed.completed_at = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        failed.branch = "feature/recovery-owner"
+        failed.has_commits = True
+        store.update(failed)
+
+        completed_retry = store.add(
+            "Completed retry on same branch",
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert completed_retry.id is not None
+        completed_retry.status = "completed"
+        completed_retry.completed_at = datetime(2026, 5, 11, 11, 0, tzinfo=UTC)
+        completed_retry.branch = failed.branch
+        completed_retry.has_commits = True
+        completed_retry.merge_status = "unmerged"
+        store.update(completed_retry)
+
+        config = query_cli.Config.load(tmp_path)
+        service = query_cli._TaskQueryService(store)
+        with (
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+        ):
+            git = _mock_unmerged_git()
+            result = service.run(
+                query_cli._TaskQueryPresets.incomplete(limit=None),
+                config=config,
+                git=git,
+                target_branch="main",
+            )
+            stale_action = {
+                "type": "needs_discussion",
+                "description": "SKIP: failed owner no progress",
+                "needs_attention_reason": "watch-no-progress-backstop",
+            }
+            assert isinstance(result.rows[0], query_cli._LineageRow)
+            stale_row = replace(result.rows[0], next_action_data=stale_action)
+            result = replace(result, rows=(stale_row,))
+            with patch.object(
+                service,
+                "_project_next_action",
+                return_value={
+                    "type": "needs_discussion",
+                    "description": "SKIP: recovery carrier blocked on current lifecycle gate",
+                    "needs_attention_reason": "retry-limit-reached",
+                    "subject_task_id": completed_retry.id,
+                },
+            ) as project_next_action:
+                result = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
+                    result,
+                    service=service,
+                    store=store,
+                    config=config,
+                    git=git,
+                    target_branch="main",
+                )
+
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        assert row.owner_task.id == completed_retry.id
+        assert row.values["next_action_owner_id"] == completed_retry.id
+        assert row.values["next_action_reason"] == "SKIP: recovery carrier blocked on current lifecycle gate"
+        project_next_action.assert_called_once_with(
+            completed_retry,
+            config=config,
+            git=git,
+            target_branch="main",
+        )
 
     def test_incomplete_hides_failed_owner_after_completed_recovery_code_is_merged(
         self,

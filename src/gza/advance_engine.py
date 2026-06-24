@@ -1199,8 +1199,71 @@ def resolve_subject_task(
                 action,
             )
     if fallback_task is not None:
-        return fallback_task
+        return _resolve_subject_fallback_task(store, row, fallback_task=fallback_task)
     raise AssertionError(f"Unable to resolve subject task for action: {action!r}")
+
+
+def _resolve_subject_fallback_task(
+    store: SqliteTaskStore,
+    row: Any | None,
+    *,
+    fallback_task: DbTask,
+) -> DbTask:
+    superseding_carrier = _resolve_superseding_recovery_carrier(store, row, fallback_task=fallback_task)
+    if superseding_carrier is not None:
+        return superseding_carrier
+    return fallback_task
+
+
+def _resolve_superseding_recovery_carrier(
+    store: SqliteTaskStore,
+    row: Any | None,
+    *,
+    fallback_task: DbTask,
+) -> DbTask | None:
+    failed_owner_id = fallback_task.id
+    if row is None or failed_owner_id is None or fallback_task.status != "failed":
+        return None
+
+    owner_branch = (fallback_task.branch or "").strip()
+    owner_unit = store.resolve_merge_unit_for_task(failed_owner_id)
+    for candidate in (
+        getattr(row, "lifecycle_action_task", None),
+        getattr(row, "recovery_action_task", None),
+    ):
+        if not isinstance(candidate, DbTask):
+            continue
+        candidate_id = candidate.id
+        if candidate_id is None or candidate_id == failed_owner_id:
+            continue
+        if candidate.status in {"failed", "dropped"}:
+            continue
+        if not _task_descends_from(store, candidate, failed_owner_id):
+            continue
+        candidate_branch = (candidate.branch or "").strip()
+        if owner_branch and candidate_branch and owner_branch == candidate_branch:
+            return candidate
+        candidate_unit = store.resolve_merge_unit_for_task(candidate_id)
+        if owner_unit is not None and candidate_unit is not None and candidate_unit.id == owner_unit.id:
+            return candidate
+    return None
+
+
+def _task_descends_from(store: SqliteTaskStore, task: DbTask, ancestor_id: str) -> bool:
+    current = task
+    seen: set[str] = set()
+    while current.based_on:
+        parent_id = current.based_on
+        if parent_id == ancestor_id:
+            return True
+        if parent_id in seen:
+            return False
+        seen.add(parent_id)
+        parent = store.get(parent_id)
+        if parent is None or parent.id is None:
+            return False
+        current = parent
+    return False
 
 
 def _subject_matches_row_lineage(store: SqliteTaskStore, subject_task: DbTask, row: Any) -> bool:

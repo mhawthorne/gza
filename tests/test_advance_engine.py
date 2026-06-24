@@ -6438,6 +6438,93 @@ def test_resolve_subject_task_warns_before_falling_back_for_missing_or_unusable_
     assert expected_warning in caplog.text
 
 
+def test_resolve_subject_task_prefers_superseding_recovery_carrier_in_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    failed_owner = store.add("Failed owner", task_type="implement")
+    assert failed_owner.id is not None
+    failed_owner.status = "failed"
+    failed_owner.failure_reason = "TIMEOUT"
+    failed_owner.branch = "feature/recovery-carrier"
+    failed_owner.completed_at = datetime.now(UTC)
+    store.update(failed_owner)
+
+    completed_retry = store.add(
+        "Completed retry",
+        task_type="implement",
+        based_on=failed_owner.id,
+        recovery_origin="retry",
+    )
+    assert completed_retry.id is not None
+    completed_retry.status = "completed"
+    completed_retry.branch = failed_owner.branch
+    completed_retry.completed_at = datetime.now(UTC)
+    store.update(completed_retry)
+
+    row = SimpleNamespace(
+        owner_task=failed_owner,
+        members=(failed_owner, completed_retry),
+        unresolved_tasks=(completed_retry,),
+        lifecycle_action_task=completed_retry,
+        recovery_action_task=completed_retry,
+        recovery_leaf_task=completed_retry,
+    )
+    action = {
+        "type": "needs_discussion",
+        "description": "SKIP: manual intervention required",
+        "needs_attention_reason": "watch-no-progress-backstop",
+    }
+
+    subject_task = resolve_subject_task(store, action, row, fallback_task=failed_owner)
+
+    assert subject_task.id == completed_retry.id
+
+
+def test_resolve_subject_task_keeps_explicit_live_subject_over_failed_owner_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    failed_owner = store.add("Failed owner", task_type="implement")
+    assert failed_owner.id is not None
+    failed_owner.status = "failed"
+    failed_owner.failure_reason = "TIMEOUT"
+    failed_owner.branch = "feature/live-subject"
+    failed_owner.completed_at = datetime.now(UTC)
+    store.update(failed_owner)
+
+    completed_retry = store.add(
+        "Completed retry",
+        task_type="implement",
+        based_on=failed_owner.id,
+        recovery_origin="retry",
+    )
+    assert completed_retry.id is not None
+    completed_retry.status = "completed"
+    completed_retry.branch = failed_owner.branch
+    completed_retry.completed_at = datetime.now(UTC)
+    store.update(completed_retry)
+
+    row = SimpleNamespace(
+        owner_task=failed_owner,
+        members=(failed_owner, completed_retry),
+        unresolved_tasks=(completed_retry,),
+        lifecycle_action_task=completed_retry,
+        recovery_action_task=completed_retry,
+        recovery_leaf_task=completed_retry,
+    )
+    action = {
+        "type": "needs_discussion",
+        "description": "SKIP: manual intervention required",
+        "needs_attention_reason": "watch-no-progress-backstop",
+        "subject_task_id": completed_retry.id,
+    }
+
+    subject_task = resolve_subject_task(store, action, row, fallback_task=failed_owner)
+
+    assert subject_task.id == completed_retry.id
+
+
 def test_resolve_advance_context_reuses_persisted_merge_state_resolution(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
     from gza.merge_state import resolve_task_merge_state_for_target as original_resolve_merge_state
