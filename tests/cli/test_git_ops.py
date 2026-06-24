@@ -14,10 +14,12 @@ from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
+    _remove_watch_merge_checkout,
     _reconcile_diverged_branch_with_origin,
     SquashBranchReconcileResult,
     _build_auto_merge_args,
     _classify_squash_reconcile_push_failure,
+    ensure_watch_main_checkout,
     _merge_single_task,
     _print_squash_reconcile_result,
     _reconcile_squash_merged_branch_with_origin,
@@ -225,6 +227,13 @@ def _write_review_report(tmp_path: Path, *, name: str, content: str) -> str:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(content, encoding="utf-8")
     return str(report_path.relative_to(tmp_path))
+
+
+def _create_worktree_registration(common_dir: Path, *, name: str, worktree_path: Path) -> Path:
+    registration_dir = common_dir / "worktrees" / name
+    registration_dir.mkdir(parents=True, exist_ok=True)
+    (registration_dir / "gitdir").write_text(str(worktree_path / ".git"), encoding="utf-8")
+    return registration_dir
 
 
 def _changes_requested_review_with_blocker(
@@ -1750,6 +1759,123 @@ def test_checkout_passes_managed_roots_to_cleanup(tmp_path: Path) -> None:
         "feature/checkout-roots",
         force=False,
         permitted_root_paths=managed_worktree_root_paths(config),
+    )
+
+
+def test_remove_watch_merge_checkout_deregisters_only_managed_checkout(tmp_path: Path) -> None:
+    """Managed watch cleanup must not prune unrelated prunable worktree registrations."""
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    checkout_path = config.main_checkout_integration_path
+    checkout_path.mkdir(parents=True)
+    (checkout_path / "tracked.txt").write_text("watch checkout", encoding="utf-8")
+
+    foreign_worktree = tmp_path.parent / "inline-worktree"
+    common_dir = tmp_path / ".git"
+    managed_registration = _create_worktree_registration(
+        common_dir,
+        name="watch-main",
+        worktree_path=checkout_path,
+    )
+    foreign_registration = _create_worktree_registration(
+        common_dir,
+        name="inline-feature",
+        worktree_path=foreign_worktree,
+    )
+
+    git = MagicMock(spec=Git)
+    git.worktree_list.return_value = [
+        {
+            "path": str(foreign_worktree),
+            "branch": "refs/heads/feature/inline",
+            "detached": False,
+            "prunable": "gitdir file points to non-existent location",
+        }
+    ]
+    git._run.return_value = SimpleNamespace(stdout=str(common_dir), returncode=0, stderr="")
+
+    _remove_watch_merge_checkout(git, checkout_path)
+
+    git.worktree_remove.assert_called_once_with(checkout_path, force=True)
+    assert not managed_registration.exists()
+    assert foreign_registration.exists()
+    assert not checkout_path.exists()
+    assert call("worktree", "prune", "--expire", "now", check=False) not in git._run.call_args_list
+
+
+def test_ensure_watch_main_checkout_recreates_prunable_registration_without_pruning_foreign_one(
+    tmp_path: Path,
+) -> None:
+    """Reviving the isolated watch checkout must only remove its own stale registration."""
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    checkout_path = config.main_checkout_integration_path
+    foreign_worktree = tmp_path.parent / "inline-worktree"
+    common_dir = tmp_path / ".git"
+    managed_registration = _create_worktree_registration(
+        common_dir,
+        name="watch-main",
+        worktree_path=checkout_path,
+    )
+    foreign_registration = _create_worktree_registration(
+        common_dir,
+        name="inline-feature",
+        worktree_path=foreign_worktree,
+    )
+
+    prunable_managed_entry = {
+        "path": str(checkout_path),
+        "branch": None,
+        "detached": True,
+        "prunable": "gitdir file points to non-existent location",
+    }
+    prunable_foreign_entry = {
+        "path": str(foreign_worktree),
+        "branch": "refs/heads/feature/inline",
+        "detached": False,
+        "prunable": "gitdir file points to non-existent location",
+    }
+    recreated_entry = {
+        "path": str(checkout_path),
+        "branch": None,
+        "detached": True,
+        "prunable": False,
+    }
+
+    git = MagicMock(spec=Git)
+    git.worktree_list.side_effect = [
+        [prunable_managed_entry, prunable_foreign_entry],
+        [prunable_foreign_entry],
+        [prunable_foreign_entry, recreated_entry],
+    ]
+
+    def _run(*args, **kwargs):
+        if args == ("rev-parse", "--git-common-dir"):
+            return SimpleNamespace(stdout=str(common_dir), returncode=0, stderr="")
+        if args == ("worktree", "add", "--detach", str(checkout_path), "main"):
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+        raise AssertionError(f"unexpected git._run call: {args!r}")
+
+    git._run.side_effect = _run
+
+    workspace_git = MagicMock()
+    workspace_git.current_branch.return_value = "HEAD"
+    workspace_git.has_changes.return_value = False
+
+    with patch("gza.cli.git_ops.Git", return_value=workspace_git) as git_cls:
+        isolated_git = ensure_watch_main_checkout(config, git, "main")
+
+    assert isolated_git is workspace_git
+    git_cls.assert_called_once_with(checkout_path)
+    assert not managed_registration.exists()
+    assert foreign_registration.exists()
+    assert call("worktree", "prune", "--expire", "now", check=False) not in git._run.call_args_list
+    workspace_git._run.assert_has_calls(
+        [
+            call("checkout", "--detach", "main"),
+            call("reset", "--hard", "main"),
+            call("clean", "-fd"),
+        ]
     )
 
 

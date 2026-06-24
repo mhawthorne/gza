@@ -56,6 +56,7 @@ from ..git import (
     cleanup_worktree_for_branch,
     is_rebase_in_progress,
     prime_advance_planning_refs,
+    remove_worktree_registration_for_path,
     resolve_ref_if_possible,
 )
 from ..lineage_query import (
@@ -729,7 +730,7 @@ def _remove_watch_merge_checkout(git: Git, checkout_path: Path) -> None:
     git.worktree_remove(checkout_path, force=True)
     if checkout_path.exists():
         shutil.rmtree(checkout_path, ignore_errors=True)
-    git._run("worktree", "prune", "--expire", "now", check=False)
+    remove_worktree_registration_for_path(git, checkout_path)
 
     if _find_worktree_entry_for_path(git, checkout_path) is not None:
         raise GitError(
@@ -757,7 +758,7 @@ def ensure_watch_main_checkout(
 
     entry = _find_worktree_entry_for_path(git, checkout_path)
     if entry is not None and entry.get("prunable"):
-        git._run("worktree", "prune", "--expire", "now", check=False)
+        remove_worktree_registration_for_path(git, checkout_path)
         entry = _find_worktree_entry_for_path(git, checkout_path)
 
     if entry is None and checkout_path.exists():
