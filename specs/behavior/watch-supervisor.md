@@ -241,8 +241,12 @@ When the installed `gza` package fingerprint changes while watch is running:
 - The persisted observation MUST include enough evidence to distinguish durable progress
   from a true no-op repeat: merge-unit identity/state/head, selected action type/reason,
   action task ID, relevant failed/recovery task ID, and current task status.
-- Watch MUST increment the no-progress streak only when the next cycle selects the same
-  subject/action with unchanged evidence. Restarting watch MUST NOT reset that streak.
+- Watch MUST increment the no-progress streak only after it actually **executes** the
+  selected action and the resulting post-execution evidence is unchanged for the same
+  subject/action. Merely evaluating a candidate, failing to reserve capacity, being denied
+  launch, skipping the action, or finding an already-running/in-flight child MUST NOT
+  increment the streak. Restarting watch MUST NOT reset a streak created by actual executed
+  no-progress outcomes.
 - Progress MUST be measured by **outcome**, not by the act of launching. Starting (or
   re-starting) a worker for a subject is NOT, by itself, durable progress. A worker launch
   that leaves the subject in the same state — no task status transition, no branch-head
@@ -324,12 +328,10 @@ The existence of these knobs is contract; their values are operator policy.
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to
 `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and
-`watch.restart_failed_batch` maps to `watch.recovery_slots`. Recovery-lane no-progress
-parking applies to unchanged existing recovery descendants too: when watch repeatedly
-selects the same `recovery_already_pending` or `recovery_already_running` descendant with
-unchanged descendant liveness evidence, the shared `watch-no-progress-backstop` MUST park
-that failed subject after `watch.no_progress_cycles` so later actionable recovery
-candidates can continue.
+`watch.restart_failed_batch` maps to `watch.recovery_slots`. Unchanged existing recovery
+descendants may still surface an already-persisted parked state, but merely re-evaluating
+`recovery_already_pending` or `recovery_already_running` without re-executing a recovery
+action MUST NOT create new no-progress ticks.
 
 ## Boundary with the engine
 

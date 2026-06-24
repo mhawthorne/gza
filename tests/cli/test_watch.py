@@ -6,6 +6,7 @@ import json
 import re
 import signal
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,8 +38,10 @@ from gza.cli.watch import (
     _format_wake_message,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
+    _finalize_watch_no_progress_after_execution,
+    _maybe_park_watch_no_progress,
+    _maybe_finalize_watch_no_progress_for_background_action,
     _query_owner_rows_with_context,
-    _refresh_watch_no_progress_after_state_change,
     _resolve_watch_attention_display_task,
     _run_cycle,
     _should_reexec_watch,
@@ -67,6 +70,7 @@ from gza.lineage_query import LineageOwnerRow
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
+    WatchProgressCandidate,
     build_watch_progress_candidate,
     clear_watch_progress_subject,
 )
@@ -2038,7 +2042,7 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
     assert spawned_task.id == spawned_child_id
 
 
-def test_watch_cycle_parks_unchanged_recovery_already_pending_descendant_using_child_evidence(tmp_path: Path) -> None:
+def test_watch_cycle_repeated_recovery_evaluation_does_not_park_pending_descendant(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -2085,13 +2089,6 @@ def test_watch_cycle_parks_unchanged_recovery_already_pending_descendant_using_c
             restart_failed=True,
             max_recovery_attempts=config.max_resume_attempts,
         )
-        observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
-        assert len(observations) == 1
-        assert observations[0].action_task_id == recovery_child.id
-        assert observations[0].action_task_status == "pending"
-        assert observations[0].action_task_started_at == recovery_child.started_at
-        assert observations[0].action_task_running_pid == 4343
-        assert observations[0].recovery_task_id == recovery_child.id
         _run_cycle(
             config=Config.load(tmp_path),
             store=make_store(tmp_path),
@@ -2103,9 +2100,9 @@ def test_watch_cycle_parks_unchanged_recovery_already_pending_descendant_using_c
             max_recovery_attempts=config.max_resume_attempts,
         )
 
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id) == []
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 1
-    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert "ATTENTION" not in text
 
 
 def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_creating_sibling(
@@ -3470,6 +3467,138 @@ def test_watch_cycle_reconcile_completes_failed_branch_unpushable_task(tmp_path:
     assert "reconcile branch publication" in text
 
 
+def test_watch_cycle_recovery_reconcile_durable_progress_does_not_record_no_progress(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/watch-reconcile-progress"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def _execute_and_complete(*, task, action, context):
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        refreshed.status = "completed"
+        refreshed.failure_reason = None
+        refreshed.completed_at = datetime.now(UTC)
+        store.update(refreshed)
+        return AdvanceActionExecutionResult(
+            action_type="reconcile_branch_divergence",
+            status="success",
+            message="Reconciled branch publication",
+            success_message="Reconciled branch publication",
+            work_done=True,
+            worker_consuming=False,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_execute_and_complete) as execute_action,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker should not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+
+    assert result.work_done is True
+    execute_action.assert_called_once()
+    refreshed = store.get(failed.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id) == []
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+
+
+def test_watch_cycle_recovery_reconcile_no_op_success_parks_at_no_progress_threshold(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed publish", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/watch-reconcile-no-op"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="reconcile_branch_divergence",
+                status="success",
+                message="Reconciled branch publication",
+                success_message="Reconciled branch publication",
+                work_done=True,
+                worker_consuming=False,
+            ),
+        ) as execute_action,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker should not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume should not spawn")),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=False,
+            max_recovery_attempts=1,
+        )
+
+    assert execute_action.call_count == 2
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
+    assert len(observations) == 1
+    assert observations[0].streak == 2
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    text = log_path.read_text()
+    assert "ATTENTION" in text
+    assert "without durable progress for 2 cycles" in text
+
+
 def test_watch_cycle_restart_failed_hides_skipped_logs_by_default(tmp_path: Path) -> None:
     """Restart-failed should suppress skipped recovery log lines unless explicitly requested."""
     setup_config(tmp_path)
@@ -3557,8 +3686,10 @@ def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Pa
     assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
 
 
-def test_watch_cycle_recovery_only_parked_running_recovery_child_allows_pending_queue(tmp_path: Path) -> None:
-    """A running recovery child should stop blocking pending pickup once no-progress parking triggers."""
+def test_watch_cycle_recovery_only_running_recovery_child_keeps_pending_queue_blocked_without_execution(
+    tmp_path: Path,
+) -> None:
+    """A merely re-evaluated running recovery child no longer parks and therefore still blocks recovery-only pending pickup."""
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -3612,9 +3743,8 @@ def test_watch_cycle_recovery_only_parked_running_recovery_child_allows_pending_
         )
 
     assert first.work_done is False
-    assert result.work_done is True
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == pending_plan.id
+    assert result.work_done is False
+    assert spawn_worker.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -9666,7 +9796,7 @@ def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_
     )
 
 
-def test_watch_cycle_parks_repeated_identical_iterate_no_progress_across_restart(tmp_path: Path) -> None:
+def test_watch_cycle_failed_iterate_launch_does_not_park_without_execution(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -9718,11 +9848,11 @@ def test_watch_cycle_parks_repeated_identical_iterate_no_progress_across_restart
             log=_WatchLog(log_path, quiet=True),
         )
 
-    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_count == 2
+    assert store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=str(impl.id)) == []
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 1
-    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
-    assert text.count(f"{impl.id} iterate") == 1
+    assert "ATTENTION" not in text
+    assert text.count("START_FAILED") == 2
 
 
 def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(tmp_path: Path) -> None:
@@ -9780,6 +9910,94 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
         subject_kind="merge_unit",
         subject_id=unit.id,
     ) == []
+
+
+def test_background_no_progress_finalizer_ignores_nonterminal_launch_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+
+    action = {"type": "iterate", "description": "pending queue iterate"}
+
+    pending_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    impl_in_progress = store.get(impl.id)
+    assert impl_in_progress is not None
+    impl_in_progress.status = "in_progress"
+    impl_in_progress.started_at = datetime.now(UTC)
+    impl_in_progress.running_pid = 5151
+    store.update(impl_in_progress)
+
+    running_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl_in_progress,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl_in_progress,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    assert pending_attention is None
+    assert running_attention is None
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    assert len(observations) == 1
+    assert observations[0].launch_evidence_fingerprint is not None
+    assert observations[0].streak == 0
+    assert observations[0].parked_reason is None
+
+
+def test_background_no_progress_finalizer_parks_repeated_completed_no_progress_outcomes(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    action = {"type": "iterate", "description": "pending queue iterate"}
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task_before=refreshed_impl,
+        action_task_after=refreshed_impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task_before=refreshed_impl,
+        action_task_after=refreshed_impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    assert first_attention is None
+    assert second_attention is not None
+    assert second_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
 
 
 def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path: Path) -> None:
@@ -9854,7 +10072,7 @@ def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path:
     assert before.evidence_fingerprint != after.evidence_fingerprint
 
 
-def test_watch_cycle_pending_dispatch_parks_repeated_identical_no_progress_across_restart(tmp_path: Path) -> None:
+def test_watch_cycle_pending_dispatch_failed_launch_does_not_park_without_execution(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -9889,24 +10107,17 @@ def test_watch_cycle_pending_dispatch_parks_repeated_identical_no_progress_acros
             dry_run=False,
             log=_WatchLog(log_path, quiet=True),
         )
-        _run_cycle(
-            config=Config.load(tmp_path),
-            store=make_store(tmp_path),
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=_WatchLog(log_path, quiet=True),
-    )
-
-    assert spawn_iterate.call_count == 1
+    assert spawn_iterate.call_count == 2
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id)) == []
     text = log_path.read_text()
-    assert "ATTENTION" in text
-    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert "ATTENTION" not in text
     assert any("START_FAILED" in line and str(impl.id) in line for line in text.splitlines())
     assert not any("START" in line and f"{impl.id} iterate" in line for line in text.splitlines())
 
 
-def test_watch_cycle_pending_dispatch_status_transition_resets_no_progress_streak(tmp_path: Path) -> None:
+def test_watch_cycle_pending_dispatch_launch_success_without_terminal_outcome_does_not_park(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -9917,55 +10128,17 @@ def test_watch_cycle_pending_dispatch_status_transition_resets_no_progress_strea
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
 
-    spawn_attempts = 0
-
-    def spawn_with_initial_claim(*_args, **_kwargs) -> int:
-        nonlocal spawn_attempts
-        spawn_attempts += 1
-        if spawn_attempts == 1:
-            claimed = store.get(impl.id)
-            assert claimed is not None
-            claimed.status = "in_progress"
-            claimed.started_at = datetime.now(UTC)
-            store.update(claimed)
-            return 0
-        return 1
-
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=spawn_with_initial_claim) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         _run_cycle(
             config=config,
             store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=_WatchLog(log_path, quiet=True),
-        )
-
-        observations = store.list_watch_progress_observations(
-            subject_kind="lineage",
-            subject_id=str(impl.id),
-        )
-        assert len(observations) == 1
-        assert observations[0].action_task_status == "in_progress"
-        assert observations[0].parked_reason is None
-
-        reset = store.get(impl.id)
-        assert reset is not None
-        reset.status = "pending"
-        reset.started_at = None
-        reset.running_pid = None
-        store.update(reset)
-
-        _run_cycle(
-            config=Config.load(tmp_path),
-            store=make_store(tmp_path),
             batch=1,
             max_iterations=10,
             dry_run=False,
@@ -9981,14 +10154,74 @@ def test_watch_cycle_pending_dispatch_status_transition_resets_no_progress_strea
         )
 
     assert spawn_iterate.call_count == 2
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    assert len(observations) == 1
+    assert observations[0].launch_evidence_fingerprint is not None
+    assert observations[0].streak == 0
+    assert observations[0].parked_reason is None
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 1
-    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
-    assert any("START_FAILED" in line and str(impl.id) in line for line in text.splitlines())
+    assert "ATTENTION" not in text
     assert any("START" in line and f"{impl.id} implement" in line for line in text.splitlines())
 
 
-def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_path: Path) -> None:
+def test_watch_cycle_pending_dispatch_running_launch_state_does_not_park(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    def mark_running(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        assert isinstance(task_id, str)
+        running_task = store.get(task_id)
+        assert running_task is not None
+        running_task.status = "in_progress"
+        running_task.started_at = datetime.now(UTC)
+        running_task.running_pid = 7777
+        store.update(running_task)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=mark_running) as spawn_iterate,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert spawn_iterate.call_count == 1
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    assert len(observations) == 1
+    assert observations[0].launch_evidence_fingerprint is not None
+    assert observations[0].streak == 0
+    assert observations[0].parked_reason is None
+    text = log_path.read_text()
+    assert "ATTENTION" not in text
+    assert any("START" in line and f"{impl.id} implement" in line for line in text.splitlines())
+
+
+def test_watch_cycle_recovery_relaunch_launch_success_without_terminal_outcome_does_not_park(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -10008,7 +10241,7 @@ def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_pa
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=[0, 1]) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
     ):
         _run_cycle(
             config=config,
@@ -10020,13 +10253,6 @@ def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_pa
             restart_failed=True,
             max_recovery_attempts=config.max_resume_attempts,
         )
-        observations = store.list_watch_progress_observations(
-            subject_kind="lineage",
-            subject_id=str(failed.id),
-        )
-        assert len(observations) == 1
-        assert observations[0].action_task_id in {child.id for child in store.get_based_on_children(failed.id)}
-        assert observations[0].parked_reason is None
         _run_cycle(
             config=Config.load(tmp_path),
             store=make_store(tmp_path),
@@ -10048,16 +10274,115 @@ def test_watch_cycle_successful_recovery_launch_resets_no_progress_streak(tmp_pa
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert spawn_iterate.call_count == 2
+    assert spawn_iterate.call_count == 3
     assert len(store.get_based_on_children(failed.id)) == 1
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(failed.id))
+    assert len(observations) == 1
+    assert observations[0].launch_evidence_fingerprint is not None
+    assert observations[0].streak == 0
+    assert observations[0].parked_reason is None
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 1
-    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
-    assert any("START_FAILED" in line and str(failed.id) in line for line in text.splitlines())
+    assert "ATTENTION" not in text
     assert any("RECOVR" in line and f"{failed.id} resume via iterate" in line for line in text.splitlines())
 
 
-def test_watch_cycle_parks_unchanged_recovery_already_running_descendant(tmp_path: Path) -> None:
+def test_recovery_deferred_background_terminal_no_progress_parks_after_repeated_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-deferred-terminal"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    real_build_candidate = build_watch_progress_candidate
+
+    def stable_candidate(*args: object, **kwargs: object) -> WatchProgressCandidate:
+        candidate = real_build_candidate(*args, **kwargs)
+        subject_task = kwargs.get("subject_task")
+        if getattr(subject_task, "id", None) == failed.id:
+            return replace(candidate, evidence_fingerprint=f"stable:{failed.id}:{candidate.action_type}")
+        return candidate
+
+    monkeypatch.setattr("gza.cli.watch.build_watch_progress_candidate", stable_candidate)
+    action = {"type": "resume", "description": "Resume failed task after MAX_TURNS"}
+
+    first_child = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert first_child.id is not None
+    first_child.status = "in_progress"
+    first_child.started_at = datetime.now(UTC)
+    first_child.running_pid = 8118
+    store.update(first_child)
+
+    first_launch_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=failed,
+        action=action,
+        action_task_before=failed,
+        action_task_after=first_child,
+        failed_task=failed,
+        no_progress_cycles=2,
+    )
+    first_child.status = "failed"
+    first_child.failure_reason = "MAX_TURNS"
+    first_child.completed_at = datetime.now(UTC)
+    store.update(first_child)
+    first_terminal_attention = _maybe_park_watch_no_progress(
+        store=store,
+        subject_task=failed,
+        action=action,
+        action_task=failed,
+        failed_task=failed,
+        no_progress_cycles=2,
+    )
+
+    second_child = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert second_child.id is not None
+    second_child.status = "in_progress"
+    second_child.started_at = datetime.now(UTC)
+    second_child.running_pid = 8229
+    store.update(second_child)
+
+    second_launch_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=failed,
+        action=action,
+        action_task_before=failed,
+        action_task_after=second_child,
+        failed_task=failed,
+        no_progress_cycles=2,
+    )
+    second_child.status = "failed"
+    second_child.failure_reason = "MAX_TURNS"
+    second_child.completed_at = datetime.now(UTC)
+    store.update(second_child)
+    second_terminal_attention = _maybe_park_watch_no_progress(
+        store=store,
+        subject_task=failed,
+        action=action,
+        action_task=failed,
+        failed_task=failed,
+        no_progress_cycles=2,
+    )
+
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(failed.id))
+    assert first_launch_attention is None
+    assert first_terminal_attention is None
+    assert second_launch_attention is None
+    assert second_terminal_attention is not None
+    assert second_terminal_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].streak == 2
+
+
+def test_watch_cycle_repeated_recovery_evaluation_does_not_park_running_descendant(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -10110,17 +10435,10 @@ def test_watch_cycle_parks_unchanged_recovery_already_running_descendant(tmp_pat
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
-    assert len(observations) == 1
-    assert observations[0].action_task_id == recovery_child.id
-    assert observations[0].action_task_status == "in_progress"
-    assert observations[0].action_task_started_at == recovery_child.started_at
-    assert observations[0].action_task_running_pid == 4242
-    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id) == []
 
     text = log_path.read_text()
-    assert text.count("ATTENTION") == 1
-    assert f"reason={WATCH_NO_PROGRESS_BACKSTOP_REASON}" in text
+    assert "ATTENTION" not in text
 
 
 def test_watch_cycle_parked_recovery_head_does_not_starve_later_candidate(tmp_path: Path) -> None:
@@ -10377,20 +10695,15 @@ def test_watch_cycle_reused_pending_recovery_liveness_transition_resets_no_progr
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
-    assert len(observations) == 1
-    assert observations[0].action_task_id == recovery_child.id
-    assert observations[0].action_task_status == "pending"
-    assert observations[0].action_task_started_at == recovery_child.started_at
-    assert observations[0].action_task_running_pid == 6060
-    assert observations[0].streak == 1
-    assert observations[0].parked_reason is None
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id) == []
 
     text = log_path.read_text()
     assert "ATTENTION" not in text
 
 
-def test_watch_cycle_unchanged_reused_pending_recovery_spawn_does_not_refresh_streak(tmp_path: Path) -> None:
+def test_watch_cycle_reused_pending_recovery_relaunch_without_terminal_outcome_does_not_tick_streak(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -10411,15 +10724,16 @@ def test_watch_cycle_unchanged_reused_pending_recovery_spawn_does_not_refresh_st
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
-    real_refresh = _refresh_watch_no_progress_after_state_change
-
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
-        patch("gza.cli.watch._refresh_watch_no_progress_after_state_change", wraps=real_refresh) as refresh_spy,
+        patch(
+            "gza.cli.watch._maybe_finalize_watch_no_progress_for_background_action",
+            wraps=_maybe_finalize_watch_no_progress_for_background_action,
+        ) as finalize_spy,
     ):
         _run_cycle(
             config=config,
@@ -10442,11 +10756,11 @@ def test_watch_cycle_unchanged_reused_pending_recovery_spawn_does_not_refresh_st
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert refresh_spy.call_count == 0
+    assert finalize_spy.call_count == 2
     observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=failed.id)
     assert len(observations) == 1
-    assert observations[0].action_task_id == recovery_child.id
-    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].launch_evidence_fingerprint is not None
+    assert observations[0].streak == 0
 
 
 def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_path: Path) -> None:

@@ -692,14 +692,7 @@ def _resolve_noop_improve_verify_clearance(
     ):
         return False, None, None
 
-    latest_completed_noop_improve = next(
-        (
-            improve
-            for improve in improve_tasks
-            if improve.status == "completed" and improve.changed_diff is False
-        ),
-        None,
-    )
+    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
     if latest_completed_noop_improve is None:
         return False, None, None
 
@@ -745,16 +738,27 @@ def _review_has_current_verify_blocker_clearance(
     blocker_summary = summarize_review_blockers(get_review_content(project_dir, review_task))
     if blocker_summary.verify_failure_count + blocker_summary.verify_timeout_count == 0:
         return False
-    return any(
-        improve.status == "completed"
-        and improve.changed_diff is False
+    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
+    return (
+        latest_completed_noop_improve is not None
         and _task_has_current_passing_review_verify_evidence(
-            task=improve,
+            task=latest_completed_noop_improve,
             review_task=review_task,
             current_branch=current_branch,
             current_head_sha=current_head_sha,
         )
-        for improve in improve_tasks
+    )
+
+
+def _latest_completed_noop_improve(improve_tasks: list[DbTask]) -> DbTask | None:
+    """Return the freshest completed no-op improve in newest-first improve order."""
+    return next(
+        (
+            improve
+            for improve in improve_tasks
+            if improve.status == "completed" and improve.changed_diff is False
+        ),
+        None,
     )
 
 

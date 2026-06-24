@@ -64,9 +64,10 @@ from ..task_query import (
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     build_watch_progress_candidate,
+    finalize_background_watch_execution,
+    finalize_watch_progress_after_execution,
     get_active_watch_no_progress_attention,
-    observe_watch_progress_and_maybe_park,
-    refresh_watch_progress_after_state_change,
+    record_background_watch_execution_start,
 )
 from ..workers import WorkerRegistry
 from ._common import (
@@ -583,11 +584,22 @@ def _maybe_park_watch_no_progress(
     action: dict[str, Any],
     action_task: DbTask | None,
     failed_task: DbTask | None,
-    no_progress_cycles: int,
+    no_progress_cycles: int | None = None,
 ) -> dict[str, Any] | None:
-    """Persist restart-safe watch no-progress observations and park at threshold."""
+    """Return an existing parked no-progress attention action for the current evidence."""
     if subject_task.id is None:
         return None
+    if no_progress_cycles is not None:
+        deferred_attention = _maybe_finalize_deferred_watch_no_progress(
+            store=store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task,
+            failed_task=failed_task,
+            no_progress_cycles=no_progress_cycles,
+        )
+        if deferred_attention is not None:
+            return deferred_attention
     candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
@@ -596,26 +608,19 @@ def _maybe_park_watch_no_progress(
         failed_task=failed_task,
     )
     active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
-    if active_attention is not None:
-        return active_attention
-    return observe_watch_progress_and_maybe_park(
-        store,
-        candidate=candidate,
-        no_progress_cycles=no_progress_cycles,
-    )
+    return active_attention
 
 
-def _refresh_watch_no_progress_after_state_change(
+def _maybe_finalize_deferred_watch_no_progress(
     *,
     store: SqliteTaskStore,
     subject_task: DbTask,
     action: dict[str, Any],
     action_task: DbTask | None,
     failed_task: DbTask | None,
-) -> None:
-    """Refresh persisted no-progress evidence only when the subject actually changed state."""
-    if subject_task.id is None:
-        return
+    no_progress_cycles: int,
+) -> dict[str, Any] | None:
+    """Finalize a previously launched detached action once watch can observe its terminal outcome."""
     candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
@@ -623,10 +628,34 @@ def _refresh_watch_no_progress_after_state_change(
         action_task=action_task,
         failed_task=failed_task,
     )
-    refresh_watch_progress_after_state_change(store, candidate=candidate)
+    observation = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    if observation is None or observation.launch_evidence_fingerprint is None:
+        return None
+    if observation.action_task_id is None:
+        return None
+    observed_action_task = store.get(observation.action_task_id)
+    if not _watch_background_execution_completed(observed_action_task):
+        return None
+    terminal_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=subject_task,
+        action=action,
+        action_task=observed_action_task,
+        failed_task=failed_task,
+    )
+    return finalize_background_watch_execution(
+        store,
+        candidate=terminal_candidate,
+        no_progress_cycles=no_progress_cycles,
+    )
 
 
-def _recovery_action_evidence_changed(
+def _finalize_watch_no_progress_after_execution(
     *,
     store: SqliteTaskStore,
     subject_task: DbTask,
@@ -634,8 +663,11 @@ def _recovery_action_evidence_changed(
     action_task_before: DbTask | None,
     action_task_after: DbTask | None,
     failed_task: DbTask | None,
-) -> bool:
-    """Return whether the tracked recovery-child evidence changed across a reuse launch."""
+    no_progress_cycles: int,
+) -> dict[str, Any] | None:
+    """Record one executed watch action after it finishes."""
+    if subject_task.id is None:
+        return None
     previous_candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
@@ -650,7 +682,62 @@ def _recovery_action_evidence_changed(
         action_task=action_task_after,
         failed_task=failed_task,
     )
-    return previous_candidate.evidence_fingerprint != refreshed_candidate.evidence_fingerprint
+    return finalize_watch_progress_after_execution(
+        store,
+        before=previous_candidate,
+        after=refreshed_candidate,
+        no_progress_cycles=no_progress_cycles,
+    )
+
+
+def _watch_background_execution_completed(action_task: DbTask | None) -> bool:
+    """Return whether watch can already observe a detached action has finished."""
+    return action_task is not None and action_task.status not in {"pending", "in_progress"}
+
+
+def _maybe_finalize_watch_no_progress_for_background_action(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task_before: DbTask | None,
+    action_task_after: DbTask | None,
+    failed_task: DbTask | None,
+    no_progress_cycles: int,
+) -> dict[str, Any] | None:
+    """Finalize no-progress only when the detached action already reached an observed outcome."""
+    if action_task_after is not None and not _watch_background_execution_completed(action_task_after):
+        before_candidate = build_watch_progress_candidate(
+            store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task_before,
+            failed_task=failed_task,
+        )
+        after_candidate = build_watch_progress_candidate(
+            store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task_after,
+            failed_task=failed_task,
+        )
+        record_background_watch_execution_start(
+            store,
+            before=before_candidate,
+            after=after_candidate,
+        )
+        return None
+    if not _watch_background_execution_completed(action_task_after):
+        return None
+    return _finalize_watch_no_progress_after_execution(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task_before=action_task_before,
+        action_task_after=action_task_after,
+        failed_task=failed_task,
+        no_progress_cycles=no_progress_cycles,
+    )
 
 
 def _resolve_recovery_action_task(
@@ -2393,24 +2480,46 @@ def _run_cycle(
                 elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
                     log.emit("START", f"{child_id} rebase")
                 refreshed_action_task = store.get(child_id) if child_id is not None else None
-                _refresh_watch_no_progress_after_state_change(
+                no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
                     store=store,
                     subject_task=display_task,
                     action=action,
-                    action_task=refreshed_action_task,
+                    action_task_before=task,
+                    action_task_after=refreshed_action_task,
                     failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
                 )
                 started_task_ids.add(str(child_id))
                 if exec_result.worker_consuming:
                     slots -= 1
                 work_done = True
+                if no_progress_attention is not None:
+                    log.emit_attention(
+                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(display_task, no_progress_attention),
+                    )
             elif exec_result.status == "success" and action_type == "reconcile_branch_divergence":
+                refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
+                no_progress_attention = _finalize_watch_no_progress_after_execution(
+                    store=store,
+                    subject_task=display_task,
+                    action=action,
+                    action_task_before=task,
+                    action_task_after=refreshed_display_task,
+                    failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                )
                 if display_task.id is not None:
                     log.emit(
                         "REPAIR",
                         f"{display_task.id}: {exec_result.success_message or exec_result.message}",
                         dedupe_key=f"advance-reconcile:{display_task.id}",
                     )
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(display_task, no_progress_attention),
+                        )
                 work_done = True
 
     # 2) Recovery queue for failed tasks.
@@ -2609,12 +2718,15 @@ def _run_cycle(
                 )
                 continue
             if exec_result.status == "success":
-                _refresh_watch_no_progress_after_state_change(
+                refreshed_failed = store.get(failed.id) if failed.id is not None else None
+                no_progress_attention = _finalize_watch_no_progress_after_execution(
                     store=store,
                     subject_task=failed,
                     action=recovery_action,
-                    action_task=action_task,
+                    action_task_before=action_task,
+                    action_task_after=refreshed_failed or action_task,
                     failed_task=failed,
+                    no_progress_cycles=config.watch.no_progress_cycles,
                 )
                 recovery_started_this_cycle = True
                 log.emit(
@@ -2629,6 +2741,11 @@ def _run_cycle(
                     f"{failed.id}: {exec_result.success_message or exec_result.message}",
                     dedupe_key=f"recovery-reconcile-success:{failed.id}",
                 )
+                if no_progress_attention is not None:
+                    log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                        message=_watch_needs_attention_message(failed, no_progress_attention),
+                    )
                 work_done = True
                 continue
             continue
@@ -2826,24 +2943,15 @@ def _run_cycle(
         if rc != 0:
             continue
         refreshed_recovered_task = store.get(recovered_task_id)
-        if (
-            not decision.reuse_existing
-            or _recovery_action_evidence_changed(
-                store=store,
-                subject_task=failed,
-                action=recovery_action,
-                action_task_before=action_task,
-                action_task_after=refreshed_recovered_task,
-                failed_task=failed,
-            )
-        ):
-            _refresh_watch_no_progress_after_state_change(
-                store=store,
-                subject_task=failed,
-                action=recovery_action,
-                action_task=refreshed_recovered_task,
-                failed_task=failed,
-            )
+        no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+            store=store,
+            subject_task=failed,
+            action=recovery_action,
+            action_task_before=action_task,
+            action_task_after=refreshed_recovered_task,
+            failed_task=failed,
+            no_progress_cycles=config.watch.no_progress_cycles,
+        )
         recovery_started_this_cycle = True
         started_task_ids.add(recovered_task_id)
         slots -= 1
@@ -2856,6 +2964,11 @@ def _run_cycle(
                 f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
             ),
         )
+        if no_progress_attention is not None:
+            log.emit_attention(
+                attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                message=_watch_needs_attention_message(failed, no_progress_attention),
+            )
 
     if recovery_mode == "recovery-only" and pending_slots <= 0 and not recovery_started_this_cycle:
         if not nonparked_recovery_subject_ids:
@@ -2950,12 +3063,14 @@ def _run_cycle(
                 if rc != 0:
                     continue
                 refreshed_pending_task = store.get(str(task.id))
-                _refresh_watch_no_progress_after_state_change(
+                no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
                     store=store,
                     subject_task=task,
                     action=pending_action,
-                    action_task=refreshed_pending_task,
+                    action_task_before=task,
+                    action_task_after=refreshed_pending_task,
                     failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
                 )
                 consume_pending_slot()
                 work_done = True
@@ -2966,6 +3081,11 @@ def _run_cycle(
                     suffix=len('"'),
                 )
                 log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
+                if no_progress_attention is not None:
+                    log.emit_attention(
+                        attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                        message=_watch_needs_attention_message(task, no_progress_attention),
+                    )
                 continue
 
             if dry_run:
@@ -3010,12 +3130,14 @@ def _run_cycle(
             if rc != 0:
                 continue
             refreshed_pending_task = store.get(str(task.id))
-            _refresh_watch_no_progress_after_state_change(
+            no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
                 store=store,
                 subject_task=task,
                 action=pending_action,
-                action_task=refreshed_pending_task,
+                action_task_before=task,
+                action_task_after=refreshed_pending_task,
                 failed_task=None,
+                no_progress_cycles=config.watch.no_progress_cycles,
             )
             consume_pending_slot()
             work_done = True
@@ -3026,6 +3148,11 @@ def _run_cycle(
                 suffix=len('"'),
             )
             log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
+            if no_progress_attention is not None:
+                log.emit_attention(
+                    attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                    message=_watch_needs_attention_message(task, no_progress_attention),
+                )
 
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     _emit_cycle_attention_summary(log)

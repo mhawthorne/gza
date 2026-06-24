@@ -292,6 +292,33 @@ def get_active_watch_no_progress_attention(
     )
 
 
+def _clear_other_subject_actions(
+    store: SqliteTaskStore,
+    *,
+    candidate: WatchProgressCandidate,
+) -> WatchProgressObservation | None:
+    existing = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    same_subject_rows = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+    if any(
+        row.action_type != candidate.action_type or row.action_reason != candidate.action_reason
+        for row in same_subject_rows
+    ):
+        store.delete_watch_progress_subject(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        return None
+    return existing
+
+
 def clear_watch_progress_subject(
     store: SqliteTaskStore,
     *,
@@ -319,25 +346,7 @@ def observe_watch_progress_and_maybe_park(
     """Persist the observation and return a parked attention action at the threshold."""
     if no_progress_cycles < 1:
         raise AssertionError("watch no-progress threshold must be positive")
-    existing = store.get_watch_progress_observation(
-        subject_kind=candidate.subject_kind,
-        subject_id=candidate.subject_id,
-        action_type=candidate.action_type,
-        action_reason=candidate.action_reason,
-    )
-    same_subject_rows = store.list_watch_progress_observations(
-        subject_kind=candidate.subject_kind,
-        subject_id=candidate.subject_id,
-    )
-    if any(
-        row.action_type != candidate.action_type or row.action_reason != candidate.action_reason
-        for row in same_subject_rows
-    ):
-        store.delete_watch_progress_subject(
-            subject_kind=candidate.subject_kind,
-            subject_id=candidate.subject_id,
-        )
-        existing = None
+    existing = _clear_other_subject_actions(store, candidate=candidate)
 
     same_evidence = existing is not None and existing.evidence_fingerprint == candidate.evidence_fingerprint
     streak = (existing.streak + 1) if (same_evidence and existing is not None) else 1
@@ -363,6 +372,131 @@ def observe_watch_progress_and_maybe_park(
             merge_unit_state=candidate.merge_unit_state,
             merge_unit_head_sha=candidate.merge_unit_head_sha,
             evidence_fingerprint=candidate.evidence_fingerprint,
+            launch_evidence_fingerprint=None,
+            streak=streak,
+            parked_reason=parked_reason,
+            observed_at=datetime.now(UTC),
+        )
+    )
+    if parked_reason is None:
+        return None
+    return build_watch_no_progress_attention_action(
+        subject_task_id=candidate.subject_task_id,
+        action_type=candidate.action_type,
+        streak=streak,
+    )
+
+
+def finalize_watch_progress_after_execution(
+    store: SqliteTaskStore,
+    *,
+    before: WatchProgressCandidate,
+    after: WatchProgressCandidate,
+    no_progress_cycles: int,
+) -> dict[str, Any] | None:
+    """Record one executed watch action, clearing on progress and counting only true no-op repeats."""
+    if before.subject_kind != after.subject_kind or before.subject_id != after.subject_id:
+        raise AssertionError("watch progress execution finalizer requires a stable subject")
+    if before.evidence_fingerprint != after.evidence_fingerprint:
+        store.delete_watch_progress_subject(
+            subject_kind=after.subject_kind,
+            subject_id=after.subject_id,
+        )
+        return None
+    return observe_watch_progress_and_maybe_park(
+        store,
+        candidate=after,
+        no_progress_cycles=no_progress_cycles,
+    )
+
+
+def record_background_watch_execution_start(
+    store: SqliteTaskStore,
+    *,
+    before: WatchProgressCandidate,
+    after: WatchProgressCandidate,
+) -> None:
+    """Persist that watch actually launched detached work without counting it yet."""
+    existing = _clear_other_subject_actions(store, candidate=after)
+    completed_fingerprint = ""
+    streak = 0
+    if existing is not None:
+        if existing.launch_evidence_fingerprint is None and existing.evidence_fingerprint:
+            completed_fingerprint = existing.evidence_fingerprint
+            streak = existing.streak
+        else:
+            completed_fingerprint = existing.evidence_fingerprint
+            streak = existing.streak
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=after.subject_kind,
+            subject_id=after.subject_id,
+            action_type=after.action_type,
+            action_reason=after.action_reason,
+            subject_task_id=after.subject_task_id,
+            action_task_id=after.action_task_id,
+            action_task_status=after.action_task_status,
+            action_task_started_at=after.action_task_started_at,
+            action_task_running_pid=after.action_task_running_pid,
+            failed_task_id=after.failed_task_id,
+            recovery_task_id=after.recovery_task_id,
+            merge_unit_id=after.merge_unit_id,
+            merge_unit_state=after.merge_unit_state,
+            merge_unit_head_sha=after.merge_unit_head_sha,
+            evidence_fingerprint=completed_fingerprint,
+            launch_evidence_fingerprint=before.evidence_fingerprint,
+            streak=streak,
+            parked_reason=None,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+
+def finalize_background_watch_execution(
+    store: SqliteTaskStore,
+    *,
+    candidate: WatchProgressCandidate,
+    no_progress_cycles: int,
+) -> dict[str, Any] | None:
+    """Finalize one previously launched detached action after its outcome becomes observable."""
+    observation = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    if observation is None or observation.launch_evidence_fingerprint is None:
+        return None
+    if candidate.evidence_fingerprint != observation.launch_evidence_fingerprint:
+        store.delete_watch_progress_subject(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        return None
+    prior_completed_fingerprint = observation.evidence_fingerprint or None
+    if prior_completed_fingerprint == candidate.evidence_fingerprint:
+        streak = observation.streak + 1
+    else:
+        streak = 1
+    parked_reason = WATCH_NO_PROGRESS_BACKSTOP_REASON if streak >= no_progress_cycles else None
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            launch_evidence_fingerprint=None,
             streak=streak,
             parked_reason=parked_reason,
             observed_at=datetime.now(UTC),
@@ -410,6 +544,7 @@ def refresh_watch_progress_after_state_change(
             merge_unit_state=candidate.merge_unit_state,
             merge_unit_head_sha=candidate.merge_unit_head_sha,
             evidence_fingerprint=candidate.evidence_fingerprint,
+            launch_evidence_fingerprint=None,
             streak=1,
             parked_reason=None,
             observed_at=datetime.now(UTC),

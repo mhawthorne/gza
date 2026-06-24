@@ -627,6 +627,7 @@ class WatchProgressObservation:
     merge_unit_state: str | None = None
     merge_unit_head_sha: str | None = None
     evidence_fingerprint: str = ""
+    launch_evidence_fingerprint: str | None = None
     streak: int = 1
     parked_reason: str | None = None
     observed_at: datetime | None = None
@@ -838,6 +839,7 @@ CREATE TABLE IF NOT EXISTS watch_progress_observations (
     merge_unit_state TEXT,
     merge_unit_head_sha TEXT,
     evidence_fingerprint TEXT NOT NULL,
+    launch_evidence_fingerprint TEXT,
     streak INTEGER NOT NULL DEFAULT 1,
     parked_reason TEXT,
     observed_at TEXT NOT NULL,
@@ -936,6 +938,7 @@ CREATE TABLE IF NOT EXISTS watch_progress_observations (
     merge_unit_state TEXT,
     merge_unit_head_sha TEXT,
     evidence_fingerprint TEXT NOT NULL,
+    launch_evidence_fingerprint TEXT,
     streak INTEGER NOT NULL DEFAULT 1,
     parked_reason TEXT,
     observed_at TEXT NOT NULL,
@@ -963,8 +966,13 @@ MIGRATION_V53_TO_V54 = f"""
 ALTER TABLE task_comments ADD COLUMN kind TEXT NOT NULL DEFAULT '{TASK_COMMENT_KIND_FEEDBACK}';
 """
 
+# Migration from v54 to v55: persist detached-launch baseline evidence
+MIGRATION_V54_TO_V55 = """
+ALTER TABLE watch_progress_observations ADD COLUMN launch_evidence_fingerprint TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 54
+SCHEMA_VERSION = 55
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1667,6 +1675,7 @@ _QUERY_ONLY_REQUIRED_WATCH_PROGRESS_COLUMNS: tuple[str, ...] = (
 _QUERY_ONLY_OPTIONAL_WATCH_PROGRESS_COLUMNS: tuple[str, ...] = (
     "action_task_started_at",
     "action_task_running_pid",
+    "launch_evidence_fingerprint",
 )
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
@@ -1727,7 +1736,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2137,6 +2146,12 @@ def _ensure_required_auto_migration_artifacts(
             "action_task_running_pid",
             "ALTER TABLE watch_progress_observations ADD COLUMN action_task_running_pid INTEGER",
         ),
+        (
+            55,
+            "watch_progress_observations",
+            "launch_evidence_fingerprint",
+            "ALTER TABLE watch_progress_observations ADD COLUMN launch_evidence_fingerprint TEXT",
+        ),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -2302,6 +2317,7 @@ def _ensure_required_auto_migration_artifacts(
                         merge_unit_state TEXT,
                         merge_unit_head_sha TEXT,
                         evidence_fingerprint TEXT NOT NULL,
+                        launch_evidence_fingerprint TEXT,
                         streak INTEGER NOT NULL DEFAULT 1,
                         parked_reason TEXT,
                         observed_at TEXT NOT NULL,
@@ -2887,6 +2903,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (52, MIGRATION_V51_TO_V52),
     (53, MIGRATION_V52_TO_V53),
     (54, MIGRATION_V53_TO_V54),
+    (55, MIGRATION_V54_TO_V55),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -4857,6 +4874,11 @@ class SqliteTaskStore:
             merge_unit_state=str(row["merge_unit_state"]) if row["merge_unit_state"] is not None else None,
             merge_unit_head_sha=str(row["merge_unit_head_sha"]) if row["merge_unit_head_sha"] is not None else None,
             evidence_fingerprint=str(row["evidence_fingerprint"]),
+            launch_evidence_fingerprint=(
+                str(row["launch_evidence_fingerprint"])
+                if "launch_evidence_fingerprint" in row_keys and row["launch_evidence_fingerprint"] is not None
+                else None
+            ),
             streak=int(row["streak"]) if row["streak"] is not None else 1,
             parked_reason=str(row["parked_reason"]) if row["parked_reason"] is not None else None,
             observed_at=_parse_db_timestamp(row["observed_at"]),
@@ -5288,11 +5310,12 @@ class SqliteTaskStore:
                     merge_unit_state,
                     merge_unit_head_sha,
                     evidence_fingerprint,
+                    launch_evidence_fingerprint,
                     streak,
                     parked_reason,
                     observed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, subject_kind, subject_id, action_type, action_reason)
                 DO UPDATE SET
                     subject_task_id = excluded.subject_task_id,
@@ -5306,6 +5329,7 @@ class SqliteTaskStore:
                     merge_unit_state = excluded.merge_unit_state,
                     merge_unit_head_sha = excluded.merge_unit_head_sha,
                     evidence_fingerprint = excluded.evidence_fingerprint,
+                    launch_evidence_fingerprint = excluded.launch_evidence_fingerprint,
                     streak = excluded.streak,
                     parked_reason = excluded.parked_reason,
                     observed_at = excluded.observed_at
@@ -5327,6 +5351,7 @@ class SqliteTaskStore:
                     observation.merge_unit_state,
                     observation.merge_unit_head_sha,
                     observation.evidence_fingerprint,
+                    observation.launch_evidence_fingerprint,
                     observation.streak,
                     observation.parked_reason,
                     observed_at,
