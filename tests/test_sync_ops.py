@@ -381,6 +381,50 @@ def test_reconcile_task_branch_merge_truth_marks_merged_and_preserves_unit_proje
     assert unit.base_sha == "base-sync-merged"
 
 
+def test_reconcile_task_branch_merge_truth_by_same_branch_improve_marks_owner_unit_merged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = _completed_branch_task(store, "Owner task", "feature/shared-followup-merged")
+    follow_up = store.add("Improve task", task_type="improve", based_on=owner.id, same_branch=True)
+    follow_up.status = "completed"
+    follow_up.completed_at = datetime.now(UTC)
+    follow_up.branch = owner.branch
+    follow_up.has_commits = True
+    follow_up.merge_status = "unmerged"
+    store.update(follow_up)
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/shared-followup-merged": "head-followup-merged",
+        "main": "base-followup-merged",
+    }.get(ref)
+
+    result = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        follow_up.id,
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+
+    assert result.merge_status == "merged"
+    owner_unit = store.resolve_merge_unit_for_task(owner.id)
+    follow_up_unit = store.resolve_merge_unit_for_task(follow_up.id)
+    assert owner_unit is not None
+    assert follow_up_unit is not None
+    assert follow_up_unit.id == owner_unit.id
+    assert owner_unit.state == "merged"
+    assert owner_unit.merged_by_task_id == owner.id
+    refreshed_owner = store.get(owner.id)
+    refreshed_follow_up = store.get(follow_up.id)
+    assert refreshed_owner is not None
+    assert refreshed_follow_up is not None
+    assert refreshed_owner.merge_status == "merged"
+    assert refreshed_follow_up.merge_status is None
+
+
 def test_sync_branch_cohorts_records_github_pr_merge_source(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task", "feature/pr-merged")

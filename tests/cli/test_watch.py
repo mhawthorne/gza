@@ -5777,6 +5777,70 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
     assert f"{task.id}: marked merged after shared reconciliation against main" in log_text
 
 
+def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_followup(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Watch implement owner", task_type="implement")
+    store.mark_completed(owner, has_commits=True, branch="feature/watch-target-already-merged")
+    assert owner.id is not None
+    store.set_merge_status(owner.id, "unmerged")
+
+    follow_up = store.add(
+        "Watch improve descendant",
+        task_type="improve",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    store.mark_completed(follow_up, has_commits=True, branch="feature/watch-target-already-merged")
+    assert follow_up.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.default_branch.return_value = "main"
+    repaired_result = SimpleNamespace(ok=True, merge_status="merged")
+    skip_action = {
+        "type": "skip",
+        "description": "SKIP: target implementation already merged (merge-unit-merged)",
+        "advance_reason": "target-already-merged",
+    }
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.reconcile_task_branch_merge_truth", return_value=repaired_result) as reconcile_branch,
+        patch("gza.cli.watch.determine_next_action", return_value=skip_action),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    reconcile_branch.assert_called_once_with(
+        store,
+        repo_git,
+        str(owner.id),
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+    owner_unit = store.resolve_merge_unit_for_task(owner.id)
+    assert owner_unit is not None
+    assert owner_unit.state == "unmerged"
+    log_text = log_path.read_text()
+    assert f"{owner.id}: marked merged after shared reconciliation against main" in log_text
+
+
 def test_watch_cycle_logs_already_merged_reconciliation_as_info(tmp_path: Path) -> None:
     """Watch should log stale merge-state reconciliation as expected info, not a merge failure."""
     setup_config(tmp_path)

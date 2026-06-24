@@ -7215,6 +7215,7 @@ def test_conflict_needs_rebase_not_emitted_when_target_already_merged(tmp_path: 
 
     assert action["type"] == "skip"
     assert action["description"] == "SKIP: target implementation already merged (merge-unit-merged)"
+    assert action["advance_reason"] == "target-already-merged"
 
 
 def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) -> None:

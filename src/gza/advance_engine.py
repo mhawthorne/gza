@@ -640,6 +640,17 @@ def _count_consecutive_noop_improves(improve_tasks: list[DbTask]) -> tuple[DbTas
     return latest_noop_improve, consecutive_noops
 
 
+def _latest_completed_noop_improve(improve_tasks: list[DbTask]) -> DbTask | None:
+    return next(
+        (
+            improve
+            for improve in improve_tasks
+            if improve.status == "completed" and improve.changed_diff is False
+        ),
+        None,
+    )
+
+
 def _latest_review_is_verify_blocked_only(ctx: AdvanceContext) -> bool:
     latest_review_blocker_summary = getattr(ctx, "latest_review_blocker_summary", None)
     return (
@@ -751,18 +762,6 @@ def _review_has_current_verify_blocker_clearance(
             current_branch=current_branch,
             current_head_sha=current_head_sha,
         )
-    )
-
-
-def _latest_completed_noop_improve(improve_tasks: list[DbTask]) -> DbTask | None:
-    """Return the freshest completed no-op improve in newest-first improve order."""
-    return next(
-        (
-            improve
-            for improve in improve_tasks
-            if improve.status == "completed" and improve.changed_diff is False
-        ),
-        None,
     )
 
 
@@ -3448,7 +3447,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             ctx.post_merge_rebase_state is not None
             and ctx.post_merge_rebase_state.already_merged
         ),
-        action=lambda ctx: {"type": "skip", "description": _target_already_merged_description(ctx)},
+        action=lambda ctx: {
+            "type": "skip",
+            "description": _target_already_merged_description(ctx),
+            "advance_reason": "target-already-merged",
+        },
     ),
     AdvanceRule(
         name="rebase_target_missing_merge_unit",

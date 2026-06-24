@@ -31,6 +31,7 @@ from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_numeric_key
 from ..git import Git, GitError
+from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
@@ -40,7 +41,7 @@ from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
     check_main_integration_verify,
 )
-from ..merge_state import resolve_task_merge_state_for_target
+from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
 from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from ..recovery_engine import (
@@ -216,6 +217,46 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
     if not description:
         description = action_type.replace("_", " ")
     return f"{task.id}: {description}"
+
+
+def _maybe_repair_target_already_merged_skip(
+    *,
+    store: SqliteTaskStore,
+    git: Git,
+    task: DbTask,
+    display_task: DbTask,
+    action: Mapping[str, Any],
+    target_branch: str,
+    dry_run: bool,
+    log: "_WatchLog",
+) -> bool:
+    if dry_run or action.get("advance_reason") != "target-already-merged" or task.id is None:
+        return False
+
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is None:
+        return False
+
+    owner_task = store.resolve_merge_unit_owner_task(merge_unit) or display_task
+    owner_effective_state = effective_no_work_merge_state(owner_task, merge_unit.state)
+    if merge_state_is_terminal_for_lifecycle(owner_effective_state):
+        return False
+
+    repaired = reconcile_task_branch_merge_truth(
+        store,
+        git,
+        str(task.id),
+        target_branch=target_branch,
+        include_diff_stats=True,
+        persist=True,
+    )
+    if repaired.ok and merge_state_is_terminal_for_lifecycle(repaired.merge_status):
+        log.emit(
+            "REPAIR",
+            f"{display_task.id}: marked {repaired.merge_status} after shared reconciliation against {target_branch}",
+        )
+        return True
+    return False
 
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
@@ -2113,6 +2154,18 @@ def _run_cycle(
                 continue
 
             if classify_advance_action(action) == "skip":
+                if _maybe_repair_target_already_merged_skip(
+                    store=store,
+                    git=git,
+                    task=task,
+                    display_task=display_task,
+                    action=action,
+                    target_branch=target_branch,
+                    dry_run=dry_run,
+                    log=log,
+                ):
+                    work_done = True
+                    continue
                 log.emit(
                     "SKIP",
                     _watch_skip_message(display_task, action),

@@ -202,6 +202,11 @@ It is the object L1/L2 ultimately resolve against.
   (non-superseded) unit.
 - Tasks attach many-to-one to a merge unit. The unit, not any single task, is the "needs
   attention" row operators act on (P1).
+- Proven-merged truth for any member of a merge unit, including a non-owner same-branch
+  follow-up (`improve`/`fix`/`rebase`), MUST resolve the active unit to its terminal
+  state. When that proof lands the unit as `merged`, merge provenance MUST stay
+  attributed to the canonical owner task rather than the follow-up row that observed the
+  merge.
 
 *Implementation note: `MergeUnit` (db.py), `merge_unit_tasks` junction, `resolve_merge_unit_for_task`,
 `list_active_merge_units`. The first-class `empty` state is being introduced by plan
