@@ -4925,11 +4925,9 @@ def test_ensure_watch_main_checkout_detaches_existing_shared_default_branch_work
     assert isolated_git is workspace_git
     git_cls.assert_called_once_with(checkout_path)
     git._run.assert_not_called()
-    assert workspace_git._run.call_args_list == [
-        call("checkout", "--detach", "main"),
-        call("reset", "--hard", "main"),
-        call("clean", "-fd"),
-    ]
+    workspace_git.checkout_detached.assert_called_once_with("main")
+    workspace_git.reset_hard.assert_called_once_with("main")
+    workspace_git.clean_force.assert_called_once_with()
     workspace_git.current_branch.assert_called_once_with()
     workspace_git.has_changes.assert_called_once_with(include_untracked=True)
 

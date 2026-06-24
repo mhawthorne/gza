@@ -350,6 +350,18 @@ class TestBasicOperations:
 
             mock_run.assert_called_once_with("checkout", "feature-branch")
 
+    def test_checkout_detached(self, tmp_path: Path):
+        """Test checking out a detached HEAD."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            git.checkout_detached("main")
+
+            mock_run.assert_called_once_with("checkout", "--detach", "main")
+
     def test_pull_success(self, tmp_path: Path):
         """Test pull returns True on success."""
         repo_dir = tmp_path / "repo"
@@ -695,6 +707,38 @@ class TestWorktreeOperations:
             # Verify base branch was included
             calls = [str(call) for call in mock_run.call_args_list]
             assert any("main" in call for call in calls)
+            assert result == worktree_path
+
+    def test_worktree_add_existing(self, tmp_path: Path):
+        """Test creating a worktree from an existing ref."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        worktree_path = tmp_path / "worktrees" / "feature"
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            result = git.worktree_add_existing(worktree_path, "feature-branch")
+
+            mock_run.assert_called_once_with("worktree", "add", str(worktree_path), "feature-branch")
+            assert result == worktree_path
+
+    def test_worktree_add_existing_detached(self, tmp_path: Path):
+        """Test creating a detached worktree from an existing ref."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        worktree_path = tmp_path / "worktrees" / "feature"
+
+        with patch.object(git, '_run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            result = git.worktree_add_existing(worktree_path, "main", detach=True)
+
+            mock_run.assert_called_once_with("worktree", "add", "--detach", str(worktree_path), "main")
             assert result == worktree_path
 
     def test_worktree_add_removes_existing(self, tmp_path: Path):

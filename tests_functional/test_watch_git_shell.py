@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from gza.cli.watch import _run_cycle, _WatchLog
-from gza.cli.git_ops import _execute_merge_action
+from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
 from gza.config import Config
 from tests.cli.conftest import make_store, setup_config
 
@@ -41,6 +41,30 @@ def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) 
     refreshed_task = store.get(task.id)
     assert refreshed_task is not None
     assert refreshed_task.merge_status == "merged"
+
+
+@pytest.mark.functional
+def test_watch_checkout_mutation_refreshes_cached_head_reads(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    git = init_basic_repo(tmp_path)
+
+    git._run("checkout", "-b", "feature/watch-cache-refresh")
+    (tmp_path / "feature.txt").write_text("feature branch\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Feature commit")
+    feature_sha = git.rev_parse("HEAD")
+    git._run("checkout", "main")
+    main_sha = git.rev_parse("HEAD")
+
+    workspace_git = ensure_watch_main_checkout(config, git, "main")
+
+    with workspace_git.cached():
+        assert workspace_git.rev_parse_if_exists("HEAD") == main_sha
+        workspace_git.checkout_detached("feature/watch-cache-refresh")
+        assert workspace_git.rev_parse_if_exists("HEAD") == feature_sha
+        workspace_git.reset_hard("main")
+        assert workspace_git.rev_parse_if_exists("HEAD") == main_sha
 
 
 @pytest.mark.functional

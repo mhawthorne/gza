@@ -525,7 +525,7 @@ def _reconcile_diverged_branch_with_origin(
             if worktree_path.exists():
                 shutil.rmtree(worktree_path, ignore_errors=True)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", str(worktree_path), branch)
+        git.worktree_add_existing(worktree_path, branch)
         worktree_git = Git(worktree_path)
         baseline = capture_rebase_diff_baseline(
             worktree_git,
@@ -766,12 +766,12 @@ def ensure_watch_main_checkout(
 
     if entry is None:
         checkout_path.parent.mkdir(parents=True, exist_ok=True)
-        git._run("worktree", "add", "--detach", str(checkout_path), target_branch)
+        git.worktree_add_existing(checkout_path, target_branch, detach=True)
 
     workspace_git = Git(checkout_path)
-    workspace_git._run("checkout", "--detach", target_branch)
-    workspace_git._run("reset", "--hard", target_branch)
-    workspace_git._run("clean", "-fd")
+    workspace_git.checkout_detached(target_branch)
+    workspace_git.reset_hard(target_branch)
+    workspace_git.clean_force()
 
     current_branch = workspace_git.current_branch()
     if current_branch != "HEAD":
@@ -800,7 +800,7 @@ def cleanup_failed_merge_checkout(workspace_git: Git) -> None:
     except GitError:
         pass
     workspace_git.reset_hard_head()
-    workspace_git._run("clean", "-fd")
+    workspace_git.clean_force()
     if workspace_git.has_changes(include_untracked=True):
         raise GitError("merge checkout remains dirty after cleanup")
 

@@ -1852,8 +1852,6 @@ def test_ensure_watch_main_checkout_recreates_prunable_registration_without_prun
     def _run(*args, **kwargs):
         if args == ("rev-parse", "--git-common-dir"):
             return SimpleNamespace(stdout=str(common_dir), returncode=0, stderr="")
-        if args == ("worktree", "add", "--detach", str(checkout_path), "main"):
-            return SimpleNamespace(stdout="", returncode=0, stderr="")
         raise AssertionError(f"unexpected git._run call: {args!r}")
 
     git._run.side_effect = _run
@@ -1870,13 +1868,10 @@ def test_ensure_watch_main_checkout_recreates_prunable_registration_without_prun
     assert not managed_registration.exists()
     assert foreign_registration.exists()
     assert call("worktree", "prune", "--expire", "now", check=False) not in git._run.call_args_list
-    workspace_git._run.assert_has_calls(
-        [
-            call("checkout", "--detach", "main"),
-            call("reset", "--hard", "main"),
-            call("clean", "-fd"),
-        ]
-    )
+    git.worktree_add_existing.assert_called_once_with(checkout_path, "main", detach=True)
+    workspace_git.checkout_detached.assert_called_once_with("main")
+    workspace_git.reset_hard.assert_called_once_with("main")
+    workspace_git.clean_force.assert_called_once_with()
 
 
 def test_run_task_backed_rebase_reconciles_parent_merge_status_when_rebased_branch_is_already_in_target(

@@ -399,6 +399,11 @@ class Git:
         with self._mutation_scope():
             self._run("checkout", branch)
 
+    def checkout_detached(self, ref: str) -> None:
+        """Checkout a detached HEAD at ``ref``."""
+        with self._mutation_scope():
+            self._run("checkout", "--detach", ref)
+
     def pull(self) -> bool:
         """Pull latest changes. Returns True if successful."""
         with self._mutation_scope():
@@ -571,6 +576,17 @@ class Git:
                 # The branch is still created locally and the task can proceed
                 pass
 
+            return path
+
+    def worktree_add_existing(self, path: Path, ref: str, *, detach: bool = False) -> Path:
+        """Create a worktree attached to an existing ref or detached at that ref."""
+        with self._mutation_scope():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            args = ["worktree", "add"]
+            if detach:
+                args.append("--detach")
+            args.extend([str(path), ref])
+            self._run(*args)
             return path
 
     def worktree_remove(self, path: Path, force: bool = False) -> subprocess.CompletedProcess:
@@ -1327,6 +1343,11 @@ class Git:
         """Reset tracked files to the given ref, discarding local tracked changes."""
         with self._mutation_scope():
             self._run("reset", "--hard", ref)
+
+    def clean_force(self) -> None:
+        """Remove untracked files and directories."""
+        with self._mutation_scope():
+            self._run("clean", "-fd")
 
     def rebase(self, branch: str) -> None:
         """Rebase the current branch onto another branch.
