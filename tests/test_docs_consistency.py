@@ -203,6 +203,15 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
     workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
     lifecycle_flat = " ".join(lifecycle.split())
     workflow_flat = " ".join(workflow.split())
+    table_adjudication_row = (
+        "| Verdict = `CHANGES_REQUESTED` AND consecutive completed no-op improves for the latest "
+        "`(impl, review)` pair >= `max_noop_improve_cycles` AND the latest blocker set includes "
+        "an adjudication-eligible disputed non-verify CODE blocker |"
+    )
+    table_generic_noop_row = (
+        "| Consecutive completed no-op improves for the latest `(impl, review)` pair >= "
+        "`max_noop_improve_cycles` |"
+    )
 
     assert "adjudication marking a disputed blocker `INVALID` for lifecycle" in overview
     assert "blocker adjudication needed" in overview
@@ -220,6 +229,12 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
 
     assert "Every `BLOCKER` must be falsifiable." in workflow
     assert "structured `## Disputed Blockers` section" in workflow
+    assert table_adjudication_row in workflow
+    assert (
+        "`create_review_adjudication` / `run_review_adjudication` / "
+        "`wait_review_adjudication` before the generic no-op park"
+    ) in workflow
+    assert workflow.index(table_adjudication_row) < workflow.index(table_generic_noop_row)
     assert "required lifecycle contract is adjudication before the generic `improve-no-op`," in workflow
     assert "`duplicate-blocker-no-progress`, and `review-max-cycles` parks." in workflow
     assert "lifecycle consumes those persisted outcomes immediately" in workflow
