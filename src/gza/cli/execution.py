@@ -83,6 +83,7 @@ from ..recovery_engine import (
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
+from ..review_tasks import build_review_blocker_dispute_metadata
 from ..review_verdict import get_review_report
 from ..runner import RunInvocationContext, generate_slug, remove_task_startup_artifacts
 from ..status_ops import apply_manual_task_status
@@ -4155,7 +4156,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     iterate_task,
                     review_task,
                     candidate.finding,
-                    dispute_metadata=dict(getattr(candidate.dispute_artifact, "metadata", {}) or {}),
+                    dispute_metadata=build_review_blocker_dispute_metadata(
+                        candidate.dispute_artifact
+                    ),
                     trigger_source="auto-recovery",
                 )
                 prepared_task = _prepare_reserved_iterate_task(
@@ -5354,6 +5357,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 finding = getattr(candidate, "finding", None)
                 dispute_artifact = getattr(candidate, "dispute_artifact", None)
                 assert finding is not None
+                assert dispute_artifact is not None
                 permit_candidate = _reserve_iterate_launch()
                 if permit_candidate is False:
                     final_status = "blocked"
@@ -5364,7 +5368,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     impl_task,
                     maybe_review_task,
                     finding,
-                    dispute_metadata=dict(getattr(dispute_artifact, "metadata", {}) or {}),
+                    dispute_metadata=build_review_blocker_dispute_metadata(
+                        dispute_artifact
+                    ),
                     trigger_source="manual",
                 )
                 if isinstance(permit_candidate, LaunchPermit):

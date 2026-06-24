@@ -4,7 +4,7 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Literal
 
-from .db import SqliteTaskStore, Task
+from .db import SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
 from .prompts import PromptBuilder
 from .review_scope import resolve_review_scope_for_impl
@@ -32,6 +32,8 @@ _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE = re.compile(
     r"^Dispute source head SHA:\s*(\S+)\s*$",
     re.MULTILINE,
 )
+_DISPUTE_ARTIFACT_ID_RE = re.compile(r"^Dispute artifact id:\s*(\d+)\s*$", re.MULTILINE)
+_DISPUTE_SOURCE_TASK_ID_RE = re.compile(r"^Dispute source task:\s*(\S+)\s*$", re.MULTILINE)
 
 
 class DuplicateReviewError(ValueError):
@@ -230,6 +232,9 @@ def build_review_blocker_adjudication_prompt(
     current_state_citation = str(dispute_metadata.get("current_state_citation", "")).strip() or "not provided"
     source_task_id = str(dispute_metadata.get("source_task_id", "")).strip() or "unknown"
     source_head_sha = str(dispute_metadata.get("head_sha", "")).strip()
+    dispute_artifact_id = _normalize_dispute_artifact_id(
+        dispute_metadata.get("disputed_artifact_id")
+    )
     scope_citation = str(dispute_metadata.get("scope_citation", "")).strip()
     downstream_task_id = str(dispute_metadata.get("downstream_task_id", "")).strip()
     source_branch = str(dispute_metadata.get("source_branch", "")).strip()
@@ -250,6 +255,8 @@ def build_review_blocker_adjudication_prompt(
         f"Review task: {review_task_id}",
         f"Dispute source task: {source_task_id}",
     ]
+    if dispute_artifact_id is not None:
+        lines.append(f"Dispute artifact id: {dispute_artifact_id}")
     if source_branch:
         lines.append(f"Dispute source branch: {source_branch}")
     if source_head_sha:
@@ -351,16 +358,123 @@ def extract_review_blocker_adjudication_prompt_parts(prompt: str) -> tuple[str, 
         return None
     return match.group(1), match.group(2), match.group(3)
 
+def extract_review_blocker_adjudication_dispute_reference(
+    prompt: str,
+) -> tuple[int | None, str | None, str | None]:
+    """Return (artifact_id, source_task_id, head_sha) embedded in an adjudication prompt."""
+    artifact_id_match = _DISPUTE_ARTIFACT_ID_RE.search(prompt)
+    source_task_match = _REVIEW_BLOCKER_ADJUDICATION_SOURCE_TASK_RE.search(prompt)
+    head_sha_match = _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE.search(prompt)
+    artifact_id = int(artifact_id_match.group(1)) if artifact_id_match is not None else None
+    source_task_id = source_task_match.group(1) if source_task_match is not None else None
+    head_sha = head_sha_match.group(1) if head_sha_match is not None else None
+    return artifact_id, source_task_id, head_sha
+
 
 def extract_review_blocker_adjudication_dispute_identity(
     prompt: str,
 ) -> tuple[str | None, str | None]:
     """Return (source_task_id, head_sha) embedded in an adjudication prompt."""
-    source_task_match = _REVIEW_BLOCKER_ADJUDICATION_SOURCE_TASK_RE.search(prompt)
-    head_sha_match = _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE.search(prompt)
-    source_task_id = source_task_match.group(1) if source_task_match is not None else None
-    head_sha = head_sha_match.group(1) if head_sha_match is not None else None
+    _, source_task_id, head_sha = extract_review_blocker_adjudication_dispute_reference(prompt)
     return source_task_id, head_sha
+
+
+def _normalize_dispute_artifact_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+        return parsed if parsed > 0 else None
+    return None
+
+
+def build_review_blocker_dispute_metadata(dispute_artifact: TaskArtifact) -> dict[str, Any]:
+    """Return canonical dispute metadata with a stable reference to the artifact itself."""
+    metadata = dict(dispute_artifact.metadata or {})
+    metadata["disputed_artifact_id"] = dispute_artifact.id
+    source_task_id = metadata.get("source_task_id")
+    if isinstance(source_task_id, str) and source_task_id.strip():
+        metadata.setdefault("disputed_source_task_id", source_task_id)
+    return metadata
+
+
+def review_blocker_dispute_matches_current(
+    *,
+    current_dispute_artifact: TaskArtifact | None,
+    metadata: Mapping[str, Any] | None = None,
+    prompt: str | None = None,
+) -> bool:
+    """Return whether metadata/prompt references the exact current dispute evidence."""
+    if current_dispute_artifact is None:
+        return True
+
+    current_artifact_id = current_dispute_artifact.id
+    current_source_task_id = None
+    current_metadata = current_dispute_artifact.metadata or {}
+    source_task_id = current_metadata.get("source_task_id")
+    if isinstance(source_task_id, str) and source_task_id.strip():
+        current_source_task_id = source_task_id
+
+    candidate_artifact_id = None
+    candidate_source_task_id = None
+    if metadata is not None:
+        candidate_artifact_id = _normalize_dispute_artifact_id(
+            metadata.get("disputed_artifact_id")
+        )
+        disputed_source_task_id = metadata.get("disputed_source_task_id")
+        if isinstance(disputed_source_task_id, str) and disputed_source_task_id.strip():
+            candidate_source_task_id = disputed_source_task_id
+        else:
+            candidate_source_task_id = metadata.get("source_task_id")
+            if not isinstance(candidate_source_task_id, str) or not candidate_source_task_id.strip():
+                candidate_source_task_id = None
+
+    if candidate_artifact_id is None and prompt:
+        artifact_match = _DISPUTE_ARTIFACT_ID_RE.search(prompt)
+        if artifact_match is not None:
+            candidate_artifact_id = int(artifact_match.group(1))
+    if candidate_source_task_id is None and prompt:
+        source_match = _DISPUTE_SOURCE_TASK_ID_RE.search(prompt)
+        if source_match is not None:
+            candidate_source_task_id = source_match.group(1)
+
+    if candidate_artifact_id is not None:
+        return candidate_artifact_id == current_artifact_id
+    if candidate_source_task_id is not None and current_source_task_id is not None:
+        return candidate_source_task_id == current_source_task_id
+    return False
+
+
+def review_blocker_dispute_references_match(
+    dispute_metadata: Mapping[str, Any],
+    *,
+    prompt: str,
+) -> bool:
+    """Return whether prompt metadata references the same dispute as the current metadata."""
+    expected_artifact_id = _normalize_dispute_artifact_id(dispute_metadata.get("disputed_artifact_id"))
+    expected_source_task_id = dispute_metadata.get("disputed_source_task_id")
+    if not isinstance(expected_source_task_id, str) or not expected_source_task_id.strip():
+        expected_source_task_id = dispute_metadata.get("source_task_id")
+        if not isinstance(expected_source_task_id, str) or not expected_source_task_id.strip():
+            expected_source_task_id = None
+
+    prompt_artifact_id = None
+    artifact_match = _DISPUTE_ARTIFACT_ID_RE.search(prompt)
+    if artifact_match is not None:
+        prompt_artifact_id = int(artifact_match.group(1))
+
+    prompt_source_task_id = None
+    source_match = _DISPUTE_SOURCE_TASK_ID_RE.search(prompt)
+    if source_match is not None:
+        prompt_source_task_id = source_match.group(1)
+
+    if expected_artifact_id is not None:
+        return prompt_artifact_id == expected_artifact_id
+    if expected_source_task_id is not None:
+        return prompt_source_task_id == expected_source_task_id
+    return False
 
 
 def find_existing_followup_task(
@@ -405,9 +519,11 @@ def find_existing_review_blocker_adjudication_task(
     finding_id: str,
     dispute_source_task_id: str | None = None,
     dispute_head_sha: str | None = None,
+    dispute_metadata: Mapping[str, Any] | None = None,
 ) -> Task | None:
     """Return an existing adjudication task for (review, finding), if any."""
     prefix = build_review_blocker_adjudication_prompt_prefix(review_task_id, impl_task_id, finding_id)
+    matching: list[Task] = []
     for child in store.get_based_on_children(review_task_id):
         if child.task_type != "internal":
             continue
@@ -419,8 +535,35 @@ def find_existing_review_blocker_adjudication_task(
                 continue
             if dispute_head_sha is not None and prompt_head_sha != dispute_head_sha:
                 continue
+            matching.append(child)
+    if not matching:
+        return None
+    if dispute_metadata is None:
+        return matching[0]
+    for child in reversed(matching):
+        if _is_reusable_review_blocker_adjudication_task(
+            store,
+            child,
+            dispute_metadata=dispute_metadata,
+        ):
             return child
     return None
+
+
+def _is_reusable_review_blocker_adjudication_task(
+    store: SqliteTaskStore,
+    existing: Task,
+    *,
+    dispute_metadata: Mapping[str, Any],
+) -> bool:
+    """Return whether an existing adjudication task still applies to the current dispute."""
+
+    if existing.status in {"pending", "in_progress"}:
+        return review_blocker_dispute_references_match(dispute_metadata, prompt=existing.prompt)
+    if existing.status not in {"completed", "failed"}:
+        return False
+
+    return review_blocker_dispute_references_match(dispute_metadata, prompt=existing.prompt)
 
 
 def create_or_reuse_followup_task(
@@ -524,15 +667,12 @@ def create_or_reuse_review_blocker_adjudication_task(
     if impl_task.id is None:
         raise ValueError("Cannot create adjudication for implementation without an ID.")
 
-    dispute_source_task_id = str(dispute_metadata.get("source_task_id", "")).strip() or None
-    dispute_head_sha = str(dispute_metadata.get("head_sha", "")).strip() or None
     existing = find_existing_review_blocker_adjudication_task(
         store,
         review_task_id=review_task.id,
         impl_task_id=impl_task.id,
         finding_id=finding.id,
-        dispute_source_task_id=dispute_source_task_id,
-        dispute_head_sha=dispute_head_sha,
+        dispute_metadata=dispute_metadata,
     )
     if existing is not None:
         return existing, False

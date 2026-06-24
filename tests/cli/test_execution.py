@@ -8619,6 +8619,8 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
+        from gza.review_verdict import ReviewFinding
+        from gza.review_verdict import ReviewFinding
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -9336,6 +9338,7 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
+        from gza.review_verdict import ReviewFinding
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -13165,6 +13168,169 @@ class TestIterateCommand:
         assert "Needs attention:" in output
         assert "reason=review-blocker-adjudication-needed" in output
         assert "review-blocker-adjudication-needed" in output
+
+    def test_iterate_creates_review_adjudication_prompt_with_dispute_artifact_id(
+        self, tmp_path: Path
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+        from gza.review_verdict import ReviewFinding
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = (
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing API guard\n"
+            "Evidence: still open.\n"
+            "Open-state citation: `src/api.py:12-18`\n"
+            "Impact: crash.\n"
+            "Required fix: add guard.\n"
+            "Required tests: add test.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        improve = store.add(
+            "No-op improve with disputed blocker",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        improve.completed_at = datetime.now(UTC)
+        store.update(improve)
+        assert improve.id is not None
+
+        dispute_artifact = store.add_artifact(
+            review.id,
+            kind="review_blocker_resolution",
+            label="disputed-B1",
+            path=".gza/artifacts/disputed-b1.txt",
+            byte_size=0,
+            sha256="0" * 64,
+            status="disputed",
+            exit_status="already_satisfied",
+            metadata={
+                "schema_version": 1,
+                "state": "disputed",
+                "review_task_id": review.id,
+                "impl_task_id": impl.id,
+                "source_task_id": improve.id,
+                "source_task_type": "improve",
+                "source_branch": impl.branch,
+                "finding_id": "B1",
+                "reason": "already_satisfied",
+                "evidence": "Current code already guards empty IDs.",
+                "current_state_citation": "`src/api.py:12-18`",
+                "finding_fingerprint": {
+                    "title": "missing api guard",
+                    "anchor": "src/api.py:12-18",
+                },
+            },
+            created_at=improve.completed_at,
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+
+        def fake_run_foreground(_config, task_id, **kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli.resolve_closing_review_action", return_value=None),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                side_effect=[
+                    {
+                        "type": "create_review_adjudication",
+                        "description": "Create adjudication",
+                        "review_task": review,
+                        "review_blocker_adjudication_candidate": SimpleNamespace(
+                            finding=ReviewFinding(
+                                id="B1",
+                                severity="BLOCKER",
+                                title="Missing API guard",
+                                body="Evidence: still open",
+                                evidence="still open",
+                                impact="crash",
+                                fix_or_followup="add guard",
+                                tests="add test",
+                                open_state_citation="`src/api.py:12-18`",
+                            ),
+                            dispute_artifact=dispute_artifact,
+                        ),
+                    },
+                    {
+                        "type": "create_review_adjudication",
+                        "description": "Create adjudication",
+                        "review_task": review,
+                        "review_blocker_adjudication_candidate": SimpleNamespace(
+                            finding=ReviewFinding(
+                                id="B1",
+                                severity="BLOCKER",
+                                title="Missing API guard",
+                                body="Evidence: still open",
+                                evidence="still open",
+                                impact="crash",
+                                fix_or_followup="add guard",
+                                tests="add test",
+                                open_state_citation="`src/api.py:12-18`",
+                            ),
+                            dispute_artifact=dispute_artifact,
+                        ),
+                    },
+                    {"type": "needs_discussion", "description": "stop"},
+                ],
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 3
+        adjudications = [task for task in store.get_all() if task.task_type == "internal"]
+        assert len(adjudications) == 1
+        assert f"Dispute artifact id: {dispute_artifact.id}" in adjudications[0].prompt
 
     def test_iterate_failed_improve_attention_uses_shortened_single_line_prompt(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

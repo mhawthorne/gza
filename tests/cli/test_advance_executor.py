@@ -227,6 +227,24 @@ def test_create_review_adjudication_spawns_internal_worker(tmp_path: Path) -> No
     store.update(review)
 
     spawned: list[tuple[str, str]] = []
+    captured_dispute_metadata: dict[str, Any] | None = None
+
+    def _create_review_adjudication(
+        impl_task: DbTask,
+        review_task: DbTask,
+        finding: ReviewFinding,
+        dispute_metadata: dict[str, Any],
+    ) -> DbTask:
+        nonlocal captured_dispute_metadata
+        captured_dispute_metadata = dict(dispute_metadata)
+        return store.add(
+            f"Adjudicate {finding.id}",
+            task_type="internal",
+            based_on=review_task.id,
+            depends_on=impl_task.id,
+            same_branch=True,
+        )
+
     context = AdvanceActionExecutionContext(
         store=store,
         trigger_source="manual",
@@ -239,13 +257,7 @@ def test_create_review_adjudication_spawns_internal_worker(tmp_path: Path) -> No
         create_resume_task=lambda _task: pytest.fail("create_resume should not run"),
         create_rebase_task=lambda _task: pytest.fail("create_rebase should not run"),
         create_implement_task=lambda _task: pytest.fail("create_implement should not run"),
-        create_review_adjudication_task=lambda impl_task, review_task, finding, dispute_metadata: store.add(
-            f"Adjudicate {finding.id}",
-            task_type="internal",
-            based_on=review_task.id,
-            depends_on=impl_task.id,
-            same_branch=True,
-        ),
+        create_review_adjudication_task=_create_review_adjudication,
         spawn_worker=lambda task, kind: spawned.append((task.id or "", kind)) or 0,
         spawn_resume_worker=lambda _task, _kind: pytest.fail("spawn_resume should not run"),
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("spawn_iterate should not run"),
@@ -269,7 +281,10 @@ def test_create_review_adjudication_spawns_internal_worker(tmp_path: Path) -> No
                     tests="add test",
                     open_state_citation="`src/api.py:12-18`",
                 ),
-                dispute_artifact=SimpleNamespace(metadata={"reason": "already_satisfied"}),
+                dispute_artifact=SimpleNamespace(
+                    id=47,
+                    metadata={"reason": "already_satisfied"},
+                ),
             ),
         },
         context=context,
@@ -278,6 +293,8 @@ def test_create_review_adjudication_spawns_internal_worker(tmp_path: Path) -> No
     assert result.status == "success"
     assert result.created_task is not None
     assert result.created_task.task_type == "internal"
+    assert captured_dispute_metadata is not None
+    assert captured_dispute_metadata["disputed_artifact_id"] == 47
     assert spawned == [(result.created_task.id or "", "review_adjudication")]
 
 

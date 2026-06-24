@@ -46,7 +46,11 @@ from gza.recovery_engine import (
 )
 from gza.recovery_read_context import RecoveryReadContext
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
-from gza.review_tasks import find_existing_review_blocker_adjudication_task
+from gza.review_tasks import (
+    build_review_blocker_dispute_metadata,
+    find_existing_review_blocker_adjudication_task,
+    review_blocker_dispute_matches_current,
+)
 from gza.review_verdict import (
     ParsedReviewReport,
     ReviewBlockerSummary,
@@ -957,6 +961,11 @@ def _latest_review_blocker_resolution_statuses(
                     raw_state = metadata.get("state")
                     if raw_state not in {"invalid", "valid", "needs_human"}:
                         continue
+                    if not review_blocker_dispute_matches_current(
+                        current_dispute_artifact=latest_dispute,
+                        metadata=metadata,
+                    ):
+                        continue
                     if metadata.get("dispute_source_task_id") != dispute_source_task_id:
                         continue
                     if dispute_head_sha != artifact.head_sha:
@@ -991,18 +1000,15 @@ def _resolve_review_blocker_adjudication_task(
 ) -> DbTask | None:
     if review_task is None or review_task.id is None or impl_task.id is None or candidate is None:
         return None
-    dispute_metadata = candidate.dispute_artifact.metadata or {}
-    dispute_source_task_id = (
-        str(dispute_metadata.get("source_task_id", "")).strip() or None
-    )
-    dispute_head_sha = str(dispute_metadata.get("head_sha", "")).strip() or None
+    dispute_metadata = build_review_blocker_dispute_metadata(candidate.dispute_artifact)
     return find_existing_review_blocker_adjudication_task(
         store,
         review_task_id=review_task.id,
         impl_task_id=impl_task.id,
         finding_id=candidate.finding.id,
-        dispute_source_task_id=dispute_source_task_id,
-        dispute_head_sha=dispute_head_sha,
+        dispute_source_task_id=None,
+        dispute_head_sha=None,
+        dispute_metadata=dispute_metadata,
     )
 
 
@@ -3738,7 +3744,6 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="review_wait_blocker_adjudication",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.review_blocker_adjudication_candidate is not None
         and ctx.active_review_blocker_adjudication is not None
         and ctx.active_review_blocker_adjudication.status == "in_progress",
         action=lambda ctx: {
@@ -3753,7 +3758,6 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="review_run_pending_blocker_adjudication",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.review_blocker_adjudication_candidate is not None
         and ctx.active_review_blocker_adjudication is not None
         and ctx.active_review_blocker_adjudication.status == "pending",
         action=lambda ctx: {
@@ -3802,14 +3806,16 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="review_duplicate_blocker_no_progress",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.duplicate_blocker_streak is not None,
+        and ctx.duplicate_blocker_streak is not None
+        and not ctx.review_blockers_revalidated,
         action=_duplicate_blocker_needs_attention_action,
     ),
     AdvanceRule(
         name="review_max_cycles",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
-        and ctx.completed_review_cycles >= ctx.max_review_cycles,
+        and ctx.completed_review_cycles >= ctx.max_review_cycles
+        and not ctx.review_blockers_revalidated,
         action=lambda ctx: with_needs_attention(
             {
                 "type": "max_cycles_reached",

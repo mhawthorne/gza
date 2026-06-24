@@ -1,5 +1,6 @@
 """Tests for review_tasks helpers."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ from gza.review_tasks import (
     build_followup_prompt,
     build_followup_prompt_prefix,
     build_review_blocker_adjudication_prompt,
+    build_review_blocker_adjudication_prompt_prefix,
     build_auto_review_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
@@ -20,6 +22,7 @@ from gza.review_tasks import (
     create_review_task,
     extract_deferred_blocker_prompt_parts,
     extract_followup_prompt_parts,
+    extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_dispute_identity,
     find_existing_deferred_blocker_task,
     find_existing_followup_task,
@@ -752,6 +755,61 @@ class TestFollowupTasks:
 
         assert found is None
 
+    def test_find_existing_review_blocker_adjudication_task_rejects_same_source_when_artifact_id_is_stale(self):
+        store = MagicMock()
+        existing = _task(
+            id="gza-601",
+            task_type="internal",
+            prompt=(
+                "Adjudicate blocker B1 from review gza-200 for task gza-101: Missing guard\n\n"
+                "Dispute source task: gza-301\n"
+                "Dispute artifact id: 11\n"
+                "Dispute source head SHA: same-sha\n"
+            ),
+        )
+        store.get_based_on_children.return_value = [existing]
+
+        found = find_existing_review_blocker_adjudication_task(
+            store,
+            review_task_id="gza-200",
+            impl_task_id="gza-101",
+            finding_id="B1",
+            dispute_metadata={
+                "source_task_id": "gza-301",
+                "head_sha": "same-sha",
+                "disputed_artifact_id": 12,
+            },
+        )
+
+        assert found is None
+
+    def test_find_existing_review_blocker_adjudication_task_rejects_source_only_prompt_when_current_dispute_has_artifact_id(self):
+        store = MagicMock()
+        existing = _task(
+            id="gza-601",
+            task_type="internal",
+            prompt=(
+                "Adjudicate blocker B1 from review gza-200 for task gza-101: Missing guard\n\n"
+                "Dispute source task: gza-301\n"
+                "Dispute source head SHA: same-sha\n"
+            ),
+        )
+        store.get_based_on_children.return_value = [existing]
+
+        found = find_existing_review_blocker_adjudication_task(
+            store,
+            review_task_id="gza-200",
+            impl_task_id="gza-101",
+            finding_id="B1",
+            dispute_metadata={
+                "source_task_id": "gza-301",
+                "head_sha": "same-sha",
+                "disputed_artifact_id": 12,
+            },
+        )
+
+        assert found is None
+
     def test_create_or_reuse_review_blocker_adjudication_task_does_not_reuse_stale_dispute(self):
         store = MagicMock()
         review_task = _task(id="gza-200", task_type="review")
@@ -819,6 +877,7 @@ class TestFollowupTasks:
             finding,
             {
                 "source_task_id": "gza-301",
+                "disputed_artifact_id": 11,
                 "source_branch": "feature/dispute",
                 "head_sha": "abc123",
                 "reason": "already_satisfied",
@@ -827,6 +886,7 @@ class TestFollowupTasks:
             },
         )
 
+        assert extract_review_blocker_adjudication_dispute_reference(prompt) == (11, "gza-301", "abc123")
         assert extract_review_blocker_adjudication_dispute_identity(prompt) == ("gza-301", "abc123")
 
     def test_deferred_blocker_task_does_not_collide_with_followup_marker(self):
@@ -866,3 +926,107 @@ class TestFollowupTasks:
         assert store.add.call_args.kwargs["prompt"].startswith(
             build_deferred_blocker_prompt_prefix("gza-200", "gza-101", "F1")
         )
+
+
+class TestCreateOrReuseReviewBlockerAdjudicationTask:
+    def test_dispute_aware_lookup_prefers_newer_reusable_match(self):
+        store = MagicMock()
+        stale = _task(
+            id="gza-501",
+            task_type="internal",
+            prompt=(
+                f"{build_review_blocker_adjudication_prompt_prefix('gza-200', 'gza-101', 'B1')} "
+                "Missing API guard\n\n"
+                "Dispute source task: gza-400"
+            ),
+            status="completed",
+            completed_at=datetime(2026, 5, 14, 12, 0, tzinfo=UTC),
+        )
+        replacement = _task(
+            id="gza-502",
+            task_type="internal",
+            prompt=(
+                f"{build_review_blocker_adjudication_prompt_prefix('gza-200', 'gza-101', 'B1')} "
+                "Missing API guard\n\n"
+                "Dispute source task: gza-401"
+            ),
+            status="pending",
+        )
+        dispute_source = _task(
+            id="gza-401",
+            task_type="improve",
+            status="completed",
+            completed_at=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        )
+        store.get_based_on_children.return_value = [stale, replacement]
+        store.get.side_effect = lambda task_id: dispute_source if task_id == "gza-401" else None
+
+        existing = find_existing_review_blocker_adjudication_task(
+            store,
+            review_task_id="gza-200",
+            impl_task_id="gza-101",
+            finding_id="B1",
+            dispute_metadata={
+                "source_task_id": "gza-401",
+                "reason": "unreproducible",
+                "evidence": "The current branch already rejects empty IDs.",
+                "current_state_citation": "src/api.py:12-18",
+            },
+        )
+
+        assert existing is replacement
+
+    def test_completed_stale_adjudication_is_not_reused_for_newer_dispute(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("202606-recovery",))
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing API guard",
+            body="Canonical blocker context.",
+            evidence="The current code still accepts empty IDs.",
+            impact="Invalid requests can crash the handler.",
+            fix_or_followup="Reject empty IDs before calling the service.",
+            tests="Add a regression for empty IDs.",
+            open_state_citation="src/api.py:12-18",
+        )
+        existing = _task(
+            id="gza-501",
+            task_type="internal",
+            prompt=(
+                f"{build_review_blocker_adjudication_prompt_prefix('gza-200', 'gza-101', 'B1')} "
+                "Missing API guard\n\n"
+                "Dispute source task: gza-400"
+            ),
+            status="completed",
+            completed_at=datetime(2026, 5, 14, 12, 0, tzinfo=UTC),
+        )
+        dispute_source = _task(
+            id="gza-401",
+            task_type="improve",
+            status="completed",
+            completed_at=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        )
+        created_task = _task(id="gza-502", task_type="internal")
+        store.get_based_on_children.return_value = [existing]
+        store.get.side_effect = lambda task_id: dispute_source if task_id == "gza-401" else None
+        store.add.return_value = created_task
+
+        created, created_now = create_or_reuse_review_blocker_adjudication_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            dispute_metadata={
+                "source_task_id": "gza-401",
+                "reason": "unreproducible",
+                "evidence": "The current branch already rejects empty IDs.",
+                "current_state_citation": "src/api.py:12-18",
+            },
+            trigger_source="manual",
+        )
+
+        assert created is created_task
+        assert created_now is True
+        store.add.assert_called_once()

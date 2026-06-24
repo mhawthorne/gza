@@ -122,7 +122,7 @@ from .review_tasks import (
     DuplicateReviewError,
     create_review_task,
     extract_followup_prompt_parts,
-    extract_review_blocker_adjudication_dispute_identity,
+    extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_prompt_parts,
 )
 from .review_verdict import (
@@ -2736,6 +2736,7 @@ def _format_review_blocker_resolution_artifact_output(
     finding_fingerprint: tuple[str, str],
     source_branch: str | None,
     head_sha: str | None,
+    disputed_artifact_id: int | None,
 ) -> str:
     lines = [
         "## Review Blocker Resolution",
@@ -2748,6 +2749,8 @@ def _format_review_blocker_resolution_artifact_output(
         f"Finding fingerprint title: {finding_fingerprint[0]}",
         f"Finding fingerprint anchor: {finding_fingerprint[1]}",
     ]
+    if disputed_artifact_id is not None:
+        lines.append(f"Disputed artifact id: {disputed_artifact_id}")
     if source_branch:
         lines.append(f"Source branch: {source_branch}")
     if head_sha:
@@ -2785,6 +2788,7 @@ def _persist_review_blocker_resolution_artifact(
     created_at: datetime | None = None,
     source_branch: str | None = None,
     dispute_source_task_id: str | None = None,
+    disputed_artifact: TaskArtifact | None = None,
 ) -> bool:
     if review_task.id is None or impl_task.id is None or source_task.id is None:
         return False
@@ -2819,6 +2823,15 @@ def _persist_review_blocker_resolution_artifact(
         metadata["downstream_task_id"] = downstream_task_id
     if dispute_source_task_id is not None:
         metadata["dispute_source_task_id"] = dispute_source_task_id
+    if disputed_artifact is not None:
+        metadata["disputed_artifact_id"] = disputed_artifact.id
+        disputed_source = (
+            disputed_artifact.metadata.get("source_task_id")
+            if disputed_artifact.metadata is not None
+            else None
+        )
+        if isinstance(disputed_source, str) and disputed_source.strip():
+            metadata["disputed_source_task_id"] = disputed_source
 
     artifact_key = _review_blocker_resolution_artifact_key(metadata)
     existing_artifact_keys = {
@@ -2843,6 +2856,7 @@ def _persist_review_blocker_resolution_artifact(
         finding_fingerprint=finding_fingerprint,
         source_branch=resolved_source_branch,
         head_sha=head_sha,
+        disputed_artifact_id=disputed_artifact.id if disputed_artifact is not None else None,
     )
     store_command_output_artifact(
         store,
@@ -2880,12 +2894,11 @@ def _find_latest_review_blocker_resolution_artifact(
     state: str,
     finding_id: str,
     finding_fingerprint: tuple[str, str],
+    disputed_artifact_id: int | None = None,
     source_task_id: str | None = None,
     head_sha: str | None = None,
 ) -> TaskArtifact | None:
-    for artifact in reversed(
-        store.list_artifacts(review_task_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
-    ):
+    for artifact in store.list_artifacts(review_task_id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND):
         metadata = artifact.metadata or {}
         if metadata.get("state") != state:
             continue
@@ -2894,6 +2907,8 @@ def _find_latest_review_blocker_resolution_artifact(
         if metadata.get("finding_id") != finding_id:
             continue
         if _resolution_fingerprint_tuple(metadata) != finding_fingerprint:
+            continue
+        if disputed_artifact_id is not None and artifact.id != disputed_artifact_id:
             continue
         if source_task_id is not None and metadata.get("source_task_id") != source_task_id:
             continue
@@ -2969,9 +2984,13 @@ def _persist_review_blocker_adjudication_for_completed_task(
         return
 
     finding_id, review_task_id, impl_task_id = prompt_parts
-    dispute_source_task_id, dispute_head_sha = extract_review_blocker_adjudication_dispute_identity(
-        completed_task.prompt
+    disputed_artifact_id, dispute_source_task_id, dispute_head_sha = (
+        extract_review_blocker_adjudication_dispute_reference(
+            completed_task.prompt
+        )
     )
+    if disputed_artifact_id is None:
+        return
     review_task = store.get(review_task_id)
     impl_task = store.get(impl_task_id)
     if review_task is None or impl_task is None:
@@ -3011,6 +3030,7 @@ def _persist_review_blocker_adjudication_for_completed_task(
         state="disputed",
         finding_id=finding.id,
         finding_fingerprint=finding_fingerprint,
+        disputed_artifact_id=disputed_artifact_id,
         source_task_id=dispute_source_task_id,
         head_sha=dispute_head_sha,
     )
@@ -3036,6 +3056,7 @@ def _persist_review_blocker_adjudication_for_completed_task(
         created_at=completed_task.completed_at,
         source_branch=cast(str | None, dispute_metadata.get("source_branch")),
         dispute_source_task_id=cast(str | None, dispute_metadata.get("source_task_id")),
+        disputed_artifact=dispute_artifact,
     )
 
 

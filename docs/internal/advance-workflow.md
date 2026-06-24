@@ -187,7 +187,7 @@ table alone:
   plumbing now creates/runs one dedicated adjudication worker and persists its strict
   `VALID | INVALID | NEEDS_HUMAN` outcome as a `review_blocker_resolution` artifact,
   and lifecycle consumes those persisted outcomes immediately: `INVALID` clears only
-  the matching disputed CODE blocker, `VALID` re-opens the normal improve lane, and
+  the exact disputed artifact named in the adjudication prompt, `VALID` re-opens the normal improve lane, and
   `NEEDS_HUMAN` parks with `review-blocker-adjudication-needed`. Verify-only blockers
   remain governed by runner-owned same-branch, same-head verify provenance.
 

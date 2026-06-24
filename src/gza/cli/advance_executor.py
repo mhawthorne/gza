@@ -16,6 +16,7 @@ from ..concurrency import (
 from ..db import SqliteTaskStore, Task as DbTask
 from ..plan_review_verdict import PlanReviewManifest
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
+from ..review_tasks import build_review_blocker_dispute_metadata
 from ._common import (
     PlanReviewMaterializationResult,
     _create_improve_task,
@@ -862,7 +863,7 @@ def execute_advance_action(
                 message="review adjudication creation is unavailable",
             )
 
-        dispute_metadata = dict(getattr(candidate.dispute_artifact, "metadata", {}) or {})
+        dispute_metadata = build_review_blocker_dispute_metadata(candidate.dispute_artifact)
         adjudication_task = context.create_review_adjudication_task(
             task,
             review_task,
