@@ -530,6 +530,42 @@ def _mixed_review_report() -> str:
     )
 
 
+def _verify_failure_only_review_report() -> str:
+    return (
+        "## Summary\n\n- Implementation matches the requested shape; verify failed at the current tip.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: failed root resume attention regression\n"
+        "Evidence: `tests/cli/test_execution.py::test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention` failed at the current branch head.\n"
+        "Impact: autonomous verify failed even though the review found no code defect.\n"
+        "Required fix: rerun verify_command at the same head and keep only durable runner-owned verify evidence.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
+def _verify_failure_plus_code_blocker_review_report() -> str:
+    return (
+        "## Summary\n\n- verify_command failed, and the review still sees a product-code defect.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: failed root resume attention regression\n"
+        "Evidence: `tests/cli/test_execution.py::test_failed_root_resume_with_existing_failed_resume_child_auto_iterate_uses_shared_attention` failed at the current branch head.\n"
+        "Impact: autonomous verify failed.\n"
+        "Required fix: rerun verify_command at the same head.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "### B2 Missing stale-review guard\n"
+        "Evidence: `src/gza/advance_engine.py:1994` still allows the stale path to surface.\n"
+        "Open-state citation: `src/gza/advance_engine.py:1994`\n"
+        "Impact: the merge path can still park or merge from the wrong state.\n"
+        "Required fix: guard the stale branch before merge.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+
+
 def _structured_code_blocker_with_timeout_evidence_review_report() -> str:
     return (
         "## Summary\n\n- Validation missing and verify rerun timed out.\n\n"
@@ -3393,6 +3429,211 @@ def test_verify_only_noop_improve_with_persisted_green_verify_evidence_becomes_m
     assert ctx.review_cleared is True
     assert action["type"] == "merge"
     assert "improve-no-op" not in action["description"]
+
+
+def test_verify_failure_only_noop_improve_with_same_head_green_evidence_merges(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-5501-verify-failure-clear",
+        when=datetime(2026, 6, 23, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 23, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_cleared is True
+    assert action["type"] == "merge"
+    assert action["type"] != "needs_discussion"
+    assert action["description"].startswith("Merge")
+    assert "improve-no-op" not in action["description"]
+
+
+@pytest.mark.parametrize(
+    ("label", "review_status", "review_branch", "review_head_sha", "review_report", "improve_status", "improve_branch", "improve_head_sha", "captured_offset_seconds"),
+    [
+        (
+            "missing_passing_improve_evidence",
+            "failed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            _verify_failure_only_review_report(),
+            None,
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            None,
+        ),
+        (
+            "mixed_code_blocker",
+            "failed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            _verify_failure_plus_code_blocker_review_report(),
+            "passed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            30,
+        ),
+        (
+            "review_branch_mismatch",
+            "failed",
+            "feat/other-branch",
+            "same-head-sha",
+            _verify_failure_only_review_report(),
+            "passed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            30,
+        ),
+        (
+            "review_head_mismatch",
+            "failed",
+            "feat/gza-5501-negative",
+            "stale-head-sha",
+            _verify_failure_only_review_report(),
+            "passed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            30,
+        ),
+        (
+            "improve_captured_before_review_completed",
+            "failed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            _verify_failure_only_review_report(),
+            "passed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            -30,
+        ),
+        (
+            "improve_branch_mismatch",
+            "failed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            _verify_failure_only_review_report(),
+            "passed",
+            "feat/other-branch",
+            "same-head-sha",
+            30,
+        ),
+        (
+            "improve_head_mismatch",
+            "failed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            _verify_failure_only_review_report(),
+            "passed",
+            "feat/gza-5501-negative",
+            "other-head-sha",
+            30,
+        ),
+        (
+            "review_verify_was_passed",
+            "passed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            _verify_failure_only_review_report(),
+            "passed",
+            "feat/gza-5501-negative",
+            "same-head-sha",
+            30,
+        ),
+    ],
+)
+def test_verify_failure_only_noop_improve_mismatches_do_not_auto_clear(
+    tmp_path: Path,
+    label: str,
+    review_status: str,
+    review_branch: str,
+    review_head_sha: str,
+    review_report: str,
+    improve_status: str | None,
+    improve_branch: str,
+    improve_head_sha: str,
+    captured_offset_seconds: int | None,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/ -q"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-5501-negative",
+        when=datetime(2026, 6, 23, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add(f"Review {label}", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+    review.output_content = review_report
+    review.review_verify_status = review_status
+    review.review_verify_branch = review_branch
+    review.review_verify_head_sha = review_head_sha
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 23, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    if improve_status is not None:
+        improve.review_verify_status = improve_status
+        improve.review_verify_branch = improve_branch
+        improve.review_verify_head_sha = improve_head_sha
+        assert captured_offset_seconds is not None
+        improve.review_verify_captured_at = review.completed_at + timedelta(seconds=captured_offset_seconds)
+        store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_cleared is False, label
+    assert action["type"] == "needs_discussion", label
+    assert action["needs_attention_reason"] == "improve-no-op", label
 
 
 def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tmp_path: Path) -> None:
