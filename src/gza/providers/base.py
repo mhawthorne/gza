@@ -18,6 +18,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
+
 if TYPE_CHECKING:
     from ..config import Config
 
@@ -112,7 +114,7 @@ class DockerConfig:
     cli_command: str
     config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
-    docker_startup_timeout: int = 60
+    docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT
 
 
 def classify_provider_api_error(*, status: int | None, error_type: str | None, message: str | None) -> str | None:

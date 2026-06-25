@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from rich.markup import escape as rich_escape
 
+from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
 from .base import (
     DockerConfig,
     PreflightCheckResult,
@@ -677,7 +678,11 @@ def sync_keychain_credentials() -> bool:
     return True
 
 
-def _get_docker_config(image_name: str, *, docker_startup_timeout: int = 60) -> DockerConfig:
+def _get_docker_config(
+    image_name: str,
+    *,
+    docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT,
+) -> DockerConfig:
     """Get Docker configuration for Claude."""
     return DockerConfig(
         image_name=image_name,

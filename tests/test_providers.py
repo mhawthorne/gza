@@ -13,7 +13,7 @@ import pytest
 from rich.console import Console
 
 from gza.colors import TaskStreamColors, build_rich_theme
-from gza.config import ClaudeConfig, Config, ConfigError
+from gza.config import ClaudeConfig, Config, ConfigError, DEFAULT_DOCKER_STARTUP_TIMEOUT
 from gza.providers import (
     ClaudeProvider,
     CodexProvider,
@@ -213,6 +213,18 @@ def test_looks_like_docker_crash_preserves_timeout_exit_code(tmp_path: Path) -> 
 class TestDockerConfig:
     """Tests for Docker configuration."""
 
+    def test_base_docker_config_uses_shared_startup_timeout_default(self, tmp_path):
+        """DockerConfig should default to the shared config startup timeout."""
+        config = DockerConfig(
+            image_name="my-project-gza",
+            npm_package="@anthropic-ai/claude-code",
+            cli_command="claude",
+            config_dir=".claude",
+            env_vars=["ANTHROPIC_API_KEY"],
+        )
+
+        assert config.docker_startup_timeout == DEFAULT_DOCKER_STARTUP_TIMEOUT
+
     def test_claude_docker_config(self, tmp_path):
         """Claude should have correct Docker config."""
         from gza.providers.claude import _get_docker_config
@@ -224,7 +236,7 @@ class TestDockerConfig:
         assert config.cli_command == "claude"
         assert config.config_dir == ".claude"
         assert "ANTHROPIC_API_KEY" in config.env_vars
-        assert config.docker_startup_timeout == 60
+        assert config.docker_startup_timeout == DEFAULT_DOCKER_STARTUP_TIMEOUT
 
     def test_gemini_docker_config(self, tmp_path):
         """Gemini should have correct Docker config."""
@@ -239,7 +251,7 @@ class TestDockerConfig:
         assert "GEMINI_API_KEY" in config.env_vars
         assert "GOOGLE_API_KEY" in config.env_vars
         assert "GOOGLE_APPLICATION_CREDENTIALS" in config.env_vars
-        assert config.docker_startup_timeout == 60
+        assert config.docker_startup_timeout == DEFAULT_DOCKER_STARTUP_TIMEOUT
 
     def test_claude_provider_uses_per_provider_image_tag(self, tmp_path):
         """ClaudeProvider should append '-claude' to docker_image for its image tag."""
@@ -4058,6 +4070,7 @@ class TestCodexProvider:
                 # API key wins: no .codex mount, env var passed instead
                 assert config.config_dir is None
                 assert "CODEX_API_KEY" in config.env_vars
+                assert config.docker_startup_timeout == DEFAULT_DOCKER_STARTUP_TIMEOUT
 
     def test_codex_docker_config_with_oauth_fallback(self):
         """OAuth should be used when no API key is configured."""

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.markup import escape as rich_escape
 
+from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
 from .base import (
     DockerConfig,
     PreflightCheckResult,
@@ -665,7 +666,11 @@ def _has_api_key() -> bool:
     return bool(os.getenv("CODEX_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
 
-def _get_docker_config(image_name: str, *, docker_startup_timeout: int = 60) -> DockerConfig:
+def _get_docker_config(
+    image_name: str,
+    *,
+    docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT,
+) -> DockerConfig:
     """Get Docker configuration for Codex.
 
     Auth priority: API key (CODEX_API_KEY / OPENAI_API_KEY) takes precedence

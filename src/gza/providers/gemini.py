@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.markup import escape as rich_escape
 
+from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
 from .base import (
     DockerConfig,
     PreflightCheckResult,
@@ -247,7 +248,11 @@ class GeminiLogRenderer:
         return RenderedLines(log_lines=lines)
 
 
-def _get_docker_config(image_name: str, *, docker_startup_timeout: int = 60) -> DockerConfig:
+def _get_docker_config(
+    image_name: str,
+    *,
+    docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT,
+) -> DockerConfig:
     """Get Docker configuration for Gemini."""
     return DockerConfig(
         image_name=image_name,
