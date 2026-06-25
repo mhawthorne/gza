@@ -626,6 +626,8 @@ gza work [task_id...] [options]
 
 `uv run gza work` starts pending tasks only. It does not run failed-task recovery (`resume` / `retry` / manual-review parking) and it does not progress review/rebase/merge lifecycle work for already-started lineages. If recovery candidates exist, `work` leaves them untouched and starts from the pending lane anyway.
 
+When `uv run gza work --background` starts a detached worker that then exits before the task actually begins running, the startup refusal is mirrored into the task log path (or startup fallback) so `uv run gza log <task-id>` surfaces the reason instead of leaving a silent 0-byte log.
+
 ### work / advance / watch operating surface
 
 Use this matrix when deciding "what will this command actually touch?"
@@ -1825,6 +1827,8 @@ When a human runs `uv run gza iterate` against a failed implementation or failed
 Before `--background` detaches, iterate now also evaluates the current lifecycle decision for completed implementations. If the decision is a true no-worker outcome (for example already merged, no remaining commits to land, plain `merge` readiness, max review cycles reached, waiting on existing work, or another shared skip/needs-attention outcome), iterate prints that decision synchronously to the caller and exits without creating a worker row. `merge_with_followups` is not treated as a no-op here: background iterate still detaches into the normal iterate worker so the shared follow-up task materialization path runs before the implementation becomes merge-ready.
 
 If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant instead of leaving the capped failed row as the active unit of work. The older failed row remains in task history, but shared lineage/lifecycle surfaces treat it as recovered: owner-row listings continue from the descendant, and `uv run gza show` on the older failed row renders `Lifecycle: recovered, ...` based on the descendant's next action or terminal state.
+
+Detached `uv run gza iterate --background` runs follow the same observability rule: if the background worker stops during startup or another no-run preflight path, the task log path and `uv run gza log <impl-task-id>` now retain the refusal reason rather than silently exiting.
 
 When iterate stops with `max_cycles_reached`, it now prints review-iteration accounting with:
 - task `completed` review-iteration count

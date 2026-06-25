@@ -99,6 +99,7 @@ from .lifecycle_completion import (
 from .lineage import get_plan_for_task
 from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
 from .merge_state import resolve_task_merge_state_for_target
+from .operator_state import blocked_dependency_error_message
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
 from .project_discovery import (
     RepoProjectConfig,
@@ -6366,10 +6367,7 @@ def run(
                     refreshed = store.get(task.id)
                     status = refreshed.status if refreshed else "unknown"
                     if claim is not None and claim.refusal_reason == "blocked":
-                        error_message(
-                            f"Error: Task {task_id} is blocked by task "
-                            f"{claim.blocking_task_id} ({claim.blocking_task_status})"
-                        )
+                        error_message(f"Error: {blocked_dependency_error_message(store, task)}")
                         return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
@@ -6396,7 +6394,8 @@ def run(
                 and get_unmerged_dependency_precondition(store, task) is not None
             )
             if is_blocked and not merge_precondition_blocked:
-                error_message(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
+                del blocking_id, blocking_status
+                error_message(f"Error: {blocked_dependency_error_message(store, task)}")
                 return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
             requested_create_pr = bool(create_pr or task.create_pr)
             allow_pr_retry = (
@@ -6438,10 +6437,7 @@ def run(
                         refreshed = store.get(task.id)
                         status = refreshed.status if refreshed else "unknown"
                         if claim is not None and claim.refusal_reason == "blocked":
-                            error_message(
-                                f"Error: Task {task_id} is blocked by task "
-                                f"{claim.blocking_task_id} ({claim.blocking_task_status})"
-                            )
+                            error_message(f"Error: {blocked_dependency_error_message(store, task)}")
                             return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                         error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                         return 1

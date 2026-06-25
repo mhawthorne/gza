@@ -68,6 +68,7 @@ from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
+from ..operator_state import blocked_dependency_error_message
 from ..plan_review_verdict import get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
 from ..query import (
@@ -112,6 +113,7 @@ from ._common import (
     _plan_review_timeout_budget_minutes,
     _prepare_task_for_immediate_execution,
     _prepare_task_for_reserved_launch,
+    _record_preclaim_startup_failure,
     _resolved_review_scope_metadata,
     _run_as_worker,
     _run_foreground,
@@ -611,12 +613,26 @@ def _run_with_registered_worker(
 
     try:
         rc = run_command()
+        startup_failed_without_running = False
+        worker = registry.get(worker_id)
+        if rc != 0 and worker is not None and worker.task_id is not None:
+            startup_task = get_store(config).get(worker.task_id)
+            startup_failed_without_running = startup_task is not None and startup_task.status == "pending"
+            if startup_failed_without_running:
+                _record_preclaim_startup_failure(
+                    config=config,
+                    registry=registry,
+                    worker_id=worker_id,
+                    task=startup_task,
+                    exit_code=rc,
+                )
         if _finalize_idle_wrapper_registration():
             return rc
         registry.mark_completed(
             worker_id,
             exit_code=rc,
             status="completed" if rc == 0 else "failed",
+            completion_reason="startup failure before task claim" if rc != 0 and startup_failed_without_running else None,
         )
         return rc
     except Exception:
@@ -1021,7 +1037,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             # Check if task is blocked by a dependency
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                return phase1_error(args, f"Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
+                del blocking_id, blocking_status
+                return phase1_error(args, blocked_dependency_error_message(store, task))
     else:
         git = Git(config.project_dir)
         target_branch = git.default_branch()

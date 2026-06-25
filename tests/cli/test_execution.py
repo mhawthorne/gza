@@ -24,6 +24,7 @@ from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.config import Config
 from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
+from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
 from gza.workers import WorkerMetadata, WorkerRegistry
 
@@ -18806,6 +18807,43 @@ class TestRunAsWorker:
         assert worker.status == "failed"
         assert worker.exit_code == 1
         assert worker.completion_reason == "startup failure before task claim"
+
+    def test_run_as_worker_preclaim_refusal_mirrors_reason_into_task_startup_log(self, tmp_path: Path):
+        """Detached pre-claim failures should be visible via the task startup log and ops sibling."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker blocked task")
+        assert task.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-prereq-log")
+        startup_capture = tmp_path / "w-worker-prereq-log-startup.log"
+        startup_capture.write_text(
+            f"Error: Task {task.id} is blocked: awaiting plan review for gza-99; "
+            "release with uv run gza implement gza-99 or uv run gza edit gza-99 --no-hold-for-review\n"
+        )
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+
+        with patch("gza.cli.signal.signal"):
+            with patch("gza.cli.run", return_value=3):
+                rc = _run_as_worker(args, config)
+
+        assert rc == 3
+        startup_log = startup_capture
+        assert startup_log.exists()
+        startup_text = startup_log.read_text()
+        assert "awaiting plan review for gza-99" in startup_text
+        assert "uv run gza edit gza-99 --no-hold-for-review" in startup_text
+
+        ops_text = ops_log_path_for(startup_log).read_text()
+        assert '"event": "start_failed"' in ops_text
+        assert f'"task_id": "{task.id}"' in ops_text
+        assert '"exit_code": 3' in ops_text
+        assert "awaiting plan review for gza-99" in ops_text
+
+        worker = registry.get("w-worker-prereq-log")
+        assert worker is not None
+        assert worker.status == "failed"
 
     def test_run_as_worker_claim_updates_registry_with_task_log_evidence(self, tmp_path: Path):
         """Claim callback should persist task/log evidence to the worker registry immediately."""
