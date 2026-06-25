@@ -4,6 +4,57 @@ import re
 from pathlib import Path
 
 
+def _normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _extract_markdown_table_rows(document: str, heading: str) -> list[tuple[str, str]]:
+    """Return normalized condition/action rows from the Markdown table under a heading."""
+    lines = document.splitlines()
+    start_index: int | None = None
+    heading_line = heading.strip()
+    for index, line in enumerate(lines):
+        if line.strip() == heading_line:
+            start_index = index + 1
+            break
+
+    assert start_index is not None, f"Heading not found: {heading}"
+
+    rows: list[tuple[str, str]] = []
+    for line in lines[start_index:]:
+        stripped = line.strip()
+        if not stripped:
+            if rows:
+                break
+            continue
+        if not stripped.startswith("|"):
+            if rows:
+                break
+            continue
+
+        match = re.match(r"^\|\s*(.*?)\s*\|\s*(.*?)\s*\|$", stripped)
+        if match is None:
+            continue
+        cells = [match.group(1), match.group(2)]
+        if set(cells[0]) == {"-"} and set(cells[1]) == {"-"}:
+            continue
+
+        rows.append(tuple(_normalize_whitespace(cell) for cell in cells))
+
+    assert rows, f"No table rows found under heading: {heading}"
+    return rows
+
+
+def _find_markdown_table_row(
+    rows: list[tuple[str, str]], *, condition_contains: str
+) -> tuple[int, str, str]:
+    normalized_needle = _normalize_whitespace(condition_contains)
+    for index, (condition, action) in enumerate(rows):
+        if normalized_needle in condition:
+            return index, condition, action
+    raise AssertionError(f"Table row not found for condition: {condition_contains}")
+
+
 def test_importer_cleanup_has_no_stale_references_in_operator_surfaces() -> None:
     """Tracked operator-facing surfaces should not refer to the removed importer module."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -371,14 +422,17 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
     workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
     lifecycle_flat = " ".join(lifecycle.split())
     workflow_flat = " ".join(workflow.split())
-    table_adjudication_row = (
-        "| Verdict = `CHANGES_REQUESTED` AND consecutive completed no-op improves for the latest "
-        "`(impl, review)` pair >= `max_noop_improve_cycles` AND the latest blocker set includes "
-        "an adjudication-eligible disputed non-verify CODE blocker |"
+    review_active_rows = _extract_markdown_table_rows(workflow, "#### 6b. Review is active (not cleared)")
+    adjudication_row_index, adjudication_condition, adjudication_action = _find_markdown_table_row(
+        review_active_rows,
+        condition_contains="adjudication-eligible disputed non-verify CODE blocker",
     )
-    table_generic_noop_row = (
-        "| Consecutive completed no-op improves for the latest `(impl, review)` pair >= "
-        "`max_noop_improve_cycles` |"
+    generic_noop_row_index, generic_noop_condition, _ = _find_markdown_table_row(
+        review_active_rows,
+        condition_contains=(
+            "Consecutive completed no-op improves for the latest `(impl, review)` pair >= "
+            "`max_noop_improve_cycles`"
+        ),
     )
 
     assert "adjudication marking a disputed blocker `INVALID` for lifecycle" in overview
@@ -397,12 +451,22 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
 
     assert "Every `BLOCKER` must be falsifiable." in workflow
     assert "structured `## Disputed Blockers` section" in workflow
-    assert table_adjudication_row in workflow
+    assert "Verdict = `CHANGES_REQUESTED`" in adjudication_condition
     assert (
-        "`create_review_adjudication` / `run_review_adjudication` / "
-        "`wait_review_adjudication` before the generic no-op park"
-    ) in workflow
-    assert workflow.index(table_adjudication_row) < workflow.index(table_generic_noop_row)
+        "consecutive completed no-op improves for the latest `(impl, review)` pair >= "
+        "`max_noop_improve_cycles`"
+    ) in adjudication_condition
+    for action_name in (
+        "`create_review_adjudication`",
+        "`run_review_adjudication`",
+        "`wait_review_adjudication`",
+    ):
+        assert action_name in adjudication_action
+    assert "generic no-op park" in adjudication_action
+    assert generic_noop_condition.startswith(
+        "Consecutive completed no-op improves for the latest `(impl, review)` pair >= "
+    )
+    assert adjudication_row_index < generic_noop_row_index
     assert "required lifecycle contract is adjudication before the generic `improve-no-op`," in workflow
     assert "`duplicate-blocker-no-progress`, and `review-max-cycles` parks." in workflow
     assert "lifecycle consumes those persisted outcomes immediately" in workflow
