@@ -49,6 +49,7 @@ from ..db import (
     task_owns_merge_status,
 )
 from ..dependency_preconditions import DependencyReadiness
+from ..dispatch_preview import DispatchPreviewEntry, build_dispatch_preview
 from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
@@ -143,6 +144,8 @@ from .advance_engine import (
     _resolve_subject_fallback_task,
     classify_advance_action,
     determine_next_action,
+    failed_recovery_decision_to_action,
+    failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
     format_needs_attention_lifecycle,
     get_action_subject_task_id,
@@ -1537,6 +1540,28 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     )
     with cache_scope:
         result = service.run(query, config=config, git=git, target_branch=target_branch)
+        normalize_kwargs: dict[str, Any] = {}
+        if not blocked_by_dropped_only and normalized_tag_filters is not None:
+            recovery_preview = build_dispatch_preview(
+                store,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+                tags=normalized_tag_filters,
+                any_tag=any_tag,
+                max_recovery_attempts=config.max_resume_attempts,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+            normalize_kwargs = {
+                "max_recovery_attempts": config.max_resume_attempts,
+                "recovery_preview_entries_by_task_id": {
+                    entry.task.id: entry
+                    for entry in recovery_preview.recovery_entries
+                    if entry.task.id is not None
+                },
+                "recovery_preview_read_context": recovery_preview.read_context,
+            }
         if not blocked_by_dropped_only:
             result = _normalize_incomplete_result_rows(
                 result,
@@ -1545,6 +1570,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
                 config=config,
                 git=git,
                 target_branch=target_branch,
+                **normalize_kwargs,
             )
     if getattr(args, "json", False):
         _render_projection_result(result, use_json=True)
@@ -1606,12 +1632,14 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         for row in result.rows:
             if not isinstance(row, _LineageRow):
                 continue
-            owner = row.owner_task
-            owner_time = owner.completed_at or owner.created_at
+            values = row.values
+            owner_time = cast("datetime | None", values.get("completed_at")) or cast(
+                "datetime | None", values.get("created_at")
+            )
             owner_time_text = owner_time.strftime('%Y-%m-%d %H:%M') if owner_time else ""
             console.print(
-                f"    [{c['task_id']}]{owner.id}[/{c['task_id']}]"
-                f" \\[{owner.task_type}]"
+                f"    [{c['task_id']}]{values.get('id', row.owner_task.id)}[/{c['task_id']}]"
+                f" \\[{values.get('task_type', row.owner_task.task_type)}]"
                 f" [{c['date']}]{owner_time_text}[/{c['date']}]"
             )
 
@@ -1713,8 +1741,12 @@ def _normalize_incomplete_result_rows(
     config: Config,
     git: Git | None,
     target_branch: str | None,
+    max_recovery_attempts: int = 0,
+    recovery_preview_entries_by_task_id: Mapping[str, DispatchPreviewEntry] | None = None,
+    recovery_preview_read_context: object | None = None,
 ) -> _TaskQueryResult:
     """Re-root incomplete rows on the implementation that owns the merge unit."""
+    recovery_preview_entries_by_task_id = recovery_preview_entries_by_task_id or {}
     normalized_rows: list[_TaskRow | _LineageRow] = []
     changed = False
     tag_filters = result.query.tag_filters
@@ -1775,33 +1807,130 @@ def _normalize_incomplete_result_rows(
         tree_changed = tree is not row.tree
         members_changed = tuple(task.id for task in members) != tuple(task.id for task in row.members)
         if not owner_changed and not tree_changed and not members_changed:
-            normalized_rows.append(row)
-            continue
-
-        changed = True
-        normalized_rows.append(
-            service._project_lineage_row(  # noqa: SLF001
-                _LineageRow(
-                    owner_task=owner_task,
-                    members=members,
-                    tree=tree,
-                    unresolved_tasks=unresolved_tasks,
-                    lifecycle_action_task=row.lifecycle_action_task,
-                    recovery_action_task=row.recovery_action_task,
-                    recovery_leaf_task=row.recovery_leaf_task,
-                    lineage_status=row.lineage_status,
-                    next_action_data=None if stale_fallback_action else row.next_action_data,
-                ),
-                result.query,
+            projected_row = _apply_incomplete_recovery_identity(
+                row,
+                service=service,
+                query=result.query,
+                store=store,
                 config=config,
                 git=git,
                 target_branch=target_branch,
+                max_recovery_attempts=max_recovery_attempts,
+                recovery_preview_entries_by_task_id=recovery_preview_entries_by_task_id,
+                recovery_preview_read_context=recovery_preview_read_context,
+            )
+            if projected_row.values != row.values:
+                changed = True
+            normalized_rows.append(projected_row)
+            continue
+
+        changed = True
+        projected_row = service._project_lineage_row(  # noqa: SLF001
+            _LineageRow(
+                owner_task=owner_task,
+                members=members,
+                tree=tree,
+                unresolved_tasks=unresolved_tasks,
+                lifecycle_action_task=row.lifecycle_action_task,
+                recovery_action_task=row.recovery_action_task,
+                recovery_leaf_task=row.recovery_leaf_task,
+                lineage_status=row.lineage_status,
+                next_action_data=None if stale_fallback_action else row.next_action_data,
+            ),
+            result.query,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+        )
+        normalized_rows.append(
+            _apply_incomplete_recovery_identity(
+                projected_row,
+                service=service,
+                query=result.query,
+                store=store,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+                max_recovery_attempts=max_recovery_attempts,
+                recovery_preview_entries_by_task_id=recovery_preview_entries_by_task_id,
+                recovery_preview_read_context=recovery_preview_read_context,
             )
         )
 
     if not changed:
         return result
     return _TaskQueryResult(query=result.query, rows=tuple(normalized_rows), total_count=result.total_count)
+
+
+def _apply_incomplete_recovery_identity(
+    row: _LineageRow,
+    *,
+    service: _TaskQueryService,
+    query: _TaskQuery,
+    store: SqliteTaskStore,
+    config: Config,
+    git: Git | None,
+    target_branch: str | None,
+    max_recovery_attempts: int,
+    recovery_preview_entries_by_task_id: Mapping[str, DispatchPreviewEntry],
+    recovery_preview_read_context: object | None,
+) -> _LineageRow:
+    recovery_leaf = row.recovery_leaf_task
+    if (
+        recovery_leaf is None
+        or recovery_leaf.id is None
+        or row.owner_task.id is None
+        or recovery_leaf.id == row.owner_task.id
+    ):
+        return row
+    preview_entry = recovery_preview_entries_by_task_id.get(recovery_leaf.id)
+    if preview_entry is None or preview_entry.decision is None:
+        return row
+
+    preview_action = failed_recovery_decision_to_action(
+        recovery_leaf,
+        preview_entry.decision,
+        subject_task_id=recovery_leaf.id,
+    )
+    if not preview_entry.runnable:
+        attention_action = failed_recovery_decision_to_attention_action(
+            store,
+            recovery_leaf,
+            preview_entry.decision,
+            max_recovery_attempts=max_recovery_attempts,
+            read_context=cast(Any | None, recovery_preview_read_context),
+        )
+        if attention_action is not None:
+            preview_action = attention_action
+
+    recovery_projection = service._project_lineage_row(  # noqa: SLF001
+        _LineageRow(
+            owner_task=recovery_leaf,
+            members=row.members,
+            tree=row.tree,
+            unresolved_tasks=row.unresolved_tasks,
+            recovery_action_task=preview_entry.task,
+            recovery_leaf_task=recovery_leaf,
+            lineage_status=row.lineage_status,
+            next_action_data=preview_action,
+        ),
+        query,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+    )
+    return _LineageRow(
+        owner_task=row.owner_task,
+        members=row.members,
+        tree=row.tree,
+        unresolved_tasks=row.unresolved_tasks,
+        lifecycle_action_task=row.lifecycle_action_task,
+        recovery_action_task=row.recovery_action_task,
+        recovery_leaf_task=row.recovery_leaf_task,
+        lineage_status=row.lineage_status,
+        next_action_data=row.next_action_data,
+        values=recovery_projection.values,
+    )
 
 
 def _resolve_incomplete_explicit_subject_task(

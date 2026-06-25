@@ -163,6 +163,8 @@ from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
     classify_advance_action,
     determine_next_action,
+    failed_recovery_decision_to_action,
+    failed_recovery_decision_to_attention_action,
     format_needs_attention_entry_for_display,
     needs_attention_recommended_next_step,
     resolve_subject_task,
@@ -183,6 +185,54 @@ def _classify_rebase_git_failure(error: BaseException) -> str:
     return "GIT_ERROR"
 
 _T = TypeVar("_T")
+
+def _print_mixed_recovery_preview_entries(
+    *,
+    store: SqliteTaskStore,
+    preview: object,
+    max_recovery_attempts: int,
+) -> None:
+    mixed_entries = [
+        entry
+        for entry in getattr(preview, "recovery_entries", ())
+        if (
+            entry.owner_task is not None
+            and entry.task.id is not None
+            and entry.owner_task.id is not None
+            and entry.task.id != entry.owner_task.id
+            and entry.decision is not None
+        )
+    ]
+    if not mixed_entries:
+        return
+
+    print("Recovery subset (shared preview):\n")
+    for entry in mixed_entries:
+        task = entry.task
+        prompt_display = shorten_prompt(task.prompt, 100)
+        console.print(f"  {task.id} {prompt_display}")
+        if entry.runnable:
+            action = failed_recovery_decision_to_action(
+                task,
+                entry.decision,
+                subject_task_id=task.id,
+            )
+            action_color = _advance_action_color(str(action["type"]))
+            console.print(f"      [{action_color}]→ {action['description']}[/{action_color}]")
+        else:
+            attention_action = failed_recovery_decision_to_attention_action(
+                store,
+                task,
+                entry.decision,
+                max_recovery_attempts=max_recovery_attempts,
+                read_context=getattr(preview, "read_context", None),
+            )
+            if attention_action is not None:
+                detail = format_needs_attention_entry_for_display(task, action=attention_action)
+                console.print(f"      {detail}")
+            else:
+                console.print(f"      SKIP: {entry.decision.reason_text}")
+        console.print()
 
 
 @dataclass(frozen=True)
@@ -3798,6 +3848,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if dry_run:
             for warning in failed_task_recovery_warnings:
                 print(f"Warning: {warning}", file=sys.stderr)
+            if not no_resume_failed and owner_rows:
+                _print_mixed_recovery_preview_entries(
+                    store=store,
+                    preview=recovery_preview,
+                    max_recovery_attempts=max_resume_attempts,
+                )
             if preview_actionable_rows:
                 print(f"Would advance {len(preview_actionable_rows)} task(s):\n")
                 print_lifecycle_action_entries(

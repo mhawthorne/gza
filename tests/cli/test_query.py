@@ -15781,6 +15781,36 @@ class TestIncompleteCommand:
 
         return failed, completed_retry
 
+    @staticmethod
+    def _setup_mixed_owner_recovery_fixture(tmp_path: Path) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        plan = store.add("Scoped completed plan", task_type="plan", tags=("release",))
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        failed_review = store.add(
+            "Scoped failed review leaf",
+            task_type="review",
+            based_on=plan.id,
+            tags=("release",),
+        )
+        failed_review.status = "failed"
+        failed_review.failure_reason = "MAX_TURNS"
+        failed_review.session_id = "sess-mixed-review"
+        failed_review.branch = "feature/scoped-failed-review"
+        failed_review.has_commits = True
+        failed_review.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(failed_review)
+        assert failed_review.id is not None
+
+        return plan, failed_review
+
     def test_incomplete_text_fields_multi_field_uses_generic_blocks(
         self,
         tmp_path: Path,
@@ -16596,6 +16626,56 @@ class TestIncompleteCommand:
         assert [(entry.task.id, entry.reason_code, entry.runnable) for entry in preview.recovery_entries] == [
             (failed.id, "automatic_recovery_disabled", False)
         ]
+
+    def test_incomplete_mixed_owner_recovery_row_uses_shared_recovery_leaf_identity(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        plan, failed_review = self._setup_mixed_owner_recovery_fixture(tmp_path)
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="query_only")
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release",),
+                any_tag=True,
+                max_recovery_attempts=1,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(tmp_path, fields="id,next_action,next_action_owner_id,unresolved_ids", json=True)
+        args.tags = ["release"]
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert [entry.task.id for entry in preview.recovery_entries] == [failed_review.id]
+        assert payload == [
+            {
+                "id": failed_review.id,
+                "next_action": "resume",
+                "next_action_owner_id": failed_review.id,
+                "unresolved_ids": [plan.id, failed_review.id],
+            }
+        ]
+
+        args = self._incomplete_args(tmp_path, fields=None)
+        args.tags = ["release"]
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert captured.out.splitlines()[0].startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)")
+        assert plan.id not in self._one_line_row_id(captured.out)
 
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,
