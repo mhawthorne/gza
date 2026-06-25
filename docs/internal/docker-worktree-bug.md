@@ -1,94 +1,80 @@
-# Docker + Git Worktree Path Bug
+# Docker + Git Worktree Isolation
 
 ## Summary
 
-When gza runs tasks in Docker mode with git worktrees, git commands executed by Claude inside the container will fail because the worktree's `.git` file contains host paths that don't exist in the container.
+The old Docker/worktree failure mode is closed by architecture now. Provider containers no
+longer receive an implicit bind mount of the canonical repository's shared `.git`
+directory, and provider-assisted rebase resolution now runs in a private checkout with its
+own real `.git/` directory. As a result, provider-side git can no longer mutate the
+canonical repo's `.git/worktrees` registry for sibling tasks.
 
 ## Status
 
-**Workaround in place**: AGENTS.md instructs Claude not to run git commands. Gza handles all git operations on the host after the task completes.
+- **Fixed in architecture**: normal Docker-backed task workspaces no longer get accidental
+  git access via a shared host `.git` mount.
+- **Rebase exception is isolated**: when agent-side git is required for provider-assisted
+  rebase conflict resolution, gza creates a private checkout with its own `.git/` and later
+  imports the resulting tip back into the canonical repo host-side.
+- **Host remains authoritative**: publication, force-with-lease checks, and canonical branch
+  updates still happen in host task context after import.
 
-**Not fixed**: The underlying issue remains. If Claude runs git commands inside Docker, they will fail.
+AGENTS.md still tells agents not to treat git as a general-purpose sandbox capability, but
+that instruction is now a policy boundary rather than the primary protection against
+cross-task worktree damage.
 
-## How It Manifests
+## Historical Failure Mode
 
-1. Claude runs `git status` (or any git command) inside the Docker container
-2. Git reads `/workspace/.git` which contains: `gitdir: /Users/username/project/.git/worktrees/task-name`
-3. That host path doesn't exist inside the container
-4. Git fails with: `fatal: not a git repository: /Users/username/project/.git/worktrees/task-name`
-5. Claude may "fix" this by running `rm .git && git init`, creating an orphaned repo
-6. Commits made in the orphaned repo are not connected to the main repo
+The original bug had two related forms:
 
-## Root Cause
+1. A Docker-mounted git worktree exposed a `.git` **file** containing host-only absolute
+   paths, so sandboxed `git status` and similar commands failed with "not a git repository".
+2. Later mitigation work briefly mounted the canonical shared `.git` directory into Docker
+   so sandboxed git would function, but that exposed `.git/worktrees` for the whole repo.
+   A `git worktree prune` or similar operation inside one container could then unregister a
+   different in-progress task's worktree.
 
-Git worktrees work via a `.git` **file** (not directory) that points to metadata in the main repo's `.git/worktrees/` directory. The path in this file is an absolute host path.
+The fixed design avoids both failure modes at once by making the default Docker path
+"no shared gitdir" and the rebase path "private gitdir".
 
-When Docker mounts the worktree at `/workspace`:
-- The `.git` file is mounted with its original content
-- The path it contains (`/Users/.../project/.git/worktrees/...`) doesn't exist in the container
-- Only the worktree directory itself is mounted, not the main repo's `.git` directory
+## Fixed Architecture
 
-## Current Architecture
+### Ordinary Docker-backed tasks
 
-```
-Host:
-  /Users/m3h/work/project/                    # Main repo
-  /Users/m3h/work/project/.git/               # Main git dir
-  /Users/m3h/work/project/.git/worktrees/     # Worktree metadata
-  /tmp/gza-worktrees/project/task-name/       # Worktree directory
-  /tmp/gza-worktrees/project/task-name/.git   # File pointing to main .git
+- The task workspace is mounted into the container.
+- The provider does **not** get an implicit bind mount of the canonical repository's shared
+  `.git` directory.
+- A worktree `.git` file therefore does not accidentally become a live view into the host
+  worktree registry.
+- Host-owned git operations continue to run outside the container where canonical branch and
+  worktree state is authoritative.
 
-Docker:
-  /workspace/                                  # Worktree mounted here
-  /workspace/.git                              # File with INVALID host path
-```
+This makes "sandboxed git mutates another task's worktree registration" structurally
+unreachable for the default provider path.
 
-## Task 90 Incident (2026-02-12)
+### Provider-assisted rebases
 
-Task 90 was the first task to trigger this bug because:
-1. AGENTS.md was updated to say "Do NOT commit until tests pass"
-2. Claude interpreted this as needing to run `git status` before committing
-3. Git failed, Claude ran `rm .git && git init`
-4. Commits were made to an orphaned repo, not the task branch
+- Rebase conflict resolution sometimes needs agent-side git to run `git rebase --continue`,
+  inspect rebase state, and apply conflict edits.
+- For that path, gza creates a **private checkout** with a real `.git/` directory owned only
+  by that checkout.
+- The private checkout imports the needed local refs from the canonical repo, performs the
+  provider-assisted rebase there, and never shares the canonical `.git/worktrees`
+  registration.
+- After provider success, the host imports the rewritten tip back into the canonical branch
+  with an expected-old-SHA guard, then performs host-side publication.
 
-The commits still exist in `/private/tmp/gza-worktrees/gza/20260212-add-rich-console-output-coloring-for-gza-work/` but are not connected to the main repo.
+That means a `git worktree prune` inside the private rebase checkout can only affect that
+checkout's own registry, not sibling task worktrees in the canonical repo.
 
-## Potential Fixes
+## Ownership Boundary
 
-### 1. Mount the main `.git` directory (Complex)
+- Provider or agent git may operate only inside an explicitly prepared private checkout.
+- Canonical branch movement, publication, and cross-task worktree lifecycle decisions remain
+  host responsibilities.
+- The canonical repo's `.git/worktrees` registry is not a provider-visible shared resource.
 
-Mount both the worktree and the main repo's `.git` at paths the container expects:
+## Historical Note
 
-```python
-# Would need to parse .git file and mount accordingly
-"-v", f"{main_repo}/.git:{host_git_path}:ro"
-```
-
-Challenges:
-- Need to rewrite paths or mount at exact host paths
-- Security considerations with exposing full git history
-
-### 2. Rewrite `.git` file in container (Moderate)
-
-After mounting, rewrite the `.git` file to point to a container-valid path, and mount the worktree metadata there.
-
-### 3. Don't use worktrees in Docker mode (Simple but slow)
-
-Use `git clone` or file copy instead of worktrees when Docker mode is enabled.
-
-### 4. Detect git commands and warn/block (Defensive)
-
-Add a hook or wrapper that detects git commands and warns Claude not to use them.
-
-## Recovery: Fetching Orphaned Commits
-
-If commits were made to an orphaned repo, they can be recovered:
-
-```bash
-# From the main repo, fetch from the orphaned repo
-git fetch /path/to/orphaned-worktree HEAD:refs/heads/recovered-branch
-
-# Or copy objects directly
-cp -r /path/to/orphaned-worktree/.git/objects/* .git/objects/
-git update-ref refs/heads/branch-name <commit-hash>
-```
+This file is kept because earlier incidents and reviews refer to "the Docker worktree bug".
+Its current role is to document the final architecture and the boundary that prevents that
+bug class from recurring.

@@ -270,6 +270,36 @@ def test_main_verify_remediation_identity_docs_match_fingerprint_aware_runtime_c
     assert "create these remediation tasks itself." in supervisor
 
 
+def test_worktree_isolation_contract_and_internal_docs_stay_aligned() -> None:
+    """Behavior spec and internal docs should agree on isolated rebase git ownership."""
+    repo_root = Path(__file__).resolve().parents[1]
+    contract = _normalize_whitespace((repo_root / "specs" / "behavior" / "worktree-reclaim.md").read_text())
+    docker_bug = _normalize_whitespace((repo_root / "docs" / "internal" / "docker-worktree-bug.md").read_text())
+    lifecycle = _normalize_whitespace((repo_root / "docs" / "internal" / "worktree-lifecycle.md").read_text())
+    rebase_flow = _normalize_whitespace((repo_root / "docs" / "internal" / "advance-rebase-flow.md").read_text())
+    internal_index = (repo_root / "docs" / "internal" / "README.md").read_text()
+
+    assert "Provider or agent git activity MUST be isolated" in contract
+    assert "MUST NOT be able to mutate the registration of some other in-progress task's worktree" in contract
+    assert "If a task needs agent-side git, it MUST run in a git context whose registry is private to that task" in contract
+
+    assert "no longer receive an implicit bind mount of the canonical repository's shared `.git`" in docker_bug
+    assert "private checkout with its own `.git/`" in docker_bug
+    assert "imports the rewritten tip back into the canonical branch" in docker_bug
+
+    assert "no longer receive an implicit bind mount of the canonical repository's shared `.git`" in rebase_flow
+    assert "private rebase checkout with its own real `.git/` directory" in rebase_flow
+    assert "skip canonical worktree setup entirely" in rebase_flow
+    assert "private checkout is the provider worktree" in rebase_flow
+    assert "imports the private checkout tip back into the canonical branch" in rebase_flow
+
+    assert "Docker-backed providers do not receive an implicit bind mount of the canonical repository's shared `.git` directory." in lifecycle
+    assert "private rebase checkout" in lifecycle
+    assert "host-side after the result is imported back" in lifecycle
+
+    assert "fixed isolation architecture" in internal_index
+
+
 def test_configuration_docs_include_main_verify_escape_hatch() -> None:
     """Canonical command docs should describe the main-verify operator escape hatch."""
     repo_root = Path(__file__).resolve().parents[1]

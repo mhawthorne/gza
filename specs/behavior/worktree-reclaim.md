@@ -43,6 +43,27 @@ report](../../docs/incidents/2026-06-02-rescue-worktree-clobbered.md)). The cont
 is the backstop that makes that outcome impossible regardless of *which* scheduler trigger
 comes to claim a branch.
 
+## Cross-task worktree-registration isolation
+
+The canonical repository's worktree registration is shared state. It records which
+worktrees exist for which branches and therefore determines whether another task can start,
+reclaim, or fail closed on a branch conflict. Because that registry directly controls task
+ownership and reclaim decisions, git operations performed inside a provider or agent context
+MUST NOT be able to mutate the registration of some other in-progress task's worktree.
+
+This invariant is narrower than the reclaim gate:
+
+- The host task context MAY still reclaim or fail on the **same branch** according to the
+  gate below, because that is the governed worktree-acquisition path.
+- Provider or agent git activity MUST be isolated so that pruning, checkout cleanup, or
+  other git housekeeping done for one task cannot unregister, prune, or otherwise mutate a
+  sibling task's live worktree registration.
+- If a task needs agent-side git, it MUST run in a git context whose registry is private to
+  that task rather than against the canonical shared worktree registry.
+
+The goal is structural, not advisory: "another task's worktree disappeared from git's
+registry" MUST be impossible as a side effect of provider-side git for a different task.
+
 ## The reclaim gate
 
 When a code work unit starts and a worktree already exists for its branch (at the intended

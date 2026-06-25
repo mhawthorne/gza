@@ -49,7 +49,19 @@ Unlike code task worktrees, non-code task worktrees are **removed on success** a
 
 Foreground `gza rebase` creates a dedicated `rebase` child task and uses that row as the canonical execution owner (status + `log_file`) across both mechanical and provider-assisted phases.
 
-It creates a **temporary** worktree at `config.worktree_path / rebase_task.id` for the duration of the run. Unlike task worktrees, this worktree is always removed after use — cleanup runs on all exit paths (mechanical success, provider-resolved success, failure, and exception), with `shutil.rmtree` fallback if `git worktree remove` leaves a directory behind. This worktree is never left registered with git after `gza rebase` exits.
+It creates a **temporary** canonical worktree at `config.worktree_path / rebase_task.id`
+for the duration of the host-side mechanical rebase setup. Unlike task worktrees, this
+worktree is always removed after use — cleanup runs on all exit paths (mechanical success,
+provider-resolved success, failure, and exception), with `shutil.rmtree` fallback if
+`git worktree remove` leaves a directory behind. This worktree is never left registered
+with git after `gza rebase` exits.
+
+If provider-assisted conflict resolution is needed, gza does **not** hand the provider the
+canonical worktree's shared gitdir. Instead it creates a separate **private rebase
+checkout** with its own real `.git/` directory, imports the needed local refs there, runs
+the provider in that checkout, and then imports the rewritten tip back into the canonical
+branch host-side before publication. The private checkout is cleaned up independently and is
+not part of the canonical repo's shared worktree registration.
 
 ## Local path dependency symlinks
 
@@ -96,6 +108,18 @@ Git enforces that a branch can only be checked out in one worktree at a time. Wh
   `git worktree remove` manually.
 
 Post-approval comment handling in `gza watch` now re-enters the implementation chain through `gza iterate <impl>`. That outer iterate wrapper does not change worktree ownership by itself; the active worktree is still selected and rotated by the inner review/improve task that iterate chooses to run.
+
+## Docker and git ownership boundary
+
+Docker-backed providers do not receive an implicit bind mount of the canonical repository's
+shared `.git` directory. Ordinary task containers therefore cannot accidentally mutate the
+canonical `.git/worktrees` registry.
+
+When agent-side git is required for rebase conflict resolution, gza creates a private
+checkout with its own `.git/` directory for that provider run. Any git housekeeping inside
+that checkout, including `git worktree prune`, is scoped to the private checkout's own
+registry. Canonical branch updates and publication still happen host-side after the result
+is imported back.
 
 ## Cleanup safety
 

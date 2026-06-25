@@ -32,4 +32,4 @@ Linked from `AGENTS.md` so these are reachable in one hop instead of by grep.
 
 ## Known issues / gotchas
 
-- [docker-worktree-bug.md](docker-worktree-bug.md) — a documented Docker + git-worktree path gotcha.
+- [docker-worktree-bug.md](docker-worktree-bug.md) — the historical Docker + git-worktree bug and the fixed isolation architecture that replaced the workaround.
