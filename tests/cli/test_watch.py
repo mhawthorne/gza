@@ -12527,6 +12527,7 @@ def test_watch_cycle_pending_improve_recovery_worker_respects_active_transient_b
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
     started_task_ids: list[str] = []
 
     def record_worker_spawn(
@@ -12574,33 +12575,49 @@ def test_watch_cycle_pending_improve_recovery_worker_respects_active_transient_b
             batch=1,
             max_iterations=10,
             dry_run=False,
-            log=_WatchLog(log_path, quiet=True),
+            log=log,
             max_recovery_attempts=config.max_resume_attempts,
         )
         first_log_text = log_path.read_text()
         first_started_task_ids = list(started_task_ids)
 
-        FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=61)
-        second_result = _run_cycle(
+        FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=5)
+        second_blocked_result = _run_cycle(
             config=Config.load(tmp_path),
             store=make_store(tmp_path),
             batch=1,
             max_iterations=10,
             dry_run=False,
-            log=_WatchLog(log_path, quiet=True),
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        second_blocked_log_text = log_path.read_text()
+        second_blocked_started_task_ids = list(started_task_ids)
+
+        FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=61)
+        due_result = _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
             max_recovery_attempts=config.max_resume_attempts,
         )
 
     assert first_result.pending == 1
     assert first_started_task_ids == []
+    assert second_blocked_result.pending == 1
+    assert second_blocked_started_task_ids == []
+    assert second_blocked_log_text.count("BACKOFF") == 1
     assert not any(
         line.split(maxsplit=2)[1] == "START" and pending_retry.id in line
         for line in first_log_text.splitlines()
     )
-    assert second_result.work_done is True
+    assert due_result.work_done is True
     assert started_task_ids == [pending_retry.id]
     log_text = log_path.read_text()
-    assert "BACKOFF" in log_text
+    assert log_text.count("BACKOFF") == 1
     assert f"{impl.id} improve delayed" in log_text
 
 

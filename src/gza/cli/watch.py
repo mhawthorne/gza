@@ -1484,6 +1484,7 @@ def _maybe_emit_active_watch_recovery_backoff(
     action_label = candidate.action_type or str(action.get("type", "action")).strip() or "action"
     last_failure_task_id = backoff.last_failure_task_id or "unknown"
     last_failure_reason = backoff.last_failure_reason or "UNKNOWN"
+    next_retry_key = backoff.next_retry_at.astimezone(UTC).isoformat() if backoff.next_retry_at is not None else "none"
     log.emit(
         "BACKOFF",
         (
@@ -1493,7 +1494,7 @@ def _maybe_emit_active_watch_recovery_backoff(
         dedupe_key=(
             "transient-recovery-backoff:"
             f"{candidate.subject_kind}:{candidate.subject_id}:{candidate.action_type}:{candidate.action_reason}:"
-            f"{last_failure_task_id}:{remaining_seconds}"
+            f"{last_failure_task_id}:{next_retry_key}"
         ),
     )
     return True
@@ -1858,7 +1859,7 @@ class _WatchLog:
         return merge_key in self._merge_logged_this_cycle
 
     def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
-        if event == "SKIP" and dedupe_key is not None:
+        if event in {"SKIP", "BACKOFF"} and dedupe_key is not None:
             self._skip_keys_this_cycle.add(dedupe_key)
             if dedupe_key in self._skip_keys_prev_cycle:
                 return
