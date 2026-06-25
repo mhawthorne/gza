@@ -9,9 +9,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from .config import Config
-from .git import Git
+from .git import Git, GitError
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,16 @@ class IsolatedRebaseCheckout:
     target_ref: str
     imported_refs: tuple[str, ...]
     source_repo: Path
+
+
+@dataclass(frozen=True)
+class ImportedRebaseTip:
+    """Canonical repo import result for an isolated rebase checkout."""
+
+    branch: str
+    new_tip: str
+    previous_tip: str
+    temp_ref: str
 
 
 def _safe_checkout_stem(value: str) -> str:
@@ -106,6 +117,49 @@ def create_isolated_rebase_checkout(
 def cleanup_isolated_rebase_checkout(checkout: IsolatedRebaseCheckout) -> None:
     """Remove a private rebase checkout without touching canonical worktrees."""
     shutil.rmtree(checkout.path, ignore_errors=True)
+
+
+def import_isolated_rebase_tip(
+    *,
+    destination_git: Git,
+    checkout: IsolatedRebaseCheckout,
+    branch: str,
+    expected_old_sha: str | None,
+    temp_ref_name: str,
+) -> ImportedRebaseTip:
+    """Import a rebased branch tip back into the canonical repo with a stale-head guard."""
+    if not expected_old_sha:
+        raise GitError(f"Cannot import rebased tip for {branch} without an expected old SHA")
+
+    temp_ref = f"refs/gza/rebase-import/{_safe_checkout_stem(temp_ref_name)}-{uuid4().hex}"
+    destination_git._run(
+        "fetch",
+        "--no-tags",
+        str(checkout.path.resolve()),
+        f"+refs/heads/{branch}:{temp_ref}",
+    )
+    imported_tip = destination_git.rev_parse(temp_ref)
+    branch_ref = f"refs/heads/{branch}"
+
+    try:
+        destination_git.update_ref(branch_ref, imported_tip, expected_old_sha)
+    except GitError as exc:
+        current_tip = destination_git.rev_parse_if_exists(branch_ref)
+        if current_tip != expected_old_sha:
+            raise GitError(
+                "Refusing to import rebased tip for "
+                f"{branch}: expected old SHA {expected_old_sha}, found {current_tip or 'missing'}"
+            ) from exc
+        raise
+    finally:
+        destination_git._run("update-ref", "-d", temp_ref, check=False)
+
+    return ImportedRebaseTip(
+        branch=branch,
+        new_tip=imported_tip,
+        previous_tip=expected_old_sha,
+        temp_ref=temp_ref,
+    )
 
 
 @contextmanager

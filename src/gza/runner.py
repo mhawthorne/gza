@@ -111,6 +111,7 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
 from .providers.log_renderers import UnknownLogProviderError, get_log_renderer
+from .rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checkout
 from .rebase_diff import (
     RebaseDiffBaseline,
     capture_rebase_diff_baseline,
@@ -168,6 +169,11 @@ VERIFIED_EMPTY_NOOP_COMPLETION_REASON = "VERIFIED_EMPTY_NOOP"
 CROSS_PROJECT_TAG = "cross-project"
 DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE = 3
 _GZA_OWNED_DIR_NAMES = (".gza", ".claude")
+
+
+def _should_use_isolated_runner_rebase_checkout(*, task: Task, config: Config) -> bool:
+    """Return whether runner-owned rebase execution should use a private checkout."""
+    return config.use_docker and task.task_type == "rebase"
 
 
 @dataclass(frozen=True)
@@ -7785,20 +7791,34 @@ def _run_inner(
     # Create worktree path
     assert task.slug is not None
     worktree_path = config.worktree_path / task.slug
+    isolated_checkout_cm = None
+    isolated_checkout = None
+    if _should_use_isolated_runner_rebase_checkout(task=task, config=config):
+        rebase_target = default_branch
+        isolated_checkout_cm = isolated_rebase_checkout(
+            config=config,
+            source_git=git,
+            branch=branch_name,
+            target_ref=rebase_target,
+            checkout_name=task.slug,
+        )
+        isolated_checkout = isolated_checkout_cm.__enter__()
+        worktree_path = isolated_checkout.path
+        worktree_git = isolated_checkout.git
+    else:
+        if not _setup_code_task_worktree(
+            task,
+            config,
+            git,
+            branch_name=branch_name,
+            worktree_path=worktree_path,
+            default_branch=default_branch,
+            resume=resume,
+        ):
+            return 1
 
-    if not _setup_code_task_worktree(
-        task,
-        config,
-        git,
-        branch_name=branch_name,
-        worktree_path=worktree_path,
-        default_branch=default_branch,
-        resume=resume,
-    ):
-        return 1
-
-    # Create a Git instance for the worktree
-    worktree_git = Git(worktree_path)
+        # Create a Git instance for the worktree
+        worktree_git = Git(worktree_path)
 
     # Restore WIP changes if resuming
     if resume:
@@ -8171,6 +8191,18 @@ def _run_inner(
                 )
                 return 0
 
+            if isolated_checkout is not None:
+                import_isolated_rebase_tip(
+                    destination_git=git,
+                    checkout=isolated_checkout,
+                    branch=branch_name,
+                    expected_old_sha=(
+                        rebase_diff_baseline.old_tip if rebase_diff_baseline is not None else None
+                    ),
+                    temp_ref_name=task.slug,
+                )
+                worktree_git = git
+
         return _complete_code_task(
             task,
             config,
@@ -8242,6 +8274,9 @@ def _run_inner(
         )
         console.print("\nInterrupted")
         return 130
+    finally:
+        if isolated_checkout_cm is not None:
+            isolated_checkout_cm.__exit__(None, None, None)
 
 
 def _run_non_code_task(
