@@ -6836,8 +6836,7 @@ def _setup_code_task_worktree(
                 git.worktree_remove(worktree_path, force=True)
 
             console.print(f"Creating worktree with existing branch: {worktree_path}")
-            # For existing branch, use git worktree add <path> <branch>
-            git._run("worktree", "add", str(worktree_path), branch_name)
+            git.worktree_add_existing(worktree_path, branch_name)
             return True
         except GitError as e:
             error_message(f"Error: Could not check out branch {branch_name} in worktree: {e}")

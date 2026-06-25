@@ -9196,8 +9196,8 @@ class TestExtractedRunInnerHelpers:
         task = Task(id=1, prompt="resume task", task_type="implement", slug="20260317-task")
         git = Mock(spec=Git)
         git.branch_exists.return_value = True
-        git._run.return_value = None
         git.worktree_remove.return_value = None
+        git.worktree_add_existing.return_value = None
 
         worktree_path = tmp_path / "worktrees" / "20260317-task"
 
@@ -9219,6 +9219,8 @@ class TestExtractedRunInnerHelpers:
             force=True,
             permitted_root_paths=managed_worktree_root_paths(config),
         )
+        git.worktree_add_existing.assert_called_once_with(worktree_path, "feature/existing")
+        git._run.assert_not_called()
 
     def test_complete_code_task_marks_failed_when_no_changes_and_no_commits(self, tmp_path: Path):
         """Completion helper should fail task when provider produced neither changes nor commits."""
