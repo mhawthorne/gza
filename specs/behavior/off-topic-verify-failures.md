@@ -79,6 +79,8 @@ canonical local merge target under an equivalent non-fail-fast verify command.
 
 - The target-side run MUST use the local canonical merge target, not `origin/*` or any
   remote-only reference.
+- The target-side run MUST execute at the exact immutable local target SHA selected for
+  classification, not by resolving a mutable branch name later at execution time.
 - If a node fails on the reviewed branch but does not fail on the local target under the
   required target-side check, lifecycle MUST NOT classify that node as deterministic
   off-topic.
@@ -97,6 +99,11 @@ A failing node is intermittent off-topic only when all of the following are true
 3. The reviewed diff does not touch a shared, global, orchestration, concurrency, or
    similarly cross-cutting area that could plausibly affect the failure without appearing
    in the node path itself.
+
+Path attribution in condition 2 MUST normalize absolute traceback or failure-location
+paths against the reviewed worktree root before comparing them to repo-relative changed
+paths. If an attributable absolute path cannot be safely made repo-relative, lifecycle
+MUST fail closed and treat the node as unknown or unscoped rather than outside-diff.
 
 If condition 3 is not true because the diff touches such a cross-cutting area, lifecycle
 MUST require a bounded target-side stress baseline before clearing the review. Without
