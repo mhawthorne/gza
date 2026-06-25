@@ -650,8 +650,8 @@ class TestBuildDockerCmd:
         assert "--rm" in cmd
         assert cmd[-1] == "test-image"
 
-    def test_mounts_git_dir_for_worktree(self, tmp_path):
-        """Should mount host .git dir when work_dir is a git worktree."""
+    def test_worktree_git_file_does_not_mount_shared_git_dir(self, tmp_path):
+        """A worktree .git file must not add an implicit shared host .git mount."""
         docker_config = DockerConfig(
             image_name="test-image",
             npm_package="@test/cli",
@@ -670,7 +670,12 @@ class TestBuildDockerCmd:
         (worktree_dir / ".git").write_text(f"gitdir: {fake_git_dir}\n")
 
         cmd = build_docker_cmd(docker_config, worktree_dir, timeout_minutes=10)
-        assert f"{main_git_dir}:{main_git_dir}" in " ".join(cmd)
+        v_indices = [i for i, x in enumerate(cmd) if x == "-v"]
+        volume_mounts = [cmd[i + 1] for i in v_indices]
+
+        assert f"{main_git_dir}:{main_git_dir}" not in volume_mounts
+        assert volume_mounts[0] == f"{worktree_dir}:/workspace"
+        assert any(".testconfig" in mount for mount in volume_mounts)
 
     def test_no_git_mount_for_regular_repo(self, tmp_path):
         """Should not add extra mount when .git is a directory (regular repo)."""
