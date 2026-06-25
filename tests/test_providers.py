@@ -22,6 +22,7 @@ from gza.providers import (
     get_provider,
 )
 from gza.providers.base import (
+    DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT,
     DOCKERFILE_TEMPLATE,
     GZA_SHIM_SETUP_COMMAND,
     _extract_startup_log_line,
@@ -223,6 +224,7 @@ class TestDockerConfig:
             env_vars=["ANTHROPIC_API_KEY"],
         )
 
+        assert DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT == DEFAULT_DOCKER_STARTUP_TIMEOUT
         assert config.docker_startup_timeout == DEFAULT_DOCKER_STARTUP_TIMEOUT
 
     def test_claude_docker_config(self, tmp_path):

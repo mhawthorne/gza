@@ -104,6 +104,7 @@ _DOCKER_DAEMON_ERROR_SNIPPETS = (
     "is the docker daemon running",
 )
 _DOCKER_CRASH_EXIT_CODES = frozenset({125, 126, 127, 137})
+DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT = DEFAULT_DOCKER_STARTUP_TIMEOUT
 
 
 @dataclass
@@ -114,7 +115,7 @@ class DockerConfig:
     cli_command: str
     config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
-    docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT
+    docker_startup_timeout: int = DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT
 
 
 def classify_provider_api_error(*, status: int | None, error_type: str | None, message: str | None) -> str | None:
