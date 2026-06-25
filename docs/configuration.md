@@ -1874,7 +1874,7 @@ watch:
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
 
-`watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule used by watch recovery backoff state. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
+`watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` enforces before relaunching the same transient failed recovery or improve action. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO      scope: tags=<comma-separated-tags> mode=any|all`.
