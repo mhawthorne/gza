@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gza import recovery_engine
-from gza.dispatch_preview import build_dispatch_preview
+from gza.dispatch_preview import build_dispatch_preview, plan_watch_dispatch_entries
 from gza.pickup import get_runnable_pending_tasks
 
 from tests.cli.conftest import make_store, setup_config
@@ -162,4 +162,62 @@ def test_build_dispatch_preview_recovery_first_explicit_filters_pending_to_expli
         failed_retry.id,
         ordered_one.id,
         ordered_two.id,
+    ]
+
+
+def test_plan_watch_dispatch_entries_caps_worker_recovery_and_preserves_preview_order(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    recovery_one = store.add("Failed implement one", task_type="implement")
+    assert recovery_one.id is not None
+    recovery_one.status = "failed"
+    recovery_one.failure_reason = "MAX_TURNS"
+    recovery_one.session_id = "sess-one"
+    recovery_one.completed_at = datetime(2026, 6, 24, 13, 0, 0, tzinfo=UTC)
+    store.update(recovery_one)
+
+    recovery_two = store.add("Failed implement two", task_type="implement")
+    assert recovery_two.id is not None
+    recovery_two.status = "failed"
+    recovery_two.failure_reason = "MAX_TURNS"
+    recovery_two.session_id = "sess-two"
+    recovery_two.completed_at = datetime(2026, 6, 24, 13, 5, 0, tzinfo=UTC)
+    store.update(recovery_two)
+
+    pending_one = store.add("Pending one", task_type="plan")
+    pending_two = store.add("Pending two", task_type="plan")
+    pending_three = store.add("Pending three", task_type="plan")
+    assert pending_one.id is not None
+    assert pending_two.id is not None
+    assert pending_three.id is not None
+
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=recovery_engine._MergeContext(git=None, default_branch=None),
+    ):
+        preview = build_dispatch_preview(
+            store,
+            tags=None,
+            any_tag=False,
+            max_recovery_attempts=1,
+        )
+
+    plan = plan_watch_dispatch_entries(
+        preview.runnable_entries,
+        slots=3,
+        recovery_slot_cap=1,
+        selection_mode="default",
+    )
+
+    assert plan.recovery_worker_slots == 1
+    assert plan.pending_slots == 2
+    assert [entry.task.id for entry in plan.entries] == [
+        recovery_one.id,
+        pending_one.id,
+        pending_two.id,
     ]

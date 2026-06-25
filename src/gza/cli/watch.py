@@ -38,6 +38,12 @@ from ..db import (
     WatchRecoveryBackoff,
     task_id_numeric_key,
 )
+from ..dispatch_preview import (
+    DispatchPreviewEntry,
+    DispatchSelectionMode,
+    build_dispatch_preview,
+    plan_watch_dispatch_entries,
+)
 from ..git import Git, GitError
 from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage_query import (
@@ -2067,6 +2073,41 @@ class _WatchCycleAnalysis:
     pending_recovery_task_ids: frozenset[str]
 
 
+def _normalize_watch_dispatch_selection_mode(
+    *,
+    recovery_mode: str | None,
+    recovery_slots: int,
+) -> DispatchSelectionMode:
+    if recovery_mode == "recovery-only":
+        return "recovery_only"
+    if recovery_mode == "pending-only" or recovery_slots <= 0:
+        return "pending_only"
+    if recovery_mode == "recovery-first":
+        return "recovery_first_explicit"
+    return "default"
+
+
+def _filter_watch_dispatch_preview_entries(
+    entries: Sequence[DispatchPreviewEntry],
+    *,
+    started_task_ids: set[str],
+    pending_recovery_task_ids: set[str],
+    step1_handled_child_task_ids: set[str],
+) -> tuple[DispatchPreviewEntry, ...]:
+    filtered: list[DispatchPreviewEntry] = []
+    for entry in entries:
+        task_id = entry.task.id
+        if task_id is None or str(task_id) in started_task_ids:
+            continue
+        if entry.lane == "pending" and (
+            str(task_id) in pending_recovery_task_ids
+            or str(task_id) in step1_handled_child_task_ids
+        ):
+            continue
+        filtered.append(entry)
+    return tuple(filtered)
+
+
 def allocate_watch_slots(
     *,
     slots: int,
@@ -3450,19 +3491,45 @@ def _run_cycle(
                 parked_recovery_subject_ids.add(str(failed.id))
                 if decision.recovery_task_id is not None:
                     pending_recovery_task_ids.add(decision.recovery_task_id)
-    pending_tasks = list(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
-    pending_candidates = [
-        task
-        for task in pending_tasks
-        if task.id is not None
-        and str(task.id) not in started_task_ids
-        and str(task.id) not in pending_recovery_task_ids
-        and str(task.id) not in step1_handled_child_task_ids
-    ]
+    dispatch_selection_mode = _normalize_watch_dispatch_selection_mode(
+        recovery_mode=recovery_mode,
+        recovery_slots=recovery_slots,
+    )
+    dispatch_preview = build_dispatch_preview(
+        store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        owner_rows=analysis.owner_rows,
+        read_context=analysis.watch_read_context,
+        tags=tags,
+        any_tag=any_tag,
+        max_recovery_attempts=max_recovery_attempts,
+        selection_mode=dispatch_selection_mode,
+    )
+    dispatch_candidate_entries = _filter_watch_dispatch_preview_entries(
+        dispatch_preview.runnable_entries,
+        started_task_ids=started_task_ids,
+        pending_recovery_task_ids=pending_recovery_task_ids,
+        step1_handled_child_task_ids=step1_handled_child_task_ids,
+    )
+    dispatch_recovery_preview_entries = _filter_watch_dispatch_preview_entries(
+        dispatch_preview.recovery_entries,
+        started_task_ids=started_task_ids,
+        pending_recovery_task_ids=pending_recovery_task_ids,
+        step1_handled_child_task_ids=step1_handled_child_task_ids,
+    )
+    dispatch_recovery_task_ids = {
+        str(entry.task.id)
+        for entry in dispatch_recovery_preview_entries
+        if entry.task.id is not None
+    }
     active_backoff_recovery_subject_ids: set[str] = set()
     if not dry_run:
         for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
             if failed.id is None:
+                continue
+            if str(failed.id) not in dispatch_recovery_task_ids:
                 continue
             if str(failed.id) in parked_recovery_subject_ids:
                 continue
@@ -3478,33 +3545,36 @@ def _run_cycle(
     launchable_recovery_subject_ids = {
         str(failed.id)
         for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
+        if str(failed.id) in dispatch_recovery_task_ids
         if str(failed.id) not in parked_recovery_subject_ids
         and str(failed.id) not in active_backoff_recovery_subject_ids
     }
-    worker_consuming_launchable_recovery_count = sum(
-        1
-        for _row, failed, _decision, _action, worker_consuming, _action_task in actionable_failed
-        if worker_consuming and str(failed.id) in launchable_recovery_subject_ids
+    dispatch_launchable_entries = tuple(
+        entry
+        for entry in dispatch_candidate_entries
+        if entry.lane != "recovery"
+        or str(entry.task.id) not in parked_recovery_subject_ids
+        and str(entry.task.id) not in active_backoff_recovery_subject_ids
     )
-    slot_allocation = allocate_watch_slots(
+    pending_tasks = [
+        entry.task
+        for entry in dispatch_launchable_entries
+        if entry.lane == "pending" and entry.task.id is not None
+    ]
+    dispatch_plan = plan_watch_dispatch_entries(
+        dispatch_launchable_entries,
         slots=slots,
-        recovery_slots_config=recovery_slots,
-        actionable_recovery_count=len(launchable_recovery_subject_ids),
-        worker_consuming_recovery_count=worker_consuming_launchable_recovery_count,
-        pending_count=len(pending_candidates),
-        gate_pending_on_actionable_recovery=(
-            recovery_mode == "recovery-only"
-            and bool(launchable_recovery_subject_ids)
-        ),
+        recovery_slot_cap=recovery_slots,
+        selection_mode=dispatch_selection_mode,
     )
-    reserved_recovery_slots = slot_allocation.recovery_slots
-    pending_slots = slot_allocation.pending_slots
+    reserved_recovery_slots = dispatch_plan.recovery_worker_slots
+    pending_slots = dispatch_plan.pending_slots
     nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids)
     recovery_started_this_cycle = False
     for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
-        if recovery_slots <= 0:
-            break
         if failed.id is None:
+            continue
+        if str(failed.id) not in dispatch_recovery_task_ids:
             continue
         if str(failed.id) in parked_recovery_subject_ids:
             if not dry_run:
@@ -3859,6 +3929,27 @@ def _run_cycle(
 
     if recovery_mode == "recovery-only" and pending_slots <= 0 and not recovery_started_this_cycle:
         if not nonparked_recovery_subject_ids:
+            pending_fallback_preview = build_dispatch_preview(
+                store,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+                tags=tags,
+                any_tag=any_tag,
+                max_recovery_attempts=max_recovery_attempts,
+                selection_mode="pending_only",
+                include_recovery=False,
+            )
+            pending_tasks = [
+                entry.task
+                for entry in _filter_watch_dispatch_preview_entries(
+                    pending_fallback_preview.runnable_entries,
+                    started_task_ids=started_task_ids,
+                    pending_recovery_task_ids=pending_recovery_task_ids,
+                    step1_handled_child_task_ids=step1_handled_child_task_ids,
+                )
+                if entry.lane == "pending" and entry.task.id is not None
+            ]
             pending_slots = slots
 
     # 3) Start new queued tasks (consumes slots)

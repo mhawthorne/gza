@@ -17,6 +17,12 @@ import pytest
 from rich.console import Console
 
 from gza.concurrency import MaxConcurrentTasksError
+from gza.dispatch_preview import (
+    DispatchPreview,
+    DispatchPreviewEntry,
+    build_dispatch_preview,
+    plan_watch_dispatch_entries,
+)
 from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
@@ -2711,6 +2717,74 @@ def test_watch_cycle_default_recovery_slot_caps_pending_implement_starts(tmp_pat
     pending_calls = [call for call in spawn_iterate.call_args_list if call.args[2].id in pending_ids]
     assert len(recovery_calls) == 1
     assert len(pending_calls) == 2
+
+
+def test_watch_cycle_dry_run_matches_shared_preview_dispatch_plan_order(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-preview-parity"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    pending_impl = store.add("Pending implement", task_type="implement")
+    pending_plan_two = store.add("Pending plan two", task_type="plan")
+    assert pending_plan.id is not None
+    assert pending_impl.id is not None
+    assert pending_plan_two.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    preview = build_dispatch_preview(
+        store,
+        config=config,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    plan = plan_watch_dispatch_entries(
+        preview.runnable_entries,
+        slots=3,
+        recovery_slot_cap=config.watch.recovery_slots,
+        selection_mode="default",
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    dispatched_ids: list[str] = []
+    for line in log_lines:
+        if "RECOVR" in line:
+            dispatched_ids.append(failed.id)
+        elif "START" in line and "[dry-run]" in line:
+            for task_id in (pending_plan.id, pending_impl.id, pending_plan_two.id):
+                if isinstance(task_id, str) and task_id in line:
+                    dispatched_ids.append(task_id)
+                    break
+    assert dispatched_ids == [entry.task.id for entry in plan.entries]
 
 
 def test_watch_cycle_dry_run_caps_pending_implement_preview_to_allocated_slots(tmp_path: Path) -> None:
@@ -12308,6 +12382,19 @@ def test_watch_cycle_pending_implement_retry_respects_active_transient_backoff(
         patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("implement recovery should stay pending during backoff")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("implement recovery should iterate when due")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("implement recovery should not spawn before cooldown is due")),
@@ -12460,6 +12547,19 @@ def test_watch_cycle_pending_improve_recovery_worker_respects_active_transient_b
         patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("improve recovery should stay on worker path")),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("improve recovery should stay on worker path")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=record_worker_spawn),
@@ -12842,6 +12942,19 @@ def test_watch_cycle_pending_review_retry_respects_active_transient_backoff(
         patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("review retry should stay on worker path")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("review retry should not iterate")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("review retry should not spawn before cooldown is due")),
@@ -13221,6 +13334,27 @@ def test_watch_cycle_active_recovery_backoff_does_not_consume_pending_slot(
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_plan]),
         patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=failed,
+                        runnable=True,
+                        worker_consuming=True,
+                        owner_task=failed,
+                        decision=decision,
+                    ),
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_plan,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
+        patch(
             "gza.cli.watch._spawn_background_iterate",
             side_effect=AssertionError("recovery launch should stay deferred during active cooldown"),
         ),
@@ -13386,6 +13520,25 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry, pending_plan]),
         patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_plan,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
+        patch(
             "gza.cli.watch._spawn_background_iterate",
             side_effect=AssertionError("improve recovery launch should stay deferred during active cooldown"),
         ),
@@ -13539,6 +13692,19 @@ def test_watch_cycle_due_improve_transient_backoff_launches_again(
         patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("improve retry should iterate")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("due improve retry should not iterate")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=record_launch),
@@ -13710,6 +13876,19 @@ def test_watch_cycle_due_improve_transient_backoff_preserves_prior_streak_and_do
         patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            ),
+        ),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("improve retry should iterate")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("due improve retry should not iterate")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=record_launch),
@@ -19308,14 +19487,16 @@ def test_watch_cycle_recomputes_pending_tasks_after_lifecycle_execution_outside_
 
     def _fake_pending_tasks(*_args, **_kwargs):
         pending_reads["count"] += 1
-        if cache_state["active"]:
-            phases.append("read-pending-analysis")
-        elif lifecycle_executed["done"]:
-            phases.append("read-pending-post-lifecycle")
-            return [pending]
-        else:
-            phases.append("read-pending-prewake")
+        phases.append("read-pending-prewake")
         return []
+
+    def _fake_build_dispatch_preview(*args, **kwargs):
+        assert cache_state["active"] is False
+        assert lifecycle_executed["done"] is True
+        phases.append("build-dispatch-preview-post-lifecycle")
+        preview = build_dispatch_preview(*args, **kwargs)
+        assert [entry.task.id for entry in preview.pending_entries] == [pending.id]
+        return preview
 
     def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
         assert cache_state["active"] is True
@@ -19362,6 +19543,7 @@ def test_watch_cycle_recomputes_pending_tasks_after_lifecycle_execution_outside_
         patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", side_effect=_fake_pending_tasks),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=_fake_build_dispatch_preview),
         patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
         patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=_fake_prepare),
@@ -19377,8 +19559,7 @@ def test_watch_cycle_recomputes_pending_tasks_after_lifecycle_execution_outside_
         )
 
     assert result.work_done is True
-    assert pending_reads["count"] >= 2
-    assert "read-pending-analysis" not in phases
+    assert pending_reads["count"] >= 1
     assert phases[:5] == [
         "read-pending-prewake",
         "cache-enter",
@@ -19387,7 +19568,7 @@ def test_watch_cycle_recomputes_pending_tasks_after_lifecycle_execution_outside_
         "execute-advance-action",
     ]
     assert phases[5:8] == [
-        "read-pending-post-lifecycle",
+        "build-dispatch-preview-post-lifecycle",
         "prepare-pending",
         "spawn-iterate",
     ]

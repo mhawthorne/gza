@@ -80,12 +80,23 @@ class DispatchPreview:
         return tuple(entry for entry in self.entries if entry.lane == "pending")
 
 
+@dataclass(frozen=True)
+class WatchDispatchPlan:
+    """Shared watch dispatch slice derived from the runnable preview order."""
+
+    entries: tuple[DispatchPreviewEntry, ...]
+    recovery_worker_slots: int
+    pending_slots: int
+
+
 def build_dispatch_preview(
     store: SqliteTaskStore,
     *,
     config: Config | None = None,
     git: Git | None = None,
     target_branch: str | None = None,
+    owner_rows: tuple[LineageOwnerRow, ...] | None = None,
+    read_context: RecoveryReadContext | None = None,
     tags: tuple[str, ...] | None,
     any_tag: bool,
     max_recovery_attempts: int,
@@ -110,6 +121,8 @@ def build_dispatch_preview(
             config=config,
             git=git,
             target_branch=target_branch,
+            owner_rows=owner_rows,
+            read_context=read_context,
             tags=normalized_tags,
             any_tag=any_tag,
             max_recovery_attempts=max_recovery_attempts,
@@ -131,6 +144,70 @@ def build_dispatch_preview(
     )
 
 
+def plan_watch_dispatch_entries(
+    entries: tuple[DispatchPreviewEntry, ...],
+    *,
+    slots: int,
+    recovery_slot_cap: int,
+    selection_mode: DispatchSelectionMode,
+) -> WatchDispatchPlan:
+    """Return the watch execution slice for one ordered preview candidate set."""
+    _validate_dispatch_preview_policy(
+        selection_mode=selection_mode,
+        order_policy=DEFAULT_DISPATCH_ORDER_POLICY,
+    )
+    if slots <= 0:
+        return WatchDispatchPlan(entries=(), recovery_worker_slots=0, pending_slots=0)
+
+    runnable_entries = tuple(entry for entry in entries if entry.runnable)
+    if selection_mode == "recovery_only":
+        recovery_worker_slots = min(
+            slots,
+            sum(1 for entry in runnable_entries if entry.lane == "recovery" and entry.worker_consuming),
+        )
+        pending_slots = 0
+    elif selection_mode == "pending_only":
+        recovery_worker_slots = 0
+        pending_slots = min(
+            slots,
+            sum(1 for entry in runnable_entries if entry.lane == "pending"),
+        )
+    else:
+        recovery_worker_slots = min(
+            slots,
+            max(0, recovery_slot_cap),
+            sum(1 for entry in runnable_entries if entry.lane == "recovery" and entry.worker_consuming),
+        )
+        pending_slots = min(
+            max(0, slots - recovery_worker_slots),
+            sum(1 for entry in runnable_entries if entry.lane == "pending"),
+        )
+
+    remaining_recovery_worker_slots = recovery_worker_slots
+    remaining_pending_slots = pending_slots
+    planned_entries: list[DispatchPreviewEntry] = []
+    for entry in runnable_entries:
+        if entry.lane == "recovery":
+            if not entry.worker_consuming:
+                planned_entries.append(entry)
+                continue
+            if remaining_recovery_worker_slots <= 0:
+                continue
+            planned_entries.append(entry)
+            remaining_recovery_worker_slots -= 1
+            continue
+        if remaining_pending_slots <= 0:
+            continue
+        planned_entries.append(entry)
+        remaining_pending_slots -= 1
+
+    return WatchDispatchPlan(
+        entries=tuple(planned_entries),
+        recovery_worker_slots=recovery_worker_slots,
+        pending_slots=pending_slots,
+    )
+
+
 def _validate_dispatch_preview_policy(
     *,
     selection_mode: DispatchSelectionMode,
@@ -148,24 +225,30 @@ def _build_recovery_preview_entries(
     config: Config | None,
     git: Git | None,
     target_branch: str | None,
+    owner_rows: tuple[LineageOwnerRow, ...] | None,
+    read_context: RecoveryReadContext | None,
     tags: tuple[str, ...] | None,
     any_tag: bool,
     max_recovery_attempts: int,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext, tuple[DispatchPreviewEntry, ...]]:
-    owner_rows, read_context = query_lineage_owner_rows_in_read_session(
-        store,
-        LineageOwnerQuery(
-            limit=None,
-            tags=tags,
-            any_tag=any_tag,
-            include_skipped=True,
-            exclude_dropped_from_planning=True,
-            max_recovery_attempts=max_recovery_attempts,
-        ),
-        config=config,
-        git=git,
-        target_branch=target_branch,
-    )
+    if owner_rows is None:
+        owner_rows, read_context = query_lineage_owner_rows_in_read_session(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                tags=tags,
+                any_tag=any_tag,
+                include_skipped=True,
+                exclude_dropped_from_planning=True,
+                max_recovery_attempts=max_recovery_attempts,
+            ),
+            config=config,
+            git=git,
+            target_branch=target_branch,
+        )
+    else:
+        owner_rows = tuple(owner_rows)
+        read_context = read_context or RecoveryReadContext()
     failed_rows = [
         row
         for row in owner_rows
