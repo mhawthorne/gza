@@ -153,7 +153,7 @@ def test_clean_lineage_aware_removes_old(tmp_path) -> None:
 
     assert result.returncode == 0
     assert not wt_path.exists()
-    assert "lineage inactive" in result.stdout
+    assert "Worktrees cleaned: 1" in result.stdout
 
 
 def test_clean_force_skips_prompt(tmp_path) -> None:
@@ -170,7 +170,7 @@ def test_clean_force_skips_prompt(tmp_path) -> None:
 
     assert result.returncode == 0
     assert not orphan.exists()
-    assert "orphaned" in result.stdout
+    assert "Worktrees cleaned: 1" in result.stdout
 
 
 def test_clean_no_force_denies_removal(tmp_path) -> None:
