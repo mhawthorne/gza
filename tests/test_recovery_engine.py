@@ -2581,7 +2581,7 @@ def test_recovery_engine_prerequisite_unmerged_legacy_empty_with_task_commits_re
     assert unit.state == "empty"
 
 
-def test_recovery_engine_prerequisite_unmerged_stays_dependency_not_ready_when_dependency_is_empty(
+def test_recovery_engine_prerequisite_unmerged_empty_dependency_does_not_become_retryable(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -2613,9 +2613,8 @@ def test_recovery_engine_prerequisite_unmerged_stays_dependency_not_ready_when_d
 
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert decision.action == "skip"
-    assert decision.reason_code == "dependency_not_ready"
-    assert decision.reason_text == "dependency precondition not satisfied"
-    assert list_failed_tasks_for_recovery(store) == []
+    assert decision.reason_code == "legacy_prerequisite_unmerged_parked"
+    assert "legacy dependency-merge failure is parked" in decision.reason_text
 
 
 def test_recovery_engine_prerequisite_unmerged_empty_session_backed_failure_stays_visible_after_dependency_merge(

@@ -11,7 +11,6 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza import dependency_preconditions as dependency_preconditions_module
 from gza.db import (
     DB_UNSET,
     SCHEMA_VERSION,
@@ -5237,7 +5236,7 @@ class TestRetryChainDependencyResolution:
         assert resolved.id == retry.id
 
     def test_recovered_dependency_uses_canonical_lineage_merge_unit(self, tmp_path: Path) -> None:
-        """Resolved retry completions must still follow the original dependency merge unit."""
+        """Resolved retry completions must use the completed retry descendant's merge unit."""
         store = self._make_store(tmp_path)
         dep = store.add("Original dependency", task_type="implement")
         store.mark_completed(dep, has_commits=True, branch="feature/original-dependency")
@@ -5253,16 +5252,18 @@ class TestRetryChainDependencyResolution:
         retry = store.add("Recovered dependency", task_type="implement", based_on=dep.id)
         store.mark_completed(retry, has_commits=True, branch="feature/original-dependency-recovered")
         assert retry.id is not None
+        retry_unit = store.resolve_merge_unit_for_task(retry.id)
+        assert retry_unit is not None
 
         downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
         readiness = store.get_dependency_readiness(downstream)
         assert readiness.ready is False
-        assert readiness.blocking_merge_unit_id == unit.id
+        assert readiness.blocking_merge_unit_id == retry_unit.id
         assert readiness.blocking_merge_state == "unmerged"
-        assert readiness.blocking_merge_unit_owner_task_id == dep.id
+        assert readiness.blocking_merge_unit_owner_task_id == retry.id
         assert store.get_pending_pickup() == []
 
-        store.set_merge_unit_state(unit.id, "merged")
+        store.set_merge_unit_state(retry_unit.id, "merged")
 
         readiness = store.get_dependency_readiness(downstream)
         assert readiness.ready is True
@@ -5384,39 +5385,14 @@ class TestRetryChainDependencyResolution:
         assert readiness.blocking_task_id == plan.id
         assert store.get_pending_pickup() == []
 
-    def test_completed_empty_implement_dependency_blocks_by_default(self, tmp_path: Path):
-        """Completed empty implement prerequisites stay blocked by default."""
+    def test_completed_empty_implement_dependency_is_runnable(self, tmp_path: Path):
+        """Completed empty implement prerequisites satisfy readiness and pickup."""
         store = self._make_store(tmp_path)
         dep = store.add("Dep", task_type="implement")
         self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-default")
         downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
 
         assert store.resolve_dependency_completion(downstream) is not None
-        assert store.get_next_pending() is None
-        assert store.get_pending_pickup() == []
-
-        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
-        assert is_blocked is True
-        assert blocking_id == dep.id
-        assert blocking_status == "completed"
-
-        assert store.count_blocked_tasks() == 1
-
-    def test_completed_empty_implement_dependency_is_runnable_when_policy_enabled(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Toggling the empty-prereq policy must flip pickup and blocked semantics together."""
-        store = self._make_store(tmp_path)
-        dep = store.add("Dep", task_type="implement")
-        self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-toggle")
-        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
-
-        monkeypatch.setattr(
-            dependency_preconditions_module,
-            "empty_prereq_satisfies_dependency",
-            lambda _store, _prereq, _dependent: True,
-        )
-
         next_task = store.get_next_pending()
         assert next_task is not None
         assert next_task.id == downstream.id
@@ -5428,6 +5404,89 @@ class TestRetryChainDependencyResolution:
         assert blocking_status is None
 
         assert store.count_blocked_tasks() == 0
+
+    def test_failed_empty_implement_dependency_stays_blocked(self, tmp_path: Path) -> None:
+        """Failed empty implement prerequisites remain blocked pending recovery."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep", task_type="implement")
+        self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-toggle")
+        assert dep.id is not None
+        dep = store.get(dep.id)
+        assert dep is not None
+        store.mark_failed(dep, failure_reason="UNKNOWN")
+        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+        assert store.get_next_pending() is None
+        assert store.get_pending_pickup() == []
+
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
+        assert is_blocked is True
+        assert blocking_id == dep.id
+        assert blocking_status == "failed"
+
+        assert store.count_blocked_tasks() == 1
+
+    def test_completed_empty_retry_descendant_unblocks_downstream(self, tmp_path: Path) -> None:
+        """A completed empty retry descendant satisfies dependents of the failed original."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep", task_type="implement")
+        assert dep.id is not None
+        store.mark_failed(dep, failure_reason="UNKNOWN")
+
+        retry = store.add("Retry", task_type="implement", based_on=dep.id, recovery_origin="retry")
+        assert retry.id is not None
+        self._complete_implement_with_branch(store, retry, branch="feature/retry-empty-ready")
+
+        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+        next_task = store.get_next_pending()
+        assert next_task is not None
+        assert next_task.id == downstream.id
+        assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
+
+        is_blocked, blocking_id, blocking_status = store.is_task_blocked(downstream)
+        assert is_blocked is False
+        assert blocking_id is None
+        assert blocking_status is None
+        assert store.count_blocked_tasks() == 0
+
+    def test_failed_empty_dependency_with_unmerged_completed_retry_stays_blocked(self, tmp_path: Path) -> None:
+        """Failed parent empty evidence must not satisfy a distinct unmerged retry descendant."""
+        store = self._make_store(tmp_path)
+        dep = store.add("Dep", task_type="implement")
+        assert dep.id is not None
+        self._complete_implement_with_branch(store, dep, branch="feature/dep-empty-parent")
+        dep = store.get(dep.id)
+        assert dep is not None
+        store.mark_failed(dep, failure_reason="UNKNOWN")
+
+        retry = store.add("Retry", task_type="implement", based_on=dep.id, recovery_origin="retry")
+        assert retry.id is not None
+        retry = self._complete_implement_with_branch(
+            store,
+            retry,
+            branch="feature/retry-unmerged-blocked",
+            merge_state="unmerged",
+        )
+        retry_unit = store.resolve_merge_unit_for_task(retry.id)
+        assert retry_unit is not None
+
+        downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
+
+        readiness = store.get_dependency_readiness(downstream)
+        assert readiness.ready is False
+        assert readiness.reason == "unmerged"
+        assert readiness.resolved_dependency is not None
+        assert readiness.resolved_dependency.id == retry.id
+        assert readiness.blocking_merge_unit_id == retry_unit.id
+        assert readiness.blocking_merge_state == "unmerged"
+        assert readiness.blocking_merge_unit_owner_task_id == retry.id
+        assert readiness.blocking_source_branch == "feature/retry-unmerged-blocked"
+
+        assert store.get_next_pending() is None
+        assert store.get_pending_pickup() == []
+        assert store.is_task_blocked(downstream) == (True, retry.id, "completed")
+        assert store.count_blocked_tasks() == 1
 
     # --- count_blocked_tasks ---
 

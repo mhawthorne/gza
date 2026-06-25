@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 import gza.recovery_engine as recovery_engine
-from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -1458,9 +1457,7 @@ def test_dependency_state_blocked_by_dropped_dep_filters_pending_only(tmp_path: 
     assert blocked_resolved.id not in ids
 
 
-def test_dependency_state_completed_empty_prereq_is_unblocked_when_policy_enabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dependency_state_completed_empty_prereq_is_unblocked(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty dependency", task_type="implement")
@@ -1472,12 +1469,6 @@ def test_dependency_state_completed_empty_prereq_is_unblocked_when_policy_enable
 
     blocked = store.add("Blocked downstream", task_type="implement", depends_on=dep.id)
     ready = store.add("Ready task", task_type="task")
-
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
-    )
 
     service = TaskQueryService(store)
     blocked_result = service.run(
@@ -1495,7 +1486,7 @@ def test_dependency_state_completed_empty_prereq_is_unblocked_when_policy_enable
     assert ready.id in unblocked_ids
 
 
-def test_dependency_state_completed_empty_prereq_blocks_by_default(tmp_path: Path) -> None:
+def test_dependency_state_failed_empty_prereq_stays_blocked(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty dependency", task_type="implement")
@@ -1504,6 +1495,9 @@ def test_dependency_state_completed_empty_prereq_blocks_by_default(tmp_path: Pat
     unit = store.resolve_merge_unit_for_task(dep.id)
     assert unit is not None
     store.set_merge_unit_state(unit.id, "empty")
+    dep = store.get(dep.id)
+    assert dep is not None
+    store.mark_failed(dep, failure_reason="UNKNOWN")
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dep.id)
 
@@ -1522,7 +1516,7 @@ def test_dependency_state_completed_empty_prereq_blocks_by_default(tmp_path: Pat
     assert downstream.id not in unblocked_ids
 
 
-def test_incomplete_preset_empty_prereq_sets_awaiting_human_by_default(tmp_path: Path) -> None:
+def test_incomplete_preset_failed_empty_prereq_sets_awaiting_human(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     dep = store.add("Empty prerequisite", task_type="implement")
@@ -1531,6 +1525,9 @@ def test_incomplete_preset_empty_prereq_sets_awaiting_human_by_default(tmp_path:
     unit = store.resolve_merge_unit_for_task(dep.id)
     assert unit is not None
     store.set_merge_unit_state(unit.id, "empty")
+    dep = store.get(dep.id)
+    assert dep is not None
+    store.mark_failed(dep, failure_reason="PREREQUISITE_UNMERGED")
 
     downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
     assert downstream.id is not None

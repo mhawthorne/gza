@@ -76,10 +76,18 @@ Consequences:
 - `empty`/`redundant` + predicate **true** = **recoverable**. The task MUST stay eligible
   for the normal recovery policy and MUST NOT be suppressed merely because the branch
   currently has no commits to land.
+- A failed recoverable `empty`/`redundant` task MUST continue to block downstream
+  merge-required dependencies until recovery resolves it through a valid completed
+  representative. Terminal no-work merge evidence alone is not enough while the failed
+  task remains recoverable.
 - A no-change / no-commit failed run whose branch resolves to `empty` or `redundant`
   against the target MUST persist a canonical non-`UNKNOWN` no-work failure reason
   (currently `TERMINAL_NO_WORK`) and MUST be classified through this shared no-work
   policy rather than falling back to `UNKNOWN` / manual-only parking.
+- Conversely, a successful no-op code path with trustworthy completion evidence and green
+  verification is terminal moot work, not failed recovery: it MUST persist as
+  `status == "completed"` plus authoritative `empty`/`redundant` merge evidence, and it
+  therefore satisfies downstream merge-required dependencies under `lineage.md` L1.
 
 ### 2. Resume vs retry vs manual
 
@@ -185,11 +193,6 @@ its stored action.
 
 ## Open questions
 
-- **OQ1 — Empty dependency semantics after recoverable failure.** If a failed
-  implementation is `empty` but still recoverable, should downstream merge-required
-  dependencies remain blocked until recovery resolves, or is `empty` still sufficient to
-  satisfy those dependencies immediately? The current contract for empty dependencies
-  lives in `lineage.md`; recovery-aware dependency semantics may need a follow-up spec.
-- **OQ2 — Provider evidence fidelity.** The fail-closed rule assumes step/token capture
+- **OQ1 — Provider evidence fidelity.** The fail-closed rule assumes step/token capture
   can be incomplete. If providers become fully reliable here, the predicate may be
   tightened later at this single policy point.

@@ -107,6 +107,9 @@ and default to **off**.
 ### §2 — No actionable branch
 
 - A completed task with no branch (nothing to land) MUST `skip`.
+- A completed branch-backed task whose authoritative merge-unit state is `empty` or
+  `redundant` is also terminal no-action work: it MUST `skip` merge/review creation, and
+  any merge-required dependent MUST treat it as satisfied under `lineage.md` L1.
 - A non-completed task with no branch MUST `skip` (no merge action is possible yet).
 
 ### §3 — Strict project scope gate (safety, runs before any code action)

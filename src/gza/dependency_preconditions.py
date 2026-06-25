@@ -34,14 +34,9 @@ def empty_prereq_satisfies_dependency(
     prereq: DbTask,
     dependent: DbTask,
 ) -> bool:
-    """Policy hook for whether an empty prerequisite satisfies a dependency.
-
-    Conservative default: an empty prerequisite is not merged work, so
-    downstream merge-required tasks stay blocked unless this one policy point is
-    deliberately flipped.
-    """
-    del store, prereq, dependent
-    return False
+    """Return whether terminal no-work prerequisite evidence satisfies a dependency."""
+    del store, dependent
+    return prereq.status == "completed"
 
 
 def plan_dependency_awaits_review(task: DbTask) -> bool:
@@ -290,9 +285,16 @@ def _resolved_dependency_lineage_satisfies_task_readiness(
     merge_unit = merge_resolution.merge_unit
     if merge_unit is None:
         return task_satisfies_merge_dependency(store, resolved_dep, dependent, read_context=read_context)
+    if (
+        resolved_dep.id is not None
+        and direct_dep.id is not None
+        and resolved_dep.id != direct_dep.id
+        and (merge_resolution.attached_task is None or merge_resolution.attached_task.id != resolved_dep.id)
+    ):
+        return task_satisfies_merge_dependency(store, resolved_dep, dependent, read_context=read_context)
     if merge_unit.state == "merged":
         return True
     if merge_unit.state in TERMINAL_NO_WORK_MERGE_STATES:
-        prereq = merge_resolution.attached_task or direct_dep
+        prereq = resolved_dep if resolved_dep.status == "completed" else merge_resolution.attached_task or direct_dep
         return empty_prereq_satisfies_dependency(store, prereq, dependent)
     return False

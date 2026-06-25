@@ -1164,7 +1164,7 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     assert f"uv run gza implement {plan.id}" in row.next_action["description"]
 
 
-def test_query_lineage_owner_rows_empty_prereq_surfaces_release_valve_by_default(tmp_path: Path) -> None:
+def test_query_lineage_owner_rows_completed_empty_prereq_is_not_awaiting_human(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -1194,13 +1194,7 @@ def test_query_lineage_owner_rows_empty_prereq_surfaces_release_valve_by_default
         target_branch="main",
     )
 
-    assert len(rows) == 1
-    row = rows[0]
-    assert row.owner_task.id == downstream.id
-    assert row.next_action is not None
-    assert row.next_action["type"] == "awaiting_human"
-    assert "empty prerequisite" in row.next_action["description"]
-    assert "gza-4072" in row.next_action["description"]
+    assert rows == ()
 
 
 def test_blocked_by_empty_prereq_label_uses_direct_empty_dependency_from_read_context(
@@ -1222,6 +1216,7 @@ def test_blocked_by_empty_prereq_label_uses_direct_empty_dependency_from_read_co
 
     read_context = _read_context_for_store(store)
     store_label = blocked_by_empty_prereq_label(store, downstream)
+    assert store_label is None
 
     def _unexpected_store_lookup(*_args, **_kwargs):
         raise AssertionError("indexed empty-prerequisite resolution should not hit the store")
@@ -1313,7 +1308,7 @@ def test_blocked_by_empty_prereq_label_uses_completed_retry_descendant_from_read
 
     read_context = _read_context_for_store(store)
     store_label = blocked_by_empty_prereq_label(store, downstream)
-    assert store_label == f"blocked by {retry.id} (empty prerequisite; manual release tracked by gza-4072 / `gza edit --clear-depends-on`)"
+    assert store_label is None
 
     def _unexpected_store_lookup(*_args, **_kwargs):
         raise AssertionError("indexed retry-descendant prerequisite resolution should not hit the store")
@@ -2511,6 +2506,64 @@ def test_blocked_by_empty_prereq_label_matches_indexed_context_for_completed_ret
         dependent,
         read_context=read_context,
     )
+
+
+def test_blocked_by_empty_prereq_label_ignores_failed_parent_empty_when_retry_descendant_is_unmerged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dependency = store.add("Failed dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "failed"
+    dependency.failure_reason = "UNKNOWN"
+    dependency.branch = "feature/parent-empty-only"
+    dependency.has_commits = False
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    parent_unit = store.create_merge_unit(
+        source_branch=dependency.branch,
+        target_branch="main",
+        owner_task_id=dependency.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(dependency.id, parent_unit.id, "owner")
+
+    retry = store.add("Completed retry", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    assert retry.id is not None
+    retry.status = "completed"
+    retry.branch = "feature/retry-still-unmerged"
+    retry.has_commits = True
+    retry.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    retry.merge_status = "unmerged"
+    store.update(retry)
+
+    retry_unit = store.create_merge_unit(
+        source_branch=retry.branch,
+        target_branch="main",
+        owner_task_id=retry.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(retry.id, retry_unit.id, "owner")
+
+    downstream = store.add("Held downstream", task_type="implement", depends_on=dependency.id)
+    assert downstream.id is not None
+
+    read_context = _read_context_for_store(store)
+    store_label = blocked_by_empty_prereq_label(store, downstream)
+    assert store_label is None
+
+    def _unexpected_store_lookup(*_args, **_kwargs):
+        raise AssertionError("indexed prerequisite label resolution should not hit the store")
+
+    monkeypatch.setattr(store, "get", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_merge_unit_for_task", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_dependency_completion", _unexpected_store_lookup)
+
+    assert blocked_by_empty_prereq_label(store, downstream, read_context=read_context) == store_label
 
 
 def test_read_context_preserves_store_based_on_child_order(tmp_path: Path) -> None:

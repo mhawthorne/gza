@@ -42,7 +42,7 @@ def test_dependency_precondition_reads_merge_unit_state(tmp_path: Path) -> None:
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_precondition_empty_unit_blocks_by_default(tmp_path: Path) -> None:
+def test_dependency_precondition_completed_empty_unit_unblocks(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
     dependency = store.add("Dependency", task_type="implement")
@@ -55,12 +55,10 @@ def test_dependency_precondition_empty_unit_blocks_by_default(tmp_path: Path) ->
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
     assert callable(empty_prereq_satisfies_dependency)
-    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+    assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_precondition_empty_policy_can_unblock_dependency(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_dependency_precondition_failed_empty_unit_stays_blocked(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
     dependency = store.add("Dependency", task_type="implement")
@@ -69,21 +67,19 @@ def test_dependency_precondition_empty_policy_can_unblock_dependency(
     unit = store.resolve_merge_unit_for_task(dependency.id)
     assert unit is not None
     store.set_merge_unit_state(unit.id, "empty")
+    dependency = store.get(dependency.id)
+    assert dependency is not None
+    store.mark_failed(dependency, failure_reason="UNKNOWN")
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
-    )
-
+    readiness = dependency_readiness(store, downstream)
+    assert readiness.ready is False
+    assert readiness.reason == "failed"
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_precondition_redundant_unit_uses_empty_release_policy(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_dependency_precondition_redundant_unit_uses_completed_empty_policy(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
     dependency = store.add("Dependency", task_type="implement")
@@ -95,19 +91,11 @@ def test_dependency_precondition_redundant_unit_uses_empty_release_policy(
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
-    assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
-
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
-    )
-
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
-def test_dependency_readiness_redundant_direct_dependency_without_resolved_descendant_uses_empty_release_policy(
-    tmp_path: Path, monkeypatch
+def test_dependency_readiness_redundant_direct_failed_dependency_without_resolved_descendant_stays_blocked(
+    tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
@@ -124,19 +112,12 @@ def test_dependency_readiness_redundant_direct_dependency_without_resolved_desce
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
-    monkeypatch.setattr(
-        dependency_preconditions_module,
-        "empty_prereq_satisfies_dependency",
-        lambda _store, _prereq, _dependent: True,
-    )
-
     readiness = dependency_readiness(store, downstream)
 
-    assert readiness.ready is True
+    assert readiness.ready is False
+    assert readiness.reason == "failed"
     assert readiness.direct_dependency is not None
     assert readiness.direct_dependency.id == dependency.id
-    assert readiness.resolved_dependency is not None
-    assert readiness.resolved_dependency.id == dependency.id
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
@@ -193,6 +174,9 @@ def test_dependency_precondition_uses_canonical_dependency_lineage_merge_unit(tm
 
     recovered = store.add("Recovered dependency", task_type="implement", based_on=dependency.id)
     store.mark_completed(recovered, has_commits=True, branch="feature/dependency-lineage-recovered")
+    assert recovered.id is not None
+    recovered_unit = store.resolve_merge_unit_for_task(recovered.id)
+    assert recovered_unit is not None
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
@@ -201,11 +185,11 @@ def test_dependency_precondition_uses_canonical_dependency_lineage_merge_unit(tm
     assert blocking_dep.id == recovered.id
 
     readiness = store.get_dependency_readiness(downstream)
-    assert readiness.blocking_merge_unit_id == unit.id
-    assert readiness.blocking_merge_unit_owner_task_id == dependency.id
-    assert readiness.blocking_source_branch == "feature/dependency-lineage"
+    assert readiness.blocking_merge_unit_id == recovered_unit.id
+    assert readiness.blocking_merge_unit_owner_task_id == recovered.id
+    assert readiness.blocking_source_branch == "feature/dependency-lineage-recovered"
 
-    store.set_merge_unit_state(unit.id, "merged")
+    store.set_merge_unit_state(recovered_unit.id, "merged")
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
@@ -276,6 +260,74 @@ def test_failed_held_plan_dependency_stays_blocked_after_completed_retry_descend
     released_readiness = store.get_dependency_readiness(downstream)
     assert released_readiness.ready is True
     assert [task.id for task in store.get_pending_pickup()] == [downstream.id]
+
+
+def test_completed_retry_descendant_with_empty_merge_unit_unblocks_dependency(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Failed dependency", task_type="implement")
+    assert dependency.id is not None
+    store.mark_failed(dependency, failure_reason="UNKNOWN")
+
+    retry = store.add("Completed retry", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    assert retry.id is not None
+    store.mark_completed(retry, has_commits=True, branch="feature/completed-empty-retry")
+    retry_unit = store.resolve_merge_unit_for_task(retry.id)
+    assert retry_unit is not None
+    store.set_merge_unit_state(retry_unit.id, "empty")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+    assert downstream.id is not None
+
+    readiness = store.get_dependency_readiness(downstream)
+    assert readiness.ready is True
+    assert readiness.direct_dependency is not None
+    assert readiness.direct_dependency.id == dependency.id
+    assert readiness.resolved_dependency is not None
+    assert readiness.resolved_dependency.id == retry.id
+    assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
+def test_failed_empty_direct_dependency_does_not_use_unmerged_retry_descendant_as_ready(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Failed dependency", task_type="implement")
+    assert dependency.id is not None
+    store.mark_completed(dependency, has_commits=True, branch="feature/direct-empty-blocked")
+    dependency_unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert dependency_unit is not None
+    store.set_merge_unit_state(dependency_unit.id, "empty")
+    dependency = store.get(dependency.id)
+    assert dependency is not None
+    store.mark_failed(dependency, failure_reason="UNKNOWN")
+
+    retry = store.add("Completed retry", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    assert retry.id is not None
+    store.mark_completed(retry, has_commits=True, branch="feature/retry-unmerged-blocked")
+    retry_unit = store.resolve_merge_unit_for_task(retry.id)
+    assert retry_unit is not None
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+    assert downstream.id is not None
+
+    readiness = dependency_readiness(store, downstream)
+    assert readiness.ready is False
+    assert readiness.reason == "unmerged"
+    assert readiness.resolved_dependency is not None
+    assert readiness.resolved_dependency.id == retry.id
+    assert readiness.blocking_merge_unit_id == retry_unit.id
+    assert readiness.blocking_merge_state == "unmerged"
+
+    blocked = get_unmerged_dependency_precondition(store, downstream)
+    assert blocked is not None
+    assert blocked.id == retry.id
+
+    indexed_readiness = dependency_preconditions_module.dependency_readiness(
+        store,
+        downstream,
+        read_context=_read_context_for_store(store),
+    )
+    assert indexed_readiness == readiness
 
 
 def test_same_branch_dependency_waits_for_completed_predecessor_before_pickup(tmp_path: Path) -> None:

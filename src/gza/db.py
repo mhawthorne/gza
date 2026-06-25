@@ -7474,12 +7474,16 @@ class SqliteTaskStore:
     def resolve_dependency_merge_unit(self, task: Task) -> DependencyMergeUnitResolution:
         """Resolve the active merge unit, if any, for ``task.depends_on``'s lineage.
 
-        Prefer the direct dependency's attached active merge unit when present.
-        If the resolved completed recovery row is attached directly, use that.
-        Otherwise walk the direct dependency's retry lineage and return the
-        first attached active merge unit found there. Callers should fall back
-        to legacy task-row merge state only when this returns no unit anywhere
-        in the dependency lineage.
+        When a failed/dropped direct dependency resolves through a distinct
+        completed retry descendant, only that completed representative's own
+        merge unit is authoritative for dependency satisfaction. The failed
+        parent's terminal no-work merge unit must not satisfy the descendant.
+
+        Otherwise, prefer the direct dependency's attached active merge unit
+        when present. If no unit is attached directly, walk the dependency's
+        retry lineage and return the first attached active merge unit found
+        there. Callers should fall back to legacy task-row merge state only
+        when this returns no authoritative unit for the satisfying task.
         """
         if task.depends_on is None:
             return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
@@ -7489,9 +7493,14 @@ class SqliteTaskStore:
             return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
 
         resolved_dep = self.resolve_dependency_completion(task)
-        candidate_ids: list[str] = [direct_dep.id]
         if resolved_dep is not None and resolved_dep.id is not None and resolved_dep.id != direct_dep.id:
-            candidate_ids.append(resolved_dep.id)
+            merge_unit = self.resolve_merge_unit_for_task(resolved_dep.id)
+            return DependencyMergeUnitResolution(
+                attached_task=resolved_dep if merge_unit is not None else None,
+                merge_unit=merge_unit,
+            )
+
+        candidate_ids: list[str] = [direct_dep.id]
 
         visited: set[str] = set()
         queue: list[str] = list(candidate_ids)

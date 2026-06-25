@@ -198,9 +198,14 @@ class RecoveryReadContext:
             return DependencyMergeUnitResolution(attached_task=None, merge_unit=None)
 
         resolved_dep = self.resolve_dependency_completion(task)
-        candidate_ids: list[str] = [direct_dep.id]
         if resolved_dep is not None and resolved_dep.id is not None and resolved_dep.id != direct_dep.id:
-            candidate_ids.append(resolved_dep.id)
+            merge_unit = self.resolve_merge_unit_for_task(resolved_dep.id)
+            return DependencyMergeUnitResolution(
+                attached_task=resolved_dep if merge_unit is not None else None,
+                merge_unit=merge_unit,
+            )
+
+        candidate_ids: list[str] = [direct_dep.id]
 
         visited: set[str] = set()
         queue: list[str] = list(candidate_ids)

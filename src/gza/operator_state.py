@@ -109,9 +109,24 @@ def _resolve_empty_prereq_candidate(
     *,
     read_context: RecoveryReadContext | None = None,
 ) -> DbTask | None:
-    """Resolve an empty prerequisite, preferring the direct dependency over retry descendants."""
+    """Resolve the no-work prerequisite that currently governs operator blocking output."""
     if task.depends_on is None:
         return None
+
+    resolved_dep = (
+        read_context.resolve_dependency_completion(task)
+        if read_context is not None
+        else store.resolve_dependency_completion(task)
+    )
+    if resolved_dep is not None and resolved_dep.id is not None and resolved_dep.id != task.depends_on:
+        unit = (
+            read_context.resolve_merge_unit_for_task(resolved_dep.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(resolved_dep.id)
+        )
+        if unit is None or effective_no_work_merge_state(resolved_dep, unit.state) not in {"empty", "redundant"}:
+            return None
+        return resolved_dep
 
     dep = read_context.get_task(task.depends_on) if read_context is not None else store.get(task.depends_on)
     if dep is not None and dep.id is not None:
@@ -123,7 +138,7 @@ def _resolve_empty_prereq_candidate(
         if unit is not None and effective_no_work_merge_state(dep, unit.state) in {"empty", "redundant"}:
             return dep
 
-    dep = read_context.resolve_dependency_completion(task) if read_context is not None else store.resolve_dependency_completion(task)
+    dep = resolved_dep
     if dep is None or dep.id is None:
         return None
     unit = (

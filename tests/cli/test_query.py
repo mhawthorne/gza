@@ -18,7 +18,6 @@ from rich.text import Text
 import gza.colors as colors
 from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
-from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli import _lifecycle_actions as lifecycle_actions_cli
 from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_position_scoped
 from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
@@ -4792,7 +4791,7 @@ class TestQueueCommand:
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
-    def test_queue_empty_prerequisite_surfaces_release_valve_by_default(self, tmp_path: Path):
+    def test_queue_completed_empty_prerequisite_is_not_reported_blocked(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -4819,8 +4818,8 @@ class TestQueueCommand:
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
         assert "Held downstream" in normalized
-        assert "empty prerequisite" in normalized
-        assert "gza-4072" in normalized
+        assert "empty prerequisite" not in normalized
+        assert "gza-4072" not in normalized
 
     def test_queue_failed_empty_prerequisite_surfaces_release_valve_by_default(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -15650,7 +15649,7 @@ class TestIncompleteCommand:
         assert self._tree_root_id(tree_output) == impl.id
         assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
 
-    def test_incomplete_empty_prereq_is_unresolved_by_default(
+    def test_incomplete_completed_empty_prereq_is_not_unresolved(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -15678,10 +15677,8 @@ class TestIncompleteCommand:
 
         assert result == 0
         one_line_output = captured.out
-        assert self._one_line_row_id(one_line_output) == downstream.id
-        assert "empty prerequisite" in one_line_output
-        assert "gza-4072" in one_line_output
-        assert "gza edit --clear-depends-on" in one_line_output
+        assert "No unresolved task lineages" in one_line_output
+        assert downstream.id not in one_line_output
 
     def test_queue_blocked_dependent_surfaces_awaiting_plan_review_release_guidance(
         self,
@@ -15777,11 +15774,10 @@ class TestIncompleteCommand:
         assert result == 0
         assert "merges blocked: main checkout has uncommitted changes - commit or stash them first" in captured.out
 
-    def test_incomplete_empty_prereq_policy_toggle_hides_release_valve_guidance(
+    def test_incomplete_failed_empty_prereq_still_shows_release_valve_guidance(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -15792,22 +15788,24 @@ class TestIncompleteCommand:
         unit = store.resolve_merge_unit_for_task(dep.id)
         assert unit is not None
         store.set_merge_unit_state(unit.id, "empty")
+        dep = store.get(dep.id)
+        assert dep is not None
+        dep.status = "failed"
+        dep.failure_reason = "PREREQUISITE_UNMERGED"
+        dep.completed_at = datetime.now(UTC)
+        store.update(dep)
 
         downstream = store.add("Held downstream", task_type="implement", depends_on=dep.id)
         assert downstream.id is not None
-
-        monkeypatch.setattr(
-            dependency_preconditions_module,
-            "empty_prereq_satisfies_dependency",
-            lambda _store, _prereq, _dependent: True,
-        )
 
         with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
             result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
         captured = capsys.readouterr()
 
         assert result == 0
-        assert "No unresolved task lineages" in captured.out
+        assert downstream.id in captured.out
+        assert "prerequisite" in captured.out
+        assert "gza edit --clear-depends-on" in captured.out
 
     def test_incomplete_surfaces_strict_scope_unverified_needs_attention(
         self,

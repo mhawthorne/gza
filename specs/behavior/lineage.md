@@ -86,6 +86,14 @@ A task `T` with `depends_on = D` MUST NOT run until `D`'s work is **satisfied**.
   the target). A completed held plan
   (`task_type == "plan"` with `auto_implement == false`) is a distinct exception:
   direct dependents MUST stay blocked until the hold is explicitly released.
+- **Completed terminal no-work is dependency-satisfying.** A prerequisite with
+  `status == "completed"` and authoritative merge-unit state `empty` or `redundant`
+  MUST satisfy merge-required `depends_on` exactly like `merged`: the work unit is
+  terminal and there is nothing left to merge.
+- **Failed terminal no-work is not self-satisfying.** A failed or dropped prerequisite
+  with `empty`/`redundant` merge evidence MUST remain blocked unless L1 resolves a valid
+  completed representative through the `based_on` recovery chain. Recoverable failed
+  empty work MUST NOT silently satisfy downstream merge-required dependencies on its own.
 - **Retry-chain satisfaction.** If `D` itself is `failed` or `dropped`, satisfaction MUST
   follow the `based_on` recovery chain rooted at `D`: the **first `status == "completed"`
   descendant** (whose merge unit is then `merged`/`empty`/`redundant`) satisfies the dependency.
@@ -230,6 +238,7 @@ with that work as it lands.*
   no (P5/E1): lineage membership, ownership, and recovery satisfaction follow `based_on`
   only, and `depends_on` is purely scheduling. Confirm no resolution path legitimately
   needs to walk `depends_on`.
-- **OQ4 — No-work semantics are mid-flight.** The merge-unit `empty`/`redundant` states
-  and their dependency-satisfaction behavior (L1, ownership) must stay in lockstep with
-  the lifecycle and recovery contracts as that implementation evolves.
+- **OQ4 — Legacy compatibility boundary for no-work states.** The merge-unit
+  `empty`/`redundant` dependency contract is explicit in L1; remaining open work is only
+  about how long task-row-only compatibility fallbacks remain supported before all
+  authoritative readiness decisions require merge-unit evidence.
