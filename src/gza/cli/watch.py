@@ -7452,12 +7452,37 @@ def cmd_queue(args: argparse.Namespace) -> int:
                 print(f"Scope gap: {_format_scope_gap_message(gap, tags=normalized_tag_filters, any_tag=any_tag)}")
         return 0
 
+    limit_arg = getattr(args, "limit", 10)
+    show_all = bool(getattr(args, "all", False)) or limit_arg in {0, -1}
+    display_limit = None if show_all else max(1, int(limit_arg))
+    runnable_preview_entries = tuple(dispatch_preview.runnable_entries if dispatch_preview is not None else ())
+    visible_runnable_entries = (
+        runnable_preview_entries
+        if display_limit is None
+        else runnable_preview_entries[:display_limit]
+    )
+    visible_recovery_entries = [entry for entry in visible_runnable_entries if entry.lane == "recovery"]
+    visible_pending_entries = [entry for entry in visible_runnable_entries if entry.lane == "pending"]
+    visible_runnable_recovery = [
+        adapted
+        for adapted in (
+            _recovery_lane_entry_from_preview_entry(
+                store,
+                entry,
+                max_recovery_attempts=config.max_resume_attempts,
+                read_context=None if dispatch_preview is None else dispatch_preview.read_context,
+            )
+            for entry in visible_recovery_entries
+        )
+        if adapted is not None
+    ]
+
     if not show_pending:
         if show_recovery:
             console.print(
                 _queue_section_summary(
                     "Runnable recovery lane (watch will run)",
-                    shown=len(recovery_entries),
+                    shown=len(visible_runnable_recovery),
                     total=len(recovery_entries),
                 )
             )
@@ -7495,30 +7520,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
             )
         return 0
 
-    limit_arg = getattr(args, "limit", 10)
-    show_all = bool(getattr(args, "all", False)) or limit_arg in {0, -1}
-    display_limit = None if show_all else max(1, int(limit_arg))
-    runnable_preview_entries = tuple(dispatch_preview.runnable_entries if dispatch_preview is not None else ())
-    visible_runnable_entries = (
-        runnable_preview_entries
-        if display_limit is None
-        else runnable_preview_entries[:display_limit]
-    )
-    visible_recovery_entries = [entry for entry in visible_runnable_entries if entry.lane == "recovery"]
-    visible_pending_entries = [entry for entry in visible_runnable_entries if entry.lane == "pending"]
-    visible_runnable_recovery = [
-        adapted
-        for adapted in (
-            _recovery_lane_entry_from_preview_entry(
-                store,
-                entry,
-                max_recovery_attempts=config.max_resume_attempts,
-                read_context=None if dispatch_preview is None else dispatch_preview.read_context,
-            )
-            for entry in visible_recovery_entries
-        )
-        if adapted is not None
-    ]
     rendered_rows = [
         QueueRenderRow(task=entry.task, position_text=str(index))
         for index, entry in enumerate(visible_pending_entries, 1)

@@ -3444,12 +3444,19 @@ class TestQueueCommand:
     ) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        runnable = _create_failed_recovery_candidate(
+        first_runnable = _create_failed_recovery_candidate(
             store,
-            prompt="Resume me",
+            prompt="Resume first",
             task_type="implement",
             failure_reason="MAX_TURNS",
-            session_id="resume-session",
+            session_id="resume-session-1",
+        )
+        second_runnable = _create_failed_recovery_candidate(
+            store,
+            prompt="Resume second",
+            task_type="implement",
+            failure_reason="MAX_TURNS",
+            session_id="resume-session-2",
         )
         manual = _create_failed_recovery_candidate(
             store,
@@ -3465,9 +3472,12 @@ class TestQueueCommand:
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Runnable recovery lane (watch will run): 1 shown / all shown" in result.stdout
+        assert "Runnable recovery lane (watch will run): 1 shown / 1 more" in result.stdout
         assert "Needs human - watch skips: 1 shown / all shown" in result.stdout
-        assert f"resume {runnable.id}" in normalized
+        assert f"resume {first_runnable.id}" in normalized
+        assert first_runnable.id in result.stdout
+        assert second_runnable.id not in result.stdout
+        assert "Resume second" not in result.stdout
         assert manual.id in result.stdout
         assert "Manual follow-up" in result.stdout
         assert "Lifecycle actions:" not in result.stdout
