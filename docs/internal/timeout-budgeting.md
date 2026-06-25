@@ -108,5 +108,6 @@ Per-test overrides stay narrow:
 
 The functional suite intentionally does not use a CPU budget. Functional tests
 legitimately spend time in child processes, and `time.process_time()` would miss
-that work. `tests_functional/conftest.py` therefore keeps only a generous 30s
-wall-clock hang guard, layered under the outer 120s verify cap.
+that work. `GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS` is therefore only a generous
+wall-clock hang-guard knob in `tests_functional/conftest.py`, layered under the
+outer 120s verify cap rather than acting as a latency budget.

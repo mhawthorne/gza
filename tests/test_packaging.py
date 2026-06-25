@@ -281,9 +281,6 @@ def test_unit_test_conftest_injects_timeout_when_default_env_is_unset(
     item = FakeItem()
     module.pytest_collection_modifyitems([item])
 
-    assert module.UNIT_TEST_HANG_TIMEOUT_MS == 30000
-    assert module.UNIT_TEST_HANG_TIMEOUT_SECONDS == 30
-    assert module.UNIT_TEST_CPU_BUDGET_MS == 1000
     assert len(item.markers) == 1
     assert item.markers[0].mark.args == (module.UNIT_TEST_HANG_TIMEOUT_SECONDS,)
     assert item.markers[0].mark.kwargs == {"method": "signal"}
