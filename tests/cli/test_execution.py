@@ -4878,7 +4878,7 @@ class TestReconciliation:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ):
-        """Terminal task workers older than the grace window should be pruned despite PID reuse."""
+        """Terminal task workers are pruned only when task and worker ages both exceed the grace window."""
         import os
         from datetime import timedelta
 
@@ -4905,6 +4905,9 @@ class TestReconciliation:
                 task_id=task.id,
                 pid=os.getpid(),
                 status="running",
+                started_at=(
+                    datetime.now(UTC) - timedelta(seconds=WORKER_TERMINAL_PRUNE_GRACE_SECONDS + 60)
+                ).isoformat(),
             )
         )
 
@@ -4912,6 +4915,47 @@ class TestReconciliation:
 
         assert registry.get("w-stale-live-terminal") is None
         assert "Warning: Pruning stale terminal worker w-stale-live-terminal" in capsys.readouterr().err
+
+    def test_prune_terminal_dead_workers_keeps_recently_started_worker_for_old_terminal_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """A freshly started worker for an old terminal task must stay visible during the grace window."""
+        import os
+        from datetime import timedelta
+
+        from gza.cli._common import (
+            WORKER_TERMINAL_PRUNE_GRACE_SECONDS,
+            prune_terminal_dead_workers,
+        )
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Old terminal task with fresh iterate worker")
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC) - timedelta(seconds=WORKER_TERMINAL_PRUNE_GRACE_SECONDS + 60)
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-fresh-live-terminal",
+                task_id=task.id,
+                pid=os.getpid(),
+                status="running",
+                started_at=datetime.now(UTC).isoformat(),
+            )
+        )
+
+        prune_terminal_dead_workers(config)
+
+        assert registry.get("w-fresh-live-terminal") is not None
+        assert "Pruning stale terminal worker w-fresh-live-terminal" not in capsys.readouterr().err
 
     def test_prune_terminal_dead_workers_silently_removes_zombie_pid(
         self,

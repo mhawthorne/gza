@@ -466,7 +466,11 @@ def _terminal_worker_is_obviously_stale(worker: WorkerMetadata, task: DbTask, *,
     """Return True when a terminal task's worker entry is old enough to prune by time."""
     completed_at = _normalize_timestamp(task.completed_at)
     if completed_at is not None:
-        return now - completed_at > timedelta(seconds=WORKER_TERMINAL_PRUNE_GRACE_SECONDS)
+        started_at = _normalize_timestamp(worker.started_at)
+        if started_at is None:
+            return False
+        grace = timedelta(seconds=WORKER_TERMINAL_PRUNE_GRACE_SECONDS)
+        return now - completed_at > grace and now - started_at > grace
 
     started_at = _normalize_timestamp(worker.started_at)
     if started_at is not None:
