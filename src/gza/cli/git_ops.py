@@ -6,11 +6,12 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import gza.colors as _colors
 from gza.query import (
@@ -162,6 +163,8 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -2964,6 +2967,25 @@ def _advance_action_color(action_type: str) -> str:
     return ac.default
 
 
+def _run_advance_owner_row_read_session(
+    store: SqliteTaskStore,
+    query_fn: Callable[[], _T],
+) -> _T:
+    """Run one or more advance owner-row queries in one read snapshot.
+
+    `cmd_advance()` sometimes needs multiple `query_lineage_owner_rows(...)`
+    calls against the same read-session snapshot, so it cannot always use the
+    one-shot `query_lineage_owner_rows_in_read_session(...)` wrapper. Those
+    manual queries may queue deferred lineage reconciliations while the read
+    session is open; apply them only after the read session closes.
+    """
+
+    with store.read_session():
+        result = query_fn()
+    apply_deferred_lineage_query_reconciliations(store)
+    return result
+
+
 def cmd_advance(args: argparse.Namespace) -> int:
     """Intelligently progress unmerged tasks through their lifecycle."""
     config = Config.load(args.project_dir)
@@ -3106,6 +3128,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             task = store.get(task_id)
             if not task:
                 return phase1_error(args, f"Task {task_id} not found")
+            explicit_task = task
             if task.status == 'failed':
                 if no_resume_failed:
                     return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
@@ -3132,7 +3155,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ) == "merged":
                     print(f"Task {task_id} is already merged")
                     return 0
-            with store.read_session():
+            def _load_explicit_owner_rows() -> tuple[list[LineageOwnerRow], bool]:
                 owner_rows = list(
                     query_lineage_owner_rows(
                         store,
@@ -3142,7 +3165,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             include_skipped=True,
                             exclude_dropped_from_planning=True,
                             max_recovery_attempts=max_resume_attempts,
-                            task_ids=(task.id,) if task.id is not None else None,
+                            task_ids=(explicit_task.id,) if explicit_task.id is not None else None,
                         ),
                         config=config,
                         git=git,
@@ -3150,7 +3173,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     )
                 )
                 dropped_owner_lineage = False
-                if not owner_rows and task.status != "dropped":
+                if not owner_rows and explicit_task.status != "dropped":
                     dropped_owner_rows = [
                         row
                         for row in query_lineage_owner_rows(
@@ -3160,7 +3183,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                                 task_types=(advance_type,) if advance_type else None,
                                 include_skipped=True,
                                 max_recovery_attempts=max_resume_attempts,
-                                task_ids=(task.id,) if task.id is not None else None,
+                                task_ids=(explicit_task.id,) if explicit_task.id is not None else None,
                             ),
                             config=config,
                             git=git,
@@ -3170,7 +3193,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     ]
                     if dropped_owner_rows:
                         dropped_owner_lineage = True
-            apply_deferred_lineage_query_reconciliations(store)
+                return owner_rows, dropped_owner_lineage
+
+            owner_rows, dropped_owner_lineage = _run_advance_owner_row_read_session(
+                store,
+                _load_explicit_owner_rows,
+            )
             if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
                 planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
                 owner_rows = [
@@ -3190,7 +3218,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ]
         else:
             target_branch = _resolve_advance_target_branch(store, git, task=None)
-            with store.read_session():
+
+            def _load_all_owner_rows() -> list[LineageOwnerRow]:
                 branch_names = [
                     task.branch
                     for task in store.get_all()
@@ -3217,7 +3246,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         target_branch=target_branch,
                     )
                 )
-            apply_deferred_lineage_query_reconciliations(store)
+                return owner_rows
+
+            owner_rows = _run_advance_owner_row_read_session(store, _load_all_owner_rows)
             if not no_resume_failed:
                 list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings, git=git, target_branch=target_branch)
             if no_resume_failed:
