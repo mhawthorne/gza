@@ -1888,7 +1888,7 @@ watch:
 
 `watch.dispatch_start_timeout` bounds how long `gza watch` waits after selecting work for it to reach a live running state. If the worker never becomes live within that window, watch logs the undispatched action, does not advance no-progress accounting for it, and keeps scanning the current watch pass for another runnable candidate instead of leaving the slot idle.
 
-`watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` enforces before relaunching the same transient failed recovery or improve action. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
+`watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` actively enforces before relaunching the same transient failed recovery or improve action. Watch writes and re-reads this cooldown state across passes and restarts, so a transient failure can delay a later watch pass from launching that same recovery or improve action until the persisted retry time is due. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
 
 When tag filters are active, watch emits an explicit scope line to console and `.gza/watch.log`:
 `INFO      scope: tags=<comma-separated-tags> mode=any|all`.
