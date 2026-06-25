@@ -3803,6 +3803,41 @@ class TestFailureReasonTracking:
         assert retrieved is not None
         assert retrieved.changed_diff is True
 
+    def test_mark_completed_persists_branch_backed_empty_merge_unit_for_no_commit_completion(
+        self, tmp_path: Path
+    ) -> None:
+        """Completed branch-backed no-op tasks should still persist authoritative empty merge state."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="No-op task", task_type="implement")
+        assert task.id is not None
+
+        store.mark_completed(
+            task,
+            has_commits=False,
+            branch="feature/verified-empty-noop",
+            head_sha="deadbeef",
+            base_sha="cafebabe",
+            completion_reason="VERIFIED_EMPTY_NOOP",
+            terminal_merge_state="empty",
+        )
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.status == "completed"
+        assert retrieved.has_commits is False
+        assert retrieved.completion_reason == "VERIFIED_EMPTY_NOOP"
+        assert retrieved.merge_status is None
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.source_branch == "feature/verified-empty-noop"
+        assert unit.target_branch == "main"
+        assert unit.state == "empty"
+        assert unit.head_sha == "deadbeef"
+        assert unit.base_sha == "cafebabe"
+
     def test_mark_failed_clears_completion_reason(self, tmp_path: Path):
         """mark_failed clears any prior completion_reason."""
         db_path = tmp_path / "test.db"

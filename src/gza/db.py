@@ -7591,8 +7591,13 @@ class SqliteTaskStore:
         head_sha: str | None | object = DB_UNSET,
         base_sha: str | None | object = DB_UNSET,
         completion_reason: str | None = None,
+        terminal_merge_state: str | None = None,
     ) -> None:
         """Mark a task as completed."""
+        if terminal_merge_state is not None and terminal_merge_state not in {"empty", "redundant"}:
+            raise ValueError(
+                "terminal_merge_state must be one of {'empty', 'redundant'} when provided"
+            )
         task.status = "completed"
         task.completed_at = datetime.now(UTC)
         task.running_pid = None
@@ -7601,6 +7606,8 @@ class SqliteTaskStore:
         task.has_commits = has_commits
         if has_commits:
             task.merge_status = "unmerged" if task_owns_merge_status(task) else None
+        elif terminal_merge_state is not None:
+            task.merge_status = merge_unit_legacy_state(terminal_merge_state)
         if branch:
             task.branch = branch
         if log_file:
@@ -7624,7 +7631,14 @@ class SqliteTaskStore:
         if changed_diff is not DB_UNSET:
             task.changed_diff = cast("bool | None", changed_diff)
         self.update(task)
-        if has_commits and task.branch and task.id is not None and self.supports_merge_units():
+        if (
+            (has_commits or terminal_merge_state is not None)
+            and task.branch
+            and task.id is not None
+            and self.supports_merge_units()
+        ):
+            next_merge_state = "unmerged" if has_commits else terminal_merge_state
+            assert next_merge_state is not None
             unit = self.get_or_create_merge_unit_for_task(task)
             if unit is not None:
                 self.attach_task_to_merge_unit(
@@ -7635,7 +7649,7 @@ class SqliteTaskStore:
                 self.refresh_merge_unit_head(unit.id, head_sha, base_sha)
                 self.set_merge_unit_state(
                     unit.id,
-                    "unmerged",
+                    next_merge_state,
                     diff_stats=(diff_files_changed, diff_lines_added, diff_lines_removed),
                 )
 

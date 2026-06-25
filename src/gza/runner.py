@@ -164,6 +164,7 @@ EXTRACTION_ALREADY_MERGED_COMPLETION_REASON = "EXTRACTION_ALREADY_MERGED"
 PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 BRANCH_UNPUSHABLE_FAILURE_REASON = "BRANCH_UNPUSHABLE"
 PROJECT_SCOPE_VIOLATION_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
+VERIFIED_EMPTY_NOOP_COMPLETION_REASON = "VERIFIED_EMPTY_NOOP"
 CROSS_PROJECT_TAG = "cross-project"
 DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE = 3
 _GZA_OWNED_DIR_NAMES = (".gza", ".claude")
@@ -761,12 +762,24 @@ def _finalize_completed_code_task(
     diff_removed: int,
     head_sha: str | None,
     base_sha: str | None,
+    has_commits: bool = True,
+    terminal_merge_state: str | None = None,
+    completion_reason: str | None = None,
+    outcome_message: str = "Outcome: completed",
 ) -> None:
     """Write terminal success logs and persist completed state for a code task."""
     # Write final log entries before marking completed in DB, so that
     # `gza log -f` (which checks task status) doesn't break out of the
     # follow loop before the log file is fully written.
-    write_log_entry(log_file, {"type": "gza", "subtype": "outcome", "message": "Outcome: completed", "exit_code": 0})
+    outcome_entry: dict[str, Any] = {
+        "type": "gza",
+        "subtype": "outcome",
+        "message": outcome_message,
+        "exit_code": 0,
+    }
+    if completion_reason is not None:
+        outcome_entry["completion_reason"] = completion_reason
+    write_log_entry(log_file, outcome_entry)
     _write_stats_entry(log_file, stats)
 
     # Mark completed — after log entries are flushed so readers see the
@@ -776,14 +789,44 @@ def _finalize_completed_code_task(
         branch=branch_name,
         log_file=str(log_file.relative_to(config.project_dir)),
         output_content=output_content,
-        has_commits=True,
+        has_commits=has_commits,
         stats=stats,
         diff_files_changed=diff_files,
         diff_lines_added=diff_added,
         diff_lines_removed=diff_removed,
         head_sha=head_sha,
         base_sha=base_sha,
+        completion_reason=completion_reason,
+        terminal_merge_state=terminal_merge_state,
     )
+
+
+def _has_trustworthy_green_verify_evidence_for_current_tree(log_file: Path, worktree_git: Git) -> bool:
+    """Require an exact-tree passed verify checkpoint from the provider run logs."""
+    current_fingerprint = _compute_tree_fingerprint(worktree_git)
+    if not current_fingerprint:
+        return False
+    for checkpoint in _extract_verify_phase_checkpoints(log_file, ops_log_path_for(log_file)):
+        if checkpoint.get("tree_fingerprint") == current_fingerprint:
+            return True
+    return False
+
+
+def _should_complete_as_verified_empty_noop(
+    *,
+    exit_code: int,
+    error_type: str | None,
+    empty_turn: bool,
+    merge_state: str | None,
+    log_file: Path,
+    worktree_git: Git,
+) -> bool:
+    """Return whether a no-change run is a proven successful empty no-op."""
+    if exit_code != 0 or error_type is not None or empty_turn:
+        return False
+    if merge_state != "empty":
+        return False
+    return _has_trustworthy_green_verify_evidence_for_current_tree(log_file, worktree_git)
 
 
 def _record_pr_publication_note(
@@ -6849,6 +6892,7 @@ def _complete_code_task(
             tasks where the agent handles rebases directly
             and no new commits should be created by the runner.
     """
+    complete_as_verified_empty_noop = False
     if skip_commit:
         has_uncommitted = False
     else:
@@ -6971,51 +7015,62 @@ def _complete_code_task(
                         and not _preserves_failure_reason_over_terminal_no_work(failure_reason)
                     ):
                         failure_reason = terminal_no_work_reason
+                    complete_as_verified_empty_noop = _should_complete_as_verified_empty_noop(
+                        exit_code=exit_code,
+                        error_type=error_type,
+                        empty_turn=empty_turn,
+                        merge_state=merge_state,
+                        log_file=log_file,
+                        worktree_git=worktree_git,
+                    )
                     if merge_state in {"empty", "redundant"}:
                         unit = store.get_or_create_merge_unit_for_task(task)
                         if unit is not None and unit.state != merge_state:
                             store.set_merge_unit_state(unit.id, merge_state)
-                provider_stderr_tail = _extract_provider_stderr_tail(log_file) if empty_turn else ""
-                task_footer(
-                    task,
-                    stats,
-                    status="No changes made",
-                    branch=branch_name,
-                )
-                write_log_entry(
-                    log_file,
-                    {
-                        "type": "gza",
-                        "subtype": "outcome",
-                        "message": "Outcome: failed (no changes made)",
-                        "exit_code": exit_code,
-                        "failure_reason": failure_reason,
-                        **({"stderr_tail": provider_stderr_tail} if provider_stderr_tail else {}),
-                    },
-                )
-                write_log_entry(
-                    log_file,
-                    {
-                        "type": "gza",
-                        "subtype": "stats",
-                        "message": f"Stats: {_observed_step_count(stats)} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
-                        "duration_seconds": stats.duration_seconds,
-                        "cost_usd": stats.cost_usd,
-                        "num_steps": _observed_step_count(stats),
-                    },
-                )
-                _mark_task_failed(
-                    task=task,
-                    config=config,
-                    store=store,
-                    log_file=log_file,
-                    stats=stats,
-                    branch=branch_name,
-                    explicit_reason=failure_reason,
-                    error_type=None,
-                    exit_code=exit_code,
-                )
-                return 0
+                if complete_as_verified_empty_noop:
+                    has_uncommitted = False
+                else:
+                    provider_stderr_tail = _extract_provider_stderr_tail(log_file) if empty_turn else ""
+                    task_footer(
+                        task,
+                        stats,
+                        status="No changes made",
+                        branch=branch_name,
+                    )
+                    write_log_entry(
+                        log_file,
+                        {
+                            "type": "gza",
+                            "subtype": "outcome",
+                            "message": "Outcome: failed (no changes made)",
+                            "exit_code": exit_code,
+                            "failure_reason": failure_reason,
+                            **({"stderr_tail": provider_stderr_tail} if provider_stderr_tail else {}),
+                        },
+                    )
+                    write_log_entry(
+                        log_file,
+                        {
+                            "type": "gza",
+                            "subtype": "stats",
+                            "message": f"Stats: {_observed_step_count(stats)} steps, {stats.duration_seconds or 0.0:.1f}s, ${stats.cost_usd or 0.0:.4f}",
+                            "duration_seconds": stats.duration_seconds,
+                            "cost_usd": stats.cost_usd,
+                            "num_steps": _observed_step_count(stats),
+                        },
+                    )
+                    _mark_task_failed(
+                        task=task,
+                        config=config,
+                        store=store,
+                        log_file=log_file,
+                        stats=stats,
+                        branch=branch_name,
+                        explicit_reason=failure_reason,
+                        error_type=None,
+                        exit_code=exit_code,
+                    )
+                    return 0
             # else: branch has commits from a previous run - treat as success without committing
 
         if has_uncommitted:
@@ -7083,7 +7138,7 @@ def _complete_code_task(
             fix_was_merged_before_run = (
                 (root_impl_unit.state if root_impl_unit is not None else root_impl.merge_status) == "merged"
             )
-    if create_pr and task.task_type != "rebase":
+    if create_pr and task.task_type != "rebase" and not complete_as_verified_empty_noop:
         pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
         if pr_outcome.kind == "nonfatal_missing_pr":
             _record_pr_publication_note(
@@ -7152,6 +7207,16 @@ def _complete_code_task(
         diff_removed=diff_removed,
         head_sha=head_sha,
         base_sha=base_sha,
+        has_commits=not complete_as_verified_empty_noop,
+        terminal_merge_state="empty" if complete_as_verified_empty_noop else None,
+        completion_reason=(
+            VERIFIED_EMPTY_NOOP_COMPLETION_REASON if complete_as_verified_empty_noop else None
+        ),
+        outcome_message=(
+            "Outcome: completed (moot: no unique commits vs target)"
+            if complete_as_verified_empty_noop
+            else "Outcome: completed"
+        ),
     )
     return _post_complete_code_task(
         task,
