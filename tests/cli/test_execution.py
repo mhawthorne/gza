@@ -8343,6 +8343,59 @@ class TestIterateCommand:
             _format_needs_attention_line(iterate_attention.task, iterate_attention.action),
         )
 
+    def test_run_iterate_task_with_recovery_preserves_iterate_foreground_invocation(self, tmp_path: Path) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import _run_iterate_task_with_recovery
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Iterate pending implementation", task_type="implement")
+        assert task.id is not None
+
+        args = argparse.Namespace(force=True)
+
+        def fake_run_with_recovery(
+            _config,
+            _store,
+            task_to_run,
+            *,
+            run_task,
+            max_resume_attempts,
+            on_recovery,
+            on_terminal_skip,
+        ):
+            assert task_to_run.id == task.id
+            assert max_resume_attempts == 2
+            assert on_recovery is not None
+            assert on_terminal_skip is not None
+            return task_to_run, run_task(task_to_run, True)
+
+        with (
+            patch("gza.cli.execution.run_with_recovery", side_effect=fake_run_with_recovery),
+            patch("gza.cli.execution._run_foreground", return_value=0) as run_foreground,
+        ):
+            final_task, rc, terminal_skip = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=task,
+                max_resume_attempts=2,
+            )
+
+        assert final_task.id == task.id
+        assert rc == 0
+        assert terminal_skip is None
+        run_foreground.assert_called_once()
+        assert run_foreground.call_args.kwargs["task_id"] == task.id
+        assert run_foreground.call_args.kwargs["resume"] is True
+        assert run_foreground.call_args.kwargs["force"] is True
+        invocation = run_foreground.call_args.kwargs["invocation"]
+        assert invocation.command == "iterate"
+        assert invocation.execution_mode == "foreground_worker"
+
     def test_iterate_live_progress_labels_non_cycle_merge_as_next_action(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):

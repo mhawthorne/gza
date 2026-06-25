@@ -165,6 +165,136 @@ def _foreground_command_invocation(command: str) -> RunInvocationContext:
 
 
 @dataclass(frozen=True)
+class IterateSummaryRow:
+    iteration_index: int
+    task_type: str
+    task_id: str | None
+    verdict: str | None
+    duration_seconds: float | None
+    steps: int | None
+    cost_usd: float | None
+    status: str
+    failure_reason: str | None
+    completion_reason: str | None
+
+
+def _format_compact_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    return format_duration(seconds).replace(" ", "")
+
+
+def _format_summary_status(row: IterateSummaryRow) -> str:
+    if row.failure_reason:
+        return f"{row.status} ({row.failure_reason})"
+    if row.completion_reason:
+        return f"{row.status} ({row.completion_reason})"
+    return row.status
+
+
+def _append_iterate_summary_row(
+    store: SqliteTaskStore,
+    rows: list[IterateSummaryRow],
+    *,
+    iteration_index: int,
+    task_type: str,
+    task: DbTask | None,
+    verdict: str | None = None,
+    status: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    refreshed_task = task
+    if task is not None and task.id is not None:
+        refreshed_task = store.get(task.id) or task
+
+    row_status = status or (refreshed_task.status if refreshed_task else "failed")
+    row_failure_reason = (refreshed_task.failure_reason if refreshed_task else None) or failure_reason
+    row_completion_reason = refreshed_task.completion_reason if refreshed_task else None
+
+    rows.append(
+        IterateSummaryRow(
+            iteration_index=iteration_index,
+            task_type=task_type,
+            task_id=refreshed_task.id if refreshed_task else None,
+            verdict=verdict,
+            duration_seconds=refreshed_task.duration_seconds if refreshed_task else None,
+            steps=get_task_step_count(refreshed_task) if refreshed_task else None,
+            cost_usd=refreshed_task.cost_usd if refreshed_task else None,
+            status=row_status,
+            failure_reason=row_failure_reason,
+            completion_reason=row_completion_reason,
+        )
+    )
+
+
+def _run_iterate_task_with_recovery(
+    *,
+    args: argparse.Namespace,
+    config: Config,
+    store: SqliteTaskStore,
+    task_to_run: DbTask,
+    max_resume_attempts: int,
+    initial_resume: bool = False,
+    invocation_name: str = "iterate",
+    on_recovery: Callable[[DbTask, DbTask, FailedRecoveryDecision], None] | None = None,
+    on_terminal_skip: Callable[[DbTask, FailedRecoveryDecision, int], None] | None = None,
+) -> tuple[DbTask, int, FailedRecoveryDecision | None]:
+    terminal_skip_decision: FailedRecoveryDecision | None = None
+
+    def _run_one(task: DbTask, resume_flag: bool) -> int:
+        assert task.id is not None
+        force = getattr(args, "force", False)
+        if resume_flag or initial_resume:
+            return _run_foreground(
+                config,
+                task_id=task.id,
+                resume=True,
+                force=force,
+                invocation=_foreground_command_invocation(invocation_name),
+            )
+        return _run_foreground(
+            config,
+            task_id=task.id,
+            force=force,
+            invocation=_foreground_command_invocation(invocation_name),
+        )
+
+    def _default_on_recovery(
+        failed_task: DbTask,
+        recovery_task: DbTask,
+        decision: FailedRecoveryDecision,
+    ) -> None:
+        assert failed_task.id is not None
+        assert recovery_task.id is not None
+        reason = failed_task.failure_reason or "UNKNOWN"
+        print(
+            f"  Auto-{decision.action}: {failed_task.id} failed with {reason}; "
+            f"created {recovery_task.id} (attempt {decision.attempt_index}/{decision.attempt_limit})."
+        )
+
+    def _capture_terminal_skip(
+        failed_task: DbTask,
+        decision: FailedRecoveryDecision,
+        failure_rc: int,
+    ) -> None:
+        nonlocal terminal_skip_decision
+        terminal_skip_decision = decision
+        if on_terminal_skip is not None:
+            on_terminal_skip(failed_task, decision, failure_rc)
+
+    final_task, rc = run_with_recovery(
+        config,
+        store,
+        task_to_run,
+        run_task=_run_one,
+        max_resume_attempts=max_resume_attempts,
+        on_recovery=on_recovery or _default_on_recovery,
+        on_terminal_skip=_capture_terminal_skip,
+    )
+    return final_task, rc, terminal_skip_decision
+
+
+@dataclass(frozen=True)
 class _IterateBackgroundPreflightContext:
     """Prepared git context for iterate background preflight."""
 
@@ -4504,63 +4634,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     if prepared_start is not None and impl_task.status == "pending" and prepared_start.task.id == impl_task.id:
         impl_task = prepared_start.task
 
-    def _run_task_with_recovery(
-        task_to_run: DbTask,
-        *,
-        initial_resume: bool = False,
-    ) -> tuple[DbTask, int, FailedRecoveryDecision | None]:
-        terminal_skip_decision: FailedRecoveryDecision | None = None
-
-        def _run_one(t: DbTask, resume_flag: bool) -> int:
-            assert t.id is not None
-            force = getattr(args, "force", False)
-            if resume_flag or initial_resume:
-                return _run_foreground(
-                    config,
-                    task_id=t.id,
-                    resume=True,
-                    force=force,
-                    invocation=_foreground_command_invocation("iterate"),
-                )
-            return _run_foreground(
-                config,
-                task_id=t.id,
-                force=force,
-                invocation=_foreground_command_invocation("iterate"),
-            )
-
-        def _on_recovery(
-            failed_task: DbTask,
-            recovery_task: DbTask,
-            decision: Any,
-        ) -> None:
-            assert failed_task.id is not None
-            assert recovery_task.id is not None
-            reason = failed_task.failure_reason or "UNKNOWN"
-            print(
-                f"  Auto-{decision.action}: {failed_task.id} failed with {reason}; "
-                f"created {recovery_task.id} (attempt {decision.attempt_index}/{decision.attempt_limit})."
-            )
-
-        def _on_terminal_skip(
-            failed_task: DbTask,
-            decision: FailedRecoveryDecision,
-            _failure_rc: int,
-        ) -> None:
-            nonlocal terminal_skip_decision
-            terminal_skip_decision = decision
-
-        final_task, rc = run_with_recovery(
-            config,
-            store,
-            task_to_run,
-            run_task=_run_one,
-            max_resume_attempts=effective_max_resume_attempts,
-            on_recovery=_on_recovery,
-            on_terminal_skip=_on_terminal_skip,
-        )
-        return final_task, rc, terminal_skip_decision
-
     # If the task is pending, run it first before entering the loop.
     if impl_task.status == "pending":
         if dry_run:
@@ -4569,8 +4642,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
         print(f"Running pending implementation {impl_task.id}...")
         pending_recovery_mode = resolve_pending_recovery_execution_mode(impl_task)
-        impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
-            impl_task,
+        impl_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+            args=args,
+            config=config,
+            store=store,
+            task_to_run=impl_task,
+            max_resume_attempts=effective_max_resume_attempts,
             initial_resume=pending_recovery_mode == "resume",
         )
         if rc != 0:
@@ -4598,8 +4675,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 run_start_task,
                 resume_start=prepared_start.initial_resume,
             )
-            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
-                run_start_task,
+            impl_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=run_start_task,
+                max_resume_attempts=effective_max_resume_attempts,
                 initial_resume=prepared_start.initial_resume,
             )
         elif use_resume:
@@ -4648,8 +4729,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 run_start_task,
                 resume_start=True,
             )
-            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(
-                run_start_task,
+            impl_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=run_start_task,
+                max_resume_attempts=effective_max_resume_attempts,
                 initial_resume=True,
             )
         else:
@@ -4683,7 +4768,13 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 run_start_task,
                 resume_start=False,
             )
-            impl_task, rc, terminal_skip_decision = _run_task_with_recovery(run_start_task)
+            impl_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=run_start_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
 
         if rc != 0:
             if terminal_skip_decision is not None:
@@ -4760,31 +4851,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     impl_task_key = impl_task.id
     assert impl_task_key is not None
 
-    @dataclass(frozen=True)
-    class IterateSummaryRow:
-        iteration_index: int
-        task_type: str
-        task_id: str | None
-        verdict: str | None
-        duration_seconds: float | None
-        steps: int | None
-        cost_usd: float | None
-        status: str
-        failure_reason: str | None
-        completion_reason: str | None
-
-    def _format_compact_duration(seconds: float | None) -> str:
-        if seconds is None:
-            return "-"
-        return format_duration(seconds).replace(" ", "")
-
-    def _format_summary_status(row: IterateSummaryRow) -> str:
-        if row.failure_reason:
-            return f"{row.status} ({row.failure_reason})"
-        if row.completion_reason:
-            return f"{row.status} ({row.completion_reason})"
-        return row.status
-
     def _append_summary_row(
         rows: list[IterateSummaryRow],
         *,
@@ -4795,27 +4861,15 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         status: str | None = None,
         failure_reason: str | None = None,
     ) -> None:
-        refreshed_task = task
-        if task is not None and task.id is not None:
-            refreshed_task = store.get(task.id) or task
-
-        row_status = status or (refreshed_task.status if refreshed_task else "failed")
-        row_failure_reason = (refreshed_task.failure_reason if refreshed_task else None) or failure_reason
-        row_completion_reason = refreshed_task.completion_reason if refreshed_task else None
-
-        rows.append(
-            IterateSummaryRow(
-                iteration_index=iteration_index,
-                task_type=task_type,
-                task_id=refreshed_task.id if refreshed_task else None,
-                verdict=verdict,
-                duration_seconds=refreshed_task.duration_seconds if refreshed_task else None,
-                steps=get_task_step_count(refreshed_task) if refreshed_task else None,
-                cost_usd=refreshed_task.cost_usd if refreshed_task else None,
-                status=row_status,
-                failure_reason=row_failure_reason,
-                completion_reason=row_completion_reason,
-            )
+        _append_iterate_summary_row(
+            store,
+            rows,
+            iteration_index=iteration_index,
+            task_type=task_type,
+            task=task,
+            verdict=verdict,
+            status=status,
+            failure_reason=failure_reason,
         )
 
     def _task_sort_key(task: DbTask) -> tuple[datetime, int]:
@@ -5024,7 +5078,13 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return False
 
         assert action_task.id is not None
-        action_task, rc, terminal_skip_decision = _run_task_with_recovery(action_task)
+        action_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+            args=args,
+            config=config,
+            store=store,
+            task_to_run=action_task,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
         if rc != 0:
             final_status = "blocked"
             attention_result = None
@@ -5598,8 +5658,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             )
 
         assert action_task is not None
-        action_task, rc, terminal_skip_decision = _run_task_with_recovery(
-            action_task,
+        action_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+            args=args,
+            config=config,
+            store=store,
+            task_to_run=action_task,
+            max_resume_attempts=effective_max_resume_attempts,
             initial_resume=initial_resume,
         )
         if rc != 0:
