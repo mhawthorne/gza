@@ -8078,6 +8078,71 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     )
 
 
+def test_watch_cycle_logs_off_topic_investigation_ids_for_cleared_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement", group="release-1")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-investigation-merge"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch(
+            "gza.cli.determine_next_action",
+            return_value={
+                "type": "merge",
+                "description": "Merge (previous review addressed)",
+                "created_investigation_task_ids": ("gza-7001",),
+                "reused_investigation_task_ids": ("gza-7000",),
+            },
+        ),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            side_effect=lambda *_args, **_kwargs: (
+                store.set_merge_status(task.id, "merged"),
+                SimpleNamespace(
+                    rc=0,
+                    created_followups=[],
+                    reused_followups=[],
+                    created_investigation_task_ids=["gza-7001"],
+                    reused_investigation_task_ids=["gza-7000"],
+                ),
+            )[1],
+        ),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    assert f"MERGE     {task.id} -> main" in log_text
+    assert "FOLLOW    gza-7001 investigation created from" in log_text
+    assert "FOLLOW    gza-7000 investigation reused from" in log_text
+
+
 def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_followup_tasks(tmp_path: Path) -> None:
     """Dry-run should preview merge_with_followups without mutating follow-up tasks."""
     setup_config(tmp_path)

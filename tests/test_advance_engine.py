@@ -6539,6 +6539,8 @@ def test_off_topic_verify_unblock_clears_review_and_persists_audit_artifact(
     ]
 
     assert action["type"] == "merge"
+    assert action["created_investigation_task_ids"] == (investigation_tasks[0].id,)
+    assert action.get("reused_investigation_task_ids") in {None, ()}
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is not None
     assert len(artifacts) == 1

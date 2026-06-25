@@ -243,6 +243,8 @@ class AdvanceContext:
     latest_completed_code_change: DbTask | None = None
     effective_review_cleared_at: datetime | None = None
     review_cleared: bool = False
+    created_investigation_task_ids: tuple[str, ...] = ()
+    reused_investigation_task_ids: tuple[str, ...] = ()
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
     latest_review_blocker_summary: ReviewBlockerSummary | None = None
@@ -1000,7 +1002,7 @@ def _classify_off_topic_noop_improve_verify_clearance(
     current_head_sha: str,
     latest_completed_noop_improve: DbTask,
     persist: bool,
-) -> tuple[bool, datetime | None, str | None]:
+) -> tuple[bool, datetime | None, str | None, tuple[str, ...], tuple[str, ...]]:
     from gza.off_topic_verify import (
         classify_failure_diff_scope,
         parse_review_verify_failure_set,
@@ -1009,34 +1011,34 @@ def _classify_off_topic_noop_improve_verify_clearance(
     )
 
     if task.branch is None:
-        return False, None, None
+        return False, None, None, (), ()
     if not getattr(
         config,
         "advance_off_topic_verify_unblock",
         DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK,
     ):
-        return False, None, None
+        return False, None, None, (), ()
     if not _task_has_current_failed_review_verify_evidence(
         task=latest_completed_noop_improve,
         review_task=latest_completed_review,
         current_branch=task.branch,
         current_head_sha=current_head_sha,
     ):
-        return False, None, None
+        return False, None, None, (), ()
     red_result = _build_review_verify_result_from_task(
         config=config,
         store=store,
         task=latest_completed_noop_improve,
     )
     if red_result is None:
-        return False, None, None
+        return False, None, None, (), ()
     red_tree_fingerprint = _extract_review_verify_tree_fingerprint(
         config=config,
         store=store,
         task=latest_completed_noop_improve,
     )
     if red_tree_fingerprint is None:
-        return False, None, None
+        return False, None, None, (), ()
     green_task = _latest_current_passing_review_verify_task(
         improve_tasks=improve_tasks,
         review_task=latest_completed_review,
@@ -1045,16 +1047,16 @@ def _classify_off_topic_noop_improve_verify_clearance(
         before=latest_completed_noop_improve.review_verify_captured_at,
     )
     if green_task is None or green_task.id is None:
-        return False, None, None
+        return False, None, None, (), ()
     green_tree_fingerprint = _extract_review_verify_tree_fingerprint(
         config=config,
         store=store,
         task=green_task,
     )
     if green_tree_fingerprint is None or green_tree_fingerprint != red_tree_fingerprint:
-        return False, None, None
+        return False, None, None, (), ()
     if not persist:
-        return False, None, None
+        return False, None, None, (), ()
     target_head_sha = (
         git.rev_parse_if_exists(target_branch)
         if target_branch and callable(getattr(git, "rev_parse_if_exists", None))
@@ -1062,7 +1064,7 @@ def _classify_off_topic_noop_improve_verify_clearance(
     )
     target_tree_fingerprint = _resolve_target_tree_fingerprint(git, target_branch)
     if not target_branch or not target_head_sha or not target_tree_fingerprint:
-        return False, None, None
+        return False, None, None, (), ()
     changed_paths = _resolve_off_topic_changed_paths(
         config=config,
         git=git,
@@ -1070,7 +1072,7 @@ def _classify_off_topic_noop_improve_verify_clearance(
         target_branch=target_branch,
     )
     if changed_paths is None:
-        return False, None, None
+        return False, None, None, (), ()
     failure_set = parse_review_verify_failure_set(red_result)
     diff_scope = classify_failure_diff_scope(
         failure_set,
@@ -1078,7 +1080,7 @@ def _classify_off_topic_noop_improve_verify_clearance(
         repo_root=_project_boundary(config).repo_root,
     )
     if diff_scope.outcome != "off_topic":
-        return False, None, None
+        return False, None, None, (), ()
     selection = select_local_target_baseline_plan(
         failure_set,
         diff_scope,
@@ -1088,7 +1090,7 @@ def _classify_off_topic_noop_improve_verify_clearance(
         relative_cwd=_project_boundary(config).scope_root.as_posix() or ".",
     )
     if not selection.available or selection.plan is None:
-        return False, None, None
+        return False, None, None, (), ()
     try:
         baseline_run = run_local_target_baseline_plan(
             selection.plan,
@@ -1098,14 +1100,14 @@ def _classify_off_topic_noop_improve_verify_clearance(
             timeout_grace_seconds=float(getattr(config, "review_verify_timeout_grace_seconds", 5.0)),
         )
     except Exception as exc:
-        return False, None, f"off-topic local-target baseline failed for {target_branch}: {exc}"
+        return False, None, f"off-topic local-target baseline failed for {target_branch}: {exc}", (), ()
     if not _baseline_run_matches_failure_signatures(
         red_result=red_result,
         baseline_results=baseline_run.results,
     ):
-        return False, None, None
+        return False, None, None, (), ()
     if latest_completed_review.id is None:
-        return False, None, None
+        return False, None, None, (), ()
     payload = {
         "reason": "off_topic_verify_failure",
         "implementation_task_id": task.id,
@@ -1154,8 +1156,14 @@ def _classify_off_topic_noop_improve_verify_clearance(
             review_clearance_artifact_producer="advance_off_topic_verify_unblock",
         )
     except Exception as exc:
-        return False, None, str(exc)
-    return True, persisted.review_cleared_at, None
+        return False, None, str(exc), (), ()
+    return (
+        True,
+        persisted.review_cleared_at,
+        None,
+        tuple(task.id for task in persisted.created_tasks if task.id is not None),
+        tuple(task.id for task in persisted.reused_tasks if task.id is not None),
+    )
 
 
 def _resolve_noop_improve_verify_clearance(
@@ -1169,29 +1177,29 @@ def _resolve_noop_improve_verify_clearance(
     latest_completed_review: DbTask | None,
     improve_tasks: list[DbTask],
     persist: bool,
-) -> tuple[bool, datetime | None, str | None]:
+) -> tuple[bool, datetime | None, str | None, tuple[str, ...], tuple[str, ...]]:
     """Return verify-only review clearance and optionally persist it."""
     if latest_completed_review is None or task.branch is None or task.id is None:
-        return False, None, None
+        return False, None, None, (), ()
 
     branch_head = _resolve_branch_head_sha(git, task.branch)
     if branch_head.warning is not None:
-        return False, None, branch_head.warning
+        return False, None, branch_head.warning, (), ()
 
     current_head_sha = branch_head.head_sha
     if current_head_sha is None:
-        return False, None, None
+        return False, None, None, (), ()
     if not _review_is_verify_only_blocked_at_head(
         project_dir=project_dir,
         review_task=latest_completed_review,
         current_branch=task.branch,
         current_head_sha=current_head_sha,
     ):
-        return False, None, None
+        return False, None, None, (), ()
 
     latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
     if latest_completed_noop_improve is None:
-        return False, None, None
+        return False, None, None, (), ()
 
     if _task_has_current_passing_review_verify_evidence(
         task=latest_completed_noop_improve,
@@ -1205,16 +1213,22 @@ def _resolve_noop_improve_verify_clearance(
             or latest_completed_noop_improve.started_at
         )
         if not persist:
-            return True, clearance_time, None
+            return True, clearance_time, None, (), ()
 
         store.clear_review_state(task.id)
         persisted_task = store.get(task.id)
         if persisted_task is None or persisted_task.review_cleared_at is None:
-            return False, None, None
+            return False, None, None, (), ()
         task.review_cleared_at = persisted_task.review_cleared_at
-        return True, persisted_task.review_cleared_at, None
+        return True, persisted_task.review_cleared_at, None, (), ()
 
-    cleared_off_topic, clearance_time, clearance_warning = _classify_off_topic_noop_improve_verify_clearance(
+    (
+        cleared_off_topic,
+        clearance_time,
+        clearance_warning,
+        created_investigation_task_ids,
+        reused_investigation_task_ids,
+    ) = _classify_off_topic_noop_improve_verify_clearance(
         config=config,
         store=store,
         git=git,
@@ -1227,8 +1241,14 @@ def _resolve_noop_improve_verify_clearance(
         persist=persist,
     )
     if cleared_off_topic:
-        return True, clearance_time, None
-    return False, None, clearance_warning
+        return (
+            True,
+            clearance_time,
+            None,
+            created_investigation_task_ids,
+            reused_investigation_task_ids,
+        )
+    return False, None, clearance_warning, (), ()
 
 
 def _review_has_current_verify_blocker_clearance(
@@ -1622,6 +1642,21 @@ def _merge_review_cleared_description(ctx: AdvanceContext) -> str:
     if getattr(ctx, "review_blockers_invalidated", False):
         return "Merge (review-blocker-invalid: disputed blocker invalidated by adjudication)"
     return "Merge (previous review addressed)"
+
+
+def _merge_review_cleared_action(ctx: AdvanceContext) -> dict[str, Any]:
+    """Return merge action for a cleared review, including off-topic investigation ids."""
+    action: dict[str, Any] = {
+        "type": "merge",
+        "description": _merge_review_cleared_description(ctx),
+    }
+    created_ids = getattr(ctx, "created_investigation_task_ids", ())
+    reused_ids = getattr(ctx, "reused_investigation_task_ids", ())
+    if created_ids:
+        action["created_investigation_task_ids"] = created_ids
+    if reused_ids:
+        action["reused_investigation_task_ids"] = reused_ids
+    return action
 
 
 def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
@@ -2727,6 +2762,8 @@ def _resolve_review_state(
     DbTask | None,
     datetime | None,
     bool,
+    tuple[str, ...],
+    tuple[str, ...],
     str | None,
     ParsedReviewReport | None,
     ReviewBlockerSummary | None,
@@ -2765,6 +2802,8 @@ def _resolve_review_state(
     )
     effective_review_cleared_at = task.review_cleared_at if persisted_review_cleared else None
     review_cleared = persisted_review_cleared
+    created_investigation_task_ids: tuple[str, ...] = ()
+    reused_investigation_task_ids: tuple[str, ...] = ()
 
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
@@ -2827,6 +2866,8 @@ def _resolve_review_state(
                 review_cleared,
                 effective_review_cleared_at,
                 noop_improve_verify_probe_warning,
+                created_investigation_task_ids,
+                reused_investigation_task_ids,
             ) = _resolve_noop_improve_verify_clearance(
                 config=config,
                 store=store,
@@ -2934,6 +2975,8 @@ def _resolve_review_state(
         latest_completed_review,
         effective_review_cleared_at,
         review_cleared,
+        created_investigation_task_ids,
+        reused_investigation_task_ids,
         review_verdict,
         review_report,
         latest_review_blocker_summary,
@@ -3544,6 +3587,8 @@ def resolve_advance_context(
         latest_completed_review,
         effective_review_cleared_at,
         review_cleared,
+        created_investigation_task_ids,
+        reused_investigation_task_ids,
         review_verdict,
         review_report,
         latest_review_blocker_summary,
@@ -3603,6 +3648,8 @@ def resolve_advance_context(
         latest_completed_code_change=latest_completed_code_change,
         effective_review_cleared_at=effective_review_cleared_at,
         review_cleared=review_cleared,
+        created_investigation_task_ids=created_investigation_task_ids,
+        reused_investigation_task_ids=reused_investigation_task_ids,
         review_verdict=review_verdict,
         review_report=review_report,
         latest_review_blocker_summary=latest_review_blocker_summary,
@@ -4499,7 +4546,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         and has_valid_review_for_merge(ctx)
         and ctx.review_cleared
         and ctx.latest_completed_review is not None,
-        action=lambda ctx: {"type": "merge", "description": _merge_review_cleared_description(ctx)},
+        action=_merge_review_cleared_action,
     ),
     AdvanceRule(
         name="non_implement_no_review",

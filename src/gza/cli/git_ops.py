@@ -2750,6 +2750,8 @@ class _MergeActionResult:
     rc: int
     created_followups: list[DbTask]
     reused_followups: list[DbTask]
+    created_investigation_task_ids: list[str]
+    reused_investigation_task_ids: list[str]
     status: str = "merged"
     block_reason: str | None = None
 
@@ -2809,6 +2811,16 @@ def _execute_merge_action(
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
     reused_followups: list[DbTask] = []
+    created_investigation_task_ids = [
+        task_id
+        for task_id in action.get("created_investigation_task_ids", ())
+        if isinstance(task_id, str) and task_id
+    ]
+    reused_investigation_task_ids = [
+        task_id
+        for task_id in action.get("reused_investigation_task_ids", ())
+        if isinstance(task_id, str) and task_id
+    ]
     execution_git = merge_git or git
     execution_branch = merge_current_branch or current_branch
     resolved_subject = _resolve_merge_subject(store, execution_git, task.id or "", target_branch=target_branch) if task.id else None
@@ -2823,6 +2835,8 @@ def _execute_merge_action(
                 rc=1,
                 created_followups=created_followups,
                 reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
             )
 
     if execution_branch != target_branch:
@@ -2834,6 +2848,8 @@ def _execute_merge_action(
             rc=1,
             created_followups=created_followups,
             reused_followups=reused_followups,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
         )
 
     if resolved_subject is not None and resolved_subject.merge_source_warning:
@@ -2842,6 +2858,8 @@ def _execute_merge_action(
             rc=1,
             created_followups=created_followups,
             reused_followups=reused_followups,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
         )
 
     if action.get("type") == "merge_with_followups":
@@ -2876,6 +2894,8 @@ def _execute_merge_action(
             rc=0,
             created_followups=created_followups,
             reused_followups=reused_followups,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
             status="already_merged",
         )
 
@@ -2942,6 +2962,8 @@ def _execute_merge_action(
         rc=rc,
         created_followups=created_followups,
         reused_followups=reused_followups,
+        created_investigation_task_ids=created_investigation_task_ids,
+        reused_investigation_task_ids=reused_investigation_task_ids,
         status=merge_result.status,
         block_reason=merge_result.block_reason,
     )
@@ -3755,6 +3777,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if merge_result.reused_followups:
                 reused_ids = ", ".join(str(t.id) for t in merge_result.reused_followups if t.id is not None)
                 console.print(f"      [{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
+            created_investigation_task_ids = getattr(merge_result, "created_investigation_task_ids", ())
+            reused_investigation_task_ids = getattr(merge_result, "reused_investigation_task_ids", ())
+            if created_investigation_task_ids:
+                created_ids = ", ".join(created_investigation_task_ids)
+                console.print(f"      [{_c_ok}]✓ Created investigation task(s): {created_ids}[/{_c_ok}]")
+            if reused_investigation_task_ids:
+                reused_ids = ", ".join(reused_investigation_task_ids)
+                console.print(f"      [{_c_warn}]↺ Reused investigation task(s): {reused_ids}[/{_c_warn}]")
             rc = merge_result.rc
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")

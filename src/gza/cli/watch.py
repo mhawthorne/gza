@@ -3219,6 +3219,10 @@ def _run_cycle(
                     log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
                 for followup_task in merge_result.reused_followups:
                     log.emit("FOLLOW", f"{followup_task.id} reused from {display_task.id}")
+                for investigation_task_id in getattr(merge_result, "created_investigation_task_ids", ()):
+                    log.emit("FOLLOW", f"{investigation_task_id} investigation created from {display_task.id}")
+                for investigation_task_id in getattr(merge_result, "reused_investigation_task_ids", ()):
+                    log.emit("FOLLOW", f"{investigation_task_id} investigation reused from {display_task.id}")
                 if getattr(merge_result, "status", None) == "blocked_dirty_checkout":
                     log.emit_attention(
                         attention_key="merge-blocked-dirty-checkout",
