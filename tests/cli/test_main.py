@@ -312,6 +312,45 @@ class TestHelpOutput:
         assert refreshed is not None
         assert refreshed.review_verify_status == "passed"
 
+    def test_flaky_reproduce_help_and_dispatch_are_registered(self, tmp_path, monkeypatch):
+        """`gza flaky reproduce` should be visible in help and dispatch through the live parser."""
+        setup_config(tmp_path)
+
+        help_result = invoke_gza("flaky", "reproduce", "--help", "--project", str(tmp_path))
+        assert help_result.returncode == 0
+        assert "bounded targeted stress harness" in help_result.stdout
+        assert "structured inconclusive artifact" in help_result.stdout
+        assert "--hypothesis" in help_result.stdout
+
+        cli_main_module = importlib.import_module("gza.cli.main")
+        captured = {}
+
+        def fake_cmd(args):
+            captured["command"] = args.command
+            captured["flaky_action"] = args.flaky_action
+            captured["task_id"] = args.task_id
+            captured["runs"] = args.runs
+            captured["project_dir"] = args.project_dir
+            return 0
+
+        monkeypatch.setattr(cli_main_module, "cmd_flaky_reproduce", fake_cmd)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["gza", "flaky", "reproduce", "gza-7", "--runs", "3", "--project", str(tmp_path)],
+        ):
+            result = cli_main_module.main()
+
+        assert result == 0
+        assert captured == {
+            "command": "flaky",
+            "flaky_action": "reproduce",
+            "task_id": "gza-7",
+            "runs": 3,
+            "project_dir": tmp_path.resolve(),
+        }
+
     def test_hidden_attach_command_is_absent_from_help_but_still_dispatches(
         self, tmp_path, monkeypatch, capsys
     ):

@@ -175,6 +175,26 @@ FAILED tests/test_beta.py::test_beta - ValueError: boom
     assert parsed.pass_fail_counts.total_failures == 0
 
 
+def test_parse_pytest_verify_failure_refuses_pre_summary_failure_like_line() -> None:
+    output = """
+gza-verify phase=failed name=unit duration_seconds=0.20
+ERROR tests/test_log.py::test_not_real - logged before pytest summary
+============================== 1 failed in 0.20s ==============================
+""".strip()
+
+    parsed = parse_pytest_verify_failure(
+        command="uv run pytest tests/ -q --maxfail=0",
+        output=output,
+        exit_status="1",
+    )
+
+    assert parsed.available is False
+    assert parsed.unavailable is not None
+    assert parsed.unavailable.reason == "no_failing_nodes"
+    assert parsed.failing_nodes == ()
+    assert parsed.pass_fail_counts.total_failures == 1
+
+
 def test_parse_pytest_verify_failure_preserves_parametrized_nodeid_with_spaces() -> None:
     output = """
 gza-verify phase=failed name=unit duration_seconds=3.10
@@ -627,7 +647,37 @@ FAILED tests/cli/test_query.py::test_query
     assert classification.shared_global_paths == ("src/gza/workers.py",)
 
 
+def test_classify_failure_diff_scope_routes_config_source_changes_to_stress_baseline() -> None:
+    parsed = parse_pytest_verify_failure(
+        command="uv run pytest tests/ -q --maxfail=0",
+        output="""
+_________________________________ test_query __________________________________
+
+    def test_query():
+>       assert 1 == 2
+E       assert 1 == 2
+
+tests/cli/test_query.py:14: AssertionError
+=========================== short test summary info ============================
+FAILED tests/cli/test_query.py::test_query
+============================== 1 failed in 0.20s ==============================
+""".strip(),
+        exit_status="1",
+    )
+
+    classification = classify_failure_diff_scope(
+        parsed,
+        changed_paths=("src/gza/config.py",),
+    )
+
+    assert classification.outcome == "off_topic"
+    assert classification.baseline_mode == "stress"
+    assert classification.shared_global_paths == ("src/gza/config.py",)
+
+
 def test_is_shared_global_or_concurrency_sensitive_path_is_named_conservative_policy() -> None:
+    assert is_shared_global_or_concurrency_sensitive_path("src/gza/config.py") is True
+    assert is_shared_global_or_concurrency_sensitive_path("src/gza/config_schema.py") is True
     assert is_shared_global_or_concurrency_sensitive_path("src/gza/workers.py") is True
     assert is_shared_global_or_concurrency_sensitive_path("tests/conftest.py") is True
     assert is_shared_global_or_concurrency_sensitive_path("src/gza/git.py") is False

@@ -27,6 +27,12 @@ from gza.cli.advance_executor import (
 from gza.config import Config
 from gza.concurrency import launch_permit
 from gza.db import Task as DbTask
+from gza.flaky_investigations import (
+    FlakyInvestigationEvidence,
+    build_flaky_reproduction_plan,
+    normalize_flaky_investigation_dedup_key,
+)
+from gza.off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
 from gza.plan_review_materialization import (
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
     build_plan_review_slice_task_specs,
@@ -296,6 +302,259 @@ def test_create_review_adjudication_spawns_internal_worker(tmp_path: Path) -> No
     assert captured_dispute_metadata is not None
     assert captured_dispute_metadata["disputed_artifact_id"] == 47
     assert spawned == [(result.created_task.id or "", "review_adjudication")]
+
+
+def _off_topic_clearance_candidate(review: DbTask, impl: DbTask, *, working_directory: str = "/workspace"):
+    from gza.advance_engine import OffTopicVerifyClearanceCandidate
+
+    assert review.id is not None
+    assert impl.id is not None
+    node = FailingNode(
+        nodeid="tests/cli/test_watch.py::test_worker_registry_race",
+        path="tests/cli/test_watch.py",
+        outcome="FAILED",
+        assertion_signature="assert running == completed",
+        failure_path="tests/cli/test_watch.py",
+        failure_line=42,
+        traceback_paths=("tests/cli/test_watch.py",),
+        trustworthy_attribution=True,
+    )
+    evidence = FlakyInvestigationEvidence(
+        node=node,
+        dedup_key=normalize_flaky_investigation_dedup_key(node.nodeid, node.assertion_signature),
+        review_task_id=review.id,
+        impl_task_id=impl.id,
+        merge_unit_id=None,
+        reviewed_head_sha="deadbeef",
+        tree_fingerprint="f" * 64,
+        observed_branch="feature/off-topic",
+        target_branch="main",
+        verify_command="./bin/tests",
+        targeted_command=None,
+        working_directory=working_directory,
+        branch_pass_fail_counts=PytestPassFailCounts(failed=1, passed=412),
+        xdist=PytestXdistMetadata(enabled=True, worker_count=8, worker_count_raw="8"),
+        branch_verify_status="failed",
+        branch_verify_exit_status="1",
+    )
+    return OffTopicVerifyClearanceCandidate(
+        review_task=review,
+        reviewed_head_sha="deadbeef",
+        tree_fingerprint="f" * 64,
+        evidences=(evidence,),
+    )
+
+
+def test_clear_off_topic_verify_blocker_creates_investigation_and_clears_review(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/off-topic-clearance")
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=Config.load(tmp_path),
+    )
+
+    action = {
+        "type": "clear_off_topic_verify_blocker",
+        "review_task": review,
+        "off_topic_verify_clearance_candidate": _off_topic_clearance_candidate(
+            review,
+            impl,
+            working_directory=str(tmp_path),
+        ),
+    }
+
+    result = execute_advance_action(
+        task=impl,
+        action=action,
+        context=context,
+    )
+
+    refreshed = store.get(impl.id)
+    assert result.status == "success"
+    assert refreshed is not None
+    assert refreshed.review_cleared_at is not None
+    assert len(result.created_investigations) == 1
+    assert result.reused_investigations == ()
+    assert result.created_investigations[0].id in result.success_message
+    created_id = result.created_investigations[0].id
+    assert created_id is not None
+
+    plan = build_flaky_reproduction_plan(
+        store,
+        project_dir=tmp_path,
+        task_id=created_id,
+        enable_xdist=False,
+        enable_randomization=False,
+    )
+    assert "uv run pytest tests/cli/test_watch.py::test_worker_registry_race --maxfail=0" in plan.command
+
+    repeat = execute_advance_action(
+        task=impl,
+        action=action,
+        context=context,
+    )
+    assert repeat.status == "success"
+    assert repeat.created_investigations == ()
+    assert len(repeat.reused_investigations) == 1
+
+
+def test_clear_off_topic_verify_blocker_fails_closed_when_investigation_persistence_fails(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/off-topic-fail-closed")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=Config.load(tmp_path),
+    )
+
+    with patch(
+        "gza.cli.advance_executor.create_or_reuse_flaky_investigations",
+        side_effect=RuntimeError("artifact write failed"),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "clear_off_topic_verify_blocker",
+                "review_task": review,
+                "off_topic_verify_clearance_candidate": _off_topic_clearance_candidate(
+                    review,
+                    impl,
+                    working_directory=str(tmp_path),
+                ),
+            },
+            context=context,
+        )
+
+    refreshed = store.get(impl.id)
+    assert result.status == "error"
+    assert "artifact write failed" in result.message
+    assert refreshed is not None
+    assert refreshed.review_cleared_at is None
+
+
+def test_clear_off_topic_verify_blocker_fails_closed_when_evidence_cannot_build_targeted_command(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/off-topic-untargetable")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=Config.load(tmp_path),
+    )
+
+    candidate = _off_topic_clearance_candidate(review, impl, working_directory=str(tmp_path))
+    [evidence] = candidate.evidences
+    untargetable_evidence = FlakyInvestigationEvidence(
+        node=evidence.node,
+        dedup_key=evidence.dedup_key,
+        review_task_id=evidence.review_task_id,
+        impl_task_id=evidence.impl_task_id,
+        merge_unit_id=evidence.merge_unit_id,
+        reviewed_head_sha=evidence.reviewed_head_sha,
+        tree_fingerprint=evidence.tree_fingerprint,
+        observed_branch=evidence.observed_branch,
+        target_branch=evidence.target_branch,
+        verify_command="make test",
+        targeted_command=None,
+        working_directory=evidence.working_directory,
+        branch_pass_fail_counts=evidence.branch_pass_fail_counts,
+        xdist=evidence.xdist,
+        branch_verify_status=evidence.branch_verify_status,
+        branch_verify_exit_status=evidence.branch_verify_exit_status,
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={
+            "type": "clear_off_topic_verify_blocker",
+            "review_task": review,
+            "off_topic_verify_clearance_candidate": candidate.__class__(
+                review_task=candidate.review_task,
+                reviewed_head_sha=candidate.reviewed_head_sha,
+                tree_fingerprint=candidate.tree_fingerprint,
+                evidences=(untargetable_evidence,),
+            ),
+        },
+        context=context,
+    )
+
+    refreshed = store.get(impl.id)
+    assert result.status == "error"
+    assert "cannot produce a bounded targeted pytest command" in result.message
+    assert refreshed is not None
+    assert refreshed.review_cleared_at is None
 
 
 def test_materialize_plan_review_slices_includes_slice_prompt_and_provenance(tmp_path: Path) -> None:

@@ -3281,6 +3281,90 @@ def test_watch_cycle_direct_reconcile_does_not_block_pending_worker_slot(
     assert str(pending_plan.id) in log_text
 
 
+def test_watch_cycle_logs_off_topic_clearance_success_message_without_starting_impl_task(
+    tmp_path: Path,
+) -> None:
+    """Watch should log clear_off_topic_verify_blocker success output instead of a misleading START."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/off-topic-watch-log"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="clear_off_topic_verify_blocker",
+        unresolved_tasks=(impl,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    success_message = (
+        "Cleared verify-only review blocker as off-topic; "
+        "created investigation task(s): gza-999"
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[]),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={
+                "type": "clear_off_topic_verify_blocker",
+                "description": "Clear off-topic verify blocker",
+            },
+        ),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="clear_off_topic_verify_blocker",
+                status="success",
+                message="",
+                success_message=success_message,
+                handled_task_id=impl.id,
+                work_done=True,
+                worker_consuming=False,
+            ),
+        ) as execute_action,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    execute_action.assert_called_once()
+    log_text = log_path.read_text()
+    assert "REPAIR" in log_text
+    assert success_message in log_text
+    assert f"START     {impl.id}" not in log_text
+
+
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_watch_cycle_recovery_only_direct_reconcile_blocks_pending_pickup(
     tmp_path: Path,

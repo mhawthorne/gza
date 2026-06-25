@@ -20,10 +20,19 @@ from gza.db import (
     task_id_numeric_key,
     task_owns_merge_status,
 )
+from gza.flaky_investigations import (
+    FlakyInvestigationEvidence,
+    derive_flaky_targeted_command,
+    normalize_flaky_investigation_dedup_key,
+)
 from gza.git import ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
+from gza.off_topic_verify import (
+    classify_failure_diff_scope,
+    parse_review_verify_failure_set,
+)
 from gza.operator_state import terminal_no_work_lifecycle_detail
 from gza.plan_review_materialization import load_materialized_plan_slice_set
 from gza.plan_review_verdict import (
@@ -71,6 +80,7 @@ from gza.runner import (
     _extract_review_verify_phase_results,
     _filter_owned_artifact_paths,
     _find_out_of_scope_paths,
+    _make_review_verify_result,
     _project_boundary,
     _review_is_verify_only_blocked_at_head,
     _task_has_current_passing_review_verify_evidence,
@@ -190,6 +200,16 @@ class ReviewBlockerResolutionStatus:
 
 
 @dataclass(frozen=True)
+class OffTopicVerifyClearanceCandidate:
+    """Execution-time clearance payload for one off-topic verify-only review block."""
+
+    review_task: DbTask
+    reviewed_head_sha: str
+    tree_fingerprint: str
+    evidences: tuple[FlakyInvestigationEvidence, ...]
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -250,6 +270,7 @@ class AdvanceContext:
     latest_review_blocker_summary: ReviewBlockerSummary | None = None
     followup_findings: tuple[ReviewFinding, ...] = ()
     recent_verify_timeout_only_reviews: tuple[DbTask, ...] = ()
+    off_topic_verify_clearance_candidate: OffTopicVerifyClearanceCandidate | None = None
 
     completed_review_cycles: int = 0
     review_cycle_boundary_task_id: str | None = None
@@ -1251,6 +1272,172 @@ def _resolve_noop_improve_verify_clearance(
     return False, None, clearance_warning, (), ()
 
 
+def _load_persisted_review_verify_result(
+    *,
+    project_dir: Path,
+    task: DbTask,
+) -> ReviewVerifyResult | None:
+    if (
+        task.review_verify_command is None
+        or task.review_verify_status is None
+        or task.review_verify_exit_status is None
+        or task.review_verify_captured_at is None
+    ):
+        return None
+    output: str | None = None
+    artifact_path = task.review_verify_artifact_file
+    if artifact_path:
+        resolved_path = (project_dir / artifact_path).resolve()
+        try:
+            output = resolved_path.read_text(encoding="utf-8")
+        except OSError:
+            output = None
+    return _make_review_verify_result(
+        task.review_verify_command,
+        status=task.review_verify_status,
+        exit_status=task.review_verify_exit_status,
+        captured_at=task.review_verify_captured_at,
+        reviewed_branch=task.review_verify_branch,
+        reviewed_head_sha=task.review_verify_head_sha,
+        reviewed_base_sha=task.review_verify_base_sha,
+        working_directory=task.review_verify_cwd,
+        failure=task.review_verify_failure,
+        output=output,
+    )
+
+
+def _review_verify_tree_fingerprint(result: ReviewVerifyResult | None) -> str | None:
+    if result is None:
+        return None
+    fingerprint: str | None = None
+    for phase in _extract_review_verify_phase_results(result.output):
+        candidate = phase.get("tree_fingerprint")
+        if isinstance(candidate, str) and candidate:
+            fingerprint = candidate
+    return fingerprint
+
+
+def _resolve_off_topic_verify_clearance_candidate(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    project_dir: Path,
+    task: DbTask,
+    target_branch: str,
+    latest_completed_review: DbTask | None,
+    improve_tasks: list[DbTask],
+) -> OffTopicVerifyClearanceCandidate | None:
+    if not getattr(config, "advance_off_topic_verify_unblock", False):
+        return None
+    if latest_completed_review is None or task.id is None or task.branch is None:
+        return None
+    if latest_completed_review.review_verify_status != "failed":
+        return None
+    if not _review_is_verify_only_blocked_at_head(
+        project_dir=project_dir,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=latest_completed_review.review_verify_head_sha,
+    ):
+        return None
+
+    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
+    if latest_completed_noop_improve is None:
+        return None
+    if not _task_has_current_passing_review_verify_evidence(
+        task=latest_completed_noop_improve,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=latest_completed_review.review_verify_head_sha,
+    ):
+        return None
+
+    review_result = _load_persisted_review_verify_result(
+        project_dir=project_dir,
+        task=latest_completed_review,
+    )
+    improve_result = _load_persisted_review_verify_result(
+        project_dir=project_dir,
+        task=latest_completed_noop_improve,
+    )
+    if review_result is None or improve_result is None:
+        return None
+    review_tree_fingerprint = _review_verify_tree_fingerprint(review_result)
+    improve_tree_fingerprint = _review_verify_tree_fingerprint(improve_result)
+    if (
+        not review_tree_fingerprint
+        or not improve_tree_fingerprint
+        or review_tree_fingerprint != improve_tree_fingerprint
+    ):
+        return None
+    if review_result.reviewed_head_sha != improve_result.reviewed_head_sha:
+        return None
+
+    try:
+        name_status_output = git.get_diff_name_status(f"{target_branch}...{task.branch}", check=True)
+    except Exception:
+        return None
+    parsed_name_status = parse_name_status_project_paths(name_status_output or "")
+    if not parsed_name_status.changed_paths:
+        return None
+
+    failure_set = parse_review_verify_failure_set(review_result)
+    diff_scope = classify_failure_diff_scope(
+        failure_set,
+        changed_paths=parsed_name_status.changed_paths,
+        repo_root=project_dir,
+    )
+    if diff_scope.outcome != "off_topic" or diff_scope.shared_global_paths:
+        return None
+
+    if latest_completed_review.id is None:
+        return None
+    if review_result.reviewed_head_sha is None:
+        return None
+
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    evidences: list[FlakyInvestigationEvidence] = []
+    for node in failure_set.failing_nodes:
+        targeted_command = derive_flaky_targeted_command(
+            verify_command=review_result.command,
+            nodeids=(node.nodeid,),
+        )
+        if not targeted_command:
+            return None
+        evidences.append(
+            FlakyInvestigationEvidence(
+                node=node,
+                dedup_key=normalize_flaky_investigation_dedup_key(
+                    node.nodeid,
+                    node.assertion_signature,
+                ),
+                review_task_id=latest_completed_review.id,
+                impl_task_id=task.id,
+                merge_unit_id=merge_unit.id if merge_unit is not None else None,
+                reviewed_head_sha=review_result.reviewed_head_sha,
+                tree_fingerprint=review_tree_fingerprint,
+                observed_branch=task.branch,
+                target_branch=target_branch,
+                verify_command=review_result.command,
+                targeted_command=targeted_command,
+                working_directory=review_result.working_directory,
+                branch_pass_fail_counts=failure_set.pass_fail_counts,
+                xdist=failure_set.xdist,
+                branch_verify_status=review_result.status,
+                branch_verify_exit_status=review_result.exit_status,
+            )
+        )
+    if not evidences:
+        return None
+    return OffTopicVerifyClearanceCandidate(
+        review_task=latest_completed_review,
+        reviewed_head_sha=review_result.reviewed_head_sha,
+        tree_fingerprint=review_tree_fingerprint,
+        evidences=tuple(evidences),
+    )
+
+
 def _review_has_current_verify_blocker_clearance(
     *,
     project_dir: Path,
@@ -1400,6 +1587,7 @@ def _latest_review_blocker_resolution_statuses(
     impl_task: DbTask,
     findings: tuple[ReviewFinding, ...],
     improve_tasks: list[DbTask],
+    allow_verify_clearance: bool = True,
 ) -> tuple[ReviewBlockerResolutionStatus, ...]:
     if review_task.id is None or impl_task.id is None:
         return ()
@@ -1407,15 +1595,18 @@ def _latest_review_blocker_resolution_statuses(
     branch_head = _resolve_branch_head_sha(git, impl_task.branch)
     current_head_sha = branch_head.head_sha
     verify_blockers_cleared = (
-        _review_has_current_verify_blocker_clearance(
-            project_dir=project_dir,
-            review_task=review_task,
-            current_branch=impl_task.branch,
-            current_head_sha=current_head_sha,
-            improve_tasks=improve_tasks,
+        allow_verify_clearance
+        and (
+            _review_has_current_verify_blocker_clearance(
+                project_dir=project_dir,
+                review_task=review_task,
+                current_branch=impl_task.branch,
+                current_head_sha=current_head_sha,
+                improve_tasks=improve_tasks,
+            )
+            if current_head_sha is not None
+            else False
         )
-        if current_head_sha is not None
-        else False
     )
 
     blockers: list[tuple[ReviewFinding, str, tuple[str, str] | None]] = []
@@ -1657,6 +1848,26 @@ def _merge_review_cleared_action(ctx: AdvanceContext) -> dict[str, Any]:
     if reused_ids:
         action["reused_investigation_task_ids"] = reused_ids
     return action
+
+
+def _clear_off_topic_verify_blocker_description(ctx: AdvanceContext) -> str:
+    candidate = getattr(ctx, "off_topic_verify_clearance_candidate", None)
+    if candidate is None:
+        return "Clear verify-only review blocker as off-topic"
+    return (
+        "Clear verify-only review blocker as off-topic and create/reuse "
+        f"{len(candidate.evidences)} investigation task(s)"
+    )
+
+
+def _clear_off_topic_verify_blocker_action(ctx: AdvanceContext) -> dict[str, Any]:
+    candidate = getattr(ctx, "off_topic_verify_clearance_candidate", None)
+    return {
+        "type": "clear_off_topic_verify_blocker",
+        "description": _clear_off_topic_verify_blocker_description(ctx),
+        "review_task": None if candidate is None else candidate.review_task,
+        "off_topic_verify_clearance_candidate": candidate,
+    }
 
 
 def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
@@ -2787,6 +2998,7 @@ def _resolve_review_state(
     bool,
     DbTask | None,
     dict[str, Any] | None,
+    OffTopicVerifyClearanceCandidate | None,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
     reviews = get_reviews_for_root(store, task)
@@ -2827,6 +3039,7 @@ def _resolve_review_state(
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
     latest_completed_code_change: DbTask | None = None
+    off_topic_verify_clearance_candidate: OffTopicVerifyClearanceCandidate | None = None
     completed_descendant_code_changes = [
         t
         for t in get_code_changing_descendants_for_root(store, task)
@@ -2861,6 +3074,10 @@ def _resolve_review_state(
         active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
         latest_noop_improve, consecutive_noop_improves = _count_consecutive_noop_improves(improve_tasks)
+        allow_off_topic_lane = bool(
+            getattr(config, "advance_off_topic_verify_unblock", False)
+            and latest_completed_review.review_verify_status == "failed"
+        )
         if not review_cleared:
             (
                 review_cleared,
@@ -2878,6 +3095,17 @@ def _resolve_review_state(
                 latest_completed_review=latest_completed_review,
                 improve_tasks=improve_tasks,
                 persist=persist_review_clearance,
+            )
+        if not review_cleared and allow_off_topic_lane:
+            off_topic_verify_clearance_candidate = _resolve_off_topic_verify_clearance_candidate(
+                config=config,
+                store=store,
+                git=git,
+                project_dir=Path(config.project_dir),
+                task=task,
+                target_branch=target_branch,
+                latest_completed_review=latest_completed_review,
+                improve_tasks=improve_tasks,
             )
 
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
@@ -2904,6 +3132,7 @@ def _resolve_review_state(
                 impl_task=task,
                 findings=review_report.findings,
                 improve_tasks=improve_tasks,
+                allow_verify_clearance=True,
             )
             all_current_review_blockers_cleared = bool(review_blocker_resolution_statuses) and all(
                 _review_blocker_status_clears_current_blocker(status)
@@ -3000,6 +3229,7 @@ def _resolve_review_state(
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
         closing_review_action,
+        off_topic_verify_clearance_candidate,
     )
 
 
@@ -3612,12 +3842,13 @@ def resolve_advance_context(
         has_fresh_unresolved_comments_since_latest_review,
         latest_completed_code_change,
         closing_review_action,
+        off_topic_verify_clearance_candidate,
     ) = _resolve_review_state(
         config,
         store,
         review_root_task,
         git,
-        target_branch,
+        target_branch=target_branch,
         persist_review_clearance=persist_review_clearance,
     )
 
@@ -3672,6 +3903,7 @@ def resolve_advance_context(
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
+        off_topic_verify_clearance_candidate=off_topic_verify_clearance_candidate,
     )
     ctx = _resolve_pre_closing_review_git_context(
         ctx,
@@ -4423,6 +4655,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
             "description": f"Spawn worker for pending improve {_task_id(ctx.active_improve_pending)}",
             "improve_task": ctx.active_improve_pending,
         },
+    ),
+    AdvanceRule(
+        name="review_clear_off_topic_verify_blocker",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.active_improve_running is None
+        and ctx.active_improve_pending is None
+        and ctx.off_topic_verify_clearance_candidate is not None,
+        action=_clear_off_topic_verify_blocker_action,
     ),
     AdvanceRule(
         name="review_blocker_adjudication_needed",

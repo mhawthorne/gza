@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import py_compile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -647,6 +648,18 @@ def _verify_failure_only_review_report() -> str:
         "## Questions / Assumptions\n\nNone.\n\n"
         "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
     )
+
+
+def _persist_verify_artifact(
+    tmp_path: Path,
+    *,
+    relative_path: str,
+    content: str,
+) -> str:
+    artifact_path = tmp_path / relative_path
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(content, encoding="utf-8")
+    return relative_path
 
 
 def _verify_failure_plus_code_blocker_review_report() -> str:
@@ -3921,6 +3934,12 @@ def test_cross_project_tag_copy_declared_project_root_advances_without_checkout_
     assert action.get("needs_attention_reason") is None
 
 
+def test_advance_engine_module_compiles() -> None:
+    """Advance engine source should stay syntactically loadable after review-state signature changes."""
+    engine_path = Path(__file__).resolve().parents[1] / "src" / "gza" / "advance_engine.py"
+    py_compile.compile(str(engine_path), doraise=True)
+
+
 def test_cross_project_tag_deleted_project_root_still_parks_without_declared_root(
     tmp_path: Path,
 ) -> None:
@@ -6079,6 +6098,179 @@ def test_verify_failure_only_noop_improve_with_same_head_green_evidence_merges(
     assert action["type"] != "needs_discussion"
     assert action["description"].startswith("Merge")
     assert "improve-no-op" not in action["description"]
+
+
+def test_off_topic_verify_policy_preserves_same_head_green_clearance_before_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_off_topic_verify_unblock = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-4710-worker-registry",
+        when=datetime(2026, 6, 23, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_exit_status = "1"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    review.review_verify_captured_at = review.completed_at
+    review.review_verify_command = "./bin/tests"
+    review.review_verify_cwd = "/workspace"
+    review.review_verify_artifact_file = _persist_verify_artifact(
+        tmp_path,
+        relative_path=".gza/artifacts/review-failure.txt",
+        content=(
+            "gza-verify phase=failed name=pytest duration_seconds=2.75 "
+            f"tree_fingerprint={'f' * 64}\n"
+            "________________ test_worker_registry_race ________________\n"
+            "tests/cli/test_watch.py:42: AssertionError\n"
+            "E assert 'running' == 'completed'\n"
+            "============================= short test summary info =============================\n"
+            "FAILED tests/cli/test_watch.py::test_worker_registry_race - assert 'running' == 'completed'\n"
+            "=========================== 1 failed, 412 passed in 2.75s ===========================\n"
+        ),
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 23, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_exit_status = "0"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    improve.review_verify_command = "./bin/tests"
+    improve.review_verify_cwd = "/workspace"
+    improve.review_verify_artifact_file = _persist_verify_artifact(
+        tmp_path,
+        relative_path=".gza/artifacts/improve-pass.txt",
+        content=(
+            "gza-verify phase=passed name=pytest duration_seconds=2.10 "
+            f"tree_fingerprint={'f' * 64}\n"
+            "=========================== 413 passed in 2.10s ===========================\n"
+        ),
+    )
+    store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+        name_status_by_range={
+            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py\n",
+        },
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+    stored_impl = store.get(impl.id)
+
+    assert ctx.review_cleared is True
+    assert ctx.off_topic_verify_clearance_candidate is None
+    assert action["type"] == "merge"
+    assert stored_impl is not None
+    assert stored_impl.review_cleared_at is not None
+
+
+def test_off_topic_verify_policy_still_fails_closed_without_current_same_head_green_evidence(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_off_topic_verify_unblock = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-5700-no-fallback-clear",
+        when=datetime(2026, 6, 23, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 23, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_exit_status = "1"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    review.review_verify_captured_at = review.completed_at
+    review.review_verify_command = "./bin/tests"
+    review.review_verify_cwd = "/workspace"
+    review.review_verify_artifact_file = _persist_verify_artifact(
+        tmp_path,
+        relative_path=".gza/artifacts/review-failure-no-fallback.txt",
+        content=(
+            "gza-verify phase=failed name=pytest duration_seconds=2.75 "
+            f"tree_fingerprint={'f' * 64}\n"
+            "________________ test_worker_registry_race ________________\n"
+            "tests/cli/test_watch.py:42: AssertionError\n"
+            "E assert 'running' == 'completed'\n"
+            "============================= short test summary info =============================\n"
+            "FAILED tests/cli/test_watch.py::test_worker_registry_race - assert 'running' == 'completed'\n"
+            "=========================== 1 failed, 412 passed in 2.75s ===========================\n"
+        ),
+    )
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 23, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_exit_status = "0"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "other-head-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    improve.review_verify_command = "./bin/tests"
+    improve.review_verify_cwd = "/workspace"
+    improve.review_verify_artifact_file = _persist_verify_artifact(
+        tmp_path,
+        relative_path=".gza/artifacts/improve-pass-head-mismatch.txt",
+        content=(
+            "gza-verify phase=passed name=pytest duration_seconds=2.10 "
+            f"tree_fingerprint={'f' * 64}\n"
+            "=========================== 413 passed in 2.10s ===========================\n"
+        ),
+    )
+    store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+        name_status_by_range={
+            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py\n",
+        },
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+    stored_impl = store.get(impl.id)
+
+    assert ctx.review_cleared is False
+    assert ctx.off_topic_verify_clearance_candidate is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert stored_impl is not None
+    assert stored_impl.review_cleared_at is None
 
 
 @pytest.mark.parametrize(

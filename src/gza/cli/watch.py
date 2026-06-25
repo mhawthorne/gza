@@ -3483,7 +3483,31 @@ def _run_cycle(
             if guarded_pending_task_id is not None:
                 step1_handled_child_task_ids.add(str(guarded_pending_task_id))
 
-            if exec_result.status == "success" and child_id is not None:
+            if exec_result.status == "success" and action_type == "clear_off_topic_verify_blocker":
+                refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
+                no_progress_attention = _finalize_watch_no_progress_after_execution(
+                    config=config,
+                    store=store,
+                    subject_task=display_task,
+                    action=action,
+                    action_task_before=task,
+                    action_task_after=refreshed_display_task,
+                    failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                )
+                if display_task.id is not None:
+                    log.emit(
+                        "REPAIR",
+                        f"{display_task.id}: {exec_result.success_message or exec_result.message}",
+                        dedupe_key=f"advance-clear-off-topic:{display_task.id}",
+                    )
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(display_task, no_progress_attention),
+                        )
+                work_done = True
+            elif exec_result.status == "success" and child_id is not None:
                 if exec_result.worker_label == "iterate":
                     log.emit("START", f"{child_id} iterate")
                 elif action_type in {"create_review", "run_review"}:

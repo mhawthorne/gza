@@ -55,7 +55,6 @@ Gza reads configuration from three YAML layers:
 | `autonomous_verify_timeout_seconds` | Integer | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
 | `review_verify_timeout_grace_seconds` | Float | `5` | Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; accepts values `>= 1` second |
 | `main_integration_verify_red_ttl_minutes` | Integer | `30` | Maximum age of a failed or unavailable local-target integration verify checkpoint before watch/advance reruns it even if the tree fingerprint is unchanged |
-| `advance_off_topic_verify_unblock` | Boolean | `false` | Allow lifecycle to clear a verify-only blocker through the audited off-topic verify-failure path; disabled keeps the existing fail-closed park behavior |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
 | `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
 | `code_task_diff_timeout_medium_minutes` | Integer | `30` | Timeout budget used for medium-sized code diffs |
@@ -63,6 +62,7 @@ Gza reads configuration from three YAML layers:
 | `code_task_diff_timeout_cap_minutes` | Integer | `45` | Hard maximum applied to code-task budgets after base timeout resolution and diff-size scaling |
 | `pr_integration` | Boolean | `true` | Enable GitHub PR discovery/comment/create flows; set `false` to skip all `gh`-backed PR operations for the project |
 | `advance_create_plan_reviews` | Boolean | `true` | Auto-create `plan_review` tasks for completed non-held plans; when disabled, lifecycle parks for manual plan-review creation instead |
+| `advance_off_topic_verify_unblock` | Boolean | `false` | Permit the audited off-topic verify-only unblock lane after trusted same-head/tree green evidence already exists; lifecycle still fails closed unless full failing-node enumeration, exact fingerprint binding, and durable investigation-task persistence all succeed |
 | `require_plan_review_before_implement` | Boolean | `true` | Require an approved `plan_review` before lifecycle automation materializes implementation work from a plan |
 | `max_plan_review_cycles` | Integer | `2` | Cap for `plan_review` / `plan_improve` loops before lifecycle automation parks for discussion |
 | `max_failed_plan_review_retries` | Integer | `3` | Max failed `plan_review` attempts for one plan source before lifecycle parks it as `needs_attention` instead of auto-spawning another review; set `0` to escalate after the first failure |
@@ -927,6 +927,7 @@ The following keys are currently discoverable via `gza config keys`:
 
 ```text
 advance_create_reviews
+advance_off_topic_verify_unblock
 advance_mode
 require_review_before_merge
 branch_mode
@@ -955,7 +956,6 @@ log_dir
 max_resume_attempts
 max_review_cycles
 max_noop_improve_cycles
-advance_off_topic_verify_unblock
 max_failed_closing_review_retries
 max_steps
 max_turns

@@ -14,6 +14,7 @@ from ..concurrency import (
     reserve_task_launch_permit,
 )
 from ..db import SqliteTaskStore, Task as DbTask
+from ..flaky_investigations import create_or_reuse_flaky_investigations
 from ..plan_review_verdict import PlanReviewManifest
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
 from ..review_tasks import build_review_blocker_dispute_metadata
@@ -105,6 +106,8 @@ class AdvanceActionExecutionResult:
     work_done: bool = False
     handled_task_id: str | None = None
     created_task: DbTask | None = None
+    created_investigations: tuple[DbTask, ...] = ()
+    reused_investigations: tuple[DbTask, ...] = ()
     improve_mode: str | None = None
     failed_improve: DbTask | None = None
     attention_type: str | None = None
@@ -128,6 +131,7 @@ _WORKER_ACTIONS = frozenset(
         "create_plan_improve",
         "run_plan_improve",
         "materialize_plan_slices",
+        "clear_off_topic_verify_blocker",
         "create_review",
         "run_review",
         "create_review_adjudication",
@@ -939,6 +943,76 @@ def execute_advance_action(
             handled_task_id=prepared_adjudication_task.id,
             worker_label="review_adjudication",
             created_task=prepared_adjudication_task,
+        )
+
+    if action_type == "clear_off_topic_verify_blocker":
+        review_task = action.get("review_task")
+        clearance = action.get("off_topic_verify_clearance_candidate")
+        if (
+            not isinstance(review_task, DbTask)
+            or review_task.id is None
+            or task.id is None
+            or context.config is None
+        ):
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message="missing off-topic clearance inputs",
+            )
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Clear off-topic verify blocker"),
+                work_done=True,
+            )
+        if clearance is None:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message="missing off-topic clearance candidate",
+            )
+
+        try:
+            upsert = create_or_reuse_flaky_investigations(
+                context.store,
+                config=context.config,
+                review_task=review_task,
+                impl_task=task,
+                evidences=clearance.evidences,
+                trigger_source=context.trigger_source,
+            )
+            context.store.clear_review_state(task.id)
+            persisted_task = context.store.get(task.id)
+            if persisted_task is None or persisted_task.review_cleared_at is None:
+                raise RuntimeError("review clearance was not persisted")
+            task.review_cleared_at = persisted_task.review_cleared_at
+        except Exception as exc:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message=f"failed to persist off-topic clearance: {exc}",
+            )
+
+        fragments = ["Cleared verify-only review blocker as off-topic"]
+        if upsert.created:
+            fragments.append(
+                "created investigation task(s): "
+                + ", ".join(str(t.id) for t in upsert.created if t.id is not None)
+            )
+        if upsert.reused:
+            fragments.append(
+                "reused investigation task(s): "
+                + ", ".join(str(t.id) for t in upsert.reused if t.id is not None)
+            )
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            success_message="; ".join(fragments),
+            work_done=True,
+            handled_task_id=task.id,
+            created_investigations=upsert.created,
+            reused_investigations=upsert.reused,
         )
 
     if action_type == "improve":

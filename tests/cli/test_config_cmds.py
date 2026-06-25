@@ -791,24 +791,28 @@ class TestLocalConfigOverrides:
         assert cfg.use_docker is False
 
     def test_local_override_allows_lifecycle_review_toggles(self, tmp_path: Path):
-        """Local overrides should accept both lifecycle review toggles."""
+        """Local overrides should accept lifecycle review toggles, including off-topic unblock."""
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
             "advance_create_reviews: true\n"
+            "advance_off_topic_verify_unblock: false\n"
             "require_review_before_merge: true\n"
         )
         (tmp_path / "gza.local.yaml").write_text(
             "advance_create_reviews: false\n"
+            "advance_off_topic_verify_unblock: true\n"
             "require_review_before_merge: false\n"
         )
 
         cfg = Config.load(tmp_path)
 
         assert cfg.advance_create_reviews is False
+        assert cfg.advance_off_topic_verify_unblock is True
         assert cfg.require_review_before_merge is False
         assert cfg.source_map["advance_create_reviews"] == "local"
+        assert cfg.source_map["advance_off_topic_verify_unblock"] == "local"
         assert cfg.source_map["require_review_before_merge"] == "local"
 
     @pytest.mark.parametrize("value", ["1", '"yes"', "null"])
@@ -890,6 +894,24 @@ class TestLocalConfigOverrides:
         assert payload["sources"]["use_docker"] == "local"
         assert payload["local_overrides_active"] is True
         assert payload["local_override_file"] == "gza.local.yaml"
+
+    def test_config_command_includes_off_topic_verify_unblock_json_and_source(self, tmp_path: Path):
+        """gza config --json should expose advance_off_topic_verify_unblock with source attribution."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "advance_off_topic_verify_unblock: false\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "advance_off_topic_verify_unblock: true\n"
+        )
+
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["advance_off_topic_verify_unblock"] is True
+        assert payload["sources"]["advance_off_topic_verify_unblock"] == "local"
 
     def test_config_command_includes_verify_profiles_and_timeout_scaling(self, tmp_path: Path):
         """`gza config --json` should expose inner/final verify commands and timeout scaling fields."""
@@ -1477,7 +1499,14 @@ class TestLocalConfigOverrides:
         assert cfg.source_map["advance_create_reviews"] == "user"
         assert cfg.source_map["require_review_before_merge"] == "user"
 
-    @pytest.mark.parametrize("key,value", [("advance_create_reviews", '"yes"'), ("require_review_before_merge", "1")])
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("advance_create_reviews", '"yes"'),
+            ("advance_off_topic_verify_unblock", "1"),
+            ("require_review_before_merge", "1"),
+        ],
+    )
     def test_user_config_rejects_non_boolean_lifecycle_review_toggles(
         self,
         tmp_path: Path,

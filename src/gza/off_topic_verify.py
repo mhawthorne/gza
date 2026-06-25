@@ -11,8 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath, PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
-from gza.cli._common import _looks_like_verify_command
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
@@ -120,6 +118,8 @@ _SHARED_GLOBAL_CONCURRENCY_SENSITIVE_PREFIXES = (
     "src/gza/cli/execution.py",
     "src/gza/cli/watch.py",
     "src/gza/concurrency.py",
+    "src/gza/config.py",
+    "src/gza/config_schema.py",
     "src/gza/db.py",
     "src/gza/main_integration_verify.py",
     "src/gza/recovery_engine.py",
@@ -138,6 +138,27 @@ _SHARED_GLOBAL_CONCURRENCY_SENSITIVE_KEYWORDS = (
 )
 DEFAULT_OFF_TOPIC_STRESS_RUNS = 20
 MAX_OFF_TOPIC_STRESS_RUNS = 20
+
+
+def _looks_like_verify_command(command: str, verify_command: str | None) -> bool:
+    """Heuristic match for verification-related command invocations."""
+    normalized = command.lower()
+    if verify_command and verify_command.strip() and verify_command.strip().lower() in normalized:
+        return True
+
+    verify_tokens = (
+        "pytest",
+        "mypy",
+        "ruff",
+        "uv run pytest",
+        "uv run mypy",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "cargo test",
+    )
+    return any(token in normalized for token in verify_tokens)
 
 
 @dataclass(frozen=True)
@@ -905,7 +926,10 @@ def build_failing_nodes(output: str) -> tuple[FailingNode, ...]:
 def _collect_summary_entries(output: str) -> tuple[tuple[Literal["FAILED", "ERROR"], str, str | None], ...]:
     entries: list[tuple[Literal["FAILED", "ERROR"], str, str | None]] = []
     seen: set[str] = set()
-    for line in output.splitlines():
+    summary_section = _extract_short_test_summary_section(output)
+    if summary_section is None:
+        return ()
+    for line in summary_section.splitlines():
         parsed_line = _parse_summary_entry_line(line)
         if parsed_line is None:
             continue
@@ -915,6 +939,24 @@ def _collect_summary_entries(output: str) -> tuple[tuple[Literal["FAILED", "ERRO
         seen.add(nodeid)
         entries.append((outcome, nodeid, signature))
     return tuple(entries)
+
+
+def _extract_short_test_summary_section(output: str) -> str | None:
+    marker = _SHORT_SUMMARY_PATTERN.search(output)
+    if marker is None:
+        return None
+
+    summary_start = marker.end()
+    remainder = output[summary_start:]
+    next_banner_start: int | None = None
+    for line in remainder.splitlines(keepends=True):
+        if line.startswith("="):
+            next_banner_start = summary_start
+            break
+        summary_start += len(line)
+
+    summary_end = next_banner_start if next_banner_start is not None else len(output)
+    return output[marker.end() : summary_end]
 
 
 def _parse_summary_entry_line(line: str) -> tuple[Literal["FAILED", "ERROR"], str, str | None] | None:

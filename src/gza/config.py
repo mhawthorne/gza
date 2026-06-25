@@ -1939,6 +1939,16 @@ class Config:
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             raise ConfigError("'advance_create_reviews' must be a boolean (true/false)")
         advance_create_reviews = bool(data.get("advance_create_reviews", DEFAULT_ADVANCE_CREATE_REVIEWS))
+        if "advance_off_topic_verify_unblock" in data and not isinstance(
+            data["advance_off_topic_verify_unblock"], bool
+        ):
+            raise ConfigError("'advance_off_topic_verify_unblock' must be a boolean (true/false)")
+        advance_off_topic_verify_unblock = bool(
+            data.get(
+                "advance_off_topic_verify_unblock",
+                DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK,
+            )
+        )
         if "advance_create_plan_reviews" in data and not isinstance(data["advance_create_plan_reviews"], bool):
             raise ConfigError("'advance_create_plan_reviews' must be a boolean (true/false)")
         advance_create_plan_reviews = bool(
@@ -2380,6 +2390,7 @@ class Config:
             verify_command=verify_command,
             inner_verify_command=inner_verify_command,
             advance_create_reviews=advance_create_reviews,
+            advance_off_topic_verify_unblock=advance_off_topic_verify_unblock,
             advance_create_plan_reviews=advance_create_plan_reviews,
             require_review_before_merge=require_review_before_merge,
             require_plan_review_before_implement=require_plan_review_before_implement,
@@ -2391,7 +2402,6 @@ class Config:
             max_plan_review_cycles=max_plan_review_cycles,
             max_failed_plan_review_retries=max_failed_plan_review_retries,
             max_noop_improve_cycles=max_noop_improve_cycles,
-            advance_off_topic_verify_unblock=advance_off_topic_verify_unblock,
             max_plan_slices=max_plan_slices,
             plan_slice_target_timeout_minutes=plan_slice_target_timeout_minutes,
             max_failed_closing_review_retries=max_failed_closing_review_retries,
@@ -2869,6 +2879,10 @@ class Config:
             )
         if "advance_create_reviews" in data and not isinstance(data["advance_create_reviews"], bool):
             errors.append("'advance_create_reviews' must be a boolean (true/false)")
+        if "advance_off_topic_verify_unblock" in data and not isinstance(
+            data["advance_off_topic_verify_unblock"], bool
+        ):
+            errors.append("'advance_off_topic_verify_unblock' must be a boolean (true/false)")
         if "advance_create_plan_reviews" in data and not isinstance(data["advance_create_plan_reviews"], bool):
             errors.append("'advance_create_plan_reviews' must be a boolean (true/false)")
 

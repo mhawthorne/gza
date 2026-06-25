@@ -1,5 +1,6 @@
 """Parity tests for discoverable configuration key registry."""
 
+import py_compile
 from dataclasses import fields
 from pathlib import Path
 
@@ -38,6 +39,19 @@ def test_configuration_doc_mentions_all_registered_keys() -> None:
     docs_text = (Path(__file__).resolve().parents[1] / "docs" / "configuration.md").read_text()
     missing = [spec.key for spec in CONFIG_KEY_REGISTRY if spec.key not in docs_text]
     assert not missing, f"Missing config keys in docs/configuration.md: {missing}"
+
+
+def test_config_registry_keys_are_unique() -> None:
+    """Discoverable config keys should not be registered twice."""
+    keys = [spec.key for spec in CONFIG_KEY_REGISTRY]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    assert not duplicates, f"Duplicate config keys in registry: {duplicates}"
+
+
+def test_config_module_compiles() -> None:
+    """Config source should stay syntactically loadable after new fields are threaded through."""
+    config_path = Path(__file__).resolve().parents[1] / "src" / "gza" / "config.py"
+    py_compile.compile(str(config_path), doraise=True)
 
 
 def test_docker_setup_command_registry_description_mentions_prewarm_execution() -> None:

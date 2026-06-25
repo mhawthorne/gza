@@ -70,6 +70,7 @@ from .execution import (
     cmd_run_inline,
     cmd_set_status,
 )
+from .flaky import cmd_flaky_reproduce
 from .git_ops import (
     cmd_advance,
     cmd_checkout,
@@ -946,6 +947,52 @@ def main() -> int:
         action="store_true",
         help="Force a fresh local main verify run now, rerun reds to classify flakes, and clear a stale halt if the rerun goes green",
     )
+
+    flaky_parser = subparsers.add_parser(
+        "flaky",
+        help="Run reproduce-or-record harness commands for flaky verify investigations",
+    )
+    flaky_subparsers = flaky_parser.add_subparsers(dest="flaky_action", required=True)
+    flaky_reproduce = flaky_subparsers.add_parser(
+        "reproduce",
+        help="Run the bounded targeted stress harness for one flaky investigation task",
+        description=(
+            "Run the bounded targeted stress harness for one flaky investigation task, "
+            "persist per-attempt evidence, and record a structured inconclusive artifact "
+            "when the same failing-node signature does not reproduce within budget."
+        ),
+    )
+    flaky_reproduce.add_argument("task_id", help="Flaky investigation task ID")
+    flaky_reproduce.add_argument(
+        "--runs",
+        type=_parse_non_negative_int,
+        default=20,
+        help="Bounded number of targeted reruns to execute (default: 20)",
+    )
+    flaky_reproduce.add_argument(
+        "--seed",
+        type=int,
+        default=1729,
+        help="Base seed for optional randomization plugins (default: 1729)",
+    )
+    flaky_reproduce.add_argument(
+        "--no-xdist",
+        action="store_true",
+        help="Do not add xdist stress flags even if xdist was present in the original verify evidence",
+    )
+    flaky_reproduce.add_argument(
+        "--no-randomization",
+        action="store_true",
+        help="Do not add pytest randomization flags even if a supported plugin is available",
+    )
+    flaky_reproduce.add_argument(
+        "--hypothesis",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Optional hypothesis to persist on the structured inconclusive record (repeatable)",
+    )
+    add_common_args(flaky_reproduce)
 
     # queue command
     queue_parser = subparsers.add_parser(
@@ -2934,6 +2981,11 @@ def main() -> int:
             return cmd_watch(args)
         elif args.command == "main-verify":
             return cmd_main_verify(args)
+        elif args.command == "flaky":
+            if getattr(args, "flaky_action", None) == "reproduce":
+                return cmd_flaky_reproduce(args)
+            print("Error: unknown flaky action", file=sys.stderr)
+            return 2
         elif args.command == "queue":
             return cmd_queue(args)
         elif args.command == "sync":

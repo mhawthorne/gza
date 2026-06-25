@@ -149,6 +149,14 @@ def test_full_config_example_groups_off_topic_verify_unblock_under_review() -> N
     assert not other_header or unblock_key not in other_section
 
 
+def test_config_examples_emit_off_topic_verify_unblock_once_per_flavor() -> None:
+    """Generated examples should not duplicate the off-topic verify key."""
+    key = "# advance_off_topic_verify_unblock: false"
+
+    assert render_config_example().count(key) == 1
+    assert render_config_example(local=True).count(key) == 1
+
+
 def test_full_config_example_groups_failed_plan_review_retries_under_lifecycle() -> None:
     rendered = render_config_example()
 

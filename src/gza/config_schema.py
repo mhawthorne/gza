@@ -44,18 +44,18 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Auto-create review tasks in lifecycle flows when review gating still requires them; manual attention is required instead when review creation is disabled.",
     ),
     ConfigKeySpec(
+        "advance_off_topic_verify_unblock",
+        "bool",
+        False,
+        "Allow lifecycle to clear a verify-only blocked review through the off-topic verify classifier; when false, the verify-only blocker remains conservative and stays blocking.",
+    ),
+    ConfigKeySpec(
         "advance_create_plan_reviews",
         "bool",
         True,
         "Auto-create plan_review tasks for completed non-held plans; manual attention is required instead when plan-review creation is disabled.",
     ),
     ConfigKeySpec("advance_mode", "str", "default", "Mode selector for `gza advance` behavior."),
-    ConfigKeySpec(
-        "advance_off_topic_verify_unblock",
-        "bool",
-        False,
-        "Allow lifecycle to clear a verify-only blocker through the audited off-topic verify-failure path; disabled keeps the existing fail-closed park behavior.",
-    ),
     ConfigKeySpec(
         "require_review_before_merge",
         "bool",

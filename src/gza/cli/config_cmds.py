@@ -1803,6 +1803,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "code_task_diff_timeout_large_minutes": config.code_task_diff_timeout_large_minutes,
         "code_task_diff_timeout_cap_minutes": config.code_task_diff_timeout_cap_minutes,
         "branch_mode": config.branch_mode,
+        "advance_off_topic_verify_unblock": config.advance_off_topic_verify_unblock,
         "max_steps": config.max_steps,
         "max_turns": config.max_turns,
         "worktree_dir": config.worktree_dir,
@@ -1828,7 +1829,6 @@ def _config_to_effective_dict(config: Config) -> dict:
         "chat_text_display_length": config.chat_text_display_length,
         "verify_command": config.verify_command,
         "inner_verify_command": config.inner_verify_command,
-        "advance_off_topic_verify_unblock": config.advance_off_topic_verify_unblock,
         "claude": {
             "fetch_auth_token_from_keychain": config.claude.fetch_auth_token_from_keychain,
             "args": config.claude.args,
