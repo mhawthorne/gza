@@ -107,6 +107,7 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
     registry = WorkerRegistry(config.workers_path)
     live_pids: set[int] = set()
     live_task_ids: set[str] = set()
+    live_active_task_pids: set[int] = set()
     active_task_statuses = {
         str(task.id): task.status
         for task in store.get_in_progress()
@@ -116,6 +117,8 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
     for worker in registry.list_all(include_completed=False):
         if worker.status != "running" or not registry.is_running(worker.worker_id):
             continue
+        if worker.pid > 0:
+            live_pids.add(worker.pid)
         if worker.task_id is not None:
             task_id = str(worker.task_id)
             task_status = active_task_statuses.get(task_id)
@@ -127,11 +130,9 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
             if task_status not in {"pending", "in_progress"}:
                 continue
             if worker.pid > 0:
-                live_pids.add(worker.pid)
+                live_active_task_pids.add(worker.pid)
             live_task_ids.add(task_id)
             continue
-        if worker.pid > 0:
-            live_pids.add(worker.pid)
 
     for task in store.get_in_progress():
         pid = task.running_pid
@@ -139,11 +140,12 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
             continue
         assert pid is not None
         live_pids.add(pid)
+        live_active_task_pids.add(pid)
         if task.id is not None:
             live_task_ids.add(str(task.id))
 
     running_task_ids = tuple(sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id)))
-    anonymous_worker_count = max(0, len(live_pids) - len(running_task_ids))
+    anonymous_worker_count = len(live_pids - live_active_task_pids)
     return live_pids, running_task_ids, anonymous_worker_count
 
 

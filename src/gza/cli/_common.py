@@ -16,7 +16,7 @@ import threading
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -322,12 +322,6 @@ def format_no_runnable_message_for_tags(
 # This is tighter than `"-" in arg` (which also matches branch names like "feature-foo").
 _TASK_ID_RE = re.compile(r"^[a-z0-9]{1,12}-[0-9]+$")
 _FAILURE_MARKER_LINE_RE = re.compile(r"^\s*\[GZA_FAILURE:(?P<reason>[A-Z0-9_]+)\]\s*$")
-# Terminal tasks should normally lose their worker entry as soon as the worker exits.
-# If PID reuse makes the liveness probe ambiguous, fall back to time-based pruning.
-WORKER_TERMINAL_PRUNE_GRACE_SECONDS = 1800
-WORKER_TERMINAL_PRUNE_FALLBACK_GRACE_SECONDS = 7200
-
-
 def _looks_like_task_id(arg: str) -> bool:
     """Return True if *arg* looks like a task ID rather than a branch name.
 
@@ -460,22 +454,6 @@ def _normalize_timestamp(value: datetime | str | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
-
-
-def _terminal_worker_is_obviously_stale(worker: WorkerMetadata, task: DbTask, *, now: datetime) -> bool:
-    """Return True when a terminal task's worker entry is old enough to prune by time."""
-    completed_at = _normalize_timestamp(task.completed_at)
-    if completed_at is not None:
-        started_at = _normalize_timestamp(worker.started_at)
-        if started_at is None:
-            return False
-        grace = timedelta(seconds=WORKER_TERMINAL_PRUNE_GRACE_SECONDS)
-        return now - completed_at > grace and now - started_at > grace
-
-    started_at = _normalize_timestamp(worker.started_at)
-    if started_at is not None:
-        return now - started_at > timedelta(seconds=WORKER_TERMINAL_PRUNE_FALLBACK_GRACE_SECONDS)
-    return False
 
 
 def _branch_has_commits(config: Config, branch: str | None) -> bool:
@@ -669,7 +647,7 @@ def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
 
 
 def prune_terminal_dead_workers(config: Config) -> None:
-    """Remove worker registry entries for terminal tasks once dead or obviously stale."""
+    """Remove worker registry entries for terminal tasks once the worker PID is dead."""
     try:
         store = get_store(config, open_mode="query_only")
         registry = WorkerRegistry(config.workers_path)
@@ -681,7 +659,6 @@ def prune_terminal_dead_workers(config: Config) -> None:
         return
 
     terminal_statuses = {"completed", "failed", "dropped", "unmerged"}
-    now = datetime.now(UTC)
     for worker in registry.list_all(include_completed=True):
         task_label = f"{worker.task_id}" if worker.task_id is not None else "<unknown>"
         try:
@@ -703,15 +680,6 @@ def prune_terminal_dead_workers(config: Config) -> None:
                 continue
             if not registry.is_running(worker.worker_id):
                 registry.remove(worker.worker_id)
-                continue
-            if not _terminal_worker_is_obviously_stale(worker, task, now=now):
-                continue
-            print(
-                f"Warning: Pruning stale terminal worker {worker.worker_id} for task {task_label}; "
-                "task is terminal, PID still resolves, and the grace window elapsed",
-                file=sys.stderr,
-            )
-            registry.remove(worker.worker_id)
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(
                 f"Warning: Failed to prune worker {worker.worker_id} for task {task_label}: {exc}",

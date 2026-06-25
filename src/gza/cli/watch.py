@@ -22,6 +22,7 @@ from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _reso
 from ..concurrency import (
     LaunchPermit,
     MaxConcurrentTasksError,
+    _collect_live_running_state as _shared_collect_live_running_state,
     get_concurrency_snapshot,
     launch_permit,
     release_task_launch_permit,
@@ -87,7 +88,6 @@ from ..watch_progress import (
     reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
 )
-from ..workers import WorkerRegistry
 from ._common import (
     _TASK_ID_RE,
     _create_implementation_task_from_source,
@@ -1734,18 +1734,6 @@ def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, qu
         step = min(quantum, remaining)
         time.sleep(step)
         remaining -= step
-
-
-def _pid_alive(pid: int | None) -> bool:
-    if pid is None or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
 def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
     snap: dict[str, dict[str, str | None]] = {}
     with store._connect() as conn:  # noqa: SLF001 - CLI internal polling helper
@@ -1975,49 +1963,8 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
 
 
 def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str], int]:
-    registry = WorkerRegistry(config.workers_path)
-    live_pids: set[int] = set()
-    live_task_ids: set[str] = set()
-    active_task_statuses = {
-        str(task.id): task.status
-        for task in store.get_in_progress()
-        if task.id is not None
-    }
-
-    for worker in registry.list_all(include_completed=False):
-        if worker.status != "running":
-            continue
-        if not registry.is_running(worker.worker_id):
-            continue
-        if worker.task_id is not None:
-            task_id = str(worker.task_id)
-            task_status = active_task_statuses.get(task_id)
-            if task_status is None:
-                task = store.get(task_id)
-                task_status = task.status if task is not None else None
-                if task_status is not None:
-                    active_task_statuses[task_id] = task_status
-            if task_status not in {"pending", "in_progress"}:
-                continue
-            if worker.pid > 0:
-                live_pids.add(worker.pid)
-        elif worker.pid > 0:
-            live_pids.add(worker.pid)
-        if worker.task_id is not None:
-            live_task_ids.add(str(worker.task_id))
-
-    for task in store.get_in_progress():
-        pid = task.running_pid
-        if not _pid_alive(pid):
-            continue
-        assert pid is not None
-        live_pids.add(pid)
-        if task.id is not None:
-            live_task_ids.add(str(task.id))
-
-    running_task_ids = sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id))
-    anonymous_worker_count = max(0, len(live_pids) - len(running_task_ids))
-    return live_pids, running_task_ids, anonymous_worker_count
+    live_pids, running_task_ids, anonymous_worker_count = _shared_collect_live_running_state(config, store)
+    return live_pids, list(running_task_ids), anonymous_worker_count
 
 
 def _format_wake_message(

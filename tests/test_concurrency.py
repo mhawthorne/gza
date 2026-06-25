@@ -89,6 +89,34 @@ def test_snapshot_ignores_dead_registry_and_task_pids(tmp_path) -> None:
     assert snapshot.running_task_ids == ()
 
 
+def test_snapshot_counts_live_terminal_task_worker_as_anonymous_capacity(tmp_path) -> None:
+    setup_config(tmp_path)
+    _append_config(tmp_path, "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task with live iterate worker", task_type="implement")
+    task.status = "completed"
+    store.update(task)
+
+    registry = WorkerRegistry(config.workers_path)
+    registry.register(
+        WorkerMetadata(
+            worker_id=registry.generate_worker_id(),
+            task_id=task.id,
+            pid=os.getpid(),
+            status="running",
+        )
+    )
+
+    snapshot = get_concurrency_snapshot(config, store)
+    assert snapshot.running == 1
+    assert snapshot.available == 0
+    assert snapshot.live_pids == frozenset({os.getpid()})
+    assert snapshot.running_task_ids == ()
+    assert snapshot.anonymous_worker_count == 1
+
+
 def test_launch_permit_allows_same_process_reentry_without_deadlock(tmp_path) -> None:
     setup_config(tmp_path)
     _append_config(tmp_path, "max_concurrent: 2\n")
