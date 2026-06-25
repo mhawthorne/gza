@@ -1923,7 +1923,7 @@ def _run_task_backed_rebase(
                 shutil.rmtree(worktree_path, ignore_errors=True)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         logger.phase(f"Creating worktree at {worktree_path}...")
-        git._run("worktree", "add", str(worktree_path), branch)
+        git.worktree_add_existing(worktree_path, branch)
     except GitError as e:
         logger.error(f"Error setting up worktree: {e}")
         mark_task_failed_from_cause(

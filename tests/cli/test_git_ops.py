@@ -1365,6 +1365,52 @@ def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> Non
     assert refreshed_unit is not None
     assert refreshed_unit.head_sha == "head-new"
     assert refreshed_unit.base_sha == "base-new"
+    repo_git.worktree_add_existing.assert_called_once_with(config.worktree_path / str(rebase_task.id), "feature/rebased")
+
+
+def test_run_task_backed_rebase_uses_worktree_add_existing_for_setup(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    parent.status = "completed"
+    parent.completed_at = datetime.now(UTC)
+    parent.branch = "feature/rebased"
+    store.update(parent)
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    repo_git.worktree_add_existing.assert_called_once_with(config.worktree_path / str(rebase_task.id), "feature/rebased")
+    assert call("worktree", "add", str(config.worktree_path / str(rebase_task.id)), "feature/rebased") not in repo_git._run.call_args_list
 
 
 def test_execute_merge_action_mark_merged_rejects_failed_owner_without_marking_unit(
