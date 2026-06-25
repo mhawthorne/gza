@@ -1,6 +1,7 @@
 """Tests for git-oriented CLI helpers."""
 
 import argparse
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1777,6 +1778,82 @@ def test_run_task_backed_rebase_passes_managed_roots_to_cleanup(tmp_path: Path) 
     )
 
 
+def test_run_task_backed_rebase_provider_cleanup_does_not_prune_or_remove_other_registrations(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    parent.status = "completed"
+    parent.completed_at = datetime.now(UTC)
+    parent.branch = "feature/rebased"
+    store.update(parent)
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = parent.branch
+    rebase_task.slug = "rebase-feature"
+    store.update(rebase_task)
+
+    canonical_worktree = config.worktree_path / str(rebase_task.id)
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git._run.return_value = None
+    repo_git.worktree_remove.return_value = None
+    repo_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    worktree_git = MagicMock()
+    worktree_git.rebase.side_effect = GitError("rebase boom")
+    worktree_git.rebase_abort.return_value = None
+
+    private_checkout = SimpleNamespace(path=tmp_path / "isolated-checkout")
+
+    @contextmanager
+    def _isolated_checkout_cm(**kwargs):
+        yield private_checkout
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
+        ),
+        patch(
+            "gza.cli.git_ops.reconcile_task_branch_merge_truth",
+            return_value=SimpleNamespace(warnings=[], skipped_reason=None, errors=[]),
+        ),
+        patch("gza.cli.git_ops.isolated_rebase_checkout", side_effect=_isolated_checkout_cm),
+        patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True),
+        patch("gza.cli.git_ops.import_isolated_rebase_tip"),
+        patch("gza.cli.git_ops.remove_worktree_registration_for_path") as remove_worktree_registration_for_path,
+        patch("gza.cli.git_ops.publish_rebased_branch"),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    repo_git.worktree_remove.assert_called_once_with(canonical_worktree, force=True)
+    remove_worktree_registration_for_path.assert_not_called()
+    assert call("worktree", "prune") not in repo_git._run.call_args_list
+
+
 def test_checkout_passes_managed_roots_to_cleanup(tmp_path: Path) -> None:
     """Checkout should pass both task and configured interactive roots to cleanup."""
     setup_config(tmp_path)
@@ -2169,10 +2246,24 @@ def test_run_task_backed_rebase_failure_does_not_reconcile_parent_merge_status(t
     worktree_git.current_branch.return_value = "feature/rebased"
     worktree_git.rebase.side_effect = GitError("rebase boom")
     worktree_git.rebase_abort.return_value = None
+    private_checkout = SimpleNamespace(path=tmp_path / "isolated-checkout")
+
+    @contextmanager
+    def _isolated_checkout_cm(**kwargs):
+        yield private_checkout
 
     with (
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch("gza.cli.git_ops.isolated_rebase_checkout", side_effect=_isolated_checkout_cm),
         patch("gza.cli.git_ops.invoke_provider_resolve", return_value=False),
         patch("gza.cli.git_ops.mark_task_failed_from_cause", return_value=None) as mark_failed,
         patch("gza.cli.git_ops.reconcile_task_branch_merge_truth") as reconcile_task_branch_merge_truth,
@@ -2215,16 +2306,39 @@ def test_run_task_backed_rebase_provider_resolve_publishes_via_shared_helper(tmp
     worktree_git.current_branch.return_value = "feature/rebased"
     worktree_git.rebase.side_effect = GitError("rebase boom")
     worktree_git.rebase_abort.return_value = None
-    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+    repo_git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/rebased": "head-new",
         "main": "base-new",
     }.get(ref)
+    private_checkout = SimpleNamespace(path=tmp_path / "isolated-checkout")
+
+    @contextmanager
+    def _isolated_checkout_cm(**kwargs):
+        yield private_checkout
 
     with (
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
         patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True),
         patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
+        ),
+        patch(
+            "gza.cli.git_ops.reconcile_task_branch_merge_truth",
+            return_value=SimpleNamespace(warnings=[], skipped_reason=None, errors=[]),
+        ),
+        patch("gza.cli.git_ops.isolated_rebase_checkout", side_effect=_isolated_checkout_cm),
+        patch("gza.cli.git_ops.import_isolated_rebase_tip"),
         patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
     ):
         rc = _run_task_backed_rebase(
@@ -2237,6 +2351,176 @@ def test_run_task_backed_rebase_provider_resolve_publishes_via_shared_helper(tmp
 
     assert rc == 0
     publish_rebased_branch.assert_called_once()
+
+
+def test_run_task_backed_rebase_provider_resolve_uses_isolated_checkout_and_guarded_import(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    rebase_task.slug = "rebase-feature"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+    repo_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.side_effect = GitError("rebase boom")
+    worktree_git.rebase_abort.return_value = None
+
+    private_checkout_path = tmp_path / "isolated-checkout"
+    private_checkout = SimpleNamespace(path=private_checkout_path)
+
+    @contextmanager
+    def _isolated_checkout_cm(**kwargs):
+        yield private_checkout
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
+        ),
+        patch(
+            "gza.cli.git_ops.reconcile_task_branch_merge_truth",
+            return_value=SimpleNamespace(warnings=[], skipped_reason=None, errors=[]),
+        ),
+        patch("gza.cli.git_ops.isolated_rebase_checkout", side_effect=_isolated_checkout_cm) as mock_isolated_checkout,
+        patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True) as invoke_provider_resolve,
+        patch("gza.cli.git_ops.import_isolated_rebase_tip") as import_isolated_rebase_tip,
+        patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    mock_isolated_checkout.assert_called_once_with(
+        config=config,
+        source_git=repo_git,
+        branch="feature/rebased",
+        target_ref="main",
+        checkout_name="rebase-feature",
+    )
+    invoke_provider_resolve.assert_called_once_with(
+        rebase_task,
+        "feature/rebased",
+        "main",
+        config,
+        log_file=ANY,
+        logger=ANY,
+        worktree_path=private_checkout_path,
+    )
+    import_isolated_rebase_tip.assert_called_once_with(
+        destination_git=repo_git,
+        checkout=private_checkout,
+        branch="feature/rebased",
+        expected_old_sha="head-old",
+        temp_ref_name="rebase-feature",
+    )
+    publish_rebased_branch.assert_called_once_with(
+        repo_git,
+        branch="feature/rebased",
+        baseline=RebaseDiffBaseline(
+            old_tip="head-old",
+            target_at_start="base-old",
+            merge_base_at_start="merge-base",
+        ),
+        logger=ANY,
+    )
+    repo_git.worktree_remove.assert_called_once_with(config.worktree_path / str(rebase_task.id), force=True)
+
+
+def test_run_task_backed_rebase_provider_resolve_stale_import_fails_closed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    rebase_task.slug = "rebase-feature"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.side_effect = GitError("rebase boom")
+    worktree_git.rebase_abort.return_value = None
+
+    private_checkout = SimpleNamespace(path=tmp_path / "isolated-checkout")
+
+    @contextmanager
+    def _isolated_checkout_cm(**kwargs):
+        yield private_checkout
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch("gza.cli.git_ops.isolated_rebase_checkout", side_effect=_isolated_checkout_cm),
+        patch("gza.cli.git_ops.invoke_provider_resolve", return_value=True),
+        patch(
+            "gza.cli.git_ops.import_isolated_rebase_tip",
+            side_effect=GitError("Refusing to import rebased tip for feature/rebased: expected old SHA head-old"),
+        ),
+        patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 1
+    publish_rebased_branch.assert_not_called()
+    refreshed = store.get(rebase_task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
 
 
 def test_run_task_backed_rebase_clean_publish_failure_does_not_fall_back_to_provider(tmp_path) -> None:

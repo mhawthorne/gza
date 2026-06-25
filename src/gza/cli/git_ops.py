@@ -78,6 +78,7 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
+from ..rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checkout
 from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
 from ..rebase_publish import publish_rebased_branch
 from ..recovery_engine import (
@@ -1959,30 +1960,46 @@ def _run_task_backed_rebase(
         branch=branch,
         target=rebase_target,
     )
+    rebase_exec_git = worktree_git
 
     try:
         logger.command(f"Rebasing '{branch}' onto '{rebase_target}'...")
         resolved_by_provider = False
         try:
-            worktree_git.rebase(rebase_target)
+            rebase_exec_git.rebase(rebase_target)
         except GitError as e:
             logger.warning(f"Conflicts detected: {e}")
             try:
-                worktree_git.rebase_abort()
+                rebase_exec_git.rebase_abort()
                 logger.phase("Aborted conflicted mechanical rebase before provider fallback.")
             except GitError as abort_error:
                 logger.warning(f"Warning: Could not abort rebase cleanly: {abort_error}")
 
             logger.phase("Invoking provider to resolve via /gza-rebase --auto...")
-            resolved = invoke_provider_resolve(
-                rebase_task,
-                branch,
-                rebase_target,
-                config,
-                log_file=log_file,
-                logger=logger,
-                worktree_path=worktree_path,
-            )
+            with isolated_rebase_checkout(
+                config=config,
+                source_git=git,
+                branch=branch,
+                target_ref=target_branch,
+                checkout_name=str(rebase_task.slug or rebase_task.id or branch),
+            ) as checkout:
+                resolved = invoke_provider_resolve(
+                    rebase_task,
+                    branch,
+                    rebase_target,
+                    config,
+                    log_file=log_file,
+                    logger=logger,
+                    worktree_path=checkout.path,
+                )
+                if resolved:
+                    import_isolated_rebase_tip(
+                        destination_git=git,
+                        checkout=checkout,
+                        branch=branch,
+                        expected_old_sha=rebase_diff_baseline.old_tip,
+                        temp_ref_name=str(rebase_task.slug or rebase_task.id or branch),
+                    )
             if not resolved:
                 logger.error("Could not resolve conflicts automatically.")
                 if failure_hint_lines:
@@ -2000,9 +2017,10 @@ def _run_task_backed_rebase(
                 return 1
 
             resolved_by_provider = True
+            rebase_exec_git = git
         try:
             publish_rebased_branch(
-                worktree_git,
+                rebase_exec_git,
                 branch=branch,
                 baseline=rebase_diff_baseline,
                 logger=logger,
@@ -2025,13 +2043,13 @@ def _run_task_backed_rebase(
         )
 
         has_commits = _branch_has_commits(config, branch)
-        head_ref = resolve_ref_if_possible(worktree_git, branch)
-        base_ref = resolve_ref_if_possible(worktree_git, rebase_target)
+        head_ref = resolve_ref_if_possible(rebase_exec_git, branch)
+        base_ref = resolve_ref_if_possible(rebase_exec_git, rebase_target)
         for warning in (head_ref.warning, base_ref.warning):
             if warning:
                 logger.warning(warning)
         comparison = compute_rebase_changed_diff(
-            worktree_git,
+            rebase_exec_git,
             baseline=rebase_diff_baseline,
             branch=branch,
             target=rebase_target,
@@ -2071,7 +2089,7 @@ def _run_task_backed_rebase(
         if target_parent_id:
             reconciliation = reconcile_task_branch_merge_truth(
                 store,
-                worktree_git,
+                rebase_exec_git,
                 target_parent_id,
                 target_branch=target_branch,
                 include_diff_stats=True,
