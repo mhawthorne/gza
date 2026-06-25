@@ -49,6 +49,7 @@ from ..db import (
     task_id_numeric_key,
     validate_prompt,
 )
+from ..dependency_preconditions import plan_dependency_awaits_review
 from ..derived_tags import resolve_derived_task_tags
 from ..extractions import (
     ExtractionDraft,
@@ -154,6 +155,54 @@ from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
 _ITERATE_TERMINAL_NO_WORK_REASON_CODES = frozenset({"merge_unit_empty", "merge_unit_redundant"})
+
+
+def _find_held_plan_in_based_on_lineage(
+    store: SqliteTaskStore,
+    *,
+    based_on_id: str | None,
+) -> DbTask | None:
+    """Return the held plan found in a based_on lineage, if any."""
+    current_id = based_on_id
+    seen: set[str] = set()
+    while current_id is not None and current_id not in seen:
+        seen.add(current_id)
+        current = store.get(current_id)
+        if current is None:
+            return None
+        if plan_dependency_awaits_review(current):
+            return current
+        current_id = current.based_on
+    return None
+
+
+def _held_plan_implement_creation_error(plan_id: str) -> str:
+    """Return the operator-facing refusal for implement tasks sourced from a held plan."""
+    return (
+        f"Error: plan {plan_id} is held for review; release it with "
+        f"uv run gza implement {plan_id} or uv run gza edit {plan_id} --no-hold-for-review "
+        "before creating implement dependents."
+    )
+
+
+def _validate_new_implement_source_not_held_for_review(
+    store: SqliteTaskStore,
+    *,
+    based_on_id: str | None,
+    depends_on_id: str | None,
+) -> str | None:
+    """Return a refusal message when a new implement task would source from a held plan."""
+    if depends_on_id is not None:
+        dep_task = store.get(depends_on_id)
+        if dep_task is not None and plan_dependency_awaits_review(dep_task):
+            assert dep_task.id is not None
+            return _held_plan_implement_creation_error(dep_task.id)
+
+    held_plan = _find_held_plan_in_based_on_lineage(store, based_on_id=based_on_id)
+    if held_plan is None:
+        return None
+    assert held_plan.id is not None
+    return _held_plan_implement_creation_error(held_plan.id)
 
 
 def _foreground_command_invocation(command: str) -> RunInvocationContext:
@@ -2199,6 +2248,16 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("Error: plan_improve must be based on the same plan source reviewed by its plan_review dependency")
             return 1
 
+    if task_type == "implement":
+        held_plan_error = _validate_new_implement_source_not_held_for_review(
+            store,
+            based_on_id=based_on,
+            depends_on_id=depends_on,
+        )
+        if held_plan_error is not None:
+            print(held_plan_error)
+            return 1
+
     # Handle --prompt-file argument
     if hasattr(args, 'prompt_file') and args.prompt_file is not None:
         if args.prompt:
@@ -2428,6 +2487,26 @@ def cmd_edit(args: argparse.Namespace) -> int:
         dep_task = store.get(depends_on_id)
         if not dep_task:
             print(f"Error: Task {depends_on_id} not found")
+            return 1
+
+    if task.task_type == "implement" and (
+        based_on_id is not None
+        or depends_on_id is not None
+        or getattr(args, "clear_depends_on", False)
+    ):
+        effective_based_on_id = based_on_id if based_on_id is not None else task.based_on
+        effective_depends_on_id = (
+            None
+            if getattr(args, "clear_depends_on", False)
+            else depends_on_id if depends_on_id is not None else task.depends_on
+        )
+        held_plan_error = _validate_new_implement_source_not_held_for_review(
+            store,
+            based_on_id=effective_based_on_id,
+            depends_on_id=effective_depends_on_id,
+        )
+        if held_plan_error is not None:
+            print(held_plan_error)
             return 1
 
     prompt_requested = False

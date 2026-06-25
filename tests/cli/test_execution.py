@@ -1393,6 +1393,56 @@ class TestEditCommand:
         assert updated.depends_on == dep_task.id
         assert updated.based_on is None
 
+    def test_cmd_edit_implement_depends_on_held_plan_rejects_inconsistent_state(self, tmp_path: Path):
+        """Pending implement tasks cannot be rewired to depend on a held plan."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        held_plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        assert held_plan.id is not None
+        held_plan.status = "completed"
+        held_plan.completed_at = datetime.now(UTC)
+        store.update(held_plan)
+        task = store.add("Target task", task_type="implement")
+        assert task.id is not None
+
+        result = invoke_gza("edit", str(task.id), "--depends-on", str(held_plan.id), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        normalized = " ".join(result.stdout.split())
+        assert f"plan {held_plan.id} is held for review" in normalized
+        assert f"uv run gza implement {held_plan.id}" in normalized
+        assert f"uv run gza edit {held_plan.id} --no-hold-for-review" in normalized
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.depends_on is None
+
+    def test_cmd_edit_implement_based_on_held_plan_rejects_inconsistent_state(self, tmp_path: Path):
+        """Pending implement tasks cannot be rewired onto a held-plan lineage."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        held_plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        assert held_plan.id is not None
+        held_plan.status = "completed"
+        held_plan.completed_at = datetime.now(UTC)
+        store.update(held_plan)
+        task = store.add("Target task", task_type="implement")
+        assert task.id is not None
+
+        result = invoke_gza("edit", str(task.id), "--based-on", str(held_plan.id), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        normalized = " ".join(result.stdout.split())
+        assert f"plan {held_plan.id} is held for review" in normalized
+        assert f"uv run gza implement {held_plan.id}" in normalized
+        assert f"uv run gza edit {held_plan.id} --no-hold-for-review" in normalized
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.based_on is None
+
     def test_cmd_edit_based_on_nonexistent_task_errors(self, tmp_path: Path):
         """--based-on with nonexistent target ID returns error code 1."""
 
@@ -19014,6 +19064,64 @@ class TestAddCommandWithChaining:
         result = invoke_gza("add", "--type", "implement", "Implement feature", "--project", str(tmp_path))
 
         assert result.returncode == 0
+
+    def test_add_implement_depends_on_held_plan_rejects_inconsistent_state(self, tmp_path: Path):
+        """Implement tasks cannot depend on a held plan outside the explicit release path."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        result = invoke_gza(
+            "add",
+            "--type",
+            "implement",
+            "--depends-on",
+            str(plan.id),
+            "Blocked implement",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        normalized = " ".join(result.stdout.split())
+        assert f"plan {plan.id} is held for review" in normalized
+        assert f"uv run gza implement {plan.id}" in normalized
+        assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized
+        assert not any(task.prompt == "Blocked implement" for task in store.get_all())
+
+    def test_add_implement_based_on_held_plan_rejects_inconsistent_state(self, tmp_path: Path):
+        """Implement tasks cannot use a held plan as their based_on source lineage."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        result = invoke_gza(
+            "add",
+            "--type",
+            "implement",
+            "--based-on",
+            str(plan.id),
+            "Blocked implement",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        normalized = " ".join(result.stdout.split())
+        assert f"plan {plan.id} is held for review" in normalized
+        assert f"uv run gza implement {plan.id}" in normalized
+        assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized
+        assert not any(task.prompt == "Blocked implement" for task in store.get_all())
 
     def test_add_with_type_review(self, tmp_path: Path):
         """Add command can create review tasks."""

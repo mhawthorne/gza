@@ -674,6 +674,11 @@ gza add [prompt] [options]
 | `--no-learnings` | Skip injecting `.gza/learnings.md` context into this task's prompt |
 | `--next` | Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump) |
 
+Held completed plans are not valid sources for pre-created implement children. If `--type implement`
+uses `--depends-on <plan-id>` and that plan is held for review, or `--based-on` points into a lineage
+rooted at a held plan, `gza add` fails and tells you to release the plan first with
+`uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review`.
+
 ### edit
 
 Edit an existing task.
@@ -707,6 +712,7 @@ gza edit <task_id> [options]
 Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`).
 Pending plan tasks may use `--hold-for-review` or `--no-hold-for-review`. Completed plan tasks may also use `--no-hold-for-review` (preferred) or `--auto-implement` (compatibility alias) to release a hold-for-review plan without rerunning it.
 All other edit flags (`--based-on`, `--depends-on`, `--clear-depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, `--no-learnings`, and completed-plan `--hold-for-review`) remain pending-only.
+Pending `implement` tasks also cannot be edited onto a held-plan dependency or a `based_on` lineage rooted at a held plan; release the plan first.
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 
@@ -1648,6 +1654,7 @@ gza implement <plan_task_id> [prompt] [options]
 
 When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
 Using `uv run gza edit <plan-id> --no-hold-for-review` also clears the hold, but that path releases the completed plan back into the automated `plan_review` lifecycle rather than directly creating implementation work.
+This explicit release step is mandatory: pre-creating an `implement` task behind a held plan via `gza add --type implement --depends-on <plan-id>` or a `--based-on` lineage rooted at that held plan is rejected instead of leaving a blocked child behind.
 
 ### plan-review
 

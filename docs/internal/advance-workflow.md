@@ -73,6 +73,8 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 | Condition | Action |
 |-----------|--------|
 | Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up (`reason=awaiting-human-review`) |
+
+Manual `implement` follow-up for a held plan is intentionally explicit. `uv run gza add --type implement --depends-on <plan-id>` and `uv run gza add --type implement --based-on <plan-id>` are not valid substitutes while the plan is still held; the CLI refuses them and tells the operator to release the hold first with `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review`.
 | Completed non-held plan with no plan review and `require_plan_review_before_implement=true` | `create_plan_review` — create and run plan-review task |
 | Completed non-held plan with pending or in-progress plan review | `run_plan_review` / `wait_plan_review` — reuse the current review attempt, never duplicate it |
 | Completed non-held plan whose failed `plan_review` attempts hit the configured cap | `needs_discussion` — stop auto-respawning and require a human decision (`reason=plan-review-repeatedly-failed`) |

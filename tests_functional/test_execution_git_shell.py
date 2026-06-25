@@ -146,6 +146,62 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
 
 
 @pytest.mark.functional
+@pytest.mark.parametrize("flag", ["--depends-on", "--based-on"])
+def test_add_implement_from_held_plan_refuses_precreated_child(tmp_path, flag: str) -> None:
+    """Subprocess add must reject implement tasks sourced from a held completed plan."""
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    result = invoke_gza(
+        "add",
+        "--type",
+        "implement",
+        flag,
+        str(plan.id),
+        "Blocked implement",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    normalized = " ".join(result.stdout.split())
+    assert f"plan {plan.id} is held for review" in normalized
+    assert f"uv run gza implement {plan.id}" in normalized
+    assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized
+    assert not any(task.prompt == "Blocked implement" for task in store.get_all())
+
+
+@pytest.mark.functional
+def test_incomplete_surfaces_release_guidance_for_existing_held_plan_child_deadlock(tmp_path) -> None:
+    """Older inconsistent rows still surface explicit held-plan release guidance."""
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+    child = store.add("Precreated implement child", task_type="implement", depends_on=plan.id)
+    assert child.id is not None
+
+    result = invoke_gza("incomplete", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    normalized = " ".join(result.stdout.split())
+    assert child.id in normalized
+    assert f"blocked: awaiting plan review for {plan.id}" in normalized
+    assert f"release with uv run gza implement {plan.id}" in normalized
+    assert f"or uv run gza edit {plan.id} --no-hold-for-review" in normalized
+
+
+@pytest.mark.functional
 def test_failed_task_retry_runs_then_iterates(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     """gza iterate --retry on a failed task retries it then enters the loop via real engine transitions."""
     setup_config(tmp_path)

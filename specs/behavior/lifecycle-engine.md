@@ -100,6 +100,11 @@ and default to **off**.
   `require_plan_review_before_implement` is off.
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
   `awaiting_human` with parked reason `awaiting-human-review`.
+  Operators MUST NOT pre-create `implement` dependents for that held plan via
+  `gza add --type implement --depends-on <plan-id>` or a `--based-on` lineage rooted at the
+  held plan; those creation/edit attempts MUST fail with explicit release guidance directing
+  the operator to `uv run gza implement <plan-id>` or
+  `uv run gza edit <plan-id> --no-hold-for-review`.
 - A completed `explore` with no plan/implement follow-up MUST go to `needs_discussion`
   (decide: drop or spawn follow-up). The engine MUST NOT silently leave it pending (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 6).
