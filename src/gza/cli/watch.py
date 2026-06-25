@@ -11,7 +11,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
@@ -29,7 +29,14 @@ from ..concurrency import (
 )
 from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
-from ..db import MERGE_SOURCE_WATCH, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from ..db import (
+    MERGE_SOURCE_WATCH,
+    SqliteTaskStore,
+    Task as DbTask,
+    WatchProgressObservation,
+    WatchRecoveryBackoff,
+    task_id_numeric_key,
+)
 from ..git import Git, GitError
 from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage_query import (
@@ -55,6 +62,10 @@ from ..recovery_engine import (
     should_hide_failed_recovery_decision,
 )
 from ..recovery_read_context import RecoveryReadContext
+from ..recovery_transients import (
+    classify_transient_recovery_terminal,
+    compute_transient_recovery_backoff_seconds,
+)
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
@@ -68,6 +79,7 @@ from ..task_query import (
 )
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
+    WatchProgressCandidate,
     build_watch_progress_candidate,
     finalize_background_watch_execution,
     finalize_watch_progress_after_execution,
@@ -150,6 +162,7 @@ from .query import _resolve_incomplete_owner_task
 
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
+_WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON = "transient-recovery-backoff"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset(
     {"retry-limit-reached", "retryable-provider-error", WATCH_NO_PROGRESS_BACKSTOP_REASON}
 )
@@ -830,6 +843,7 @@ def _watch_iterate_impl_target(
 
 def _maybe_park_watch_no_progress(
     *,
+    config: Config | None = None,
     store: SqliteTaskStore,
     subject_task: DbTask,
     action: dict[str, Any],
@@ -842,6 +856,7 @@ def _maybe_park_watch_no_progress(
         return None
     if no_progress_cycles is not None:
         deferred_attention = _maybe_finalize_deferred_watch_no_progress(
+            config=config,
             store=store,
             subject_task=subject_task,
             action=action,
@@ -859,11 +874,34 @@ def _maybe_park_watch_no_progress(
         failed_task=failed_task,
     )
     active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
-    return active_attention
+    if active_attention is not None:
+        return active_attention
+    if _get_active_watch_recovery_backoff(store=store, candidate=candidate) is not None:
+        return {"defer_launch_reason": _WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON}
+    if _watch_action_uses_transient_recovery_backoff(
+        subject_task=subject_task,
+        action=action,
+    ) and _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=config,
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+        failed_task=failed_task,
+        candidate=candidate,
+    ):
+        if _get_active_watch_recovery_backoff(store=store, candidate=candidate) is not None:
+            return {"defer_launch_reason": _WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON}
+    return None
+
+
+def _watch_no_progress_result_deferred_for_transient_backoff(result: dict[str, Any] | None) -> bool:
+    return result is not None and result.get("defer_launch_reason") == _WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON
 
 
 def _maybe_finalize_deferred_watch_no_progress(
     *,
+    config: Config | None,
     store: SqliteTaskStore,
     subject_task: DbTask,
     action: dict[str, Any],
@@ -899,6 +937,16 @@ def _maybe_finalize_deferred_watch_no_progress(
         action_task=observed_action_task,
         failed_task=failed_task,
     )
+    if _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=config,
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=observed_action_task,
+        failed_task=failed_task,
+        candidate=terminal_candidate,
+    ):
+        return None
     return finalize_background_watch_execution(
         store,
         candidate=terminal_candidate,
@@ -908,6 +956,7 @@ def _maybe_finalize_deferred_watch_no_progress(
 
 def _finalize_watch_no_progress_after_execution(
     *,
+    config: Config | None = None,
     store: SqliteTaskStore,
     subject_task: DbTask,
     action: dict[str, Any],
@@ -933,6 +982,16 @@ def _finalize_watch_no_progress_after_execution(
         action_task=action_task_after,
         failed_task=failed_task,
     )
+    if _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=config,
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task_after,
+        failed_task=failed_task,
+        candidate=refreshed_candidate,
+    ):
+        return None
     return finalize_watch_progress_after_execution(
         store,
         before=previous_candidate,
@@ -948,6 +1007,7 @@ def _watch_background_execution_completed(action_task: DbTask | None) -> bool:
 
 def _maybe_finalize_watch_no_progress_for_background_action(
     *,
+    config: Config | None = None,
     store: SqliteTaskStore,
     subject_task: DbTask,
     action: dict[str, Any],
@@ -981,6 +1041,7 @@ def _maybe_finalize_watch_no_progress_for_background_action(
     if not _watch_background_execution_completed(action_task_after):
         return None
     return _finalize_watch_no_progress_after_execution(
+        config=config,
         store=store,
         subject_task=subject_task,
         action=action,
@@ -989,6 +1050,467 @@ def _maybe_finalize_watch_no_progress_for_background_action(
         failed_task=failed_task,
         no_progress_cycles=no_progress_cycles,
     )
+
+
+def _watch_task_sort_key(task: DbTask) -> tuple[datetime, int]:
+    when = task.completed_at or task.created_at or datetime.min
+    if when.tzinfo is not None:
+        when = when.astimezone(UTC).replace(tzinfo=None)
+    return (when, task_id_numeric_key(task.id))
+
+
+def _collect_recovery_descendants(store: SqliteTaskStore, root_task_id: str) -> list[DbTask]:
+    descendants: list[DbTask] = []
+    stack = list(store.get_based_on_children(root_task_id))
+    while stack:
+        current = stack.pop()
+        descendants.append(current)
+        if current.id is not None:
+            stack.extend(store.get_based_on_children(current.id))
+    return descendants
+
+
+def _resolve_latest_failed_recovery_attempt(store: SqliteTaskStore, failed_task: DbTask) -> DbTask | None:
+    if failed_task.id is None:
+        return None
+    candidates = [
+        descendant
+        for descendant in _collect_recovery_descendants(store, failed_task.id)
+        if descendant.status == "failed"
+        and descendant.task_type == failed_task.task_type
+        and descendant.recovery_origin in {"resume", "retry"}
+        and descendant.id is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=_watch_task_sort_key)
+
+
+def _resolve_improve_subject_and_review(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+) -> tuple[DbTask | None, DbTask | None]:
+    review = action.get("review_task")
+    review_task = review if isinstance(review, DbTask) else None
+    impl_task: DbTask | None = None
+    if subject_task.task_type == "implement":
+        impl_task = subject_task
+    elif subject_task.task_type == "review" and subject_task.depends_on:
+        candidate = store.get(subject_task.depends_on)
+        if candidate is not None and candidate.task_type == "implement":
+            impl_task = candidate
+    if review_task is None and subject_task.task_type == "review":
+        review_task = subject_task
+    return impl_task, review_task
+
+
+def _resolve_latest_failed_watch_attempt(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+    action_task: DbTask | None,
+    failed_task: DbTask | None,
+    max_resume_attempts: int | None = None,
+) -> DbTask | None:
+    action_type = str(action.get("type", "")).strip()
+    if action_type in {"resume", "retry"} and failed_task is not None:
+        return _resolve_latest_failed_recovery_attempt(store, failed_task)
+    if action_task is not None and action_task.status == "failed":
+        return action_task
+    if action_type in {"improve", "run_improve"}:
+        impl_task, review_task = _resolve_improve_subject_and_review(
+            store=store,
+            subject_task=subject_task,
+            action=action,
+        )
+        if impl_task is None or impl_task.id is None or review_task is None or review_task.id is None:
+            return None
+        improve_mode, failed_improve, _improve_decision = resolve_improve_action(
+            store,
+            impl_task.id,
+            review_task.id,
+            max_resume_attempts=max_resume_attempts,
+        )
+        if improve_mode in {"resume", "retry"} and failed_improve is not None:
+            return failed_improve
+    return None
+
+
+def _persist_transient_watch_recovery_backoff(
+    *,
+    config: Config | None,
+    store: SqliteTaskStore,
+    candidate,
+    failed_attempt: DbTask,
+    transient_code: str,
+    transient_fingerprint: str,
+) -> None:
+    now = datetime.now(UTC)
+    existing = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    streak = 1
+    next_retry_at = None
+    if existing is not None:
+        if existing.last_failure_task_id == failed_attempt.id:
+            streak = existing.streak
+            next_retry_at = existing.next_retry_at
+        else:
+            streak = existing.streak + 1
+    delay_seconds = compute_transient_recovery_backoff_seconds(config, streak) if config is not None else 0
+    if next_retry_at is None:
+        next_retry_at = now + timedelta(seconds=delay_seconds)
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed_attempt.id,
+            last_failure_reason=failed_attempt.failure_reason or transient_code,
+            last_failure_fingerprint=transient_fingerprint,
+            streak=streak,
+            next_retry_at=next_retry_at,
+            updated_at=now,
+        )
+    )
+
+
+def _preserve_watch_no_progress_observation_after_transient_terminal(
+    *,
+    store: SqliteTaskStore,
+    candidate,
+    failed_attempt: DbTask,
+) -> None:
+    observation = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    if observation is None:
+        return
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=failed_attempt.id or candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=observation.evidence_fingerprint,
+            launch_evidence_fingerprint=None,
+            streak=observation.streak,
+            parked_reason=observation.parked_reason,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+
+def _maybe_skip_watch_no_progress_for_transient_terminal(
+    *,
+    config: Config | None,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+    action_task: DbTask | None,
+    failed_task: DbTask | None,
+    candidate,
+) -> bool:
+    failed_attempt = _resolve_latest_failed_watch_attempt(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+        failed_task=failed_task,
+        max_resume_attempts=config.max_resume_attempts if config is not None else None,
+    )
+    transient = classify_transient_recovery_terminal(
+        failed_attempt,
+        project_dir=config.project_dir if config is not None else None,
+    )
+    if transient is None or failed_attempt is None:
+        return False
+    _persist_transient_watch_recovery_backoff(
+        config=config,
+        store=store,
+        candidate=candidate,
+        failed_attempt=failed_attempt,
+        transient_code=transient.code,
+        transient_fingerprint=transient.fingerprint,
+    )
+    _preserve_watch_no_progress_observation_after_transient_terminal(
+        store=store,
+        candidate=candidate,
+        failed_attempt=failed_attempt,
+    )
+    return True
+
+
+def _watch_transient_backoff_remaining_seconds(backoff: WatchRecoveryBackoff, *, now: datetime) -> int:
+    if backoff.next_retry_at is None:
+        return 0
+    return max(0, int((backoff.next_retry_at - now).total_seconds()))
+
+
+def _get_active_watch_recovery_backoff(
+    *,
+    store: SqliteTaskStore,
+    candidate: WatchProgressCandidate,
+    now: datetime | None = None,
+) -> WatchRecoveryBackoff | None:
+    now = now or datetime.now(UTC)
+    backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    if backoff is None:
+        return None
+    if _watch_transient_backoff_remaining_seconds(backoff, now=now) <= 0:
+        return None
+    return backoff
+
+
+def _watch_action_uses_transient_recovery_backoff(
+    *,
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+) -> bool:
+    action_type = str(action.get("type", "")).strip()
+    if action_type in {"improve", "run_improve", "resume", "retry"}:
+        return True
+    if action_type != "iterate":
+        return False
+    return resolve_pending_recovery_execution_mode(subject_task) in {"resume", "retry"}
+
+
+def _resolve_pending_improve_root_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    current = task
+    visited: set[str] = set()
+    while True:
+        if current.task_type == "implement":
+            return current
+        current_id = current.id
+        if current_id is not None:
+            if current_id in visited:
+                return None
+            visited.add(current_id)
+        if current.depends_on:
+            dependency = store.get(current.depends_on)
+            if dependency is not None and dependency.task_type == "review" and dependency.depends_on:
+                impl_task = store.get(dependency.depends_on)
+                if impl_task is not None and impl_task.task_type == "implement":
+                    return impl_task
+        if not current.based_on:
+            return None
+        parent = store.get(current.based_on)
+        if parent is None:
+            return None
+        current = parent
+
+
+def _resolve_pending_improve_backoff_candidate_from_rows(
+    *,
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    pending_improve: DbTask,
+    failed_improve: DbTask | None,
+) -> WatchProgressCandidate | None:
+    if impl_task.id is None:
+        return None
+    subject_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl_task,
+        action={"type": "", "description": ""},
+        action_task=pending_improve,
+        failed_task=failed_improve if failed_improve is not None and failed_improve.status == "failed" else None,
+    )
+    matching_backoffs = [
+        backoff
+        for backoff in store.list_watch_recovery_backoffs(
+            subject_kind=subject_candidate.subject_kind,
+            subject_id=subject_candidate.subject_id,
+        )
+        if backoff.action_type in {"improve", "run_improve"}
+        and (
+            failed_improve is None
+            or failed_improve.id is None
+            or backoff.last_failure_task_id == failed_improve.id
+        )
+    ]
+    if not matching_backoffs:
+        return None
+    backoff = matching_backoffs[0]
+    return build_watch_progress_candidate(
+        store,
+        subject_task=impl_task,
+        action={
+            "type": backoff.action_type,
+            "description": backoff.action_reason,
+        },
+        action_task=pending_improve,
+        failed_task=failed_improve if failed_improve is not None and failed_improve.status == "failed" else None,
+    )
+
+
+def _resolve_pending_recovery_backoff_candidate(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+) -> tuple[DbTask, WatchProgressCandidate] | None:
+    pending_recovery_mode = resolve_pending_recovery_execution_mode(subject_task)
+    if subject_task.status == "pending" and pending_recovery_mode in {"resume", "retry"}:
+        parent = store.get(subject_task.based_on) if subject_task.based_on else None
+        if subject_task.task_type == "improve":
+            impl_task = _resolve_pending_improve_root_task(store, subject_task)
+            if impl_task is not None and impl_task.id is not None:
+                observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=impl_task.id)
+                parent_id = parent.id if parent is not None else None
+                improve_observation = next(
+                    (
+                        observation
+                        for observation in observations
+                        if observation.action_type in {"improve", "run_improve"}
+                        and parent_id is not None
+                        and (observation.action_task_id == parent_id or observation.failed_task_id == parent_id)
+                    ),
+                    None,
+                )
+                if improve_observation is None:
+                    improve_observation = next(
+                        (
+                            observation
+                            for observation in observations
+                            if observation.action_type in {"improve", "run_improve"}
+                        ),
+                        None,
+                    )
+                if improve_observation is not None:
+                    candidate = build_watch_progress_candidate(
+                        store,
+                        subject_task=impl_task,
+                        action={
+                            "type": improve_observation.action_type,
+                            "description": improve_observation.action_reason,
+                        },
+                        action_task=subject_task,
+                        failed_task=parent if parent is not None and parent.status == "failed" else None,
+                    )
+                    return impl_task, candidate
+                row_candidate = _resolve_pending_improve_backoff_candidate_from_rows(
+                    store=store,
+                    impl_task=impl_task,
+                    pending_improve=subject_task,
+                    failed_improve=parent if parent is not None and parent.status == "failed" else None,
+                )
+                if row_candidate is not None:
+                    return impl_task, row_candidate
+
+        if parent is None or parent.status != "failed":
+            return None
+        recovery_description = (
+            f"Resume failed task ({parent.failure_reason or 'UNKNOWN'})"
+            if pending_recovery_mode == "resume"
+            else f"Retry failed task ({parent.failure_reason or 'UNKNOWN'})"
+        )
+        candidate = build_watch_progress_candidate(
+            store,
+            subject_task=parent,
+            action={
+                "type": pending_recovery_mode,
+                "description": recovery_description,
+            },
+            action_task=subject_task,
+            failed_task=parent,
+        )
+        return parent, candidate
+
+    if _watch_action_uses_transient_recovery_backoff(subject_task=subject_task, action=action):
+        candidate = build_watch_progress_candidate(
+            store,
+            subject_task=subject_task,
+            action=dict(action),
+            action_task=subject_task,
+            failed_task=subject_task if subject_task.status == "failed" else None,
+        )
+        return subject_task, candidate
+    return None
+
+
+def _maybe_emit_active_watch_recovery_backoff(
+    *,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+) -> bool:
+    resolved = _resolve_active_watch_recovery_backoff(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+    )
+    if resolved is None:
+        return False
+    log_subject_task, candidate, backoff = resolved
+    now = datetime.now(UTC)
+    remaining_seconds = _watch_transient_backoff_remaining_seconds(backoff, now=now)
+    if remaining_seconds <= 0:
+        return False
+    action_label = candidate.action_type or str(action.get("type", "action")).strip() or "action"
+    last_failure_task_id = backoff.last_failure_task_id or "unknown"
+    last_failure_reason = backoff.last_failure_reason or "UNKNOWN"
+    log.emit(
+        "BACKOFF",
+        (
+            f"{log_subject_task.id} {action_label} delayed {remaining_seconds}s after transient failure "
+            f"(last={last_failure_task_id} {last_failure_reason})"
+        ),
+        dedupe_key=(
+            "transient-recovery-backoff:"
+            f"{candidate.subject_kind}:{candidate.subject_id}:{candidate.action_type}:{candidate.action_reason}:"
+            f"{last_failure_task_id}:{remaining_seconds}"
+        ),
+    )
+    return True
+
+
+def _resolve_active_watch_recovery_backoff(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: Mapping[str, Any],
+) -> tuple[DbTask, WatchProgressCandidate, WatchRecoveryBackoff] | None:
+    resolved = _resolve_pending_recovery_backoff_candidate(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+    )
+    if resolved is None:
+        return None
+    log_subject_task, candidate = resolved
+    now = datetime.now(UTC)
+    backoff = _get_active_watch_recovery_backoff(store=store, candidate=candidate, now=now)
+    if backoff is None:
+        return None
+    return log_subject_task, candidate, backoff
 
 
 def _resolve_recovery_action_task(
@@ -2751,7 +3273,15 @@ def _run_cycle(
                     )
                 continue
             if not dry_run and display_task.id is not None:
+                if _maybe_emit_active_watch_recovery_backoff(
+                    store=store,
+                    log=log,
+                    subject_task=display_task,
+                    action=action,
+                ):
+                    continue
                 no_progress_attention = _maybe_park_watch_no_progress(
+                    config=config,
                     store=store,
                     subject_task=display_task,
                     action=action,
@@ -2759,6 +3289,14 @@ def _run_cycle(
                     failed_task=None,
                     no_progress_cycles=config.watch.no_progress_cycles,
                 )
+                if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                    _maybe_emit_active_watch_recovery_backoff(
+                        store=store,
+                        log=log,
+                        subject_task=display_task,
+                        action=action,
+                    )
+                    continue
                 if no_progress_attention is not None:
                     log.emit_attention(
                         attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
@@ -2890,6 +3428,7 @@ def _run_cycle(
                     log.emit("START", f"{child_id} rebase")
                 refreshed_action_task = store.get(child_id) if child_id is not None else None
                 no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+                    config=config,
                     store=store,
                     subject_task=display_task,
                     action=action,
@@ -2910,6 +3449,7 @@ def _run_cycle(
             elif exec_result.status == "success" and action_type == "reconcile_branch_divergence":
                 refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
                 no_progress_attention = _finalize_watch_no_progress_after_execution(
+                    config=config,
                     store=store,
                     subject_task=display_task,
                     action=action,
@@ -2972,36 +3512,47 @@ def _run_cycle(
         and str(task.id) not in pending_recovery_task_ids
         and str(task.id) not in step1_handled_child_task_ids
     ]
-    worker_consuming_recovery_count = sum(
+    active_backoff_recovery_subject_ids: set[str] = set()
+    if not dry_run:
+        for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
+            if failed.id is None:
+                continue
+            if str(failed.id) in parked_recovery_subject_ids:
+                continue
+            if (
+                _resolve_active_watch_recovery_backoff(
+                    store=store,
+                    subject_task=failed,
+                    action=recovery_action,
+                )
+                is not None
+            ):
+                active_backoff_recovery_subject_ids.add(str(failed.id))
+    launchable_recovery_subject_ids = {
+        str(failed.id)
+        for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
+        if str(failed.id) not in parked_recovery_subject_ids
+        and str(failed.id) not in active_backoff_recovery_subject_ids
+    }
+    worker_consuming_launchable_recovery_count = sum(
         1
         for _row, failed, _decision, _action, worker_consuming, _action_task in actionable_failed
-        if worker_consuming and str(failed.id) not in parked_recovery_subject_ids
+        if worker_consuming and str(failed.id) in launchable_recovery_subject_ids
     )
     slot_allocation = allocate_watch_slots(
         slots=slots,
         recovery_slots_config=recovery_slots,
-        actionable_recovery_count=sum(
-            1
-            for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
-            if str(failed.id) not in parked_recovery_subject_ids
-        ),
-        worker_consuming_recovery_count=worker_consuming_recovery_count,
+        actionable_recovery_count=len(launchable_recovery_subject_ids),
+        worker_consuming_recovery_count=worker_consuming_launchable_recovery_count,
         pending_count=len(pending_candidates),
         gate_pending_on_actionable_recovery=(
             recovery_mode == "recovery-only"
-            and any(
-                str(failed.id) not in parked_recovery_subject_ids
-                for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
-            )
+            and bool(launchable_recovery_subject_ids)
         ),
     )
     reserved_recovery_slots = slot_allocation.recovery_slots
     pending_slots = slot_allocation.pending_slots
-    nonparked_recovery_subject_ids = {
-        str(failed.id)
-        for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
-        if str(failed.id) not in parked_recovery_subject_ids
-    }
+    nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids)
     recovery_started_this_cycle = False
     for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
         if recovery_slots <= 0:
@@ -3024,10 +3575,19 @@ def _run_cycle(
                         message=_watch_needs_attention_message(failed, active_attention),
                     )
             continue
+        if not dry_run:
+            if _maybe_emit_active_watch_recovery_backoff(
+                store=store,
+                log=log,
+                subject_task=failed,
+                action=recovery_action,
+            ):
+                continue
         if worker_consuming_recovery and reserved_recovery_slots <= 0:
             continue
         if not dry_run:
             no_progress_attention = _maybe_park_watch_no_progress(
+                config=config,
                 store=store,
                 subject_task=failed,
                 action=recovery_action,
@@ -3035,6 +3595,14 @@ def _run_cycle(
                 failed_task=failed,
                 no_progress_cycles=config.watch.no_progress_cycles,
             )
+            if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                _maybe_emit_active_watch_recovery_backoff(
+                    store=store,
+                    log=log,
+                    subject_task=failed,
+                    action=recovery_action,
+                )
+                continue
             if no_progress_attention is not None:
                 parked_recovery_subject_ids.add(str(failed.id))
                 nonparked_recovery_subject_ids.discard(str(failed.id))
@@ -3090,6 +3658,7 @@ def _run_cycle(
             if exec_result.status == "success":
                 refreshed_failed = store.get(failed.id) if failed.id is not None else None
                 no_progress_attention = _finalize_watch_no_progress_after_execution(
+                    config=config,
                     store=store,
                     subject_task=failed,
                     action=recovery_action,
@@ -3314,6 +3883,7 @@ def _run_cycle(
             continue
         refreshed_recovered_task = store.get(recovered_task_id)
         no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+            config=config,
             store=store,
             subject_task=failed,
             action=recovery_action,
@@ -3377,7 +3947,15 @@ def _run_cycle(
                     consume_pending_slot()
                     work_done = True
                     continue
+                if _maybe_emit_active_watch_recovery_backoff(
+                    store=store,
+                    log=log,
+                    subject_task=task,
+                    action=pending_action,
+                ):
+                    continue
                 no_progress_attention = _maybe_park_watch_no_progress(
+                    config=config,
                     store=store,
                     subject_task=task,
                     action=pending_action,
@@ -3385,6 +3963,14 @@ def _run_cycle(
                     failed_task=None,
                     no_progress_cycles=config.watch.no_progress_cycles,
                 )
+                if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                    _maybe_emit_active_watch_recovery_backoff(
+                        store=store,
+                        log=log,
+                        subject_task=task,
+                        action=pending_action,
+                    )
+                    continue
                 if no_progress_attention is not None:
                     log.emit_attention(
                         attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
@@ -3434,6 +4020,7 @@ def _run_cycle(
                     continue
                 refreshed_pending_task = store.get(str(task.id))
                 no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+                    config=config,
                     store=store,
                     subject_task=task,
                     action=pending_action,
@@ -3469,7 +4056,15 @@ def _run_cycle(
                 consume_pending_slot()
                 work_done = True
                 continue
+            if _maybe_emit_active_watch_recovery_backoff(
+                store=store,
+                log=log,
+                subject_task=task,
+                action=pending_action,
+            ):
+                continue
             no_progress_attention = _maybe_park_watch_no_progress(
+                config=config,
                 store=store,
                 subject_task=task,
                 action=pending_action,
@@ -3477,6 +4072,14 @@ def _run_cycle(
                 failed_task=None,
                 no_progress_cycles=config.watch.no_progress_cycles,
             )
+            if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                _maybe_emit_active_watch_recovery_backoff(
+                    store=store,
+                    log=log,
+                    subject_task=task,
+                    action=pending_action,
+                )
+                continue
             if no_progress_attention is not None:
                 log.emit_attention(
                     attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
@@ -3501,6 +4104,7 @@ def _run_cycle(
                 continue
             refreshed_pending_task = store.get(str(task.id))
             no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+                config=config,
                 store=store,
                 subject_task=task,
                 action=pending_action,

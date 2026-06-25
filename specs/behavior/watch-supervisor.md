@@ -293,11 +293,22 @@ When the installed `gza` package fingerprint changes while watch is running:
   launch, skipping the action, or finding an already-running/in-flight child MUST NOT
   increment the streak. Restarting watch MUST NOT reset a streak created by actual executed
   no-progress outcomes.
+- When the latest relevant failed recovery or improve attempt for that selected
+  subject/action is a **transient terminal** (for example provider-capacity,
+  infrastructure/worker death before durable work, or timeout before meaningful execution),
+  watch MUST NOT increment the no-progress streak for that cycle. Instead it MUST preserve
+  the last real no-progress streak unchanged, clear any deferred launch marker for the
+  observed attempt, and persist or update per-subject transient recovery cooldown state for
+  that same subject/action pair.
 - Progress MUST be measured by **outcome**, not by the act of launching. Starting (or
   re-starting) a worker for a subject is NOT, by itself, durable progress. A worker launch
   that leaves the subject in the same state — no task status transition, no branch-head
   change, no merge-unit state change, no recovery-edge creation — is a no-op repeat and MUST
   advance the streak, not reset it.
+- A completed no-op attempt is **not** transient for this rule. If a completed improve,
+  rebase, or other launched action reaches a durable terminal with unchanged evidence
+  (for example completed improve with `changed_diff = false`), it MUST still count toward
+  the normal no-progress parking threshold.
 - Dead prepared recovery workers are a distinct primary failure signal, not merely
   "no-progress" evidence. When watch can prove a detached worker for a pending recovery row
   died before claiming it, reconciliation MUST terminalize that row as a failed recovery
@@ -371,6 +382,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.recovery_slots` | Slots per cycle reserved for worker-consuming failed-task recovery before pending pickup |
 | `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
+| `watch.transient_recovery_backoff_max` | Maximum persisted cooldown for transient failed recovery/improve retries |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
 | `watch.no_activity_timeout` | Reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
 | `--tag` / `--all-tags` | Supervisor execution scope (`--tag` matches any requested tag by default; `--all-tags` requires all of them) |

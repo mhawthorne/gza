@@ -151,6 +151,14 @@ its stored action.
   attempt MUST count toward that budget first. Automation MAY spend the remaining bounded
   attempt(s) before escalating to shared needs-attention; it MUST NOT park immediately on
   the first same-action startup-abort descendant alone.
+- Those transient failed recovery descendants still remain distinct from **real**
+  no-progress outcomes. When watch later reevaluates the same selected recovery or improve
+  action, an explicit transient terminal such as `PROVIDER_UNAVAILABLE`,
+  `RETRYABLE_PROVIDER_ERROR`, `INFRASTRUCTURE_ERROR`, `WORKER_DIED`, `NO_ACTIVITY`, or a
+  timeout before meaningful execution MUST NOT increment the shared
+  `watch-no-progress-backstop` streak by itself. Watch may persist retry cooldown for that
+  subject/action, but the preserved real no-progress streak remains unchanged until a
+  durable no-op or non-transient repeat occurs.
 - A bounded automatic recovery attempt starts when automation creates a recovery edge/child
   or adopts an existing explicit recovery descendant for execution.
 - A non-terminal recovery descendant MUST NOT leave the original failed subject recoverable

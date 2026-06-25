@@ -284,7 +284,8 @@ def get_active_watch_no_progress_attention(
     if observation.parked_reason != WATCH_NO_PROGRESS_BACKSTOP_REASON:
         return None
     if _watch_no_progress_park_is_stale(store, observation=observation, candidate=candidate):
-        store.delete_watch_progress_subject(
+        _clear_watch_subject_state(
+            store,
             subject_kind=observation.subject_kind,
             subject_id=observation.subject_id,
         )
@@ -343,7 +344,8 @@ def reconcile_stale_watch_no_progress_parks(store: SqliteTaskStore) -> int:
             continue
         if not _watch_no_progress_park_is_stale(store, observation=observation):
             continue
-        store.delete_watch_progress_subject(
+        _clear_watch_subject_state(
+            store,
             subject_kind=observation.subject_kind,
             subject_id=observation.subject_id,
         )
@@ -370,12 +372,30 @@ def _clear_other_subject_actions(
         row.action_type != candidate.action_type or row.action_reason != candidate.action_reason
         for row in same_subject_rows
     ):
-        store.delete_watch_progress_subject(
+        _clear_watch_subject_state(
+            store,
             subject_kind=candidate.subject_kind,
             subject_id=candidate.subject_id,
         )
         return None
     return existing
+
+
+def _clear_watch_subject_state(
+    store: SqliteTaskStore,
+    *,
+    subject_kind: str,
+    subject_id: str,
+) -> None:
+    """Clear all watch-owned persisted state for one subject after durable progress."""
+    store.delete_watch_progress_subject(
+        subject_kind=subject_kind,
+        subject_id=subject_id,
+    )
+    store.delete_watch_recovery_backoff_subject(
+        subject_kind=subject_kind,
+        subject_id=subject_id,
+    )
 
 
 def clear_watch_progress_subject(
@@ -390,7 +410,8 @@ def clear_watch_progress_subject(
         store,
         subject_task=subject_task,
     )
-    store.delete_watch_progress_subject(
+    _clear_watch_subject_state(
+        store,
         subject_kind=subject_kind,
         subject_id=subject_id,
     )
@@ -457,7 +478,8 @@ def finalize_watch_progress_after_execution(
     if before.subject_kind != after.subject_kind or before.subject_id != after.subject_id:
         raise AssertionError("watch progress execution finalizer requires a stable subject")
     if before.evidence_fingerprint != after.evidence_fingerprint:
-        store.delete_watch_progress_subject(
+        _clear_watch_subject_state(
+            store,
             subject_kind=after.subject_kind,
             subject_id=after.subject_id,
         )
@@ -527,7 +549,8 @@ def finalize_background_watch_execution(
     if observation is None or observation.launch_evidence_fingerprint is None:
         return None
     if candidate.evidence_fingerprint != observation.launch_evidence_fingerprint:
-        store.delete_watch_progress_subject(
+        _clear_watch_subject_state(
+            store,
             subject_kind=candidate.subject_kind,
             subject_id=candidate.subject_id,
         )

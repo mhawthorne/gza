@@ -8,7 +8,7 @@ import re
 import signal
 import sys
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, call, patch
@@ -43,6 +43,7 @@ from gza.cli.watch import (
     _maybe_repair_target_already_merged_skip,
     _maybe_park_watch_no_progress,
     _maybe_finalize_watch_no_progress_for_background_action,
+    _maybe_skip_watch_no_progress_for_transient_terminal,
     _query_owner_rows_with_context,
     _resolve_watch_attention_display_task,
     _run_cycle,
@@ -51,6 +52,7 @@ from gza.cli.watch import (
     _should_reexec_watch,
     _task_snapshot,
     _watch_needs_attention_message,
+    _watch_no_progress_result_deferred_for_transient_backoff,
     _watch_reexec_argv,
     _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
@@ -67,7 +69,7 @@ from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_s
 import gza.colors as colors
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.config import Config
-from gza.db import Task, WatchProgressObservation
+from gza.db import Task, WatchProgressObservation, WatchRecoveryBackoff
 from gza.plan_review_verdict import validate_plan_review_manifest
 import gza.recovery_engine as recovery_engine
 from gza.git import Git, GitError
@@ -2041,18 +2043,15 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is True
+    assert result.work_done is False
     refreshed_retry_child = store.get(retry_child.id)
     assert refreshed_retry_child is not None
     assert refreshed_retry_child.status == "failed"
     assert refreshed_retry_child.failure_reason == "NO_ACTIVITY"
-
-    assert spawn_iterate.call_count == 1
-    spawned_child_id = spawn_iterate.call_args.kwargs["prepared_task_id"]
-    assert isinstance(spawned_child_id, str)
-    assert spawned_child_id != retry_child.id
-    spawned_task = spawn_iterate.call_args.args[2]
-    assert spawned_task.id == spawned_child_id
+    assert spawn_iterate.call_count == 0
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} retry delayed" in log_text
 
 
 def test_watch_cycle_repeated_recovery_evaluation_does_not_park_pending_descendant(tmp_path: Path) -> None:
@@ -11242,6 +11241,21 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
             observed_at=datetime.now(UTC),
         )
     )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id="gza-999",
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="fp-clear-me",
+            streak=1,
+            next_retry_at=datetime.now(UTC) + timedelta(seconds=60),
+            updated_at=datetime.now(UTC),
+        )
+    )
 
     clear_watch_progress_subject(store, subject_task=impl)
 
@@ -11249,6 +11263,15 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
         subject_kind="merge_unit",
         subject_id=unit.id,
     ) == []
+    assert (
+        store.get_watch_recovery_backoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+        )
+        is None
+    )
 
 
 def test_background_no_progress_finalizer_ignores_nonterminal_launch_state(tmp_path: Path) -> None:
@@ -11337,6 +11360,60 @@ def test_background_no_progress_finalizer_parks_repeated_completed_no_progress_o
     assert second_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
     assert len(observations) == 1
     assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
+def test_background_no_progress_finalizer_completed_noop_improve_still_parks(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert impl.id is not None
+    assert review.id is not None
+
+    improve = store.add("Improve feature", task_type="improve", based_on=impl.id, depends_on=review.id)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.changed_diff = False
+    improve.completed_at = datetime.now(UTC)
+    store.update(improve)
+
+    refreshed_impl = store.get(impl.id)
+    refreshed_review = store.get(review.id)
+    refreshed_improve = store.get(improve.id)
+    assert refreshed_impl is not None
+    assert refreshed_review is not None
+    assert refreshed_improve is not None
+    action = {"type": "run_improve", "description": "Run existing improve", "review_task": refreshed_review}
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task_before=refreshed_improve,
+        action_task_after=refreshed_improve,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task_before=refreshed_improve,
+        action_task_after=refreshed_improve,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    assert first_attention is None
+    assert second_attention is not None
+    assert second_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].streak == 2
 
 
 def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path: Path) -> None:
@@ -11719,6 +11796,2045 @@ def test_recovery_deferred_background_terminal_no_progress_parks_after_repeated_
     assert len(observations) == 1
     assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
     assert observations[0].streak == 2
+
+
+def test_improve_deferred_background_transient_terminal_does_not_park_and_preserves_real_streak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert impl.id is not None
+    assert review.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+
+    config = Config.load(tmp_path)
+    action = {"type": "improve", "description": "Create improve task", "review_task": review}
+    real_build_candidate = build_watch_progress_candidate
+
+    def stable_candidate(*args: object, **kwargs: object) -> WatchProgressCandidate:
+        candidate = real_build_candidate(*args, **kwargs)
+        subject_task = kwargs.get("subject_task")
+        if getattr(subject_task, "id", None) == impl.id and candidate.action_type == "improve":
+            return replace(candidate, evidence_fingerprint=f"stable:{impl.id}:improve")
+        return candidate
+
+    monkeypatch.setattr("gza.cli.watch.build_watch_progress_candidate", stable_candidate)
+    seeded_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=review,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=seeded_candidate.subject_kind,
+            subject_id=seeded_candidate.subject_id,
+            action_type=seeded_candidate.action_type,
+            action_reason=seeded_candidate.action_reason,
+            subject_task_id=seeded_candidate.subject_task_id,
+            action_task_id=seeded_candidate.action_task_id,
+            action_task_status=seeded_candidate.action_task_status,
+            action_task_started_at=seeded_candidate.action_task_started_at,
+            action_task_running_pid=seeded_candidate.action_task_running_pid,
+            failed_task_id=seeded_candidate.failed_task_id,
+            recovery_task_id=seeded_candidate.recovery_task_id,
+            merge_unit_id=seeded_candidate.merge_unit_id,
+            merge_unit_state=seeded_candidate.merge_unit_state,
+            merge_unit_head_sha=seeded_candidate.merge_unit_head_sha,
+            evidence_fingerprint=seeded_candidate.evidence_fingerprint,
+            streak=1,
+            parked_reason=None,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    first_improve = store.add("Improve attempt 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+    assert first_improve.id is not None
+    first_improve.status = "in_progress"
+    first_improve.started_at = datetime.now(UTC)
+    first_improve.running_pid = 8118
+    store.update(first_improve)
+
+    first_launch_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        config=config,
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=review,
+        action_task_after=first_improve,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    first_improve.status = "failed"
+    first_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    first_improve.recovery_origin = "retry"
+    first_improve.completed_at = datetime.now(UTC)
+    store.update(first_improve)
+    first_terminal_attention = _maybe_park_watch_no_progress(
+        config=config,
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=review,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    second_improve = store.add(
+        "Improve attempt 2",
+        task_type="improve",
+        based_on=first_improve.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert second_improve.id is not None
+    second_improve.status = "in_progress"
+    second_improve.started_at = datetime.now(UTC)
+    second_improve.running_pid = 8229
+    store.update(second_improve)
+
+    second_launch_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        config=config,
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=review,
+        action_task_after=second_improve,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_improve.status = "failed"
+    second_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    second_improve.completed_at = datetime.now(UTC)
+    store.update(second_improve)
+    second_terminal_attention = _maybe_park_watch_no_progress(
+        config=config,
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=review,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    backoff = store.get_watch_recovery_backoff(
+        subject_kind="lineage",
+        subject_id=str(impl.id),
+        action_type="improve",
+        action_reason="Create improve task",
+    )
+
+    assert first_launch_attention is None
+    assert _watch_no_progress_result_deferred_for_transient_backoff(first_terminal_attention)
+    assert second_launch_attention is None
+    assert _watch_no_progress_result_deferred_for_transient_backoff(second_terminal_attention)
+    assert len(observations) == 1
+    assert observations[0].streak == 1
+    assert observations[0].parked_reason is None
+    assert observations[0].launch_evidence_fingerprint is None
+    assert backoff is not None
+    assert backoff.last_failure_task_id == second_improve.id
+    assert backoff.last_failure_reason == "PROVIDER_UNAVAILABLE"
+    assert backoff.streak == 2
+
+
+def test_transient_watch_recovery_backoff_is_idempotent_for_same_failed_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 22, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    failed = store.add("Failed improve", task_type="improve")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.recovery_origin = "retry"
+    failed.completed_at = FrozenDateTime.current
+    store.update(failed)
+
+    action = {"type": "improve", "description": "Create improve task"}
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=action,
+        action_task=failed,
+        failed_task=None,
+    )
+
+    first = _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=failed,
+        action=action,
+        action_task=failed,
+        failed_task=None,
+        candidate=candidate,
+    )
+    first_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    assert first is True
+    assert first_backoff is not None
+    assert first_backoff.streak == 1
+    assert first_backoff.next_retry_at == FrozenDateTime.current + timedelta(seconds=60)
+
+    FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=5)
+    second = _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=failed,
+        action=action,
+        action_task=failed,
+        failed_task=None,
+        candidate=candidate,
+    )
+    second_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    assert second is True
+    assert second_backoff is not None
+    assert second_backoff.streak == 1
+    assert second_backoff.next_retry_at == first_backoff.next_retry_at
+
+
+def test_transient_watch_recovery_backoff_advances_for_new_failed_attempt_on_same_subject_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 22, 10, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    first_failed = store.add("Failed improve 1", task_type="improve")
+    assert first_failed.id is not None
+    first_failed.status = "failed"
+    first_failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    first_failed.recovery_origin = "retry"
+    first_failed.completed_at = FrozenDateTime.current
+    store.update(first_failed)
+
+    action = {"type": "improve", "description": "Create improve task"}
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=first_failed,
+        action=action,
+        action_task=first_failed,
+        failed_task=None,
+    )
+
+    first = _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=first_failed,
+        action=action,
+        action_task=first_failed,
+        failed_task=None,
+        candidate=candidate,
+    )
+    first_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    second_failed = store.add(
+        "Failed improve 2",
+        task_type="improve",
+        based_on=first_failed.id,
+        recovery_origin="retry",
+    )
+    assert second_failed.id is not None
+    second_failed.status = "failed"
+    second_failed.failure_reason = "WORKER_DIED"
+    second_failed.completed_at = FrozenDateTime.current + timedelta(seconds=5)
+    store.update(second_failed)
+
+    FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=5)
+    second = _maybe_skip_watch_no_progress_for_transient_terminal(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=first_failed,
+        action=action,
+        action_task=second_failed,
+        failed_task=None,
+        candidate=candidate,
+    )
+    second_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    assert first is True
+    assert second is True
+    assert first_backoff is not None
+    assert second_backoff is not None
+    assert first_backoff.streak == 1
+    assert first_backoff.next_retry_at == datetime(2026, 6, 24, 22, 11, tzinfo=UTC)
+    assert second_backoff.last_failure_task_id == second_failed.id
+    assert second_backoff.last_failure_reason == "WORKER_DIED"
+    assert second_backoff.last_failure_fingerprint == "transient:improve:WORKER_DIED"
+    assert second_backoff.streak == 2
+    assert second_backoff.next_retry_at == datetime(2026, 6, 24, 22, 12, 5, tzinfo=UTC)
+
+
+def test_watch_cycle_recovery_backoff_blocks_until_due_then_launches(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.session_id = "sess-backoff-gate"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=Config.load(tmp_path).max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=failed,
+        failed_task=failed,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="fp-pending-retry",
+            streak=1,
+            next_retry_at=datetime.now(UTC) + timedelta(seconds=60),
+            updated_at=datetime.now(UTC),
+        )
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_task_ids: list[str] = []
+
+    def record_resume_spawn(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    def record_worker_spawn(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    def record_iterate_spawn(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        assert isinstance(task_id, str)
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=record_resume_spawn),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=record_worker_spawn),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=record_iterate_spawn),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+        store.upsert_watch_recovery_backoff(
+            WatchRecoveryBackoff(
+                subject_kind=candidate.subject_kind,
+                subject_id=candidate.subject_id,
+                action_type=candidate.action_type,
+                action_reason=candidate.action_reason,
+                subject_task_id=candidate.subject_task_id,
+                last_failure_task_id=failed.id,
+                last_failure_reason="PROVIDER_UNAVAILABLE",
+                last_failure_fingerprint="fp-pending-retry",
+                streak=1,
+                next_retry_at=datetime.now(UTC) - timedelta(seconds=1),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert len(started_task_ids) == 1
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} {candidate.action_type} delayed" in log_text
+
+
+def test_watch_cycle_pending_implement_retry_respects_active_transient_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 22, 20, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.session_id = "sess-pending-implement-retry"
+    failed.completed_at = FrozenDateTime.current
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=config.max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=failed,
+        failed_task=failed,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:implement:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current + timedelta(seconds=60),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+
+    pending_retry = store.add(
+        "Pending implement retry",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("implement recovery should stay pending during backoff")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("implement recovery should iterate when due")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("implement recovery should not spawn before cooldown is due")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    assert result.pending == 1
+    assert store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    ) == []
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} retry delayed" in log_text
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and pending_retry.id in line
+        for line in log_text.splitlines()
+    )
+
+
+def test_watch_cycle_pending_improve_recovery_worker_respects_active_transient_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 22, 30, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    improve_action = {
+        "type": "improve",
+        "description": "Create improve task (review CHANGES_REQUESTED)",
+        "review_task": review,
+    }
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=failed_improve,
+        failed_task=failed_improve,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=1,
+            parked_reason=None,
+            observed_at=FrozenDateTime.current,
+        )
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed_improve.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:improve:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current + timedelta(seconds=60),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+
+    pending_retry = store.add(
+        "Pending improve retry",
+        task_type="improve",
+        based_on=failed_improve.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_task_ids: list[str] = []
+
+    def record_worker_spawn(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    patches = (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("improve recovery should stay on worker path")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("improve recovery should stay on worker path")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=record_worker_spawn),
+    )
+
+    with contextlib.ExitStack() as stack:
+        for active_patch in patches:
+            stack.enter_context(active_patch)
+        first_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        first_log_text = log_path.read_text()
+        first_started_task_ids = list(started_task_ids)
+
+        FrozenDateTime.current = FrozenDateTime.current + timedelta(seconds=61)
+        second_result = _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert first_result.pending == 1
+    assert first_started_task_ids == []
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and pending_retry.id in line
+        for line in first_log_text.splitlines()
+    )
+    assert second_result.work_done is True
+    assert started_task_ids == [pending_retry.id]
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{impl.id} improve delayed" in log_text
+
+
+def test_watch_cycle_improve_transient_terminal_defers_same_cycle_relaunch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 23, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    impl.branch = "feature/improve-backoff"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease retry later."
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    improve_action = {
+        "type": "improve",
+        "description": "Create improve task",
+        "review_task": review,
+    }
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=impl,
+        failed_task=None,
+    )
+
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, review, failed_improve),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="review",
+        unresolved_tasks=(impl,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[]),
+        patch("gza.cli.watch.determine_next_action", return_value=improve_action),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            side_effect=AssertionError("improve launch should defer behind initial transient cooldown"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    assert result.work_done is False
+    assert backoff is not None
+    assert backoff.last_failure_task_id == failed_improve.id
+    assert backoff.streak == 1
+    assert backoff.next_retry_at == FrozenDateTime.current + timedelta(seconds=60)
+    assert (
+        store.get_watch_progress_observation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+        )
+        is None
+    )
+    assert get_active_watch_no_progress_attention(store, candidate=candidate) is None
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{impl.id} improve delayed 60s" in log_text
+    assert "START" not in log_text
+
+
+def test_watch_cycle_pending_improve_retry_respects_active_transient_backoff_without_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 23, 5, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    impl.branch = "feature/improve-backoff"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease retry later."
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    improve_action = {
+        "type": "improve",
+        "description": "Create improve task",
+        "review_task": review,
+    }
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=impl,
+        failed_task=None,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed_improve.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:improve:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current + timedelta(seconds=60),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+
+    pending_retry = store.add(
+        "Pending improve retry",
+        task_type="improve",
+        based_on=failed_improve.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    unrelated = store.add("Unrelated pending review", task_type="review")
+    assert unrelated.id is not None
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_worker_task_ids: list[str] = []
+
+    def _record_worker_start(_args: argparse.Namespace, _config: Config, *, task_id: str, **_kwargs: object) -> int:
+        started_worker_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry, unrelated]),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("pending improve retry should not iterate before cooldown is due"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("pending improve retry should not resume before cooldown is due"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=_record_worker_start),
+    ):
+        result = _run_cycle(
+            config=Config.load(tmp_path),
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert result.work_done is True
+    assert pending_retry.status == "pending"
+    assert started_worker_task_ids == [unrelated.id]
+    assert store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    ) == []
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{impl.id} improve delayed 60s" in log_text
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and pending_retry.id in line
+        for line in log_text.splitlines()
+    )
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and unrelated.id in line
+        for line in log_text.splitlines()
+    )
+
+
+def test_watch_cycle_pending_review_retry_respects_active_transient_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 22, 40, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    failed = store.add("Failed review", task_type="review")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.session_id = "sess-pending-review-retry"
+    failed.completed_at = FrozenDateTime.current
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=config.max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=failed,
+        failed_task=failed,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:review:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current + timedelta(seconds=60),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+
+    pending_retry = store.add(
+        "Pending review retry",
+        task_type="review",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("review retry should stay on worker path")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("review retry should not iterate")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("review retry should not spawn before cooldown is due")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    assert result.pending == 1
+    assert store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    ) == []
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} retry delayed" in log_text
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and pending_retry.id in line
+        for line in log_text.splitlines()
+    )
+
+
+def test_watch_cycle_failed_recovery_transient_terminal_defers_same_cycle_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 2\n")
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 23, 10, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.session_id = "sess-recovery-transient"
+    failed.completed_at = FrozenDateTime.current
+    store.update(failed)
+
+    failed_retry = store.add(
+        "Failed retry attempt",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "WORKER_DIED"
+    failed_retry.completed_at = FrozenDateTime.current
+    store.update(failed_retry)
+
+    config = Config.load(tmp_path)
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=config.max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=failed,
+        failed_task=failed,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=failed_retry.id,
+            action_task_status=failed_retry.status,
+            action_task_started_at=failed_retry.started_at,
+            action_task_running_pid=failed_retry.running_pid,
+            failed_task_id=failed_retry.id,
+            recovery_task_id=failed_retry.id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            launch_evidence_fingerprint="launch:retry",
+            streak=1,
+            parked_reason=None,
+            observed_at=FrozenDateTime.current,
+        )
+    )
+
+    row = LineageOwnerRow(
+        owner_task=failed,
+        members=(failed, failed_retry),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=failed,
+        recovery_leaf_task=failed,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[]),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("recovery launch should defer behind initial transient cooldown"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("worker retry should not spawn during transient cooldown"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("resume worker should not spawn during transient cooldown"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    assert result.work_done is False
+    assert backoff is not None
+    assert backoff.last_failure_task_id == failed_retry.id
+    assert backoff.streak == 1
+    assert backoff.next_retry_at == FrozenDateTime.current + timedelta(seconds=60)
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} retry delayed 60s" in log_text
+    assert "RECOVR" not in log_text
+
+
+def test_watch_cycle_failed_recovery_transient_terminal_without_deferred_observation_still_persists_backoff_and_skips_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 2\n")
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 23, 11, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.session_id = "sess-recovery-transient-no-observation"
+    failed.completed_at = FrozenDateTime.current
+    store.update(failed)
+
+    failed_retry = store.add(
+        "Failed retry attempt",
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "WORKER_DIED"
+    failed_retry.completed_at = FrozenDateTime.current
+    store.update(failed_retry)
+
+    config = Config.load(tmp_path)
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=config.max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=failed,
+        failed_task=failed,
+    )
+
+    row = LineageOwnerRow(
+        owner_task=failed,
+        members=(failed, failed_retry),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=failed,
+        recovery_leaf_task=failed,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[]),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("recovery launch should defer behind initial transient cooldown"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("worker retry should not spawn during transient cooldown"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("resume worker should not spawn during transient cooldown"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    assert result.work_done is False
+    assert store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    ) == []
+    assert backoff is not None
+    assert backoff.last_failure_task_id == failed_retry.id
+    assert backoff.streak == 1
+    assert backoff.next_retry_at == FrozenDateTime.current + timedelta(seconds=60)
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} retry delayed 60s" in log_text
+    assert "RECOVR" not in log_text
+
+
+def test_watch_cycle_active_recovery_backoff_does_not_consume_pending_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 23, 20, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed.session_id = "sess-recovery-backoff-slot"
+    failed.completed_at = FrozenDateTime.current
+    store.update(failed)
+
+    pending_plan = store.add("Unrelated pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=config.max_resume_attempts)
+    recovery_action = failed_recovery_decision_to_action(failed, decision)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action=recovery_action,
+        action_task=failed,
+        failed_task=failed,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:implement:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current + timedelta(seconds=60),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+
+    row = LineageOwnerRow(
+        owner_task=failed,
+        members=(failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=failed,
+        recovery_leaf_task=failed,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_task_ids: list[str] = []
+
+    def record_pending_start(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_plan]),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("recovery launch should stay deferred during active cooldown"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("resume worker should stay deferred during active cooldown"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=record_pending_start),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert started_task_ids == [pending_plan.id]
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{failed.id} {candidate.action_type} delayed" in log_text
+    assert "RECOVR" not in log_text
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and pending_plan.id in line
+        for line in log_text.splitlines()
+    )
+
+
+def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 23, 25, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    improve_action = {
+        "type": "improve",
+        "description": "Create improve task (review CHANGES_REQUESTED)",
+        "review_task": review,
+    }
+    observed_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=failed_improve,
+        failed_task=failed_improve,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=observed_candidate.subject_kind,
+            subject_id=observed_candidate.subject_id,
+            action_type=observed_candidate.action_type,
+            action_reason=observed_candidate.action_reason,
+            subject_task_id=observed_candidate.subject_task_id,
+            action_task_id=failed_improve.id,
+            action_task_status=failed_improve.status,
+            action_task_started_at=failed_improve.started_at,
+            action_task_running_pid=failed_improve.running_pid,
+            failed_task_id=failed_improve.id,
+            recovery_task_id=failed_improve.id,
+            merge_unit_id=observed_candidate.merge_unit_id,
+            merge_unit_state=observed_candidate.merge_unit_state,
+            merge_unit_head_sha=observed_candidate.merge_unit_head_sha,
+            evidence_fingerprint=observed_candidate.evidence_fingerprint,
+            streak=1,
+            parked_reason=None,
+            observed_at=FrozenDateTime.current,
+        )
+    )
+    pending_retry = store.add(
+        "Pending improve retry",
+        task_type="improve",
+        based_on=failed_improve.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    pending_plan = store.add("Unrelated pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=pending_retry,
+        failed_task=failed_improve,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed_improve.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:improve:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current + timedelta(seconds=60),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+    started_task_ids: list[str] = []
+
+    def record_pending_start(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry, pending_plan]),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("improve recovery launch should stay deferred during active cooldown"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("improve resume worker should stay deferred during active cooldown"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=record_pending_start),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert started_task_ids == [pending_plan.id]
+    log_text = log_path.read_text()
+    assert "BACKOFF" in log_text
+    assert f"{impl.id} {candidate.action_type} delayed" in log_text
+    assert "RECOVR" not in log_text
+    assert any(
+        line.split(maxsplit=2)[1] == "START" and pending_plan.id in line
+        for line in log_text.splitlines()
+    )
+
+
+def test_watch_cycle_due_improve_transient_backoff_launches_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 25, 0, 5, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    pending_retry = store.add(
+        "Pending improve retry",
+        task_type="improve",
+        based_on=failed_improve.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    improve_action = {
+        "type": "improve",
+        "description": "Create improve task (review CHANGES_REQUESTED)",
+        "review_task": review,
+    }
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=pending_retry,
+        failed_task=failed_improve,
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed_improve.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:improve:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=FrozenDateTime.current - timedelta(seconds=1),
+            updated_at=FrozenDateTime.current,
+        )
+    )
+    no_progress_attention = _maybe_park_watch_no_progress(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=pending_retry,
+        failed_task=failed_improve,
+        no_progress_cycles=2,
+    )
+    preserved_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    preserved_observation = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    launched_task_ids: list[str] = []
+
+    def record_launch(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        launched_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("improve retry should iterate")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("due improve retry should not iterate")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=record_launch),
+    ):
+        result = _run_cycle(
+            config=Config.load(tmp_path),
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=Config.load(tmp_path).max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    assert launched_task_ids == [pending_retry.id]
+    log_text = log_path.read_text()
+    assert "BACKOFF" not in log_text
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and impl.id in line and "delayed" in line
+        for line in log_text.splitlines()
+    )
+
+
+def test_watch_cycle_due_improve_transient_backoff_preserves_prior_streak_and_does_not_extend_same_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 25, 0, 15, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    pending_retry = store.add(
+        "Pending improve retry",
+        task_type="improve",
+        based_on=failed_improve.id,
+        depends_on=review.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+
+    improve_action = {
+        "type": "improve",
+        "description": "Create improve task (review CHANGES_REQUESTED)",
+        "review_task": review,
+    }
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=pending_retry,
+        failed_task=failed_improve,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=failed_improve.id,
+            action_task_status=failed_improve.status,
+            action_task_started_at=failed_improve.started_at,
+            action_task_running_pid=failed_improve.running_pid,
+            failed_task_id=failed_improve.id,
+            recovery_task_id=failed_improve.id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            launch_evidence_fingerprint="launch:improve",
+            streak=1,
+            parked_reason=None,
+            observed_at=FrozenDateTime.current,
+        )
+    )
+    due_retry_at = FrozenDateTime.current - timedelta(seconds=1)
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=failed_improve.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="transient:improve:PROVIDER_UNAVAILABLE",
+            streak=1,
+            next_retry_at=due_retry_at,
+            updated_at=FrozenDateTime.current,
+        )
+    )
+    no_progress_attention = _maybe_park_watch_no_progress(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=impl,
+        action=improve_action,
+        action_task=pending_retry,
+        failed_task=failed_improve,
+        no_progress_cycles=2,
+    )
+    preserved_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    preserved_observation = store.get_watch_progress_observation(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    launched_task_ids: list[str] = []
+
+    def record_launch(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        launched_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry]),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("improve retry should iterate")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("due improve retry should not iterate")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=record_launch),
+    ):
+        result = _run_cycle(
+            config=Config.load(tmp_path),
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=Config.load(tmp_path).max_resume_attempts,
+        )
+
+    refreshed_backoff = store.get_watch_recovery_backoff(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+        action_type=candidate.action_type,
+        action_reason=candidate.action_reason,
+    )
+    assert no_progress_attention is None
+    assert preserved_backoff is not None
+    assert preserved_backoff.last_failure_task_id == failed_improve.id
+    assert preserved_backoff.streak == 1
+    assert preserved_backoff.next_retry_at == due_retry_at
+    assert preserved_observation is not None
+    assert preserved_observation.streak == 1
+    assert preserved_observation.parked_reason is None
+    assert preserved_observation.launch_evidence_fingerprint is None
+    assert result.work_done is True
+    assert launched_task_ids == [pending_retry.id]
+    if refreshed_backoff is not None:
+        assert refreshed_backoff.last_failure_task_id == failed_improve.id
+        assert refreshed_backoff.streak == 1
+        assert refreshed_backoff.next_retry_at == due_retry_at
+    log_text = log_path.read_text()
+    assert "BACKOFF" not in log_text
+    assert "watch-no-progress-backstop" not in log_text
+
+
+def test_watch_no_progress_treats_provider_unavailable_with_turn_and_token_evidence_and_no_capacity_proof_as_real_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 25, 0, 10, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    impl = store.add("Implement feature", task_type="implement")
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert impl.id is not None
+    assert review.id is not None
+    impl.status = "completed"
+    impl.completed_at = FrozenDateTime.current
+    store.update(impl)
+    review.status = "completed"
+    review.completed_at = FrozenDateTime.current
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease retry later."
+    store.update(review)
+
+    action = {"type": "improve", "description": "Create improve task", "review_task": review}
+    real_build_candidate = build_watch_progress_candidate
+
+    def stable_candidate(*args: object, **kwargs: object) -> WatchProgressCandidate:
+        candidate = real_build_candidate(*args, **kwargs)
+        subject = kwargs.get("subject_task")
+        if getattr(subject, "id", None) == impl.id and candidate.action_type == "improve":
+            return replace(candidate, evidence_fingerprint=f"stable:{impl.id}:improve")
+        return candidate
+
+    monkeypatch.setattr("gza.cli.watch.build_watch_progress_candidate", stable_candidate)
+
+    failed_improve = store.add("Improve attempt", task_type="improve", based_on=impl.id, depends_on=review.id)
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_improve.recovery_origin = "retry"
+    failed_improve.num_turns_reported = 1
+    failed_improve.output_tokens = 32
+    failed_improve.completed_at = FrozenDateTime.current
+    store.update(failed_improve)
+
+    first_result = _finalize_watch_no_progress_after_execution(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=review,
+        action_task_after=failed_improve,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_result = _finalize_watch_no_progress_after_execution(
+        config=Config.load(tmp_path),
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=review,
+        action_task_after=failed_improve,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    backoff = store.get_watch_recovery_backoff(
+        subject_kind="lineage",
+        subject_id=str(impl.id),
+        action_type="improve",
+        action_reason="Create improve task",
+    )
+
+    assert first_result is None
+    assert second_result is not None
+    assert second_result["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].streak == 2
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert backoff is None
 
 
 def test_watch_cycle_repeated_recovery_evaluation_does_not_park_running_descendant(tmp_path: Path) -> None:

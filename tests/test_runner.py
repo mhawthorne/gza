@@ -25,6 +25,7 @@ from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
 from gza.rebase_diff import RebaseDiffBaseline
 from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.cli import _create_improve_task, _create_rebase_task
 from gza.review_verdict import ReviewFinding, parse_review_report
@@ -9357,6 +9358,67 @@ class TestExtractedRunInnerHelpers:
         decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
         assert decision.action == "retry"
         assert decision.reason_code == "PROVIDER_UNAVAILABLE"
+
+    def test_complete_code_task_capacity_failure_with_turn_and_token_stats_requires_explicit_capacity_proof_for_transient_classification(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement capacity failure", task_type="implement")
+        task.slug = "20260624-capacity-failure-with-stats"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text(
+            '{"type":"thread.started"}\n'
+            '{"type":"turn.started"}\n'
+            '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Try again shortly."}}\n'
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            worktree_git,
+            log_file,
+            "test/branch",
+            TaskStats(
+                duration_seconds=1.0,
+                num_turns_reported=1,
+                output_tokens=32,
+                cost_usd=0.01,
+            ),
+            1,
+            pre_run_status=set(),
+            worktree_summary_path=tmp_path / "worktree-summary.md",
+            summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+            summary_dir=tmp_path / ".gza" / "summaries",
+            error_type="provider_unavailable",
+        )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "PROVIDER_UNAVAILABLE"
+        assert refreshed.num_turns_reported == 1
+        assert refreshed.output_tokens == 32
+        transient = classify_transient_recovery_terminal(refreshed, project_dir=tmp_path)
+        assert transient is not None
+        assert transient.failure_reason == "PROVIDER_UNAVAILABLE"
+
+        refreshed.output_content = None
+        transient_without_capacity_proof = classify_transient_recovery_terminal(refreshed)
+        assert transient_without_capacity_proof is None
 
     @pytest.mark.parametrize(
         ("error_type", "stats", "exit_code", "expected_reason", "expected_action"),

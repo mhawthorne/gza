@@ -5503,6 +5503,29 @@ class SqliteTaskStore:
             ).fetchone()
         return self._row_to_watch_recovery_backoff(row)
 
+    def list_watch_recovery_backoffs(
+        self,
+        *,
+        subject_kind: str,
+        subject_id: str,
+    ) -> list[WatchRecoveryBackoff]:
+        """List persisted watch transient-recovery cooldown rows for one subject."""
+        if not self.supports_watch_recovery_backoffs():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM watch_recovery_backoffs
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                ORDER BY updated_at DESC, action_type ASC, action_reason ASC
+                """,
+                (self._project_id, subject_kind, subject_id),
+            ).fetchall()
+        return [backoff for row in rows if (backoff := self._row_to_watch_recovery_backoff(row)) is not None]
+
     def delete_watch_recovery_backoff_subject(self, *, subject_kind: str, subject_id: str) -> None:
         """Clear persisted watch transient-recovery cooldowns for one subject."""
         if not self.supports_watch_recovery_backoffs():
