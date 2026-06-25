@@ -1270,7 +1270,7 @@ def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_release_valve_by_
     assert row.next_action is not None
     assert row.next_action["type"] == "awaiting_human"
     assert "empty prerequisite" in row.next_action["description"]
-    assert "gza-4072" in row.next_action["description"]
+    assert "requires recovery or manual resolution" in row.next_action["description"]
 
 
 def test_blocked_by_empty_prereq_label_uses_completed_retry_descendant_from_read_context(

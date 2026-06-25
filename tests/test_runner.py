@@ -9471,6 +9471,76 @@ class TestExtractedRunInnerHelpers:
         assert unit is not None
         assert unit.state == "empty"
 
+    def test_complete_code_task_verified_empty_noop_unblocks_downstream_dependency(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement no-op dependency", task_type="implement")
+        task.slug = "20260625-verified-empty-noop-dependency"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        passed_fingerprint = "c" * 64
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "timestamp": "2026-06-25T00:00:00+00:00",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests --quick",
+                        "aggregated_output": (
+                            "gza-verify phase=passed name=pytest duration_seconds=1.25 "
+                            f"tree_fingerprint={passed_fingerprint}\n"
+                        ),
+                        "exit_code": 0,
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "test/noop-dependency": "feedface",
+            "main": "cafebabe",
+        }.get(ref)
+
+        with (
+            patch("gza.runner.resolve_task_merge_state_for_target", return_value="empty"),
+            patch("gza.runner._compute_tree_fingerprint", return_value=passed_fingerprint),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/noop-dependency",
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        downstream = store.add(prompt="Blocked on verified noop dependency", task_type="implement", depends_on=task.id)
+
+        readiness = store.get_dependency_readiness(downstream)
+        assert readiness.ready is True
+        assert readiness.reason == "ready"
+        assert [candidate.id for candidate in store.get_pending_pickup()] == [downstream.id]
+        assert store.is_task_blocked(downstream) == (False, None, None)
+
     def test_complete_code_task_classifies_capacity_no_change_run_as_provider_unavailable(
         self,
         tmp_path: Path,

@@ -15,12 +15,12 @@ if TYPE_CHECKING:
     from .dependency_preconditions import DependencyReadiness
 
 EMPTY_PREREQ_RELEASE_VALVE_DETAIL = (
-    "empty prerequisite; manual release tracked by "
-    "gza-4072 / `gza edit --clear-depends-on`"
+    "empty prerequisite; no unique commits vs target, but the prerequisite lineage still "
+    "requires recovery or manual resolution"
 )
 REDUNDANT_PREREQ_RELEASE_VALVE_DETAIL = (
-    "redundant prerequisite; commits already present on target; manual release tracked by "
-    "gza-4072 / `gza edit --clear-depends-on`"
+    "redundant prerequisite; commits already present on target, but the prerequisite lineage "
+    "still requires recovery or manual resolution"
 )
 MOOT_EMPTY_LIFECYCLE_DETAIL = "moot (no unique commits vs target)"
 MOOT_REDUNDANT_LIFECYCLE_DETAIL = "moot (commits already present on target)"

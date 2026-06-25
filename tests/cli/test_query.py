@@ -4850,7 +4850,7 @@ class TestQueueCommand:
         normalized = " ".join(result.stdout.split())
         assert "Held downstream" in normalized
         assert "empty prerequisite" in normalized
-        assert "gza-4072" in normalized
+        assert "requires recovery or manual resolution" in normalized
 
     def test_queue_layout_keeps_first_line_columns_stable_and_second_line_aligned(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -7858,11 +7858,14 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Failure Reason: PREREQUISITE_UNMERGED" in result.stdout
-        assert "Failure Summary: Historical dependency-ordering failure produced no work; task is moot." in result.stdout
+        assert (
+            "Failure Summary: Historical dependency-ordering failure produced no work, but the failed "
+            "prerequisite lineage still requires recovery or manual resolution."
+        ) in result.stdout
         assert "Merge Status: empty" in result.stdout
         assert f"gza merge {dep.id}" not in result.stdout
         assert f"gza retry {task.id}" not in result.stdout
-        assert "gza-4072 (`gza edit --clear-depends-on`)" in result.stdout
+        assert "gza-4072 (`gza edit --clear-depends-on`)" not in result.stdout
 
     def test_show_prerequisite_unmerged_prefers_resolved_dependency_from_log(self, tmp_path: Path):
         """PREREQUISITE_UNMERGED next steps should use resolved dependency_task_id from outcome log."""
@@ -15805,7 +15808,7 @@ class TestIncompleteCommand:
         assert result == 0
         assert downstream.id in captured.out
         assert "prerequisite" in captured.out
-        assert "gza edit --clear-depends-on" in captured.out
+        assert "requires recovery or manual resolution" in captured.out
 
     def test_incomplete_surfaces_strict_scope_unverified_needs_attention(
         self,

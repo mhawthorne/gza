@@ -3317,8 +3317,8 @@ def _failure_summary(
             )
         if empty_lookup.is_empty:
             return (
-                "Historical dependency-ordering failure produced no work; task is moot. "
-                "Manual downstream release is tracked by gza-4072 (`gza edit --clear-depends-on`)."
+                "Historical dependency-ordering failure produced no work, but the failed "
+                "prerequisite lineage still requires recovery or manual resolution."
             )
     summaries = {
         "AGENT_FORFEIT": "Agent forfeited: could not complete the task.",
