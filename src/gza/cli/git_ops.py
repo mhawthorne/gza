@@ -405,6 +405,7 @@ def _reconcile_diverged_branch_with_origin(
     git: Git,
     task: DbTask,
     *,
+    target_branch: str,
     remote: str = "origin",
 ) -> BranchDivergenceReconcileResult:
     """Reconcile a diverged local/origin branch without consuming a worker slot."""
@@ -413,9 +414,23 @@ def _reconcile_diverged_branch_with_origin(
             status="error",
             message=f"Cannot reconcile divergence for task {task.id}: branch is missing",
         )
+    if not target_branch:
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message="Cannot reconcile divergence: target branch is missing",
+        )
+    if not git.branch_exists(target_branch):
+        return BranchDivergenceReconcileResult(
+            status="error",
+            message=(
+                f"Cannot reconcile divergence for '{task.branch}': missing local target branch "
+                f"'{target_branch}'"
+            ),
+        )
 
     branch = task.branch
     remote_ref = f"{remote}/{branch}"
+    rebase_target = target_branch
     remote_sha_before_push = git.rev_parse_if_exists(remote_ref)
     if not remote_sha_before_push:
         return BranchDivergenceReconcileResult(
@@ -504,7 +519,10 @@ def _reconcile_diverged_branch_with_origin(
         except GitError as fetch_error:
             return BranchDivergenceReconcileResult(
                 status="error",
-                message=f"Failed to fetch {remote} before rebasing '{branch}' onto '{remote_ref}': {fetch_error}",
+                message=(
+                    f"Failed to fetch {remote} before reconciling '{branch}' for rebase onto "
+                    f"'{rebase_target}': {fetch_error}"
+                ),
             )
         remote_sha_after_fetch = git.rev_parse_if_exists(remote_ref)
         if not remote_sha_after_fetch:
@@ -533,10 +551,10 @@ def _reconcile_diverged_branch_with_origin(
         baseline = capture_rebase_diff_baseline(
             worktree_git,
             branch=branch,
-            target=remote_ref,
+            target=rebase_target,
         )
         try:
-            worktree_git.rebase(remote_ref)
+            worktree_git.rebase(rebase_target)
         except GitError as rebase_error:
             try:
                 worktree_git.rebase_abort()
@@ -545,9 +563,8 @@ def _reconcile_diverged_branch_with_origin(
             return BranchDivergenceReconcileResult(
                 status="needs_attention",
                 message=(
-                    f"SKIP: mechanical rebase onto '{remote_ref}' hit conflicts: {rebase_error}. "
-                    "Resolve the origin divergence manually; the sandboxed rebase worker cannot access "
-                    "that remote-tracking ref."
+                    f"SKIP: mechanical rebase onto local target '{rebase_target}' hit conflicts: "
+                    f"{rebase_error}. Resolve the local-target rebase manually before continuing."
                 ),
                 attention_reason="reconcile-needs-manual-resolution",
             )
@@ -565,7 +582,7 @@ def _reconcile_diverged_branch_with_origin(
         )
         return BranchDivergenceReconcileResult(
             status="reconciled",
-            message=f"Rebased '{branch}' onto '{remote_ref}' {publish_detail}",
+            message=f"Rebased '{branch}' onto local target '{rebase_target}' {publish_detail}",
         )
     except (GitError, ValueError) as exc:
         return BranchDivergenceReconcileResult(
@@ -3435,7 +3452,12 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     prepared_resume=mode == "resume",
                     prepared_phase="preloop",
                 ),
-                reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
+                reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(
+                    config,
+                    git,
+                    t,
+                    target_branch=target_branch,
+                ),
             )
 
         for row in owner_rows:

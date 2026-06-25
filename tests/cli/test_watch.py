@@ -9714,7 +9714,7 @@ def test_watch_cycle_reconcile_conflict_respects_zero_slots(tmp_path: Path) -> N
             return_value=SimpleNamespace(
                 status="needs_rebase",
                 message="Mechanical rebase conflicted",
-                rebase_target="origin/feature/watch-reconcile-zero-slots",
+                rebase_target="main",
             ),
         ),
         patch("gza.cli.watch._create_rebase_task", side_effect=AssertionError("rebase task should not be created")),
@@ -9768,7 +9768,7 @@ def test_watch_cycle_reconcile_conflict_spawns_rebase_and_logs_start(tmp_path: P
             return_value=SimpleNamespace(
                 status="needs_rebase",
                 message="Mechanical rebase conflicted",
-                rebase_target="origin/feature/watch-reconcile-conflict",
+                rebase_target="main",
             ),
         ),
         patch("gza.cli.watch.launch_permit"),
@@ -9787,6 +9787,7 @@ def test_watch_cycle_reconcile_conflict_spawns_rebase_and_logs_start(tmp_path: P
 
     assert result.work_done is True
     assert create_rebase.call_count == 1
+    assert create_rebase.call_args.args[3] == "main"
     assert spawn_worker.call_count == 1
     assert f"START     {rebase_task.id} rebase" in log_path.read_text()
 

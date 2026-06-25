@@ -3029,7 +3029,12 @@ def run_with_recovery(
             from .git_ops import _reconcile_diverged_branch_with_origin, complete_branch_unpushable_after_reconcile
 
             git = Git(config.project_dir)
-            reconcile_outcome = _reconcile_diverged_branch_with_origin(config, git, refreshed)
+            reconcile_outcome = _reconcile_diverged_branch_with_origin(
+                config,
+                git,
+                refreshed,
+                target_branch=git.default_branch(),
+            )
             if reconcile_outcome.status != "reconciled":
                 if on_terminal_skip is not None:
                     on_terminal_skip(refreshed, decision, _failure_exit_code(rc))

@@ -2953,7 +2953,12 @@ def _run_cycle(
             target_branch=target_branch,
             max_recovery_attempts=max_recovery_attempts,
         ),
-        reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(config, git, t),
+        reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(
+            config,
+            git,
+            t,
+            target_branch=target_branch,
+        ),
     )
     current_branch = git.current_branch()
     merge_git: Git | None = None

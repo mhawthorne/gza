@@ -2620,7 +2620,7 @@ def test_reconcile_branch_divergence_conflict_creates_targeted_rebase_task(tmp_p
         reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
             status="needs_rebase",
             message="Mechanical rebase conflicted",
-            rebase_target="origin/feature/reconcile-conflict",
+            rebase_target="main",
         ),
     )
 
@@ -2631,11 +2631,53 @@ def test_reconcile_branch_divergence_conflict_creates_targeted_rebase_task(tmp_p
     )
 
     assert result.status == "success"
-    assert captured["target"] == "origin/feature/reconcile-conflict"
+    assert captured["target"] == "main"
     assert result.success_message.startswith("Created rebase task ")
 
 
-def test_reconcile_branch_divergence_conflict_against_origin_returns_needs_attention(tmp_path: Path) -> None:
+def test_reconcile_branch_divergence_needs_rebase_without_target_fails_closed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/reconcile-missing-target")
+    store.update(impl)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        create_targeted_rebase_task=lambda _task, _target: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="needs_rebase",
+            message="Mechanical rebase conflicted",
+            rebase_target=None,
+        ),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "reconcile_branch_divergence"},
+        context=context,
+    )
+
+    assert result.status == "error"
+    assert "needs_rebase without a rebase_target" in result.message
+
+
+def test_reconcile_branch_divergence_local_target_conflict_returns_needs_attention(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -2663,9 +2705,8 @@ def test_reconcile_branch_divergence_conflict_against_origin_returns_needs_atten
         reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
             status="needs_attention",
             message=(
-                "SKIP: mechanical rebase onto 'origin/feature/reconcile-origin-conflict' hit conflicts: "
-                "conflict. Resolve the origin divergence manually; the sandboxed rebase worker cannot access "
-                "that remote-tracking ref."
+                "SKIP: mechanical rebase onto local target 'main' hit conflicts: "
+                "conflict. Resolve the local-target rebase manually before continuing."
             ),
             attention_reason="reconcile-needs-manual-resolution",
         ),

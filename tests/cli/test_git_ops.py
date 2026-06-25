@@ -3605,7 +3605,7 @@ def test_reconcile_diverged_branch_with_origin_force_pushes_gza_rewrite(tmp_path
     git.count_commits_ahead.side_effect = [1, 1]
     git.is_merged.return_value = True
 
-    result = _reconcile_diverged_branch_with_origin(config, git, task)
+    result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "reconciled"
     assert "force-with-lease" in result.message
@@ -3646,7 +3646,7 @@ def test_reconcile_diverged_branch_with_origin_force_pushes_stale_origin_rewrite
     git.count_commits_ahead.side_effect = [2, 2]
     git.is_merged.side_effect = [True, True]
 
-    result = _reconcile_diverged_branch_with_origin(config, git, task)
+    result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "reconciled"
     assert "force-with-lease" in result.message
@@ -3699,7 +3699,7 @@ def test_reconcile_diverged_branch_with_origin_force_pushes_dead_wip_savepoint_d
         SimpleNamespace(returncode=0, stdout="WIP: gza task interrupted\n"),
     ]
 
-    result = _reconcile_diverged_branch_with_origin(config, git, task)
+    result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "reconciled"
     assert "force-with-lease" in result.message
@@ -3731,6 +3731,7 @@ def test_reconcile_diverged_branch_with_origin_rebases_already_fetched_external_
     task = SimpleNamespace(id="gza-2a", branch="feature/already-fetched-external")
 
     git = MagicMock(spec=Git)
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "origin/feature/already-fetched-external": "remote-visible",
         "feature/already-fetched-external": "local-tip",
@@ -3765,16 +3766,22 @@ def test_reconcile_diverged_branch_with_origin_rebases_already_fetched_external_
         patch(
             "gza.cli.git_ops.capture_rebase_diff_baseline",
             return_value=RebaseDiffBaseline("old", "target", "base"),
-        ),
+        ) as capture_baseline,
         patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
     ):
-        result = _reconcile_diverged_branch_with_origin(config, git, task)
+        result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "reconciled"
     git.push_ref_force_with_lease.assert_not_called()
     git.fetch.assert_called_once_with("origin")
-    worktree_git.rebase.assert_called_once_with("origin/feature/already-fetched-external")
+    worktree_git.rebase.assert_called_once_with("main")
+    capture_baseline.assert_called_once_with(
+        worktree_git,
+        branch="feature/already-fetched-external",
+        target="main",
+    )
     publish_rebased_branch.assert_called_once()
+    assert "origin/feature/already-fetched-external" not in result.message
     assert git.is_merged.call_args_list == [
         call(
             "feature/already-fetched-external",
@@ -3809,6 +3816,7 @@ def test_reconcile_diverged_branch_with_origin_reports_already_aligned_after_reb
     task = SimpleNamespace(id="gza-2b", branch="feature/already-aligned")
 
     git = MagicMock(spec=Git)
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "origin/feature/already-aligned": "remote-visible",
         "feature/already-aligned": "local-tip",
@@ -3839,11 +3847,12 @@ def test_reconcile_diverged_branch_with_origin_reports_already_aligned_after_reb
             return_value=SimpleNamespace(pushed=False),
         ),
     ):
-        result = _reconcile_diverged_branch_with_origin(config, git, task)
+        result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "reconciled"
     assert "verified origin was already aligned" in result.message
     assert "and pushed" not in result.message
+    assert "local target 'main'" in result.message
 
 
 def test_reconcile_diverged_branch_with_origin_rebases_after_remote_moves(tmp_path: Path) -> None:
@@ -3852,6 +3861,7 @@ def test_reconcile_diverged_branch_with_origin_rebases_after_remote_moves(tmp_pa
     task = SimpleNamespace(id="gza-2", branch="feature/external")
 
     git = MagicMock(spec=Git)
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = ["remote-old", "local-tip", "remote-new"]
     git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef("feature/external")
     git.count_commits_ahead.side_effect = [1, 0]
@@ -3866,15 +3876,20 @@ def test_reconcile_diverged_branch_with_origin_rebases_after_remote_moves(tmp_pa
         patch(
             "gza.cli.git_ops.capture_rebase_diff_baseline",
             return_value=RebaseDiffBaseline("old", "target", "base"),
-        ),
+        ) as capture_baseline,
         patch("gza.cli.git_ops.publish_rebased_branch") as publish_rebased_branch,
     ):
-        result = _reconcile_diverged_branch_with_origin(config, git, task)
+        result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "reconciled"
-    assert "Rebased 'feature/external' onto 'origin/feature/external'" in result.message
+    assert "Rebased 'feature/external' onto local target 'main'" in result.message
     git.fetch.assert_called_once_with("origin")
-    worktree_git.rebase.assert_called_once_with("origin/feature/external")
+    worktree_git.rebase.assert_called_once_with("main")
+    capture_baseline.assert_called_once_with(
+        worktree_git,
+        branch="feature/external",
+        target="main",
+    )
     publish_rebased_branch.assert_called_once()
 
 
@@ -3884,6 +3899,7 @@ def test_reconcile_diverged_branch_with_origin_routes_conflicts_to_rebase(tmp_pa
     task = SimpleNamespace(id="gza-3", branch="feature/conflict")
 
     git = MagicMock(spec=Git)
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = ["remote-old", "local-tip", "remote-new"]
     git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef("feature/conflict")
     git.count_commits_ahead.side_effect = [1, 0]
@@ -3900,11 +3916,13 @@ def test_reconcile_diverged_branch_with_origin_routes_conflicts_to_rebase(tmp_pa
             return_value=RebaseDiffBaseline("old", "target", "base"),
         ),
     ):
-        result = _reconcile_diverged_branch_with_origin(config, git, task)
+        result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
 
     assert result.status == "needs_attention"
     assert result.attention_reason == "reconcile-needs-manual-resolution"
-    assert "sandboxed rebase worker cannot access that remote-tracking ref" in result.message
+    assert "local target 'main'" in result.message
+    assert "origin/feature/conflict" not in result.message
+    assert "remote-tracking ref" not in result.message
     worktree_git.rebase_abort.assert_called_once()
 
 
@@ -3989,7 +4007,7 @@ def test_advance_batch_limit_skips_reconcile_conflict_fallback_without_spawning_
             return_value=SimpleNamespace(
                 status="needs_rebase",
                 message="Mechanical rebase conflicted",
-                rebase_target="origin/feature/reconcile-fallback",
+                rebase_target="main",
             ),
         ),
     ):

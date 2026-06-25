@@ -1583,7 +1583,13 @@ def execute_advance_action(
                 attention_reason=reconcile_outcome.attention_reason or "reconcile-needs-manual-resolution",
             )
 
-        rebase_target = reconcile_outcome.rebase_target or f"origin/{task.branch}"
+        rebase_target = reconcile_outcome.rebase_target
+        if not rebase_target:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                message="branch reconciliation returned needs_rebase without a rebase_target",
+            )
         capacity_blocked = _worker_capacity_blocked_result(
             action_type=action_type,
             context=context,

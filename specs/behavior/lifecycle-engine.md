@@ -133,11 +133,15 @@ Conflict is decided against the canonical local target (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1).
 - Branch cannot merge AND no rebase child AND the branch does not already contain the
   target tip → create a `rebase` task (`needs_rebase`).
-- Local branch and `origin/<branch>` have diverged → reconcile the source ref directly
-  (publish the strictly-ahead or patch-equivalent local side; otherwise fetch and
-  mechanically rebase onto the remote side, then publish). A genuine host-side conflict
-  here MUST be parked as `needs_discussion`, **not** delegated to a sandboxed rebase task
-  — task sandboxes cannot reach remote-tracking refs.
+- Local branch and `origin/<branch>` have diverged → reconcile publication host-side.
+  The engine MAY inspect, fetch, and publish the unit's own `origin/<branch>` ref to
+  decide whether the local side is strictly ahead, patch-equivalent, or otherwise safe to
+  republish. But merge/rebase correctness MUST still be proven against the canonical
+  local target branch, never any `origin/*` ref: if direct publication is not enough, the
+  mechanical fallback MUST rebase onto that local target branch and then publish. A
+  genuine host-side conflict in that local-target rebase MUST be parked as
+  `needs_discussion`, **not** delegated to a sandboxed rebase task — task sandboxes
+  cannot reach remote-tracking refs, and worker rebase targets MUST stay local.
 - Branch cannot merge AND the latest rebase child `failed`, with no later proof the work
   landed → `needs_discussion` (rebase-failed). The proof set is intentionally narrow: the
   merge unit is recorded `merged`, the branch tip equals the target tip, or the branch
@@ -448,9 +452,10 @@ push succeeded**:
 **Recovery and continuation.** A `BRANCH_UNPUSHABLE` unit
 routes into §4: benign/mechanical divergence (including superseded gza WIP savepoints) is
 reconciled automatically (publish the strictly-ahead or patch-equivalent local side;
-otherwise fetch and mechanically rebase, then publish); only a genuine host-side conflict
-parks for a human (the existing §4 reconcile / merge-source manual codes). Once reconcile
-or rebase makes the branch pushable, if `create_pr` is set and no PR yet exists, the engine
+otherwise fetch, mechanically rebase onto the canonical local target branch, then
+publish); only a genuine host-side conflict in that local-target rebase parks for a human
+(the existing §4 reconcile / merge-source manual codes). Once reconcile or rebase makes
+the branch pushable, if `create_pr` is set and no PR yet exists, the engine
 MUST publish and create the PR, then proceed to the §8 merge gate — closing
 push → PR → merge end-to-end with no human step on the mechanical path.
 
