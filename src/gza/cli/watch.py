@@ -7486,8 +7486,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
                     total=len(recovery_entries),
                 )
             )
-            if recovery_entries:
-                for entry in recovery_entries:
+            if visible_runnable_recovery:
+                for entry in visible_runnable_recovery:
                     console.print(_format_queue_recovery_lane_detail(entry))
             else:
                 console.print("No recovery candidates")

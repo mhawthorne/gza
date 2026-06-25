@@ -1541,7 +1541,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     with cache_scope:
         result = service.run(query, config=config, git=git, target_branch=target_branch)
         normalize_kwargs: dict[str, Any] = {}
-        if not blocked_by_dropped_only and normalized_tag_filters is not None:
+        if not blocked_by_dropped_only:
             recovery_preview = build_dispatch_preview(
                 store,
                 config=config,
@@ -1883,6 +1883,10 @@ def _apply_incomplete_recovery_identity(
         or recovery_leaf.id == row.owner_task.id
     ):
         return row
+    if isinstance(row.next_action_data, Mapping):
+        explicit_subject_task_id = get_action_subject_task_id(row.next_action_data)
+        if explicit_subject_task_id is not None and explicit_subject_task_id != recovery_leaf.id:
+            return row
     preview_entry = recovery_preview_entries_by_task_id.get(recovery_leaf.id)
     if preview_entry is None or preview_entry.decision is None:
         return row

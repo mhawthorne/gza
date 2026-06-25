@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -120,6 +121,24 @@ def _mock_unmerged_git() -> Git:
 
         def worktree_list(self) -> list[dict[str, object]]:
             return []
+
+        def worktree_health_probe(self):
+            from gza.git_health import GitWorktreeHealthProbe
+
+            return GitWorktreeHealthProbe(
+                command="git worktree list --porcelain",
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+        def _run(self, *args: str, check: bool = True, stdin: bytes | None = None):
+            del check, stdin
+            if args == ("worktree", "list", "--porcelain"):
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+            if args == ("rev-parse", "--git-common-dir"):
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout=".git\n", stderr="")
+            raise AssertionError(f"_mock_unmerged_git received unexpected git command: {args!r}")
 
         def is_ancestor(self, ancestor: str, descendant: str) -> bool:
             del ancestor, descendant
@@ -15633,6 +15652,38 @@ class TestIncompleteCommand:
         return first_line.split()[1]
 
     @staticmethod
+    def _ids_present_in_output(output: str, *tasks: Task) -> set[str]:
+        return {
+            task.id
+            for task in tasks
+            if task.id is not None and task.id in output
+        }
+
+    @staticmethod
+    def _advance_recovery_subset_ids(output: str, *tasks: Task) -> set[str]:
+        if "Recovery subset (shared preview):" not in output:
+            return set()
+        recovery_section = output.split("Recovery subset (shared preview):", 1)[1]
+        recovery_section = recovery_section.split("Would advance", 1)[0]
+        return TestIncompleteCommand._ids_present_in_output(recovery_section, *tasks)
+
+    @staticmethod
+    def _watch_recovery_report_ids(output: str, *tasks: Task) -> set[str]:
+        candidate_ids = [task.id for task in tasks if task.id is not None]
+        matched: set[str] = set()
+        for line in output.splitlines():
+            stripped = line.strip()
+            line_ids = [task_id for task_id in candidate_ids if task_id in stripped]
+            if not line_ids:
+                continue
+            if stripped.startswith(("resume ", "retry ", "reconcile ", "skip ")):
+                matched.add(line_ids[-1])
+                continue
+            if any(stripped.startswith(f"{task_id} ") for task_id in candidate_ids):
+                matched.add(line_ids[0])
+        return matched
+
+    @staticmethod
     def _setup_merged_owner_with_live_descendant_fixture(tmp_path: Path) -> tuple[Task, Task]:
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -16676,6 +16727,246 @@ class TestIncompleteCommand:
         assert result == 0
         assert captured.out.splitlines()[0].startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)")
         assert plan.id not in self._one_line_row_id(captured.out)
+
+    def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_unscoped_mixed_owner_row(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        plan, failed_review = self._setup_mixed_owner_recovery_fixture(tmp_path)
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.git_ops.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+            ),
+        ):
+            queue_result = invoke_gza("queue", "--recovery", "--all", "--project", str(tmp_path))
+            watch_result = invoke_gza(
+                "watch",
+                "--dry-run",
+                "--recovery-only",
+                "--show-skipped",
+                "--yes",
+                "--quiet",
+                "--project",
+                str(tmp_path),
+            )
+            advance_result = invoke_gza("advance", "--dry-run", "--project", str(tmp_path))
+            incomplete_result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id,next_action_owner_id",
+                "--last",
+                "0",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert queue_result.returncode == 0
+        assert watch_result.returncode == 0
+        assert advance_result.returncode == 0
+        assert incomplete_result.returncode == 0
+
+        candidate_tasks = (plan, failed_review)
+        expected_ids = {failed_review.id}
+        assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
+        assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
+        assert self._advance_recovery_subset_ids(advance_result.stdout, *candidate_tasks) == expected_ids
+        assert json.loads(incomplete_result.stdout) == [
+            {
+                "id": failed_review.id,
+                "next_action_owner_id": failed_review.id,
+            }
+        ]
+
+    def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_any_tag_scope(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(release_only)
+        assert release_only.id is not None
+
+        release_ops = store.add("Release and ops", task_type="plan", tags=("release", "ops"))
+        release_ops.status = "failed"
+        release_ops.failure_reason = "TEST_FAILURE"
+        release_ops.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_ops)
+        assert release_ops.id is not None
+
+        ops_only = store.add("Ops only", task_type="plan", tags=("ops",))
+        ops_only.status = "failed"
+        ops_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        ops_only.completed_at = datetime(2026, 6, 24, 9, 10, tzinfo=UTC)
+        store.update(ops_only)
+        assert ops_only.id is not None
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.git_ops.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+            ),
+        ):
+            queue_result = invoke_gza(
+                "queue", "--recovery", "--all", "--tag", "release", "--tag", "ops", "--project", str(tmp_path)
+            )
+            watch_result = invoke_gza(
+                "watch",
+                "--dry-run",
+                "--recovery-only",
+                "--show-skipped",
+                "--yes",
+                "--quiet",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--project",
+                str(tmp_path),
+            )
+            advance_result = invoke_gza(
+                "advance",
+                "--dry-run",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--project",
+                str(tmp_path),
+            )
+            incomplete_result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id",
+                "--last",
+                "0",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert queue_result.returncode == 0
+        assert watch_result.returncode == 0
+        assert advance_result.returncode == 0
+        assert incomplete_result.returncode == 0
+
+        candidate_tasks = (release_only, release_ops, ops_only)
+        expected_ids = {release_only.id, release_ops.id, ops_only.id}
+        assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
+        assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
+        assert self._ids_present_in_output(advance_result.stdout, *candidate_tasks) == expected_ids
+        assert {row["id"] for row in json.loads(incomplete_result.stdout)} == expected_ids
+
+    def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_all_tag_scope(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        both = store.add("Both tags", task_type="plan", tags=("release", "ops"))
+        both.status = "failed"
+        both.failure_reason = "INFRASTRUCTURE_ERROR"
+        both.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(both)
+        assert both.id is not None
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_only)
+        assert release_only.id is not None
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.git_ops.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+            ),
+        ):
+            queue_result = invoke_gza(
+                "queue", "--recovery", "--all", "--tag", "release", "--tag", "ops", "--all-tags", "--project", str(tmp_path)
+            )
+            watch_result = invoke_gza(
+                "watch",
+                "--dry-run",
+                "--recovery-only",
+                "--show-skipped",
+                "--yes",
+                "--quiet",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--all-tags",
+                "--project",
+                str(tmp_path),
+            )
+            advance_result = invoke_gza(
+                "advance",
+                "--dry-run",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--all-tags",
+                "--project",
+                str(tmp_path),
+            )
+            incomplete_result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id",
+                "--last",
+                "0",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--all-tags",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert queue_result.returncode == 0
+        assert watch_result.returncode == 0
+        assert advance_result.returncode == 0
+        assert incomplete_result.returncode == 0
+
+        candidate_tasks = (both, release_only)
+        expected_ids = {both.id}
+        assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
+        assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
+        assert self._ids_present_in_output(advance_result.stdout, *candidate_tasks) == expected_ids
+        assert json.loads(incomplete_result.stdout) == [{"id": both.id}]
 
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,
