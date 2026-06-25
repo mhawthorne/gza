@@ -30,6 +30,7 @@ from gza.cli.git_ops import (
     _ResolvedMergeSubject,
     ensure_watch_main_checkout,
 )
+import gza.cli.watch as watch_module
 from gza.cli.watch import (
     WatchSlotAllocation,
     _collect_advance_completed_tasks,
@@ -15899,6 +15900,127 @@ def test_cmd_watch_first_start_preserves_confirmation_prompt(tmp_path: Path) -> 
 
     assert rc == 0
     assert run_cycle.call_count == 1
+    input_mock.assert_called_once_with("\nProceed? [y/N] ")
+
+
+def test_cmd_watch_confirmed_first_start_computes_snapshot_once(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending implement", task_type="implement")
+    assert pending.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch.get_concurrency_snapshot", wraps=watch_module.get_concurrency_snapshot) as snapshot_mock,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("builtins.input", return_value="y") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    log_text = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert rc == 128 + signal.SIGTERM
+    assert snapshot_mock.call_count == 1
+    assert log_text.count(" WAKE ") == 1
+    input_mock.assert_called_once_with("\nProceed? [y/N] ")
+
+
+def test_cmd_watch_yes_runs_exactly_one_cycle(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        resumed_reexec=False,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert run_cycle.call_count == 1
+    input_mock.assert_not_called()
+
+
+def test_cmd_watch_declining_first_start_aborts_without_mutations(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending implement", task_type="implement")
+    assert pending.id is not None
+    before = _task_snapshot(store)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+    )
+
+    with (
+        patch("gza.cli.watch.get_concurrency_snapshot", wraps=watch_module.get_concurrency_snapshot) as snapshot_mock,
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    after = _task_snapshot(store)
+    log_text = (tmp_path / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert rc == 0
+    assert snapshot_mock.call_count == 1
+    assert log_text.count(" WAKE ") == 1
+    assert before == after
+    spawn_iterate.assert_not_called()
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
 

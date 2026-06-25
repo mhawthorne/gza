@@ -2045,6 +2045,18 @@ class _CycleResult:
 
 
 @dataclass(frozen=True)
+class _WatchCyclePlan:
+    running_task_ids: tuple[str, ...]
+    anonymous_worker_count: int
+    pending_count: int
+    blocked_pending_count: int
+    running: int
+    effective_batch: int
+    slots: int
+    analysis: "_WatchCycleAnalysis"
+
+
+@dataclass(frozen=True)
 class WatchSlotAllocation:
     recovery_slots: int
     pending_slots: int
@@ -2569,6 +2581,54 @@ def _analyze_watch_cycle(
         )
 
 
+def _build_watch_cycle_plan(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    recovery_slots: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int,
+) -> _WatchCyclePlan:
+    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
+    running_task_ids = tuple(snapshot.running_task_ids)
+    pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
+    blocked_pending_count = sum(
+        1
+        for pending_task in store.get_pending(limit=None)
+        if pending_task.task_type != "internal"
+        and task_matches_tag_filters(task_tags=pending_task.tags, tag_filters=tags, any_tag=any_tag)
+        and store.is_task_blocked(pending_task)[0]
+    )
+    running = snapshot.running
+    effective_batch = min(batch, snapshot.limit)
+    slots = max(0, effective_batch - running)
+    git = Git(config.project_dir)
+    analysis = _analyze_watch_cycle(
+        config=config,
+        store=store,
+        git=git,
+        slots=slots,
+        tags=tags,
+        any_tag=any_tag,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    return _WatchCyclePlan(
+        running_task_ids=running_task_ids,
+        anonymous_worker_count=snapshot.anonymous_worker_count,
+        pending_count=pending_count,
+        blocked_pending_count=blocked_pending_count,
+        running=running,
+        effective_batch=effective_batch,
+        slots=slots,
+        analysis=analysis,
+    )
+
+
 def _run_cycle(
     *,
     config: Config,
@@ -2588,6 +2648,11 @@ def _run_cycle(
     show_skipped: bool = False,
     auto_restart_on_drift: bool = True,
     installed_package_drift: _InstalledPackageDriftState | None = None,
+    precomputed_plan: _WatchCyclePlan | None = None,
+    begin_cycle: bool = True,
+    end_cycle: bool = True,
+    emit_cycle_header: bool = True,
+    emit_lifecycle_summary: bool = True,
 ) -> _CycleResult:
     from ._common import (
         prune_terminal_dead_workers,
@@ -2606,7 +2671,8 @@ def _run_cycle(
         recovery_slots=recovery_slots,
     )
 
-    log.begin_cycle()
+    if begin_cycle:
+        log.begin_cycle()
     _warn_if_installed_gza_changed(
         log,
         installed_package_drift,
@@ -2618,39 +2684,42 @@ def _run_cycle(
         reconcile_dead_pending_recovery_tasks(config)
         reconcile_stale_watch_no_progress_parks(store)
 
-    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
-    running_task_ids = list(snapshot.running_task_ids)
-    anonymous_worker_count = snapshot.anonymous_worker_count
-    running_task_id_set = set(running_task_ids)
-    pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
-    blocked_pending_count = sum(
-        1
-        for pending_task in store.get_pending(limit=None)
-        if pending_task.task_type != "internal"
-        and task_matches_tag_filters(task_tags=pending_task.tags, tag_filters=tags, any_tag=any_tag)
-        and store.is_task_blocked(pending_task)[0]
+    plan = precomputed_plan or _build_watch_cycle_plan(
+        config=config,
+        store=store,
+        batch=batch,
+        tags=tags,
+        any_tag=any_tag,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
     )
-    running = snapshot.running
-    effective_batch = min(batch, snapshot.limit)
-    slots = max(0, effective_batch - running)
+    running_task_ids = list(plan.running_task_ids)
+    anonymous_worker_count = plan.anonymous_worker_count
+    running_task_id_set = set(running_task_ids)
+    pending_count = plan.pending_count
+    blocked_pending_count = plan.blocked_pending_count
+    running = plan.running
+    slots = plan.slots
     work_done = False
     started_task_ids: set[str] = set()
     step1_handled_child_task_ids: set[str] = set()
 
-    log.emit(
-        "WAKE",
-        _format_wake_message(
-            running=running,
-            runnable_pending=pending_count,
-            blocked_pending=blocked_pending_count,
-            slots=slots,
-            running_task_ids=running_task_ids,
-            anonymous_worker_count=anonymous_worker_count,
-        ),
-    )
-    scope_message = _format_scope_message(tags, any_tag=any_tag)
-    if scope_message is not None:
-        log.emit("INFO", scope_message)
+    if emit_cycle_header:
+        log.emit(
+            "WAKE",
+            _format_wake_message(
+                running=running,
+                runnable_pending=pending_count,
+                blocked_pending=blocked_pending_count,
+                slots=slots,
+                running_task_ids=running_task_ids,
+                anonymous_worker_count=anonymous_worker_count,
+            ),
+        )
+        scope_message = _format_scope_message(tags, any_tag=any_tag)
+        if scope_message is not None:
+            log.emit("INFO", scope_message)
 
     def _reserve_watch_launch(worker_label: str, subject_task_id: str) -> LaunchPermit | None:
         try:
@@ -2689,17 +2758,7 @@ def _run_cycle(
     # Merges run first; worker-spawning actions consume available slots.
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
     git = Git(config.project_dir)
-    analysis = _analyze_watch_cycle(
-        config=config,
-        store=store,
-        git=git,
-        slots=slots,
-        tags=tags,
-        any_tag=any_tag,
-        recovery_slots=recovery_slots,
-        recovery_mode=recovery_mode,
-        max_recovery_attempts=max_recovery_attempts,
-    )
+    analysis = plan.analysis
     target_branch = analysis.target_branch
     for gap in analysis.scope_gaps:
         log.emit_attention(
@@ -2973,7 +3032,7 @@ def _run_cycle(
         lifecycle_summary = format_cycle_lifecycle_action_summary(
             (row.owner_task, action) for row, _task, action in action_plan
         )
-        if lifecycle_summary is not None:
+        if emit_lifecycle_summary and lifecycle_summary is not None:
             log.emit("INFO", lifecycle_summary)
         has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan)
         can_merge = merge_actions_available
@@ -4182,12 +4241,63 @@ def _run_cycle(
 
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     _emit_cycle_attention_summary(log)
-    log.end_cycle()
+    if end_cycle:
+        log.end_cycle()
     return _CycleResult(
         work_done=work_done,
         running=_count_live_workers(config, store),
         pending=pending_count,
     )
+
+
+def _preview_initial_watch_cycle(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    max_iterations: int,
+    log: _WatchLog,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    recovery_slots: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int,
+    show_skipped: bool,
+    auto_restart_on_drift: bool,
+    installed_package_drift: _InstalledPackageDriftState | None,
+) -> tuple[_CycleResult, _WatchCyclePlan]:
+    plan = _build_watch_cycle_plan(
+        config=config,
+        store=store,
+        batch=batch,
+        tags=tags,
+        any_tag=any_tag,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
+    )
+    log.begin_cycle()
+    result = _run_cycle(
+        config=config,
+        store=store,
+        batch=batch,
+        max_iterations=max_iterations,
+        dry_run=True,
+        quiet=False,
+        log=log,
+        tags=tags,
+        any_tag=any_tag,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
+        show_skipped=show_skipped,
+        auto_restart_on_drift=auto_restart_on_drift,
+        installed_package_drift=installed_package_drift,
+        precomputed_plan=plan,
+        begin_cycle=False,
+        end_cycle=False,
+    )
+    return result, plan
 
 
 def _has_explicit_max_concurrent(config: Config) -> bool:
@@ -4330,19 +4440,19 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         resumed_reexec = bool(getattr(args, "resumed_reexec", False))
         skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
+        pending_first_cycle_plan: _WatchCyclePlan | None = None
+        preview_cycle_open = False
         if resumed_reexec:
             log.emit(
                 "INFO",
                 "auto-resumed after code update (skipping first-pass confirmation)",
             )
         if not skip_confirm:
-            preview_result = _run_cycle(
+            preview_result, preview_plan = _preview_initial_watch_cycle(
                 config=config,
                 store=store,
                 batch=batch,
                 max_iterations=max_iterations,
-                dry_run=True,
-                quiet=False,
                 log=log,
                 tags=tag_filters,
                 any_tag=any_tag,
@@ -4361,14 +4471,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 except KeyboardInterrupt:
                     raise
                 if answer not in ("y", "yes"):
+                    log.end_cycle()
                     print("Aborted.")
                     return 0
+                pending_first_cycle_plan = preview_plan
+                preview_cycle_open = True
+            else:
+                log.end_cycle()
 
         while True:
             if stop_requested:
+                if preview_cycle_open:
+                    log.end_cycle()
                 break
 
             if not _system_can_run_tasks(config):
+                if preview_cycle_open:
+                    log.end_cycle()
+                    preview_cycle_open = False
+                    pending_first_cycle_plan = None
                 pending_count = len(_pending_runnable_tasks(store, tags=tag_filters, any_tag=any_tag))
                 log.emit(
                     "HOLD",
@@ -4415,7 +4536,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 show_skipped=show_skipped,
                 auto_restart_on_drift=auto_restart_on_drift,
                 installed_package_drift=installed_package_drift,
+                precomputed_plan=pending_first_cycle_plan,
+                begin_cycle=not preview_cycle_open,
+                end_cycle=True,
+                emit_cycle_header=not preview_cycle_open,
+                emit_lifecycle_summary=not preview_cycle_open,
             )
+            pending_first_cycle_plan = None
+            preview_cycle_open = False
 
             current_snapshot = _task_snapshot(store)
             _emit_transition_events(
