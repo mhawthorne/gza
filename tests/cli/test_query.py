@@ -16543,6 +16543,60 @@ class TestIncompleteCommand:
         assert json.loads(captured.out) == [{"id": both.id}]
         assert [entry.task.id for entry in preview.recovery_entries] == [both.id]
 
+    def test_incomplete_tag_scope_respects_configured_max_resume_attempts_in_recovery_preview(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_resume_attempts: 0\n")
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        failed = store.add("Release recovery disabled", task_type="plan", tags=("release",))
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(failed)
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release",),
+                any_tag=True,
+                max_recovery_attempts=0,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(
+            tmp_path,
+            fields="id,next_action,next_action_reason",
+            json=True,
+        )
+        args.tags = ["release"]
+        args.all_tags = False
+        result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": failed.id,
+                "next_action": "skip",
+                "next_action_reason": "SKIP: automatic recovery is disabled",
+            }
+        ]
+        assert [(entry.task.id, entry.reason_code, entry.runnable) for entry in preview.recovery_entries] == [
+            (failed.id, "automatic_recovery_disabled", False)
+        ]
+
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,
         tmp_path: Path,

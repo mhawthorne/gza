@@ -1506,6 +1506,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             task_types=(task_type_filter,) if task_type_filter else None,
             tags=tag_filters,
             any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
             date_filter=date_filter,
             mode=mode,
         )
