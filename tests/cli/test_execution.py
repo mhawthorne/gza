@@ -1537,6 +1537,42 @@ class TestRetryCommand:
         assert "Created task " in result.stdout
         assert f"retry of {task.id}" in result.stdout
 
+    def test_retry_multiple_task_ids_continues_after_validation_failure(self, tmp_path: Path):
+        """Retry processes every requested task ID even when one task is invalid."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed task")
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        pending = store.add("Pending task")
+        assert pending.status == "pending"
+
+        completed = store.add("Completed task")
+        completed.status = "completed"
+        completed.completed_at = datetime.now(UTC)
+        store.update(completed)
+
+        result = invoke_gza(
+            "retry",
+            str(failed.id),
+            str(pending.id),
+            str(completed.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert f"retry of {failed.id}" in result.stdout
+        assert f"task {pending.id} is pending" in result.stdout
+        assert f"retry of {completed.id}" in result.stdout
+        assert len(store.get_based_on_children(failed.id)) == 1
+        assert store.get_based_on_children(pending.id) == []
+        assert len(store.get_based_on_children(completed.id)) == 1
+
     def test_retry_pending_task_fails(self, tmp_path: Path):
         """Retry command fails for pending tasks."""
         setup_db_with_tasks(tmp_path, [
@@ -2471,6 +2507,44 @@ class TestResumeCommand:
         assert new_task.id != task.id
         assert new_task.status == "pending"
         assert new_task.session_id == "test-session-123"
+
+    def test_resume_multiple_task_ids_continues_after_validation_failure(self, tmp_path: Path):
+        """Resume processes every requested task ID even when one task is invalid."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_one = store.add("First failed task")
+        failed_one.status = "failed"
+        failed_one.session_id = "resume-session-one"
+        failed_one.completed_at = datetime.now(UTC)
+        store.update(failed_one)
+
+        pending = store.add("Pending task")
+        assert pending.status == "pending"
+
+        failed_two = store.add("Second failed task")
+        failed_two.status = "failed"
+        failed_two.session_id = "resume-session-two"
+        failed_two.completed_at = datetime.now(UTC)
+        store.update(failed_two)
+
+        result = invoke_gza(
+            "resume",
+            str(failed_one.id),
+            str(pending.id),
+            str(failed_two.id),
+            "--queue",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert f"resume of {failed_one.id}" in result.stdout
+        assert f"task {pending.id} is pending" in result.stdout
+        assert f"resume of {failed_two.id}" in result.stdout
+        assert len(store.get_based_on_children(failed_one.id)) == 1
+        assert store.get_based_on_children(pending.id) == []
+        assert len(store.get_based_on_children(failed_two.id)) == 1
 
     def test_resume_with_queue_stays_pickable_by_work(self, tmp_path: Path):
         """Queued resume children should stay visible to pickup and executable via work."""

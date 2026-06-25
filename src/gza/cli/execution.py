@@ -2718,30 +2718,31 @@ def cmd_edit(args: argparse.Namespace) -> int:
     return 1
 
 
-def cmd_retry(args: argparse.Namespace) -> int:
-    """Retry a failed or completed task by creating a new pending task."""
-    config = Config.load(args.project_dir)
-    if hasattr(args, 'no_docker') and args.no_docker:
-        config.use_docker = False
+def _single_or_multiple_task_ids(args: argparse.Namespace) -> list[str]:
+    task_ids = getattr(args, "task_ids", None)
+    if task_ids:
+        return list(task_ids)
+    task_id = getattr(args, "task_id", None)
+    if task_id:
+        return [task_id]
+    return []
 
-    # Override max_turns if specified
-    if hasattr(args, 'max_turns') and args.max_turns is not None:
-        config.max_steps = args.max_turns
-        config.max_turns = args.max_turns
 
-    store = get_store(config)
-
-    # Get the original task
-    task_id = resolve_id(config, args.task_id)
+def _retry_one_task(
+    *,
+    args: argparse.Namespace,
+    config: Config,
+    store: SqliteTaskStore,
+    task_id_arg: str,
+) -> int:
+    task_id = resolve_id(config, task_id_arg)
     task = store.get(task_id)
     if not task:
         return phase1_error(args, f"Task {task_id} not found")
 
-    # Validate status
     if task.status not in ("completed", "failed"):
-        return phase1_error(args, f"Can only retry completed or failed tasks (task is {task.status})")
+        return phase1_error(args, f"Can only retry completed or failed tasks (task {task_id} is {task.status})")
 
-    # Check if task already has a successful retry
     children = store.get_based_on_children(task_id)
     successful_retry = next((c for c in children if c.status == "completed"), None)
     if successful_retry:
@@ -2768,13 +2769,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
         return 1
     new_task = prepared_retry_task
 
-    # Handle queue mode - add to queue without executing
     if hasattr(args, 'queue') and args.queue:
         return 0
 
-    # Handle background mode - spawn worker to run the new task
     if args.background:
-        # Create a temporary args object for the worker with the new task_id
         assert new_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [new_task.id]
@@ -2787,7 +2785,6 @@ def cmd_retry(args: argparse.Namespace) -> int:
         release_task_launch_permit(str(new_task.id))
         return rc
 
-    # Default: run the new task immediately
     print(f"\nRunning task {new_task.id}...")
     rc = _run_foreground(
         config,
@@ -2797,6 +2794,26 @@ def cmd_retry(args: argparse.Namespace) -> int:
     )
     release_task_launch_permit(str(new_task.id))
     return rc
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    """Retry a failed or completed task by creating a new pending task."""
+    config = Config.load(args.project_dir)
+    if hasattr(args, 'no_docker') and args.no_docker:
+        config.use_docker = False
+
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    store = get_store(config)
+    exit_code = 0
+    for task_id_arg in _single_or_multiple_task_ids(args):
+        rc = _retry_one_task(args=args, config=config, store=store, task_id_arg=task_id_arg)
+        if rc != 0:
+            exit_code = rc
+    return exit_code
 
 
 def _default_mark_completed_mode(task_type: str) -> str:
@@ -5939,26 +5956,20 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     )
 
 
-def cmd_resume(args: argparse.Namespace) -> int:
-    """Resume a failed or orphaned task from where it left off."""
-    config = Config.load(args.project_dir)
-    if args.no_docker:
-        config.use_docker = False
-
-    # Override max_turns if specified
-    if hasattr(args, 'max_turns') and args.max_turns is not None:
-        config.max_steps = args.max_turns
-        config.max_turns = args.max_turns
-
-    store = get_store(config)
-
-    task_id = resolve_id(config, args.task_id)
+def _resume_one_task(
+    *,
+    args: argparse.Namespace,
+    config: Config,
+    store: SqliteTaskStore,
+    task_id_arg: str,
+) -> int:
+    task_id = resolve_id(config, task_id_arg)
     task = store.get(task_id)
     if not task:
         return phase1_error(args, f"Task {task_id} not found")
 
     if task.status not in ("failed", "in_progress"):
-        return phase1_error(args, f"Can only resume failed or orphaned tasks (task is {task.status})")
+        return phase1_error(args, f"Can only resume failed or orphaned tasks (task {task_id} is {task.status})")
 
     if task.status == "in_progress":
         # Allow resume only if the task is orphaned (no live worker)
@@ -6031,3 +6042,23 @@ def cmd_resume(args: argparse.Namespace) -> int:
     )
     release_task_launch_permit(str(new_task.id))
     return rc
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Resume a failed or orphaned task from where it left off."""
+    config = Config.load(args.project_dir)
+    if args.no_docker:
+        config.use_docker = False
+
+    # Override max_turns if specified
+    if hasattr(args, 'max_turns') and args.max_turns is not None:
+        config.max_steps = args.max_turns
+        config.max_turns = args.max_turns
+
+    store = get_store(config)
+    exit_code = 0
+    for task_id_arg in _single_or_multiple_task_ids(args):
+        rc = _resume_one_task(args=args, config=config, store=store, task_id_arg=task_id_arg)
+        if rc != 0:
+            exit_code = rc
+    return exit_code

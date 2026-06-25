@@ -47,8 +47,8 @@ Practical examples showing common workflows with Gza.
 | Kill a running task | `gza kill <task_id>` |
 | Create review | `gza review <impl_id>` |
 | Address feedback | `gza improve <impl_id>` |
-| Resume failed task | `gza resume <task_id>` |
-| Create a new retry attempt | `gza retry <task_id>` |
+| Resume failed task(s) | `gza resume <task_id> [<task_id> ...]` |
+| Create new retry attempt(s) | `gza retry <task_id> [<task_id> ...]` |
 | View unmerged work | `uv run gza unmerged` |
 | Rebase a branch | `gza rebase <task_id>` |
 | Create PR | `gza pr <task_id>` |

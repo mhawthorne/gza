@@ -1117,34 +1117,38 @@ gza run-inline <task_id> [options]
 Resume a failed task from where it left off. The AI continues with the existing conversation context.
 
 ```bash
-gza resume <task_id> [options]
+gza resume <task_id> [<task_id> ...] [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID to resume (e.g. `gza-1234`) |
+| `task_id` | One or more full prefixed task IDs to resume (e.g. `gza-1234 gza-1235`) |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--background`, `-b` | Run worker in background |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the resumed task |
 
+When multiple task IDs are provided, each task is validated and processed independently. A validation error for one task is reported without preventing later task IDs from being resumed.
+
 ### retry
 
 Retry a failed or completed task by creating a new attempt with a fresh conversation. Implement retries may fork a fresh branch; same-branch follow-up retries stay attached to the shared branch.
 
 ```bash
-gza retry <task_id> [options]
+gza retry <task_id> [<task_id> ...] [options]
 ```
 
 | Option | Description |
 |--------|-------------|
-| `task_id` | Full prefixed task ID to retry (e.g. `gza-1234`) |
+| `task_id` | One or more full prefixed task IDs to retry (e.g. `gza-1234 gza-1235`) |
 | `--no-docker` | Run Claude directly instead of in Docker (only with --background) |
 | `--background`, `-b` | Run worker in background |
 | `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the retry task |
+
+When multiple task IDs are provided, each task is validated and processed independently. A validation error for one task is reported without preventing later task IDs from being retried.
 
 For immediate-start commands that hand work off to detached workers (`work`, `resume`, `retry`, `implement`, `extract`, `review`, `improve`, `fix`, `iterate`, `rebase`, and `advance --new`), any parent-side validation or startup-preparation failure is reported on the caller's stderr before the worker detaches. Success, queue, and no-op status messages remain on stdout.
 

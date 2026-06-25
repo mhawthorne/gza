@@ -78,6 +78,14 @@ Add to queue without running immediately:
 $ uv run gza resume gza-5 --queue
 ```
 
+Resume several failed tasks in one command:
+
+```bash
+$ uv run gza resume gza-5 gza-8 gza-13 --queue
+```
+
+Each source task is validated and processed independently. If one task cannot be resumed, gza reports that task's error and continues with the remaining IDs.
+
 ## Retry a task
 
 Retry creates a fresh attempt. Use this when the AI went down a wrong path and you want it to start over.
@@ -94,6 +102,14 @@ Stats: Runtime: 8m 12s | Turns: 32 | Cost: $0.67
 ```
 
 Retry creates a new task that reuses the same branch (if it exists) but starts a new conversation.
+
+Retry several failed or completed tasks in one command:
+
+```bash
+$ uv run gza retry gza-5 gza-8 gza-13 --queue
+```
+
+Each source task is validated and processed independently. If one task cannot be retried, gza reports that task's error and continues with the remaining IDs.
 
 ## Recover failed tasks with watch
 

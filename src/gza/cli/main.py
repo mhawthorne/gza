@@ -1961,9 +1961,11 @@ def main() -> int:
     # retry command
     retry_parser = subparsers.add_parser("retry", help="Retry a failed or completed task")
     retry_parser.add_argument(
-        "task_id",
+        "task_ids",
         type=str,
-        help="Full prefixed task ID to retry",
+        nargs="+",
+        metavar="task_id",
+        help="Full prefixed task ID(s) to retry",
     )
     retry_parser.add_argument(
         "--no-docker",
@@ -1996,9 +1998,11 @@ def main() -> int:
     # resume command
     resume_parser = subparsers.add_parser("resume", help="Resume a failed task from where it left off")
     resume_parser.add_argument(
-        "task_id",
+        "task_ids",
         type=str,
-        help="Full prefixed task ID to resume",
+        nargs="+",
+        metavar="task_id",
+        help="Full prefixed task ID(s) to resume",
     )
     resume_parser.add_argument(
         "--no-docker",
