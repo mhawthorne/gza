@@ -1351,6 +1351,9 @@ gza incomplete [options]
 | `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
+| `--tag TAG` | Only show unresolved rows matching tag filters (repeatable); recovery rows use the same shared preview scope as `queue`, `watch`, and `advance` |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
+| `--any-tag` | With repeated `--tag` values, match any requested tag explicitly (default) |
 | `--json` | Output JSON rows from the unified query API |
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
@@ -1804,6 +1807,9 @@ uv run gza advance [task_id] [options]
 | `--new` | Start new pending tasks to fill remaining `--batch` slots (requires `--batch`) |
 | `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |
 | `--squash-threshold N` | Squash-merge branches with N or more commits (0 disables) |
+| `--tag TAG` | Only advance, recover, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the shared scoped recovery subset |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
+| `--any-tag` | With repeated `--tag` values, match any requested tag explicitly (default) |
 
 `uv run gza advance` is the explicit non-looping lifecycle command. It evaluates recovery and existing lineage lifecycle work first. It does not start fresh pending work unless you opt into `--new`, and when `--new` is present the pending lane only fills whatever `--batch` capacity remains after recovery/lifecycle actions.
 

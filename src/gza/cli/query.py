@@ -1458,6 +1458,11 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
     if getattr(args, "list_fields", False):
         return _print_projection_fields("incomplete", blocked_by_dropped=blocked_by_dropped_only)
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")

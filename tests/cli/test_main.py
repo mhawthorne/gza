@@ -454,6 +454,8 @@ class TestHelpOutput:
         assert "--tag TAG" in result.stdout
         assert "--all-tags" in result.stdout
         assert "--blocked-by-dropped" in result.stdout
+        assert "--tag" in result.stdout
+        assert "--any-tag" in result.stdout
         assert "live shared lifecycle planner" in result.stdout
         assert "deprecated and no longer supported" not in result.stdout
         assert "incomplete --blocked-by-dropped --list-fields" in Path("docs/configuration.md").read_text()
@@ -498,6 +500,8 @@ class TestHelpOutput:
 
         assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in help_text
         assert "Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)" in help_text
+        assert "--tag TAG" in help_result.stdout
+        assert "--any-tag" in help_result.stdout
         assert "Skip auto-resume of resumable failed tasks" not in help_text
 
         assert "shared automatic failed-task recovery (resume/retry)" in docs_text

@@ -475,7 +475,7 @@ def main() -> int:
         ),
     )
     add_common_args(incomplete_parser)
-    incomplete_parser.set_defaults(last=5)
+    incomplete_parser.set_defaults(last=5, all_tags=False)
     incomplete_parser.add_argument(
         "--json",
         action="store_true",
@@ -518,19 +518,6 @@ def main() -> int:
         help="Date field used by --days filters (default: effective)",
     )
     incomplete_parser.add_argument(
-        "--tag",
-        action="append",
-        dest="tags",
-        metavar="TAG",
-        help="Only show unresolved lineage owners matching tag filters (repeatable)",
-    )
-    incomplete_parser.add_argument(
-        "--all-tags",
-        action="store_true",
-        dest="all_tags",
-        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
-    )
-    incomplete_parser.add_argument(
         "--fields",
         metavar="CSV",
         help="Projection fields override (comma-separated; works in text or JSON mode)",
@@ -539,6 +526,26 @@ def main() -> int:
         "--list-fields",
         action="store_true",
         help="List valid --fields values for this command and exit",
+    )
+    incomplete_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only show unresolved rows matching tag filters (repeatable); recovery rows use the same shared preview scope as queue/watch/advance",
+    )
+    incomplete_tag_mode = incomplete_parser.add_mutually_exclusive_group()
+    incomplete_tag_mode.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    incomplete_tag_mode.add_argument(
+        "--any-tag",
+        action="store_false",
+        dest="all_tags",
+        help="With repeated --tag values, match any requested tag (default)",
     )
 
     # unstick command
@@ -887,6 +894,7 @@ def main() -> int:
         description="Run recovery plus review/merge lifecycle work; use --new to also start pending tasks.",
     )
     add_common_args(advance_parser)
+    advance_parser.set_defaults(all_tags=False)
     advance_parser.add_argument(
         "task_id",
         type=str,
@@ -987,6 +995,26 @@ def main() -> int:
             "Squash-merge branches with N or more commits. "
             "0 disables auto-squash. Default: from gza.yaml."
         ),
+    )
+    advance_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only advance, recover, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the shared scoped recovery subset",
+    )
+    advance_tag_mode = advance_parser.add_mutually_exclusive_group()
+    advance_tag_mode.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    advance_tag_mode.add_argument(
+        "--any-tag",
+        action="store_false",
+        dest="all_tags",
+        help="With repeated --tag values, match any requested tag (default)",
     )
 
     # watch command

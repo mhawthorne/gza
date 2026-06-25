@@ -31,6 +31,7 @@ from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_pos
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
+from gza.dispatch_preview import build_dispatch_preview
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
@@ -16433,6 +16434,114 @@ class TestIncompleteCommand:
                 "next_action_reason": "Rebase before failed-task recovery",
             }
         ]
+
+    def test_incomplete_tag_scope_matches_shared_recovery_preview_ids(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(release_only)
+        assert release_only.id is not None
+
+        release_ops = store.add("Release and ops", task_type="plan", tags=("release", "ops"))
+        release_ops.status = "failed"
+        release_ops.failure_reason = "TEST_FAILURE"
+        release_ops.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_ops)
+        assert release_ops.id is not None
+
+        ops_only = store.add("Ops only", task_type="plan", tags=("ops",))
+        ops_only.status = "failed"
+        ops_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        ops_only.completed_at = datetime(2026, 6, 24, 9, 10, tzinfo=UTC)
+        store.update(ops_only)
+        assert ops_only.id is not None
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release", "ops"),
+                any_tag=True,
+                max_recovery_attempts=1,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(tmp_path, fields="id", json=True)
+        args.tags = ["release", "ops"]
+        args.all_tags = False
+        result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert {row["id"] for row in json.loads(captured.out)} == {
+            release_only.id,
+            release_ops.id,
+            ops_only.id,
+        }
+        assert {entry.task.id for entry in preview.recovery_entries} == {
+            release_only.id,
+            release_ops.id,
+            ops_only.id,
+        }
+
+    def test_incomplete_all_tags_scope_matches_shared_recovery_preview_ids(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        both = store.add("Both tags", task_type="plan", tags=("release", "ops"))
+        both.status = "failed"
+        both.failure_reason = "INFRASTRUCTURE_ERROR"
+        both.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(both)
+        assert both.id is not None
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_only)
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release", "ops"),
+                any_tag=False,
+                max_recovery_attempts=1,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(tmp_path, fields="id", json=True)
+        args.tags = ["release", "ops"]
+        args.all_tags = True
+        result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": both.id}]
+        assert [entry.task.id for entry in preview.recovery_entries] == [both.id]
 
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,

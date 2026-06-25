@@ -49,6 +49,7 @@ from ..db import (
 )
 from ..dependency_preconditions import task_is_merged
 from ..derived_tags import resolve_derived_task_tags
+from ..dispatch_preview import build_dispatch_preview
 from ..failure_reasons import is_readonly_db_failure, mark_task_failed_from_cause
 from ..git import (
     Git,
@@ -84,10 +85,13 @@ from ..rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checko
 from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
 from ..rebase_publish import publish_rebased_branch
 from ..recovery_engine import (
+    _MergeContext,
+    build_merge_context_from_git,
     list_failed_tasks_for_recovery,
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
+from ..recovery_read_context import RecoveryReadContext
 from ..review_verdict import (
     ReviewFinding,
     get_review_content,
@@ -119,6 +123,7 @@ from ..sync_ops import (
     reconcile_task_branch_merge_truth,
     sync_branch_cohorts,
 )
+from ..task_query import normalize_tag_filters
 from ..worktree_roots import managed_worktree_root_paths
 from ._common import (
     DuplicateReviewError,
@@ -143,6 +148,7 @@ from ._common import (
     format_duplicate_rebase_message,
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
+    parse_cli_tag_filters,
     phase1_error,
     resolve_id,
 )
@@ -3135,6 +3141,11 @@ def _run_advance_owner_row_read_session(
 
 def cmd_advance(args: argparse.Namespace) -> int:
     """Intelligently progress unmerged tasks through their lifecycle."""
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     config = Config.load(args.project_dir)
     store = get_store(config)
 
@@ -3269,6 +3280,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
     preview_actionable_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
     preview_gated_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
     new_pending_tasks: list = []
+    recovery_preview_task_ids: set[str] = set()
+
+    def _advance_scope_mismatch_message(explicit_task_id: str) -> str:
+        scoped_filters: list[str] = []
+        if advance_type is not None:
+            scoped_filters.append(f"--type {advance_type}")
+        if tag_filters:
+            scope_mode = "--any-tag" if any_tag else "--all-tags"
+            scoped_filters.append(" ".join([*(f"--tag {tag}" for tag in tag_filters), scope_mode]))
+        scope_text = ", ".join(scoped_filters) if scoped_filters else "the requested scope"
+        return f"Task {explicit_task_id} does not match the requested advance scope ({scope_text})"
 
     with planning_cache:
         # Determine which tasks to advance
@@ -3310,6 +3332,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         LineageOwnerQuery(
                             limit=None,
                             task_types=(advance_type,) if advance_type else None,
+                            tags=tag_filters,
+                            any_tag=any_tag,
                             include_skipped=True,
                             exclude_dropped_from_planning=True,
                             max_recovery_attempts=max_resume_attempts,
@@ -3330,6 +3354,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             LineageOwnerQuery(
                                 limit=None,
                                 task_types=(advance_type,) if advance_type else None,
+                                tags=tag_filters,
+                                any_tag=any_tag,
                                 include_skipped=True,
                                 max_recovery_attempts=max_resume_attempts,
                                 task_ids=(explicit_task.id,) if explicit_task.id is not None else None,
@@ -3350,6 +3376,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 _load_explicit_owner_rows,
             )
             if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
+                if advance_type is not None or tag_filters is not None:
+                    return phase1_error(args, _advance_scope_mismatch_message(task_id))
                 planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
                 owner_rows = [
                     LineageOwnerRow(
@@ -3387,6 +3415,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         LineageOwnerQuery(
                             limit=None,
                             task_types=(advance_type,) if advance_type else None,
+                            tags=tag_filters,
+                            any_tag=any_tag,
                             include_skipped=True,
                             exclude_dropped_from_planning=True,
                             max_recovery_attempts=max_resume_attempts,
@@ -3416,6 +3446,32 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Apply --max limit
         if max_tasks is not None:
             owner_rows = owner_rows[:max_tasks]
+
+        if owner_rows:
+            recovery_read_context = RecoveryReadContext()
+            if git is not None:
+                try:
+                    recovery_read_context.merge_context = build_merge_context_from_git(git, target_branch)
+                except (AttributeError, TypeError):
+                    recovery_read_context.merge_context = _MergeContext(git=git, default_branch=target_branch)
+            recovery_preview = build_dispatch_preview(
+                store,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+                owner_rows=tuple(owner_rows),
+                read_context=recovery_read_context,
+                tags=tag_filters,
+                any_tag=any_tag,
+                max_recovery_attempts=max_resume_attempts,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+            recovery_preview_task_ids = {
+                entry.task.id
+                for entry in recovery_preview.recovery_entries
+                if entry.task.id is not None
+            }
 
         # Use the currently checked-out branch as the target for conflict checks,
         # merge execution, and rebase task creation.
@@ -3585,6 +3641,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
 
         for row in owner_rows:
+            if (
+                row.lifecycle_action_task is None
+                and row.recovery_action_task is not None
+                and row.recovery_leaf_task is not None
+                and row.recovery_leaf_task.id not in recovery_preview_task_ids
+            ):
+                continue
             action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
             precomputed_action = row.next_action
             action = (
@@ -3782,6 +3845,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     pending_tasks = get_runnable_pending_tasks(
                         store,
                         limit=remaining,
+                        tags=normalize_tag_filters(tag_filters),
+                        any_tag=any_tag,
                         quiet_seconds=config.quiet_period_seconds,
                     )
                     if pending_tasks:
@@ -3823,6 +3888,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 new_pending_tasks = get_runnable_pending_tasks(
                     store,
                     limit=remaining,
+                    tags=normalize_tag_filters(tag_filters),
+                    any_tag=any_tag,
                     quiet_seconds=config.quiet_period_seconds,
                 )
                 if new_pending_tasks:
@@ -4031,6 +4098,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
             new_pending_tasks = get_runnable_pending_tasks(
                 store,
                 limit=remaining,
+                tags=normalize_tag_filters(tag_filters),
+                any_tag=any_tag,
                 quiet_seconds=config.quiet_period_seconds,
             )
         for pt in new_pending_tasks:
