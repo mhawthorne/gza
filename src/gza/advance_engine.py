@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from gza.branch_resolution import resolve_rebase_target_task
-from gza.config import DEFAULT_MAX_NOOP_IMPROVE_CYCLES
+from gza.config import DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK, DEFAULT_MAX_NOOP_IMPROVE_CYCLES
 from gza.console import prompt_available_width, shorten_prompt
 from gza.db import (
     TASK_COMMENT_KIND_FEEDBACK,
@@ -49,6 +49,7 @@ from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_t
 from gza.review_tasks import (
     build_review_blocker_dispute_metadata,
     find_existing_review_blocker_adjudication_task,
+    persist_off_topic_verify_clearance,
     review_blocker_dispute_matches_current,
 )
 from gza.review_verdict import (
@@ -66,6 +67,8 @@ from gza.runner import (
     CROSS_PROJECT_TAG,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
+    ReviewVerifyResult,
+    _extract_review_verify_phase_results,
     _filter_owned_artifact_paths,
     _find_out_of_scope_paths,
     _project_boundary,
@@ -112,6 +115,8 @@ WORKER_CONSUMING_ACTIONS = frozenset(
 MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
 VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
 _LOG = logging.getLogger(__name__)
+REVIEW_CLEARANCE_ARTIFACT_KIND = "review_clearance"
+VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND = "verify_command_output"
 
 
 @dataclass(frozen=True)
@@ -779,11 +784,387 @@ def _resolve_branch_head_sha(git: Any, branch: str | None) -> BranchHeadResoluti
     )
 
 
+def _task_has_current_failed_review_verify_evidence(
+    *,
+    task: DbTask,
+    review_task: DbTask,
+    current_branch: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    if task.review_verify_status != "failed":
+        return False
+    if task.review_verify_captured_at is None:
+        return False
+    if review_task.completed_at is not None and task.review_verify_captured_at <= review_task.completed_at:
+        return False
+    if not current_branch or task.review_verify_branch != current_branch:
+        return False
+    if not current_head_sha or task.review_verify_head_sha != current_head_sha:
+        return False
+    return True
+
+
+def _matching_review_verify_artifact(store: SqliteTaskStore, task: DbTask) -> TaskArtifact | None:
+    if task.id is None:
+        return None
+    artifacts = store.list_artifacts(task.id, kind=VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND)
+    if not artifacts:
+        return None
+    if task.review_verify_artifact_file:
+        for artifact in artifacts:
+            if artifact.path == task.review_verify_artifact_file:
+                return artifact
+    return artifacts[0]
+
+
+def _read_review_verify_output(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> str | None:
+    artifact = _matching_review_verify_artifact(store, task)
+    if artifact is None or not artifact.path:
+        return None
+    artifact_path = (Path(config.project_dir) / artifact.path).resolve()
+    try:
+        return artifact_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _extract_review_verify_tree_fingerprint(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> str | None:
+    artifact = _matching_review_verify_artifact(store, task)
+    if artifact is not None:
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        candidate = metadata.get("tree_fingerprint") if metadata is not None else None
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    for phase in _extract_review_verify_phase_results(
+        _read_review_verify_output(config=config, store=store, task=task)
+    ):
+        candidate = phase.get("tree_fingerprint")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _build_review_verify_result_from_task(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> ReviewVerifyResult | None:
+    if (
+        not task.review_verify_command
+        or not task.review_verify_status
+        or not task.review_verify_exit_status
+        or task.review_verify_captured_at is None
+    ):
+        return None
+    return ReviewVerifyResult(
+        command=task.review_verify_command,
+        status=task.review_verify_status,
+        exit_status=task.review_verify_exit_status,
+        captured_at=task.review_verify_captured_at,
+        reviewed_branch=task.review_verify_branch,
+        reviewed_head_sha=task.review_verify_head_sha,
+        reviewed_base_sha=task.review_verify_base_sha,
+        working_directory=task.review_verify_cwd,
+        failure=task.review_verify_failure,
+        output=_read_review_verify_output(config=config, store=store, task=task),
+    )
+
+
+def _latest_current_passing_review_verify_task(
+    *,
+    improve_tasks: list[DbTask],
+    review_task: DbTask,
+    current_branch: str | None,
+    current_head_sha: str | None,
+    before: datetime | None,
+) -> DbTask | None:
+    for improve in improve_tasks:
+        if not _task_has_current_passing_review_verify_evidence(
+            task=improve,
+            review_task=review_task,
+            current_branch=current_branch,
+            current_head_sha=current_head_sha,
+        ):
+            continue
+        if before is not None and improve.review_verify_captured_at is not None and improve.review_verify_captured_at >= before:
+            continue
+        return improve
+    return None
+
+
+def _resolve_off_topic_changed_paths(
+    *,
+    config: Any,
+    git: Any,
+    branch: str,
+    target_branch: str,
+) -> tuple[str, ...] | None:
+    get_diff_name_status = getattr(git, "get_diff_name_status", None)
+    if not callable(get_diff_name_status):
+        return None
+    try:
+        name_status_output = get_diff_name_status(f"{target_branch}...{branch}", check=True)
+    except Exception:
+        return None
+    parsed_name_status = parse_name_status_project_paths(name_status_output or "")
+    return tuple(
+        sorted(
+            _filter_owned_artifact_paths(
+                parsed_name_status.changed_paths,
+                boundary=_project_boundary(config),
+            )
+        )
+    )
+
+
+def _resolve_target_tree_fingerprint(git: Any, target_branch: str | None) -> str | None:
+    if not target_branch:
+        return None
+    resolve_refs = getattr(git, "resolve_refs", None)
+    if not callable(resolve_refs):
+        return None
+    try:
+        resolved = resolve_refs((target_branch,), peel="tree")
+    except Exception:
+        return None
+    candidate = resolved.get(target_branch)
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _resolve_baseline_worktree_root(config: Any) -> Path:
+    worktree_dir = Path(getattr(config, "worktree_dir", "."))
+    if not worktree_dir.is_absolute():
+        worktree_dir = Path(config.project_dir) / worktree_dir
+    return worktree_dir.resolve() / "off-topic-target-baselines"
+
+
+def _normalized_failing_node_signature(node: Any) -> tuple[str, str]:
+    assertion_signature = getattr(node, "assertion_signature", None)
+    return (
+        str(getattr(node, "nodeid", "")),
+        assertion_signature if isinstance(assertion_signature, str) else "",
+    )
+
+
+def _baseline_run_matches_failure_signatures(
+    *,
+    red_result: ReviewVerifyResult,
+    baseline_results: tuple[ReviewVerifyResult, ...],
+) -> bool:
+    from gza.off_topic_verify import parse_review_verify_failure_set
+
+    red_failure_set = parse_review_verify_failure_set(red_result)
+    if not red_failure_set.available or not red_failure_set.failing_nodes:
+        return False
+    expected_signatures = {
+        _normalized_failing_node_signature(node)
+        for node in red_failure_set.failing_nodes
+    }
+    matched_same_signature = False
+    for baseline_result in baseline_results:
+        baseline_failure_set = parse_review_verify_failure_set(baseline_result)
+        if baseline_result.status == "passed":
+            continue
+        if not baseline_failure_set.available or not baseline_failure_set.failing_nodes:
+            return False
+        observed_signatures = {
+            _normalized_failing_node_signature(node)
+            for node in baseline_failure_set.failing_nodes
+        }
+        if observed_signatures != expected_signatures:
+            return False
+        matched_same_signature = True
+    return matched_same_signature
+
+
+def _classify_off_topic_noop_improve_verify_clearance(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    target_branch: str,
+    task: DbTask,
+    latest_completed_review: DbTask,
+    improve_tasks: list[DbTask],
+    current_head_sha: str,
+    latest_completed_noop_improve: DbTask,
+    persist: bool,
+) -> tuple[bool, datetime | None, str | None]:
+    from gza.off_topic_verify import (
+        classify_failure_diff_scope,
+        parse_review_verify_failure_set,
+        run_local_target_baseline_plan,
+        select_local_target_baseline_plan,
+    )
+
+    if task.branch is None:
+        return False, None, None
+    if not getattr(
+        config,
+        "advance_off_topic_verify_unblock",
+        DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK,
+    ):
+        return False, None, None
+    if not _task_has_current_failed_review_verify_evidence(
+        task=latest_completed_noop_improve,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha,
+    ):
+        return False, None, None
+    red_result = _build_review_verify_result_from_task(
+        config=config,
+        store=store,
+        task=latest_completed_noop_improve,
+    )
+    if red_result is None:
+        return False, None, None
+    red_tree_fingerprint = _extract_review_verify_tree_fingerprint(
+        config=config,
+        store=store,
+        task=latest_completed_noop_improve,
+    )
+    if red_tree_fingerprint is None:
+        return False, None, None
+    green_task = _latest_current_passing_review_verify_task(
+        improve_tasks=improve_tasks,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha,
+        before=latest_completed_noop_improve.review_verify_captured_at,
+    )
+    if green_task is None or green_task.id is None:
+        return False, None, None
+    green_tree_fingerprint = _extract_review_verify_tree_fingerprint(
+        config=config,
+        store=store,
+        task=green_task,
+    )
+    if green_tree_fingerprint is None or green_tree_fingerprint != red_tree_fingerprint:
+        return False, None, None
+    if not persist:
+        return False, None, None
+    target_head_sha = (
+        git.rev_parse_if_exists(target_branch)
+        if target_branch and callable(getattr(git, "rev_parse_if_exists", None))
+        else None
+    )
+    target_tree_fingerprint = _resolve_target_tree_fingerprint(git, target_branch)
+    if not target_branch or not target_head_sha or not target_tree_fingerprint:
+        return False, None, None
+    changed_paths = _resolve_off_topic_changed_paths(
+        config=config,
+        git=git,
+        branch=task.branch,
+        target_branch=target_branch,
+    )
+    if changed_paths is None:
+        return False, None, None
+    failure_set = parse_review_verify_failure_set(red_result)
+    diff_scope = classify_failure_diff_scope(
+        failure_set,
+        changed_paths=changed_paths,
+        repo_root=_project_boundary(config).repo_root,
+    )
+    if diff_scope.outcome != "off_topic":
+        return False, None, None
+    selection = select_local_target_baseline_plan(
+        failure_set,
+        diff_scope,
+        target_branch=target_branch,
+        target_head_sha=target_head_sha,
+        target_tree_fingerprint=target_tree_fingerprint,
+        relative_cwd=_project_boundary(config).scope_root.as_posix() or ".",
+    )
+    if not selection.available or selection.plan is None:
+        return False, None, None
+    try:
+        baseline_run = run_local_target_baseline_plan(
+            selection.plan,
+            repo_git=git,
+            worktree_root=_resolve_baseline_worktree_root(config),
+            timeout_seconds=int(getattr(config, "autonomous_verify_timeout_seconds", 120)),
+            timeout_grace_seconds=float(getattr(config, "review_verify_timeout_grace_seconds", 5.0)),
+        )
+    except Exception as exc:
+        return False, None, f"off-topic local-target baseline failed for {target_branch}: {exc}"
+    if not _baseline_run_matches_failure_signatures(
+        red_result=red_result,
+        baseline_results=baseline_run.results,
+    ):
+        return False, None, None
+    if latest_completed_review.id is None:
+        return False, None, None
+    payload = {
+        "reason": "off_topic_verify_failure",
+        "implementation_task_id": task.id,
+        "review_task_id": latest_completed_review.id,
+        "green_task_id": green_task.id,
+        "red_task_id": latest_completed_noop_improve.id,
+        "head_sha": current_head_sha,
+        "tree_fingerprint": red_tree_fingerprint,
+        "verify_command": red_result.command,
+        "target_branch": target_branch,
+        "target_head_sha": target_head_sha,
+        "target_tree_fingerprint": target_tree_fingerprint,
+        "changed_paths": list(changed_paths),
+        "baseline_mode": selection.plan.mode,
+        "shared_global_paths": list(diff_scope.shared_global_paths),
+        "failing_nodes": [
+            {
+                "nodeid": node.nodeid,
+                "path": node.path,
+                "assertion_signature": node.assertion_signature,
+                "failure_path": node.failure_path,
+                "failure_line": node.failure_line,
+                "traceback_paths": list(node.traceback_paths),
+            }
+            for node in failure_set.failing_nodes
+        ],
+        "baseline_results": [
+            {
+                "status": result.status,
+                "exit_status": result.exit_status,
+                "captured_at": result.captured_at.isoformat(),
+            }
+            for result in baseline_run.results
+        ],
+    }
+    try:
+        persisted = persist_off_topic_verify_clearance(
+            store,
+            config=config,
+            review_task=latest_completed_review,
+            impl_task=task,
+            payload=payload,
+            trigger_source="advance_off_topic_verify_unblock",
+            review_clearance_artifact_kind=REVIEW_CLEARANCE_ARTIFACT_KIND,
+            review_clearance_artifact_label="review_clearance",
+            review_clearance_artifact_producer="advance_off_topic_verify_unblock",
+        )
+    except Exception as exc:
+        return False, None, str(exc)
+    return True, persisted.review_cleared_at, None
+
+
 def _resolve_noop_improve_verify_clearance(
     *,
+    config: Any,
     store: SqliteTaskStore,
     git: Any,
     project_dir: Path,
+    target_branch: str,
     task: DbTask,
     latest_completed_review: DbTask | None,
     improve_tasks: list[DbTask],
@@ -798,6 +1179,8 @@ def _resolve_noop_improve_verify_clearance(
         return False, None, branch_head.warning
 
     current_head_sha = branch_head.head_sha
+    if current_head_sha is None:
+        return False, None, None
     if not _review_is_verify_only_blocked_at_head(
         project_dir=project_dir,
         review_task=latest_completed_review,
@@ -810,28 +1193,42 @@ def _resolve_noop_improve_verify_clearance(
     if latest_completed_noop_improve is None:
         return False, None, None
 
-    if not _task_has_current_passing_review_verify_evidence(
+    if _task_has_current_passing_review_verify_evidence(
         task=latest_completed_noop_improve,
         review_task=latest_completed_review,
         current_branch=task.branch,
         current_head_sha=current_head_sha,
     ):
-        return False, None, None
+        clearance_time = (
+            latest_completed_noop_improve.review_verify_captured_at
+            or latest_completed_noop_improve.completed_at
+            or latest_completed_noop_improve.started_at
+        )
+        if not persist:
+            return True, clearance_time, None
 
-    clearance_time = (
-        latest_completed_noop_improve.review_verify_captured_at
-        or latest_completed_noop_improve.completed_at
-        or latest_completed_noop_improve.started_at
+        store.clear_review_state(task.id)
+        persisted_task = store.get(task.id)
+        if persisted_task is None or persisted_task.review_cleared_at is None:
+            return False, None, None
+        task.review_cleared_at = persisted_task.review_cleared_at
+        return True, persisted_task.review_cleared_at, None
+
+    cleared_off_topic, clearance_time, clearance_warning = _classify_off_topic_noop_improve_verify_clearance(
+        config=config,
+        store=store,
+        git=git,
+        target_branch=target_branch,
+        task=task,
+        latest_completed_review=latest_completed_review,
+        improve_tasks=improve_tasks,
+        current_head_sha=current_head_sha,
+        latest_completed_noop_improve=latest_completed_noop_improve,
+        persist=persist,
     )
-    if not persist:
+    if cleared_off_topic:
         return True, clearance_time, None
-
-    store.clear_review_state(task.id)
-    persisted_task = store.get(task.id)
-    if persisted_task is None or persisted_task.review_cleared_at is None:
-        return False, None, None
-    task.review_cleared_at = persisted_task.review_cleared_at
-    return True, persisted_task.review_cleared_at, None
+    return False, None, clearance_warning
 
 
 def _review_has_current_verify_blocker_clearance(
@@ -1308,7 +1705,7 @@ def _noop_improve_verify_probe_failure_action(ctx: AdvanceContext) -> dict[str, 
                 f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
                 f"(latest {latest_noop_id}), but verify-only auto-clear could not be validated "
                 f"because {ctx.noop_improve_verify_probe_warning}. Review remains uncleared until "
-                "branch-head freshness can be established."
+                "lifecycle can revalidate the same-head clearance evidence."
             ),
             "probe_warning": ctx.noop_improve_verify_probe_warning,
         },
@@ -2321,6 +2718,7 @@ def _resolve_review_state(
     store: SqliteTaskStore,
     task: DbTask,
     git: Any,
+    target_branch: str,
     *,
     persist_review_clearance: bool,
 ) -> tuple[
@@ -2430,9 +2828,11 @@ def _resolve_review_state(
                 effective_review_cleared_at,
                 noop_improve_verify_probe_warning,
             ) = _resolve_noop_improve_verify_clearance(
+                config=config,
                 store=store,
                 git=git,
                 project_dir=Path(config.project_dir),
+                target_branch=target_branch,
                 task=task,
                 latest_completed_review=latest_completed_review,
                 improve_tasks=improve_tasks,
@@ -3172,6 +3572,7 @@ def resolve_advance_context(
         store,
         review_root_task,
         git,
+        target_branch,
         persist_review_clearance=persist_review_clearance,
     )
 

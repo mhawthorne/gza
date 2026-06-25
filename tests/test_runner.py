@@ -12583,6 +12583,7 @@ class TestExtractedRunInnerHelpers:
             "reviewed_base_sha": "cafebabe",
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "abc1234",
+            "tree_fingerprint": None,
             "working_directory": None,
         }
         assert (tmp_path / artifacts[0].path).exists() is False
@@ -17025,6 +17026,7 @@ class TestProviderPromptSanitization:
             "reviewed_base_sha": None,
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
+            "tree_fingerprint": failed_fingerprint,
             "working_directory": refreshed.review_verify_cwd,
         }
         assert (tmp_path / artifact.path).read_text(encoding="utf-8") == (
@@ -17113,6 +17115,7 @@ class TestProviderPromptSanitization:
             "reviewed_base_sha": None,
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
+            "tree_fingerprint": None,
             "working_directory": refreshed.review_verify_cwd,
         }
 

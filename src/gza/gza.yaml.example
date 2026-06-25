@@ -383,6 +383,11 @@ project_name: my-project
 
 # --- Review ---
 
+# Allow lifecycle to clear a verify-only blocker through the audited off-topic verify-failure
+# path; disabled keeps the existing fail-closed park behavior.
+# Default: false
+# advance_off_topic_verify_unblock: false
+
 # Timeout in seconds for lifecycle/automation-initiated verify_command runs.
 # Default: 120
 # autonomous_verify_timeout_seconds: 120

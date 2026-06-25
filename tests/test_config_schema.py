@@ -97,6 +97,18 @@ def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
     assert config.get_plan_slice_target_timeout_minutes() == 25
 
 
+def test_config_load_parses_advance_off_topic_verify_unblock(tmp_path) -> None:
+    """The off-topic verify unblock policy knob should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "advance_off_topic_verify_unblock: true\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.advance_off_topic_verify_unblock is True
+
+
 def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path) -> None:
     """Unset plan slice timeout should derive from the code-task timeout cap."""
     (tmp_path / "gza.yaml").write_text(

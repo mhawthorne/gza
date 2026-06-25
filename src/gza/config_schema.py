@@ -51,6 +51,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("advance_mode", "str", "default", "Mode selector for `gza advance` behavior."),
     ConfigKeySpec(
+        "advance_off_topic_verify_unblock",
+        "bool",
+        False,
+        "Allow lifecycle to clear a verify-only blocker through the audited off-topic verify-failure path; disabled keeps the existing fail-closed park behavior.",
+    ),
+    ConfigKeySpec(
         "require_review_before_merge",
         "bool",
         True,

@@ -912,6 +912,21 @@ class TestLocalConfigOverrides:
         assert effective["code_task_diff_timeout_medium_threshold"] == 500
         assert effective["code_task_diff_timeout_large_threshold"] == 1500
 
+    def test_config_command_includes_off_topic_verify_unblock_and_source(self, tmp_path: Path):
+        """`gza config --json` should expose off-topic verify unblock policy and source."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "advance_off_topic_verify_unblock: true\n"
+        )
+
+        result = invoke_gza("config", "--json", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["advance_off_topic_verify_unblock"] is True
+        assert payload["sources"]["advance_off_topic_verify_unblock"] == "base"
+
     def test_config_command_projects_source_for_branch_strategy_preset(self, tmp_path: Path):
         """gza config should attribute normalized branch_strategy fields to configured source."""
 

@@ -82,6 +82,7 @@ DEFAULT_MAX_REVIEW_CYCLES = 3
 DEFAULT_MAX_PLAN_REVIEW_CYCLES = 2
 DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES = 3
 DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 1
+DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK = False
 DEFAULT_MAX_PLAN_SLICES: int | None = None
 DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES: int | None = None
 DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES = 3
@@ -133,6 +134,7 @@ VALID_CONFIG_FIELDS = {
     "require_plan_review_before_implement", "pr_integration", "advance_mode", "max_resume_attempts",
     "max_review_cycles", "max_plan_review_cycles", "max_failed_plan_review_retries",
     "max_noop_improve_cycles", "max_plan_slices",
+    "advance_off_topic_verify_unblock",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
     "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "quiet_period_seconds",
@@ -219,6 +221,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "max_plan_review_cycles": None,
     "max_failed_plan_review_retries": None,
     "max_noop_improve_cycles": None,
+    "advance_off_topic_verify_unblock": None,
     "max_plan_slices": None,
     "plan_slice_target_timeout_minutes": None,
     "max_failed_closing_review_retries": None,
@@ -348,6 +351,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "max_plan_review_cycles": None,
     "max_failed_plan_review_retries": None,
     "max_noop_improve_cycles": None,
+    "advance_off_topic_verify_unblock": None,
     "max_plan_slices": None,
     "plan_slice_target_timeout_minutes": None,
     "max_failed_closing_review_retries": None,
@@ -1042,6 +1046,7 @@ class Config:
     max_plan_review_cycles: int = DEFAULT_MAX_PLAN_REVIEW_CYCLES
     max_failed_plan_review_retries: int = DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES
     max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
+    advance_off_topic_verify_unblock: bool = DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK
     max_plan_slices: int | None = DEFAULT_MAX_PLAN_SLICES
     plan_slice_target_timeout_minutes: int | None = DEFAULT_PLAN_SLICE_TARGET_TIMEOUT_MINUTES
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
@@ -1987,6 +1992,12 @@ class Config:
         )
         if max_noop_improve_cycles <= 0:
             raise ConfigError("'max_noop_improve_cycles' must be positive")
+        advance_off_topic_verify_unblock = data.get(
+            "advance_off_topic_verify_unblock",
+            DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK,
+        )
+        if not isinstance(advance_off_topic_verify_unblock, bool):
+            raise ConfigError("'advance_off_topic_verify_unblock' must be a boolean (true/false)")
         max_plan_slices = _validate_optional_positive_int_field(
             data.get("max_plan_slices", DEFAULT_MAX_PLAN_SLICES),
             "max_plan_slices",
@@ -2380,6 +2391,7 @@ class Config:
             max_plan_review_cycles=max_plan_review_cycles,
             max_failed_plan_review_retries=max_failed_plan_review_retries,
             max_noop_improve_cycles=max_noop_improve_cycles,
+            advance_off_topic_verify_unblock=advance_off_topic_verify_unblock,
             max_plan_slices=max_plan_slices,
             plan_slice_target_timeout_minutes=plan_slice_target_timeout_minutes,
             max_failed_closing_review_retries=max_failed_closing_review_retries,
@@ -2899,6 +2911,11 @@ class Config:
                 errors.append("'max_noop_improve_cycles' must be an integer")
             elif data["max_noop_improve_cycles"] <= 0:
                 errors.append("'max_noop_improve_cycles' must be positive")
+        if (
+            "advance_off_topic_verify_unblock" in data
+            and not isinstance(data["advance_off_topic_verify_unblock"], bool)
+        ):
+            errors.append("'advance_off_topic_verify_unblock' must be a boolean (true/false)")
         _validate_optional_positive_int_field(
             data.get("max_plan_slices"),
             "max_plan_slices",

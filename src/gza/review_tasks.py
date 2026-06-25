@@ -1,10 +1,17 @@
-"""Shared helpers for creating review, follow-up, and adjudication tasks."""
+"""Shared helpers for creating review, follow-up, adjudication, and investigation tasks."""
 
+import json
 import re
 from collections.abc import Iterable, Mapping
-from typing import Any, Literal
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, Literal, cast
 
-from .db import SqliteTaskStore, Task, TaskArtifact
+from .artifacts import prepare_command_output_artifact, store_command_output_artifact
+from .config import Config
+from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
 from .prompts import PromptBuilder
 from .review_scope import resolve_review_scope_for_impl
@@ -35,6 +42,9 @@ _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE = re.compile(
 _DISPUTE_ARTIFACT_ID_RE = re.compile(r"^Dispute artifact id:\s*(\d+)\s*$", re.MULTILINE)
 _DISPUTE_SOURCE_TASK_ID_RE = re.compile(r"^Dispute source task:\s*(\S+)\s*$", re.MULTILINE)
 
+OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND = "off_topic_verify_investigation"
+OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES = frozenset({"pending", "in_progress"})
+
 
 class DuplicateReviewError(ValueError):
     """Raised when attempting to create a duplicate active review task."""
@@ -44,6 +54,19 @@ class DuplicateReviewError(ValueError):
         super().__init__(
             f"An active review task already exists: {active_review.id} ({active_review.status})"
         )
+
+
+class OffTopicVerifyPersistenceError(RuntimeError):
+    """Raised when audited off-topic investigation or clearance persistence fails closed."""
+
+
+@dataclass(frozen=True)
+class OffTopicVerifyClearancePersistenceResult:
+    """Persisted off-topic verify clearance details."""
+
+    created_tasks: tuple[Task, ...]
+    reused_tasks: tuple[Task, ...]
+    review_cleared_at: datetime
 
 
 def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) -> set[str]:
@@ -180,6 +203,380 @@ def build_review_blocker_adjudication_prompt_prefix(
 ) -> str:
     """Build deterministic prompt prefix for blocker adjudication tasks."""
     return f"Adjudicate blocker {finding_id} from review {review_task_id} for task {impl_task_id}:"
+
+
+def _normalize_off_topic_investigation_signature(failing_node: Mapping[str, Any]) -> dict[str, str]:
+    nodeid = str(failing_node.get("nodeid", "")).strip()
+    assertion_signature = str(failing_node.get("assertion_signature", "") or "").strip()
+    if not nodeid:
+        raise ValueError("failing node evidence must include nodeid")
+    return {"nodeid": nodeid, "assertion_signature": assertion_signature}
+
+
+def _off_topic_investigation_signature_key(signature: Mapping[str, str]) -> str:
+    raw = f"{signature['nodeid']}\n{signature['assertion_signature']}"
+    return sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _format_off_topic_investigation_review_scope(
+    *,
+    signature: Mapping[str, str],
+    payload: Mapping[str, Any],
+) -> str:
+    lines = [
+        "Investigate off-topic verify failure",
+        f"Node: {signature['nodeid']}",
+    ]
+    if signature["assertion_signature"]:
+        lines.append(f"Signature: {signature['assertion_signature']}")
+    lines.extend(
+        [
+            f"Implementation task: {payload.get('implementation_task_id')}",
+            f"Review task: {payload.get('review_task_id')}",
+            f"Reviewed head SHA: {payload.get('head_sha')}",
+            f"Target branch: {payload.get('target_branch')}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_off_topic_verify_investigation_prompt(
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    signature: Mapping[str, str],
+    payload: Mapping[str, Any],
+) -> str:
+    heading = (
+        f"Investigate off-topic verify failure {signature['nodeid']} "
+        f"from review {review_task_id} for task {impl_task_id}: REPRODUCE-OR-RECORD"
+    )
+    lines = [
+        heading,
+        "",
+        "This task exists because lifecycle cleared a verify-only review blocker through the audited off-topic path.",
+        "Contract: REPRODUCE-OR-RECORD.",
+        "1. Reproduce the exact failing node under a bounded stress harness and fix only with proof, or",
+        "2. Close with a structured inconclusive record that preserves attempts, environment, and observed evidence.",
+        "Do not default to blanket sleeps, retries, @flaky, or broad timeout changes.",
+        "",
+        f"Implementation task: {impl_task_id}",
+        f"Review task: {review_task_id}",
+        f"Reviewed head SHA: {payload.get('head_sha')}",
+        f"Reviewed tree fingerprint: {payload.get('tree_fingerprint')}",
+        f"Target branch: {payload.get('target_branch')}",
+        f"Target head SHA: {payload.get('target_head_sha')}",
+        f"Failing node: {signature['nodeid']}",
+    ]
+    if signature["assertion_signature"]:
+        lines.append(f"Failure signature: {signature['assertion_signature']}")
+    lines.extend(
+        [
+            f"Baseline mode: {payload.get('baseline_mode')}",
+            f"Verify command: {payload.get('verify_command')}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def create_or_reuse_off_topic_verify_investigations(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    review_task: Task,
+    impl_task: Task,
+    payload: Mapping[str, Any],
+    trigger_source: str,
+) -> tuple[tuple[Task, ...], tuple[Task, ...]]:
+    """Create or reuse one investigation task per normalized failing-node signature.
+
+    Returns:
+        (created_tasks, reused_tasks)
+    """
+    if review_task.id is None:
+        raise ValueError("Cannot create investigation for review without an ID.")
+    if impl_task.id is None:
+        raise ValueError("Cannot create investigation for implementation without an ID.")
+
+    failing_nodes_raw = payload.get("failing_nodes")
+    if not isinstance(failing_nodes_raw, list) or not failing_nodes_raw:
+        raise ValueError("off-topic investigation payload must include failing_nodes")
+
+    tasks_by_id = {task.id: task for task in store.get_all() if task.id is not None}
+    created: list[Task] = []
+    reused: list[Task] = []
+
+    for failing_node_raw in failing_nodes_raw:
+        if not isinstance(failing_node_raw, Mapping):
+            raise ValueError("failing node evidence must be a mapping")
+        signature = _normalize_off_topic_investigation_signature(failing_node_raw)
+        signature_key = _off_topic_investigation_signature_key(signature)
+
+        matching_task_ids: list[str] = []
+        for task in tasks_by_id.values():
+            assert task.id is not None
+            for artifact in store.list_artifacts(task.id, kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND):
+                metadata = artifact.metadata or {}
+                if metadata.get("signature_key") == signature_key:
+                    matching_task_ids.append(task.id)
+                    break
+        matching_tasks = [tasks_by_id[task_id] for task_id in dict.fromkeys(matching_task_ids)]
+        reusable_tasks = [
+            task for task in matching_tasks if task.status in OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES
+        ]
+        if len(reusable_tasks) > 1:
+            raise ValueError(
+                f"multiple active off-topic investigation tasks already exist for signature {signature['nodeid']}"
+            )
+        if reusable_tasks:
+            reused.append(reusable_tasks[0])
+            continue
+
+        prompt = build_off_topic_verify_investigation_prompt(
+            review_task_id=review_task.id,
+            impl_task_id=impl_task.id,
+            signature=signature,
+            payload=payload,
+        )
+        created_task = store.add(
+            prompt=prompt,
+            task_type="explore",
+            based_on=review_task.id,
+            depends_on=impl_task.id,
+            same_branch=True,
+            tags=resolve_derived_task_tags(impl_task),
+            review_scope=_format_off_topic_investigation_review_scope(signature=signature, payload=payload),
+            trigger_source=trigger_source,
+        )
+        investigation_payload = {
+            "reason": "off_topic_verify_failure",
+            "signature_key": signature_key,
+            "nodeid": signature["nodeid"],
+            "assertion_signature": signature["assertion_signature"],
+            "implementation_task_id": impl_task.id,
+            "review_task_id": review_task.id,
+            "head_sha": payload.get("head_sha"),
+            "tree_fingerprint": payload.get("tree_fingerprint"),
+            "target_branch": payload.get("target_branch"),
+            "target_head_sha": payload.get("target_head_sha"),
+            "target_tree_fingerprint": payload.get("target_tree_fingerprint"),
+            "baseline_mode": payload.get("baseline_mode"),
+            "verify_command": payload.get("verify_command"),
+            "failing_node": dict(failing_node_raw),
+        }
+        store_command_output_artifact(
+            store,
+            created_task,
+            config,
+            kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+            producer="advance_off_topic_verify_unblock",
+            label="off_topic_verify_investigation",
+            output=json.dumps(investigation_payload, indent=2, sort_keys=True),
+            status="queued",
+            head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else None,
+            metadata=investigation_payload,
+            content_type="application/json; charset=utf-8",
+        )
+        created.append(created_task)
+        assert created_task.id is not None
+        tasks_by_id[created_task.id] = created_task
+
+    return tuple(created), tuple(reused)
+
+
+def persist_off_topic_verify_clearance(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    review_task: Task,
+    impl_task: Task,
+    payload: Mapping[str, Any],
+    trigger_source: str,
+    review_clearance_artifact_kind: str,
+    review_clearance_artifact_label: str,
+    review_clearance_artifact_producer: str,
+) -> OffTopicVerifyClearancePersistenceResult:
+    """Persist investigation tasks and review clearance as one fail-closed transaction."""
+    if review_task.id is None:
+        raise ValueError("Cannot persist off-topic clearance for review without an ID.")
+    if impl_task.id is None:
+        raise ValueError("Cannot persist off-topic clearance for implementation without an ID.")
+
+    failing_nodes_raw = payload.get("failing_nodes")
+    if not isinstance(failing_nodes_raw, list) or not failing_nodes_raw:
+        raise ValueError("off-topic investigation payload must include failing_nodes")
+
+    tasks_by_id = {task.id: task for task in store.get_all() if task.id is not None}
+    created: list[Task] = []
+    reused: list[Task] = []
+    prepared_paths: list[Path] = []
+    conn = cast(Any, store._connect())
+    try:
+        conn.execute("BEGIN")
+        cleared_at = datetime.now(UTC)
+        clearance_payload = dict(payload)
+
+        for failing_node_raw in failing_nodes_raw:
+            if not isinstance(failing_node_raw, Mapping):
+                raise ValueError("failing node evidence must be a mapping")
+            signature = _normalize_off_topic_investigation_signature(failing_node_raw)
+            signature_key = _off_topic_investigation_signature_key(signature)
+
+            matching_task_ids: list[str] = []
+            for task in tasks_by_id.values():
+                assert task.id is not None
+                for artifact in store.list_artifacts(task.id, kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND):
+                    metadata = artifact.metadata or {}
+                    if metadata.get("signature_key") == signature_key:
+                        matching_task_ids.append(task.id)
+                        break
+            matching_tasks = [tasks_by_id[task_id] for task_id in dict.fromkeys(matching_task_ids)]
+            reusable_tasks = [
+                task
+                for task in matching_tasks
+                if task.status in OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES
+            ]
+            if len(reusable_tasks) > 1:
+                raise ValueError(
+                    f"multiple active off-topic investigation tasks already exist for signature {signature['nodeid']}"
+                )
+            if reusable_tasks:
+                reused.append(reusable_tasks[0])
+                continue
+
+            prompt = build_off_topic_verify_investigation_prompt(
+                review_task_id=review_task.id,
+                impl_task_id=impl_task.id,
+                signature=signature,
+                payload=payload,
+            )
+            created_task_id = store._next_id(conn)
+            created_task = store._add_task_conn(
+                conn,
+                NewTaskParams(
+                    prompt=prompt,
+                    task_id=created_task_id,
+                    task_type="explore",
+                    based_on=review_task.id,
+                    depends_on=impl_task.id,
+                    same_branch=True,
+                    tags=resolve_derived_task_tags(impl_task),
+                    review_scope=_format_off_topic_investigation_review_scope(
+                        signature=signature,
+                        payload=payload,
+                    ),
+                    trigger_source=trigger_source,
+                ),
+            )
+            assert created_task.id is not None
+            investigation_payload = {
+                "reason": "off_topic_verify_failure",
+                "signature_key": signature_key,
+                "nodeid": signature["nodeid"],
+                "assertion_signature": signature["assertion_signature"],
+                "implementation_task_id": impl_task.id,
+                "review_task_id": review_task.id,
+                "head_sha": payload.get("head_sha"),
+                "tree_fingerprint": payload.get("tree_fingerprint"),
+                "target_branch": payload.get("target_branch"),
+                "target_head_sha": payload.get("target_head_sha"),
+                "target_tree_fingerprint": payload.get("target_tree_fingerprint"),
+                "baseline_mode": payload.get("baseline_mode"),
+                "verify_command": payload.get("verify_command"),
+                "failing_node": dict(failing_node_raw),
+            }
+            prepared_investigation = prepare_command_output_artifact(
+                Path(config.project_dir),
+                created_task.id,
+                label="off_topic_verify_investigation",
+                output=json.dumps(investigation_payload, indent=2, sort_keys=True),
+                created_at=cleared_at,
+            )
+            prepared_paths.append(prepared_investigation.absolute_path)
+            store._add_artifact_conn(
+                conn,
+                created_task.id,
+                kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+                producer=review_clearance_artifact_producer,
+                label="off_topic_verify_investigation",
+                path=prepared_investigation.path,
+                content_type="application/json; charset=utf-8",
+                byte_size=prepared_investigation.bytes,
+                sha256=prepared_investigation.digest,
+                created_at=cleared_at,
+                status="queued",
+                head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else None,
+                metadata=investigation_payload,
+            )
+            created.append(created_task)
+            tasks_by_id[created_task.id] = created_task
+
+        clearance_payload["created_investigation_task_ids"] = [task.id for task in created]
+        clearance_payload["reused_investigation_task_ids"] = [task.id for task in reused]
+        prepared_clearance = prepare_command_output_artifact(
+            Path(config.project_dir),
+            impl_task.id,
+            label=review_clearance_artifact_label,
+            output=json.dumps(clearance_payload, indent=2, sort_keys=True),
+            created_at=cleared_at,
+        )
+        prepared_paths.append(prepared_clearance.absolute_path)
+        store._set_review_cleared_at_conn(conn, impl_task.id, cleared_at)
+        store._add_artifact_conn(
+            conn,
+            impl_task.id,
+            kind=review_clearance_artifact_kind,
+            producer=review_clearance_artifact_producer,
+            label=review_clearance_artifact_label,
+            path=prepared_clearance.path,
+            content_type="application/json; charset=utf-8",
+            byte_size=prepared_clearance.bytes,
+            sha256=prepared_clearance.digest,
+            created_at=cleared_at,
+            status="cleared",
+            head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else None,
+            metadata={
+                "reason": "off_topic_verify_failure",
+                "review_task_id": review_task.id,
+                "tree_fingerprint": payload.get("tree_fingerprint"),
+                "green_task_id": payload.get("green_task_id"),
+                "red_task_id": payload.get("red_task_id"),
+                "target_branch": payload.get("target_branch"),
+                "created_investigation_task_ids": clearance_payload["created_investigation_task_ids"],
+                "reused_investigation_task_ids": clearance_payload["reused_investigation_task_ids"],
+                "failing_nodes": payload.get("failing_nodes"),
+            },
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        for prepared_path in reversed(prepared_paths):
+            try:
+                if prepared_path.exists():
+                    prepared_path.unlink()
+                parent = prepared_path.parent
+                while parent.name and parent.exists() and parent != Path(config.project_dir):
+                    if any(parent.iterdir()):
+                        break
+                    parent.rmdir()
+                    parent = parent.parent
+            except Exception:
+                continue
+        raise OffTopicVerifyPersistenceError(
+            f"off-topic verify clearance persistence failed: {exc}"
+        ) from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    impl_task.review_cleared_at = cleared_at
+    return OffTopicVerifyClearancePersistenceResult(
+        created_tasks=tuple(created),
+        reused_tasks=tuple(reused),
+        review_cleared_at=cleared_at,
+    )
 
 
 def build_followup_prompt(

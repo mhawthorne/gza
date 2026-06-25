@@ -135,6 +135,20 @@ def test_full_config_example_groups_main_integration_verify_red_ttl_under_review
     assert not other_header or ttl_key not in other_section
 
 
+def test_full_config_example_groups_off_topic_verify_unblock_under_review() -> None:
+    rendered = render_config_example()
+
+    review_start = rendered.index("# --- Review ---")
+    learnings_start = rendered.index("# --- Learnings ---")
+    unblock_key = "# advance_off_topic_verify_unblock: false"
+
+    unblock_index = rendered.index(unblock_key)
+
+    assert review_start < unblock_index < learnings_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or unblock_key not in other_section
+
+
 def test_full_config_example_groups_failed_plan_review_retries_under_lifecycle() -> None:
     rendered = render_config_example()
 

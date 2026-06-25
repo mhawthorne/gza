@@ -6623,13 +6623,22 @@ class SqliteTaskStore:
 
         If task_id does not exist, this is a no-op (no error is raised).
         """
-        now = _format_db_timestamp(datetime.now(UTC))
-        assert now is not None
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE tasks SET review_cleared_at = ? WHERE project_id = ? AND id = ?",
-                (now, self._project_id, task_id),
-            )
+            self._set_review_cleared_at_conn(conn, task_id, datetime.now(UTC))
+
+    def _set_review_cleared_at_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        cleared_at: datetime,
+    ) -> None:
+        """Persist a specific review-cleared timestamp using an open connection."""
+        now = _format_db_timestamp(cleared_at)
+        assert now is not None
+        conn.execute(
+            "UPDATE tasks SET review_cleared_at = ? WHERE project_id = ? AND id = ?",
+            (now, self._project_id, task_id),
+        )
 
     def invalidate_review_state(self, task_id: str) -> None:
         """Invalidate review state on a task so it requires a new review.

@@ -1,15 +1,19 @@
 """Tests for review_tasks helpers."""
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gza.artifacts import store_command_output_artifact
+from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.db import Task
 from gza.review_tasks import (
     DuplicateReviewError,
+    OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
@@ -29,6 +33,7 @@ from gza.review_tasks import (
     find_existing_review_blocker_adjudication_task,
     format_blocker_finding_context,
     format_followup_finding_context,
+    persist_off_topic_verify_clearance,
 )
 from gza.review_verdict import ReviewFinding
 
@@ -43,6 +48,14 @@ def _task(**overrides) -> Task:
     )
     defaults.update(overrides)
     return Task(**defaults)
+
+
+def _make_store(tmp_path: Path) -> tuple[Config, SqliteTaskStore]:
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    config = Config.load(tmp_path)
+    db_path = tmp_path / ".gza" / "gza.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return config, SqliteTaskStore(db_path, prefix=config.project_prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +410,99 @@ class TestCreateReviewTask:
         store.resolve_merge_unit_for_task.assert_called_once_with("gza-12")
         review_task = store.add.return_value
         store.get_or_create_merge_unit_for_task.assert_called_once_with(review_task)
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "dropped"])
+def test_persist_off_topic_verify_clearance_creates_new_investigation_when_only_terminal_match_exists(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    config, store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.branch = "feat/review-task-reuse"
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    store.update(review)
+
+    terminal = store.add(
+        "Terminal investigation",
+        task_type="explore",
+        depends_on=impl.id,
+        based_on=review.id,
+        same_branch=True,
+    )
+    assert terminal.id is not None
+    terminal.status = terminal_status
+    store.update(terminal)
+
+    failing_node = {
+        "nodeid": "tests/cli/test_query.py::test_worker_registry",
+        "assertion_signature": "AssertionError: assert 'running' == 'completed'",
+        "path": "tests/cli/test_query.py",
+        "failure_path": "tests/cli/test_query.py",
+        "failure_line": 42,
+        "traceback_paths": ["tests/cli/test_query.py"],
+    }
+    signature_key = hashlib.sha256(
+        f"{failing_node['nodeid']}\n{failing_node['assertion_signature']}".encode("utf-8")
+    ).hexdigest()
+    store_command_output_artifact(
+        store,
+        terminal,
+        config,
+        kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+        producer="test",
+        label="off_topic_verify_investigation",
+        output="{}",
+        status="queued",
+        metadata={
+            "signature_key": signature_key,
+            "nodeid": failing_node["nodeid"],
+            "assertion_signature": failing_node["assertion_signature"],
+        },
+    )
+
+    payload = {
+        "reason": "off_topic_verify_failure",
+        "implementation_task_id": impl.id,
+        "review_task_id": review.id,
+        "green_task_id": "gza-100",
+        "red_task_id": "gza-101",
+        "head_sha": "same-head-sha",
+        "tree_fingerprint": "f" * 64,
+        "verify_command": "uv run pytest tests/ -q --maxfail=0",
+        "target_branch": "main",
+        "target_head_sha": "main-head-sha",
+        "target_tree_fingerprint": "a" * 64,
+        "baseline_mode": "single",
+        "failing_nodes": [failing_node],
+    }
+
+    result = persist_off_topic_verify_clearance(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        payload=payload,
+        trigger_source="advance_off_topic_verify_unblock",
+        review_clearance_artifact_kind="review_clearance",
+        review_clearance_artifact_label="review_clearance",
+        review_clearance_artifact_producer="advance_off_topic_verify_unblock",
+    )
+
+    assert [task.id for task in result.reused_tasks] == []
+    assert len(result.created_tasks) == 1
+    assert result.created_tasks[0].id != terminal.id
+    clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
+    assert len(clearance_artifacts) == 1
+    assert clearance_artifacts[0].metadata["created_investigation_task_ids"] == [result.created_tasks[0].id]
+    assert clearance_artifacts[0].metadata["reused_investigation_task_ids"] == []
 
 
 class TestFollowupTasks:

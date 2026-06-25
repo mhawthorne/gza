@@ -131,6 +131,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "autonomous_verify_timeout_seconds",
             "review_verify_timeout_grace_seconds",
             "main_integration_verify_red_ttl_minutes",
+            "advance_off_topic_verify_unblock",
             "recommend_rebase_behind_commits",
         ),
     ),

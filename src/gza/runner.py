@@ -2601,6 +2601,14 @@ def _store_review_verify_artifact_records(
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
         "reviewed_base_sha": result.reviewed_base_sha,
+        "tree_fingerprint": next(
+            (
+                tree_fingerprint
+                for phase in reversed(_extract_review_verify_phase_results(result.output))
+                if isinstance((tree_fingerprint := phase.get("tree_fingerprint")), str) and tree_fingerprint
+            ),
+            None,
+        ),
         **(metadata or {}),
     }
     if project_results:
