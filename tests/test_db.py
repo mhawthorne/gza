@@ -3696,6 +3696,34 @@ class TestEditPromptDefaultContent:
         assert "Implement plan from task " in editor_content[0]
         assert "design-feature-x" in editor_content[0]
 
+    def test_edit_task_interactive_stamps_last_edited_at_on_prompt_change(self, tmp_path: Path, monkeypatch):
+        """Interactive prompt edits should stamp last_edited_at when the prompt changes."""
+        from gza.db import SqliteTaskStore, edit_task_interactive
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Original prompt")
+        assert task.last_edited_at is None
+
+        def mock_run(cmd):
+            temp_file = cmd[1]
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write("Updated prompt from editor")
+
+            class Result:
+                returncode = 0
+
+            return Result()
+
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
+
+        assert edit_task_interactive(store, task) is True
+
+        reloaded = store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.prompt == "Updated prompt from editor"
+        assert reloaded.last_edited_at is not None
+
 
 class TestFailureReasonTracking:
     """Tests for failure_reason field and extract_failure_reason function."""
@@ -8921,6 +8949,32 @@ class TestSharedDbIsolationAndImportGating:
         assert reloaded.prompt == "Task with query-only execution-mode damage"
         assert any("tasks.execution_mode" in warning for warning in query_store.startup_warnings())
 
+    def test_task_last_edited_at_round_trips_on_update_and_stays_null_on_add(self, tmp_path: Path) -> None:
+        """Fresh inserts leave last_edited_at NULL until a meaningful update persists it."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task without edits yet")
+        assert task.id is not None
+        assert task.last_edited_at is None
+
+        with sqlite3.connect(db_path) as conn:
+            persisted = conn.execute(
+                "SELECT last_edited_at FROM tasks WHERE project_id = ? AND id = ?",
+                (store._project_id, task.id),
+            ).fetchone()
+        assert persisted is not None
+        assert persisted[0] is None
+
+        stamped_at = datetime(2026, 6, 24, 18, 30, tzinfo=UTC)
+        task.last_edited_at = stamped_at
+        store.update(task)
+
+        reloaded = store.get(task.id)
+        assert reloaded is not None
+        assert reloaded.last_edited_at == stamped_at
+
     def test_query_only_open_pre_v40_db_missing_completion_reason_reads_with_null(
         self, tmp_path: Path
     ) -> None:
@@ -9442,6 +9496,26 @@ class TestSharedDbIsolationAndImportGating:
         assert "watch_recovery_backoffs" in tables
         assert "idx_watch_recovery_backoffs_due" in indexes
 
+    def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_tasks_column(db_path, "last_edited_at")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 56")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+
+        assert version == SCHEMA_VERSION
+        assert "last_edited_at" in task_columns
+
     def test_watch_recovery_backoff_round_trip_and_delete(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")
@@ -9525,6 +9599,34 @@ class TestSharedDbIsolationAndImportGating:
             "missing required table watch_recovery_backoffs" in warning
             for warning in query_store.startup_warnings()
         )
+
+    def test_query_only_open_pre_v57_missing_last_edited_at_reads_with_null(
+        self, tmp_path: Path
+    ) -> None:
+        """Query-only open should read v56 snapshots without forcing last_edited_at."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        task = store.add("Task before last-edited migration")
+        assert task.id is not None
+
+        _drop_tasks_column(db_path, "last_edited_at")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 56")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            reloaded = query_store.get(task.id)
+        finally:
+            db_path.chmod(0o644)
+
+        assert reloaded is not None
+        assert reloaded.prompt == "Task before last-edited migration"
+        assert reloaded.last_edited_at is None
+        assert any("tasks.last_edited_at" in warning for warning in query_store.startup_warnings())
 
     def test_query_only_open_pre_v56_incomplete_watch_recovery_backoffs_warns_and_degrades(
         self, tmp_path: Path

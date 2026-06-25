@@ -80,6 +80,33 @@ def test_full_config_example_groups_docker_startup_timeout_under_execution() -> 
     assert not other_header or timeout_key not in other_section
 
 
+def test_full_config_example_groups_quiet_period_seconds_under_storage() -> None:
+    rendered = render_config_example()
+
+    storage_start = rendered.index("# --- Storage ---")
+    provider_start = rendered.index("# --- Provider ---")
+    quiet_key = "# quiet_period_seconds:"
+
+    quiet_index = rendered.index(quiet_key)
+
+    assert storage_start < quiet_index < provider_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or quiet_key not in other_section
+
+
+def test_config_examples_describe_quiet_period_as_upcoming_only() -> None:
+    """Generated examples must not claim quiet-period enforcement before runtime support exists."""
+    rendered = render_config_example()
+    rendered_local = render_config_example(local=True)
+
+    expected_fragment = (
+        "current releases expose the setting only and do not yet hold tasks from execution"
+    )
+
+    assert expected_fragment in rendered
+    assert expected_fragment in rendered_local
+
+
 def test_full_config_example_groups_review_verify_timeout_grace_under_review() -> None:
     rendered = render_config_example()
 

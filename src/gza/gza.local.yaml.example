@@ -109,6 +109,12 @@
 # gza init activates this line when you explicitly choose local mode or a concrete shared DB path.
 # db_path: .gza/gza.db
 
+# Seconds reserved for the upcoming newly-created-task quiet-period pickup/display implementation;
+# current releases expose the setting only and do not yet hold tasks from execution, and `0` keeps
+# the future hold disabled.
+# Default: 300
+# quiet_period_seconds: 300
+
 # --- Provider ---
 
 # Chat output truncation length (0 = unlimited).

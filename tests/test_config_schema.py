@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gza.config import Config, ConfigError
+from gza.config import Config, ConfigError, DEFAULT_QUIET_PERIOD_SECONDS
 from gza.config_schema import (
     CONFIG_KEY_REGISTRY,
     NON_CONFIG_ROOT_KEYS,
@@ -120,6 +120,71 @@ def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
     config = Config.load(tmp_path)
 
     assert config.docker_startup_timeout == 60
+
+
+def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
+    """quiet_period_seconds should default when omitted."""
+    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+
+    config = Config.load(tmp_path)
+
+    assert config.quiet_period_seconds == DEFAULT_QUIET_PERIOD_SECONDS
+
+
+def test_config_load_accepts_zero_quiet_period_seconds(tmp_path) -> None:
+    """quiet_period_seconds should accept zero as the disable sentinel."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "quiet_period_seconds: 0\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.quiet_period_seconds == 0
+
+
+def test_quiet_period_registry_description_marks_setting_as_upcoming_not_enforced() -> None:
+    """Discoverable metadata must not claim quiet-period enforcement before runtime wiring lands."""
+    quiet_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "quiet_period_seconds")
+
+    assert "upcoming" in quiet_spec.description
+    assert "do not yet hold tasks from execution" in quiet_spec.description
+    assert "0" in quiet_spec.description
+
+
+def test_quiet_period_docs_match_config_only_scope() -> None:
+    """Operator docs must describe quiet_period_seconds as config plumbing, not active behavior."""
+    docs_text = (Path(__file__).resolve().parents[1] / "docs" / "configuration.md").read_text()
+
+    assert "quiet_period_seconds" in docs_text
+    assert "upcoming newly-created-task quiet-period pickup/display implementation" in docs_text
+    assert "do not yet hold tasks from execution" in docs_text
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("-1", "'quiet_period_seconds' must be non-negative"),
+    ("1.5", "'quiet_period_seconds' must be an integer"),
+    ("true", "'quiet_period_seconds' must be an integer"),
+])
+def test_config_validation_rejects_invalid_quiet_period_seconds(
+    tmp_path,
+    value: str,
+    expected: str,
+) -> None:
+    """Load and validate should reject invalid quiet_period_seconds values."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        f"quiet_period_seconds: {value}\n"
+    )
+
+    is_valid, errors, warnings = Config.validate(tmp_path)
+
+    assert not is_valid
+    assert expected in errors
+    assert warnings == []
+
+    with pytest.raises(ConfigError, match=expected):
+        Config.load(tmp_path)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "1.5", '"60"'])

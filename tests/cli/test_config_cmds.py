@@ -1068,6 +1068,26 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["watch"]["transient_recovery_backoff_max"] == 240
         assert payload["sources"]["watch.transient_recovery_backoff_max"] == "base"
 
+    def test_config_command_includes_quiet_period_seconds_json_and_source(self, tmp_path: Path):
+        """gza config --json should expose quiet_period_seconds with source attribution."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "quiet_period_seconds: 0\n"
+        )
+
+        result = invoke_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["quiet_period_seconds"] == 0
+        assert payload["sources"]["quiet_period_seconds"] == "base"
+
     def test_config_command_includes_main_checkout_isolate_text_and_source(self, tmp_path: Path):
         """gza config should render main_checkout_isolate rows with false values and sources."""
 

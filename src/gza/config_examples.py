@@ -84,7 +84,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "main_checkout_isolate",
         ),
     ),
-    _Section("Storage", ("db_path", "log_dir", "tasks_file", "cleanup_days")),
+    _Section("Storage", ("db_path", "log_dir", "tasks_file", "cleanup_days", "quiet_period_seconds")),
     _Section(
         "Provider",
         (

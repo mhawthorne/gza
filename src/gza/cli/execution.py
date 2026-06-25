@@ -2550,15 +2550,20 @@ def cmd_edit(args: argparse.Namespace) -> int:
             info_messages.append(f"Task {task.id} is already a {new_type}")
         else:
             task.task_type = new_type
+            task.last_edited_at = datetime.now(UTC)
             update_messages.append(f"✓ Converted task {task.id} to {new_type}")
             changed = True
 
     # Handle non-interactive prompt editing
     if prompt_requested:
         assert new_prompt is not None
-        task.prompt = new_prompt
-        update_messages.append(f"✓ Updated task {task.id}")
-        changed = True
+        if task.prompt == new_prompt:
+            info_messages.append(f"Task {task.id} prompt unchanged")
+        else:
+            task.prompt = new_prompt
+            task.last_edited_at = datetime.now(UTC)
+            update_messages.append(f"✓ Updated task {task.id}")
+            changed = True
 
     tag_message: str | None = None
     if tag_action is not None:

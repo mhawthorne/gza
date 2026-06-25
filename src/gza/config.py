@@ -102,6 +102,7 @@ DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_MAIN_CHECKOUT_ISOLATE = False
 DEFAULT_CLEANUP_DAYS = 30
+DEFAULT_QUIET_PERIOD_SECONDS = 300
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
 DEFAULT_REVIEW_CONTEXT_FILE_LIMIT = 12
@@ -134,7 +135,8 @@ VALID_CONFIG_FIELDS = {
     "max_noop_improve_cycles", "max_plan_slices",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
-    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "review_diff_small_threshold",
+    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "quiet_period_seconds",
+    "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
     "review_verify_timeout_grace_seconds", "main_integration_verify_red_ttl_minutes",
     "code_task_diff_timeout_medium_threshold", "code_task_diff_timeout_large_threshold",
@@ -239,6 +241,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "merge_squash_threshold": None,
     "main_checkout_isolate": None,
     "cleanup_days": None,
+    "quiet_period_seconds": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
@@ -352,6 +355,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "merge_squash_threshold": None,
     "main_checkout_isolate": None,
     "cleanup_days": None,
+    "quiet_period_seconds": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
     "review_context_file_limit": None,
@@ -549,6 +553,32 @@ def _validate_positive_int_field(
         return None
     validated_value = _validate_optional_positive_int_field(value, field_name, errors=errors)
     if validated_value is None:
+        return None
+    return validated_value
+
+
+def _validate_non_negative_int_field(
+    value: object,
+    field_name: str,
+    *,
+    errors: list[str] | None = None,
+) -> int | None:
+    """Validate a required non-negative integer field with shared load/validate errors."""
+
+    def _record_error(message: str) -> None:
+        if errors is None:
+            raise ConfigError(message)
+        errors.append(message)
+
+    if value is None:
+        _record_error(f"'{field_name}' must be a non-negative integer")
+        return None
+    if not _is_strict_int(value):
+        _record_error(f"'{field_name}' must be an integer")
+        return None
+    validated_value = cast(int, value)
+    if validated_value < 0:
+        _record_error(f"'{field_name}' must be non-negative")
         return None
     return validated_value
 
@@ -1021,6 +1051,7 @@ class Config:
     watch: WatchConfig = field(default_factory=WatchConfig)
     iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
+    quiet_period_seconds: int = DEFAULT_QUIET_PERIOD_SECONDS
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
     review_context_file_limit: int = DEFAULT_REVIEW_CONTEXT_FILE_LIMIT
@@ -2122,6 +2153,12 @@ class Config:
             raise ConfigError("cleanup_days must be a positive integer")
         if cleanup_days < 1:
             raise ConfigError("cleanup_days must be a positive integer")
+        quiet_period_seconds = _validate_non_negative_int_field(
+            data.get("quiet_period_seconds", DEFAULT_QUIET_PERIOD_SECONDS),
+            "quiet_period_seconds",
+        )
+        if quiet_period_seconds is None:
+            raise ConfigError("'quiet_period_seconds' must be a non-negative integer")
 
         try:
             review_diff_small_threshold = int(
@@ -2352,6 +2389,7 @@ class Config:
             merge_squash_threshold=merge_squash_threshold,
             main_checkout_isolate=main_checkout_isolate,
             cleanup_days=cleanup_days,
+            quiet_period_seconds=quiet_period_seconds,
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
             review_context_file_limit=review_context_file_limit,
@@ -2758,6 +2796,12 @@ class Config:
             errors.append("'interactive_worktree_dir' must be a string")
         if "main_checkout_isolate" in data and not isinstance(data["main_checkout_isolate"], bool):
             errors.append("'main_checkout_isolate' must be a boolean (true/false)")
+        if "quiet_period_seconds" in data:
+            _validate_non_negative_int_field(
+                data["quiet_period_seconds"],
+                "quiet_period_seconds",
+                errors=errors,
+            )
 
         if "review_diff_small_threshold" in data:
             if not isinstance(data["review_diff_small_threshold"], int):

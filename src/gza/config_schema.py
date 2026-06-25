@@ -77,6 +77,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("claude.fetch_auth_token_from_keychain", "bool", False, "Fetch Claude auth token from macOS keychain for Docker."),
     ConfigKeySpec("claude_args", "list[str]", None, "Deprecated legacy alias for `claude.args`."),
     ConfigKeySpec("cleanup_days", "int", 30, "Default retention window for `gza clean`."),
+    ConfigKeySpec(
+        "quiet_period_seconds",
+        "int",
+        300,
+        "Seconds reserved for the upcoming newly-created-task quiet-period pickup/display implementation; current releases expose the setting only and do not yet hold tasks from execution, and `0` keeps the future hold disabled.",
+    ),
     ConfigKeySpec("colors.*", "str", None, "Ad-hoc color override map keyed by output field."),
     ConfigKeySpec("defaults.max_steps", "int", 50, "Default step budget for task execution."),
     ConfigKeySpec("defaults.max_turns", "int", 50, "Deprecated legacy alias for defaults.max_steps."),

@@ -413,6 +413,7 @@ class Task:
     input_tokens: int | None = None   # Total input tokens (including cache tokens)
     output_tokens: int | None = None  # Total output tokens
     created_at: datetime | None = None
+    last_edited_at: datetime | None = None  # Last meaningful prompt/type edit; NULL means use created_at
     started_at: datetime | None = None
     running_pid: int | None = None
     completed_at: datetime | None = None
@@ -655,6 +656,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
         "created_at",
+        "last_edited_at",
         "started_at",
         "completed_at",
         "pr_last_synced_at",
@@ -1011,8 +1013,13 @@ CREATE INDEX IF NOT EXISTS idx_watch_recovery_backoffs_due
     ON watch_recovery_backoffs(project_id, next_retry_at);
 """
 
+# Migration from v56 to v57: persist last meaningful task edit timestamp
+MIGRATION_V56_TO_V57 = """
+ALTER TABLE tasks ADD COLUMN last_edited_at TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 56
+SCHEMA_VERSION = 57
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1290,6 +1297,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 attach_duration_seconds REAL,
                 cost_usd REAL,
                 created_at TEXT NOT NULL,
+                last_edited_at TEXT,
                 started_at TEXT,
                 running_pid INTEGER,
                 completed_at TEXT,
@@ -1429,7 +1437,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
         task_columns = (
             "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on", "has_commits",
             "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
-            "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "started_at", "running_pid", "completed_at",
+            "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "last_edited_at", "started_at", "running_pid", "completed_at",
             "group", "depends_on", "spec", "review_scope", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
             "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
             "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
@@ -1474,13 +1482,13 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
 
         conn.execute(
             f"""
-            INSERT INTO tasks (
-                project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
-                duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
-                attach_count, attach_duration_seconds, cost_usd, created_at, started_at, running_pid, completed_at,
-                "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
-                pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, model_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
-                merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
+                INSERT INTO tasks (
+                    project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
+                    duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
+                    attach_count, attach_duration_seconds, cost_usd, created_at, last_edited_at, started_at, running_pid, completed_at,
+                    "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
+                    pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, model_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
+                    merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 changed_diff, review_cleared_at, review_score,
                 review_verify_command, review_verify_status, review_verify_exit_status, review_verify_failure,
                 review_verify_captured_at, review_verify_head_sha, review_verify_base_sha, review_verify_branch,
@@ -1790,7 +1798,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2037,6 +2045,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         53: ("watch_progress_observations", "action_task_running_pid"),
         54: ("task_comments", "kind"),
         56: ("watch_recovery_backoffs", "updated_at"),
+        57: ("tasks", "last_edited_at"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -2217,6 +2226,7 @@ def _ensure_required_auto_migration_artifacts(
             "launch_evidence_fingerprint",
             "ALTER TABLE watch_progress_observations ADD COLUMN launch_evidence_fingerprint TEXT",
         ),
+        (57, "tasks", "last_edited_at", "ALTER TABLE tasks ADD COLUMN last_edited_at TEXT"),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -2513,6 +2523,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     attach_duration_seconds REAL,
     cost_usd REAL,
     created_at TEXT NOT NULL,
+    last_edited_at TEXT,
     started_at TEXT,
     running_pid INTEGER,
     completed_at TEXT,
@@ -3020,6 +3031,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (54, MIGRATION_V53_TO_V54),
     (55, MIGRATION_V54_TO_V55),
     (56, MIGRATION_V55_TO_V56),
+    (57, MIGRATION_V56_TO_V57),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3475,6 +3487,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing required column tasks.queue_position; "
                 "explicit queue ordering will be unavailable."
             )
+        if not self._query_only_has_column("tasks", "last_edited_at"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column tasks.last_edited_at; "
+                "task edit recency will fall back to created_at."
+            )
         if not self._query_only_has_column("tasks", "completion_reason"):
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional column tasks.completion_reason; "
@@ -3809,6 +3826,7 @@ class SqliteTaskStore:
             input_tokens=row["input_tokens"] if "input_tokens" in keys else None,
             output_tokens=row["output_tokens"] if "output_tokens" in keys else None,
             created_at=_parse_db_timestamp(row["created_at"]),
+            last_edited_at=_parse_db_timestamp(row["last_edited_at"]) if "last_edited_at" in keys else None,
             started_at=_parse_db_timestamp(row["started_at"]),
             running_pid=row["running_pid"] if "running_pid" in keys else None,
             completed_at=_parse_db_timestamp(row["completed_at"]),
@@ -4215,6 +4233,7 @@ class SqliteTaskStore:
                     cost_usd = ?,
                     input_tokens = ?,
                     output_tokens = ?,
+                    last_edited_at = ?,
                     started_at = ?,
                     running_pid = ?,
                     completed_at = ?,
@@ -4288,6 +4307,7 @@ class SqliteTaskStore:
                     task.cost_usd,
                     task.input_tokens,
                     task.output_tokens,
+                    _format_db_timestamp(task.last_edited_at),
                     _format_db_timestamp(task.started_at),
                     task.running_pid,
                     _format_db_timestamp(task.completed_at),
@@ -8047,7 +8067,9 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
         errors = validate_prompt(prompt)
 
         if not errors:
-            task.prompt = prompt
+            if task.prompt != prompt:
+                task.prompt = prompt
+                task.last_edited_at = datetime.now(UTC)
             store.update(task)
             return True
 
@@ -8092,7 +8114,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on",
         "has_commits", "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns",
         "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
-        "created_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "review_scope", "create_review",
+        "created_at", "last_edited_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "review_scope", "create_review",
         "auto_implement",
         "create_pr",
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
@@ -8113,6 +8135,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "pr_state": "NULL",
         "pr_last_synced_at": "NULL",
         "sync_last_synced_at": "NULL",
+        "last_edited_at": "NULL",
         "completion_reason": "NULL",
         "changed_diff": "NULL",
         "recovery_origin": "NULL",
@@ -8683,6 +8706,7 @@ def _task_to_dict(task: "Task") -> dict:
         "input_tokens": task.input_tokens,
         "output_tokens": task.output_tokens,
         "created_at": _format_db_timestamp(task.created_at),
+        "last_edited_at": _format_db_timestamp(task.last_edited_at),
         "started_at": _format_db_timestamp(task.started_at),
         "completed_at": _format_db_timestamp(task.completed_at),
         "group": task.group,

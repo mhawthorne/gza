@@ -1808,6 +1808,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "worktree_dir": config.worktree_dir,
         "work_count": config.work_count,
         "main_checkout_isolate": config.main_checkout_isolate,
+        "quiet_period_seconds": config.quiet_period_seconds,
         "watch": {
             "batch": config.watch.batch,
             "poll": config.watch.poll,

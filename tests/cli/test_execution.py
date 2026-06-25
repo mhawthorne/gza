@@ -771,6 +771,26 @@ class TestEditCommand:
         assert updated.status == "failed"
         assert updated.tags == ("backend", "release-1.2")
 
+    def test_edit_add_tag_preserves_last_edited_at(self, tmp_path: Path):
+        """Tag-only edits should not reset the meaningful-edit timestamp."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Tagged task", tags=("backend",))
+        original_edit_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
+        task.last_edited_at = original_edit_at
+        store.update(task)
+
+        result = invoke_gza("edit", str(task.id), "--add-tag", "release-1.2", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.tags == ("backend", "release-1.2")
+        assert updated.last_edited_at == original_edit_at
+
     def test_edit_non_tag_mutation_stays_restricted_for_non_pending_task(self, tmp_path: Path):
         """Non-pending tasks should reject prompt or metadata edits outside tag mutations."""
 
@@ -1250,6 +1270,25 @@ class TestEditCommand:
         # Verify prompt was updated
         updated = store.get(task.id)
         assert updated.prompt == "New prompt from command line"
+        assert updated.last_edited_at is not None
+
+    def test_edit_prompt_stamps_last_edited_at(self, tmp_path: Path):
+        """Meaningful prompt edits should stamp last_edited_at."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Original prompt text")
+        assert task.last_edited_at is None
+
+        result = invoke_gza("edit", str(task.id), "--prompt", "Edited prompt text", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.prompt == "Edited prompt text"
+        assert updated.last_edited_at is not None
 
     def test_edit_with_prompt_validation_error(self, tmp_path: Path):
         """Edit command validates prompt length."""
@@ -1302,6 +1341,25 @@ class TestEditCommand:
         # Verify prompt was updated
         updated = store.get(task.id)
         assert updated.prompt == "New prompt from stdin input"
+
+    def test_edit_task_type_conversion_stamps_last_edited_at(self, tmp_path: Path):
+        """Task-type conversions should stamp last_edited_at."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Original task", task_type="implement")
+        assert task.last_edited_at is None
+
+        result = invoke_gza("edit", str(task.id), "--explore", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert f"Converted task {task.id} to explore" in result.stdout
+
+        updated = store.get(task.id)
+        assert updated is not None
+        assert updated.task_type == "explore"
+        assert updated.last_edited_at is not None
 
     def test_cmd_edit_based_on_sets_based_on_field(self, tmp_path: Path):
         """--based-on sets task.based_on, not task.depends_on."""
