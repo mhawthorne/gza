@@ -638,7 +638,7 @@ Use this matrix when deciding "what will this command actually touch?"
 Two operator-facing queue surfaces show these sets separately:
 
 - `uv run gza next` shows recovery, lifecycle actions, and pending as distinct sections.
-- `uv run gza queue` shows the pending lane by default; add `--full` to also show recovery and lifecycle actions.
+- `uv run gza queue` shows the pending lane by default; add `--full`, `--recovery`, or `--recovery-first` for broader dispatch previews.
 - Recovery lane entries belong to `advance` / `watch`, not `work`.
 - Lifecycle-action entries belong to `advance` / `watch`, not `work`.
 - Pending lane entries belong to `work` / `watch`.
@@ -1573,9 +1573,13 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--tag TAG` | Only list pending tasks matching tag filters by default (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; add `--full` to also show matching recovery and lifecycle lanes, plus out-of-scope derived blockers without starting them) |
+| `--tag TAG` | Only list pending tasks matching tag filters by default (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; add `--full` to preview matching recovery candidates and lifecycle actions too, or `--recovery-first` to limit pending display to explicitly positioned tasks) |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
-| `--full` | Also show recovery and lifecycle lanes (default queue output is pending lane only) |
+| `--pending` | Show only the pending lane preview |
+| `--recovery` | Show the recovery-only dispatch preview (alias for `--recovery-only`) |
+| `--recovery-only` | Show the recovery-only dispatch preview |
+| `--recovery-first` | Preview recovery first, then only pending tasks with an explicit queue position |
+| `--full` | Compatibility alias for the default multi-lane dispatch preview |
 | `-n, --limit N` | Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks) |
 | `--all` | Show all runnable tasks (blocked tasks are always shown) |
 
@@ -1600,7 +1604,7 @@ Add `--full` to render the current three-lane preview:
 
 Within the pending lane, runnable pending tasks appear first and pending tasks blocked by unsatisfied direct dependencies appear at the bottom. Internal tasks remain excluded.
 By default, `gza queue` shows the first 10 runnable tasks plus all blocked tasks. Use `-n 0`, `-n -1`, or `--all` to show all runnable tasks too.
-To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order for the pending lane. Add `--full` when you also want the same-scope recovery lane, lifecycle actions, and scope-gap diagnostics.
+To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order for the pending lane. Add `--full` when you also want the same-scope recovery lane, lifecycle actions, and scope-gap diagnostics, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
@@ -1841,6 +1845,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
 | `--recovery-slots N` | Slots per watch pass reserved for worker-consuming failed-task recovery before pending pickup (default: `watch.recovery_slots` or `1`) |
 | `--recovery-only` | Send the full batch to failed-task recovery; pending pickup waits until recovery drains |
+| `--recovery-first` | Prioritize recovery, then only start pending tasks with an explicit queue position |
 | `--pending-only` | Disable failed-task recovery and spend all watch slots on pending pickup |
 | `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and the recovery lane |
 | `--dry-run` | Show what watch would do without executing; with `--recovery-only`, print the full failed-recovery report and exit |
@@ -1880,7 +1885,7 @@ When watch detects that the installed `gza` package fingerprint has changed sinc
 
 If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
 
-`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope, showing actionable `resume` and `retry` decisions plus any shared `Needs attention` rows by default, then exits without entering the normal watch loop. Plain `uv run gza watch` now reserves a recovery lane by default: default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup, with the remaining `batch - 1` slots left for pending work. The rule is uniform for worker-consuming recovery: at batch 1, default plain watch gives the single slot to worker-consuming recovery first; use `--pending-only` or `watch.recovery_slots: 0` when you intentionally want pending-only behavior on a single slot. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot. `max_resume_attempts` is still the shared recovery toggle (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Ordinary skipped tasks stay hidden by default; pass `--show-skipped` to include those non-attention skips with launch mode and attempt counts in both the dry-run report and live watch logs. Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted entirely from this recovery surface rather than being counted as skipped. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.
+`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface for this mode. It prints the failed-task decision report for the current scope, showing actionable `resume` and `retry` decisions plus any shared `Needs attention` rows by default, then exits without entering the normal watch loop. Plain `uv run gza watch` now reserves a recovery lane by default: default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup, with the remaining `batch - 1` slots left for pending work. The rule is uniform for worker-consuming recovery: at batch 1, default plain watch gives the single slot to worker-consuming recovery first; use `--pending-only` or `watch.recovery_slots: 0` when you intentionally want pending-only behavior on a single slot. `--recovery-first` keeps the normal recovery preference but only allows pending tasks with an explicit `queue_position` to fill the remaining slots. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot. `max_resume_attempts` is still the shared recovery toggle (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Ordinary skipped tasks stay hidden by default; pass `--show-skipped` to include those non-attention skips with launch mode and attempt counts in both the dry-run report and live watch logs. Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted entirely from this recovery surface rather than being counted as skipped. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.
 
 ### learnings
 

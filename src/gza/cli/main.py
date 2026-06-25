@@ -845,22 +845,29 @@ def main() -> int:
     watch_recovery_mode.add_argument(
         "--recovery-only",
         action="store_const",
-        const="recovery-only",
-        dest="recovery_mode",
+        const="recovery_only",
+        dest="dispatch_mode",
         help="Send the full batch to failed-task recovery; pending pickup waits until recovery drains",
+    )
+    watch_recovery_mode.add_argument(
+        "--recovery-first",
+        action="store_const",
+        const="recovery_first_explicit",
+        dest="dispatch_mode",
+        help="Prioritize recovery, then only start pending tasks with an explicit queue position",
     )
     watch_recovery_mode.add_argument(
         "--pending-only",
         action="store_const",
-        const="pending-only",
-        dest="recovery_mode",
+        const="pending_only",
+        dest="dispatch_mode",
         help="Disable failed-task recovery and use all slots for pending pickup",
     )
     watch_recovery_mode.add_argument(
         "--restart-failed",
         action="store_const",
-        const="recovery-only",
-        dest="recovery_mode",
+        const="recovery_only",
+        dest="dispatch_mode",
         help=argparse.SUPPRESS,
     )
     watch_parser.add_argument(
@@ -918,7 +925,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the matching pending pickup order, or add '--full' to also preview matching recovery candidates and lifecycle actions. Scoped watch reports out-of-scope derived blockers but does not start them",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the matching pending pickup order, or add '--full' to also preview matching recovery candidates and lifecycle actions. Add '--recovery-first' to restrict pending display to explicitly positioned tasks. Scoped watch reports out-of-scope derived blockers but does not start them",
     )
     watch_parser.add_argument(
         "--all-tags",
@@ -943,17 +950,17 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="Preview the pending lane by default; add --full for recovery and lifecycle lanes too; manage pending-lane ordering",
-        description="Preview the pending lane by default and manage pending-lane ordering. Add --full to also show the recovery and lifecycle lanes.",
+        help="Preview the pending lane by default; use --full, --recovery, or --recovery-first for broader dispatch previews; manage pending-lane ordering",
+        description="Preview the pending lane by default and manage pending-lane ordering. Use --full, --recovery, or --recovery-first for broader dispatch previews.",
     )
     add_common_args(queue_parser)
-    queue_parser.set_defaults(limit=10, all=False, full=False)
+    queue_parser.set_defaults(limit=10, all=False, dispatch_mode="pending_only")
     queue_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list pending tasks matching tag filters by default (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Add --full to also show matching recovery and lifecycle lanes, plus out-of-scope derived blockers without starting them",
+        help="Only list pending tasks matching tag filters by default (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Add '--full' to preview matching recovery candidates and lifecycle actions too, or '--recovery-first' to limit pending display to explicitly positioned tasks",
     )
     queue_parser.add_argument(
         "--all-tags",
@@ -961,10 +968,41 @@ def main() -> int:
         dest="all_tags",
         help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
     )
-    queue_parser.add_argument(
+    queue_display_mode = queue_parser.add_mutually_exclusive_group()
+    queue_display_mode.add_argument(
+        "--pending",
+        action="store_const",
+        const="pending_only",
+        dest="dispatch_mode",
+        help="Show only the pending lane preview",
+    )
+    queue_display_mode.add_argument(
+        "--recovery",
+        action="store_const",
+        const="recovery_only",
+        dest="dispatch_mode",
+        help="Show the recovery-only dispatch preview (alias for --recovery-only)",
+    )
+    queue_display_mode.add_argument(
+        "--recovery-only",
+        action="store_const",
+        const="recovery_only",
+        dest="dispatch_mode",
+        help="Show the recovery-only dispatch preview",
+    )
+    queue_display_mode.add_argument(
+        "--recovery-first",
+        action="store_const",
+        const="recovery_first_explicit",
+        dest="dispatch_mode",
+        help="Preview recovery first, then only pending tasks with an explicit queue position",
+    )
+    queue_display_mode.add_argument(
         "--full",
-        action="store_true",
-        help="Also show recovery and lifecycle lanes (default queue output is pending lane only)",
+        action="store_const",
+        const="default",
+        dest="dispatch_mode",
+        help="Compatibility alias for the default multi-lane dispatch preview",
     )
     queue_parser.add_argument(
         "-n",

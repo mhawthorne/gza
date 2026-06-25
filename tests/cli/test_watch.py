@@ -15989,6 +15989,72 @@ def test_cmd_watch_keeps_explicit_max_concurrent_without_warning_when_batch_with
     assert " WARN " not in log_text
 
 
+def test_cmd_watch_uses_config_recovery_slots_zero_as_pending_only_mode(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  recovery_slots: 0\n")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        dispatch_mode=None,
+        recovery_slots=None,
+        restart_failed_batch=None,
+    )
+
+    def assert_pending_only(**kwargs) -> _CycleResult:
+        assert kwargs["recovery_mode"] == "pending_only"
+        assert kwargs["recovery_slots"] == 0
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=assert_pending_only) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+
+
+def test_cmd_watch_explicit_recovery_first_overrides_config_zero_recovery_slots(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  recovery_slots: 0\n")
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        dispatch_mode="recovery_first_explicit",
+        recovery_slots=None,
+        restart_failed_batch=None,
+    )
+
+    def assert_recovery_first(**kwargs) -> _CycleResult:
+        assert kwargs["recovery_mode"] == "recovery_first_explicit"
+        assert kwargs["recovery_slots"] == 0
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=assert_recovery_first) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+
+
 def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None:
     """Watch should re-exec itself on the first pass boundary where drift is detected."""
     setup_config(tmp_path)

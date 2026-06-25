@@ -32,6 +32,19 @@ DEFAULT_DISPATCH_ORDER_POLICY: DispatchOrderPolicy = "recovery_preferred_with_pe
 _RUNNABLE_RECOVERY_ACTIONS = frozenset({"resume", "retry", "reconcile"})
 
 
+def normalize_dispatch_selection_mode(
+    requested_mode: DispatchSelectionMode | None,
+    *,
+    recovery_slots: int | None = None,
+) -> DispatchSelectionMode:
+    """Normalize CLI-selected dispatch mode into the shared internal model."""
+    if requested_mode is not None:
+        return requested_mode
+    if recovery_slots is not None and recovery_slots <= 0:
+        return "pending_only"
+    return "default"
+
+
 @dataclass(frozen=True)
 class DispatchPreviewEntry:
     """One ordered recovery or pending candidate in the shared dispatch preview."""

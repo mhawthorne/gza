@@ -597,7 +597,7 @@ def test_configuration_docs_describe_recovery_vs_pending_operating_surface() -> 
         "Lifecycle-action entries belong to `advance` / `watch`, not `work`.",
         "Pending lane entries belong to `work` / `watch`.",
         "`gza next` now renders three distinct sections:",
-        "`uv run gza queue` shows the pending lane by default; add `--full` to also show recovery and lifecycle actions.",
+        "`uv run gza queue` shows the pending lane by default; add `--full`, `--recovery`, or `--recovery-first` for broader dispatch previews.",
     ]
 
     for snippet in required_snippets:
@@ -1053,7 +1053,7 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
     assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
-    assert "add `--full` to also show matching recovery and lifecycle lanes, plus out-of-scope derived blockers without starting them" in config_content
+    assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in config_content
     assert "Only list pending tasks matching tag filters by default" in config_content
     assert "Only list recovery, lifecycle, and pending lanes matching tag filters" not in config_content
 

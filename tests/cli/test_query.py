@@ -3575,6 +3575,38 @@ class TestQueueCommand:
         assert "Lifecycle actions:" not in result.stdout
         assert failed.id not in result.stdout
 
+    @pytest.mark.parametrize("flag", ["--recovery", "--recovery-only"])
+    def test_queue_recovery_only_mode_omits_lifecycle_and_pending_sections(
+        self,
+        tmp_path: Path,
+        flag: str,
+    ) -> None:
+        failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
+
+        with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza("queue", flag, "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
+        assert "Recovery lane:" in result.stdout
+        assert f"resume {failed.id}" in normalized
+        assert "Lifecycle actions:" not in result.stdout
+        assert "Pending lane:" not in result.stdout
+        assert "Pending queue work" not in result.stdout
+        assert plan.id not in result.stdout
+
+    def test_queue_recovery_only_empty_state_reports_no_recovery_candidates(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store.add("Pending queue task")
+
+        result = invoke_gza("queue", "--recovery", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "No recovery candidates" in result.stdout
+        assert "No pending tasks" not in result.stdout
+        assert "Pending lane:" not in result.stdout
+
     def test_queue_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
         failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
 
@@ -3631,7 +3663,7 @@ class TestQueueCommand:
         pending_idx = result.stdout.index("Pending lane:")
         assert recovery_idx < lifecycle_idx < pending_idx
 
-    def test_queue_default_listing_is_git_free_but_full_mode_exercises_git_path(self, tmp_path: Path) -> None:
+    def test_queue_pending_mode_is_git_free_but_default_mode_exercises_git_path(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         task = store.add("Pending queue task")
@@ -3653,7 +3685,7 @@ class TestQueueCommand:
                     all=False,
                     tags=None,
                     any_tag=False,
-                    full=False,
+                    dispatch_mode="pending_only",
                 )
             )
 
@@ -3678,7 +3710,7 @@ class TestQueueCommand:
                         all=False,
                         tags=None,
                         any_tag=False,
-                        full=True,
+                        dispatch_mode=None,
                     )
                 )
 

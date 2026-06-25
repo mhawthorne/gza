@@ -42,6 +42,7 @@ from ..dispatch_preview import (
     DispatchPreviewEntry,
     DispatchSelectionMode,
     build_dispatch_preview,
+    normalize_dispatch_selection_mode,
     plan_watch_dispatch_entries,
 )
 from ..git import Git, GitError
@@ -1660,12 +1661,20 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--max-idle", str(args.max_idle)])
     if getattr(args, "max_iterations", None) is not None:
         argv.extend(["--max-iterations", str(args.max_iterations)])
-    recovery_mode = getattr(args, "recovery_mode", None)
-    if recovery_mode is None and getattr(args, "restart_failed", False):
-        recovery_mode = "recovery-only"
-    if recovery_mode == "recovery-only":
+    requested_dispatch_mode = getattr(args, "dispatch_mode", None)
+    if requested_dispatch_mode is None and hasattr(args, "recovery_mode"):
+        requested_dispatch_mode = getattr(args, "recovery_mode", None)
+    if requested_dispatch_mode is None and getattr(args, "restart_failed", False):
+        requested_dispatch_mode = "recovery_only"
+    dispatch_mode = _normalize_watch_dispatch_selection_mode(
+        dispatch_mode=cast(str | None, requested_dispatch_mode),
+        recovery_slots=getattr(args, "recovery_slots", None),
+    )
+    if dispatch_mode == "recovery_only":
         argv.append("--recovery-only")
-    elif recovery_mode == "pending-only":
+    elif dispatch_mode == "recovery_first_explicit":
+        argv.append("--recovery-first")
+    elif dispatch_mode == "pending_only":
         argv.append("--pending-only")
     if getattr(args, "recovery_slots", None) is not None:
         argv.extend(["--recovery-slots", str(args.recovery_slots)])
@@ -2075,16 +2084,19 @@ class _WatchCycleAnalysis:
 
 def _normalize_watch_dispatch_selection_mode(
     *,
-    recovery_mode: str | None,
-    recovery_slots: int,
+    dispatch_mode: str | None,
+    recovery_slots: int | None,
 ) -> DispatchSelectionMode:
-    if recovery_mode == "recovery-only":
-        return "recovery_only"
-    if recovery_mode == "pending-only" or recovery_slots <= 0:
-        return "pending_only"
-    if recovery_mode == "recovery-first":
-        return "recovery_first_explicit"
-    return "default"
+    if dispatch_mode == "recovery-only":
+        dispatch_mode = "recovery_only"
+    elif dispatch_mode == "pending-only":
+        dispatch_mode = "pending_only"
+    elif dispatch_mode == "recovery-first":
+        dispatch_mode = "recovery_first_explicit"
+    return normalize_dispatch_selection_mode(
+        cast(DispatchSelectionMode | None, dispatch_mode),
+        recovery_slots=recovery_slots,
+    )
 
 
 def _filter_watch_dispatch_preview_entries(
@@ -2390,7 +2402,7 @@ def _analyze_watch_cycle(
     tags: tuple[str, ...] | None,
     any_tag: bool,
     recovery_slots: int,
-    recovery_mode: str | None,
+    recovery_mode: DispatchSelectionMode | None,
     max_recovery_attempts: int,
 ) -> _WatchCycleAnalysis:
     del slots, recovery_slots, recovery_mode
@@ -2568,7 +2580,7 @@ def _run_cycle(
     any_tag: bool = False,
     quiet: bool = False,
     recovery_slots: int = 1,
-    recovery_mode: str | None = None,
+    recovery_mode: DispatchSelectionMode | None = None,
     restart_failed: bool = False,
     restart_failed_batch: int | None = None,
     max_recovery_attempts: int = 1,
@@ -2585,9 +2597,13 @@ def _run_cycle(
     tags = normalize_tag_filters(tags)
     if restart_failed:
         recovery_slots = batch if restart_failed_batch is None else restart_failed_batch
-        recovery_mode = "recovery-only"
+        recovery_mode = "recovery_only"
     elif restart_failed_batch is not None:
         recovery_slots = restart_failed_batch
+    recovery_mode = _normalize_watch_dispatch_selection_mode(
+        dispatch_mode=recovery_mode,
+        recovery_slots=recovery_slots,
+    )
 
     log.begin_cycle()
     _warn_if_installed_gza_changed(
@@ -3491,10 +3507,7 @@ def _run_cycle(
                 parked_recovery_subject_ids.add(str(failed.id))
                 if decision.recovery_task_id is not None:
                     pending_recovery_task_ids.add(decision.recovery_task_id)
-    dispatch_selection_mode = _normalize_watch_dispatch_selection_mode(
-        recovery_mode=recovery_mode,
-        recovery_slots=recovery_slots,
-    )
+    dispatch_selection_mode = recovery_mode
     dispatch_preview = build_dispatch_preview(
         store,
         config=config,
@@ -3927,7 +3940,7 @@ def _run_cycle(
                 message=_watch_needs_attention_message(failed, no_progress_attention),
             )
 
-    if recovery_mode == "recovery-only" and pending_slots <= 0 and not recovery_started_this_cycle:
+    if recovery_mode == "recovery_only" and pending_slots <= 0 and not recovery_started_this_cycle:
         if not nonparked_recovery_subject_ids:
             pending_fallback_preview = build_dispatch_preview(
                 store,
@@ -4196,14 +4209,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
     max_iterations = (
         args.max_iterations if args.max_iterations is not None else config.watch.max_iterations
     )
-    recovery_mode = getattr(args, "recovery_mode", None)
-    if recovery_mode is None and getattr(args, "restart_failed", False):
-        recovery_mode = "recovery-only"
+    requested_dispatch_mode = getattr(args, "dispatch_mode", None)
+    if requested_dispatch_mode is None and hasattr(args, "recovery_mode"):
+        requested_dispatch_mode = getattr(args, "recovery_mode", None)
+    if requested_dispatch_mode is None and getattr(args, "restart_failed", False):
+        requested_dispatch_mode = "recovery_only"
     auto_restart_on_drift = bool(getattr(args, "auto_restart_on_drift", True))
     recovery_slots_arg = getattr(args, "recovery_slots", None)
     if recovery_slots_arg is None:
         recovery_slots_arg = getattr(args, "restart_failed_batch", None)
     recovery_slots = recovery_slots_arg if recovery_slots_arg is not None else config.watch.recovery_slots
+    dispatch_mode = _normalize_watch_dispatch_selection_mode(
+        dispatch_mode=cast(str | None, requested_dispatch_mode),
+        recovery_slots=recovery_slots,
+    )
     max_recovery_attempts = (
         args.max_resume_attempts
         if getattr(args, "max_resume_attempts", None) is not None
@@ -4233,9 +4252,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if recovery_slots < 0:
         print("Error: --recovery-slots must be a non-negative integer")
         return 1
-    if recovery_mode == "recovery-only":
+    if dispatch_mode == "recovery_only":
         recovery_slots = batch
-    elif recovery_mode == "pending-only":
+    elif dispatch_mode == "pending_only":
         recovery_slots = 0
     if max_recovery_attempts < 0:
         print("Error: --max-resume-attempts must be non-negative")
@@ -4294,7 +4313,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         system_hold_active = False
 
         # Preview the first watch pass and ask for confirmation before executing
-        if recovery_mode == "recovery-only" and dry_run:
+        if dispatch_mode == "recovery_only" and dry_run:
             _dry_run_git = Git(config.project_dir)
             _dry_run_target_branch = _dry_run_git.default_branch()
             _emit_recovery_dry_run_report(
@@ -4327,7 +4346,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 tags=tag_filters,
                 any_tag=any_tag,
                 recovery_slots=recovery_slots,
-                recovery_mode=recovery_mode,
+                recovery_mode=dispatch_mode,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
                 auto_restart_on_drift=auto_restart_on_drift,
@@ -4374,7 +4393,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 config=config,
                 log=log,
-                restart_failed_mode=recovery_mode == "recovery-only",
+                restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
             )
             previous_snapshot = pre_cycle_snapshot
@@ -4390,7 +4409,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 tags=tag_filters,
                 any_tag=any_tag,
                 recovery_slots=recovery_slots,
-                recovery_mode=recovery_mode,
+                recovery_mode=dispatch_mode,
                 max_recovery_attempts=max_recovery_attempts,
                 show_skipped=show_skipped,
                 auto_restart_on_drift=auto_restart_on_drift,
@@ -4404,7 +4423,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 config=config,
                 log=log,
-                restart_failed_mode=recovery_mode == "recovery-only",
+                restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
             )
             completed_ids = _collect_completed_transition_ids(
@@ -4425,7 +4444,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 current_snapshot,
                 store=store,
                 max_recovery_attempts=max_recovery_attempts,
-                restart_failed_mode=recovery_mode == "recovery-only",
+                restart_failed_mode=dispatch_mode == "recovery_only",
                 tags=tag_filters,
                 any_tag=any_tag,
             )
@@ -4556,7 +4575,15 @@ def cmd_queue(args: argparse.Namespace) -> int:
     store = get_store(config)
     service = TaskQueryService(store)
     action = getattr(args, "queue_action", None)
-    full = bool(getattr(args, "full", False))
+    requested_dispatch_mode = getattr(args, "dispatch_mode", None)
+    if requested_dispatch_mode is None and hasattr(args, "full"):
+        requested_dispatch_mode = "default" if bool(getattr(args, "full", False)) else "pending_only"
+    dispatch_mode = normalize_dispatch_selection_mode(
+        cast(DispatchSelectionMode | None, requested_dispatch_mode)
+    )
+    show_recovery = dispatch_mode != "pending_only"
+    show_lifecycle = dispatch_mode in {"default", "recovery_first_explicit"}
+    show_pending = dispatch_mode != "recovery_only"
     try:
         tag_filters, any_tag = parse_cli_tag_filters(args)
     except ValueError as exc:
@@ -4648,7 +4675,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
     recovery_entries: list[RecoveryLaneEntry] = []
     lifecycle_entries: list[LifecycleActionEntry] = []
     scope_gaps: list[ScopedTagScopeGap] = []
-    if full:
+    runnable_pending: list[DbTask] = []
+    blocked_pending: list[TaskRow] = []
+    if show_recovery or show_lifecycle:
         queue_git = Git(config.project_dir)
         queue_target_branch = queue_git.default_branch()
         scope_gaps = collect_scoped_tag_scope_gaps(
@@ -4659,40 +4688,88 @@ def cmd_queue(args: argparse.Namespace) -> int:
             git=queue_git,
             target_branch=queue_target_branch,
         )
-        recovery_entries = collect_recovery_lane_entries(
+        if show_recovery:
+            recovery_entries = collect_recovery_lane_entries(
+                store,
+                tags=normalized_tag_filters,
+                any_tag=any_tag,
+                max_recovery_attempts=config.max_resume_attempts,
+                git=queue_git,
+                target_branch=queue_target_branch,
+            )
+        if show_lifecycle:
+            lifecycle_entries = collect_lifecycle_action_entries(
+                store,
+                config=config,
+                git=queue_git,
+                target_branch=queue_target_branch,
+                tags=normalized_tag_filters,
+                any_tag=any_tag,
+                max_recovery_attempts=config.max_resume_attempts,
+                persist_post_merge_rebase_state=False,
+            )
+    if show_pending:
+        dispatch_preview = build_dispatch_preview(
             store,
             tags=normalized_tag_filters,
             any_tag=any_tag,
             max_recovery_attempts=config.max_resume_attempts,
-            git=queue_git,
-            target_branch=queue_target_branch,
+            selection_mode=dispatch_mode,
+            include_recovery=False,
         )
-        lifecycle_entries = collect_lifecycle_action_entries(
-            store,
-            config=config,
-            git=queue_git,
-            target_branch=queue_target_branch,
-            tags=normalized_tag_filters,
-            any_tag=any_tag,
-            max_recovery_attempts=config.max_resume_attempts,
-            persist_post_merge_rebase_state=False,
-        )
-    queue_rows = [
-        row
-        for row in service.run(
-            TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag)
-        ).rows
-        if isinstance(row, TaskRow)
-    ]
-    runnable_pending = [row.task for row in queue_rows if not bool(row.values.get("blocked"))]
-    blocked_pending = [row for row in queue_rows if bool(row.values.get("blocked"))]
+        runnable_pending = [entry.task for entry in dispatch_preview.pending_entries]
+        queue_rows = [
+            row
+            for row in service.run(
+                TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag)
+            ).rows
+            if isinstance(row, TaskRow)
+        ]
+        blocked_pending = [row for row in queue_rows if bool(row.values.get("blocked"))]
     if not runnable_pending and not blocked_pending and not recovery_entries and not lifecycle_entries:
-        if tag_filters:
+        if dispatch_mode == "recovery_only":
+            if tag_filters:
+                print(f"No recovery candidates matching tags: {', '.join(tag_filters)}")
+            else:
+                print("No recovery candidates")
+        elif tag_filters:
             print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
-            for gap in scope_gaps:
-                print(f"Scope gap: {_format_scope_gap_message(gap, tags=normalized_tag_filters, any_tag=any_tag)}")
         else:
             print("No pending tasks")
+        if show_recovery or show_lifecycle:
+            for gap in scope_gaps:
+                print(f"Scope gap: {_format_scope_gap_message(gap, tags=normalized_tag_filters, any_tag=any_tag)}")
+        return 0
+
+    if not show_pending:
+        if show_recovery:
+            console.print(
+                build_queue_summary(
+                    "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
+                )
+            )
+            if recovery_entries:
+                for entry in recovery_entries:
+                    console.print(_format_queue_recovery_lane_detail(entry))
+            else:
+                console.print("No recovery candidates")
+        if show_lifecycle:
+            console.print()
+            console.print(
+                build_queue_summary(
+                    "Lifecycle actions: `advance` / `watch` lifecycle work visible ahead of pending pickup."
+                )
+            )
+            if lifecycle_entries:
+                print_lifecycle_action_entries(console, lifecycle_entries)
+            else:
+                console.print("No lifecycle actions")
+        if show_recovery or show_lifecycle:
+            _print_queue_scope_gaps(
+                gaps=scope_gaps,
+                tags=normalized_tag_filters,
+                any_tag=any_tag,
+            )
         return 0
 
     limit_arg = getattr(args, "limit", 10)
@@ -4739,7 +4816,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
     widths = queue_render_widths(rendered_rows)
 
-    if full:
+    if show_recovery:
         console.print(
             build_queue_summary(
                 "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
@@ -4752,6 +4829,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             console.print("No recovery candidates")
 
         console.print()
+    if show_lifecycle:
         console.print(
             build_queue_summary(
                 "Lifecycle actions: `advance` / `watch` lifecycle work visible ahead of pending pickup."
@@ -4761,7 +4839,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print_lifecycle_action_entries(console, lifecycle_entries)
         else:
             console.print("No lifecycle actions")
-
         console.print()
     console.print(
         build_queue_summary(
@@ -4770,7 +4847,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
     if not runnable_pending and not blocked_pending:
         console.print("No pending tasks")
-        if full:
+        if show_recovery or show_lifecycle:
             _print_queue_scope_gaps(
                 gaps=scope_gaps,
                 tags=normalized_tag_filters,
@@ -4795,7 +4872,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         [row for row in rendered_rows if row.blocked],
         widths=widths,
     )
-    if full:
+    if show_recovery or show_lifecycle:
         _print_queue_scope_gaps(
             gaps=scope_gaps,
             tags=normalized_tag_filters,

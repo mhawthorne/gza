@@ -154,8 +154,9 @@ class TestHelpOutput:
         assert next_help.returncode == 0
         assert "recovery, lifecycle, and pending lanes separately" in next_help.stdout
         assert queue_help.returncode == 0
+        queue_help_text = " ".join(queue_help.stdout.split())
         assert "Preview the pending lane by default" in queue_help.stdout
-        assert "Add --full to also show the recovery and lifecycle lanes" in queue_help.stdout
+        assert "Use --full, --recovery, or --recovery-first for broader dispatch previews." in queue_help_text
         assert work_help.returncode == 0
         assert "does not run recovery or review/merge lifecycle work" in work_help.stdout
         assert advance_help.returncode == 0
@@ -679,8 +680,8 @@ class TestHelpOutput:
         assert expected in docs_text
         assert "If GitHub is unavailable, lookup fails, or no live PR exists, fix preserves the normal auto-review flow." in docs_text
 
-    def test_watch_and_queue_tag_help_point_to_same_scoped_pickup_preview(self, tmp_path):
-        """Help/docs should describe default pending previews and `--full` expanded queue scope."""
+    def test_watch_and_queue_tag_help_point_to_same_scoped_dispatch_preview(self, tmp_path):
+        """Help/docs should describe the queue/watch preview surface and the new mode flags."""
         setup_config(tmp_path)
 
         watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
@@ -692,15 +693,17 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'uv run gza queue --tag TAG' to preview the matching pending pickup order, or add '--full' to also preview matching recovery candidates and lifecycle actions" in watch_text
-        assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_text
+        assert "use 'uv run gza queue --tag TAG' to preview the matching pending pickup order" in watch_text
+        assert "derived blockers" in watch_text
+        assert "does not start them" in watch_text
         assert "pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'" in queue_text
-        assert "Add --full to also show matching recovery and lifecycle lanes, plus out-of-scope derived blockers without starting them" in queue_text
+        assert "Add '--full' to preview matching recovery candidates and lifecycle actions too" in queue_text
+        assert "--recovery-first" in queue_text
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
         assert "Only list pending tasks matching tag filters by default" in docs_text
-        assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in docs_text
-        assert "Add `--full` when you also want the same-scope recovery lane, lifecycle actions, and scope-gap diagnostics" in docs_text
+        assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order" in docs_text
+        assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in docs_text
         assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_recovery_lane_flags(self, tmp_path):
@@ -712,6 +715,7 @@ class TestHelpOutput:
         assert "default: watch.batch or 2" in text
         assert "--recovery-slots" in text
         assert "--recovery-only" in text
+        assert "--recovery-first" in text
         assert "--pending-only" in text
         assert "--restart-failed" not in text
         assert "--restart-failed-batch" not in text
@@ -737,6 +741,7 @@ class TestHelpOutput:
         assert "Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and the recovery lane" in docs_text
         assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in docs_text
         assert "`watch.recovery_slots`" in docs_text
+        assert "`--recovery-first`" in docs_text
         assert "`--pending-only`" in docs_text
         assert "live watch logs" in docs_text
 
@@ -1384,6 +1389,70 @@ class TestCommandAliases:
         assert args.task_id == "test-project-1"
         if queue_action == "move":
             assert args.position == 2
+
+    def test_watch_recovery_only_and_recovery_first_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "gza",
+                "watch",
+                "--recovery-only",
+                "--recovery-first",
+                "--project",
+                str(tmp_path),
+            ],
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                main()
+
+        assert excinfo.value.code == 2
+
+    def test_queue_pending_and_recovery_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "gza",
+                "queue",
+                "--pending",
+                "--recovery",
+                "--project",
+                str(tmp_path),
+            ],
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                main()
+
+        assert excinfo.value.code == 2
+
+    @pytest.mark.parametrize("flag", ["--recovery", "--recovery-only"])
+    def test_queue_recovery_flags_map_to_same_internal_dispatch_mode(
+        self,
+        tmp_path: Path,
+        flag: str,
+    ) -> None:
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "queue", flag, "--project", str(tmp_path)]),
+            patch("gza.cli.main.cmd_queue", return_value=0) as cmd_queue,
+        ):
+            rc = main()
+
+        assert rc == 0
+        args = cmd_queue.call_args.args[0]
+        assert args.dispatch_mode == "recovery_only"
 
 
 class TestWorkForceBackgroundDispatch:
