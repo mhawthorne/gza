@@ -1123,7 +1123,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the matching pending pickup order, or add '--full' to also preview matching recovery candidates and lifecycle actions. Add '--recovery-first' to restrict pending display to explicitly positioned tasks. Scoped watch reports out-of-scope derived blockers but does not start them",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG --pending' to preview the matching pending pickup order, or plain 'uv run gza queue --tag TAG' for the shared recovery+pending preview. Add '--recovery-first' to restrict pending display to explicitly positioned tasks. Scoped watch reports out-of-scope derived blockers but does not start them",
     )
     watch_parser.add_argument(
         "--all-tags",
@@ -1237,17 +1237,17 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="Preview the pending lane by default; use --full, --recovery, or --recovery-first for broader dispatch previews; manage pending-lane ordering",
-        description="Preview the pending lane by default and manage pending-lane ordering. Use --full, --recovery, or --recovery-first for broader dispatch previews.",
+        help="Preview the shared dispatch order by default; use --pending or --recovery for narrower views; manage pending-lane ordering",
+        description="Preview the shared dispatch order by default and manage pending-lane ordering. Use --pending or --recovery for narrower views.",
     )
     add_common_args(queue_parser)
-    queue_parser.set_defaults(limit=10, all=False, dispatch_mode="pending_only")
+    queue_parser.set_defaults(limit=10, all=False)
     queue_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list pending tasks matching tag filters by default (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Add '--full' to preview matching recovery candidates and lifecycle actions too, or '--recovery-first' to limit pending display to explicitly positioned tasks",
+        help="Only preview dispatch rows matching tag filters (repeatable); the pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Use '--pending' for the pending-only view or '--recovery-first' to limit pending display to explicitly positioned tasks",
     )
     queue_parser.add_argument(
         "--all-tags",
@@ -1289,19 +1289,19 @@ def main() -> int:
         action="store_const",
         const="default",
         dest="dispatch_mode",
-        help="Compatibility alias for the default multi-lane dispatch preview",
+        help="Compatibility alias for the default shared dispatch preview",
     )
     queue_parser.add_argument(
         "-n",
         "--limit",
         type=_parse_queue_limit,
         metavar="N",
-        help="Show first N runnable tasks (default: 10; blocked tasks are always shown; use 0, -1, or --all for all runnable tasks)",
+        help="Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use 0, -1, or --all for all runnable rows)",
     )
     queue_parser.add_argument(
         "--all",
         action="store_true",
-        help="Show all runnable tasks (blocked tasks are always shown)",
+        help="Show all runnable dispatch rows (blocked pending and needs-human recovery rows are always shown)",
     )
 
     def _add_queue_tag_scope_args(subparser: argparse.ArgumentParser, *, action: str) -> None:

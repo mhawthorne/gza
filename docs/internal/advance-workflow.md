@@ -450,7 +450,7 @@ Default `gza watch` uses the same bounded shared recovery policy as the explicit
 
 `gza watch` now shares the same lifecycle execution gate as `gza advance`: every actionable non-worker lifecycle action runs regardless of free worker slots, while worker-consuming actions remain slot-gated. Watch still owns scheduling order and live slot accounting; only the action-type gate is shared.
 Separately from the failed-task recovery lane, each watch pass now emits one concise `Lifecycle actions (...)` summary line for the actionable review/rebase/merge/materialization work already queued in that pass's lifecycle plan. The summary reuses the shared lifecycle action types rather than inventing watch-only wording, and it appears once per pass before execution so operators can compare watch behavior with `advance --dry-run`.
-`gza queue` is now the lighter operator preview: by default it renders only the git-free pending lane, and `gza queue --full` opts into the recovery lane, lifecycle lane, and scope-gap diagnostics that depend on the shared git-backed planning context.
+`gza queue` is now the shared dispatch preview: by default it renders runnable recovery plus pending in watch order, with separate needs-human recovery rows and blocked pending rows outside the runnable cap. `gza queue --pending` is the git-free pending-only view; `gza queue --recovery` is the recovery-only view.
 
 When the recovery lane is active:
 

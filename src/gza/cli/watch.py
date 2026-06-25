@@ -7195,6 +7195,50 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _queue_section_count_text(*, shown: int, total: int) -> str:
+    """Return a stable per-section count string for queue output."""
+    remaining = max(0, total - shown)
+    if remaining == 0:
+        return f"{shown} shown / all shown"
+    return f"{shown} shown / {remaining} more"
+
+
+def _queue_section_summary(title: str, *, shown: int, total: int) -> Text:
+    """Build a queue summary line with explicit shown/more counts."""
+    return build_queue_summary(f"{title}: {_queue_section_count_text(shown=shown, total=total)}")
+
+
+def _recovery_lane_entry_from_preview_entry(
+    store: SqliteTaskStore,
+    entry: DispatchPreviewEntry,
+    *,
+    max_recovery_attempts: int,
+    read_context: RecoveryReadContext | None,
+) -> RecoveryLaneEntry | None:
+    """Adapt a dispatch preview entry onto the shared recovery display path."""
+    decision = entry.decision
+    owner_task = entry.owner_task
+    if decision is None or owner_task is None:
+        return None
+    attention_action: dict[str, Any] | None = None
+    if not entry.runnable:
+        attention_action = failed_recovery_decision_to_attention_action(
+            store,
+            entry.task,
+            decision,
+            max_recovery_attempts=max_recovery_attempts,
+            read_context=read_context,
+        )
+        if attention_action is None:
+            return None
+    return RecoveryLaneEntry(
+        owner_task=owner_task,
+        task=entry.task,
+        decision=decision,
+        attention_action=attention_action,
+    )
+
+
 def cmd_queue(args: argparse.Namespace) -> int:
     """Inspect and adjust pending queue urgency."""
     config = Config.load(args.project_dir)
@@ -7302,13 +7346,18 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print(f"{message} (task is not currently runnable; ordering will apply once runnable)")
         return 0
 
+    dispatch_preview = None
     recovery_entries: list[RecoveryLaneEntry] = []
+    needs_human_entries: list[RecoveryLaneEntry] = []
     lifecycle_entries: list[LifecycleActionEntry] = []
     scope_gaps: list[ScopedTagScopeGap] = []
-    runnable_pending: list[DbTask] = []
+    runnable_pending_total: list[DbTask] = []
     blocked_pending: list[TaskRow] = []
+    preview_git: Git | None = None
+    queue_target_branch: str | None = None
     if show_recovery or show_lifecycle:
         queue_git = Git(config.project_dir)
+        preview_git = queue_git
         queue_target_branch = queue_git.default_branch()
         scope_gaps = collect_scoped_tag_scope_gaps(
             store,
@@ -7318,15 +7367,6 @@ def cmd_queue(args: argparse.Namespace) -> int:
             git=queue_git,
             target_branch=queue_target_branch,
         )
-        if show_recovery:
-            recovery_entries = collect_recovery_lane_entries(
-                store,
-                tags=normalized_tag_filters,
-                any_tag=any_tag,
-                max_recovery_attempts=config.max_resume_attempts,
-                git=queue_git,
-                target_branch=queue_target_branch,
-            )
         if show_lifecycle:
             lifecycle_entries = collect_lifecycle_action_entries(
                 store,
@@ -7338,18 +7378,72 @@ def cmd_queue(args: argparse.Namespace) -> int:
                 max_recovery_attempts=config.max_resume_attempts,
                 persist_post_merge_rebase_state=False,
             )
-    queue_rows = [
-        row
-        for row in service.run(
-            TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag),
-            config=config,
-        ).rows
-        if isinstance(row, TaskRow)
-    ]
-    runnable_rows, quiet_rows, blocked_pending = partition_queue_rows(queue_rows)
-    runnable_pending = [row.task for row in runnable_rows]
-    if not runnable_pending and not quiet_rows and not blocked_pending and not recovery_entries and not lifecycle_entries:
-        if tag_filters:
+    quiet_rows: list[TaskRow] = []
+    if show_recovery or show_pending:
+        dispatch_preview = build_dispatch_preview(
+            store,
+            tags=normalized_tag_filters,
+            any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
+            selection_mode=dispatch_mode,
+            include_recovery=show_recovery,
+            include_pending=show_pending,
+            git=preview_git,
+            target_branch=queue_target_branch,
+        )
+        if show_recovery:
+            recovery_entries = [
+                adapted
+                for adapted in (
+                    _recovery_lane_entry_from_preview_entry(
+                        store,
+                        entry,
+                        max_recovery_attempts=config.max_resume_attempts,
+                        read_context=dispatch_preview.read_context,
+                    )
+                    for entry in dispatch_preview.runnable_entries
+                    if entry.lane == "recovery"
+                )
+                if adapted is not None
+            ]
+            needs_human_entries = [
+                adapted
+                for adapted in (
+                    _recovery_lane_entry_from_preview_entry(
+                        store,
+                        entry,
+                        max_recovery_attempts=config.max_resume_attempts,
+                        read_context=dispatch_preview.read_context,
+                    )
+                    for entry in dispatch_preview.needs_human_entries
+                )
+                if adapted is not None
+            ]
+        if show_pending:
+            runnable_pending_total = [entry.task for entry in dispatch_preview.pending_entries]
+            queue_rows = [
+                row
+                for row in service.run(
+                    TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag),
+                    config=config,
+                ).rows
+                if isinstance(row, TaskRow)
+            ]
+            _runnable_rows, quiet_rows, blocked_pending = partition_queue_rows(queue_rows)
+    if (
+        not runnable_pending_total
+        and not quiet_rows
+        and not blocked_pending
+        and not recovery_entries
+        and not needs_human_entries
+        and not lifecycle_entries
+    ):
+        if dispatch_mode == "recovery_only":
+            if tag_filters:
+                print(f"No recovery candidates matching tags: {', '.join(tag_filters)}")
+            else:
+                print("No recovery candidates")
+        elif tag_filters:
             print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
             print("No pending tasks")
@@ -7361,13 +7455,27 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if not show_pending:
         if show_recovery:
             console.print(
-                build_queue_summary("Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup.")
+                _queue_section_summary(
+                    "Runnable recovery lane (watch will run)",
+                    shown=len(recovery_entries),
+                    total=len(recovery_entries),
+                )
             )
             if recovery_entries:
                 for entry in recovery_entries:
                     console.print(_format_queue_recovery_lane_detail(entry))
             else:
                 console.print("No recovery candidates")
+            console.print()
+            console.print(
+                _queue_section_summary(
+                    "Needs human - watch skips",
+                    shown=len(needs_human_entries),
+                    total=len(needs_human_entries),
+                )
+            )
+            for entry in needs_human_entries:
+                console.print(_format_queue_recovery_lane_detail(entry))
         if show_lifecycle:
             console.print()
             console.print(
@@ -7390,9 +7498,30 @@ def cmd_queue(args: argparse.Namespace) -> int:
     limit_arg = getattr(args, "limit", 10)
     show_all = bool(getattr(args, "all", False)) or limit_arg in {0, -1}
     display_limit = None if show_all else max(1, int(limit_arg))
-    visible_runnable = runnable_pending if display_limit is None else runnable_pending[:display_limit]
+    runnable_preview_entries = tuple(dispatch_preview.runnable_entries if dispatch_preview is not None else ())
+    visible_runnable_entries = (
+        runnable_preview_entries
+        if display_limit is None
+        else runnable_preview_entries[:display_limit]
+    )
+    visible_recovery_entries = [entry for entry in visible_runnable_entries if entry.lane == "recovery"]
+    visible_pending_entries = [entry for entry in visible_runnable_entries if entry.lane == "pending"]
+    visible_runnable_recovery = [
+        adapted
+        for adapted in (
+            _recovery_lane_entry_from_preview_entry(
+                store,
+                entry,
+                max_recovery_attempts=config.max_resume_attempts,
+                read_context=None if dispatch_preview is None else dispatch_preview.read_context,
+            )
+            for entry in visible_recovery_entries
+        )
+        if adapted is not None
+    ]
     rendered_rows = [
-        QueueRenderRow(task=task, position_text=str(index)) for index, task in enumerate(visible_runnable, 1)
+        QueueRenderRow(task=entry.task, position_text=str(index))
+        for index, entry in enumerate(visible_pending_entries, 1)
     ]
 
     def _blocked_by_text(row: TaskRow) -> str:
@@ -7444,14 +7573,14 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     if show_recovery:
         console.print(
-            build_queue_summary("Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup.")
+            _queue_section_summary(
+                "Runnable recovery lane (watch will run)",
+                shown=len(visible_runnable_recovery),
+                total=len(recovery_entries),
+            )
         )
-        if recovery_entries:
-            for entry in recovery_entries:
-                console.print(_format_queue_recovery_lane_detail(entry))
-        else:
-            console.print("No recovery candidates")
-
+        for entry in visible_runnable_recovery:
+            console.print(_format_queue_recovery_lane_detail(entry))
         console.print()
     if show_lifecycle:
         console.print(
@@ -7465,9 +7594,13 @@ def cmd_queue(args: argparse.Namespace) -> int:
             console.print("No lifecycle actions")
         console.print()
     console.print(
-        build_queue_summary("Pending lane: `gza queue` preview only. `gza work` / `watch` start from this lane.")
+        _queue_section_summary(
+            "Pending lane (watch will run after recovery policy allows slots)",
+            shown=len(visible_pending_entries),
+            total=len(runnable_pending_total),
+        )
     )
-    if not runnable_pending and not quiet_rows and not blocked_pending:
+    if not runnable_pending_total and not quiet_rows and not blocked_pending:
         console.print("No pending tasks")
         if show_recovery or show_lifecycle:
             _print_queue_scope_gaps(
@@ -7482,8 +7615,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
     elif quiet_rendered_rows or blocked_pending:
         console.print("No runnable tasks")
 
-    if display_limit is not None and len(runnable_pending) > display_limit:
-        remaining = len(runnable_pending) - display_limit
+    if display_limit is not None and len(runnable_pending_total) > display_limit:
+        remaining = len(runnable_pending_total) - display_limit
         plural = "tasks" if remaining != 1 else "task"
         console.print(
             build_queue_summary(f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)")
@@ -7498,11 +7631,31 @@ def cmd_queue(args: argparse.Namespace) -> int:
         )
         print_queue_rows(console, quiet_rendered_rows, widths=widths)
 
-    print_queue_rows(
-        console,
-        [row for row in rendered_rows if row.blocked],
-        widths=widths,
-    )
+    if blocked_pending:
+        console.print()
+        console.print(
+            _queue_section_summary(
+                "Blocked pending rows (outside runnable cap)",
+                shown=len(blocked_pending),
+                total=len(blocked_pending),
+            )
+        )
+        print_queue_rows(
+            console,
+            [row for row in rendered_rows if row.blocked],
+            widths=widths,
+        )
+    if show_recovery:
+        console.print()
+        console.print(
+            _queue_section_summary(
+                "Needs human - watch skips",
+                shown=len(needs_human_entries),
+                total=len(needs_human_entries),
+            )
+        )
+        for entry in needs_human_entries:
+            console.print(_format_queue_recovery_lane_detail(entry))
     if show_recovery or show_lifecycle:
         _print_queue_scope_gaps(
             gaps=scope_gaps,

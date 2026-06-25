@@ -879,7 +879,7 @@ def test_configuration_docs_describe_recovery_vs_pending_operating_surface() -> 
         "Lifecycle-action entries belong to `advance` / `watch`, not `work`.",
         "Pending lane entries belong to `work` / `watch`.",
         "`gza next` now renders three distinct sections:",
-        "`uv run gza queue` shows the pending lane by default; add `--full`, `--recovery`, or `--recovery-first` for broader dispatch previews.",
+        "`uv run gza queue` shows the shared dispatch preview by default; use `--pending` for the pending-only view, `--recovery` for recovery-only, or `--recovery-first` to limit pending rows to explicit queue positions.",
     ]
 
     for snippet in required_snippets:
@@ -1337,7 +1337,7 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in watch_section
     assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup" in watch_section
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
-    assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in watch_section
+    assert "use `uv run gza queue --tag TAG --pending` to preview the matching pending pickup order" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
     assert "watch.parked_auto_rearm.enabled" in watch_section
     assert "watch.parked_auto_rearm.require_target_advanced" in watch_section
@@ -1351,8 +1351,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "fresh `retry-limit` clear records one durable manual rearm epoch" in unstick_section
     assert "not currently parked" in unstick_section
     assert "missing branch cannot prove unresolved" in unstick_section
-    assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in config_content
-    assert "Only list pending tasks matching tag filters by default" in config_content
+    assert "use `--pending` for the pending-only view" in config_content
+    assert "Only preview dispatch rows matching tag filters" in config_content
     assert "Only list recovery, lifecycle, and pending lanes matching tag filters" not in config_content
 
     assert "\ngza advance [task_id] [options]\n" not in advance_section

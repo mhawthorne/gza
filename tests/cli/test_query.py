@@ -3390,7 +3390,7 @@ class TestQueueCommand:
         monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
         yield
 
-    def test_queue_defaults_to_first_ten_runnable_tasks(self, tmp_path: Path):
+    def test_queue_defaults_to_first_ten_runnable_dispatch_rows(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3404,23 +3404,9 @@ class TestQueueCommand:
         assert "Task 10" in result.stdout
         assert "Task 11" not in result.stdout
         assert "Task 12" not in result.stdout
-        assert "2 more runnable tasks" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots): 10 shown / 2 more" in result.stdout
 
-    def test_queue_shows_recovery_lane_separately_from_pending_lane(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
-        store.add("Pending queue task")
-
-        result = invoke_gza("queue", "--full", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Recovery lane:" in result.stdout
-        assert "Pending lane:" in result.stdout
-        assert f"retry {failed.id}" in " ".join(result.stdout.split())
-        assert "Pending queue task" in result.stdout
-
-    def test_queue_default_shows_only_pending_lane(self, tmp_path: Path):
+    def test_queue_default_shows_recovery_and_pending_from_shared_preview(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
         failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
@@ -3429,31 +3415,64 @@ class TestQueueCommand:
         result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Pending lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
+        assert f"retry {failed.id}" in " ".join(result.stdout.split())
         assert "Pending queue task" in result.stdout
-        assert "Recovery lane:" not in result.stdout
+
+    def test_queue_pending_mode_shows_only_pending_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
+        store.add("Pending queue task")
+
+        result = invoke_gza("queue", "--pending", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
+        assert "Pending queue task" in result.stdout
+        assert "Runnable recovery lane (watch will run):" not in result.stdout
+        assert "Needs human - watch skips:" not in result.stdout
         assert "Lifecycle actions:" not in result.stdout
         assert failed.id not in result.stdout
 
     @pytest.mark.parametrize("flag", ["--recovery", "--recovery-only"])
-    def test_queue_recovery_only_mode_omits_lifecycle_and_pending_sections(
+    def test_queue_recovery_only_mode_shows_runnable_and_needs_human_sections(
         self,
         tmp_path: Path,
         flag: str,
     ) -> None:
-        failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        runnable = _create_failed_recovery_candidate(
+            store,
+            prompt="Resume me",
+            task_type="implement",
+            failure_reason="MAX_TURNS",
+            session_id="resume-session",
+        )
+        manual = _create_failed_recovery_candidate(
+            store,
+            prompt="Manual follow-up",
+            task_type="plan",
+            failure_reason="TEST_FAILURE",
+            session_id=None,
+        )
+        store.add("Pending queue work")
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", flag, "--project", str(tmp_path))
+            result = invoke_gza("queue", flag, "-n", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Recovery lane:" in result.stdout
-        assert f"resume {failed.id}" in normalized
+        assert "Runnable recovery lane (watch will run): 1 shown / all shown" in result.stdout
+        assert "Needs human - watch skips: 1 shown / all shown" in result.stdout
+        assert f"resume {runnable.id}" in normalized
+        assert manual.id in result.stdout
+        assert "Manual follow-up" in result.stdout
         assert "Lifecycle actions:" not in result.stdout
-        assert "Pending lane:" not in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" not in result.stdout
         assert "Pending queue work" not in result.stdout
-        assert plan.id not in result.stdout
 
     def test_queue_recovery_only_empty_state_reports_no_recovery_candidates(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -3465,25 +3484,25 @@ class TestQueueCommand:
         assert result.returncode == 0
         assert "No recovery candidates" in result.stdout
         assert "No pending tasks" not in result.stdout
-        assert "Pending lane:" not in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" not in result.stdout
 
     def test_queue_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
         failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Recovery lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
         assert "Lifecycle actions:" in result.stdout
-        assert "Pending lane:" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
         assert f"resume {failed.id}" in normalized
         assert plan.id in result.stdout
         assert "Materialize implementation slices from plan review" in result.stdout
-        recovery_idx = result.stdout.index("Recovery lane:")
+        recovery_idx = result.stdout.index("Runnable recovery lane (watch will run):")
         lifecycle_idx = result.stdout.index("Lifecycle actions:")
-        pending_idx = result.stdout.index("Pending lane:")
+        pending_idx = result.stdout.index("Pending lane (watch will run after recovery policy allows slots):")
         assert recovery_idx < lifecycle_idx < pending_idx
 
     def test_queue_preview_does_not_persist_merged_lifecycle_state(self, tmp_path: Path):
@@ -3491,7 +3510,7 @@ class TestQueueCommand:
         preview_git = _PreviewLifecycleGit(merged_branches=(merged_impl.branch or "",))
 
         with patch("gza.cli.watch.Git", return_value=preview_git):
-            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--project", str(tmp_path))
 
         store = make_store(tmp_path)
         refreshed_impl = store.get(merged_impl.id)
@@ -3508,19 +3527,19 @@ class TestQueueCommand:
         failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Recovery lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
         assert "Lifecycle actions:" in result.stdout
-        assert "Pending lane:" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
         assert f"resume {failed.id}" in normalized
         assert legacy_impl.id in result.stdout
         assert "Merge (review APPROVED)" in result.stdout
-        recovery_idx = result.stdout.index("Recovery lane:")
+        recovery_idx = result.stdout.index("Runnable recovery lane (watch will run):")
         lifecycle_idx = result.stdout.index("Lifecycle actions:")
-        pending_idx = result.stdout.index("Pending lane:")
+        pending_idx = result.stdout.index("Pending lane (watch will run after recovery policy allows slots):")
         assert recovery_idx < lifecycle_idx < pending_idx
 
     def test_queue_pending_mode_is_git_free_but_default_mode_exercises_git_path(self, tmp_path: Path) -> None:
@@ -3555,9 +3574,9 @@ class TestQueueCommand:
             output.plain if isinstance(output, Text) else str(output)
             for output in recording_console.outputs
         )
-        assert "Pending lane:" in rendered
+        assert "Pending lane (watch will run after recovery policy allows slots):" in rendered
         assert "Pending queue task" in rendered
-        assert "Recovery lane:" not in rendered
+        assert "Runnable recovery lane (watch will run):" not in rendered
         assert "Lifecycle actions:" not in rendered
 
         with patch.object(watch_cli, "Git", lambda _project_dir: exploding_git):
@@ -3624,20 +3643,28 @@ class TestQueueCommand:
         assert "Task 12" in result.stdout
         assert "more runnable tasks" not in result.stdout
 
-    def test_queue_limit_restricts_output(self, tmp_path: Path):
+    def test_queue_limit_restricts_combined_runnable_dispatch_order(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
-
-        for i in range(5):
-            store.add(f"Task {i + 1}")
+        failed = _create_failed_recovery_candidate(
+            store,
+            prompt="Retry first",
+            task_type="plan",
+            failure_reason="INFRASTRUCTURE_ERROR",
+            session_id=None,
+        )
+        store.add("Pending 1")
+        store.add("Pending 2")
 
         result = invoke_gza("queue", "-n", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Task 1" in result.stdout
-        assert "Task 2" in result.stdout
-        assert "Task 3" not in result.stdout
-        assert "3 more runnable tasks" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert f"retry {failed.id}" in normalized
+        assert "Pending 1" in result.stdout
+        assert "Pending 2" not in result.stdout
+        assert "Runnable recovery lane (watch will run): 1 shown / all shown" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots): 1 shown / 1 more" in result.stdout
 
     def test_queue_shows_quiet_lane_without_numbering_quiet_tasks(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -4331,7 +4358,7 @@ class TestQueueCommand:
         )
 
         assert result.returncode == 0
-        assert "Recovery lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
         assert "Scope gap:" in result.stdout
         assert failed.id in result.stdout
         assert retry_child.id in result.stdout
@@ -4691,7 +4718,7 @@ class TestQueueCommand:
         lines = result.stdout.splitlines()
         runnable_line = next(i for i, line in enumerate(lines) if "Runnable" in line)
         blocker_line = next(i for i, line in enumerate(lines) if "Dependency blocker" in line)
-        blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
+        blocked_line = next(i for i, line in enumerate(lines) if blocked.id in line and "Blocked pending" in line)
         assert runnable_line < blocker_line < blocked_line
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
@@ -4730,7 +4757,7 @@ class TestQueueCommand:
         assert "No pending tasks" not in result.stdout
         assert "Blocked pending" in result.stdout
         lines = result.stdout.splitlines()
-        blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
+        blocked_line = next(i for i, line in enumerate(lines) if blocked.id in line and "Blocked pending" in line)
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
@@ -4843,7 +4870,8 @@ class TestQueueCommand:
         assert result.returncode == 0
         lines = result.stdout.splitlines()
         task_line = next(i for i, line in enumerate(lines) if "Vanilla task" in line)
-        assert task_line == len(lines) - 1
+        if task_line + 1 < len(lines):
+            assert not lines[task_line + 1].startswith(" ")
 
     def test_queue_shows_urgent_and_blocked_metadata_on_same_second_line(self, tmp_path: Path):
         setup_config(tmp_path)

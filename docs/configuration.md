@@ -643,7 +643,7 @@ Use this matrix when deciding "what will this command actually touch?"
 Two operator-facing queue surfaces show these sets separately:
 
 - `uv run gza next` shows recovery, lifecycle actions, and pending as distinct sections.
-- `uv run gza queue` shows the pending lane by default; add `--full`, `--recovery`, or `--recovery-first` for broader dispatch previews.
+- `uv run gza queue` shows the shared dispatch preview by default; use `--pending` for the pending-only view, `--recovery` for recovery-only, or `--recovery-first` to limit pending rows to explicit queue positions.
 - Recovery lane entries belong to `advance` / `watch`, not `work`.
 - Lifecycle-action entries belong to `advance` / `watch`, not `work`.
 - Pending lane entries belong to `work` / `watch`.
@@ -1613,15 +1613,15 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--tag TAG` | Only list pending tasks matching tag filters by default (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; add `--full` to preview matching recovery candidates and lifecycle actions too, or `--recovery-first` to limit pending display to explicitly positioned tasks) |
+| `--tag TAG` | Only preview dispatch rows matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; use `--pending` for the pending-only view, or `--recovery-first` to limit pending display to explicitly positioned tasks) |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--pending` | Show only the pending lane preview |
 | `--recovery` | Show the recovery-only dispatch preview (alias for `--recovery-only`) |
 | `--recovery-only` | Show the recovery-only dispatch preview |
 | `--recovery-first` | Preview recovery first, then only pending tasks with an explicit queue position |
-| `--full` | Compatibility alias for the default multi-lane dispatch preview |
-| `-n, --limit N` | Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks) |
-| `--all` | Show all runnable tasks (blocked tasks are always shown) |
+| `--full` | Compatibility alias for the default shared dispatch preview |
+| `-n, --limit N` | Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use `0`, `-1`, or `--all` for all runnable rows) |
+| `--all` | Show all runnable dispatch rows (blocked pending and needs-human recovery rows are always shown) |
 
 Queue pickup ordering is:
 1. Explicit `queue_position` values in ascending order
@@ -1632,19 +1632,17 @@ Use `gza queue next <task_id>` to make a task the next ordered item, or `gza que
 When `queue move`, `queue next`, or `queue clear` include `--tag` filters, explicit ordering is shared across all tasks matching that tag scope, even when some tasks have additional unrelated tags.
 Those commands fail closed when the target task does not match the provided tag scope (`any` semantics by default, `all` with `--all-tags`) and do not mutate queue ordering in that case.
 When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
-By default, `gza queue` renders only the pending lane:
+By default, `gza queue` renders the shared dispatch preview:
 
+- Runnable recovery lane, showing failed-task recovery rows that `uv run gza advance` / `uv run gza watch` can run automatically.
+- Lifecycle actions, showing actionable review/rebase/merge/materialization work that belong to `uv run gza advance` / `uv run gza watch`.
 - Pending lane, showing the actual queue ordering that `uv run gza work` / `uv run gza watch` use for new pending starts.
+- Needs-human recovery rows, shown separately so they never consume the runnable preview cap.
 
-Add `--full` to render the current three-lane preview:
-
-- Recovery lane first, showing failed-task recovery or manual-attention lineages that belong to `uv run gza advance` / `uv run gza watch`.
-- Lifecycle actions second, showing actionable review/rebase/merge/materialization work that belong to `uv run gza advance` / `uv run gza watch`.
-- Pending lane third, showing the actual queue ordering that `uv run gza work` / `uv run gza watch` use for new pending starts.
-
-Within the pending lane, runnable pending tasks appear first and pending tasks blocked by unsatisfied direct dependencies appear at the bottom. Internal tasks remain excluded.
-By default, `gza queue` shows the first 10 runnable tasks plus all blocked tasks. Use `-n 0`, `-n -1`, or `--all` to show all runnable tasks too.
-To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order for the pending lane. Add `--full` when you also want the same-scope recovery lane, lifecycle actions, and scope-gap diagnostics, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
+Use `--pending` for the git-free pending-only view, `--recovery` for recovery-only, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
+Within the pending lane, runnable pending tasks appear first and pending tasks blocked by unsatisfied direct dependencies appear in their own blocked section. Internal tasks remain excluded.
+By default, `gza queue` shows the first 10 runnable dispatch rows in shared preview order, while blocked pending rows and needs-human recovery rows always remain visible. Use `-n 0`, `-n -1`, or `--all` to show all runnable rows too.
+To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order across recovery and pending lanes. Add `--pending` when you want the matching pending pickup order only, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
@@ -1983,7 +1981,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--show-skipped` | With `--recovery-only`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next cycle boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
-| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions. Scoped watch reports out-of-scope derived blockers but does not start them |
+| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG --pending` to preview the matching pending pickup order, or plain `uv run gza queue --tag TAG` for the shared recovery+pending preview. Scoped watch reports out-of-scope derived blockers but does not start them |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 
 `uv run gza watch` combines the two surfaces above: it runs recovery decisions, review/rebase/merge lifecycle work, and pending-lane pickup in one loop. Recovery and pending are still distinct sets even when watch is driving both.
