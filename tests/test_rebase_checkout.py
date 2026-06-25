@@ -20,6 +20,8 @@ class _FakeGit:
     config_values: dict[str, str] = {}
     rev_parse_values: dict[str, str | None] = {}
     update_ref_error: GitError | None = None
+    run_error_command: str | None = None
+    run_error: Exception | None = None
 
     def __init__(self, repo_dir: Path):
         self.repo_dir = Path(repo_dir)
@@ -37,6 +39,8 @@ class _FakeGit:
             return SimpleNamespace(stdout="", returncode=0)
         if args[:2] == ("config", "--get"):
             return SimpleNamespace(stdout=_FakeGit.config_values.get(args[2], "") + ("\n" if args[2] in _FakeGit.config_values else ""), returncode=0)
+        if args and args[0] == _FakeGit.run_error_command and _FakeGit.run_error is not None:
+            raise _FakeGit.run_error
         return SimpleNamespace(stdout="", returncode=0)
 
     def ref_exists(self, ref: str) -> bool:
@@ -78,6 +82,8 @@ def test_create_isolated_rebase_checkout_uses_private_git_dir_and_local_fetch(mo
     }
     _FakeGit.rev_parse_values = {}
     _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
     monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
 
     source_repo = tmp_path / "repo"
@@ -122,6 +128,40 @@ def test_create_isolated_rebase_checkout_uses_private_git_dir_and_local_fetch(mo
     assert not checkout.path.exists()
 
 
+def test_create_isolated_rebase_checkout_removes_temp_dir_when_fetch_fails(monkeypatch, tmp_path: Path) -> None:
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = set()
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    expected_error = GitError("fetch failed")
+    _FakeGit.run_error_command = "fetch"
+    _FakeGit.run_error = expected_error
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    source_repo.mkdir()
+    source_git = _FakeGit(source_repo)
+    config = Config(
+        project_dir=source_repo,
+        project_name="repo",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+
+    with pytest.raises(GitError, match="fetch failed") as excinfo:
+        create_isolated_rebase_checkout(
+            config=config,
+            source_git=source_git,
+            branch="feature/private-rebase",
+            target_ref="main",
+            checkout_name="gza-6134-f1",
+        )
+
+    assert excinfo.value is expected_error
+    created_checkout_dirs = list(config.worktree_path.glob("*-rebase-git-*"))
+    assert created_checkout_dirs == []
+
+
 def test_import_isolated_rebase_tip_fetches_private_tip_and_updates_canonical_ref(monkeypatch, tmp_path: Path) -> None:
     _FakeGit.instances = []
     _FakeGit.existing_refs = set()
@@ -131,6 +171,8 @@ def test_import_isolated_rebase_tip_fetches_private_tip_and_updates_canonical_re
         "refs/heads/feature/private-rebase": "old-tip",
     }
     _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
     monkeypatch.setattr("gza.rebase_checkout.uuid4", lambda: SimpleNamespace(hex="123"))
 
     destination_git = _FakeGit(tmp_path / "canonical")
@@ -179,6 +221,8 @@ def test_import_isolated_rebase_tip_fails_closed_when_canonical_branch_moved(mon
         "refs/heads/feature/private-rebase": "unexpected-new-tip",
     }
     _FakeGit.update_ref_error = GitError("update-ref failed")
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
     monkeypatch.setattr("gza.rebase_checkout.uuid4", lambda: SimpleNamespace(hex="123"))
 
     destination_git = _FakeGit(tmp_path / "canonical")

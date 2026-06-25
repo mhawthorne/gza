@@ -90,19 +90,23 @@ def create_isolated_rebase_checkout(
         )
     )
     checkout_git = Git(checkout_path)
-    checkout_git._run("init")
-    _copy_git_identity(source_git=source_git, checkout_git=checkout_git)
+    try:
+        checkout_git._run("init")
+        _copy_git_identity(source_git=source_git, checkout_git=checkout_git)
 
-    imported_refs = _build_import_refspecs(source_git, branch=branch, target_ref=target_ref)
-    checkout_git._run(
-        "fetch",
-        "--no-tags",
-        str(source_git.repo_dir.resolve()),
-        *imported_refs,
-    )
-    checkout_git.checkout(branch)
-    checkout_git.reset_hard(branch)
-    checkout_git.clean_force()
+        imported_refs = _build_import_refspecs(source_git, branch=branch, target_ref=target_ref)
+        checkout_git._run(
+            "fetch",
+            "--no-tags",
+            str(source_git.repo_dir.resolve()),
+            *imported_refs,
+        )
+        checkout_git.checkout(branch)
+        checkout_git.reset_hard(branch)
+        checkout_git.clean_force()
+    except Exception:
+        shutil.rmtree(checkout_path, ignore_errors=True)
+        raise
 
     return IsolatedRebaseCheckout(
         path=checkout_path,
