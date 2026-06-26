@@ -2,7 +2,6 @@
 
 import os
 import shlex
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,15 +12,13 @@ import pytest
 from gza.cli.watch import _run_cycle, _WatchLog
 from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
 from gza.config import Config
+from gza.git import Git
 from tests.cli.conftest import make_store, setup_config
 
 from tests_functional.git_helpers import init_basic_repo, setup_git_repo_with_task_branch
 
 
 def _install_counting_git_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    real_git = shutil.which("git")
-    assert real_git is not None
-
     counter_path = tmp_path / "git-count.log"
     shim_dir = tmp_path / "bin"
     shim_dir.mkdir()
@@ -29,7 +26,7 @@ def _install_counting_git_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     shim_path.write_text(
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$*\" >> {shlex.quote(str(counter_path))}\n"
-        f"exec {shlex.quote(real_git)} \"$@\"\n"
+        f"exec {shlex.quote(Git._git_executable())} \"$@\"\n"
     )
     shim_path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")

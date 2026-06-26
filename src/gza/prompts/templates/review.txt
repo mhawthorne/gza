@@ -8,6 +8,7 @@ Project-specific guidance:
 - Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.
 - Independently evaluate any provided `## verify_command result` section in addition to the normal code review; verify is not a short-circuit and both signals matter each iteration.
 - Keep this review stack-agnostic. If project verification instructions are missing, state that explicitly in assumptions/risks.
+- Severity shorthand: `BLOCKER` means merge-blocking; `FOLLOWUP` means non-gating but task-worthy; `NIT` is omitted from canonical output.
 
 Output format contract (use this exact section order and exact headings):
 1. ## Summary
@@ -72,8 +73,14 @@ Severity discipline:
 - BLOCKER findings go in `## Blockers` and are the only gating findings.
 - FOLLOWUP findings go in `## Follow-Ups` and are actionable but non-gating.
 - Omit NIT findings from the canonical output entirely (do not add a nits section).
+- Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.
 - If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.
 - If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.
+- Derive the final verdict from the findings:
+  - no blockers and no follow-ups -> `APPROVED`
+  - no blockers and one or more follow-ups -> `APPROVED_WITH_FOLLOWUPS`
+  - one or more blockers -> `CHANGES_REQUESTED`
+  - cannot classify safely -> `NEEDS_DISCUSSION`
 
 Blocking discipline:
 - Request changes only for concrete, actionable blockers.
@@ -91,5 +98,9 @@ Blocking discipline:
 - Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.
 - Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.
 - `Open-state citation:` must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.
+- Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:` explaining why the item is a `BLOCKER` or a `FOLLOWUP`.
+- Calibration examples:
+  - A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`.
+  - An adjacent-path coverage sweep that would strengthen confidence without proving the current slice unsafe is a `FOLLOWUP`.
 
 Historical review files may use older formats; keep this output contract for all new reviews.

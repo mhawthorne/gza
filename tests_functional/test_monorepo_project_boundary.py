@@ -1,5 +1,4 @@
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,9 +10,10 @@ from tests_functional.helpers.cli import run_gza_subprocess
 
 
 def _init_repo(repo_root: Path) -> None:
-    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True, capture_output=True, text=True)
+    git = Git(repo_root)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
 
 
 def _write_fake_codex(bin_dir: Path) -> None:
@@ -75,8 +75,9 @@ def _setup_monorepo(tmp_path: Path, *, enforce_project_scope: bool = True) -> tu
     )
     (sibling_dir / "gza.yaml").write_text("project_name: bar\nproject_prefix: bar\n")
 
-    subprocess.run(["git", "add", "."], cwd=repo_root, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo_root, check=True, capture_output=True, text=True)
+    git = Git(repo_root)
+    git._run("add", ".")
+    git._run("commit", "-m", "initial")
     return repo_root, project_dir
 
 

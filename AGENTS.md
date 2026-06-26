@@ -1,7 +1,6 @@
 # Gza
 
 A coding AI agent runner for Claude Code.
-
 **Keep AGENTS.md under 100 lines.** Move details to `docs/`. This file is for critical agent behavioral rules only.
 
 ## Essential Commands
@@ -22,6 +21,7 @@ See `docs/` for detailed documentation:
 - [docs/configuration.md](docs/configuration.md) — full command list, all options, config reference
 - [docs/skills.md](docs/skills.md) — skill usage and authoring
 - [docs/docker.md](docs/docker.md) — Docker setup, custom Dockerfiles, provider auth
+- [docs/merge-policy.md](docs/merge-policy.md) — review severity and merge-gate policy (`BLOCKER` blocks merge; `FOLLOWUP` ships with follow-up)
 - [docs/internal/](docs/internal/README.md) — internal architecture, design notes & practices (index)
 ## Critical Rules
 **Task management**: When the user mentions "task", "add a task", or asks to track something for later, use `uv run gza add "..."`. NEVER edit `etc/todo.txt` or other files manually.

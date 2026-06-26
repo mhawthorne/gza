@@ -154,6 +154,8 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 
 #### 6b. Review is active (not cleared)
 
+Severity semantics for `BLOCKER`, `FOLLOWUP`, and `NIT` live in [docs/merge-policy.md](../merge-policy.md). Use that rubric when interpreting review output or adjusting the review contract.
+
 | Condition | Action |
 |-----------|--------|
 | Latest review is `pending` | `run_review` — spawn worker |
@@ -174,7 +176,7 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
 | Verdict = unknown | `needs_discussion` — manual intervention |
 
-When a review blocker is one instance of a repeated same-module pattern, reviewers should consolidate the affected-file gaps plus any analogous gaps in diff-touched same-module siblings into one blocker so improve can close the whole class in one pass.
+When a review blocker is one instance of a repeated same-module pattern, reviewers should consolidate the affected-file gaps plus any analogous gaps in diff-touched same-module siblings into one blocker so improve can close the whole class in one pass. `BLOCKER` remains merge-blocking; `FOLLOWUP` remains non-gating but task-worthy.
 
 Tracked review/improve report contracts are stricter than the current lifecycle action
 table alone:

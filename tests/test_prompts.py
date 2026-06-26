@@ -13,6 +13,7 @@ from gza.prompts import PromptBuilder
 REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
     "Start with a repo-rules/learnings pass: compare the diff and behavior against AGENTS.md, REVIEW.md, project docs, and `.gza/learnings.md`; call out violations or regressions explicitly.",
+    "Severity shorthand: `BLOCKER` means merge-blocking; `FOLLOWUP` means non-gating but task-worthy; `NIT` is omitted from canonical output.",
     "Open-state citation:",
     "Class-of-issue enumeration:",
     "Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
@@ -29,6 +30,12 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
     "If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`;",
     "If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.",
+    "Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.",
+    "Derive the final verdict from the findings:",
+    "cannot classify safely -> `NEEDS_DISCUSSION`",
+    "Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:`",
+    "A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`.",
+    "An adjacent-path coverage sweep that would strengthen confidence without proving the current slice unsafe is a `FOLLOWUP`.",
 ]
 
 IMPROVE_DISPUTE_CONTRACT_CLAUSES = [
@@ -805,6 +812,55 @@ class TestPromptBuilderBuild:
         _assert_summary_checklist_contract(interactive_skill_content)
         _assert_summary_checklist_contract(task_review_skill_content)
         assert "## Task Prompt Alignment" not in task_review_skill_content
+
+    def test_review_template_tightens_verdict_derivation_and_omits_per_finding_severity(self):
+        """Review template should define verdict derivation and forbid duplicate severity fields."""
+        content = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "review.txt"
+        ).read_text()
+
+        assert "no blockers and no follow-ups -> `APPROVED`" in content
+        assert "no blockers and one or more follow-ups -> `APPROVED_WITH_FOLLOWUPS`" in content
+        assert "one or more blockers -> `CHANGES_REQUESTED`" in content
+        assert "cannot classify safely -> `NEEDS_DISCUSSION`" in content
+        assert (
+            "Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field."
+            in content
+        )
+        directive_content = content.replace(
+            "Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.",
+            "",
+        )
+        assert "`Severity:`" not in directive_content
+
+    def test_review_template_includes_borderline_rubric_justification_and_calibration_examples(self):
+        """Review template should explain borderline classification and anchor it with examples."""
+        content = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "review.txt"
+        ).read_text()
+
+        assert (
+            "Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:`"
+            in content
+        )
+        assert (
+            "A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`."
+            in content
+        )
+        assert (
+            "An adjacent-path coverage sweep that would strengthen confidence without proving the current slice unsafe is a `FOLLOWUP`."
+            in content
+        )
 
     def test_task_review_skill_does_not_provide_second_ask_source(self):
         """Task-review scaffold should hand off only canonical ask context to subagents."""

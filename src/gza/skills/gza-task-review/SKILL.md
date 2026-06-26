@@ -196,6 +196,13 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
 <If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
 <If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.>
+<Severity shorthand: `BLOCKER` means merge-blocking; `FOLLOWUP` means non-gating but task-worthy; `NIT` is omitted from canonical output.>
+<Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.>
+<Derive the final verdict from the findings:>
+<cannot classify safely -> `NEEDS_DISCUSSION`>
+<Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:`>
+<A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`.>
+<An adjacent-path coverage sweep that would strengthen confidence without proving the current slice unsafe is a `FOLLOWUP`.>
 <Open-state citation must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.>
 
 ## Follow-Ups
@@ -212,6 +219,7 @@ You are reviewing a gza task's implementation. Your job is to read the project r
 
 <Brief justification>
 <Verdict is blocking if either the code review or verify produced blocker findings.>
+<Verdict is derived from the findings: no blockers/no follow-ups -> APPROVED; no blockers/at least one follow-up -> APPROVED_WITH_FOLLOWUPS; any blocker -> CHANGES_REQUESTED; cannot classify safely -> NEEDS_DISCUSSION.>
 Verdict: APPROVED|APPROVED_WITH_FOLLOWUPS|CHANGES_REQUESTED|NEEDS_DISCUSSION
 ```
 
