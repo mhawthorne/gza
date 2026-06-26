@@ -4108,7 +4108,7 @@ class TestQueueCommand:
         assert refreshed_ops_first.queue_position == 1
         assert refreshed_ops_second.queue_position == 2
 
-    def test_queue_tag_scope_reports_out_of_scope_runnable_child_when_scoped_pending_lane_is_empty(
+    def test_queue_tag_scope_reports_scope_less_runnable_child_when_scoped_pending_lane_is_empty(
         self,
         tmp_path: Path,
     ) -> None:
@@ -4127,10 +4127,10 @@ class TestQueueCommand:
         store.update(plan)
 
         child = store.add(
-            "Out of scope implement child",
+            "Scope-less implement child",
             task_type="implement",
             based_on=plan.id,
-            tags=("v0.5.0",),
+            tags=(),
         )
         assert child.id is not None
 
@@ -4150,7 +4150,7 @@ class TestQueueCommand:
         assert child.id in result.stdout
         assert "out-of-scope child" in result.stdout
 
-    def test_queue_tag_scope_reports_depends_on_only_out_of_scope_runnable_child(
+    def test_queue_tag_scope_suppresses_depends_on_only_future_scoped_child(
         self,
         tmp_path: Path,
     ) -> None:
@@ -4186,10 +4186,9 @@ class TestQueueCommand:
 
         assert result.returncode == 0
         assert "No pending tasks matching tags: 202606-recovery" in result.stdout
-        assert "Scope gap:" in result.stdout
-        assert explore.id in result.stdout
-        assert child.id in result.stdout
-        assert "out-of-scope child" in result.stdout
+        assert "Scope gap:" not in result.stdout
+        assert explore.id not in result.stdout
+        assert child.id not in result.stdout
 
     def test_queue_tag_scope_reports_gap_alongside_visible_scoped_pending_rows(
         self,
@@ -4216,10 +4215,10 @@ class TestQueueCommand:
         store.update(plan)
 
         child = store.add(
-            "Out of scope implement child",
+            "Scope-less implement child",
             task_type="implement",
             based_on=plan.id,
-            tags=("v0.5.0",),
+            tags=(),
         )
         assert child.id is not None
 
@@ -4266,10 +4265,10 @@ class TestQueueCommand:
         store.update(plan)
 
         child = store.add(
-            "Out of scope implement child",
+            "Scope-less implement child",
             task_type="implement",
             based_on=plan.id,
-            tags=("v0.5.0",),
+            tags=(),
         )
         assert child.id is not None
 
@@ -4289,7 +4288,7 @@ class TestQueueCommand:
         assert child.id in result.stdout
         assert "out-of-scope child" in result.stdout
 
-    def test_queue_tag_scope_reports_blocked_out_of_scope_pending_child(
+    def test_queue_tag_scope_reports_blocked_scope_less_pending_child(
         self,
         tmp_path: Path,
     ) -> None:
@@ -4311,11 +4310,11 @@ class TestQueueCommand:
         store.update(plan)
 
         child = store.add(
-            "Blocked out of scope implement child",
+            "Blocked scope-less implement child",
             task_type="implement",
             based_on=plan.id,
             depends_on=blocked_by.id,
-            tags=("v0.5.0",),
+            tags=(),
         )
         assert child.id is not None
 
@@ -4336,7 +4335,7 @@ class TestQueueCommand:
         assert "out-of-scope child" in result.stdout
         assert "blocked implement" in result.stdout
 
-    def test_queue_tag_scope_reports_independent_out_of_scope_child_even_with_runnable_in_scope_sibling(
+    def test_queue_tag_scope_suppresses_independent_future_scoped_child_even_with_runnable_in_scope_sibling(
         self,
         tmp_path: Path,
     ) -> None:
@@ -4381,10 +4380,9 @@ class TestQueueCommand:
 
         assert result.returncode == 0
         assert in_scope_child.id in result.stdout
-        assert "Scope gap:" in result.stdout
-        assert plan.id in result.stdout
-        assert out_of_scope_child.id in result.stdout
-        assert "out-of-scope child" in result.stdout
+        assert "Scope gap:" not in result.stdout
+        assert plan.id not in result.stdout
+        assert out_of_scope_child.id not in result.stdout
 
     def test_queue_tag_scope_reports_failed_owner_with_out_of_scope_retry_child(
         self,
@@ -4446,10 +4444,10 @@ class TestQueueCommand:
         store.update(plan)
 
         child = store.add(
-            "Out of scope implement child",
+            "Scope-less implement child",
             task_type="implement",
             based_on=plan.id,
-            tags=("ops",),
+            tags=(),
         )
         assert child.id is not None
 
@@ -4629,10 +4627,10 @@ class TestQueueCommand:
 
         store.delete(matching_child.id)
         out_of_scope_child = store.add(
-            "Any-tag out of scope child",
+            "Any-tag scope-less child",
             task_type="implement",
             based_on=plan.id,
-            tags=("v0.5.0",),
+            tags=(),
         )
         assert out_of_scope_child.id is not None
 

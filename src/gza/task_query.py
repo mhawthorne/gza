@@ -9,6 +9,7 @@ from typing import Any, Literal, TypeVar
 
 from . import lineage
 from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
+from .lifecycle_completion import task_is_complete_for_lifecycle
 from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 
@@ -1199,6 +1200,44 @@ def collect_scoped_tag_scope_gaps(
             return False
         return _task_is_in_scope_runnable_or_running(blocking_task)
 
+    def _task_merge_state(task: DbTask) -> str | None:
+        if task.id is None:
+            return task.merge_status
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is None:
+            return task.merge_status
+        return effective_no_work_merge_state(task, unit.state)
+
+    def _task_is_in_scope_and_unfinished(task: DbTask) -> bool:
+        if task.id is None or task.task_type == "internal" or task.status == "dropped":
+            return False
+        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag):
+            return False
+        return not task_is_complete_for_lifecycle(task, merge_state=_task_merge_state(task))
+
+    def _scope_gap_is_suppressed_by_terminal_owner_future_scoped_child(
+        owner: DbTask,
+        child: DbTask,
+        lineage_members: Sequence[DbTask],
+    ) -> bool:
+        if not child.tags:
+            return False
+        if not task_is_complete_for_lifecycle(owner, merge_state=_task_merge_state(owner)):
+            return False
+        child_id = child.id
+        if child_id is None:
+            return False
+        for member in (owner, *lineage_members):
+            member_id = member.id
+            if member_id is None or member_id == child_id:
+                continue
+            if not _task_is_in_scope_and_unfinished(member):
+                continue
+            blocked, blocking_id, _blocking_status = store.is_task_blocked(member)
+            if blocked and blocking_id == child_id:
+                return False
+        return True
+
     gaps: list[ScopedTagScopeGap] = []
     seen_blocking_child_ids: set[str] = set()
     owner_rows, _read_context = query_lineage_owner_rows_in_read_session(
@@ -1280,6 +1319,8 @@ def collect_scoped_tag_scope_gaps(
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag):
                 continue
             if _scope_gap_is_suppressed_by_in_scope_dependency(task):
+                continue
+            if _scope_gap_is_suppressed_by_terminal_owner_future_scoped_child(owner, task, candidate_members):
                 continue
             if task.status == "in_progress":
                 blocking_state = "running"

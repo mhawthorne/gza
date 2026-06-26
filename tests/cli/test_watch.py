@@ -4410,7 +4410,7 @@ def test_watch_cycle_logs_tag_scope_with_any_mode(tmp_path: Path) -> None:
     assert "INFO      scope: tags=backend,release-1.2 mode=any" in log_path.read_text()
 
 
-def test_watch_cycle_reports_out_of_scope_runnable_child_without_starting_it(tmp_path: Path) -> None:
+def test_watch_cycle_reports_scope_less_runnable_child_without_starting_it(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4426,10 +4426,10 @@ def test_watch_cycle_reports_out_of_scope_runnable_child_without_starting_it(tmp
     store.update(plan)
 
     child = store.add(
-        "Out of scope implement child",
+        "Scope-less implement child",
         task_type="implement",
         based_on=plan.id,
-        tags=("v0.5.0",),
+        tags=(),
     )
     assert child.id is not None
 
@@ -4460,7 +4460,7 @@ def test_watch_cycle_reports_out_of_scope_runnable_child_without_starting_it(tmp
     assert f"START     {child.id}" not in log_text
 
 
-def test_watch_cycle_reports_depends_on_only_out_of_scope_runnable_child_without_starting_it(tmp_path: Path) -> None:
+def test_watch_cycle_suppresses_depends_on_only_future_scoped_child(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4503,13 +4503,13 @@ def test_watch_cycle_reports_depends_on_only_out_of_scope_runnable_child_without
         )
 
     log_text = log_path.read_text()
-    assert "out-of-scope child" in log_text
-    assert explore.id in log_text
-    assert child.id in log_text
+    assert "out-of-scope child" not in log_text
+    assert explore.id not in log_text
+    assert child.id not in log_text
     assert f"START     {child.id}" not in log_text
 
 
-def test_watch_cycle_reports_blocked_out_of_scope_pending_child_without_starting_it(tmp_path: Path) -> None:
+def test_watch_cycle_reports_blocked_scope_less_pending_child_without_starting_it(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4528,11 +4528,11 @@ def test_watch_cycle_reports_blocked_out_of_scope_pending_child_without_starting
     store.update(plan)
 
     child = store.add(
-        "Blocked out of scope implement child",
+        "Blocked scope-less implement child",
         task_type="implement",
         based_on=plan.id,
         depends_on=blocked_by.id,
-        tags=("v0.5.0",),
+        tags=(),
     )
     assert child.id is not None
 

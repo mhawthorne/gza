@@ -348,6 +348,12 @@ When the installed `gza` package fingerprint changes while watch is running:
   runnable, or already-running derived child that does not match the active tag filter,
   watch MUST surface that blocker in operator-facing attention output without starting,
   resuming, retrying, merging, or reordering the out-of-scope child.
+- That scoped blocker signal exists to surface **real in-scope stalls**, not intentional
+  future-scope planning. If the owner's own deliverable is already terminal and the
+  out-of-scope child has at least one explicit scope tag of its own, watch MUST suppress
+  that attention unless some in-scope unfinished member is still genuinely blocked on
+  that child. An untagged/scope-less child remains a surfaced orphan until it is given a
+  scope.
 - Scope banners, wake summaries, and attention output SHOULD make the active scope
   explicit so operators can tell when watch is intentionally ignoring other work.
 

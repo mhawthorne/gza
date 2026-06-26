@@ -243,7 +243,9 @@ def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_ava
     assert f"uv run gza implement {plan.id}" in str(row.values["next_action_reason"])
 
 
-def test_collect_scoped_tag_scope_gaps_reports_out_of_scope_blocking_child(tmp_path: Path) -> None:
+def test_collect_scoped_tag_scope_gaps_suppresses_completed_owner_future_scoped_child(
+    tmp_path: Path,
+) -> None:
     store = _store(tmp_path)
     plan = store.add(
         "Scoped owner",
@@ -257,10 +259,10 @@ def test_collect_scoped_tag_scope_gaps_reports_out_of_scope_blocking_child(tmp_p
     store.update(plan)
 
     child = store.add(
-        "Out of scope child",
+        "Deferred future-scoped child",
         task_type="implement",
         based_on=plan.id,
-        tags=("v0.5.0",),
+        tags=("v0.6.0",),
     )
     assert child.id is not None
 
@@ -270,18 +272,7 @@ def test_collect_scoped_tag_scope_gaps_reports_out_of_scope_blocking_child(tmp_p
         any_tag=False,
     )
 
-    assert gaps == [
-        ScopedTagScopeGap(
-            owner_id=plan.id,
-            blocking_child_id=child.id,
-            child_task_type="implement",
-            child_status="pending",
-            child_tags=("v0.5.0",),
-            missing_filter_tags=("202606-recovery",),
-            suggested_next_command=f"uv run gza edit {child.id} --add-tag 202606-recovery",
-            blocking_state="runnable",
-        )
-    ]
+    assert gaps == []
 
 
 def test_collect_scoped_tag_scope_gaps_uses_one_read_session_connection(
@@ -301,10 +292,10 @@ def test_collect_scoped_tag_scope_gaps_uses_one_read_session_connection(
     store.update(plan)
 
     child = store.add(
-        "Out of scope child",
+        "Scope-less orphan child",
         task_type="implement",
         based_on=plan.id,
-        tags=("v0.5.0",),
+        tags=(),
     )
     assert child.id is not None
 
@@ -342,10 +333,10 @@ def test_collect_scoped_tag_scope_gaps_any_tag_suggests_single_matching_tag(tmp_
     store.update(plan)
 
     child = store.add(
-        "Out of scope child",
+        "Scope-less orphan child",
         task_type="implement",
         based_on=plan.id,
-        tags=("v0.5.0",),
+        tags=(),
     )
     assert child.id is not None
 
@@ -380,10 +371,10 @@ def test_collect_scoped_tag_scope_gaps_reports_owner_missing_from_lineage_projec
     store.update(plan)
 
     child = store.add(
-        "Out of scope child",
+        "Scope-less orphan child",
         task_type="implement",
         based_on=plan.id,
-        tags=("v0.5.0",),
+        tags=(),
     )
     assert child.id is not None
 
@@ -412,14 +403,14 @@ def test_collect_scoped_tag_scope_gaps_reports_owner_missing_from_lineage_projec
         blocking_child_id=child.id,
         child_task_type="implement",
         child_status="pending",
-        child_tags=("v0.5.0",),
+        child_tags=(),
         missing_filter_tags=("202606-recovery",),
         suggested_next_command=f"uv run gza edit {child.id} --add-tag 202606-recovery",
         blocking_state="runnable",
     ) in gaps
 
 
-def test_collect_scoped_tag_scope_gaps_reports_independent_out_of_scope_child_even_with_runnable_in_scope_sibling(
+def test_collect_scoped_tag_scope_gaps_suppresses_independent_future_scoped_child_even_with_runnable_in_scope_sibling(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -443,10 +434,10 @@ def test_collect_scoped_tag_scope_gaps_reports_independent_out_of_scope_child_ev
     assert in_scope_child.id is not None
 
     out_of_scope_child = store.add(
-        "Independent out-of-scope child",
+        "Independent future-scoped child",
         task_type="review",
         based_on=plan.id,
-        tags=("v0.5.0",),
+        tags=("v0.6.0",),
     )
     assert out_of_scope_child.id is not None
 
@@ -456,17 +447,139 @@ def test_collect_scoped_tag_scope_gaps_reports_independent_out_of_scope_child_ev
         any_tag=False,
     )
 
-    assert ScopedTagScopeGap(
-        owner_id=plan.id,
-        blocking_child_id=out_of_scope_child.id,
-        child_task_type="review",
-        child_status="pending",
-        child_tags=("v0.5.0",),
-        missing_filter_tags=("202606-recovery",),
-        suggested_next_command=f"uv run gza edit {out_of_scope_child.id} --add-tag 202606-recovery",
-        blocking_state="runnable",
-    ) in gaps
-    assert all(gap.blocking_child_id != in_scope_child.id for gap in gaps)
+    assert gaps == []
+
+
+def test_collect_scoped_tag_scope_gaps_reports_completed_owner_scope_less_child(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add(
+        "Scoped owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Scope-less orphan child",
+        task_type="implement",
+        based_on=plan.id,
+        tags=(),
+    )
+    assert child.id is not None
+
+    gaps = collect_scoped_tag_scope_gaps(
+        store,
+        tag_filters=("202606-recovery",),
+        any_tag=False,
+    )
+
+    assert gaps == [
+        ScopedTagScopeGap(
+            owner_id=plan.id,
+            blocking_child_id=child.id,
+            child_task_type="implement",
+            child_status="pending",
+            child_tags=(),
+            missing_filter_tags=("202606-recovery",),
+            suggested_next_command=f"uv run gza edit {child.id} --add-tag 202606-recovery",
+            blocking_state="runnable",
+        )
+    ]
+
+
+def test_collect_scoped_tag_scope_gaps_reports_in_scope_member_blocked_by_future_scoped_child(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add(
+        "Scoped owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Deferred future-scoped child",
+        task_type="implement",
+        based_on=plan.id,
+        tags=("v0.6.0",),
+    )
+    assert child.id is not None
+
+    blocked_member = store.add(
+        "Blocked in-scope member",
+        task_type="review",
+        based_on=child.id,
+        depends_on=child.id,
+        tags=("202606-recovery", "v0.5.0"),
+    )
+    assert blocked_member.id is not None
+
+    gaps = collect_scoped_tag_scope_gaps(
+        store,
+        tag_filters=("202606-recovery",),
+        any_tag=False,
+    )
+
+    assert gaps == [
+        ScopedTagScopeGap(
+            owner_id=plan.id,
+            blocking_child_id=child.id,
+            child_task_type="implement",
+            child_status="pending",
+            child_tags=("v0.6.0",),
+            missing_filter_tags=("202606-recovery",),
+            suggested_next_command=f"uv run gza edit {child.id} --add-tag 202606-recovery",
+            blocking_state="runnable",
+        )
+    ]
+
+
+def test_collect_scoped_tag_scope_gaps_keeps_in_scope_dependency_suppression(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add(
+        "Scoped owner",
+        task_type="plan",
+        tags=("202606-recovery",),
+    )
+    assert plan.id is not None
+
+    in_scope_blocker = store.add(
+        "Runnable in-scope blocker",
+        task_type="implement",
+        based_on=plan.id,
+        tags=("202606-recovery",),
+    )
+    assert in_scope_blocker.id is not None
+
+    out_of_scope_child = store.add(
+        "Out-of-scope child blocked by in-scope dependency",
+        task_type="review",
+        based_on=in_scope_blocker.id,
+        depends_on=in_scope_blocker.id,
+        tags=("v0.6.0",),
+    )
+    assert out_of_scope_child.id is not None
+
+    gaps = collect_scoped_tag_scope_gaps(
+        store,
+        tag_filters=("202606-recovery",),
+        any_tag=False,
+    )
+
+    assert gaps == []
 
 
 def test_incomplete_preset_keeps_held_plan_visible_when_pending_dependent_awaits_review(
