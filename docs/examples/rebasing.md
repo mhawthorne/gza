@@ -10,7 +10,7 @@ If main has new commits since your task branch was created, you may need to reba
 $ gza merge gza-3
 Error: Branch 'feature/add-user-auth' has conflicts with main.
 Rebase the branch first:
-  gza rebase gza-3
+  gza rebase gza-3 --run
 ```
 
 ## Check for conflicts
@@ -25,10 +25,18 @@ Unmerged branches:
      Status: needs rebase
 ```
 
-## Rebase onto main
+## Queue or run the rebase
+
+Bare `gza rebase <task_id>` now creates a pending `rebase` child task. Use `--run` for immediate foreground execution or `--background` to detach a worker:
 
 ```bash
 $ gza rebase gza-3
+✓ Created rebase task gza-8
+  Parent: gza-3
+  Branch: feature/add-user-auth
+  Target: main
+
+$ gza rebase gza-3 --run
 Rebasing feature/add-user-auth onto main...
 Successfully rebased. 3 commits applied.
 ```
@@ -40,7 +48,7 @@ If there are no conflicts, the rebase completes automatically.
 If the rebase encounters conflicts:
 
 ```bash
-$ gza rebase gza-3
+$ gza rebase gza-3 --run
 Rebasing feature/add-user-auth onto main...
 CONFLICT in src/auth/login.py
 
@@ -63,7 +71,7 @@ uv run gza skills-install --target codex gza-rebase --project .
 If you're working with a team and main has been updated on the remote:
 
 ```bash
-$ gza rebase gza-3 --remote
+$ gza rebase gza-3 --run --remote
 Fetching origin...
 Rebasing feature/add-user-auth onto origin/main...
 Successfully rebased.
@@ -100,8 +108,8 @@ Unmerged branches:
   gza-5 20260108-fix-typo (up to date)
 
 # Rebase each one
-$ gza rebase gza-3
-$ gza rebase gza-4
+$ gza rebase gza-3 --run
+$ gza rebase gza-4 --run
 
 # Then merge all at once
 $ gza merge gza-3 gza-4 gza-5 --squash

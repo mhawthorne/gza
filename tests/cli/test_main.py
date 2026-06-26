@@ -1605,6 +1605,69 @@ class TestDirectExecutionForceDispatch:
         assert parsed_args.force is True
 
 
+class TestDirectExecutionModeParsing:
+    @pytest.mark.parametrize(
+        ("argv", "command_patch"),
+        [
+            (["gza", "implement", "testproject-1", "--run"], "gza.cli.main.cmd_implement"),
+            (["gza", "review", "testproject-1", "--run"], "gza.cli.main.cmd_review"),
+            (["gza", "improve", "testproject-1", "--run"], "gza.cli.main.cmd_improve"),
+            (["gza", "rebase", "testproject-1", "--run"], "gza.cli.main.cmd_rebase"),
+            (["gza", "retry", "testproject-1", "--run"], "gza.cli.main.cmd_retry"),
+            (["gza", "resume", "testproject-1", "--run"], "gza.cli.main.cmd_resume"),
+            (["gza", "fix", "testproject-1", "--run"], "gza.cli.main.cmd_fix"),
+            (["gza", "extract", "--branch", "feature/source", "src/file.py", "--run"], "gza.cli.main.cmd_extract"),
+            (["gza", "plan-review", "testproject-1", "--run"], "gza.cli.main.cmd_plan_review"),
+            (["gza", "plan-improve", "testproject-1", "--run"], "gza.cli.main.cmd_plan_improve"),
+        ],
+    )
+    def test_direct_execution_commands_expose_execution_mode_flags(self, tmp_path: Path, argv: list[str], command_patch: str) -> None:
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", [*argv, "--project", str(tmp_path)]),
+            patch(command_patch, return_value=0) as cmd_handler,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_handler.assert_called_once()
+        parsed_args = cmd_handler.call_args.args[0]
+        assert parsed_args.run is True
+        assert parsed_args.queue is False
+        assert parsed_args.background is False
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (("implement", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("review", "testproject-1", "-q", "-b"), "argument --background/-b: not allowed with argument --queue/-q"),
+            (("improve", "testproject-1", "-r", "-b"), "argument --background/-b: not allowed with argument --run/-r"),
+            (("rebase", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("retry", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("resume", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("fix", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("extract", "--branch", "feature/source", "src/file.py", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("plan-review", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+            (("plan-improve", "testproject-1", "-q", "-r"), "argument --run/-r: not allowed with argument --queue/-q"),
+        ],
+    )
+    def test_direct_execution_mode_flags_are_mutually_exclusive(
+        self,
+        tmp_path: Path,
+        argv: tuple[str, ...],
+        expected: str,
+    ) -> None:
+        setup_config(tmp_path)
+
+        result = invoke_gza(*argv, "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert expected in result.stderr
+
+
 class TestIterateBackgroundForceDispatch:
     """Command-level regression tests for iterate --background force propagation."""
 

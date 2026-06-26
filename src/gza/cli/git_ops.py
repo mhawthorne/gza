@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import gza.colors as _colors
 from gza.query import (
@@ -2147,32 +2147,58 @@ def _run_task_backed_rebase(
             logger.warning(f"Warning: Failed to remove rebase worktree at {worktree_path}")
 
 
+def _execution_mode(args: argparse.Namespace) -> Literal["queue", "run", "background"]:
+    if getattr(args, "background", False):
+        return "background"
+    if getattr(args, "run", False):
+        return "run"
+    return "queue"
+
+
 def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
     task_id = resolve_id(config, args.task_id)
     git = Git(config.project_dir)
+    execution_mode = _execution_mode(args)
 
     current_branch = git.current_branch()
     if not _require_default_branch(
         git,
         current_branch,
         "rebase",
-        to_stderr=bool(getattr(args, "background", False)),
+        to_stderr=execution_mode == "background",
     ):
         return 1
 
-    # Handle background mode - create a rebase task and run through the standard runner
-    if getattr(args, 'background', False):
-        store = get_store(config)
-        task = store.get(task_id)
-        if not task:
-            return phase1_error(args, f"Task {task_id} not found")
-        if not task.branch:
-            return phase1_error(args, f"Task {task_id} has no branch")
-        target = getattr(args, 'onto', None) or git.default_branch()
-        if getattr(args, 'remote', False):
-            target = f"origin/{target}"
+    store = get_store(config)
+
+    # Get the task
+    task = store.get(task_id)
+    if not task:
+        return phase1_error(args, f"Task {task_id} not found")
+
+    # Validate task state
+    if task.status not in ("completed", "unmerged", "running"):
+        return phase1_error(
+            args,
+            f"Task {task.id} is not completed, unmerged, or running (status: {task.status})",
+        )
+
+    if not task.branch:
+        return phase1_error(args, f"Task {task.id} has no branch")
+
+    # Check if branch exists
+    if not git.branch_exists(task.branch):
+        return phase1_error(args, f"Branch '{task.branch}' does not exist")
+
+    print(f"On branch {current_branch}")
+
+    # Determine rebase target: use --onto if provided, else current branch
+    rebase_target = getattr(args, 'onto', None) or current_branch
+    task_target = f"origin/{rebase_target}" if getattr(args, "remote", False) else rebase_target
+
+    if execution_mode == "background":
         try:
             permit = launch_permit(config, store)
         except MaxConcurrentTasksError as exc:
@@ -2181,7 +2207,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             store,
             task_id,
             task.branch,
-            target,
+            task_target,
             trigger_source="manual",
         )
         prepared_rebase_task = _prepare_task_for_immediate_execution(
@@ -2206,43 +2232,23 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             prepared_task=prepared_rebase_task,
         )
 
-    store = get_store(config)
-
-    # Get the task
-    task = store.get(task_id)
-    if not task:
-        print(f"Error: Task {task_id} not found")
-        return 1
-
-    # Validate task state
-    if task.status not in ("completed", "unmerged", "running"):
-        print(f"Error: Task {task.id} is not completed, unmerged, or running (status: {task.status})")
-        return 1
-
-    if not task.branch:
-        print(f"Error: Task {task.id} has no branch")
-        return 1
-
-    # Check if branch exists
-    if not git.branch_exists(task.branch):
-        print(f"Error: Branch '{task.branch}' does not exist")
-        return 1
-
-    print(f"On branch {current_branch}")
-
-    # Determine rebase target: use --onto if provided, else current branch
-    rebase_target = getattr(args, 'onto', None) or current_branch
-
     rebase_task = _create_rebase_task(
         store,
         task_id,
         task.branch,
-        rebase_target,
+        task_target,
         trigger_source="manual",
     )
     assert rebase_task.id is not None
     rebase_task.branch = task.branch
     store.update(rebase_task)
+
+    if execution_mode == "queue":
+        print(f"✓ Created rebase task {rebase_task.id}")
+        print(f"  Parent: {task.id}")
+        print(f"  Branch: {task.branch}")
+        print(f"  Target: {task_target}")
+        return 0
 
     return _run_task_backed_rebase(
         config=config,

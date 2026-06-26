@@ -1124,10 +1124,13 @@ gza resume <task_id> [options]
 |--------|-------------|
 | `task_id` | Full prefixed task ID to resume (e.g. `gza-1234`) |
 | `--no-docker` | Run Claude directly instead of in Docker |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
-| `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the resumed task |
+
+Bare `gza resume <task_id>` creates the resumed task and leaves it pending. Use `--run` for immediate foreground execution or `--background` for detached execution.
 
 ### retry
 
@@ -1140,11 +1143,14 @@ gza retry <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed task ID to retry (e.g. `gza-1234`) |
-| `--no-docker` | Run Claude directly instead of in Docker (only with --background) |
+| `--no-docker` | Run Claude directly instead of in Docker |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
-| `--queue`, `-q` | Add task to queue without executing immediately |
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Skip dependency merge precondition checks when starting the retry task |
+
+Bare `gza retry <task_id>` creates the retry task and leaves it pending. Use `--run` for immediate foreground execution or `--background` for detached execution.
 
 For immediate-start commands that hand work off to detached workers (`work`, `resume`, `retry`, `implement`, `extract`, `review`, `improve`, `fix`, `iterate`, `rebase`, and `advance --new`), any parent-side validation or startup-preparation failure is reported on the caller's stderr before the worker detaches. Success, queue, and no-op status messages remain on stdout.
 
@@ -1431,7 +1437,11 @@ gza rebase <task_id> [options]
 | `--remote` | Fetch from origin and rebase against remote target branch |
 | `--resolve` | Auto-resolve rebase conflicts using `/gza-rebase` in the active provider runtime |
 | `--force`, `-f` | Force remove worktree even if it has uncommitted changes |
+| `--queue`, `-q` | Queue the rebase task without running it (default) |
+| `--run`, `-r` | Run the rebase task immediately in the foreground |
 | `--background`, `-b` | Run rebase in background |
+
+Bare `gza rebase <task_id>` creates a pending `rebase` child task. Use `--run` to execute that task-backed rebase in the foreground or `--background` to detach a worker.
 
 When `--resolve` is used, gza runs the active task provider (`claude`, `codex`, or `gemini`) and sends the `/gza-rebase --auto` prompt. If the `gza-rebase` skill is missing for that runtime, gza fails fast with an install command such as:
 
@@ -1496,7 +1506,8 @@ gza improve <impl_task_id> [options]
 | `--review-id ID` | Explicit full prefixed review task ID to base the improve on (overrides auto-pick of most recent completed review; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion; if the branch already has an open PR, push same-branch improve commits first |
 | `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
@@ -1521,7 +1532,8 @@ gza fix <task_id> [options]
 |--------|-------------|
 | `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
 | `--review` | Auto-create review task on completion; if the branch already has an open PR, push same-branch fix commits first |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
@@ -1533,7 +1545,7 @@ When a fix run completes with `--review`, gza performs the same narrow PR check 
 
 ### review
 
-Create and run a review task for an implementation. Runs immediately by default.
+Create and optionally run a review task for an implementation.
 
 ```bash
 gza review <task_id> [options]
@@ -1542,7 +1554,8 @@ gza review <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed task ID (implement, improve, review, or fix — auto-resolves to root implementation; e.g. `gza-1234`) |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--no-pr` | Do not post review to PR even if one exists |
@@ -1652,7 +1665,8 @@ gza implement <plan_task_id> [prompt] [options]
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
 | `--no-learnings` | Skip injecting learnings context |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
@@ -1676,7 +1690,8 @@ gza plan-review <task_id> [options]
 | `--rerun` | Create a fresh review attempt even if a completed review already exists |
 | `--edit-slices` | Open a completed approved `plan_review` by review ID in `$EDITOR`, validate the edited manifest, and persist it as a review-tied override |
 | `--materialize` | Materialize implementation slices exactly once from a completed approved `plan_review` by review ID |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
@@ -1699,7 +1714,8 @@ gza plan-improve <task_id> [options]
 | Option | Description |
 |--------|-------------|
 | `task_id` | Full prefixed completed `CHANGES_REQUESTED` `plan_review` task ID to revise |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
@@ -1739,7 +1755,8 @@ gza extract SOURCE --files-from FILE [options]
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
 | `--no-learnings` | Skip injecting learnings context |
-| `--queue`, `-q` | Add task to queue without executing immediately |
+| `--queue`, `-q` | Queue the task without running it (default) |
+| `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |

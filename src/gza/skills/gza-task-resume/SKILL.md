@@ -27,7 +27,7 @@ uv run gza history --status failed --last 10
 Preferred tracked resume flow:
 
 ```bash
-uv run gza resume <TASK_ID>
+uv run gza resume <TASK_ID> --run
 ```
 
 If the user explicitly wants foreground inline execution through runner orchestration:
@@ -39,7 +39,7 @@ uv run gza run-inline <TASK_ID> --resume
 Optional flags when requested:
 
 ```bash
-uv run gza resume <TASK_ID> --no-docker
+uv run gza resume <TASK_ID> --run --no-docker
 uv run gza resume <TASK_ID> --background
 uv run gza run-inline <TASK_ID> --resume --no-docker
 ```

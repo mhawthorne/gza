@@ -173,6 +173,26 @@ def add_hidden_parser(subparsers, name: str, **kwargs):
     return parser
 
 
+def add_execution_mode_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared queue/run/background execution mode flags."""
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--queue", "-q",
+        action="store_true",
+        help="Queue the task without running it (default)",
+    )
+    mode_group.add_argument(
+        "--run", "-r",
+        action="store_true",
+        help="Run the task immediately in the foreground",
+    )
+    mode_group.add_argument(
+        "--background", "-b",
+        action="store_true",
+        help="Run the task in a detached background worker",
+    )
+
+
 def _keyboard_interrupt_exit() -> int:
     print("stopping due to ctrl+c", file=sys.stderr)
     return 130
@@ -1244,11 +1264,7 @@ def main() -> int:
         action="store_true",
         help="Auto-resolve conflicts using AI (non-interactive)",
     )
-    rebase_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run rebase in background (detached mode)",
-    )
+    add_execution_mode_args(rebase_parser)
     add_common_args(rebase_parser)
 
     # checkout command
@@ -1970,16 +1986,7 @@ def main() -> int:
         action="store_true",
         help="Run Claude directly instead of in Docker (only with --background)",
     )
-    retry_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
-    retry_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
+    add_execution_mode_args(retry_parser)
     retry_parser.add_argument(
         "--max-turns",
         type=int,
@@ -2005,16 +2012,7 @@ def main() -> int:
         action="store_true",
         help="Run Claude directly instead of in Docker",
     )
-    resume_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
-    resume_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
+    add_execution_mode_args(resume_parser)
     resume_parser.add_argument(
         "--max-turns",
         type=int,
@@ -2055,16 +2053,7 @@ def main() -> int:
         metavar="ID",
         help="Explicit full review task ID to base the improve on (overrides auto-pick of most recent completed review)",
     )
-    improve_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    improve_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(improve_parser)
     improve_parser.add_argument(
         "--no-docker",
         action="store_true",
@@ -2108,16 +2097,7 @@ def main() -> int:
         action="store_true",
         help="Auto-create review task on completion; if the branch already has an open PR, push same-branch fix commits first",
     )
-    fix_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    fix_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(fix_parser)
     fix_parser.add_argument(
         "--no-docker",
         action="store_true",
@@ -2303,16 +2283,7 @@ def main() -> int:
         dest="skip_learnings",
         help="Skip injecting .gza/learnings.md context into this task's prompt",
     )
-    implement_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    implement_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(implement_parser)
     implement_parser.add_argument(
         "--no-docker",
         action="store_true",
@@ -2357,16 +2328,7 @@ def main() -> int:
         action="store_true",
         help="Materialize implementation slices exactly once from a completed approved plan_review ID",
     )
-    plan_review_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    plan_review_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(plan_review_parser)
     plan_review_parser.add_argument(
         "--no-docker",
         action="store_true",
@@ -2405,16 +2367,7 @@ def main() -> int:
         type=str,
         help="Full prefixed completed CHANGES_REQUESTED plan_review task ID to revise",
     )
-    plan_improve_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    plan_improve_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(plan_improve_parser)
     plan_improve_parser.add_argument(
         "--no-docker",
         action="store_true",
@@ -2541,16 +2494,7 @@ def main() -> int:
         dest="skip_learnings",
         help="Skip injecting .gza/learnings.md context into this task's prompt",
     )
-    extract_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    extract_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(extract_parser)
     extract_parser.add_argument(
         "--no-docker",
         action="store_true",
@@ -2579,16 +2523,7 @@ def main() -> int:
         type=str,
         help="Full prefixed task ID (implement, improve, review, or fix — resolves to owning implementation)",
     )
-    review_parser.add_argument(
-        "--queue", "-q",
-        action="store_true",
-        help="Add task to queue without executing immediately",
-    )
-    review_parser.add_argument(
-        "--background", "-b",
-        action="store_true",
-        help="Run worker in background (detached mode)",
-    )
+    add_execution_mode_args(review_parser)
     review_parser.add_argument(
         "--no-docker",
         action="store_true",

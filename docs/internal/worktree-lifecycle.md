@@ -45,16 +45,16 @@ Unlike code task worktrees, non-code task worktrees are **removed on success** a
 
 **Single-file stale-name recovery**: If log recovery fails and the report directory contains exactly one other `*.md` file, gza treats that as a stale filename mismatch, copies its contents into the expected path, logs a warning naming both filenames, and completes normally. If there are zero or multiple mismatched `*.md` files, the task still fails with `MISSING_REPORT_ARTIFACT`.
 
-### `gza rebase` CLI (foreground mode)
+### `gza rebase --run` CLI (foreground mode)
 
-Foreground `gza rebase` creates a dedicated `rebase` child task and uses that row as the canonical execution owner (status + `log_file`) across both mechanical and provider-assisted phases.
+Foreground `gza rebase --run` creates a dedicated `rebase` child task and uses that row as the canonical execution owner (status + `log_file`) across both mechanical and provider-assisted phases. Bare `gza rebase` only queues that child.
 
 It creates a **temporary** canonical worktree at `config.worktree_path / rebase_task.id`
 for the duration of the host-side mechanical rebase setup. Unlike task worktrees, this
 worktree is always removed after use — cleanup runs on all exit paths (mechanical success,
 provider-resolved success, failure, and exception), with `shutil.rmtree` fallback if
 `git worktree remove` leaves a directory behind. This worktree is never left registered
-with git after `gza rebase` exits.
+with git after `gza rebase --run` exits.
 
 If provider-assisted conflict resolution is needed, gza does **not** hand the provider the
 canonical worktree's shared gitdir. Instead it creates a separate **private rebase

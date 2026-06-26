@@ -384,8 +384,8 @@ In interactive mode, the same `Needs attention` section is part of the plan prev
 | Command | Relationship |
 |---------|-------------|
 | `gza work` | Advance spawns workers that run `gza work --worker-mode` |
-| `gza review` | Advance creates review tasks equivalent to `gza review --queue` |
-| `gza improve` | Advance creates improve tasks equivalent to `gza improve --queue` |
+| `gza review` | Advance creates review tasks equivalent to bare `gza review` (queue-by-default) |
+| `gza improve` | Advance creates improve tasks equivalent to bare `gza improve` (queue-by-default) |
 | `gza rebase` | Advance creates rebase tasks equivalent to `gza rebase --background` |
 | `gza merge` | Advance merges directly, same as `gza merge <id>` |
 | `gza watch` | Runs advance in a loop with sleep intervals; `watch.recovery_slots` reserves failed-task recovery capacity before pending pickup |

@@ -140,7 +140,7 @@ For anything nontrivial, run a review first:
 
 ```bash
 # AI reviews the implementation
-gza review gza-1
+gza review gza-1 --run
 # Created review task gza-2 — runs immediately
 
 # Read the review
@@ -152,10 +152,10 @@ If the review requests changes, improve and re-review:
 ```bash
 # Address review feedback (continues on the same branch)
 # You can pass the implement, improve, or review task ID — gza auto-resolves to the root implementation.
-gza improve gza-1
+gza improve gza-1 --run
 
 # Review again
-gza review gza-1
+gza review gza-1 --run
 ```
 
 When you're satisfied, merge or create a PR:

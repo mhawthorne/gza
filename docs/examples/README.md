@@ -45,12 +45,12 @@ Practical examples showing common workflows with Gza.
 | Tail worker logs | `gza log -w <worker_id> -f` |
 | View task log | `gza log <task_id>` |
 | Kill a running task | `gza kill <task_id>` |
-| Create review | `gza review <impl_id>` |
-| Address feedback | `gza improve <impl_id>` |
-| Resume failed task | `gza resume <task_id>` |
-| Create a new retry attempt | `gza retry <task_id>` |
+| Create review immediately | `gza review <impl_id> --run` |
+| Address feedback immediately | `gza improve <impl_id> --run` |
+| Resume failed task immediately | `gza resume <task_id> --run` |
+| Create a new retry attempt immediately | `gza retry <task_id> --run` |
 | View unmerged work | `uv run gza unmerged` |
-| Rebase a branch | `gza rebase <task_id>` |
+| Rebase a branch immediately | `gza rebase <task_id> --run` |
 | Create PR | `gza pr <task_id>` |
 | Merge to main | `gza merge <task_id> --squash` |
 | View tasks by tag | `gza search --tag <tag>` |

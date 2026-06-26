@@ -120,7 +120,7 @@ Prevention (Step 7) stops recurrence; it does **not** clear the rows already stu
 | Action | When | How |
 |---|---|---|
 | **DROP** | moot / dead / stale / superseded / never-merged-and-abandoned (incl. months-old backlog and dead `INFRASTRUCTURE_ERROR` leaves once their owner is resolved elsewhere) | `uv run gza set-status <id> dropped` — clears the row now and stops it reappearing; branch is kept |
-| **SPAWN follow-up** | completed explore/plan blocked only on a "what next" decision (`explore-needs-follow-up-decision`, plan awaiting implement) | `uv run gza add --based-on <id> ...` (from an explore) or `uv run gza implement <plan-id>` (from a plan) — the follow-up *is* the unstick |
+| **SPAWN follow-up** | completed explore/plan blocked only on a "what next" decision (`explore-needs-follow-up-decision`, plan awaiting implement) | `uv run gza add --based-on <id> ...` (from an explore) or `uv run gza implement <plan-id>` (from a plan; queues by default) — the follow-up *is* the unstick |
 | **RESCUE inline** | review/improve-loop on one unit (`review-no-exit`, per-unit `verify-unreproducible`) | `/gza-task-fix <impl-id>` |
 | **LEAVE** | genuinely-live pending/in-flight work, or ready advance actions (`materialize_plan_slices`, recovery lane) watch will run | nothing — these are not stuck |
 

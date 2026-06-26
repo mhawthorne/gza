@@ -92,7 +92,7 @@ Existing orphan recovery branches created before this behavior was fixed are lef
 ## Relationship to `gza rebase` CLI command
 
 `gza rebase` operates entirely within dedicated temporary checkouts — it never modifies the
-main working tree. When invoked without `--background`:
+main working tree. Bare `gza rebase <task-id>` now only creates the pending child task. When invoked with `--run`:
 
 1. Any stale worktree for the task's branch is force-removed.
 2. A fresh worktree is created at `config.worktree_path / task.id`.

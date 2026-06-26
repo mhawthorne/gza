@@ -158,6 +158,16 @@ from .query import _get_orphaned_tasks, _print_orphaned_warning
 
 _ITERATE_TERMINAL_NO_WORK_REASON_CODES = frozenset({"merge_unit_empty", "merge_unit_redundant"})
 
+ExecutionMode = Literal["queue", "run", "background"]
+
+
+def _execution_mode(args: argparse.Namespace) -> ExecutionMode:
+    if getattr(args, "background", False):
+        return "background"
+    if getattr(args, "run", False):
+        return "run"
+    return "queue"
+
 
 def _find_held_plan_in_based_on_lineage(
     store: SqliteTaskStore,
@@ -364,7 +374,7 @@ def _finalize_immediate_execution_task(
     reserved_permit: LaunchPermit | None = None,
 ) -> tuple[DbTask | None, LaunchPermit | None]:
     """Print task creation only after immediate-execution preparation succeeds."""
-    if getattr(args, "queue", False):
+    if _execution_mode(args) == "queue":
         emit_created()
         return task, None
 
@@ -398,7 +408,7 @@ def _reserve_immediate_execution_permit(
     config: Config,
     store: SqliteTaskStore,
 ) -> LaunchPermit | Literal[False] | None:
-    if getattr(args, "queue", False):
+    if _execution_mode(args) == "queue":
         return None
     if not isinstance(getattr(config, "max_concurrent", None), int):
         return None
@@ -1214,6 +1224,7 @@ def cmd_plan_review(args: argparse.Namespace) -> int:
     if hasattr(args, "max_turns") and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
     plan_source_id = resolve_id(config, args.task_id)
@@ -1290,10 +1301,10 @@ def cmd_plan_review(args: argparse.Namespace) -> int:
         plan_review_task = prepared_plan_review_task
         mark_launch_transferred()
 
-    if hasattr(args, "queue") and args.queue:
+    if execution_mode == "queue":
         return 0
 
-    if hasattr(args, "background") and args.background:
+    if execution_mode == "background":
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [plan_review_task.id]
         rc = _spawn_background_worker(
@@ -1379,7 +1390,7 @@ def _cmd_plan_review_manifest_action(
 ) -> int:
     if getattr(args, "rerun", False):
         return phase1_error(args, "--rerun cannot be combined with --edit-slices or --materialize")
-    if getattr(args, "queue", False) or getattr(args, "background", False):
+    if _execution_mode(args) != "run":
         return phase1_error(args, "--queue/--background are not supported with --edit-slices or --materialize")
     if review_task.task_type != "plan_review":
         return phase1_error(
@@ -1480,6 +1491,7 @@ def cmd_plan_improve(args: argparse.Namespace) -> int:
     if hasattr(args, "max_turns") and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
     review_task_id = resolve_id(config, args.task_id)
@@ -1578,10 +1590,10 @@ def cmd_plan_improve(args: argparse.Namespace) -> int:
         plan_improve_task = prepared_plan_improve_task
         mark_launch_transferred()
 
-    if hasattr(args, "queue") and args.queue:
+    if execution_mode == "queue":
         return 0
 
-    if hasattr(args, "background") and args.background:
+    if execution_mode == "background":
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [plan_improve_task.id]
         rc = _spawn_background_worker(
@@ -1614,6 +1626,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
 
@@ -1705,7 +1718,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
             plan_task.auto_implement = True
             store.update(plan_task)
 
-            if hasattr(args, "queue") and args.queue:
+            if execution_mode == "queue":
                 _emit_plan_slice_materialization(
                     materialization,
                     plan_source_id=plan_source_id,
@@ -1740,7 +1753,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
                 return 1
             mark_launch_transferred()
 
-            if hasattr(args, "background") and args.background:
+            if execution_mode == "background":
                 worker_args = argparse.Namespace(**vars(args))
                 prepared_first_task_id = prepared_first_task.id
                 assert prepared_first_task_id is not None
@@ -1816,11 +1829,11 @@ def cmd_implement(args: argparse.Namespace) -> int:
         store.update(plan_task)
 
         # Handle queue mode - add to queue without executing
-        if hasattr(args, 'queue') and args.queue:
+        if execution_mode == "queue":
             return 0
 
         # Handle background mode - spawn worker to run the implement task
-        if hasattr(args, 'background') and args.background:
+        if execution_mode == "background":
             assert impl_task.id is not None
             worker_args = argparse.Namespace(**vars(args))
             worker_args.task_ids = [impl_task.id]
@@ -1854,6 +1867,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     if hasattr(args, "max_turns") and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     source_task_id_raw = args.source if hasattr(args, "source") else None
     source_branch = args.branch if hasattr(args, "branch") else None
@@ -1985,7 +1999,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
     base_branch = args.base_branch if hasattr(args, "base_branch") and args.base_branch else None
     created_task_summaries: list[_CreatedImmediateExecutionTask] = []
 
-    if hasattr(args, "queue") and args.queue:
+    if execution_mode == "queue":
         for source, draft in drafts:
             try:
                 impl_task, bundle_dir = _create_extract_task(
@@ -2025,7 +2039,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
             created_task.emit_created()
         return 0
 
-    if hasattr(args, "background") and args.background:
+    if execution_mode == "background":
         try:
             reserved_permits = launch_permits(config, store, count=len(drafts))
         except MaxConcurrentTasksError as exc:
@@ -2728,6 +2742,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
 
@@ -2769,11 +2784,11 @@ def cmd_retry(args: argparse.Namespace) -> int:
     new_task = prepared_retry_task
 
     # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
+    if execution_mode == "queue":
         return 0
 
     # Handle background mode - spawn worker to run the new task
-    if args.background:
+    if execution_mode == "background":
         # Create a temporary args object for the worker with the new task_id
         assert new_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
@@ -3147,6 +3162,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
 
@@ -3374,11 +3390,11 @@ def cmd_improve(args: argparse.Namespace) -> int:
         mark_launch_transferred()
 
     # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
+    if execution_mode == "queue":
         return 0
 
     # Handle background mode - spawn worker to run the improve task
-    if hasattr(args, 'background') and args.background:
+    if execution_mode == "background":
         assert improve_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [improve_task.id]
@@ -3412,6 +3428,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
     impl_task, err = resolve_impl_task(store, resolve_id(config, args.task_id))
@@ -3470,10 +3487,10 @@ def cmd_fix(args: argparse.Namespace) -> int:
         return 1
     fix_task = prepared_fix_task
 
-    if hasattr(args, 'queue') and args.queue:
+    if execution_mode == "queue":
         return 0
 
-    if hasattr(args, 'background') and args.background:
+    if execution_mode == "background":
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [fix_task.id]
         rc = _spawn_background_worker(
@@ -3524,6 +3541,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     config = Config.load(args.project_dir)
     if args.no_docker:
         config.use_docker = False
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
 
@@ -3584,11 +3602,11 @@ def cmd_review(args: argparse.Namespace) -> int:
         mark_launch_transferred()
 
     # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
+    if execution_mode == "queue":
         return 0
 
     # Handle background mode - spawn worker to run the review task
-    if hasattr(args, 'background') and args.background:
+    if execution_mode == "background":
         assert review_task.id is not None
         worker_args = argparse.Namespace(**vars(args))
         worker_args.task_ids = [review_task.id]
@@ -5949,6 +5967,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if hasattr(args, 'max_turns') and args.max_turns is not None:
         config.max_steps = args.max_turns
         config.max_turns = args.max_turns
+    execution_mode = _execution_mode(args)
 
     store = get_store(config)
 
@@ -6006,11 +6025,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
     new_task = prepared_resume_task
 
     # Handle queue mode - add to queue without executing
-    if hasattr(args, 'queue') and args.queue:
+    if execution_mode == "queue":
         return 0
 
     # Handle background mode
-    if args.background:
+    if execution_mode == "background":
         assert new_task.id is not None
         rc = _spawn_background_resume_worker(
             args,

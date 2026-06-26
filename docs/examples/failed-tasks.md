@@ -56,10 +56,10 @@ For bulk unattended recovery after fixing an environment issue, use the watch re
 
 Resume continues the existing conversation. The AI picks up where it left off with full context of what it already did.
 
-`uv run gza resume` runs the new task immediately by default. Use `--queue` to add to queue without executing:
+Bare `uv run gza resume` now creates the resumed task and leaves it pending. Use `--run` for immediate foreground execution, or `--queue` if you want the intent spelled out explicitly:
 
 ```bash
-$ uv run gza resume gza-5
+$ uv run gza resume gza-5 --run
 === Resuming Task gza-5: 20260108-add-user-auth ===
 ...
 === Done ===
@@ -69,7 +69,7 @@ Stats: Runtime: 5m 23s | Turns: 15 | Cost: $0.34
 Increase the turn limit if the original was too low:
 
 ```bash
-$ uv run gza resume gza-5 --max-turns 100
+$ uv run gza resume gza-5 --run --max-turns 100
 ```
 
 Add to queue without running immediately:
@@ -82,10 +82,10 @@ $ uv run gza resume gza-5 --queue
 
 Retry creates a fresh attempt. Use this when the AI went down a wrong path and you want it to start over.
 
-`uv run gza retry` runs the new task immediately by default. Use `--queue` to add to queue without executing:
+Bare `uv run gza retry` now creates the retry task and leaves it pending. Use `--run` for immediate foreground execution, or `--queue` if you want the intent spelled out explicitly:
 
 ```bash
-$ uv run gza retry gza-5
+$ uv run gza retry gza-5 --run
 Created task gza-6 (retry of gza-5)
 === Task gza-6: 20260108-add-user-auth ===
 ...

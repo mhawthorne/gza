@@ -28,6 +28,7 @@ from gza.cli.git_ops import (
     _run_task_backed_rebase,
     _tracking_ref_refresh_command,
     cmd_advance,
+    cmd_rebase,
 )
 from gza.config import Config
 from gza.git import Git, GitError, ResolvedGitRef, ResolvedMergeSourceRef
@@ -5103,6 +5104,7 @@ def test_rebase_background_creator_phase_failure_cleans_up_created_task_and_arti
     git = SimpleNamespace(
         current_branch=MagicMock(return_value="main"),
         default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
     )
 
     with (
@@ -5145,6 +5147,7 @@ def test_rebase_background_reuses_prepared_child_without_second_startup_pass(tmp
     git = SimpleNamespace(
         current_branch=MagicMock(return_value="main"),
         default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
     )
     captured_spawn: dict[str, object] = {}
 
@@ -5174,6 +5177,94 @@ def test_rebase_background_reuses_prepared_child_without_second_startup_pass(tmp
     prepared_task = captured_spawn["prepared_task"]
     assert prepared_task is not None
     assert getattr(prepared_task, "id", None) == captured_spawn["task_id"]
+
+
+def test_rebase_defaults_to_queue_without_running_or_spawning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl_task = store.add("Implement feature", task_type="implement")
+    assert impl_task.id is not None
+    impl_task.status = "completed"
+    impl_task.branch = "test-project/20260129-implement-feature"
+    impl_task.completed_at = datetime.now(UTC)
+    store.update(impl_task)
+
+    git = SimpleNamespace(
+        current_branch=MagicMock(return_value="main"),
+        default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
+    )
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=impl_task.id,
+        onto=None,
+        remote=False,
+        force=False,
+        resolve=False,
+        run=False,
+        queue=False,
+        background=False,
+        no_docker=True,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.cli.git_ops._require_default_branch", return_value=True),
+        patch("gza.cli.git_ops._run_task_backed_rebase", side_effect=AssertionError("should stay queued")),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=AssertionError("should stay queued")),
+        patch("gza.cli.git_ops._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+    ):
+        rc = cmd_rebase(args)
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Created rebase task" in output
+    created = store.get_based_on_children(impl_task.id)
+    assert len(created) == 1
+    assert created[0].task_type == "rebase"
+    assert created[0].status == "pending"
+    assert created[0].branch == impl_task.branch
+
+
+def test_rebase_run_uses_foreground_task_backed_path(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl_task = store.add("Implement feature", task_type="implement")
+    assert impl_task.id is not None
+    impl_task.status = "completed"
+    impl_task.branch = "test-project/20260129-implement-feature"
+    impl_task.completed_at = datetime.now(UTC)
+    store.update(impl_task)
+
+    git = SimpleNamespace(
+        current_branch=MagicMock(return_value="main"),
+        default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
+    )
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=impl_task.id,
+        onto=None,
+        remote=False,
+        force=False,
+        resolve=False,
+        run=True,
+        queue=False,
+        background=False,
+        no_docker=True,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.cli.git_ops._require_default_branch", return_value=True),
+        patch("gza.cli.git_ops._run_task_backed_rebase", return_value=0) as run_rebase,
+    ):
+        rc = cmd_rebase(args)
+
+    assert rc == 0
+    run_rebase.assert_called_once()
 
 
 def test_reconcile_squash_merge_skips_when_no_remote_tracking_ref() -> None:

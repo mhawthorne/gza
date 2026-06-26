@@ -30,7 +30,7 @@ Ask the user what they want to accomplish. Use AskUserQuestion to gather:
    - `plan` - Planning and design work that produces a specification
    - `implement` - Code implementation based on clear requirements
    - `review` - Code review or quality assessment
-   - `improve` - Address review feedback and/or unresolved task comments on an implementation. Runs from review findings, from unresolved comments, or from both; comments-only improve is supported when no usable review exists (use `uv run gza improve <impl-id>`)
+   - `improve` - Address review feedback and/or unresolved task comments on an implementation. Runs from review findings, from unresolved comments, or from both; comments-only improve is supported when no usable review exists (use `uv run gza improve <impl-id> --run`)
 
 3. **Additional context** (optional):
    - Should this be tagged to relate it to other tasks? (--tag TAG, repeatable)
@@ -158,13 +158,13 @@ uv run gza add --tag metrics --type implement --depends-on gza-d "add metrics ex
 **Improve workflow (addressing review findings and/or unresolved comments):**
 ```bash
 # After a review requests changes, create an improve task
-uv run gza improve gza-t  # where gza-t is the implementation task ID
-uv run gza improve gza-t --review  # auto-create review after improvements
+uv run gza improve gza-t --run  # where gza-t is the implementation task ID
+uv run gza improve gza-t --run --review  # auto-create review after improvements
 
 # Comments-only improve: when no usable review exists but unresolved task
 # comments do, improve still runs using comments-only feedback. Add comments
 # first via `gza comment <task_id> "<text>"`, then:
-uv run gza improve gza-t
+uv run gza improve gza-t --run
 ```
 
 ## Important notes

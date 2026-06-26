@@ -34,6 +34,7 @@ def _args(project_dir: Path, **overrides: object) -> Namespace:
         "model": None,
         "provider": None,
         "skip_learnings": False,
+        "run": False,
         "background": False,
         "queue": False,
         "force": False,
@@ -142,6 +143,43 @@ def test_extract_dry_run_uses_current_branch_when_no_source_selector(tmp_path: P
     mock_print.assert_called_once()
     assert mock_print.call_args.kwargs["source_label"] == "branch feature/current"
     assert mock_print.call_args.kwargs["dry_run"] is True
+
+
+def test_extract_defaults_to_queue_without_running_or_spawning(tmp_path: Path) -> None:
+    from gza.cli.execution import cmd_extract
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    source = SourceSelection(
+        source_task_id=None,
+        source_branch="feature/source",
+        source_base_ref="main",
+    )
+    draft = _draft(source=source)
+    git = MagicMock(spec=Git)
+    git.branch_exists.return_value = False
+
+    with (
+        patch("gza.cli.execution.Git", return_value=git),
+        patch("gza.cli.execution.resolve_source_selection", return_value=source),
+        patch("gza.cli.execution.normalize_selected_paths", return_value=("src/extracted.py",)),
+        patch("gza.cli.execution.plan_extraction", return_value=draft),
+        patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+        patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        patch("gza.cli.execution._spawn_background_workers", side_effect=AssertionError("should stay queued")),
+    ):
+        rc = cmd_extract(
+            _args(
+                tmp_path,
+                branch="feature/source",
+                paths=("src/extracted.py",),
+            )
+        )
+
+    assert rc == 0
+    created = get_latest_task(store, task_type="implement")
+    assert created is not None
+    assert created.status == "pending"
 
 
 def test_extract_bundle_write_failure_marks_failed_task_when_delete_fails(tmp_path: Path) -> None:
@@ -373,6 +411,7 @@ def test_extract_foreground_refuses_before_creating_task_when_no_capacity(
                 tmp_path,
                 branch="feature/source",
                 paths=("src/extracted.py",),
+                run=True,
             )
         )
 
@@ -476,6 +515,7 @@ def test_extract_per_commit_foreground_does_not_hold_future_reserved_permit_whil
                 commits=["aaa111", "bbb222"],
                 per_commit=True,
                 paths=("src/extracted.py",),
+                run=True,
             )
         )
 

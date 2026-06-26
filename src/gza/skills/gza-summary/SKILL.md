@@ -59,7 +59,7 @@ Treat each command as the authoritative surface for one domain:
 
 **From `uv run gza advance --unimplemented`:**
 - Identify completed `plan` or `explore` rows that do not yet have implementation work
-- Suggest `uv run gza implement <full prefixed task id>` only for completed plan rows
+- Suggest bare `uv run gza implement <full prefixed task id>` only for completed plan rows; note that it queues by default
 - Suggest `uv run gza advance --unimplemented --create` when implement tasks should be queued from listed source rows
 
 **From `uv run gza next --all`:**

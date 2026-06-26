@@ -651,7 +651,7 @@ def test_retry_docs_and_examples_describe_same_branch_retry_split() -> None:
     assert "Implement retries may fork a fresh branch; same-branch follow-up retries stay attached to the shared branch." in retry_section
     assert "from scratch" not in retry_section
     assert "Starts a fresh conversation." not in retry_section
-    assert "| Create a new retry attempt | `gza retry <task_id>` |" in examples_readme
+    assert "| Create a new retry attempt immediately | `gza retry <task_id> --run` |" in examples_readme
     assert "| Retry from scratch | `gza retry <task_id>` |" not in examples_readme
 
 

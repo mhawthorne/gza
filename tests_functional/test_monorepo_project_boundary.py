@@ -157,6 +157,7 @@ def test_monorepo_project_boundary_flow(tmp_path: Path) -> None:
     retry_result = run_gza_subprocess(
         "retry",
         str(blocked.id),
+        "--run",
         "--no-docker",
         "--project",
         str(project_dir),

@@ -2124,8 +2124,8 @@ class TestRetryCommand:
         assert new_task.status in ("pending", "in_progress")
         assert new_task.based_on == task.id
 
-    def test_retry_runs_by_default(self, tmp_path: Path):
-        """Retry command runs the newly created task immediately by default."""
+    def test_retry_run_flag_runs_immediately(self, tmp_path: Path):
+        """Retry command runs immediately only with --run."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2137,7 +2137,7 @@ class TestRetryCommand:
         store.update(task)
 
         with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
-            result = invoke_gza("retry", str(task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("retry", str(task.id), "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the new task was created and run was attempted
         assert "Created task " in result.stdout
@@ -2409,8 +2409,8 @@ class TestResumeCommand:
         assert result.returncode == 1
         assert "Can only resume failed or orphaned tasks" in result.stdout
 
-    def test_resume_runs_by_default(self, tmp_path: Path):
-        """Resume command runs the new task immediately by default."""
+    def test_resume_run_flag_runs_immediately(self, tmp_path: Path):
+        """Resume command runs immediately only with --run."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -2426,7 +2426,7 @@ class TestResumeCommand:
             patch("gza.git.Git.branch_exists", return_value=False),
             patch("gza.cli._run_foreground", return_value=0) as run_foreground,
         ):
-            result = invoke_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("resume", str(task.id), "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the command creates a new task
         assert "resume of " in result.stdout
@@ -2843,7 +2843,7 @@ class TestResumeCommand:
         store.update(task)
 
         with patch("gza.cli._run_foreground", return_value=0) as run_foreground:
-            result = invoke_gza("resume", str(task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("resume", str(task.id), "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify output
         assert "resume of " in result.stdout
@@ -5534,6 +5534,7 @@ class TestImplementCommand:
             provider=None,
             skip_learnings=False,
             review_scope=None,
+            run=True,
             background=False,
             queue=False,
             force=False,
@@ -5611,6 +5612,7 @@ class TestImplementCommand:
             provider=None,
             skip_learnings=False,
             review_scope=None,
+            run=True,
             background=False,
             queue=False,
             force=False,
@@ -5741,6 +5743,7 @@ class TestPlanReviewAndImproveCommands:
             rerun=False,
             edit_slices=True,
             materialize=False,
+            run=True,
             queue=False,
             background=False,
             model=None,
@@ -5755,6 +5758,7 @@ class TestPlanReviewAndImproveCommands:
             rerun=False,
             edit_slices=False,
             materialize=True,
+            run=True,
             queue=False,
             background=False,
             model=None,
@@ -5821,6 +5825,7 @@ class TestPlanReviewAndImproveCommands:
             rerun=False,
             edit_slices=True,
             materialize=False,
+            run=True,
             queue=False,
             background=False,
             model=None,
@@ -5866,7 +5871,7 @@ class TestPlanReviewAndImproveCommands:
         store.update(review)
         _store_plan_review_override_artifact(tmp_path, store, review.id, output="[]")
 
-        result = invoke_gza("plan-review", str(review.id), "--materialize", "--project", str(tmp_path))
+        result = invoke_gza("plan-review", str(review.id), "--materialize", "--run", "--project", str(tmp_path))
 
         assert result.returncode == 1
         assert len([task for task in store.get_all() if task.task_type == "implement"]) == 0
@@ -6746,8 +6751,8 @@ class TestImproveCommand:
         all_tasks = store.get_all()
         assert len(all_tasks) == 3
 
-    def test_improve_runs_by_default(self, tmp_path: Path):
-        """Improve command runs the task immediately by default (without any flags)."""
+    def test_improve_run_flag_runs_immediately(self, tmp_path: Path):
+        """Improve command runs immediately only with --run."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -6765,10 +6770,10 @@ class TestImproveCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        # Run improve command without --queue. Stub the foreground worker because
-        # this test only cares that the default path attempts immediate execution.
+        # Run improve with --run. Stub the foreground worker because this test
+        # only cares that the explicit foreground path is selected.
         with patch("gza.cli._run_foreground", return_value=0):
-            result = invoke_gza("improve", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("improve", str(impl_task.id), "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the improve task was created and run was attempted
         assert result.returncode == 0
@@ -7578,6 +7583,7 @@ class TestFixCommand:
             task_id=str(impl_task.id),
             queue=False,
             background=False,
+            run=True,
             no_docker=True,
             max_turns=None,
             model=None,
@@ -7927,8 +7933,8 @@ class TestReviewCommand:
         assert retry_node.task.id == retry_impl.id
         assert any(child.task.id == review_task.id for child in retry_node.children)
 
-    def test_review_runs_by_default(self, tmp_path: Path):
-        """Review command runs the review task immediately by default."""
+    def test_review_run_flag_runs_immediately(self, tmp_path: Path):
+        """Review command runs immediately only with --run."""
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -7939,8 +7945,7 @@ class TestReviewCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        # Run review command without --queue (will attempt to run immediately)
-        result = invoke_gza("review", str(impl_task.id), "--no-docker", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--run", "--no-docker", "--project", str(tmp_path))
 
         # Verify the review task was created and run attempted
         assert "Created review task " in result.stdout
@@ -8015,8 +8020,7 @@ class TestReviewCommand:
             review_dir = tmp_path / ".gza" / "reviews"
             review_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run review command with --open flag (runs by default)
-            result = invoke_gza("review", str(impl_task.id), "--open", "--no-docker", "--project", str(tmp_path))
+            result = invoke_gza("review", str(impl_task.id), "--open", "--run", "--no-docker", "--project", str(tmp_path))
 
             # Check that warning about missing EDITOR is shown
             # Note: This might not appear in output if the task doesn't complete successfully in test
@@ -17760,6 +17764,7 @@ class TestForegroundInvocationContextWiring:
             model=None,
             provider=None,
             skip_learnings=False,
+            run=True,
             background=False,
             queue=False,
             force=False,
@@ -17799,6 +17804,7 @@ class TestForegroundInvocationContextWiring:
             model=None,
             provider=None,
             skip_learnings=False,
+            run=False,
             background=False,
             queue=True,
             force=False,
@@ -17837,6 +17843,7 @@ class TestForegroundInvocationContextWiring:
             model=None,
             provider=None,
             skip_learnings=False,
+            run=False,
             background=False,
             queue=True,
             force=False,
@@ -17865,6 +17872,7 @@ class TestForegroundInvocationContextWiring:
             no_docker=True,
             model=None,
             provider=None,
+            run=True,
             background=False,
             queue=False,
             open=False,
@@ -17896,6 +17904,7 @@ class TestForegroundInvocationContextWiring:
             no_docker=True,
             model=None,
             provider=None,
+            run=True,
             background=False,
             queue=False,
             open=False,
@@ -17954,6 +17963,7 @@ class TestForegroundInvocationContextWiring:
             review_id=None,
             model=None,
             provider=None,
+            run=True,
             background=False,
             queue=False,
             force=False,
@@ -18009,6 +18019,7 @@ class TestForegroundInvocationContextWiring:
             review_id=None,
             model=None,
             provider=None,
+            run=False,
             background=False,
             queue=False,
             force=False,
@@ -18054,6 +18065,7 @@ class TestForegroundInvocationContextWiring:
             review_id=None,
             model=None,
             provider=None,
+            run=False,
             background=False,
             queue=False,
             force=False,
@@ -18089,6 +18101,7 @@ class TestForegroundInvocationContextWiring:
             no_docker=True,
             queue=False,
             background=False,
+            run=False,
             model=None,
             provider=None,
         )
@@ -18118,6 +18131,7 @@ class TestForegroundInvocationContextWiring:
             no_docker=True,
             queue=False,
             background=False,
+            run=False,
             model=None,
             provider=None,
         )
@@ -18147,6 +18161,7 @@ class TestForegroundInvocationContextWiring:
             max_turns=None,
             model=None,
             provider=None,
+            run=True,
             force=False,
         )
 
@@ -18174,6 +18189,7 @@ class TestForegroundInvocationContextWiring:
             task_id=failed.id,
             no_docker=True,
             max_turns=None,
+            run=True,
             background=False,
             queue=False,
             force=False,
@@ -18204,6 +18220,7 @@ class TestForegroundInvocationContextWiring:
             task_id=failed.id,
             no_docker=True,
             max_turns=None,
+            run=False,
             background=False,
             queue=False,
             force=False,
@@ -18242,6 +18259,7 @@ class TestForegroundInvocationContextWiring:
             task_id=failed.id,
             no_docker=True,
             max_turns=None,
+            run=True,
             background=False,
             queue=False,
             force=False,
@@ -18253,6 +18271,283 @@ class TestForegroundInvocationContextWiring:
         assert capsys.readouterr().out.strip() == "Error: already at max concurrent tasks: 1 running, limit is 1"
         after_ids = {task.id for task in store.get_all()}
         assert after_ids == before_ids
+
+    def test_bare_implement_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_implement
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("Plan feature", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            plan_task_id=plan.id,
+            prompt=None,
+            group=None,
+            depends_on=None,
+            review=False,
+            same_branch=False,
+            branch_type=None,
+            review_scope=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            run=False,
+            background=False,
+            queue=False,
+            force=False,
+            create_pr=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_workers", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_implement(args) == 0
+
+        created = next(task for task in store.get_pending() if task.task_type == "implement")
+        assert created.depends_on == plan.id
+
+    def test_bare_review_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_review
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement auth", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            model=None,
+            provider=None,
+            run=False,
+            background=False,
+            queue=False,
+            open=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_review(args) == 0
+
+        created = next(task for task in store.get_pending() if task.task_type == "review")
+        assert created.depends_on == impl.id
+
+    def test_bare_improve_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_improve
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement api", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+        review = store.add("Review api", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            no_docker=True,
+            max_turns=None,
+            review=False,
+            review_id=None,
+            model=None,
+            provider=None,
+            run=False,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_improve(args) == 0
+
+        created = next(task for task in store.get_pending() if task.task_type == "improve")
+        assert created.based_on == impl.id
+
+    def test_bare_retry_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_retry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = store.add("Failed implement", task_type="implement")
+        failed.status = "failed"
+        store.update(failed)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            run=False,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_retry(args) == 0
+
+        created = next(task for task in store.get_pending() if task.based_on == failed.id)
+        assert created.task_type == failed.task_type
+
+    def test_bare_resume_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_resume
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = store.add("Failed implement", task_type="implement")
+        failed.status = "failed"
+        failed.session_id = "resume-session-123"
+        store.update(failed)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            run=False,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_resume_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_resume(args) == 0
+
+        created = next(task for task in store.get_pending() if task.based_on == failed.id)
+        assert created.session_id == failed.session_id
+
+    def test_bare_fix_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_fix
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement parser", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=impl.id,
+            queue=False,
+            background=False,
+            run=False,
+            no_docker=True,
+            max_turns=None,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_fix(args) == 0
+
+        created = next(task for task in store.get_pending() if task.task_type == "fix")
+        assert created.based_on == impl.id
+
+    def test_bare_plan_review_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_plan_review
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("Plan rollout", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            task_id=plan.id,
+            rerun=False,
+            edit_slices=False,
+            materialize=False,
+            model=None,
+            provider=None,
+            run=False,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_plan_review(args) == 0
+
+        created = next(task for task in store.get_pending() if task.task_type == "plan_review")
+        assert created.depends_on == plan.id
+
+    def test_bare_plan_improve_defaults_to_queue(self, tmp_path: Path) -> None:
+        from gza.cli.execution import cmd_plan_improve
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            task_id=review.id,
+            model=None,
+            provider=None,
+            run=False,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should stay queued")),
+            patch("gza.cli.execution._spawn_background_worker", side_effect=AssertionError("should stay queued")),
+        ):
+            assert cmd_plan_improve(args) == 0
+
+        created = next(task for task in store.get_pending() if task.task_type == "plan_improve")
+        assert created.depends_on == review.id
 
     def test_cmd_iterate_passes_iterate_invocation_to_run_foreground(self, tmp_path: Path):
         from unittest.mock import MagicMock

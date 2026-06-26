@@ -54,7 +54,7 @@ The plan content is also stored in the database, so it's available to dependent 
 For unattended lifecycle progress, create or run the plan-review task:
 
 ```bash
-$ uv run gza plan-review gza-1
+$ uv run gza plan-review gza-1 --run
 ✓ Created plan review task gza-2
   Plan source: gza-1
 
@@ -70,14 +70,14 @@ $ uv run gza show gza-2
 If you need to correct the reviewed slicing before materializing tasks:
 
 ```bash
-$ uv run gza plan-review gza-2 --edit-slices
-$ uv run gza plan-review gza-2 --materialize
+$ uv run gza plan-review gza-2 --run --edit-slices
+$ uv run gza plan-review gza-2 --run --materialize
 ✓ Materialized implementation slices for plan review gza-2
 ```
 
 ## Phase 3: Implement reviewed slices
 
-The normal manual approval path is now `uv run gza implement <plan-id>`. When an approved valid plan-review manifest exists, it materializes the reviewed slices instead of creating one monolithic implement task:
+The normal manual approval path is now `uv run gza implement <plan-id>`. Bare `implement` queues the work; add `--run` if you want it to start immediately. When an approved valid plan-review manifest exists, it materializes the reviewed slices instead of creating one monolithic implement task:
 
 ```bash
 $ uv run gza implement gza-1
@@ -106,7 +106,7 @@ Branch: feature/implement-the-jwt-authentication
 Create and run a review task:
 
 ```bash
-$ uv run gza review gza-2
+$ uv run gza review gza-2 --run
 ✓ Created review task gza-3
 === Task: Review implementation... ===
     ID: gza-3 20260108-review-implementation
@@ -122,7 +122,7 @@ Stats: Runtime: 3m 18s | Turns: 8 | Cost: $0.28
 > ```
 >
 > If `gza-1` is a completed plan still held for review, this command is rejected on purpose.
-> Release the plan first with `uv run gza implement gza-1` or
+> Release the plan first with `uv run gza implement gza-1` (queues by default) or
 > `uv run gza edit gza-1 --no-hold-for-review`, then create follow-up implementation work.
 >
 > Add `--pr` as well if you want the implementation to request PR creation or reuse after it completes successfully. That request is evaluated at completion time and skipped without failing when PRs are unavailable, so later `uv run gza review` runs can post PR comments automatically when a PR exists:
@@ -164,10 +164,10 @@ Verdict: CHANGES_REQUESTED
 
 ## Phase 5: Address review feedback
 
-If the review requests changes, create and run an improve task (runs immediately by default):
+If the review requests changes, create and run an improve task with `--run`:
 
 ```bash
-$ uv run gza improve gza-2
+$ uv run gza improve gza-2 --run
 ✓ Created improve task gza-4
 === Task: Improve implementation based on review... ===
     ID: gza-4 20260108-improve-implementation
@@ -183,7 +183,7 @@ Stats: Runtime: 5m 22s | Turns: 14 | Cost: $0.45
 Run a follow-up review to verify the changes:
 
 ```bash
-$ uv run gza review gza-2
+$ uv run gza review gza-2 --run
 ✓ Created review task gza-5
 === Task: Review implementation... ===
     ID: gza-5 20260108-review-implementation
@@ -270,9 +270,9 @@ feature/implement-the-jwt-authentication | merge=merged | pr=#143:closed
 The complete workflow:
 
 1. **Plan** - `uv run gza add --type plan` → `uv run gza work <task_id>`
-2. **Plan review** - `uv run gza plan-review <plan_id>` → inspect `uv run gza show <plan_review_id>` → optionally `--edit-slices` / `--materialize`
+2. **Plan review** - `uv run gza plan-review <plan_id>` queues by default; use `--run` to execute immediately → inspect `uv run gza show <plan_review_id>` → optionally `--run --edit-slices` / `--run --materialize`
 3. **Implement** - `uv run gza implement <plan_id>` (materializes approved slices when present) → `uv run gza work <task_id>`
-4. **Review** - `uv run gza review <impl_id>`
-5. **Improve** (if needed) - `uv run gza improve <task_id>` → `uv run gza review <task_id>` (accepts implement, improve, or review ID — auto-resolves)
+4. **Review** - `uv run gza review <impl_id> --run`
+5. **Improve** (if needed) - `uv run gza improve <task_id> --run` → `uv run gza review <task_id> --run` (accepts implement, improve, or review ID — auto-resolves)
 6. **Merge** - `uv run gza pr <impl_id>` → `uv run gza merge <impl_id> --squash` → `uv run gza sync <impl_id>`
 7. **Daily reconciliation** - `uv run gza unmerged` answers the default-branch merge-truth question; use `uv run gza sync` when you explicitly want broader branch and PR refresh

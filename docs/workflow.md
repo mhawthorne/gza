@@ -84,7 +84,7 @@ You can manually review plans using the `gza-plan-review` skill to refine before
 ## Implement a specific plan
 
 ```bash
-gza implement -q <plan_task_id>
+gza implement <plan_task_id>
 (grab new pending implement task i)
 gza iterate -i 5 -b <implement_task_id>
 
@@ -101,6 +101,8 @@ $ gza set-status <task_id> dropped
 ## Extract changes from a branch into a new task
 
 ```bash
-$ uv run gza extract --branch $branch --base-branch $base_branch -q
+$ uv run gza extract --branch $branch --base-branch $base_branch
 $ uv run gza iterate <new-implement-task-id>
 ```
+
+Bare `gza implement <plan_task_id>` and `uv run gza extract ...` queue the new implementation task by default. Add `--run` when you want immediate foreground execution instead of queueing.
