@@ -71,6 +71,15 @@ records provenance on recovery edges.
 - **P5 — Based-on, not depends-on, defines a lineage.** Membership in a lineage (and thus
   ownership and recovery-chain walks) follows `based_on`. `depends_on` connects *separate*
   lineages in execution order; it does not make two tasks the same unit.
+- **P6 — Terminal landed/no-work units are not actionable.** An active merge unit in a
+  terminal landed/no-work state (`merged`, `empty`, or `redundant`) is not an actionable
+  owner row on operator or recovery-selection surfaces. `gza incomplete`, watch
+  needs-attention reporting, and recovery-target selection MUST suppress that owner row
+  unless a failed descendant carries unique unmerged work that is not represented on the
+  unit's target. This keep/drop boundary MUST be proven from unique-unmerged-work truth,
+  not inferred from task type. If the query cannot prove that a failed descendant has no
+  unique unmerged work against the target, it MUST keep that descendant visible and let
+  [recovery.md](recovery.md) decide the recovery action; visibility fails closed.
 
 ## The canonical operations
 

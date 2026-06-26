@@ -47,7 +47,7 @@ Read every in-scope doc under `specs/behavior/`. Extract each **normative statem
 an atomic, checkable assertion. Normative statements are:
 
 - RFC-2119 keywords: **MUST / MUST NOT / SHOULD / SHOULD NOT / MAY**.
-- The numbered **invariants** (overview) and **principles** (`P1`–`P5`).
+- The numbered **invariants** (overview) and **principles** (`P*`, for example `P1`–`P6`).
 - Each ordered **rule** (`§1`–`§8`) — guard → action pairs.
 - The **parked reason codes** table (the closed set).
 - The **policy knobs** table (what is contract: the *existence* of the bound/gate; the
@@ -60,9 +60,11 @@ short prefix for the source behavior spec, `SECTION` is the local anchor (`INV3`
 
 Current tracked behavior-spec prefixes:
 
+- `LIN` — `lineage.md`
 - `OV` — `00-overview.md`
 - `LE` — `lifecycle-engine.md`
 - `OTV` — `off-topic-verify-failures.md`
+- `REC` — `recovery.md`
 - `WS` — `watch-supervisor.md`
 - `MV` — `main-verify-self-heal.md`
 
@@ -74,6 +76,8 @@ the assertion inventory first. Examples:
 - `LE-P4-LOCAL-TARGET` — "merge-ness MUST be proven against the local target, never origin."
 - `OV-INV2-BOUNDED-LOOPS` — "every loop MUST be bounded; hitting the bound escalates."
 - `LE-RC-rebase-did-not-unblock-merge` — that reason code exists and is emitted on §4.
+- `LIN-P6-TERMINAL-LANDED-NOT-ACTIONABLE` — terminal landed/no-work merge-unit owners stay
+  off actionable lineage/recovery surfaces unless unique unmerged work remains visible.
 - `MV-MV2-RERUN-BEFORE-REUSE` — red verdicts MUST be re-verified before automation acts.
 - `MV-MV4-REMEDIATE-DEDUP-BUMP` — confirmed red verify failures MUST create or reuse
   one remediation task per failure signature and bump it to the front of the runnable

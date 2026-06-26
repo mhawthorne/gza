@@ -340,6 +340,15 @@ def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
     ) in behavior_check_flat
 
 
+def test_behavior_check_skill_tracks_open_ended_principle_inventory() -> None:
+    """Behavior-check extraction rules should not cap numbered principles below the current spec set."""
+    repo_root = Path(__file__).resolve().parents[1]
+    behavior_check = (repo_root / "src" / "gza" / "skills" / "gza-behavior-check" / "SKILL.md").read_text()
+
+    assert "The numbered **invariants** (overview) and **principles** (`P*`, for example `P1`–`P6`)." in behavior_check
+    assert "`LIN-P6-TERMINAL-LANDED-NOT-ACTIONABLE`" in behavior_check
+
+
 def test_watch_feature_spec_distinguishes_worker_consuming_capacity_from_direct_recovery() -> None:
     """Feature spec should match the watch scheduler contract for recovery slot usage."""
     repo_root = Path(__file__).resolve().parents[1]
