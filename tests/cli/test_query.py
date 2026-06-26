@@ -5653,9 +5653,31 @@ class TestShowCommand:
         path_result = invoke_gza("artifact", str(task.id), "--path", "--project", str(tmp_path))
 
         assert content_result.returncode == 0
-        assert content_result.stdout == "newer output\n\n"
+        assert content_result.stdout == "newer output\n"
         assert path_result.returncode == 0
         assert path_result.stdout.strip() == str(tmp_path / newer.path)
+
+    def test_artifact_command_preserves_content_without_trailing_newline(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with artifact without newline", task_type="review")
+        store.update(task)
+        config = Config.load(tmp_path)
+        store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="exact output",
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+
+        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
+
+        assert content_result.returncode == 0
+        assert content_result.stdout == "exact output"
 
     def test_artifact_command_does_not_fall_back_to_older_content_when_latest_row_is_metadata_only(
         self, tmp_path: Path

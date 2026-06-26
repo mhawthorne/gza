@@ -4173,7 +4173,7 @@ def cmd_artifact(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        print(resolved.path.read_text(encoding="utf-8"))
+        sys.stdout.write(resolved.path.read_text(encoding="utf-8"))
     except OSError as exc:
         console.print(f"[red]Error: Failed to read artifact {resolved.artifact.id}: {exc}[/red]")
         return 1
