@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
@@ -520,21 +521,26 @@ _CONTAINER_COMMON_GITDIR = "/gza-git/common"
 
 @dataclass
 class _DockerGitMetadataContext:
-    """Temporarily rewrite worktree git metadata for Docker-backed provider runs."""
+    """Clean up per-task Docker config + generated metadata after a provider run.
 
-    host_git_file: Path
-    host_commondir_file: Path
-    original_git_file_text: str
-    original_commondir_text: str
+    Container git resolves through bind-mounted, container-valid ``.git`` /
+    ``commondir`` files (generated under ``metadata_tempdir``), so the host
+    worktree ``.git`` file and its (shared) ``commondir`` are never modified and
+    git auto-discovery keeps working for nested repos inside the container.
+    ``restore()`` reverts the per-task ``docker_volumes`` / ``docker_env`` config
+    and removes the generated temp dir; there is no host git state to restore, and
+    a worker killed before cleanup only leaks a tmp dir (never poisons host git).
+    """
+
+    metadata_tempdir: Path
     original_docker_volumes: list[str]
     original_docker_env: list[str]
     target_config: Config
 
     def restore(self) -> None:
-        self.host_git_file.write_text(self.original_git_file_text, encoding="utf-8")
-        self.host_commondir_file.write_text(self.original_commondir_text, encoding="utf-8")
         self.target_config.docker_volumes = list(self.original_docker_volumes)
         setattr(self.target_config, "docker_env", list(self.original_docker_env))
+        shutil.rmtree(self.metadata_tempdir, ignore_errors=True)
 
 
 def _prepare_docker_worktree_git_metadata(
@@ -543,7 +549,19 @@ def _prepare_docker_worktree_git_metadata(
     target_config: Config,
     worktree_path: Path,
 ) -> _DockerGitMetadataContext | None:
-    """Make a worktree `.git` file container-valid for the duration of a provider run."""
+    """Give the container a container-valid view of the worktree git metadata.
+
+    Mounts the worktree gitdir and the shared common gitdir at neutral container
+    paths (so the canonical checkout's ``.git`` is never discoverable inside the
+    agent — the gza-6172 hijack guarantee), then bind-mounts *generated*
+    container-valid ``.git`` and ``commondir`` files over the container's view of
+    those paths. The host worktree ``.git`` file and the shared ``commondir`` are
+    left byte-for-byte untouched, so concurrent host-side ``git worktree``
+    operations across the repo are never broken and nothing leaks (beyond a tmp
+    dir) if the worker is killed. Because no global ``GIT_DIR``/``GIT_COMMON_DIR``
+    is set, normal git auto-discovery still works for nested repos under
+    ``/workspace`` (submodules, vendored repos, test fixtures).
+    """
     if not config.use_docker:
         return None
 
@@ -569,38 +587,37 @@ def _prepare_docker_worktree_git_metadata(
     if not host_common_gitdir.is_absolute():
         host_common_gitdir = (host_worktree_gitdir / host_common_gitdir).resolve()
 
+    # Generate container-valid metadata files and bind-mount them *over the
+    # container's view only* — the host's shared `.git`/`commondir` stay
+    # untouched. `/workspace/.git` -> the container worktree gitdir; that gitdir's
+    # `commondir` -> the container common gitdir.
+    metadata_tempdir = Path(tempfile.mkdtemp(prefix="gza-docker-git-"))
+    container_git_file = metadata_tempdir / "dotgit"
+    container_commondir_file = metadata_tempdir / "commondir"
+    container_git_file.write_text(f"gitdir: {_CONTAINER_WORKTREE_GITDIR}\n", encoding="utf-8")
+    container_commondir_file.write_text(f"{_CONTAINER_COMMON_GITDIR}\n", encoding="utf-8")
+
     original_docker_volumes = list(getattr(target_config, "docker_volumes", []))
     original_docker_env = list(getattr(target_config, "docker_env", []))
-    try:
-        target_config.docker_volumes = [
-            *original_docker_volumes,
-            f"{host_worktree_gitdir}:{_CONTAINER_WORKTREE_GITDIR}",
-            f"{host_common_gitdir}:{_CONTAINER_COMMON_GITDIR}",
-        ]
-        setattr(
-            target_config,
-            "docker_env",
-            [
-                *original_docker_env,
-                f"GZA_CONTAINER_GITDIR={_CONTAINER_WORKTREE_GITDIR}",
-                f"GZA_CONTAINER_COMMON_GITDIR={_CONTAINER_COMMON_GITDIR}",
-            ],
-        )
-
-        host_git_file.write_text(f"gitdir: {_CONTAINER_WORKTREE_GITDIR}\n", encoding="utf-8")
-        host_commondir_file.write_text(f"{_CONTAINER_COMMON_GITDIR}\n", encoding="utf-8")
-    except Exception:
-        host_git_file.write_text(git_file_text + "\n", encoding="utf-8")
-        host_commondir_file.write_text(commondir_text + "\n", encoding="utf-8")
-        target_config.docker_volumes = list(original_docker_volumes)
-        setattr(target_config, "docker_env", list(original_docker_env))
-        raise
+    target_config.docker_volumes = [
+        *original_docker_volumes,
+        f"{host_worktree_gitdir}:{_CONTAINER_WORKTREE_GITDIR}",
+        f"{host_common_gitdir}:{_CONTAINER_COMMON_GITDIR}",
+        f"{container_git_file}:/workspace/.git:ro",
+        f"{container_commondir_file}:{_CONTAINER_WORKTREE_GITDIR}/commondir:ro",
+    ]
+    setattr(
+        target_config,
+        "docker_env",
+        [
+            *original_docker_env,
+            f"GZA_CONTAINER_GITDIR={_CONTAINER_WORKTREE_GITDIR}",
+            f"GZA_CONTAINER_COMMON_GITDIR={_CONTAINER_COMMON_GITDIR}",
+        ],
+    )
 
     return _DockerGitMetadataContext(
-        host_git_file=host_git_file,
-        host_commondir_file=host_commondir_file,
-        original_git_file_text=git_file_text + "\n",
-        original_commondir_text=commondir_text + "\n",
+        metadata_tempdir=metadata_tempdir,
         original_docker_volumes=original_docker_volumes,
         original_docker_env=original_docker_env,
         target_config=target_config,
