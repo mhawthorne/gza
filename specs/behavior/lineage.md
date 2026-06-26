@@ -93,6 +93,10 @@ A task `T` with `depends_on = D` MUST NOT run until `D`'s work is **satisfied**.
   `status == "completed"` and authoritative merge-unit state `empty` or `redundant`
   MUST satisfy merge-required `depends_on` exactly like `merged`: the work unit is
   terminal and there is nothing left to merge.
+- **Failed merged work is already satisfied.** A failed prerequisite whose authoritative
+  merge-unit state is `merged` MUST satisfy downstream merge-required dependencies even
+  when no completed retry descendant exists. Once the dependency's work is already on
+  the target, dependents must not stay blocked on the failed task row.
 - **Failed terminal no-work is not self-satisfying.** A failed or dropped prerequisite
   with `empty`/`redundant` merge evidence MUST remain blocked unless L1 resolves a valid
   completed representative through the `based_on` recovery chain. Recoverable failed

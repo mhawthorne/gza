@@ -35,6 +35,8 @@ An `empty` merge-unit state is the other terminal lifecycle outcome for code-bea
 
 An `empty` prerequisite also has a distinct dependency-policy answer. It **does** satisfy a downstream merge-required `depends_on` edge, because the upstream merge unit is terminal and moot. That decision must stay routed through the single shared `empty_prereq_satisfies_dependency()` policy hook in `src/gza/dependency_preconditions.py`; its default return is `True`, and any future policy flip should only require changing that one hook instead of reworking multiple lifecycle call sites.
 
+A prerequisite with authoritative merge-unit state `merged` is stronger still: once the dependency's work is already landed on target, downstream merge-required `depends_on` edges are satisfied even if the direct task row later ends in `failed`. That is a dependency-readiness rule, not a failed-task recovery suppression rule; the same failed task must still follow the shared recovery policy for its own operator-facing recovery row decisions.
+
 Missing dependency rows are the opposite policy case: they remain a hard blocked pending state. Pickup, claim, runner preflight, and query projections must all treat a `depends_on` edge with no backing row as not runnable rather than as an unowned compatibility fallback.
 
 When a dependency points at a failed original task whose work was later recovered, readiness still follows the dependency lineage's canonical active merge unit, not merely the completed descendant row that satisfied the retry chain. Resolve the active merge unit from the direct dependency lineage first; only fall back to legacy task-row `merge_status` when no merge unit exists anywhere in that lineage.

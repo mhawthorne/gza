@@ -10,6 +10,7 @@ from .recovery_read_context import RecoveryReadContext
 
 MERGE_REQUIRED_DEPENDENCY_TASK_TYPES = frozenset({"task", "implement", "improve", "fix", "rebase"})
 TERMINAL_NO_WORK_MERGE_STATES = frozenset({"empty", "redundant"})
+DIRECT_DEPENDENCY_SELF_SATISFYING_MERGE_STATES = TERMINAL_NO_WORK_MERGE_STATES | frozenset({"merged"})
 
 
 @dataclass(frozen=True)
@@ -198,7 +199,11 @@ def dependency_readiness(
         return held_plan_block
 
     if resolved_dep is None:
-        if _resolved_merge_state(store, direct_dep, read_context=read_context) in TERMINAL_NO_WORK_MERGE_STATES and resolved_dependency_satisfies_task_readiness(
+        if _resolved_merge_state(
+            store,
+            direct_dep,
+            read_context=read_context,
+        ) in DIRECT_DEPENDENCY_SELF_SATISFYING_MERGE_STATES and resolved_dependency_satisfies_task_readiness(
             store,
             direct_dep,
             task,

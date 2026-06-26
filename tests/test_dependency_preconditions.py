@@ -79,6 +79,31 @@ def test_dependency_precondition_failed_empty_unit_stays_blocked(tmp_path: Path)
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 
+def test_dependency_precondition_failed_merged_unit_unblocks(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    store.mark_completed(dependency, has_commits=True, branch="feature/dependency-merged-toggle")
+    assert dependency.id is not None
+    unit = store.resolve_merge_unit_for_task(dependency.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged")
+    dependency = store.get(dependency.id)
+    assert dependency is not None
+    store.mark_failed(dependency, failure_reason="UNKNOWN")
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    readiness = dependency_readiness(store, downstream)
+    assert readiness.ready is True
+    assert readiness.reason == "ready"
+    assert readiness.direct_dependency is not None
+    assert readiness.direct_dependency.id == dependency.id
+    assert readiness.resolved_dependency is not None
+    assert readiness.resolved_dependency.id == dependency.id
+    assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
 def test_dependency_precondition_redundant_unit_uses_completed_empty_policy(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
