@@ -139,6 +139,14 @@ clean or dirty, and the action taken (reclaimed / failed). The motivating incide
 to diagnose precisely because the destructive removal emitted nothing; a reclaim that cannot
 be traced is itself a defect.
 
+Workspace acquisition failures that happen before provider execution starts MUST also leave
+a canonical task ops-log outcome before the task is marked failed. This includes branch
+resolution failures, code-task worktree creation failures, and detached non-code worktree
+setup failures. The outcome MUST include the exact setup/git failure text, the canonical
+failure reason, and setup-phase metadata so operators can distinguish "claimed but never
+acquired a workspace" from "provider ran and failed." A direct manual run and a supervisor
+run MUST use the same logging path.
+
 ## Policy knob
 
 - **`worktree_auto_reclaim_clean`** (default: **on**).

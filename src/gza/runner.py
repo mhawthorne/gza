@@ -1401,6 +1401,98 @@ def _record_run_failure(
     )
 
 
+@dataclass(frozen=True)
+class WorkspaceSetupResult:
+    ok: bool
+    message: str | None = None
+    failure_reason: str = "GIT_ERROR"
+    phase: str = "workspace_setup"
+    branch: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _mark_workspace_setup_failure(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: Provider | str,
+    invocation: RunInvocationContext | None,
+    interaction_mode: str,
+    resume: bool,
+    message: str,
+    failure_reason: str = "GIT_ERROR",
+    phase: str = "workspace_setup",
+    branch: str | None = None,
+    exit_code: int = 1,
+    prelude_written: bool = False,
+) -> None:
+    """Write a canonical setup-failure outcome before marking the task failed."""
+    log_file = ensure_task_log_path(config, store, task)
+    provider_name = provider if isinstance(provider, str) else provider.name
+    if branch and not task.branch:
+        task.branch = branch
+        store.update(task)
+
+    if not prelude_written:
+        write_worker_start_event(log_file, resumed=resume)
+        write_log_entry(
+            log_file,
+            {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"},
+        )
+        if branch:
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "branch",
+                    "message": f"Branch: {branch}",
+                    "branch": branch,
+                },
+            )
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "info",
+                "message": f"Provider: {provider_name}, Model: {config.model or 'default'}",
+            },
+        )
+        write_execution_provenance_event(
+            log_file,
+            invocation=invocation or _resolve_default_invocation_context(),
+            provider=provider,
+            interaction_mode=interaction_mode,
+            resumed=resume,
+        )
+
+    write_log_entry(
+        log_file,
+        {
+            "type": "gza",
+            "subtype": "outcome",
+            "message": message,
+            "exit_code": exit_code,
+            "failure_reason": failure_reason,
+            "phase": "workspace_setup",
+            "setup_phase": phase,
+            **({"branch": branch} if branch else {}),
+        },
+    )
+    _mark_task_failed(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        branch=branch,
+        explicit_reason=failure_reason,
+        error_type=None,
+        exit_code=exit_code,
+    )
+
+
 _TASK_EXECUTION_MODE_BY_INVOCATION_MODE: dict[str, str] = {
     "background_worker": "worker_background",
     "foreground_worker": "worker_foreground",
@@ -6956,14 +7048,20 @@ def _setup_code_task_worktree(
     worktree_path: Path,
     default_branch: str,
     resume: bool,
-) -> bool:
+) -> WorkspaceSetupResult:
     """Create or re-create a code-task worktree and check out the target branch."""
     if resume or task.same_branch:
         # Validate branch exists before attempting to check it out
         if not git.branch_exists(branch_name):
-            error_message(f"Error: Branch '{branch_name}' no longer exists. Cannot resume.")
+            message = f"Branch '{branch_name}' no longer exists. Cannot resume."
+            error_message(f"Error: {message}")
             console.print("The branch may have been deleted or merged.")
-            return False
+            return WorkspaceSetupResult(
+                ok=False,
+                message=message,
+                phase="branch_exists",
+                branch=branch_name,
+            )
 
         # Check out existing branch in worktree
         try:
@@ -6980,10 +7078,16 @@ def _setup_code_task_worktree(
 
             console.print(f"Creating worktree with existing branch: {worktree_path}")
             git.worktree_add_existing(worktree_path, branch_name)
-            return True
+            return WorkspaceSetupResult(ok=True, branch=branch_name)
         except GitError as e:
-            error_message(f"Error: Could not check out branch {branch_name} in worktree: {e}")
-            return False
+            message = f"Could not check out branch {branch_name} in worktree: {e}"
+            error_message(f"Error: {message}")
+            return WorkspaceSetupResult(
+                ok=False,
+                message=message,
+                phase="worktree_add_existing",
+                branch=branch_name,
+            )
 
     # Delete existing branch if in single mode (worktree_add will recreate it)
     if config.branch_mode == "single" and git.branch_exists(branch_name):
@@ -6995,10 +7099,16 @@ def _setup_code_task_worktree(
             console.print(f"Creating retry branch from base branch: [blue]{task.base_branch}[/blue]")
         console.print(f"Creating worktree: {worktree_path}")
         git.worktree_add(worktree_path, branch_name, base_ref)
-        return True
+        return WorkspaceSetupResult(ok=True, branch=branch_name)
     except GitError as e:
-        error_message(f"Git error: {e}")
-        return False
+        message = str(e)
+        error_message(f"Git error: {message}")
+        return WorkspaceSetupResult(
+            ok=False,
+            message=message,
+            phase="worktree_add",
+            branch=branch_name,
+        )
 
 
 def _filter_stageable_paths(
@@ -7920,9 +8030,42 @@ def _run_inner(
 
     # Code tasks (implement/improve) require git
     assert git is not None, "git is required for code tasks"
-    default_branch = git.default_branch()
+    log_file = ensure_task_log_path(config, store, task)
+    try:
+        default_branch = git.default_branch()
+    except GitError as exc:
+        message = str(exc)
+        error_message(f"Git error: {message}")
+        _mark_workspace_setup_failure(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation,
+            interaction_mode=interaction_mode,
+            resume=resume,
+            message=message,
+            phase="default_branch",
+        )
+        return 1
 
-    branch_name = _resolve_code_task_branch_name(task, config, store, git, resume=resume)
+    try:
+        branch_name = _resolve_code_task_branch_name(task, config, store, git, resume=resume)
+    except GitError as exc:
+        message = str(exc)
+        error_message(f"Git error: {message}")
+        _mark_workspace_setup_failure(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation,
+            interaction_mode=interaction_mode,
+            resume=resume,
+            message=message,
+            phase="branch_resolution",
+        )
+        return 1
     if branch_name is None:
         return 1
 
@@ -7933,18 +8076,35 @@ def _run_inner(
     isolated_checkout = None
     if _should_use_isolated_runner_rebase_checkout(task=task, config=config):
         rebase_target = default_branch
-        isolated_checkout_cm = isolated_rebase_checkout(
-            config=config,
-            source_git=git,
-            branch=branch_name,
-            target_ref=rebase_target,
-            checkout_name=task.slug,
-        )
-        isolated_checkout = isolated_checkout_cm.__enter__()
+        try:
+            isolated_checkout_cm = isolated_rebase_checkout(
+                config=config,
+                source_git=git,
+                branch=branch_name,
+                target_ref=rebase_target,
+                checkout_name=task.slug,
+            )
+            isolated_checkout = isolated_checkout_cm.__enter__()
+        except (GitError, OSError, RuntimeError) as exc:
+            message = str(exc)
+            error_message(f"Git error: {message}")
+            _mark_workspace_setup_failure(
+                task=task,
+                config=config,
+                store=store,
+                provider=provider,
+                invocation=invocation,
+                interaction_mode=interaction_mode,
+                resume=resume,
+                message=message,
+                phase="isolated_checkout",
+                branch=branch_name,
+            )
+            return 1
         worktree_path = isolated_checkout.path
         worktree_git = isolated_checkout.git
     else:
-        if not _setup_code_task_worktree(
+        setup_result = _setup_code_task_worktree(
             task,
             config,
             git,
@@ -7952,7 +8112,31 @@ def _run_inner(
             worktree_path=worktree_path,
             default_branch=default_branch,
             resume=resume,
-        ):
+        )
+        if not setup_result:
+            if isinstance(setup_result, WorkspaceSetupResult):
+                message = setup_result.message or f"Could not create worktree for branch {branch_name}"
+                failure_reason = setup_result.failure_reason
+                phase = setup_result.phase
+                failed_branch = setup_result.branch or branch_name
+            else:
+                message = f"Could not create worktree for branch {branch_name}"
+                failure_reason = "GIT_ERROR"
+                phase = "worktree_add"
+                failed_branch = branch_name
+            _mark_workspace_setup_failure(
+                task=task,
+                config=config,
+                store=store,
+                provider=provider,
+                invocation=invocation,
+                interaction_mode=interaction_mode,
+                resume=resume,
+                message=message,
+                failure_reason=failure_reason,
+                phase=phase,
+                branch=failed_branch,
+            )
             return 1
 
         # Create a Git instance for the worktree
@@ -7973,15 +8157,6 @@ def _run_inner(
     task.branch = branch_name
 
     store.update(task)
-
-    # Setup logging using the canonical task log path selected during preflight.
-    if task.log_file:
-        log_file = config.project_dir / Path(task.log_file)
-    else:
-        config.log_path.mkdir(parents=True, exist_ok=True)
-        log_file = config.log_path / f"{task.slug}.log"
-        task.log_file = str(log_file.relative_to(config.project_dir))
-        store.update(task)
 
     # Write orchestration pre-run entries
     write_worker_start_event(log_file, resumed=resume)
@@ -8979,14 +9154,18 @@ def _run_non_code_task(
         return 0
 
     except GitError as e:
-        error_message(f"Git error: {e}")
-        _mark_task_failed(
+        message = str(e)
+        error_message(f"Git error: {message}")
+        _mark_workspace_setup_failure(
             task=task,
             config=config,
             store=store,
-            log_file=log_file,
-            explicit_reason="GIT_ERROR",
-            error_type=None,
-            exit_code=1,
+            provider=provider,
+            invocation=invocation,
+            interaction_mode=interaction_mode,
+            resume=resume,
+            message=message,
+            phase="detached_worktree",
+            prelude_written=True,
         )
         return 1

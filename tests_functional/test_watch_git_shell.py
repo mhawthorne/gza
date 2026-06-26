@@ -1,18 +1,21 @@
 """Functional tests for watch flows that require a real git repo."""
 
+import argparse
 import os
 import shlex
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gza.cli.watch import _run_cycle, _WatchLog
+from gza.cli.watch import _CycleResult, _run_cycle, _WatchLog, cmd_watch
 from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
 from gza.config import Config
-from gza.git import Git
+from gza.git import Git, GitError
+from gza.git_health import check_git_health as real_check_git_health, current_git_health_alert
 from tests.cli.conftest import make_store, setup_config
 
 from tests_functional.git_helpers import init_basic_repo, setup_git_repo_with_task_branch
@@ -57,6 +60,15 @@ def _seed_watch_analysis_fixture(tmp_path: Path, *, branch_count: int) -> tuple[
         git._run("update-ref", f"refs/remotes/origin/{branch}", branch_sha)
 
     return store, git
+
+
+def _mark_task_running(store, task_id: str) -> None:
+    task = store.get(task_id)
+    assert task is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC)
+    task.running_pid = os.getpid()
+    store.update(task)
 
 
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) -> None:
@@ -236,3 +248,125 @@ def test_watch_cycle_analysis_uses_cached_git_reads_for_repeated_branch_probes(
     # Keep this budget loose enough for unrelated fixed-cost probes while still
     # failing if watch falls back to roughly-per-branch uncached git reads.
     assert git_invocations < max_allowed_invocations
+
+
+@pytest.mark.functional
+def test_cmd_watch_global_git_health_halt_avoids_task_cascade_and_resumes_dispatch(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    init_basic_repo(tmp_path)
+
+    first_pending = store.add("First pending plan", task_type="plan")
+    second_pending = store.add("Second pending plan", task_type="plan")
+    assert first_pending.id is not None
+    assert second_pending.id is not None
+    seeded_task_ids = {first_pending.id, second_pending.id}
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=1,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        resumed_reexec=False,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+    sleep_calls: list[int] = []
+    probe_failures = [
+        SimpleNamespace(
+            worktree_list=MagicMock(
+                side_effect=GitError(
+                    "fatal: invalid commondir /gza-git/common\n"
+                    "fatal: not a git repository: /workspace/.git/worktrees/broken"
+                )
+            )
+        ),
+        SimpleNamespace(worktree_list=MagicMock(return_value=[{"path": str(tmp_path)}])),
+        SimpleNamespace(worktree_list=MagicMock(return_value=[{"path": str(tmp_path)}])),
+    ]
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 2:
+            handler = signal_handlers[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+    def probe_side_effect(store_arg, _git, persist=True):
+        probe_git = probe_failures.pop(0)
+        return real_check_git_health(store_arg, probe_git, persist=persist)
+
+    def fake_spawn_background_worker(
+        _args,
+        _config,
+        *,
+        task_id: str,
+        **_kwargs,
+    ) -> int:
+        _mark_task_running(store, task_id)
+        return 0
+
+    def wait_for_dispatch_start(**kwargs):
+        task = kwargs["store"].get(str(kwargs["task_id"]))
+        return True, f"task {kwargs['task_id']} reached running state", task
+
+    def run_real_cycle_once_then_idle(**kwargs):
+        if not hasattr(run_real_cycle_once_then_idle, "seen"):
+            run_real_cycle_once_then_idle.seen = True  # type: ignore[attr-defined]
+            return _run_cycle(**kwargs)
+        return _CycleResult(work_done=False, running=1, pending=1)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._system_can_run_tasks", return_value=True),
+        patch("gza.cli.watch.check_git_health", side_effect=probe_side_effect),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_background_worker) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=wait_for_dispatch_start),
+        patch("gza.cli.watch._run_cycle", side_effect=run_real_cycle_once_then_idle),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert sleep_calls == [1, 1]
+    assert spawn_worker.call_count == 1
+    assert spawn_worker.call_args.kwargs["task_id"] == first_pending.id
+
+    refreshed_first = store.get(first_pending.id)
+    refreshed_second = store.get(second_pending.id)
+    assert refreshed_first is not None
+    assert refreshed_second is not None
+    assert refreshed_first.status == "in_progress"
+    assert refreshed_first.failure_reason is None
+    assert refreshed_second.status == "pending"
+    assert refreshed_second.failure_reason is None
+    assert current_git_health_alert(store) is None
+
+    derived_children = [task for task in store.get_all() if task.based_on in seeded_task_ids]
+    assert derived_children == []
+    assert not any(
+        task.id in seeded_task_ids and task.status == "failed" and task.failure_reason == "GIT_ERROR"
+        for task in store.get_all()
+    )
+
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert log_text.count(" ATTENTION ") == 1
+    assert log_text.count("git worktree health RED - dispatch halted") == 1
+    assert "Inspect `.git/worktrees/*/commondir` for container-only paths such as `/gza-git/common`" in log_text
+    assert "RESUME    git worktree health restored - resuming dispatch" in log_text
+    assert "START" in log_text
+    assert "GIT_ERROR" not in log_text

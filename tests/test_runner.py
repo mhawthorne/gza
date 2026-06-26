@@ -48,6 +48,7 @@ from gza.runner import (
     ResolvedTimeoutBudget,
     ReviewVerifyResult,
     RunInvocationContext,
+    WorkspaceSetupResult,
     _apply_transcript_stats_fallback,
     _build_code_task_commit_subject,
     _build_context_from_chain,
@@ -9181,7 +9182,7 @@ class TestExtractedRunInnerHelpers:
         git = Mock(spec=Git)
         git.branch_exists.return_value = False
 
-        ok = _setup_code_task_worktree(
+        result = _setup_code_task_worktree(
             task,
             config,
             git,
@@ -9191,7 +9192,10 @@ class TestExtractedRunInnerHelpers:
             resume=True,
         )
 
-        assert ok is False
+        assert result.ok is False
+        assert result.failure_reason == "GIT_ERROR"
+        assert result.phase == "branch_exists"
+        assert "no longer exists" in (result.message or "")
 
     def test_setup_code_task_worktree_resume_passes_managed_roots_to_cleanup(self, tmp_path: Path):
         """Resume/same-branch setup should guard cleanup with configured roots."""
@@ -9206,7 +9210,7 @@ class TestExtractedRunInnerHelpers:
         worktree_path = tmp_path / "worktrees" / "20260317-task"
 
         with patch("gza.runner.cleanup_worktree_for_branch", return_value=None) as mock_cleanup:
-            ok = _setup_code_task_worktree(
+            result = _setup_code_task_worktree(
                 task,
                 config,
                 git,
@@ -9216,7 +9220,7 @@ class TestExtractedRunInnerHelpers:
                 resume=True,
             )
 
-        assert ok is True
+        assert result.ok is True
         mock_cleanup.assert_called_once_with(
             git,
             "feature/existing",
@@ -17010,6 +17014,107 @@ class TestSelectiveStaging:
 
 class TestExceptionHandlerMarkFailed:
     """Tests that exception handlers in _run_inner and _run_non_code_task mark tasks as failed."""
+
+    def test_code_task_worktree_setup_failure_writes_ops_outcome(self, tmp_path: Path):
+        """Code-task worktree setup failures should leave a canonical ops outcome."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement setup logging", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260626-implement-setup-logging"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        setup_error = "fatal: invalid commondir /gza-git/common"
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/setup-logging"),
+            patch(
+                "gza.runner._setup_code_task_worktree",
+                return_value=WorkspaceSetupResult(
+                    ok=False,
+                    message=setup_error,
+                    phase="worktree_add",
+                    branch="feature/setup-logging",
+                ),
+            ),
+        ):
+            rc = _run_inner(task, config, config, store, provider, git, resume=False)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.log_file is not None
+
+        log_file = config.project_dir / refreshed.log_file
+        assert log_file.exists()
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["message"] == setup_error
+        assert outcome["failure_reason"] == "GIT_ERROR"
+        assert outcome["phase"] == "workspace_setup"
+        assert outcome["setup_phase"] == "worktree_add"
+        assert outcome["branch"] == "feature/setup-logging"
+        assert any(entry.get("subtype") == "execution" for entry in ops_entries)
+
+    def test_non_code_detached_worktree_git_error_writes_ops_outcome(self, tmp_path: Path):
+        """Non-code setup GitError should be persisted before the task is marked failed."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Explore setup failure", task_type="explore")
+        assert task.id is not None
+        task.slug = "20260626-explore-setup-failure"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        setup_error = "fatal: broken detached worktree"
+        git.default_branch.side_effect = GitError(setup_error)
+
+        rc = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.log_file is not None
+
+        log_file = config.project_dir / refreshed.log_file
+        assert log_file.exists()
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["message"] == setup_error
+        assert outcome["failure_reason"] == "GIT_ERROR"
+        assert outcome["phase"] == "workspace_setup"
+        assert outcome["setup_phase"] == "detached_worktree"
+        assert any(entry.get("subtype") == "execution" for entry in ops_entries)
 
     def test_git_error_in_run_inner_marks_failed(self, tmp_path: Path):
         """Test that GitError during post-run finalization marks the task as failed."""
