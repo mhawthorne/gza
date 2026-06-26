@@ -1206,13 +1206,14 @@ uv run gza merged [options]
 | Option | Description |
 |--------|-------------|
 | `--source SOURCE` | Filter by recorded merge source: `manual`, `advance`, `watch`, `github_pr`, or `external` |
+| `--all` | Show full merged history instead of the default last-1-day window |
 | `--last-days N` | Only show units merged in the last N days |
 | `--since DATE` | Only show units merged on or after `YYYY-MM-DD` or another ISO timestamp |
 | `--json` | Output structured JSON rows |
 | `--fields CSV` | Projection field override (for example `merge_unit_id,merge_source,branch`) |
 | `--list-fields` | List valid `--fields` values for this command and exit |
 
-`uv run gza merged` is the audit surface for persisted merge provenance. It reads canonical merge-unit state and renders merged units newest-first, with default columns for unit ID, owner task, source, merge timestamp, and source branch. Use it to answer questions like `uv run gza merged --source manual --last-days 7`.
+`uv run gza merged` is the audit surface for persisted merge provenance. It reads canonical merge-unit state and renders merged units newest-first, with default columns for unit ID, owner task, source, merge timestamp, and source branch. By default, plain `uv run gza merged` shows only units merged in the last 1 day. Pass `--all` to see full history, or use explicit `--last-days` / `--since` filters to request a different window. Use it to answer questions like `uv run gza merged --source manual --last-days 7`.
 
 ### lineage
 

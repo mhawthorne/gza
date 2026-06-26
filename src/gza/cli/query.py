@@ -1967,6 +1967,8 @@ def cmd_merged(args: argparse.Namespace) -> int:
     if last_days is not None:
         last_days_after = datetime.now(UTC) - _dt.timedelta(days=last_days)
         after = max(after, last_days_after) if after is not None else last_days_after
+    if after is None and not getattr(args, "all", False):
+        after = datetime.now(UTC) - _dt.timedelta(days=1)
 
     units = store.list_merged_units(
         source=getattr(args, "source", None),

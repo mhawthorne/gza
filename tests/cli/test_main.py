@@ -957,6 +957,30 @@ class TestHelpOutput:
         assert "`applied_drop_task_ids`" in docs_text
         assert "live unresolved lineages" in docs_text
 
+    def test_merged_help_and_docs_describe_default_window_and_all_escape_hatch(self, tmp_path):
+        """`merged` help/docs should describe the default 1-day window and `--all` override."""
+        setup_config(tmp_path)
+
+        merged_help = invoke_gza("merged", "--help", "--project", str(tmp_path))
+        assert merged_help.returncode == 0
+
+        help_text = " ".join(merged_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "--all" in merged_help.stdout
+        assert "--last-days N" in merged_help.stdout
+        assert "--since DATE" in merged_help.stdout
+        assert "By default, this shows only units merged in the last 1 day" in help_text
+        assert "pass --all to show full history" in help_text
+        assert "Explicit --last-days and --since filters override that default exactly as provided" in help_text
+        assert "Show full merged history instead of the default last-1-day window" in help_text
+
+        assert "uv run gza merged [options]" in docs_text
+        assert "| `--all` | Show full merged history instead of the default last-1-day window |" in docs_text
+        assert "By default, plain `uv run gza merged` shows only units merged in the last 1 day" in docs_text
+        assert "Pass `--all` to see full history" in docs_text
+        assert "use explicit `--last-days` / `--since` filters to request a different window" in docs_text
+
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)

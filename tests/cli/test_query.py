@@ -13031,9 +13031,78 @@ class TestUnmergedUnifiedQueryOutput:
             merged_at=datetime.now(UTC) - timedelta(days=10),
         )
 
+        recent = store.add("Recent merged", task_type="implement")
+        store.mark_completed(recent, has_commits=True, branch="feature/recent-merged")
+        assert recent.id is not None
+        recent_unit = store.resolve_merge_unit_for_task(recent.id)
+        assert recent_unit is not None
+        store.set_merge_unit_state(
+            recent_unit.id,
+            "merged",
+            merge_source="watch",
+            merged_at=datetime.now(UTC) - timedelta(hours=12),
+        )
+
+        default_args = argparse.Namespace(
+            project_dir=tmp_path,
+            source=None,
+            all=False,
+            last_days=None,
+            since=None,
+            fields="merge_unit_id,merge_source,branch",
+            list_fields=False,
+            json=True,
+        )
+
+        default_result = query_cli.cmd_merged(default_args)
+        default_captured = capsys.readouterr()
+
+        assert default_result == 0
+        assert json.loads(default_captured.out) == [
+            {
+                "merge_unit_id": recent_unit.id,
+                "merge_source": "watch",
+                "branch": "feature/recent-merged",
+            }
+        ]
+
+        all_args = argparse.Namespace(
+            project_dir=tmp_path,
+            source=None,
+            all=True,
+            last_days=None,
+            since=None,
+            fields="merge_unit_id,merge_source,branch",
+            list_fields=False,
+            json=True,
+        )
+
+        all_result = query_cli.cmd_merged(all_args)
+        all_captured = capsys.readouterr()
+
+        assert all_result == 0
+        assert json.loads(all_captured.out) == [
+            {
+                "merge_unit_id": recent_unit.id,
+                "merge_source": "watch",
+                "branch": "feature/recent-merged",
+            },
+            {
+                "merge_unit_id": manual_unit.id,
+                "merge_source": "manual",
+                "branch": "feature/manual-merged",
+            },
+            {
+                "merge_unit_id": advance_unit.id,
+                "merge_source": "advance",
+                "branch": "feature/advance-merged",
+            },
+        ]
+
         args = argparse.Namespace(
             project_dir=tmp_path,
             source="manual",
+            all=False,
             last_days=7,
             since=None,
             fields="merge_unit_id,merge_source,branch",
@@ -13051,6 +13120,39 @@ class TestUnmergedUnifiedQueryOutput:
                 "merge_source": "manual",
                 "branch": "feature/manual-merged",
             }
+        ]
+
+        since_args = argparse.Namespace(
+            project_dir=tmp_path,
+            source=None,
+            all=False,
+            last_days=None,
+            since="2026-01-01",
+            fields="merge_unit_id,merge_source,branch",
+            list_fields=False,
+            json=True,
+        )
+
+        since_result = query_cli.cmd_merged(since_args)
+        since_captured = capsys.readouterr()
+
+        assert since_result == 0
+        assert json.loads(since_captured.out) == [
+            {
+                "merge_unit_id": recent_unit.id,
+                "merge_source": "watch",
+                "branch": "feature/recent-merged",
+            },
+            {
+                "merge_unit_id": manual_unit.id,
+                "merge_source": "manual",
+                "branch": "feature/manual-merged",
+            },
+            {
+                "merge_unit_id": advance_unit.id,
+                "merge_source": "advance",
+                "branch": "feature/advance-merged",
+            },
         ]
 
     def test_unmerged_text_fields_unknown_field_errors_clearly(

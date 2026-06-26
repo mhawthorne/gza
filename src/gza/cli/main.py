@@ -679,12 +679,25 @@ def main() -> int:
         help="Output structured JSON rows; with --execute, rows include the applied drops",
     )
 
-    merged_parser = subparsers.add_parser("merged", help="List merged merge units")
+    merged_parser = subparsers.add_parser(
+        "merged",
+        help="List merged merge units (default: last 1 day; use --all for full history)",
+        description=(
+            "List merged merge units. By default, this shows only units merged in the last 1 day; "
+            "pass --all to show full history. Explicit --last-days and --since filters override "
+            "that default exactly as provided."
+        ),
+    )
     add_common_args(merged_parser)
     merged_parser.add_argument(
         "--source",
         choices=sorted(MERGE_SOURCE_VALUES),
         help="Filter merged units by recorded merge source",
+    )
+    merged_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show full merged history instead of the default last-1-day window",
     )
     merged_parser.add_argument(
         "--last-days",
