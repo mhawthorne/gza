@@ -8,7 +8,7 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore, TaskStats
-from gza.git import Git, GitApplyResult, GitError
+from gza.git import Git, GitApplyResult, GitError, GitStatusError
 from gza.log_paths import ops_log_path_for
 from gza.providers import RunResult
 from gza.runner import (
@@ -806,6 +806,55 @@ def test_complete_code_task_does_not_commit_when_seeded_paths_reverted_to_clean(
     assert refreshed is not None
     assert refreshed.status == "failed"
     assert refreshed.failure_reason == "UNKNOWN"
+
+
+def test_complete_code_task_broken_worktree_status_is_retryable_infra_not_unknown(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db", prefix="testproject")
+    task = store.add("Extracted task", task_type="implement")
+    task.slug = "20260625-broken-worktree"
+    task.status = "in_progress"
+    store.update(task)
+
+    config = Mock(spec=Config)
+    config.project_dir = tmp_path
+    config.log_path = tmp_path / "logs"
+    config.log_path.mkdir(parents=True, exist_ok=True)
+
+    log_file = config.log_path / "broken-worktree.log"
+    worktree_summary_path = tmp_path / "worktree-summary.md"
+    worktree_summary_path.write_text("# Summary\n")
+    summary_path = tmp_path / ".gza" / "summaries" / "broken-worktree.md"
+
+    worktree_git = Mock()
+    worktree_git.status_porcelain.side_effect = GitStatusError(
+        "git status --porcelain failed with exit code 128: fatal: not a git repository"
+    )
+
+    rc = _complete_code_task(
+        task,
+        config,
+        store,
+        worktree_git,
+        log_file,
+        "feature/broken-worktree",
+        TaskStats(duration_seconds=1.0, num_steps_computed=1, cost_usd=0.0),
+        0,
+        pre_run_status=set(),
+        worktree_summary_path=worktree_summary_path,
+        summary_path=summary_path,
+        summary_dir=summary_path.parent,
+    )
+
+    assert rc == 0
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
+    assert refreshed.failure_reason != "UNKNOWN"
+
+    log_text = ops_log_path_for(log_file).read_text()
+    assert "Outcome: failed (INFRASTRUCTURE_ERROR)" in log_text
+    assert "retryable infrastructure failure" in log_text
 
 
 def test_complete_code_task_fails_on_out_of_scope_paths(tmp_path: Path) -> None:

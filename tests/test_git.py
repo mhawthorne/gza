@@ -8,6 +8,7 @@ import pytest
 from gza.git import (
     Git,
     GitError,
+    GitStatusError,
     GitWorktreeHealthProbe,
     ResolvedGitRef,
     active_worktree_path_for_branch,
@@ -1657,6 +1658,22 @@ class TestStatusPorcelain:
             result = git.status_porcelain()
 
         assert result == set()
+
+    def test_status_porcelain_raises_on_git_failure(self, tmp_path: Path):
+        """status_porcelain distinguishes git failure from a clean tree."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=128,
+                stdout="",
+                stderr="fatal: not a git repository: /tmp/repo/.git/worktrees/task",
+            )
+
+            with pytest.raises(GitStatusError, match="not a git repository"):
+                git.status_porcelain()
 
     def test_modified_file(self, tmp_path: Path):
         """Test status_porcelain detects modified files."""

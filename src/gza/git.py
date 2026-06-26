@@ -17,6 +17,10 @@ class GitError(Exception):
     pass
 
 
+class GitStatusError(GitError):
+    """`git status --porcelain` failed, so tree cleanliness is unknown."""
+
+
 def git_error_indicates_containerized_worktree_metadata_failure(error: BaseException | str) -> bool:
     """Return whether a git failure points at container-only `/gza-git` metadata.
 
@@ -541,8 +545,10 @@ class Git:
         """
         result = self._run("status", "--porcelain", check=False)
         if result.returncode != 0:
-            error_output = result.stderr or result.stdout
-            raise GitError(f"git status --porcelain failed:\n{error_output}")
+            error_output = result.stderr.strip() or result.stdout.strip() or "unknown git status failure"
+            raise GitStatusError(
+                f"git status --porcelain failed with exit code {result.returncode}: {error_output}"
+            )
         entries: set[tuple[str, str]] = set()
         for line in result.stdout.splitlines():
             if not line:

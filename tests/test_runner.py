@@ -579,6 +579,46 @@ class TestBuildPrompt:
         assert "report what you accomplished" in prompt
         assert "write a summary" not in prompt.lower()
 
+    def test_build_prompt_retry_task_includes_prior_attempt_log_hint(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        original = store.add("Implement feature retry", task_type="implement")
+        retry = store.add(
+            "Implement feature retry",
+            task_type="implement",
+            based_on=original.id,
+            recovery_origin="retry",
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        prompt = build_prompt(retry, config, store, summary_path=Path("/workspace/.gza/summaries/test.md"))
+
+        assert f"task {original.id}" in prompt
+        assert f"uv run gza log {original.id}" in prompt
+        assert "Retry context:" in prompt
+
+    def test_build_prompt_non_retry_task_omits_prior_attempt_log_hint(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        original = store.add("Implement feature normal", task_type="implement")
+        child = store.add(
+            "Implement feature normal",
+            task_type="implement",
+            based_on=original.id,
+        )
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+
+        prompt = build_prompt(child, config, store, summary_path=Path("/workspace/.gza/summaries/test.md"))
+
+        assert "Retry context:" not in prompt
+        assert f"uv run gza log {original.id}" not in prompt
+
     def test_build_prompt_explore_type_ignores_summary_path(self, tmp_path: Path):
         """Test that explore tasks use report_path, not summary_path."""
         db_path = tmp_path / "test.db"

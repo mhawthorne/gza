@@ -83,6 +83,7 @@ from .git import (
     Git,
     GitApplyResult,
     GitError,
+    GitStatusError,
     cleanup_worktree_for_branch,
     git_error_indicates_containerized_worktree_metadata_failure,
     is_rebase_in_progress,
@@ -277,6 +278,14 @@ def _git_error_failure() -> ResolvedRunFailure:
     )
 
 
+def _infrastructure_error_failure(message: str) -> ResolvedRunFailure:
+    return ResolvedRunFailure(
+        reason="INFRASTRUCTURE_ERROR",
+        status=f"Failed: {message}",
+        outcome_message="Outcome: failed (INFRASTRUCTURE_ERROR)",
+    )
+
+
 def _rebase_conflict_failure() -> ResolvedRunFailure:
     return ResolvedRunFailure(
         reason=REBASE_CONFLICT_FAILURE_REASON,
@@ -293,8 +302,6 @@ def _resolved_git_failure(error: BaseException) -> ResolvedRunFailure:
             outcome_message="Outcome: failed (INFRASTRUCTURE_ERROR)",
         )
     return _git_error_failure()
-
-
 def _task_is_cross_project(task: Task) -> bool:
     """Return whether a task carries the reserved cross-project scope tag."""
     return CROSS_PROJECT_TAG in task.tags
@@ -7212,7 +7219,31 @@ def _complete_code_task(
         seeded_paths = seeded_paths or set()
         boundary = _project_boundary(config)
         # Compute which files changed during the provider run (selective staging)
-        post_run_status = worktree_git.status_porcelain()
+        try:
+            post_run_status = worktree_git.status_porcelain()
+        except GitStatusError as exc:
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "warning",
+                    "message": (
+                        "Could not inspect post-run worktree state; classifying as retryable infrastructure failure "
+                        f"instead of no-op: {exc}"
+                    ),
+                },
+            )
+            _record_run_failure(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                stats=stats,
+                failure=_infrastructure_error_failure("worktree git status became unavailable after provider run"),
+                exit_code=exit_code,
+                branch=branch_name,
+            )
+            return 0
         new_changes = post_run_status - pre_run_status
         status_paths = {filepath for _, filepath in post_run_status}
         candidate_stage_paths = {filepath for _, filepath in new_changes} | seeded_paths
@@ -8415,7 +8446,28 @@ def _run_inner(
         prompt = build_prompt(task, task_config, store, report_path=None, summary_path=prompt_summary_path, git=git)
 
     # Snapshot worktree state before provider runs so we can selectively stage only new changes
-    pre_run_status = worktree_git.status_porcelain()
+    try:
+        pre_run_status = worktree_git.status_porcelain()
+    except GitStatusError as exc:
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "warning",
+                "message": f"Could not inspect pre-run worktree state: {exc}",
+            },
+        )
+        _record_run_failure(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            stats=TaskStats(),
+            branch=branch_name,
+            failure=_infrastructure_error_failure("worktree git status is unavailable before provider run"),
+            exit_code=1,
+        )
+        return 1
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
     timeout_budget = _resolve_task_timeout_budget(
         task=task,

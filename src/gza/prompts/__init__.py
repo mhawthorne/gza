@@ -174,6 +174,14 @@ class PromptBuilder:
             if context:
                 base_prompt += "\n\n" + context
 
+        if task.recovery_origin == "retry" and task.based_on:
+            base_prompt += (
+                "\n\nRetry context:\n"
+                f"- A prior attempt exists at task {task.based_on}.\n"
+                f"- You may run `uv run gza log {task.based_on}` to inspect that attempt's reasoning and transcript before continuing.\n"
+                "- Treat that history as optional context; this retry should still succeed from the current worktree state even if you do not consult it."
+            )
+
         # Task type-specific instructions from templates
         if task.task_type == "explore":
             if report_path:

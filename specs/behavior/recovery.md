@@ -95,6 +95,11 @@ Consequences:
   choose `resume` on the first automatic recovery attempt.
 - Retryable provider/infrastructure failures that should not reuse the same execution
   thread MUST choose `retry`.
+- A code-task run that cannot read post-run worktree git status (for example
+  `git status --porcelain` fails because the worktree admin linkage was detached or
+  pruned) MUST classify as the existing retryable infrastructure failure bucket,
+  not as "no changes made" / `UNKNOWN`. Git inspection failure is not proof of a
+  clean tree.
 - Git/worktree-admin failures that indicate the task hit container-only or otherwise
   unavailable worktree metadata (for example `git worktree list --porcelain` or similar
   commands failing on `/gza-git/...`) MUST classify as retryable infrastructure failure,
@@ -157,6 +162,9 @@ its stored action.
   resumable; it MUST be treated as a retry (fresh attempt) or, if nothing is left to do,
   parked — never silently no-op'd.
 - A `pending` task with `recovery_origin = retry` MUST start a fresh execution attempt.
+- Retry prompts MAY mention the immediate prior attempt id (`based_on`) and offer an
+  opt-in log/transcript lookup handle for that attempt, but this context is advisory
+  only; the retry must remain executable without consulting prior logs.
 - The empty-recovery mootness logic in section 1 (which governs *failed* tasks) MUST NOT be
   used to suppress an explicit pending resume/retry row to a no-op.
 - If a detached worker for a prepared pending recovery row dies before claiming the task,
