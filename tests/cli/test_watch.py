@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import re
 import signal
 import sys
@@ -70,7 +71,7 @@ from gza.cli.watch import (
 from gza.recovery_read_context import RecoveryReadContext
 from gza.advance_engine import classify_advance_action, failed_recovery_decision_to_action
 from gza.cli._recovery_lane import collect_recovery_lane_entries
-from gza.cli._common import set_task_queue_position_scoped
+from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 import gza.colors as colors
@@ -15783,7 +15784,7 @@ def test_installed_gza_package_fingerprint_changes_only_when_python_source_chang
 
 
 def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
-    """Watch should advertise next-pass automatic re-exec once per new drift fingerprint."""
+    """Watch should advertise next-cycle-boundary re-exec once per new drift fingerprint."""
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
@@ -15816,7 +15817,7 @@ def test_watch_warns_once_per_installed_package_drift(tmp_path: Path) -> None:
     assert len(warning_lines) == 2
     assert all(
         line.endswith(
-            "WARNING   installed gza changed since watch started -- watch will re-exec on the next watch pass to load new code"
+            "WARNING   installed gza changed since watch started -- watch will re-exec at the next cycle boundary to load new code"
         )
         for line in warning_lines
     )
@@ -15858,13 +15859,12 @@ def test_watch_drift_state_does_not_request_reexec_when_fingerprint_is_unchanged
         auto_restart_on_drift=True,
         dry_run=False,
         stop_requested=False,
-        cycle_result=_CycleResult(False, 0, 0),
         drift_state=drift_state,
     ) is False
 
 
 def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_work() -> None:
-    """Pending drift should restart watch at the next pass boundary regardless of queue state."""
+    """Pending drift should restart watch at the next cycle boundary regardless of queue state."""
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
     drift_state.pending_restart_fingerprint = "changed-1"
 
@@ -15872,7 +15872,6 @@ def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_wo
         auto_restart_on_drift=True,
         dry_run=False,
         stop_requested=False,
-        cycle_result=_CycleResult(False, 3, 7),
         drift_state=drift_state,
     ) is True
 
@@ -15898,9 +15897,34 @@ def test_watch_reexec_guards_still_suppress_pending_drift(
         auto_restart_on_drift=auto_restart_on_drift,
         dry_run=dry_run,
         stop_requested=stop_requested,
-        cycle_result=_CycleResult(False, 3, 7),
         drift_state=drift_state,
     ) is False
+
+
+@pytest.mark.parametrize(
+    ("drift_state", "expected"),
+    [
+        (None, False),
+        (_InstalledPackageDriftState(startup_fingerprint="startup"), False),
+        (
+            _InstalledPackageDriftState(
+                startup_fingerprint="startup",
+                pending_restart_fingerprint="changed-1",
+            ),
+            True,
+        ),
+    ],
+)
+def test_watch_reexec_requires_pending_drift_state(
+    drift_state: _InstalledPackageDriftState | None,
+    expected: bool,
+) -> None:
+    assert _should_reexec_watch(
+        auto_restart_on_drift=True,
+        dry_run=False,
+        stop_requested=False,
+        drift_state=drift_state,
+    ) is expected
 
 
 def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> None:
@@ -16344,8 +16368,8 @@ def test_cmd_watch_explicit_recovery_first_overrides_config_zero_recovery_slots(
     assert run_cycle.call_count == 1
 
 
-def test_cmd_watch_reexecs_on_drift_after_batch_boundary(tmp_path: Path) -> None:
-    """Watch should re-exec itself on the first pass boundary where drift is detected."""
+def test_cmd_watch_reexecs_on_drift_after_cycle_boundary(tmp_path: Path) -> None:
+    """Watch should re-exec itself at the first cycle boundary where drift is detected."""
     setup_config(tmp_path)
 
     args = argparse.Namespace(
@@ -16702,7 +16726,9 @@ def test_watch_restart_failed_retries_historical_prerequisite_unmerged_row_with_
     assert retry_child.recovery_origin == "retry"
 
 
-def test_cmd_watch_reexecs_on_next_pass_even_when_work_is_still_running(tmp_path: Path) -> None:
+def test_cmd_watch_reexecs_at_next_cycle_boundary_even_when_work_is_still_running(
+    tmp_path: Path,
+) -> None:
     """Detached workers should not block watch from restarting to pick up drifted code."""
     setup_config(tmp_path)
 
@@ -16746,6 +16772,43 @@ def test_cmd_watch_reexecs_on_next_pass_even_when_work_is_still_running(tmp_path
 
     sleep_interruptibly.assert_not_called()
     execv.assert_called_once()
+
+
+def test_reexec_recovery_keeps_live_in_progress_pid_and_counts_it_running(tmp_path: Path) -> None:
+    """Live worker state should survive reconciliation and be rediscovered after watch re-exec."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    running = store.add("Running implement", task_type="implement")
+    assert running.id is not None
+    running.status = "in_progress"
+    running.running_pid = os.getpid()
+    store.update(running)
+
+    config = Config.load(tmp_path)
+    registry = WorkerRegistry(config.workers_path)
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-live-reexec",
+            task_id=running.id,
+            pid=os.getpid(),
+            status="running",
+        )
+    )
+
+    reconcile_in_progress_tasks(config)
+
+    refreshed = store.get(running.id)
+    assert refreshed is not None
+    assert refreshed.status == "in_progress"
+    assert refreshed.running_pid == os.getpid()
+    assert refreshed.failure_reason is None
+
+    live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+
+    assert os.getpid() in live_pids
+    assert running_task_ids == [running.id]
+    assert anonymous_worker_count == 0
 
 
 def test_cmd_watch_shutdown_signal_wins_over_pending_reexec(tmp_path: Path) -> None:

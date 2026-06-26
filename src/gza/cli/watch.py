@@ -1628,7 +1628,7 @@ def _warn_if_installed_gza_changed(
     if auto_restart_on_drift:
         message = (
             "installed gza changed since watch started -- watch will re-exec "
-            "on the next watch pass to load new code"
+            "at the next cycle boundary to load new code"
         )
     else:
         message = "installed gza changed since watch started -- restart watch to pick up new code"
@@ -1643,7 +1643,6 @@ def _should_reexec_watch(
     auto_restart_on_drift: bool,
     dry_run: bool,
     stop_requested: bool,
-    cycle_result: "_CycleResult",
     drift_state: _InstalledPackageDriftState | None,
 ) -> bool:
     if not auto_restart_on_drift or dry_run or stop_requested or drift_state is None:
@@ -4646,7 +4645,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 auto_restart_on_drift=auto_restart_on_drift,
                 dry_run=dry_run,
                 stop_requested=stop_requested,
-                cycle_result=cycle_result,
                 drift_state=installed_package_drift,
             ):
                 reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
