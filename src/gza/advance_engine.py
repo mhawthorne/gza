@@ -2281,7 +2281,7 @@ def _rebase_failure_circuit_breaker_action(ctx: AdvanceContext) -> dict[str, Any
             },
         },
         reason="rebase-failure-circuit-breaker",
-        subject_task_id=ctx.task.id,
+        subject_task_id=_needs_attention_subject_id(ctx),
     )
 
 
@@ -2297,7 +2297,7 @@ def _already_rebased_but_lineage_incomplete_action(ctx: AdvanceContext) -> dict[
             ),
         },
         reason="branch-already-rebased-lineage-incomplete",
-        subject_task_id=ctx.task.id,
+        subject_task_id=_needs_attention_subject_id(ctx),
     )
 
 

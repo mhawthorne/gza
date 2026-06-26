@@ -9765,6 +9765,47 @@ def test_already_rebased_incomplete_lineage_returns_needs_attention_instead_of_r
     assert classify_advance_action(action) == "needs_attention"
 
 
+def test_already_rebased_incomplete_lineage_leaf_subjects_owning_implementation(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/already-rebased-leaf-subject",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    rebase = store.add("Incomplete rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "pending_resume"
+    rebase.branch = impl.branch
+    rebase.merge_status = "unmerged"
+    store.update(rebase)
+    store.get_or_create_merge_unit_for_task(rebase)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=False,
+            ref_shas={
+                rebase.branch: "branch-sha",
+                "main": "target-sha",
+            },
+            ancestor_pairs={("main", rebase.branch): True},
+        ),
+        rebase,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "branch-already-rebased-lineage-incomplete"
+    assert action["subject_task_id"] == impl.id
+    assert classify_advance_action(action) == "needs_attention"
+
+
 def test_failed_rebase_resolution_precedence_merge_unit_wins(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
