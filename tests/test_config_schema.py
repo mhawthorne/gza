@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from gza.config import Config, ConfigError, DEFAULT_QUIET_PERIOD_SECONDS
+from gza.config import (
+    Config,
+    ConfigError,
+    DEFAULT_QUIET_PERIOD_SECONDS,
+    DEFAULT_WATCH_DISPATCH_START_TIMEOUT,
+)
 from gza.config_schema import (
     CONFIG_KEY_REGISTRY,
     NON_CONFIG_ROOT_KEYS,
@@ -148,6 +153,28 @@ def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
     assert config.docker_startup_timeout == 60
 
 
+def test_config_load_defaults_watch_dispatch_start_timeout(tmp_path) -> None:
+    """watch.dispatch_start_timeout should default when omitted."""
+    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+
+    config = Config.load(tmp_path)
+
+    assert config.watch.dispatch_start_timeout == DEFAULT_WATCH_DISPATCH_START_TIMEOUT
+
+
+def test_config_load_parses_watch_dispatch_start_timeout(tmp_path) -> None:
+    """watch.dispatch_start_timeout should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        "  dispatch_start_timeout: 7\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.watch.dispatch_start_timeout == 7
+
+
 def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should default when omitted."""
     (tmp_path / "gza.yaml").write_text("project_name: demo\n")
@@ -248,3 +275,27 @@ def test_config_validate_rejects_invalid_docker_startup_timeout(tmp_path, value:
     assert not is_valid
     assert expected in errors
     assert warnings == []
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("0", "'watch.dispatch_start_timeout' must be positive"),
+    ("-1", "'watch.dispatch_start_timeout' must be positive"),
+    ("1.5", "'watch.dispatch_start_timeout' must be an integer"),
+    ("true", "'watch.dispatch_start_timeout' must be an integer"),
+])
+def test_config_watch_dispatch_start_timeout_validation(tmp_path, value: str, expected: str) -> None:
+    """Load and validate should reject invalid watch.dispatch_start_timeout values."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        f"  dispatch_start_timeout: {value}\n"
+    )
+
+    is_valid, errors, warnings = Config.validate(tmp_path)
+
+    assert not is_valid
+    assert expected in errors
+    assert warnings == []
+
+    with pytest.raises(ConfigError, match=expected):
+        Config.load(tmp_path)

@@ -97,6 +97,7 @@ DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
 DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX = 1800
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
+DEFAULT_WATCH_DISPATCH_START_TIMEOUT = 2
 DEFAULT_WATCH_RECOVERY_SLOTS = 1
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
@@ -238,6 +239,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
         "no_progress_cycles": None,
+        "dispatch_start_timeout": None,
     },
     "iterate_max_iterations": None,
     "interactive_worktree_dir": None,
@@ -967,6 +969,7 @@ class WatchConfig:
     transient_recovery_backoff_max: int = DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
     no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
+    dispatch_start_timeout: int = DEFAULT_WATCH_DISPATCH_START_TIMEOUT
 
 
 @dataclass
@@ -2142,6 +2145,12 @@ class Config:
             raise ConfigError("watch.no_progress_cycles must be a positive integer")
         if watch_no_progress_cycles < 1:
             raise ConfigError("watch.no_progress_cycles must be a positive integer")
+        watch_dispatch_start_timeout = _validate_positive_int_field(
+            watch_data.get("dispatch_start_timeout", DEFAULT_WATCH_DISPATCH_START_TIMEOUT),
+            "watch.dispatch_start_timeout",
+        )
+        if watch_dispatch_start_timeout is None:
+            raise ConfigError("watch.dispatch_start_timeout must be a positive integer")
 
         watch_config = WatchConfig(
             batch=watch_batch,
@@ -2155,6 +2164,7 @@ class Config:
             transient_recovery_backoff_max=watch_transient_recovery_backoff_max,
             failure_halt_after=watch_failure_halt_after,
             no_progress_cycles=watch_no_progress_cycles,
+            dispatch_start_timeout=watch_dispatch_start_timeout,
         )
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
 
@@ -2744,6 +2754,12 @@ class Config:
                         or watch_data["no_progress_cycles"] < 1
                     ):
                         errors.append("watch.no_progress_cycles must be a positive integer")
+                if "dispatch_start_timeout" in watch_data:
+                    _validate_positive_int_field(
+                        watch_data["dispatch_start_timeout"],
+                        "watch.dispatch_start_timeout",
+                        errors=errors,
+                    )
 
         if "claude_args" in data:
             warnings.append("'claude_args' is deprecated. Migrate to 'claude.args'.")

@@ -300,6 +300,16 @@ When the installed `gza` package fingerprint changes while watch is running:
   launch, skipping the action, or finding an already-running/in-flight child MUST NOT
   increment the streak. Restarting watch MUST NOT reset a streak created by actual executed
   no-progress outcomes.
+- After selecting a worker-consuming action, watch MUST wait only a small bounded
+  `watch.dispatch_start_timeout` window for the chosen task to prove execution. A live
+  running state counts, and a live registered worker counts, including the legitimate
+  preloop case where the task row is still `pending`. A task that already reaches an
+  observable terminal outcome inside that same bounded window also counts as executed
+  work rather than an undispatched launch no-show. Only when neither live-running proof
+  nor an observable post-launch terminal outcome appears in the window may watch log the
+  action as undispatched, skip no-progress accounting for that attempted launch, and
+  continue scanning the same cycle for another runnable candidate instead of leaving the
+  slot idle.
 - When the latest relevant failed recovery or improve attempt for that selected
   subject/action is a **transient terminal** (for example provider-capacity,
   infrastructure/worker death before durable work, or timeout before meaningful execution),
@@ -397,6 +407,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
 | `watch.transient_recovery_backoff_max` | Maximum persisted cooldown for transient failed recovery/improve retries |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
+| `watch.dispatch_start_timeout` | Bounded wait for selected work to prove live execution, either by a running worker or by an observable post-launch terminal outcome, before watch treats the dispatch as undispatched and moves on |
 | `watch.no_activity_timeout` | Reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
 | `--tag` / `--all-tags` | Supervisor execution scope (`--tag` matches any requested tag by default; `--all-tags` requires all of them) |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |

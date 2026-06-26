@@ -345,6 +345,10 @@ project_name: my-project
 #   Default concurrent worker target for `gza watch`.
 #   Default: 2
 #   batch: 2
+#   Bounded seconds `gza watch` waits for selected work to reach a live running state before
+#   treating the dispatch as undispatched and moving on.
+#   Default: 2
+#   dispatch_start_timeout: 2
 #   Initial cooldown after a non-auto-resumable watch failure.
 #   Default: 60
 #   failure_backoff_initial: 60

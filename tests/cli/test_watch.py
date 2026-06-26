@@ -175,6 +175,26 @@ def _append_watch_config(tmp_path: Path, extra: str) -> None:
     config_path.write_text(config_path.read_text() + extra)
 
 
+def _wait_for_dispatch_start_from_store(store):
+    return lambda **kwargs: (
+        True,
+        f"task {kwargs['task_id']} reached running state",
+        store.get(str(kwargs["task_id"])),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _default_watch_dispatch_start_liveness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "gza.cli.watch._wait_for_watch_dispatch_start",
+        lambda **kwargs: (
+            True,
+            f"task {kwargs['task_id']} reached running state",
+            kwargs["store"].get(str(kwargs["task_id"])),
+        ),
+    )
+
+
 def _run_cycle_and_emit_transition_events(
     *,
     config: Config,
@@ -605,6 +625,7 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=prepare_pending_impl) as prepare_task,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle_and_emit_transition_events(
             config=config,
@@ -655,6 +676,7 @@ def test_watch_cycle_pending_resume_row_on_empty_branch_preserves_resume_startup
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle_and_emit_transition_events(
             config=config,
@@ -921,6 +943,7 @@ def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle_and_emit_transition_events(
             config=config,
@@ -983,6 +1006,7 @@ def test_watch_cycle_tag_prefers_explicit_queue_order(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle_and_emit_transition_events(
             config=config,
@@ -1023,6 +1047,7 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle_and_emit_transition_events(
             config=config,
@@ -1074,6 +1099,7 @@ def test_watch_cycle_restart_failed_prioritizes_oldest_created_failed_task(tmp_p
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1124,6 +1150,7 @@ def test_watch_cycle_default_auto_resume_prioritizes_oldest_created_failed_task(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1215,6 +1242,7 @@ def test_watch_cycle_plain_mode_batch_one_defaults_to_recovery_first(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1267,6 +1295,7 @@ def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1322,6 +1351,7 @@ def test_watch_cycle_default_mode_keeps_reusable_pending_recovery_child_runnable
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1368,6 +1398,7 @@ def test_watch_cycle_default_mode_starts_queued_retry_child_as_pending_work(tmp_
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1461,6 +1492,7 @@ def test_watch_cycle_default_mode_does_not_treat_unrelated_in_progress_child_as_
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1575,6 +1607,7 @@ def test_watch_cycle_default_mode_non_actionable_failed_row_starts_pending(tmp_p
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1712,6 +1745,7 @@ def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(t
         ),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1880,6 +1914,7 @@ def test_watch_cycle_default_watch_false_positives_stay_silent(
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -1964,6 +1999,7 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -2161,6 +2197,7 @@ def test_watch_cycle_restart_failed_reuses_existing_deep_recovery_chain_without_
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -2293,6 +2330,7 @@ def test_watch_cycle_recovery_mode_does_not_resume_test_failure_tasks(tmp_path: 
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -2332,6 +2370,7 @@ def test_watch_cycle_resume_spawn_failure_does_not_fall_back_to_generic_iterate(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=1) as spawn_resume,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result_first = _run_cycle(
             config=config,
@@ -2398,6 +2437,7 @@ def test_watch_cycle_reuses_preexisting_pending_resume_child_with_resume_semanti
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
     ):
         result = _run_cycle(
             config=config,
@@ -9990,6 +10030,84 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
     assert f"START     {prepared_rebase.id} rebase" in log_path.read_text()
 
 
+def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tmp_path: Path) -> None:
+    """An undispatched merge-conflict rebase should fall through so the next queued task can start."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-undispatched-rebase"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    queued = store.add("Queued plan", task_type="plan")
+    assert queued.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.return_value = False
+
+    created_rebase = SimpleNamespace(id="test-rebase-raw")
+    prepared_rebase = SimpleNamespace(id="test-rebase-prepared")
+
+    def wait_for_start(*, task_id: str, **_kwargs: object) -> tuple[bool, str, object | None]:
+        if task_id == prepared_rebase.id:
+            return False, f"task {task_id} remains pending with no live worker", None
+        if task_id == queued.id:
+            return True, f"task {task_id} reached running state", store.get(task_id)
+        raise AssertionError(f"unexpected task id {task_id}")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch._create_rebase_task", return_value=created_rebase),
+        patch("gza.cli.watch.launch_permit"),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", return_value=prepared_rebase),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=wait_for_start),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_worker.call_count == 2
+    assert spawn_worker.call_args_list[0].kwargs["task_id"] == prepared_rebase.id
+    assert spawn_worker.call_args_list[1].kwargs["task_id"] == queued.id
+    log_text = log_path.read_text()
+    assert "START_UNDISPATCHED" in log_text
+    assert f"{task.id} -> {prepared_rebase.id}: dispatch did not reach running" in log_text
+    assert f"START     {prepared_rebase.id} rebase" not in log_text
+    assert f"START     {queued.id} plan" in log_text
+
+
 def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creating_task(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
@@ -10893,6 +11011,11 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            return_value=(True, "task has a live registered worker", store.get(impl.id)),
+        ),
+        patch("gza.cli.watch._watch_task_has_live_registered_worker", return_value=True),
     ):
         result = _run_cycle(
             config=config,
@@ -10938,6 +11061,11 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            return_value=(True, "task has a live registered worker", store.get(impl.id)),
+        ),
+        patch("gza.cli.watch._watch_task_has_live_registered_worker", return_value=True),
     ):
         result = _run_cycle(
             config=config,
@@ -10955,6 +11083,226 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
         line.split(maxsplit=2)[1] == "START" and f"{impl.id} iterate" in line
         for line in log_path.read_text().splitlines()
     )
+
+
+def test_watch_cycle_undispatched_create_review_falls_through_without_no_progress_tick(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-undispatched"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    pending = store.add("Pending work", task_type="implement")
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    def wait_for_start(*, task_id: str, **_kwargs: object) -> tuple[bool, str, object | None]:
+        if task_id == impl.id:
+            return False, f"task {task_id} remains completed with no live worker", store.get(task_id)
+        if task_id == pending.id:
+            return True, f"task {task_id} reached running state", store.get(task_id)
+        raise AssertionError(f"unexpected task id {task_id}")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=wait_for_start),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 2
+    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
+    assert observations == []
+    text = log_path.read_text()
+    assert f"{impl.id} create_review: dispatch did not reach running" in text
+    assert any("START" in line and f"{pending.id} implement" in line for line in text.splitlines())
+    assert "watch-no-progress-backstop" not in text
+
+
+def test_watch_cycle_create_review_quick_terminal_iterate_counts_as_executed_work(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-fast-terminal"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    pending = store.add("Pending fallback", task_type="implement")
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    def finish_iterate_immediately(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        if task_id != impl.id:
+            raise AssertionError("pending fallback should not start when create_review consumed the slot")
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        now = datetime.now(UTC)
+        refreshed_impl.status = "completed"
+        refreshed_impl.started_at = now
+        refreshed_impl.completed_at = now
+        refreshed_impl.running_pid = None
+        store.update(refreshed_impl)
+        review = store.add("Auto review", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.started_at = now
+        review.completed_at = now
+        store.update(review)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=finish_iterate_immediately) as spawn_iterate,
+        patch(
+            "gza.cli.watch._maybe_finalize_watch_no_progress_for_background_action",
+            wraps=_maybe_finalize_watch_no_progress_for_background_action,
+        ) as finalize_spy,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert finalize_spy.call_count == 1
+    assert len(store.get_reviews_for_task(impl.id)) == 1
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id)) == []
+    text = log_path.read_text()
+    assert "START_UNDISPATCHED" not in text
+    assert any("START" in line and f"{impl.id} iterate" in line for line in text.splitlines())
+    assert not any("START" in line and f"{pending.id} implement" in line for line in text.splitlines())
+
+
+def test_watch_cycle_materialize_plan_slices_success_does_not_wait_for_dispatch_start(tmp_path: Path) -> None:
+    """Direct materialization success should count as progress without startup-failure logging."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Approved plan ready to materialize", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Approved plan review", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    row = LineageOwnerRow(
+        owner_task=plan,
+        members=(plan, review),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "materialize_plan_slices", "description": "Materialize implementation slices"},
+        next_action_reason="materialize",
+        unresolved_tasks=(plan,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=plan,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[]),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "materialize_plan_slices", "description": "Materialize implementation slices"},
+        ),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="materialize_plan_slices",
+                status="success",
+                message="Materialized implementation slices: gza-200",
+                success_message="Materialized implementation slices: gza-200",
+                handled_task_id=review.id,
+                work_done=True,
+                worker_consuming=False,
+                attempted_spawn=False,
+                worker_started=False,
+            ),
+        ) as execute_action,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            side_effect=AssertionError("direct materialization should not wait for dispatch start"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    execute_action.assert_called_once()
+    assert "START_UNDISPATCHED" not in log_path.read_text()
 
 
 def test_watch_cycle_noop_improve_limit_emits_attention_without_iterate(tmp_path: Path) -> None:
@@ -11779,6 +12127,10 @@ def test_watch_cycle_pending_dispatch_launch_success_without_terminal_outcome_do
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            return_value=(True, "task reached running state", store.get(str(impl.id))),
+        ),
     ):
         _run_cycle(
             config=config,
@@ -11863,6 +12215,72 @@ def test_watch_cycle_pending_dispatch_running_launch_state_does_not_park(tmp_pat
     assert any("START" in line and f"{impl.id} implement" in line for line in text.splitlines())
 
 
+def test_watch_cycle_pending_dispatch_quick_terminal_launch_counts_as_executed_work(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    first = store.add("First implement", task_type="implement")
+    assert first.id is not None
+    second = store.add("Second implement", task_type="implement")
+    assert second.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    def finish_first_immediately(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        if task_id != first.id:
+            raise AssertionError("second pending task should not start when the first consumed the slot")
+        refreshed = store.get(first.id)
+        assert refreshed is not None
+        now = datetime.now(UTC)
+        refreshed.status = "completed"
+        refreshed.started_at = now
+        refreshed.completed_at = now
+        refreshed.running_pid = None
+        store.update(refreshed)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=finish_first_immediately) as spawn_iterate,
+        patch(
+            "gza.cli.watch._maybe_finalize_watch_no_progress_for_background_action",
+            wraps=_maybe_finalize_watch_no_progress_for_background_action,
+        ) as finalize_spy,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    refreshed_second = store.get(second.id)
+    assert refreshed_second is not None
+    assert result.work_done is True
+    assert spawn_iterate.call_count == 1
+    assert finalize_spy.call_count == 1
+    assert refreshed_second.status == "pending"
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(first.id)) == []
+    text = log_path.read_text()
+    assert "START_UNDISPATCHED" not in text
+    assert any("START" in line and f"{first.id} implement" in line for line in text.splitlines())
+    assert not any("START" in line and f"{second.id} implement" in line for line in text.splitlines())
+
+
 def test_watch_cycle_recovery_relaunch_launch_success_without_terminal_outcome_does_not_park(
     tmp_path: Path,
 ) -> None:
@@ -11886,6 +12304,11 @@ def test_watch_cycle_recovery_relaunch_launch_success_without_terminal_outcome_d
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            side_effect=lambda **_kwargs: (True, "task reached running state", store.get(str(failed.id))),
+        ),
+        patch("gza.cli.watch._watch_task_has_live_registered_worker", return_value=True),
     ):
         _run_cycle(
             config=config,
@@ -19197,6 +19620,10 @@ def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
         patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
         patch("gza.cli.git_ops._create_review_task", side_effect=AssertionError("local review creation should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            return_value=(True, "task has a live registered worker", store.get(impl.id)),
+        ),
     ):
         _run_cycle(
             config=config,

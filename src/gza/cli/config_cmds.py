@@ -1833,6 +1833,8 @@ def _config_to_effective_dict(config: Config) -> dict:
             "failure_backoff_max": config.watch.failure_backoff_max,
             "transient_recovery_backoff_max": config.watch.transient_recovery_backoff_max,
             "failure_halt_after": config.watch.failure_halt_after,
+            "no_progress_cycles": config.watch.no_progress_cycles,
+            "dispatch_start_timeout": config.watch.dispatch_start_timeout,
         },
         "provider": config.provider,
         "task_providers": config.task_providers,

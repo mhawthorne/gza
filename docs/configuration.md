@@ -74,7 +74,7 @@ Gza reads configuration from three YAML layers:
 | `max_concurrent` | Integer | explicit `watch.batch` or `5` | Hard global ceiling on concurrently running task-executing processes across `work`, `watch`, `advance`, iterate/recovery helpers, and internal task runners. Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5` |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
-| `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1}` | Defaults for `gza watch` loop behavior |
+| `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, dispatch_start_timeout: 2}` | Defaults for `gza watch` loop behavior |
 | `quiet_period_seconds` | Integer | `300` | Seconds reserved for the upcoming newly-created-task quiet-period pickup/display implementation; current releases expose the setting only and do not yet hold tasks from execution, and `0` keeps the future hold disabled |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
@@ -1019,6 +1019,7 @@ watch.failure_halt_after
 watch.max_idle
 watch.no_activity_timeout
 watch.no_progress_cycles
+watch.dispatch_start_timeout
 watch.max_iterations
 watch.poll
 watch.recovery_slots
@@ -1884,6 +1885,8 @@ watch:
 `watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY` because its task log or startup evidence has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
+
+`watch.dispatch_start_timeout` bounds how long `gza watch` waits after selecting work for it to reach a live running state. If the worker never becomes live within that window, watch logs the undispatched action, does not advance no-progress accounting for it, and keeps scanning the current watch pass for another runnable candidate instead of leaving the slot idle.
 
 `watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` enforces before relaunching the same transient failed recovery or improve action. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
 

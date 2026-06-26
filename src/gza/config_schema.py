@@ -230,6 +230,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("watch.failure_halt_after", "int | null", 10, "Exit `gza watch` after this many consecutive non-auto-resumable failures."),
     ConfigKeySpec("watch.no_progress_cycles", "int", 3, "Repeated unchanged watch-action cycles before the subject is parked for manual attention."),
+    ConfigKeySpec("watch.dispatch_start_timeout", "int", 2, "Bounded seconds `gza watch` waits for selected work to reach a live running state before treating the dispatch as undispatched and moving on."),
     ConfigKeySpec("watch.max_idle", "int | null", None, "Idle timeout seconds for `gza watch` loop exit."),
     ConfigKeySpec("watch.no_activity_timeout", "int", 60, "Seconds before watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`."),
     ConfigKeySpec("watch.max_iterations", "int", 10, "Default review/improve loop cap in `gza watch`."),

@@ -96,6 +96,7 @@ from ..watch_progress import (
     reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
 )
+from ..workers import WorkerRegistry
 from ._common import (
     _TASK_ID_RE,
     _create_implementation_task_from_source,
@@ -935,6 +936,8 @@ def _maybe_finalize_deferred_watch_no_progress(
         return None
     if observation.action_task_id is None:
         return None
+    if config is not None and _watch_task_has_live_registered_worker(config, observation.action_task_id):
+        return None
     observed_action_task = store.get(observation.action_task_id)
     if not _watch_background_execution_completed(observed_action_task):
         return None
@@ -1025,6 +1028,32 @@ def _maybe_finalize_watch_no_progress_for_background_action(
     no_progress_cycles: int,
 ) -> dict[str, Any] | None:
     """Finalize no-progress only when the detached action already reached an observed outcome."""
+    if (
+        config is not None
+        and action_task_after is not None
+        and action_task_after.id is not None
+        and _watch_task_has_live_registered_worker(config, str(action_task_after.id))
+    ):
+        before_candidate = build_watch_progress_candidate(
+            store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task_before,
+            failed_task=failed_task,
+        )
+        after_candidate = build_watch_progress_candidate(
+            store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task_after,
+            failed_task=failed_task,
+        )
+        record_background_watch_execution_start(
+            store,
+            before=before_candidate,
+            after=after_candidate,
+        )
+        return None
     if action_task_after is not None and not _watch_background_execution_completed(action_task_after):
         before_candidate = build_watch_progress_candidate(
             store,
@@ -2035,6 +2064,161 @@ def _spawn_worker_with_failure_log(
     if rc != 0:
         log.emit("START_FAILED", failure_message, dedupe_key=dedupe_key)
     return rc
+
+
+def _watch_task_has_live_registered_worker(config: Config, task_id: str) -> bool:
+    registry = WorkerRegistry(config.workers_path)
+    for worker in registry.list_all(include_completed=False):
+        if str(worker.task_id or "") != task_id:
+            continue
+        if worker.status != "running" or not registry.is_running(worker.worker_id):
+            continue
+        return True
+    return False
+
+
+@dataclass(frozen=True)
+class _WatchDispatchTaskSnapshot:
+    task_id: str | None
+    status: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    running_pid: int | None
+    failure_reason: str | None
+    completion_reason: str | None
+
+
+def _snapshot_watch_dispatch_task(task: object | None) -> _WatchDispatchTaskSnapshot | None:
+    if task is None:
+        return None
+    return _WatchDispatchTaskSnapshot(
+        task_id=getattr(task, "id", None),
+        status=getattr(task, "status", None),
+        started_at=getattr(task, "started_at", None),
+        completed_at=getattr(task, "completed_at", None),
+        running_pid=getattr(task, "running_pid", None),
+        failure_reason=getattr(task, "failure_reason", None),
+        completion_reason=getattr(task, "completion_reason", None),
+    )
+
+
+def _watch_dispatch_has_observed_terminal_outcome(
+    *,
+    task_before: _WatchDispatchTaskSnapshot | None,
+    task_after: DbTask | None,
+) -> bool:
+    if task_after is None or task_after.status in {"pending", "in_progress"}:
+        return False
+    if task_before is None:
+        return any(
+            value is not None
+            for value in (
+                task_after.started_at,
+                task_after.completed_at,
+                task_after.running_pid,
+                task_after.failure_reason,
+                task_after.completion_reason,
+            )
+        )
+    if task_before.task_id is not None and task_after.id != task_before.task_id:
+        return False
+    if task_before.status in {"pending", "in_progress"} and task_after.status not in {"pending", "in_progress"}:
+        return True
+    return (
+        task_after.status != task_before.status
+        or task_after.started_at != task_before.started_at
+        or task_after.completed_at != task_before.completed_at
+        or task_after.running_pid != task_before.running_pid
+        or task_after.failure_reason != task_before.failure_reason
+        or task_after.completion_reason != task_before.completion_reason
+    )
+
+
+def _watch_dispatch_start_state(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task_id: str,
+    task_before: _WatchDispatchTaskSnapshot | None = None,
+) -> tuple[bool, str, DbTask | None]:
+    task = store.get(task_id)
+    live_pids, running_task_ids, _ = _collect_live_running_state(config, store)
+    live_registered_worker = _watch_task_has_live_registered_worker(config, task_id)
+    if task_id in set(running_task_ids):
+        if task is not None and task.status == "pending":
+            return True, f"task {task_id} is pending with a live registered worker in preloop", task
+        return True, f"task {task_id} reached running state", task
+    if live_registered_worker:
+        return True, f"task {task_id} has a live registered worker", task
+    if _watch_dispatch_has_observed_terminal_outcome(task_before=task_before, task_after=task):
+        return True, f"task {task_id} reached an observable terminal outcome after dispatch", task
+    if task is None:
+        return False, f"task {task_id} no longer exists after dispatch", None
+    if task.status == "in_progress":
+        pid = task.running_pid
+        if pid is None:
+            return False, f"task {task_id} is in_progress but has no running_pid or live worker", task
+        if pid not in live_pids:
+            return False, f"task {task_id} is in_progress but running_pid {pid} is not live", task
+    return False, f"task {task_id} remains {task.status} with no live worker", task
+
+
+def _wait_for_watch_dispatch_start(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task_id: str,
+    task_before: _WatchDispatchTaskSnapshot | None = None,
+) -> tuple[bool, str, DbTask | None]:
+    deadline = time.monotonic() + config.watch.dispatch_start_timeout
+    poll_seconds = 0.1
+    while True:
+        started, reason, task = _watch_dispatch_start_state(
+            config=config,
+            store=store,
+            task_id=task_id,
+            task_before=task_before,
+        )
+        if started:
+            return True, reason, task
+        if time.monotonic() >= deadline:
+            return False, reason, task
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def _watch_execution_requires_dispatch_confirmation(result: AdvanceActionExecutionResult) -> bool:
+    """Return whether a shared advance result represents a real worker launch attempt."""
+    return result.worker_consuming and result.attempted_spawn and result.worker_started and result.handled_task_id is not None
+
+
+def _confirm_watch_dispatch_start(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    task_id: str,
+    task_before: _WatchDispatchTaskSnapshot | None,
+    start_label: str,
+    dedupe_key: str,
+) -> tuple[bool, DbTask | None]:
+    """Wait for bounded live or terminal execution proof and emit the shared undispatched log on failure."""
+    started, dispatch_reason, refreshed_task = _wait_for_watch_dispatch_start(
+        config=config,
+        store=store,
+        task_id=task_id,
+        task_before=task_before,
+    )
+    if not started:
+        log.emit(
+            "START_UNDISPATCHED",
+            (
+                f"{start_label}: dispatch did not reach running within "
+                f"{config.watch.dispatch_start_timeout}s ({dispatch_reason})"
+            ),
+            dedupe_key=dedupe_key,
+        )
+        return False, refreshed_task
+    return True, refreshed_task
 
 
 @dataclass
@@ -3309,14 +3493,34 @@ def _run_cycle(
                                 )
                                 continue
                             step1_handled_child_task_ids.add(str(rebase_task.id))
-                            work_done = True
                             if slots > 0:
+                                rebase_task_before = _snapshot_watch_dispatch_task(prepared_rebase_task)
                                 rebase_rc = _watch_spawn_worker(prepared_rebase_task, "rebase")
                                 _release_watch_reserved_task(str(prepared_rebase_task.id))
                                 if rebase_rc == 0:
+                                    started, _refreshed_rebase_task = _confirm_watch_dispatch_start(
+                                        config=config,
+                                        store=store,
+                                        log=log,
+                                        task_id=str(prepared_rebase_task.id),
+                                        task_before=rebase_task_before,
+                                        start_label=f"{display_task.id} -> {prepared_rebase_task.id}",
+                                        dedupe_key=(
+                                            f"merge-conflict-rebase-undispatched:{display_task.id}:"
+                                            f"{prepared_rebase_task.id}"
+                                        ),
+                                    )
+                                    if not started:
+                                        log.emit(
+                                            "SKIP",
+                                            f"{display_task.id}: merge conflict routed to rebase",
+                                            dedupe_key=f"merge-conflict:{display_task.id}",
+                                        )
+                                        continue
                                     log.emit("START", f"{prepared_rebase_task.id} rebase")
                                     started_task_ids.add(str(prepared_rebase_task.id))
                                     slots -= 1
+                                    work_done = True
                                 else:
                                     log.emit(
                                         "SKIP",
@@ -3330,6 +3534,7 @@ def _run_cycle(
                                     f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
                                     dedupe_key=f"merge-conflict-rebase-queued:{display_task.id}",
                                 )
+                                work_done = True
                             log.emit(
                                 "SKIP",
                                 f"{display_task.id}: merge conflict routed to rebase",
@@ -3540,7 +3745,19 @@ def _run_cycle(
                             message=_watch_needs_attention_message(display_task, no_progress_attention),
                         )
                 work_done = True
-            elif exec_result.status == "success" and child_id is not None:
+            elif exec_result.status == "success" and _watch_execution_requires_dispatch_confirmation(exec_result):
+                assert child_id is not None
+                started, refreshed_action_task = _confirm_watch_dispatch_start(
+                    config=config,
+                    store=store,
+                    log=log,
+                    task_id=str(child_id),
+                    task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
+                    start_label=f"{display_task.id} {action_type}",
+                    dedupe_key=f"advance-undispatched:{action_type}:{display_task.id}:{child_id}",
+                )
+                if not started:
+                    continue
                 if exec_result.worker_label == "iterate":
                     log.emit("START", f"{child_id} iterate")
                 elif action_type in {"create_review", "run_review"}:
@@ -3551,7 +3768,6 @@ def _run_cycle(
                     log.emit("START", f"{child_id} implement")
                 elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
                     log.emit("START", f"{child_id} rebase")
-                refreshed_action_task = store.get(child_id) if child_id is not None else None
                 no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
                     config=config,
                     store=store,
@@ -3595,6 +3811,24 @@ def _run_cycle(
                             message=_watch_needs_attention_message(display_task, no_progress_attention),
                         )
                 work_done = True
+            elif exec_result.status == "success":
+                refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
+                no_progress_attention = _finalize_watch_no_progress_after_execution(
+                    config=config,
+                    store=store,
+                    subject_task=display_task,
+                    action=action,
+                    action_task_before=task,
+                    action_task_after=refreshed_display_task,
+                    failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                )
+                work_done = exec_result.work_done
+                if no_progress_attention is not None and display_task.id is not None:
+                    log.emit_attention(
+                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(display_task, no_progress_attention),
+                    )
 
     # 2) Recovery queue for failed tasks.
     pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)
@@ -3878,6 +4112,7 @@ def _run_cycle(
                 )
                 if prepared_recovered_task is None:
                     continue
+                recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -3917,6 +4152,7 @@ def _run_cycle(
                     continue
                 resume_recovered_task = prepared_recovered_task
                 recovered_task_id = str(prepared_recovered_task.id)
+                recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -3989,6 +4225,7 @@ def _run_cycle(
                 continue
             retry_recovered_task = prepared_recovered_task
             recovered_task_id = str(prepared_recovered_task.id)
+            recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
                 _spawn_worker_with_failure_log(
@@ -4032,7 +4269,17 @@ def _run_cycle(
 
         if rc != 0:
             continue
-        refreshed_recovered_task = store.get(recovered_task_id)
+        started, refreshed_recovered_task = _confirm_watch_dispatch_start(
+            config=config,
+            store=store,
+            log=log,
+            task_id=recovered_task_id,
+            task_before=recovered_task_before,
+            start_label=f"{failed.id} -> {recovered_task_id}",
+            dedupe_key=f"recovery-undispatched:{failed.id}:{recovered_task_id}",
+        )
+        if not started:
+            continue
         no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
             config=config,
             store=store,
@@ -4172,6 +4419,7 @@ def _run_cycle(
                         dedupe_key=f"prepare-iterate-failed:{task.id}",
                     )
                     continue
+                pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
@@ -4190,7 +4438,17 @@ def _run_cycle(
                 _release_watch_reserved_task(str(prepared_pending_task.id))
                 if rc != 0:
                     continue
-                refreshed_pending_task = store.get(str(task.id))
+                started, refreshed_pending_task = _confirm_watch_dispatch_start(
+                    config=config,
+                    store=store,
+                    log=log,
+                    task_id=str(task.id),
+                    task_before=pending_task_before,
+                    start_label=f"{task.id} {task_type}",
+                    dedupe_key=f"pending-undispatched:{task.id}:iterate",
+                )
+                if not started:
+                    continue
                 no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
                     config=config,
                     store=store,
@@ -4259,6 +4517,7 @@ def _run_cycle(
                 )
                 continue
             worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+            pending_task_before = _snapshot_watch_dispatch_task(task)
             rc = _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=log,
@@ -4274,7 +4533,17 @@ def _run_cycle(
             )
             if rc != 0:
                 continue
-            refreshed_pending_task = store.get(str(task.id))
+            started, refreshed_pending_task = _confirm_watch_dispatch_start(
+                config=config,
+                store=store,
+                log=log,
+                task_id=str(task.id),
+                task_before=pending_task_before,
+                start_label=f"{task.id} {task_type}",
+                dedupe_key=f"pending-undispatched:{task.id}:worker",
+            )
+            if not started:
+                continue
             no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
                 config=config,
                 store=store,

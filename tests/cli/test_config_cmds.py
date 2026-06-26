@@ -1105,6 +1105,36 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["watch"]["transient_recovery_backoff_max"] == 240
         assert payload["sources"]["watch.transient_recovery_backoff_max"] == "base"
 
+    def test_config_command_includes_watch_dispatch_timeout_and_no_progress_json_and_sources(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """gza config --json should expose watch dispatch/no-progress settings with source attribution."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  no_progress_cycles: 4\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  dispatch_start_timeout: 7\n"
+        )
+
+        result = invoke_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["watch"]["no_progress_cycles"] == 4
+        assert payload["sources"]["watch.no_progress_cycles"] == "base"
+        assert payload["effective"]["watch"]["dispatch_start_timeout"] == 7
+        assert payload["sources"]["watch.dispatch_start_timeout"] == "local"
+
     def test_config_command_includes_quiet_period_seconds_json_and_source(self, tmp_path: Path):
         """gza config --json should expose quiet_period_seconds with source attribution."""
 
