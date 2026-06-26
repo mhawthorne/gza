@@ -16337,7 +16337,7 @@ class TestExtractedRunInnerHelpers:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.status == "failed"
-        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.failure_reason == "REBASE_CONFLICT"
 
         surfaced = capsys.readouterr()
         assert "Rebase still in progress after provider success." in surfaced.err
@@ -16346,7 +16346,109 @@ class TestExtractedRunInnerHelpers:
         log_file = config.project_dir / refreshed.log_file
         log_text = ops_log_path_for(log_file).read_text()
         assert "Rebase still in progress after provider success." in log_text
-        assert '"failure_reason": "GIT_ERROR"' in log_text
+        assert '"failure_reason": "REBASE_CONFLICT"' in log_text
+
+    def test_runner_rebase_invalid_container_git_path_failure_is_infrastructure_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.branch = "feature/rebase-parent"
+        store.mark_in_progress(parent)
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.slug = "20260626-runner-rebase-invalid-container-git-path"
+        store.update(task)
+
+        isolated_path = config.worktree_path / "isolated-rebase"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        class _CheckoutContext:
+            path = isolated_path
+            git = isolated_git
+            branch = parent.branch
+            target_ref = "main"
+            imported_refs: tuple[str, ...] = ()
+            source_repo = tmp_path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch("gza.runner.import_isolated_rebase_tip", side_effect=GitError("git worktree list --porcelain failed: fatal: Invalid path '/gza-git': No such file or directory")),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
+
+        surfaced = capsys.readouterr().out
+        assert "Invalid path '/gza-git'" in surfaced
 
     def test_complete_code_task_uses_summary_for_commit_subject(self, tmp_path: Path):
         """Commit subject should come from worktree summary when present."""

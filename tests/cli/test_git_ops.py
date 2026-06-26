@@ -2281,6 +2281,7 @@ def test_run_task_backed_rebase_failure_does_not_reconcile_parent_merge_status(t
     assert refreshed_parent is not None
     assert refreshed_parent.merge_status == "unmerged"
     mark_failed.assert_called_once()
+    assert mark_failed.call_args.kwargs["explicit_reason"] == "REBASE_CONFLICT"
     reconcile_task_branch_merge_truth.assert_not_called()
 
 
@@ -2565,6 +2566,50 @@ def test_run_task_backed_rebase_clean_publish_failure_does_not_fall_back_to_prov
     worktree_git.rebase_abort.assert_not_called()
     mark_failed.assert_called_once()
     assert mark_failed.call_args.kwargs["explicit_reason"] == "GIT_ERROR"
+
+
+def test_run_task_backed_rebase_container_git_metadata_failure_retries_as_infra(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+
+    invalid_path_error = GitError(
+        "git worktree list --porcelain failed: fatal: Invalid path '/gza-git': No such file or directory"
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", side_effect=invalid_path_error),
+        patch("gza.cli.git_ops.mark_task_failed_from_cause", return_value=None) as mark_failed,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 1
+    mark_failed.assert_called_once()
+    assert mark_failed.call_args.kwargs["explicit_reason"] == "INFRASTRUCTURE_ERROR"
 
 
 def test_run_task_backed_rebase_remote_ref_lookup_failure_marks_task_failed(tmp_path) -> None:

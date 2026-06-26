@@ -55,6 +55,7 @@ from ..git import (
     ResolvedMergeSourceRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
+    git_error_indicates_containerized_worktree_metadata_failure,
     is_rebase_in_progress,
     prime_advance_planning_refs,
     remove_worktree_registration_for_path,
@@ -164,6 +165,12 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_rebase_git_failure(error: BaseException) -> str:
+    if git_error_indicates_containerized_worktree_metadata_failure(error):
+        return "INFRASTRUCTURE_ERROR"
+    return "GIT_ERROR"
 
 _T = TypeVar("_T")
 
@@ -1916,7 +1923,7 @@ def _run_task_backed_rebase(
                 store=store,
                 log_file=log_file,
                 branch=branch,
-                explicit_reason="GIT_ERROR",
+                explicit_reason=_classify_rebase_git_failure(e),
             )
             return 1
         logger.info("✓ Fetched from origin")
@@ -1950,7 +1957,7 @@ def _run_task_backed_rebase(
             store=store,
             log_file=log_file,
             branch=branch,
-            explicit_reason="GIT_ERROR",
+            explicit_reason=_classify_rebase_git_failure(e),
         )
         return 1
 
@@ -2011,7 +2018,7 @@ def _run_task_backed_rebase(
                     store=store,
                     log_file=log_file,
                     branch=branch,
-                    explicit_reason="TEST_FAILURE",
+                    explicit_reason="REBASE_CONFLICT",
                 )
                 print()
                 return 1
@@ -2025,14 +2032,14 @@ def _run_task_backed_rebase(
                 baseline=rebase_diff_baseline,
                 logger=logger,
             )
-        except GitError:
+        except GitError as e:
             mark_task_failed_from_cause(
                 task=rebase_task,
                 config=config,
                 store=store,
                 log_file=log_file,
                 branch=branch,
-                explicit_reason="GIT_ERROR",
+                explicit_reason=_classify_rebase_git_failure(e),
             )
             print()
             return 1
@@ -2125,7 +2132,7 @@ def _run_task_backed_rebase(
             store=store,
             log_file=log_file,
             branch=branch,
-            explicit_reason="GIT_ERROR",
+            explicit_reason=_classify_rebase_git_failure(e),
         )
         print()
         return 1

@@ -1,6 +1,7 @@
 """Git operations for Gza."""
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -14,6 +15,18 @@ from typing import Any
 class GitError(Exception):
     """Git operation failed."""
     pass
+
+
+def git_error_indicates_containerized_worktree_metadata_failure(error: BaseException | str) -> bool:
+    """Return whether a git failure points at container-only `/gza-git` metadata.
+
+    These failures are infrastructure/worktree-availability issues, not user-edit
+    conflicts. They typically surface when host-side git bookkeeping touches a
+    worktree whose admin files still reference the container-only `/gza-git/...`
+    mount view.
+    """
+    text = str(error)
+    return "/gza-git" in text
 
 
 @dataclass(frozen=True)
@@ -246,6 +259,20 @@ class Git:
         if self._cache is not None:
             self._cache.clear()
 
+    @staticmethod
+    def _git_executable() -> str:
+        """Resolve the real git binary instead of a provider shell shim.
+
+        Functional tests and host-side maintenance flows create temporary repos
+        outside `/workspace`. They should use the system git binary directly;
+        the `/tmp/gza-shims/git` guard exists for provider shell sessions, not
+        for this trusted wrapper.
+        """
+        filtered_path = ":".join(
+            entry for entry in os.environ.get("PATH", "").split(":") if entry != "/tmp/gza-shims"
+        )
+        return shutil.which("git", path=filtered_path) or "git"
+
     def _cache_key(
         self,
         *args: str,
@@ -363,7 +390,7 @@ class Git:
             CompletedProcess result
         """
         result = subprocess.run(
-            ["git", *args],
+            [self._git_executable(), *args],
             cwd=self.repo_dir,
             capture_output=True,
             text=True,

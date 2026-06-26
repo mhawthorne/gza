@@ -780,6 +780,39 @@ def test_decide_failed_task_recovery_live_probe_failure_logs_warning_and_does_no
     )
 
 
+def test_decide_failed_task_recovery_invalid_container_git_path_probe_failure_stays_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Unitless implementation with invalid container git path", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.branch = "feature/invalid-container-git-path"
+    failed.has_commits = True
+    failed.session_id = "sess-invalid-container-git-path"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    def _raise_git_error(**kwargs: object) -> None:
+        raise GitError(
+            "git worktree list --porcelain failed: fatal: Invalid path '/gza-git': No such file or directory"
+        )
+
+    monkeypatch.setattr(recovery_engine, "resolve_task_merge_state_for_target", _raise_git_error)
+    _stub_merge_context(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="gza.recovery_engine"):
+        decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("live merge-state probe failed" in m for m in warning_messages)
+    assert any("/gza-git" in m for m in warning_messages)
+    assert decision.action == "resume"
+
+
 def test_list_failed_tasks_for_recovery_emits_one_warning_when_branch_reachability_probe_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1335,6 +1368,23 @@ def test_recovery_engine_infra_failure_chooses_retry(tmp_path: Path) -> None:
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
     assert decision.action == "retry"
     assert decision.launch_mode == "worker"
+
+
+def test_recovery_engine_rebase_conflict_parks_with_distinct_attention_reason(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="REBASE_CONFLICT", session_id="sess-rebase")
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "rebase_conflict_requires_manual_resolution"
+    assert decision.reason_text == "rebase conflict requires manual resolution"
+    assert (
+        get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=decision,
+            max_recovery_attempts=1,
+        )
+        == "rebase-failed-needs-manual-resolution"
+    )
 
 
 def test_classify_failure_reason_branch_unpushable_is_reconcile() -> None:

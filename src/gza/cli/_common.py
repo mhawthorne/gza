@@ -3388,6 +3388,7 @@ def _failure_summary(
         "AGENT_FORFEIT": "Agent forfeited: could not complete the task.",
         "MAX_STEPS": "Stopped due to max steps limit.",
         "MAX_TURNS": "Stopped due to max turns limit.",
+        "REBASE_CONFLICT": "Stopped because the rebase still requires manual conflict resolution.",
         "TERMINATED": "Stopped by an external termination signal.",
         "TERMINAL_NO_WORK": "Task produced no publishable work; the branch resolved as terminal no-work.",
         "PREREQUISITE_UNMERGED": "Dependency is not yet merged to main.",

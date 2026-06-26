@@ -83,6 +83,7 @@ from .git import (
     GitApplyResult,
     GitError,
     cleanup_worktree_for_branch,
+    git_error_indicates_containerized_worktree_metadata_failure,
     is_rebase_in_progress,
     parse_diff_numstat,
 )
@@ -168,6 +169,7 @@ PR_REQUIRED_FAILURE_REASON = "PR_REQUIRED"
 BRANCH_UNPUSHABLE_FAILURE_REASON = "BRANCH_UNPUSHABLE"
 PROJECT_SCOPE_VIOLATION_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
 VERIFIED_EMPTY_NOOP_COMPLETION_REASON = "VERIFIED_EMPTY_NOOP"
+REBASE_CONFLICT_FAILURE_REASON = "REBASE_CONFLICT"
 CROSS_PROJECT_TAG = "cross-project"
 DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE = 3
 _GZA_OWNED_DIR_NAMES = (".gza", ".claude")
@@ -270,6 +272,24 @@ def _git_error_failure() -> ResolvedRunFailure:
         status="Failed: git error",
         outcome_message="Outcome: failed (GIT_ERROR)",
     )
+
+
+def _rebase_conflict_failure() -> ResolvedRunFailure:
+    return ResolvedRunFailure(
+        reason=REBASE_CONFLICT_FAILURE_REASON,
+        status="Failed: rebase conflict requires manual resolution",
+        outcome_message=f"Outcome: failed ({REBASE_CONFLICT_FAILURE_REASON})",
+    )
+
+
+def _resolved_git_failure(error: BaseException) -> ResolvedRunFailure:
+    if git_error_indicates_containerized_worktree_metadata_failure(error):
+        return ResolvedRunFailure(
+            reason="INFRASTRUCTURE_ERROR",
+            status="Failed: git worktree metadata became unavailable",
+            outcome_message="Outcome: failed (INFRASTRUCTURE_ERROR)",
+        )
+    return _git_error_failure()
 
 
 def _task_is_cross_project(task: Task) -> bool:
@@ -7781,15 +7801,16 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
             )
         except GitError as e:
             error_message(f"Git error: {e}")
+            resolved_failure = _resolved_git_failure(e)
             if retry_log_path is not None:
                 write_log_entry(
                     retry_log_path,
                     {
                         "type": "gza",
                         "subtype": "outcome",
-                        "message": "Outcome: failed (GIT_ERROR)",
+                        "message": resolved_failure.outcome_message,
                         "exit_code": 1,
-                        "failure_reason": "GIT_ERROR",
+                        "failure_reason": resolved_failure.reason,
                     },
                 )
                 _write_stats_entry(retry_log_path, stats)
@@ -7801,7 +7822,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
                 stats=stats,
                 branch=task.branch,
                 has_commits=bool(task.has_commits),
-                explicit_reason="GIT_ERROR",
+                explicit_reason=resolved_failure.reason,
                 error_type=None,
                 exit_code=1,
                 head_sha=head_sha,
@@ -8287,7 +8308,7 @@ def _run_inner(
                     store=store,
                     log_file=log_file,
                     stats=stats,
-                    failure=_git_error_failure(),
+                    failure=_rebase_conflict_failure(),
                     exit_code=1,
                     branch=branch_name,
                 )
@@ -8338,7 +8359,7 @@ def _run_inner(
             log_file=log_file,
             stats=stats,
             branch=branch_name,
-            failure=_git_error_failure(),
+            failure=_resolved_git_failure(e),
             exit_code=1,
         )
         return 1

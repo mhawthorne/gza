@@ -95,9 +95,17 @@ Consequences:
   choose `resume` on the first automatic recovery attempt.
 - Retryable provider/infrastructure failures that should not reuse the same execution
   thread MUST choose `retry`.
+- Git/worktree-admin failures that indicate the task hit container-only or otherwise
+  unavailable worktree metadata (for example `git worktree list --porcelain` or similar
+  commands failing on `/gza-git/...`) MUST classify as retryable infrastructure failure,
+  not as generic `GIT_ERROR` / manual-only parking.
 - Provider-side transient availability failures surfaced as stream/log errors (for
   example a Codex `turn.failed` reporting that the selected model is at capacity)
   MUST classify as a retryable provider-availability failure, not `UNKNOWN`.
+- A rebase that still has unresolved conflict state after the automated/provider-assisted
+  path completes MUST persist a distinct manual failure reason for "rebase conflict
+  requires manual resolution". It MUST NOT collapse into the same bucket as infrastructure
+  or worktree-admin git failures.
 - Manual-only failures MUST park for a human and MUST NOT be auto-resumed or auto-retried.
 - A fresh retry MUST create a new execution attempt. A resume MUST preserve the provider
   session/thread being continued.

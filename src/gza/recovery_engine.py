@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
 _MANUAL_ONLY_REASONS = {
     "CONFIG_ERROR",
+    "REBASE_CONFLICT",
     "TEST_FAILURE",
     "GIT_ERROR",
     "MISSING_REPORT_ARTIFACT",
@@ -1527,6 +1528,14 @@ def decide_failed_task_recovery(
                 attempt_index=attempt_index,
                 attempt_limit=attempt_limit,
             )
+    if reason == "REBASE_CONFLICT":
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="rebase_conflict_requires_manual_resolution",
+            reason_text="rebase conflict requires manual resolution",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
     if reason != "PREREQUISITE_UNMERGED" and classify_failure_reason(reason) == "manual":
         return _skip_decision(
             task_id=task_id,
@@ -1795,6 +1804,8 @@ def _get_failed_recovery_needs_attention_reason(
 
     if decision.reason_code == "automatic_recovery_disabled":
         return "automatic-recovery-disabled"
+    if decision.reason_code == "rebase_conflict_requires_manual_resolution":
+        return "rebase-failed-needs-manual-resolution"
     if decision.reason_code == "manual_failure_reason":
         return "manual-failure-reason"
     if decision.reason_code == "reconcile_branch_missing":
