@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Overnight unattended reviver for parked gza tasks.
 
-YOU launch this (it runs ``gza fix`` / ``gza iterate``) — the "automated tool the
+YOU launch this (it runs ``gza fix`` / ``gza advance``) — the "automated tool the
 user runs" pattern, like ``gza watch -y``. It dispatches on the ``next_action``
 field that ``gza incomplete --json`` already computes:
 
   * review/improve no-progress backstop or retry-limit (``next_action=skip`` with
-    the matching reason) → ``gza fix -b`` (a fresh attempt; iterate is a no-op there)
-  * lifecycle steps (``resume`` / ``create_review`` / ``improve``) → ``gza iterate -b``
+    the matching reason) → ``gza fix -b`` (a fresh attempt; advance is a no-op there)
+  * lifecycle steps (``resume`` / ``create_review`` / ``improve``) → ``gza advance <id> -y``
+    (one lifecycle step; watch finishes it)
   * everything else (GIT_ERROR / needs_rebase / awaiting_human / merge) → leave parked
 
 Don't-fix-twice-in-a-row guard: a ``fix`` only advances a unit when it makes a
@@ -20,6 +21,12 @@ Usage:
     scripts/revive_stuck.py                       # 15-min cycles, 1 task/cycle
     scripts/revive_stuck.py --batch 4 --interval 600
     scripts/revive_stuck.py --once --dry-run      # show decisions, run nothing
+    scripts/revive_stuck.py --tag system          # only revive tasks tagged `system`
+    scripts/revive_stuck.py --tag a --tag b       # match-ANY (repeatable or comma-separated)
+
+Tag filtering is a short-term client-side narrowing of ``gza incomplete --json`` on the
+lineage-owner tags; it will be replaced when ``gza incomplete`` accepts ``--tag`` natively
+(gza-6466), matching the ``watch`` / ``queue`` argument convention.
 """
 
 from __future__ import annotations
@@ -51,6 +58,23 @@ def _gza(args: list[str], project: Path) -> tuple[int, str, str]:
         text=True,
     )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _parse_tags(raw_tags: list[str] | None) -> set[str] | None:
+    """Normalize repeatable ``--tag`` values (comma-separated allowed) to a set.
+
+    Returns None when no tags were given. Short-term client-side filter until
+    ``gza incomplete`` learns ``--tag`` natively (tracked by gza-6466).
+    """
+    if not raw_tags:
+        return None
+    tags = {
+        part.strip().lower()
+        for raw in raw_tags
+        for part in str(raw).split(",")
+        if part.strip()
+    }
+    return tags or None
 
 
 def _seq(task_id: str) -> int:
@@ -90,11 +114,9 @@ def _classify(row: dict, project: Path) -> tuple[list[str] | None, str]:
         if _latest_task_is_fix(row, project):
             return None, "leave (latest task is already a fix — won't fix twice in a row)"
         return ["fix", "-b", task_id], "fix"
-    # Lifecycle steps iterate can drive.
-    if action == "resume":
-        return ["iterate", "-b", "--resume", task_id], "iterate --resume"
-    if action in ("create_review", "improve", "create_improve"):
-        return ["iterate", "-b", task_id], f"iterate ({action})"
+    # Lifecycle steps advance can drive (one transition, then watch carries it).
+    if action in ("resume", "create_review", "improve", "create_improve"):
+        return ["advance", task_id, "-y"], f"advance ({action})"
     # GIT_ERROR / needs_rebase / supersedes / awaiting_human / merge → leave it.
     return None, f"leave ({action or 'unknown'})"
 
@@ -106,27 +128,56 @@ def _log(log_path: Path, message: str) -> None:
         fh.write(line + "\n")
 
 
-def _classified_rows(project: Path) -> list[tuple[str, list[str] | None, str, str]]:
-    """Return [(task_id, cmd_or_None, label, reason), ...] for every live row."""
+def _row_matches_tags(row: dict, tag_filters: set[str] | None) -> bool:
+    """Match-ANY (OR) on the lineage-owner tags; True when no filter is set."""
+    if tag_filters is None:
+        return True
+    owner_tags = {str(t).strip().lower() for t in (row.get("tags") or [])}
+    return not owner_tags.isdisjoint(tag_filters)
+
+
+def _classified_rows(
+    project: Path, tag_filters: set[str] | None
+) -> tuple[list[tuple[str, list[str] | None, str, str]], int]:
+    """Return (classified live rows, total live row count before tag filtering).
+
+    The total is every non-dropped incomplete row; the returned list is narrowed
+    to rows matching ``tag_filters`` (match-ANY) when one is given.
+    """
     rc, out, _err = _gza(["incomplete", "--json", "--last", "0"], project)
     if rc != 0:
-        return []
+        return [], 0
     try:
         rows = json.loads(out)
     except json.JSONDecodeError:
-        return []
+        return [], 0
     result: list[tuple[str, list[str] | None, str, str]] = []
+    total = 0
     for row in rows:
         if (row.get("status") or "") == "dropped":
             continue
+        total += 1
+        if not _row_matches_tags(row, tag_filters):
+            continue
         cmd, label = _classify(row, project)
         result.append((row.get("id") or "?", cmd, label, row.get("next_action_reason") or ""))
-    return result
+    return result, total
 
 
-def _run_pass(project: Path, log_path: Path, attempted: set[str], dry_run: bool, batch: int) -> bool:
+def _run_pass(
+    project: Path,
+    log_path: Path,
+    attempted: set[str],
+    dry_run: bool,
+    batch: int,
+    tag_filters: set[str] | None,
+) -> bool:
     """One cycle: log every row's decision, then dispatch up to ``batch`` fresh ones."""
-    rows = _classified_rows(project)
+    rows, total = _classified_rows(project, tag_filters)
+    if tag_filters:
+        _log(log_path, f"found {total} incomplete task(s); {len(rows)} match tag {sorted(tag_filters)}")
+    else:
+        _log(log_path, f"found {total} incomplete task(s)")
 
     actionable: list[tuple[str, list[str], str]] = []
     for task_id, cmd, label, reason in rows:
@@ -162,16 +213,27 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Show decisions; execute nothing")
     parser.add_argument("--project", type=Path, default=REPO_ROOT, help="Project dir to run gza from (default: repo root)")
     parser.add_argument("--log", type=Path, default=Path.home() / "revive-stuck.log", help="Log file path")
+    parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only revive tasks whose lineage-owner tags match (repeatable; comma-separated "
+             "values allowed). Match-ANY. Short-term client-side filter until `gza incomplete "
+             "--tag` lands (gza-6466).",
+    )
     args = parser.parse_args()
 
     project: Path = args.project.resolve()
+    tag_filters = _parse_tags(args.tags)
     _log(args.log, f"── revive-stuck started (interval {args.interval}s, batch {args.batch}, "
-                   f"project {project}, dry_run={args.dry_run})")
+                   f"project {project}, dry_run={args.dry_run}"
+                   + (f", tags={sorted(tag_filters)}" if tag_filters else "") + ")")
 
     attempted: set[str] = set()
     try:
         while True:
-            acted = _run_pass(project, args.log, attempted, args.dry_run, args.batch)
+            acted = _run_pass(project, args.log, attempted, args.dry_run, args.batch, tag_filters)
             if not acted:
                 _log(args.log, "no fresh actionable task this pass; resetting attempted set")
                 attempted.clear()
