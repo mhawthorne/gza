@@ -5052,13 +5052,14 @@ class TestQueueCommand:
         assert styled["Recovery row prompt"] == queue_colors.prompt
 
     def test_format_queue_recovery_lane_detail_themes_needs_attention_fields(self, tmp_path: Path) -> None:
+        from gza.advance_engine import build_needs_attention_entry_for_display
         from gza.cli._recovery_lane import RecoveryLaneEntry
         from gza.colors import QueueColors
         from gza.recovery_engine import FailedRecoveryDecision
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
-        task = store.add("Attention recovery prompt", task_type="plan")
+        task = store.add('Attention recovery prompt with "quote" inside', task_type="plan")
         assert task.id is not None
         decision = FailedRecoveryDecision(
             task_id=task.id,
@@ -5088,10 +5089,11 @@ class TestQueueCommand:
             rendered = watch_cli._format_queue_recovery_lane_detail(entry)
 
         assert isinstance(rendered, Text)
+        display = build_needs_attention_entry_for_display(task, action=entry.attention_action)
         styled = _styled_substrings(rendered)
         assert styled[str(task.id)] == queue_colors.task_id
         assert styled[task.task_type] == queue_colors.task_type
-        assert styled["Attention recovery prompt"] == queue_colors.prompt
+        assert styled[display.text[display.prompt_start:display.prompt_end]] == queue_colors.prompt
 
     def test_next_tag_filters_pending_and_blocked_counts(self, tmp_path: Path):
         setup_config(tmp_path)

@@ -212,6 +212,15 @@ class OffTopicVerifyClearanceCandidate:
 
 
 @dataclass(frozen=True)
+class NeedsAttentionDisplayEntry:
+    """Rendered needs-attention display text plus known field boundaries."""
+
+    text: str
+    prompt_start: int
+    prompt_end: int
+
+
+@dataclass(frozen=True)
 class AdvanceContext:
     """Resolved task state used by advance rules."""
 
@@ -2614,11 +2623,34 @@ def format_needs_attention_entry_for_display(
     suffix: int = 0,
 ) -> str:
     """Render a needs-attention line with the shared single-line short prompt."""
+    return build_needs_attention_entry_for_display(
+        task,
+        action=action,
+        prefix=prefix,
+        suffix=suffix,
+    ).text
+
+
+def build_needs_attention_entry_for_display(
+    task: DbTask,
+    *,
+    action: Mapping[str, Any],
+    prefix: int = 0,
+    suffix: int = 0,
+) -> NeedsAttentionDisplayEntry:
+    """Render a needs-attention line plus the displayed prompt boundaries."""
     prompt = shorten_prompt(
         task.prompt or "",
         prompt_available_width(prefix=prefix, suffix=suffix),
     )
-    return format_needs_attention_entry(task, prompt=prompt, action=action)
+    task_id = task.id or "unknown"
+    task_type = task.task_type or "task"
+    prompt_start = len(f'{task_id} {task_type} "')
+    return NeedsAttentionDisplayEntry(
+        text=format_needs_attention_entry(task, prompt=prompt, action=action),
+        prompt_start=prompt_start,
+        prompt_end=prompt_start + len(prompt),
+    )
 
 
 def format_needs_attention_lifecycle(action: Mapping[str, Any]) -> str:

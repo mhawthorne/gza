@@ -138,6 +138,7 @@ from ._queue_render import (
 from ._recovery_lane import RecoveryLaneEntry, collect_recovery_lane_entries
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
+    build_needs_attention_entry_for_display,
     classify_advance_action,
     determine_next_action,
     failed_recovery_decision_to_action,
@@ -5559,19 +5560,13 @@ def _format_queue_recovery_lane_detail(entry: RecoveryLaneEntry) -> Text:
     task_type = task.task_type or "task"
 
     if entry.attention_action is not None:
-        rendered = Text(
-            format_needs_attention_entry_for_display(task, action=entry.attention_action)
-        )
-        task_type_start = rendered.plain.find(task_type, len(task_id) + 1)
-        if rendered.plain.startswith(task_id):
-            rendered.stylize(colors.task_id, 0, len(task_id))
-        if task_type_start != -1:
-            rendered.stylize(colors.task_type, task_type_start, task_type_start + len(task_type))
-        prompt_start = rendered.plain.find('"', task_type_start + len(task_type))
-        if prompt_start != -1:
-            prompt_end = rendered.plain.find('"', prompt_start + 1)
-            if prompt_end > prompt_start + 1:
-                rendered.stylize(colors.prompt, prompt_start + 1, prompt_end)
+        display = build_needs_attention_entry_for_display(task, action=entry.attention_action)
+        rendered = Text(display.text)
+        task_type_start = len(task_id) + 1
+        rendered.stylize(colors.task_id, 0, len(task_id))
+        rendered.stylize(colors.task_type, task_type_start, task_type_start + len(task_type))
+        if display.prompt_end > display.prompt_start:
+            rendered.stylize(colors.prompt, display.prompt_start, display.prompt_end)
         return rendered
 
     decision = entry.decision

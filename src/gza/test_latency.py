@@ -399,6 +399,10 @@ def main(argv: list[str] | None = None) -> int:
         pytest_args,
         emit_sigterm_summary=args.summary,
     )
+    if args.summary and exit_code != 0 and test_durations:
+        report = build_report(test_durations, total_wall_time_seconds, _current_timestamp())
+        sys.stderr.write(render_summary(report) + "\n")
+        sys.stderr.flush()
     if exit_code != 0:
         return exit_code
     report = build_report(test_durations, total_wall_time_seconds, _current_timestamp())
