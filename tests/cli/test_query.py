@@ -5679,6 +5679,129 @@ class TestShowCommand:
         assert content_result.returncode == 0
         assert content_result.stdout == "exact output"
 
+    def test_artifact_command_preserves_crlf_and_carriage_return_bytes(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with carriage-return artifact output", task_type="review")
+        store.update(task)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="line one\r\nprogress 10%\rprogress 100%\r\nline two",
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        expected_bytes = (tmp_path / stored.path).read_bytes()
+
+        content_result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
+
+        assert content_result.returncode == 0
+        assert content_result.stdout.encode("utf-8") == expected_bytes
+
+    def test_artifact_command_filters_by_kind_and_returns_latest_match(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task with mixed artifact kinds", task_type="review")
+        store.update(task)
+        config = Config.load(tmp_path)
+        store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="older verify output\n",
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="build_output",
+            producer="review_verify",
+            label="build",
+            output="newest build output\n",
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+        latest_verify = store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="latest verify output\n",
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+
+        content_result = invoke_gza(
+            "artifact",
+            str(task.id),
+            "--kind",
+            "verify_command_output",
+            "--project",
+            str(tmp_path),
+        )
+        path_result = invoke_gza(
+            "artifact",
+            str(task.id),
+            "--kind",
+            "verify_command_output",
+            "--path",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert content_result.returncode == 0
+        assert content_result.stdout == "latest verify output\n"
+        assert path_result.returncode == 0
+        assert path_result.stdout.strip() == str(tmp_path / latest_verify.path)
+
+    def test_artifact_command_errors_when_task_has_no_artifacts(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task without artifacts", task_type="review")
+        store.update(task)
+
+        result = invoke_gza("artifact", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert f"Task {task.id} has no artifacts" in result.stdout
+
+    def test_artifact_command_errors_when_no_matching_artifact_kind_exists(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Task without matching artifacts", task_type="review")
+        store.update(task)
+        config = Config.load(tmp_path)
+        store_command_output_artifact(
+            store,
+            task,
+            config,
+            kind="build_output",
+            producer="review_verify",
+            label="build",
+            output="build output\n",
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+
+        result = invoke_gza(
+            "artifact",
+            str(task.id),
+            "--kind",
+            "verify_command_output",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert f"Task {task.id} has no artifacts of kind verify_command_output" in result.stdout
+
     def test_artifact_command_does_not_fall_back_to_older_content_when_latest_row_is_metadata_only(
         self, tmp_path: Path
     ) -> None:

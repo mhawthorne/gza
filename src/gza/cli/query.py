@@ -4173,11 +4173,22 @@ def cmd_artifact(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        sys.stdout.write(resolved.path.read_text(encoding="utf-8"))
+        _write_stdout_bytes(resolved.path.read_bytes())
     except OSError as exc:
         console.print(f"[red]Error: Failed to read artifact {resolved.artifact.id}: {exc}[/red]")
         return 1
     return 0
+
+
+def _write_stdout_bytes(payload: bytes) -> None:
+    """Write artifact content without text-mode newline normalization."""
+    stdout_buffer = getattr(sys.stdout, "buffer", None)
+    if stdout_buffer is not None:
+        stdout_buffer.write(payload)
+        stdout_buffer.flush()
+        return
+
+    sys.stdout.write(payload.decode("utf-8", errors="replace"))
 
 
 def _show_incompatible_flags(args: argparse.Namespace) -> list[str]:
