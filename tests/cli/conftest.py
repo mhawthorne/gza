@@ -73,7 +73,6 @@ def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
         f"project_name: {project_name}\n"
         f"worktree_dir: {worktree_dir}\n"
         f"db_path: {db_path}\n"
-        "quiet_period_seconds: 0\n"
     )
 
 

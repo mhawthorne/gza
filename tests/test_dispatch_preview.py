@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from gza import recovery_engine
-from gza.config import Config
 from gza.dispatch_preview import build_dispatch_preview, plan_watch_dispatch_entries
 from gza.pickup import get_runnable_pending_tasks
+
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -163,49 +163,6 @@ def test_build_dispatch_preview_recovery_first_explicit_filters_pending_to_expli
         ordered_one.id,
         ordered_two.id,
     ]
-
-
-def test_build_dispatch_preview_filters_quiet_pending_but_keeps_exempt_tasks(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    config_path = tmp_path / "gza.yaml"
-    config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
-    config = Config.load(tmp_path)
-    store = make_store(tmp_path)
-
-    quiet = store.add("Fresh quiet pending", task_type="plan")
-    expired = store.add("Expired pending", task_type="plan")
-    urgent = store.add("Urgent fresh pending", task_type="plan", urgent=True)
-    explicit = store.add("Explicit fresh pending", task_type="plan")
-    assert quiet.id is not None
-    assert expired.id is not None
-    assert urgent.id is not None
-    assert explicit.id is not None
-
-    now = datetime.now(UTC)
-    quiet.last_edited_at = now - timedelta(seconds=30)
-    expired.last_edited_at = now - timedelta(seconds=300)
-    urgent.last_edited_at = now - timedelta(seconds=30)
-    explicit.last_edited_at = now - timedelta(seconds=30)
-    store.update(quiet)
-    store.update(expired)
-    store.update(urgent)
-    store.update(explicit)
-    store.set_queue_position(explicit.id, 1)
-
-    preview = build_dispatch_preview(
-        store,
-        config=config,
-        tags=None,
-        any_tag=False,
-        max_recovery_attempts=1,
-        include_recovery=False,
-    )
-
-    pending_ids = [entry.task.id for entry in preview.pending_entries]
-    assert quiet.id not in pending_ids
-    assert explicit.id in pending_ids
-    assert urgent.id in pending_ids
-    assert expired.id in pending_ids
 
 
 def test_plan_watch_dispatch_entries_caps_worker_recovery_and_preserves_preview_order(

@@ -1816,50 +1816,89 @@ def _known_container_git_root_marker(value: str) -> str | None:
     return "/gza-git" if "/gza-git" in value else None
 
 
+def _current_worktree_admin_dir(git: "Git") -> Path | None:
+    """Return the linked-worktree admin dir for ``git.repo_dir``, when present."""
+    git_path = git.repo_dir / ".git"
+    if not git_path.is_file():
+        return None
+    try:
+        git_file = git_path.read_text().strip()
+    except OSError:
+        return None
+    prefix = "gitdir: "
+    if not git_file.startswith(prefix):
+        return None
+    raw_path = git_file[len(prefix):].strip()
+    if not raw_path:
+        return None
+    admin_dir = Path(raw_path)
+    if not admin_dir.is_absolute():
+        admin_dir = (git.repo_dir / admin_dir).resolve(strict=False)
+    else:
+        admin_dir = admin_dir.resolve(strict=False)
+    return admin_dir
+
+
+def _scan_worktree_admin_registration_dir(registration_dir: Path) -> list[WorktreeAdminMetadataIssue]:
+    """Inspect one worktree admin registration directory for container-only paths."""
+    registration_name = registration_dir.name
+    issues: list[WorktreeAdminMetadataIssue] = []
+    for admin_file, expected_value in (("commondir", "../.."), ("gitdir", None)):
+        admin_path = registration_dir / admin_file
+        value = _read_worktree_admin_file(admin_path)
+        if value is None:
+            continue
+        marker = _known_container_git_root_marker(value)
+        if marker is None:
+            continue
+        if admin_file == "commondir":
+            problem = "containerized-commondir"
+            details = (
+                f"{admin_path} contains container-only path '{value}'; "
+                "host commondir metadata should stay relative to the canonical repository."
+            )
+        else:
+            problem = "containerized-gitdir"
+            details = (
+                f"{admin_path} contains container-only path '{value}'; "
+                "host gitdir metadata must not point at container-only mounts."
+            )
+        issues.append(
+            WorktreeAdminMetadataIssue(
+                registration_name=registration_name,
+                admin_file=admin_file,
+                admin_path=admin_path,
+                value=value,
+                problem=problem,
+                details=details,
+                expected_value=expected_value,
+                suspected_container_path_marker=marker,
+            )
+        )
+    return issues
+
+
 def validate_host_worktree_admin_metadata(git: "Git") -> WorktreeAdminMetadataValidation:
     """Inspect shared ``.git/worktrees`` admin files for host-invalid metadata."""
-    common_dir = _git_common_dir(git)
+    try:
+        common_dir = _git_common_dir(git)
+    except GitError:
+        common_dir = (git.repo_dir / ".git").resolve(strict=False)
     worktrees_dir = common_dir / "worktrees"
-    if not worktrees_dir.is_dir():
-        return WorktreeAdminMetadataValidation(common_dir=common_dir, issues=())
-
     issues: list[WorktreeAdminMetadataIssue] = []
-    for registration_dir in sorted(worktrees_dir.iterdir()):
-        if not registration_dir.is_dir():
-            continue
-        registration_name = registration_dir.name
-        for admin_file, expected_value in (("commondir", "../.."), ("gitdir", None)):
-            admin_path = registration_dir / admin_file
-            value = _read_worktree_admin_file(admin_path)
-            if value is None:
+    scanned_dirs: set[Path] = set()
+    if worktrees_dir.is_dir():
+        for registration_dir in sorted(worktrees_dir.iterdir()):
+            if not registration_dir.is_dir():
                 continue
-            marker = _known_container_git_root_marker(value)
-            if marker is None:
-                continue
-            if admin_file == "commondir":
-                problem = "containerized-commondir"
-                details = (
-                    f"{admin_path} contains container-only path '{value}'; "
-                    "host commondir metadata should stay relative to the canonical repository."
-                )
-            else:
-                problem = "containerized-gitdir"
-                details = (
-                    f"{admin_path} contains container-only path '{value}'; "
-                    "host gitdir metadata must not point at container-only mounts."
-                )
-            issues.append(
-                WorktreeAdminMetadataIssue(
-                    registration_name=registration_name,
-                    admin_file=admin_file,
-                    admin_path=admin_path,
-                    value=value,
-                    problem=problem,
-                    details=details,
-                    expected_value=expected_value,
-                    suspected_container_path_marker=marker,
-                )
-            )
+            scanned_dirs.add(registration_dir.resolve(strict=False))
+            issues.extend(_scan_worktree_admin_registration_dir(registration_dir))
+
+    current_admin_dir = _current_worktree_admin_dir(git)
+    if current_admin_dir is not None:
+        resolved_admin_dir = current_admin_dir.resolve(strict=False)
+        if resolved_admin_dir not in scanned_dirs:
+            issues.extend(_scan_worktree_admin_registration_dir(current_admin_dir))
 
     return WorktreeAdminMetadataValidation(common_dir=common_dir, issues=tuple(issues))
 

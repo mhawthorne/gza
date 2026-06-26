@@ -374,16 +374,6 @@ def _canonicalize_db_timestamp_text(value: str | None) -> str | None:
     return _format_db_timestamp(parsed)
 
 
-def _coerce_quiet_seconds(value: object) -> int:
-    """Normalize optional quiet-period inputs; invalid values disable the filter."""
-    if value is None:
-        return 0
-    try:
-        return int(cast(Any, value))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _normalize_db_comparable_value(column: str, value: object) -> object:
     """Normalize DB values before equality checks that include timestamp text."""
     if column in _DB_TIMESTAMP_COLUMN_NAMES:
@@ -3773,22 +3763,6 @@ class SqliteTaskStore:
         order_parts.append(f"{created_at} ASC")
         return ", ".join(order_parts)
 
-    def _quiet_period_filter_sql(self, alias: str = "t") -> str:
-        """Return the quiet-period pickup filter for schemas that can evaluate it."""
-        required_columns = ("created_at", "last_edited_at", "recovery_origin", "urgent", "queue_position")
-        if not all(self._query_only_has_column("tasks", column) for column in required_columns):
-            return ""
-        return (
-            "NOT ("
-            ":quiet_seconds > 0 "
-            f"AND COALESCE({alias}.recovery_origin, '') NOT IN ('retry', 'resume') "
-            f"AND COALESCE({alias}.urgent, 0) = 0 "
-            f"AND {alias}.queue_position IS NULL "
-            f"AND (julianday(:now) - julianday(COALESCE({alias}.last_edited_at, {alias}.created_at))) "
-            "* 86400.0 < :quiet_seconds"
-            ")"
-        )
-
     def _ensure_project_row(self) -> None:
         """Ensure the current project is registered in the shared DB."""
         now = _format_db_timestamp(datetime.now(UTC))
@@ -4499,7 +4473,6 @@ class SqliteTaskStore:
         *,
         tags: Iterable[str] | None = None,
         any_tag: bool = False,
-        quiet_seconds: int = 0,
     ) -> Task | None:
         """Get the next pending task (oldest first), skipping blocked tasks.
 
@@ -4507,13 +4480,7 @@ class SqliteTaskStore:
         dependency is failed but a completed retry exists anywhere in the
         based_on chain.
         """
-        pending = self.get_pending_pickup(
-            limit=1,
-            group=group,
-            tags=tags,
-            any_tag=any_tag,
-            quiet_seconds=quiet_seconds,
-        )
+        pending = self.get_pending_pickup(limit=1, group=group, tags=tags, any_tag=any_tag)
         return pending[0] if pending else None
 
     def get_pending_pickup(
@@ -4523,7 +4490,6 @@ class SqliteTaskStore:
         *,
         tags: Iterable[str] | None = None,
         any_tag: bool = False,
-        quiet_seconds: int = 0,
     ) -> list[Task]:
         """Get runnable pending tasks in pickup order.
 
@@ -4536,46 +4502,36 @@ class SqliteTaskStore:
         if not normalized_tags and group is not None:
             normalized_tags = _normalize_tags((group,))
         with self._connect() as conn:
-            quiet_filter = self._quiet_period_filter_sql("t")
             query = """
                 SELECT t.* FROM tasks t
-                WHERE t.project_id = :project_id
+                WHERE t.project_id = ?
                 AND t.status = 'pending'
                 AND t.task_type != 'internal'
                 ORDER BY
                     {order_by}
                 """
-            now_text = _format_db_timestamp(datetime.now(UTC))
-            assert now_text is not None
-            params: dict[str, str | int | None] = {
-                "project_id": self._project_id,
-                "now": now_text,
-                "quiet_seconds": _coerce_quiet_seconds(quiet_seconds),
-            }
-            if quiet_filter:
-                query = query.replace("ORDER BY", f"AND {quiet_filter}\nORDER BY", 1)
+            params: list[str | int | None] = [self._project_id]
             query = query.format(order_by=self._task_pickup_order_sql("t"))
             if normalized_tags:
                 if not self._query_only_supports_tags():
                     return []
-                tag_params = {f"tag_{idx}": tag for idx, tag in enumerate(normalized_tags)}
-                placeholders = ",".join(f":{name}" for name in tag_params)
-                params.update(tag_params)
+                placeholders = ",".join("?" for _ in normalized_tags)
                 if any_tag:
                     query = query.replace(
                         "ORDER BY",
                         f"AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders}))\nORDER BY",
                         1,
                     )
+                    params.extend(normalized_tags)
                 else:
                     query = query.replace(
                         "ORDER BY",
                         f"AND (SELECT COUNT(DISTINCT tt.tag) FROM task_tags tt WHERE tt.project_id = t.project_id AND tt.task_id = t.id AND tt.tag IN ({placeholders})) = ?\nORDER BY",
                         1,
                     )
-                    params["tag_count"] = len(normalized_tags)
-                    query = query.replace("= ?\nORDER BY", "= :tag_count\nORDER BY", 1)
-            cur = conn.execute(query, params)
+                    params.extend(normalized_tags)
+                    params.append(len(normalized_tags))
+            cur = conn.execute(query, tuple(params))
             candidates = self._rows_to_tasks(conn, cur.fetchall())
 
         runnable: list[Task] = []

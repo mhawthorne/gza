@@ -150,7 +150,6 @@ def build_dispatch_preview(
             any_tag=any_tag,
             selection_mode=selection_mode,
             pending_limit=pending_limit,
-            quiet_seconds=int(getattr(config, "quiet_period_seconds", 0) or 0) if config is not None else 0,
         )
 
     return DispatchPreview(
@@ -369,11 +368,8 @@ def _build_pending_preview_entries(
     any_tag: bool,
     selection_mode: DispatchSelectionMode,
     pending_limit: int | None,
-    quiet_seconds: int = 0,
 ) -> tuple[DispatchPreviewEntry, ...]:
-    pending_tasks = list(
-        get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag, quiet_seconds=quiet_seconds)
-    )
+    pending_tasks = list(get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag))
     if selection_mode == "recovery_first_explicit":
         pending_tasks = [task for task in pending_tasks if task.queue_position is not None]
     if pending_limit is not None:

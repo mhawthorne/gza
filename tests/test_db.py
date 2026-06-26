@@ -1022,45 +1022,6 @@ class TestTaskChaining:
         assert blocked.id not in pickup_ids
         assert all(task.task_type != "internal" for task in pickup)
 
-    def test_get_pending_pickup_respects_quiet_period_and_exemptions(self, tmp_path: Path):
-        """Pickup listing excludes quiet-held tasks while preserving bypass signals."""
-        db_path = tmp_path / "test.db"
-        store = SqliteTaskStore(db_path)
-
-        quiet = store.add("Fresh quiet pending")
-        expired = store.add("Expired quiet pending")
-        urgent = store.add("Urgent fresh pending", urgent=True)
-        explicit = store.add("Explicit fresh pending")
-        disabled = store.add("Disabled quiet pending")
-        assert quiet.id is not None
-        assert expired.id is not None
-        assert urgent.id is not None
-        assert explicit.id is not None
-        assert disabled.id is not None
-
-        now = datetime.now(UTC)
-        quiet.last_edited_at = now - timedelta(seconds=30)
-        expired.last_edited_at = now - timedelta(seconds=300)
-        urgent.last_edited_at = now - timedelta(seconds=30)
-        explicit.last_edited_at = now - timedelta(seconds=30)
-        disabled.last_edited_at = now - timedelta(seconds=30)
-        store.update(quiet)
-        store.update(expired)
-        store.update(urgent)
-        store.update(explicit)
-        store.update(disabled)
-        store.set_queue_position(explicit.id, 1)
-
-        quiet_filtered_ids = {task.id for task in store.get_pending_pickup(quiet_seconds=300)}
-        disabled_ids = {task.id for task in store.get_pending_pickup(quiet_seconds=0)}
-
-        assert quiet.id not in quiet_filtered_ids
-        assert expired.id in quiet_filtered_ids
-        assert urgent.id in quiet_filtered_ids
-        assert explicit.id in quiet_filtered_ids
-        assert disabled.id not in quiet_filtered_ids
-        assert quiet.id in disabled_ids
-
     def test_get_pending_pickup_includes_pending_retry_child_of_failed_parent(self, tmp_path: Path):
         """Queued retry children of failed parents must remain visible to normal pickup."""
         db_path = tmp_path / "test.db"

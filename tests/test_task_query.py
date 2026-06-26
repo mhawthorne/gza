@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 import gza.recovery_engine as recovery_engine
-from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -24,7 +23,6 @@ from gza.task_query import (
     TaskQuery,
     TaskQueryPresets,
     TaskQueryService,
-    TaskRow,
     collect_scoped_tag_scope_gaps,
     task_matches_tag_filters,
 )
@@ -1682,64 +1680,6 @@ def test_queue_listing_preset_includes_blocked_tasks_after_runnable_rows(tmp_pat
 
     assert prompts == ["Runnable task", "Blocking task", "Blocked task"]
     assert blocked_flags == [False, False, True]
-
-
-def test_queue_listing_projects_quiet_fields_from_shared_projection(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    quiet = store.add("Fresh quiet task")
-    runnable = store.add("Older runnable task")
-    assert quiet.id is not None
-    assert runnable.id is not None
-    quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
-    runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
-    store.update(quiet)
-    store.update(runnable)
-
-    service = TaskQueryService(store)
-    result = service.run(
-        TaskQueryPresets.queue_listing(limit=None),
-        config=SimpleNamespace(quiet_period_seconds=300),
-    )
-    rows = [row for row in result.rows if isinstance(row, TaskRow)]
-    quiet_row = next(row for row in rows if row.task.id == quiet.id)
-    runnable_row = next(row for row in rows if row.task.id == runnable.id)
-
-    assert quiet_row.values["quiet"] is True
-    assert quiet_row.values["quiet_available_at"] == quiet.last_edited_at + timedelta(seconds=300)
-    assert runnable_row.values["quiet"] is False
-    assert runnable_row.values["quiet_available_at"] is None
-
-    payload = result.to_json()
-    quiet_json = next(row for row in payload if row["id"] == quiet.id)
-    assert quiet_json["quiet"] is True
-    assert quiet_json["quiet_available_at"] == quiet.last_edited_at + timedelta(seconds=300)
-
-
-def test_partition_queue_rows_keeps_blocked_quiet_tasks_in_blocked_lane(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    blocker = store.add("Blocking dependency")
-    blocked_quiet = store.add("Blocked and fresh quiet task", depends_on=blocker.id)
-    runnable = store.add("Runnable task")
-    assert blocker.id is not None
-    assert blocked_quiet.id is not None
-    assert runnable.id is not None
-    blocked_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
-    runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
-    store.update(blocked_quiet)
-    store.update(runnable)
-
-    service = TaskQueryService(store)
-    result = service.run(
-        TaskQueryPresets.queue_listing(limit=None),
-        config=SimpleNamespace(quiet_period_seconds=300),
-    )
-    rows = [row for row in result.rows if isinstance(row, TaskRow)]
-
-    runnable_rows, quiet_rows, blocked_rows = partition_queue_rows(rows)
-
-    assert blocked_quiet.id in {row.task.id for row in blocked_rows}
-    assert blocked_quiet.id not in {row.task.id for row in quiet_rows}
-    assert runnable.id in {row.task.id for row in runnable_rows}
 
 
 def test_task_matches_tag_filters_use_or_by_default_and_and_with_all_tags() -> None:

@@ -194,7 +194,6 @@ class _RejectedLegacyFlagAction(argparse.Action):
 
 
 HIDDEN_COMMANDS: set[str] = set()
-TASK_NO_DOCKER_HELP = "Run Claude directly instead of in Docker for background or immediate runs"
 
 
 def add_hidden_parser(subparsers, name: str, **kwargs):
@@ -2084,7 +2083,7 @@ def main() -> int:
     retry_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker",
     )
     add_execution_mode_args(retry_parser)
     retry_parser.add_argument(
@@ -2157,7 +2156,7 @@ def main() -> int:
     improve_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     improve_parser.add_argument(
         "--max-turns",
@@ -2201,7 +2200,7 @@ def main() -> int:
     fix_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     fix_parser.add_argument(
         "--max-turns",
@@ -2394,7 +2393,7 @@ def main() -> int:
     implement_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     implement_parser.add_argument(
         "--max-turns",
@@ -2439,7 +2438,7 @@ def main() -> int:
     plan_review_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     plan_review_parser.add_argument(
         "--max-turns",
@@ -2478,7 +2477,7 @@ def main() -> int:
     plan_improve_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     plan_improve_parser.add_argument(
         "--max-turns",
@@ -2605,7 +2604,7 @@ def main() -> int:
     extract_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only with --background or when running immediately)",
     )
     extract_parser.add_argument(
         "--max-turns",
@@ -2634,7 +2633,7 @@ def main() -> int:
     review_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help=TASK_NO_DOCKER_HELP,
+        help="Run Claude directly instead of in Docker (only used with --background or when running immediately)",
     )
     review_parser.add_argument(
         "--no-pr",

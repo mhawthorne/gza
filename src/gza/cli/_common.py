@@ -1994,11 +1994,7 @@ def _spawn_background_worker(
             _print_background_phase1_error("Cannot resume without specifying a task ID")
             return 1
         # Select a candidate for UX; actual claim happens in the child runner.
-        selected_task = store.get_next_pending(
-            tags=selected_tags,
-            any_tag=any_tag,
-            quiet_seconds=config.quiet_period_seconds,
-        )
+        selected_task = store.get_next_pending(tags=selected_tags, any_tag=any_tag)
         if not selected_task:
             if selected_tags:
                 _print_work_message(
@@ -2727,12 +2723,7 @@ def _spawn_background_workers(
         return 1 if had_error else 0
 
     if selected_tags:
-        pending_tasks = store.get_pending_pickup(
-            limit=count,
-            tags=selected_tags,
-            any_tag=any_tag,
-            quiet_seconds=config.quiet_period_seconds,
-        )
+        pending_tasks = store.get_pending_pickup(limit=count, tags=selected_tags, any_tag=any_tag)
         if not pending_tasks:
             print(format_no_runnable_message_for_tags(store, selected_tags, any_tag=any_tag))
             return 0
@@ -2753,7 +2744,7 @@ def _spawn_background_workers(
             )
         return 1 if had_error else 0
 
-    pending_tasks = store.get_pending_pickup(limit=count, quiet_seconds=config.quiet_period_seconds)
+    pending_tasks = store.get_pending_pickup(limit=count)
     if not pending_tasks:
         print("No pending tasks found")
         return 0

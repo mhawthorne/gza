@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 from rich.text import Text
 
@@ -11,7 +10,6 @@ import gza.colors as _colors
 
 from ..console import prompt_available_width, shorten_prompt
 from ..db import Task as DbTask
-from ..task_query import TaskRow
 
 
 @dataclass(frozen=True)
@@ -22,7 +20,6 @@ class QueueRenderRow:
     position_text: str
     blocked: bool = False
     blocked_by_text: str | None = None
-    quiet_available_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,9 +81,7 @@ def build_queue_row_renderables(
         extras.append(("[urgent]", colors.urgent))
     if task.queue_position is not None:
         extras.append((f"[#{task.queue_position}]", colors.explicit_position))
-    if row.quiet_available_text:
-        extras.append((f"held until {row.quiet_available_text}", colors.blocked_by))
-    if row.blocked_by_text:
+    if row.blocked and row.blocked_by_text:
         extras.append((row.blocked_by_text, colors.blocked_by))
 
     if not extras:
@@ -109,28 +104,6 @@ def build_blocked_count_summary(count: int) -> Text:
     """Return a themed blocked-count summary for `gza next`."""
     plural = "tasks" if count != 1 else "task"
     return Text(f"({count} {plural} blocked by dependencies)", style=_colors.QUEUE_COLORS.blocked_by)
-
-
-def format_quiet_available_at(value: object) -> str | None:
-    """Return a stable UTC label for quiet-lane hold-until timestamps."""
-    if not isinstance(value, datetime):
-        return None
-    return value.astimezone(UTC).strftime("%H:%M UTC")
-
-
-def partition_queue_rows(rows: list[TaskRow]) -> tuple[list[TaskRow], list[TaskRow], list[TaskRow]]:
-    """Split queue-listing rows into runnable, quiet, and dependency-blocked lanes."""
-    runnable_rows: list[TaskRow] = []
-    quiet_rows: list[TaskRow] = []
-    blocked_rows: list[TaskRow] = []
-    for row in rows:
-        if bool(row.values.get("blocked")):
-            blocked_rows.append(row)
-        elif bool(row.values.get("quiet")):
-            quiet_rows.append(row)
-        else:
-            runnable_rows.append(row)
-    return runnable_rows, quiet_rows, blocked_rows
 
 
 def print_queue_rows(

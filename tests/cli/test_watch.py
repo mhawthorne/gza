@@ -1659,12 +1659,7 @@ def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next
 
 def test_watch_cycle_default_mode_non_actionable_failed_row_starts_pending(tmp_path: Path) -> None:
     """Plain watch should move on to pending work when the scoped failed row is not auto-recoverable."""
-    (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "db_path: .gza/gza.db\n"
-        "max_resume_attempts: 0\n"
-        "quiet_period_seconds: 0\n"
-    )
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 0\n")
     store = make_store(tmp_path)
 
     root = store.add("Failed root", task_type="implement", tags=("backlog",))
@@ -5818,7 +5813,6 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
         "main_checkout_isolate: true\n"
-        "quiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -11287,7 +11281,6 @@ def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tm
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
         "main_checkout_isolate: true\n"
-        "quiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -17845,174 +17838,6 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     assert text.count("  gza-1 review still needs manual attention") == 1
 
 
-def test_watch_cycle_logs_one_quiet_skip_per_stable_hold_window(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    config_path = tmp_path / "gza.yaml"
-    config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
-    store = make_store(tmp_path)
-    config = Config.load(tmp_path)
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-
-    older_quiet = store.add("Older quiet task", task_type="implement")
-    newer_quiet = store.add("Newer quiet task", task_type="implement")
-    assert older_quiet.id is not None
-    assert newer_quiet.id is not None
-    older_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=45)
-    newer_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
-    store.update(older_quiet)
-    store.update(newer_quiet)
-
-    with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
-        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
-        patch("gza.cli.watch._spawn_background_iterate") as spawn_iterate,
-        patch("gza.cli.watch._spawn_background_worker") as spawn_worker,
-        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
-        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
-        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
-    ):
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
-
-    quiet_skip_lines = [line for line in log_path.read_text().splitlines() if "held by quiet period" in line]
-    assert len(quiet_skip_lines) == 1
-    assert older_quiet.id in quiet_skip_lines[0]
-    assert newer_quiet.id not in quiet_skip_lines[0]
-    assert "START" not in log_path.read_text()
-    spawn_iterate.assert_not_called()
-    spawn_worker.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "expired",
-        "urgent",
-        "explicit_position",
-    ],
-)
-def test_watch_cycle_dispatches_expired_or_quiet_exempt_pending_task(tmp_path: Path, case: str) -> None:
-    setup_config(tmp_path)
-    config_path = tmp_path / "gza.yaml"
-    config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
-    store = make_store(tmp_path)
-    config = Config.load(tmp_path)
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-
-    task = store.add("Dispatchable quiet-period case", task_type="plan", urgent=(case == "urgent"))
-    assert task.id is not None
-    task.last_edited_at = (
-        datetime.now(UTC) - timedelta(seconds=300)
-        if case == "expired"
-        else datetime.now(UTC) - timedelta(seconds=30)
-    )
-    store.update(task)
-    if case == "explicit_position":
-        store.set_queue_position(task.id, 1)
-
-    with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
-        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
-        patch("gza.cli.watch._spawn_background_iterate") as spawn_iterate,
-        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
-        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
-        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
-    ):
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
-
-    log_text = log_path.read_text()
-    assert "held by quiet period" not in log_text
-    assert any(line.split(maxsplit=2)[1] == "START" and task.id in line for line in log_text.splitlines())
-    spawn_worker.assert_called_once()
-    spawn_iterate.assert_not_called()
-
-
-def test_watch_cycle_reemits_quiet_skip_after_edit_moves_hold_window(tmp_path: Path) -> None:
-    setup_config(tmp_path)
-    config_path = tmp_path / "gza.yaml"
-    config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
-    store = make_store(tmp_path)
-    config = Config.load(tmp_path)
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-
-    quiet_task = store.add("Quiet task with moving hold window", task_type="implement")
-    assert quiet_task.id is not None
-    quiet_task.last_edited_at = datetime.now(UTC) - timedelta(seconds=295)
-    store.update(quiet_task)
-
-    with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
-        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
-        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
-        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
-        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
-        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
-    ):
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
-        first_lines = [line for line in log_path.read_text().splitlines() if "held by quiet period" in line]
-        assert len(first_lines) == 1
-
-        updated_task = store.get(quiet_task.id)
-        assert updated_task is not None
-        updated_task.last_edited_at = datetime.now(UTC) - timedelta(seconds=30)
-        store.update(updated_task)
-
-        _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
-
-    quiet_skip_lines = [line for line in log_path.read_text().splitlines() if "held by quiet period" in line]
-    assert len(quiet_skip_lines) == 2
-    assert all(quiet_task.id in line for line in quiet_skip_lines)
-    assert quiet_skip_lines[0] != quiet_skip_lines[1]
-
-
 def test_installed_gza_package_fingerprint_changes_only_when_python_source_changes(tmp_path: Path) -> None:
     """Package fingerprint should ignore mtimes and change when Python contents change."""
     package_root = tmp_path / "gza"
@@ -22030,7 +21855,6 @@ def test_cmd_watch_holds_until_docker_returns_then_resumes(tmp_path: Path) -> No
         f"worktree_dir: {worktree_dir}\n"
         "use_docker: true\n"
         "docker_startup_timeout: 1\n"
-        "quiet_period_seconds: 0\n"
         "watch:\n"
         "  failure_backoff_initial: 60\n"
         "  failure_backoff_max: 240\n"

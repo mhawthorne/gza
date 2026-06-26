@@ -94,15 +94,17 @@ def test_full_config_example_groups_quiet_period_seconds_under_storage() -> None
     assert not other_header or quiet_key not in other_section
 
 
-def test_config_examples_describe_quiet_period_as_display_only() -> None:
-    """Generated examples should describe the quiet lane without claiming pickup gating."""
+def test_config_examples_describe_quiet_period_as_upcoming_only() -> None:
+    """Generated examples must not claim quiet-period enforcement before runtime support exists."""
     rendered = render_config_example()
     rendered_local = render_config_example(local=True)
 
-    assert "Quiet lane of `gza queue` / `gza next`" in rendered
-    assert "worker pickup" in rendered
-    assert "Quiet lane of `gza queue` / `gza next`" in rendered_local
-    assert "worker pickup" in rendered_local
+    expected_fragment = (
+        "current releases expose the setting only and do not yet hold tasks from execution"
+    )
+
+    assert expected_fragment in rendered
+    assert expected_fragment in rendered_local
 
 
 def test_full_config_example_groups_review_verify_timeout_grace_under_review() -> None:

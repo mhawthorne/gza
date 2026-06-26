@@ -71,6 +71,52 @@ def _mark_task_running(store, task_id: str) -> None:
     store.update(task)
 
 
+def _setup_linked_worktree_watch_project(tmp_path: Path) -> tuple[object, Path, Path]:
+    """Create a temp project that runs from a real linked git worktree."""
+    canonical_repo = tmp_path / "canonical"
+    canonical_repo.mkdir()
+    git = init_basic_repo(canonical_repo)
+
+    git._run("checkout", "-b", "feature/watch-health-linked")
+    (canonical_repo / "feature.txt").write_text("linked worktree fixture\n")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Add linked worktree fixture")
+    git._run("checkout", "main")
+
+    project_dir = tmp_path / "worktrees" / "watch-health-project"
+    project_dir.parent.mkdir(parents=True, exist_ok=True)
+    git._run("worktree", "add", str(project_dir), "feature/watch-health-linked")
+
+    setup_config(project_dir)
+    config_path = project_dir / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "use_docker: false\n")
+    store = make_store(project_dir)
+    commondir_path = canonical_repo / ".git" / "worktrees" / project_dir.name / "commondir"
+    assert commondir_path.exists()
+    return store, project_dir, commondir_path
+
+
+def _corrupt_linked_worktree_commondir_for_probe_failure(
+    project_dir: Path,
+    commondir_path: Path,
+):
+    """Write a container-style commondir value that makes real git probing fail.
+
+    The exact `/gza-git/common` incident path can be a live mount inside agent
+    environments, which aliases this linked worktree into the wrong repository
+    instead of failing. Keep the same `/gza-git/common` failure class but fall
+    back to an obviously missing descendant so the functional regression remains
+    deterministic.
+    """
+    project_git = Git(project_dir)
+    for candidate in ("/gza-git/common", "/gza-git/common/missing"):
+        commondir_path.write_text(candidate)
+        probe = project_git._run("worktree", "list", "--porcelain", check=False)
+        if probe.returncode != 0:
+            return candidate, probe
+    pytest.fail("corrupt linked-worktree commondir did not break `git worktree list --porcelain`")
+
+
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) -> None:
     store, git, task, _wt = setup_git_repo_with_task_branch(
         tmp_path,
@@ -370,3 +416,113 @@ def test_cmd_watch_global_git_health_halt_avoids_task_cascade_and_resumes_dispat
     assert "RESUME    git worktree health restored - resuming dispatch" in log_text
     assert "START" in log_text
     assert "GIT_ERROR" not in log_text
+
+
+@pytest.mark.functional
+def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_after_repair(
+    tmp_path: Path,
+) -> None:
+    store, project_dir, commondir_path = _setup_linked_worktree_watch_project(tmp_path)
+    pending = store.add("Pending plan after linked-worktree repair", task_type="plan")
+    assert pending.id is not None
+    original_commondir = commondir_path.read_text().strip()
+    seeded_ids = {task.id for task in store.get_all()}
+    seeded_statuses = {task.id: task.status for task in store.get_all()}
+    log_path = project_dir / ".gza" / "watch.log"
+
+    corrupt_value, broken_probe = _corrupt_linked_worktree_commondir_for_probe_failure(
+        project_dir,
+        commondir_path,
+    )
+    assert corrupt_value.startswith("/gza-git/common")
+    assert broken_probe.returncode != 0
+    assert (
+        "not a git repository" in broken_probe.stderr
+        or "invalid commondir" in broken_probe.stderr
+    )
+
+    args = argparse.Namespace(
+        project_dir=project_dir,
+        batch=1,
+        poll=1,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+        resumed_reexec=False,
+        dispatch_mode=None,
+        recovery_slots=1,
+        max_resume_attempts=1,
+        group=None,
+    )
+
+    if log_path.exists():
+        log_path.unlink()
+
+    with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
+        held_rc = cmd_watch(args)
+
+    assert held_rc == 0
+    held_tasks = store.get_all()
+    assert {task.id for task in held_tasks} == seeded_ids
+    assert {task.id: task.status for task in held_tasks} == seeded_statuses
+    assert not any(task.status == "in_progress" for task in held_tasks)
+    assert not any(
+        task.task_type in {"review", "improve", "rebase", "resume", "retry"}
+        and task.based_on in seeded_ids
+        for task in held_tasks
+    )
+    refreshed_pending = store.get(pending.id)
+    assert refreshed_pending is not None
+    assert refreshed_pending.status == "pending"
+    assert refreshed_pending.log_file is None
+    assert current_git_health_alert(store) is None
+
+    held_log = log_path.read_text()
+    assert held_log.count(" HOLD ") == 1
+    assert held_log.count(" ATTENTION ") == 1
+    assert held_log.count("git worktree health RED - dispatch halted") == 1
+    assert "`git worktree list` failed (exit 128)" in held_log
+    assert str(commondir_path) in held_log
+    assert "restore `../..`" in held_log
+    assert "/gza-git/common" in held_log
+
+    commondir_path.write_text(original_commondir)
+    repaired_probe = Git(project_dir)._run("worktree", "list", "--porcelain", check=False)
+    assert repaired_probe.returncode == 0
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    log_path.unlink(missing_ok=True)
+    with (
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        resumed_rc = cmd_watch(args)
+
+    assert resumed_rc == 128 + signal.SIGTERM
+    resumed_tasks = store.get_all()
+    assert {task.id for task in resumed_tasks} == seeded_ids
+    resumed_pending = store.get(pending.id)
+    assert resumed_pending is not None
+    assert resumed_pending.status == "pending"
+    assert current_git_health_alert(store) is None
+
+    resumed_log = log_path.read_text()
+    assert "git worktree health RED - dispatch halted" not in resumed_log
+    assert " HOLD " not in resumed_log
+    assert " ATTENTION " not in resumed_log
+    assert any(
+        "START" in line and pending.id in line and "[dry-run]" in line
+        for line in resumed_log.splitlines()
+    )

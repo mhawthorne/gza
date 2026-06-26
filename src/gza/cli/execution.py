@@ -1230,11 +1230,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if tasks_completed > 0:
                 print(task_separator)
             if selected_tags:
-                next_task = session_store.get_next_pending(
-                    tags=selected_tags,
-                    any_tag=any_tag,
-                    quiet_seconds=config.quiet_period_seconds,
-                )
+                next_task = session_store.get_next_pending(tags=selected_tags, any_tag=any_tag)
                 if not next_task:
                     if tasks_completed == 0:
                         print(
@@ -1283,11 +1279,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if i < count - 1:  # Not the last iteration
                 from ..db import SqliteTaskStore
                 session_store = SqliteTaskStore.from_config(config)
-                next_task = session_store.get_next_pending(
-                    tags=selected_tags,
-                    any_tag=any_tag,
-                    quiet_seconds=config.quiet_period_seconds,
-                )
+                next_task = session_store.get_next_pending(tags=selected_tags, any_tag=any_tag)
                 if not next_task:
                     elapsed = format_duration(time.time() - start_time)
                     if selected_tags:

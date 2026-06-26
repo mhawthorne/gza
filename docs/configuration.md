@@ -75,7 +75,7 @@ Gza reads configuration from three YAML layers:
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
 | `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, dispatch_start_timeout: 2}` | Defaults for `gza watch` loop behavior |
-| `quiet_period_seconds` | Integer | `300` | Seconds a newly created task stays in the Quiet lane of `gza queue` / `gza next` before rejoining normal pending display order; current releases still do not change worker pickup eligibility, and `0` disables the quiet lane |
+| `quiet_period_seconds` | Integer | `300` | Seconds reserved for the upcoming newly-created-task quiet-period pickup/display implementation; current releases expose the setting only and do not yet hold tasks from execution, and `0` keeps the future hold disabled |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
 | `theme` | String | `minimal` | Built-in color theme: `default_dark`, `minimal`, `selective_neon`, or `blue`. Override with `gza.local.yaml`. |

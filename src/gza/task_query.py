@@ -12,7 +12,6 @@ from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeri
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
-from .pickup import effective_edit_time, is_in_quiet_period
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -222,8 +221,6 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "tags",
         "urgent",
         "queue_position",
-        "quiet",
-        "quiet_available_at",
         "blocked",
         "blocking_id",
         "blocking_status",
@@ -432,7 +429,6 @@ class TaskQueryService:
         target_branch: str | None = None,
     ) -> TaskQueryResult:
         """Execute a query and return projected rows."""
-        projection_now = datetime.now(UTC)
         if query.scope == "lineages":
             all_lineages = self._collect_lineages_unlimited(
                 query,
@@ -455,16 +451,7 @@ class TaskQueryService:
 
         all_tasks = self._collect_tasks_unlimited(query)
         tasks = self._apply_limit(all_tasks, query.limit)
-        task_rows = tuple(
-            self._project_task_row(
-                task,
-                query,
-                config=config,
-                target_branch=target_branch,
-                now=projection_now,
-            )
-            for task in tasks
-        )
+        task_rows = tuple(self._project_task_row(task, query, target_branch=target_branch) for task in tasks)
         return TaskQueryResult(query=query, rows=task_rows, total_count=len(all_tasks))
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
@@ -808,28 +795,13 @@ class TaskQueryService:
 
         return filtered
 
-    def _project_task_row(
-        self,
-        task: DbTask,
-        query: TaskQuery,
-        *,
-        config: Any | None,
-        target_branch: str | None,
-        now: datetime,
-    ) -> TaskRow:
+    def _project_task_row(self, task: DbTask, query: TaskQuery, *, target_branch: str | None) -> TaskRow:
         root = _resolve_lineage_root(self._store, task)
         branch_owner = _resolve_lineage_owner_task(self._store, task)
         readiness = self._store.get_dependency_readiness(task)
         blocked = not readiness.ready
         blocking_id = readiness.blocking_task_id
         blocking_status = readiness.blocking_task_status
-        quiet_seconds = int(getattr(config, "quiet_period_seconds", 0) or 0)
-        quiet = is_in_quiet_period(task, now=now, quiet_seconds=quiet_seconds)
-        quiet_available_at = None
-        if quiet:
-            effective_at = effective_edit_time(task)
-            if effective_at is not None:
-                quiet_available_at = effective_at + timedelta(seconds=quiet_seconds)
         review_verdict = None
         comments_count = 0
         if task.id is not None:
@@ -850,8 +822,6 @@ class TaskQueryService:
             "tags": list(task.tags),
             "urgent": task.urgent,
             "queue_position": task.queue_position,
-            "quiet": quiet,
-            "quiet_available_at": quiet_available_at,
             "lineage_root_id": root.id,
             "branch_owner_id": branch_owner.id,
             "branch_merge_state": self._branch_merge_state(branch_owner),

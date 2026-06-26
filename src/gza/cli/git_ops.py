@@ -3757,11 +3757,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
                 remaining = max(0, effective_start_budget - planned_workers)
                 if remaining > 0:
-                    pending_tasks = get_runnable_pending_tasks(
-                        store,
-                        limit=remaining,
-                        quiet_seconds=config.quiet_period_seconds,
-                    )
+                    pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
                     if pending_tasks:
                         print(f"Would start {len(pending_tasks)} new pending task(s):\n")
                         for pt in pending_tasks:
@@ -3798,11 +3794,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
             remaining = max(0, effective_start_budget - planned_workers)
             if remaining > 0:
-                new_pending_tasks = get_runnable_pending_tasks(
-                    store,
-                    limit=remaining,
-                    quiet_seconds=config.quiet_period_seconds,
-                )
+                new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
                 if new_pending_tasks:
                     print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
                     for pt in new_pending_tasks:
@@ -4006,11 +3998,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # was shown), fetch now.
         if not new_pending_tasks:
             remaining = effective_start_budget - workers_started
-            new_pending_tasks = get_runnable_pending_tasks(
-                store,
-                limit=remaining,
-                quiet_seconds=config.quiet_period_seconds,
-            )
+            new_pending_tasks = get_runnable_pending_tasks(store, limit=remaining)
         for pt in new_pending_tasks:
             if workers_started >= effective_start_budget:
                 break

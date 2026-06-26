@@ -382,6 +382,27 @@ class TestGitWorktreeHealth:
         assert validation.is_healthy is True
         assert validation.issues == ()
 
+    def test_validate_host_worktree_admin_metadata_detects_linked_worktree_admin_leak(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        admin_dir = tmp_path / "canonical" / ".git" / "worktrees" / "linked"
+        admin_dir.mkdir(parents=True)
+        (repo_dir / ".git").write_text(f"gitdir: {admin_dir}\n")
+        (admin_dir / "commondir").write_text("/gza-git/common/missing\n")
+        (admin_dir / "gitdir").write_text(f"{repo_dir / '.git'}\n")
+        git = Git(repo_dir)
+
+        with patch("gza.git._git_common_dir", side_effect=GitError("fatal: not a git repository")):
+            validation = validate_host_worktree_admin_metadata(git)
+
+        assert validation.is_healthy is False
+        assert len(validation.issues) == 1
+        issue = validation.issues[0]
+        assert issue.registration_name == "linked"
+        assert issue.admin_file == "commondir"
+        assert issue.admin_path == admin_dir / "commondir"
+        assert issue.value == "/gza-git/common/missing"
+
 class TestBasicOperations:
     """Tests for basic git operations."""
 
