@@ -158,6 +158,20 @@ state to win over already-mergeable fresh code.
 - When Docker is required and unavailable after waiting up to the configured startup/wake
   budget, watch MUST emit a visible `HOLD` signal, start no tasks, fail no tasks, skip
   the rest of the cycle entirely, and sleep interruptibly until the next poll boundary.
+- Independently of Docker readiness, before dispatching or executing task work for a
+  cycle, watch MUST run a host-side git worktree health probe against the project
+  checkout. If that probe fails, watch MUST halt dispatch/execution for the cycle, MUST
+  NOT call into lifecycle planning or worker start paths for that pass, MUST NOT mark
+  runnable tasks failed, MUST NOT create recovery children, and MUST NOT spend worker
+  slots while the halt is active.
+- A git-health halt MUST surface exactly one visible durable attention row with reason
+  `git-worktree-health-red` describing the probe failure in compact operator-facing form.
+  The durable state for that alert MUST retain both the compact alert text and the full
+  raw probe failure text so the current red condition can be surfaced without rerunning
+  the failing path solely for display.
+- Watch MUST rerun that git-health probe on later passes and MUST resume automatically
+  once the probe succeeds again. When health is restored after one or more halted passes,
+  watch MUST emit a visible `RESUME` signal before proceeding with the next normal cycle.
 - While held for this system precondition, watch MUST NOT mutate failure-backoff or
   failure-halt state, idle accounting, transition snapshots, or any per-task recovery
   state derived from a normal cycle. A held pass is not a partial cycle.
