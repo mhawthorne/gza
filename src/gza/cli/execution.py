@@ -4387,9 +4387,7 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     iterate_task,
                     review_task,
                     candidate.finding,
-                    dispute_metadata=build_review_blocker_dispute_metadata(
-                        candidate.dispute_artifact
-                    ),
+                    dispute_metadata=dict(candidate.dispute_metadata),
                     trigger_source="auto-recovery",
                 )
                 prepared_task = _prepare_reserved_iterate_task(

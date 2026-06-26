@@ -965,6 +965,55 @@ class TestFollowupTasks:
         assert "Dispute source task: gza-302" in prompt
         assert "Dispute source head SHA: new-sha" in prompt
 
+    def test_create_or_reuse_review_blocker_adjudication_task_does_not_reuse_same_source_with_stale_head(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("202606-recovery",))
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing API guard",
+            body="Body",
+            evidence="Evidence",
+            impact="Impact",
+            fix_or_followup="Required fix",
+            tests="Required tests",
+            open_state_citation="`src/api.py:12-18`",
+        )
+        existing = _task(
+            id="gza-602",
+            task_type="internal",
+            prompt=(
+                "Adjudicate blocker B1 from review gza-200 for task gza-101: Missing API guard\n\n"
+                "Dispute source task: gza-301\n"
+                "Dispute source head SHA: old-sha\n"
+            ),
+        )
+        created_task = _task(id="gza-603", task_type="internal")
+        store.get_based_on_children.return_value = [existing]
+        store.add.return_value = created_task
+
+        created, created_now = create_or_reuse_review_blocker_adjudication_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            dispute_metadata={
+                "source_task_id": "gza-301",
+                "head_sha": "new-sha",
+                "reason": "repeated_reviewer_request",
+                "evidence": "The same blocker repeated across review cycles.",
+                "current_state_citation": "`src/api.py:12-18`",
+            },
+            trigger_source="manual",
+        )
+
+        assert created is created_task
+        assert created_now is True
+        prompt = store.add.call_args.kwargs["prompt"]
+        assert "Dispute source task: gza-301" in prompt
+        assert "Dispute source head SHA: new-sha" in prompt
+
     def test_extract_review_blocker_adjudication_dispute_identity_reads_current_prompt_lines(self):
         finding = ReviewFinding(
             id="B1",

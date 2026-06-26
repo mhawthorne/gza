@@ -168,7 +168,7 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 | Verdict = `CHANGES_REQUESTED` AND consecutive completed no-op improves for the latest `(impl, review)` pair >= `max_noop_improve_cycles` AND the latest blocker set includes an adjudication-eligible disputed non-verify CODE blocker | `create_review_adjudication` / `run_review_adjudication` / `wait_review_adjudication` before the generic no-op park; lifecycle persists and consumes the strict `VALID | INVALID | NEEDS_HUMAN` outcome for the matching disputed blocker |
 | Verdict = `CHANGES_REQUESTED`, the latest blocker set is verify-only, current trusted green verify evidence already exists for the exact reviewed head/tree fingerprint, `advance_off_topic_verify_unblock=true`, and a fresh red reverify classifies as off-topic with full failing-node enumeration | `clear_off_topic_verify_blocker` — clear the review blocker, create or reuse exactly one non-blocking investigation task per normalized failing-node signature, and surface the created/reused investigation IDs in operator output. If the investigation record cannot be durably created or reused, lifecycle fails closed and keeps the review blocking |
 | Consecutive completed no-op improves for the latest `(impl, review)` pair >= `max_noop_improve_cycles` | `needs_discussion` — reason=`improve-no-op`; stop repeated no-op improve loops unless runner-owned current passing verify evidence already cleared the review before lifecycle evaluation, or the opt-in `advance_off_topic_verify_unblock` path proved the later red verify result off-topic with same-head/same-fingerprint evidence. This row applies only when the lineage is not tagged `allow-noop-improve`. If the evidence is absent, stale, branch/head mismatched, the fresh in-improve verify still fails, the classifier is unavailable, or the blocker is not verify-only, lifecycle parks instead of auto-clearing. If the branch-head freshness probe itself fails, lifecycle still parks but the action description carries that probe failure instead of a generic no-op message |
-| Verdict = `CHANGES_REQUESTED` AND the same primary blocker repeats for 3 consecutive completed review cycles with no completed rebase boundary between them | `needs_discussion` — reason `duplicate-blocker-no-progress`; stop the generic review/improve loop and require manual intervention |
+| Verdict = `CHANGES_REQUESTED` AND the same primary blocker repeats for 3 consecutive completed review cycles with no completed rebase boundary between them | `create_review_adjudication` / `run_review_adjudication` / `wait_review_adjudication` using synthesized repeated-review dispute metadata before the generic duplicate-blocker or review-max-cycles park |
 | Live branch-head probe fails while checking whether the latest completed review is still current | `needs_discussion` — reason=`review-freshness-unverified`; fail closed, surface the probe warning, and do not treat cached merge-unit head metadata as proof the review is current |
 | Verdict = `CHANGES_REQUESTED` AND durable-progress-epoch cycles >= `max_review_cycles` with no stale-review refresh path | `max_cycles_reached` — manual intervention |
 | Verdict = `CHANGES_REQUESTED` AND no improve exists | `improve` — create improve task |
@@ -189,13 +189,14 @@ table alone:
   code change. Each disputed item should identify the blocker (`Finding:`), the dispute
   reason (`Reason:`), current-state evidence (`Evidence:`), and a current-source
   `Current-state citation:`; `Scope citation:` and `Downstream task:` are optional.
-- Once `max_noop_improve_cycles` is reached for a disputed non-verify CODE blocker, the
-  required lifecycle contract is adjudication before the generic `improve-no-op`,
+- Once `max_noop_improve_cycles` is reached for a disputed non-verify CODE blocker, or
+  once the same non-verify CODE blocker repeats across the duplicate-blocker review
+  bound, the required lifecycle contract is adjudication before the generic `improve-no-op`,
   `duplicate-blocker-no-progress`, and `review-max-cycles` parks. The current runtime
   plumbing now creates/runs one dedicated adjudication worker and persists its strict
   `VALID | INVALID | NEEDS_HUMAN` outcome as a `review_blocker_resolution` artifact,
-  and lifecycle consumes those persisted outcomes immediately: `INVALID` clears only
-  the exact disputed artifact named in the adjudication prompt, `VALID` re-opens the normal improve lane, and
+  and lifecycle consumes those persisted outcomes immediately: `INVALID` clears the
+  current blocker for lifecycle purposes, `VALID` re-opens the normal improve lane, and
   `NEEDS_HUMAN` parks with `review-blocker-adjudication-needed`. Verify-only blockers
   remain governed by runner-owned same-branch, same-head verify provenance.
 
@@ -263,7 +264,7 @@ no-op, duplicate-blocker, or bounded-review-loop parks; if runtime behavior stil
 that mismatch is an implementation gap against the spec, not operator-facing no-op-only
 guidance.
 
-Advance also computes a generic duplicate-blocker backstop from completed review reports only. When the latest completed `CHANGES_REQUESTED` review and the two immediately preceding completed review cycles all carry the same primary blocker fingerprint (normalized blocker title plus the first open-state citation, or the normalized required-fix text when no citation exists), the engine returns `needs_discussion` with reason `duplicate-blocker-no-progress`. The streak resets across any completed same-lineage rebase between the compared reviews, on any non-`CHANGES_REQUESTED` review, on missing blocker fingerprints, or when the primary blocker changes.
+Advance also computes a duplicate-blocker streak from completed review reports only. When the latest completed `CHANGES_REQUESTED` review and the two immediately preceding completed review cycles all carry the same primary blocker fingerprint (normalized blocker title plus the first open-state citation, or the normalized required-fix text when no citation exists), the engine first routes that repeated blocker through review-blocker adjudication using synthesized dispute metadata bound to the current reviewed branch state. Only if adjudication later returns `NEEDS_HUMAN` (or the adjudication path is otherwise exhausted) does lifecycle surface `needs_discussion` with reason `duplicate-blocker-no-progress`. The streak resets across any completed same-lineage rebase between the compared reviews, on any non-`CHANGES_REQUESTED` review, on missing blocker fingerprints, or when the primary blocker changes.
 
 ## Action Types
 

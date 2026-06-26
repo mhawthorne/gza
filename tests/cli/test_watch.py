@@ -12170,7 +12170,7 @@ def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path:
 
     action = {
         "type": "create_review_adjudication",
-        "description": "Create review-blocker-disputed adjudication for blocker B1",
+        "description": "Create review-blocker adjudication for blocker B1",
     }
     before = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=review)
 

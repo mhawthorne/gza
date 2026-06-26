@@ -4229,7 +4229,7 @@ def test_disputed_noop_improve_routes_to_review_blocker_adjudication(tmp_path: P
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
     assert action["type"] == "create_review_adjudication"
-    assert "review-blocker-disputed" in action["description"]
+    assert "review-blocker adjudication" in action["description"]
     candidate = action["review_blocker_adjudication_candidate"]
     assert candidate.finding.id == "B1"
     assert action["review_task"].id == review.id
@@ -4836,7 +4836,7 @@ def test_valid_adjudication_returns_to_normal_improve(tmp_path: Path) -> None:
     assert ctx.review_blockers_revalidated is True
     assert ctx.consecutive_noop_improves == 0
     assert action["type"] == "improve"
-    assert "review-blocker-disputed" not in action["description"]
+    assert "review-blocker adjudication" not in action["description"]
 
 
 def test_unparseable_adjudication_parks_with_specific_attention_reason(tmp_path: Path) -> None:
@@ -8244,6 +8244,22 @@ def test_three_consecutive_identical_primary_blockers_returns_needs_attention(
     review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
     _add_completed_improve_for_review(store, impl, review2, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
     review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+    review3.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing guard\n"
+        "Evidence: the current code still misses the guard.\n"
+        "Open-state citation: `src/gza/foo.py:10`\n"
+        "Impact: invalid input still reaches the unsafe path.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: cover the empty-input case.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
 
     reports = {
         review1.id: _blocker_report("### B1 `Missing guard`", citation="`src/GZA/foo.py:10-12`"),
@@ -8258,13 +8274,12 @@ def test_three_consecutive_identical_primary_blockers_returns_needs_attention(
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
-    assert action["subject_task_id"] == impl.id
-    assert "3 consecutive review cycles" in action["description"]
-    assert action["duplicate_blocker"]["cycles"] == 3
-    assert action["duplicate_blocker"]["review_task_ids"] == (review3.id, review2.id, review1.id)
-    assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "create_review_adjudication"
+    assert action["review_task"].id == review3.id
+    candidate = action["review_blocker_adjudication_candidate"]
+    assert candidate.finding.id == "B1"
+    assert candidate.dispute_metadata["reason"] == "repeated_reviewer_request"
+    assert classify_advance_action(action) == "actionable"
 
 
 def test_two_duplicate_blockers_then_different_primary_blocker_does_not_bail(
@@ -8361,6 +8376,8 @@ def test_duplicate_blocker_falls_back_to_required_fix_without_citation(
     review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
     _add_completed_improve_for_review(store, impl, review2, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
     review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
 
     reports = {
         review1.id: _blocker_report("Missing guard", citation=None, fix="Return early on empty input"),
@@ -8375,11 +8392,13 @@ def test_duplicate_blocker_falls_back_to_required_fix_without_citation(
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
+    assert action["type"] == "create_review_adjudication"
+    candidate = action["review_blocker_adjudication_candidate"]
+    assert candidate.finding.id == "B1"
+    assert candidate.dispute_metadata["current_state_citation"] == "return early on empty input"
 
 
-def test_noop_improve_limit_preempts_duplicate_blocker_backstop(
+def test_duplicate_blocker_backstop_preempts_noop_improve_limit_for_non_verify_code_blocker(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -8412,6 +8431,10 @@ def test_noop_improve_limit_preempts_duplicate_blocker_backstop(
         when=datetime(2026, 5, 14, 16, 0, tzinfo=UTC),
         changed_diff=False,
     )
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
 
     reports = {
         review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
@@ -8426,8 +8449,126 @@ def test_noop_improve_limit_preempts_duplicate_blocker_backstop(
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["type"] == "create_review_adjudication"
+    candidate = action["review_blocker_adjudication_candidate"]
+    assert candidate.finding.id == "B1"
+    assert candidate.dispute_metadata["reason"] == "repeated_reviewer_request"
+
+
+def test_duplicate_blocker_pending_adjudication_is_run_after_candidate_reuse(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.review_tasks import create_or_reuse_review_blocker_adjudication_task
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-blocker-pending-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(store, impl, review1, when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC))
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(store, impl, review2, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+
+    reports = {
+        review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review2.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review3.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    first_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert first_action["type"] == "create_review_adjudication"
+    candidate = first_action["review_blocker_adjudication_candidate"]
+    adjudication, created_now = create_or_reuse_review_blocker_adjudication_task(
+        store,
+        review_task=review3,
+        impl_task=impl,
+        finding=candidate.finding,
+        dispute_metadata=candidate.dispute_metadata,
+        trigger_source="manual",
+    )
+    assert created_now is True
+    adjudication.status = "pending"
+    store.update(adjudication)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "run_review_adjudication"
+    assert action["review_adjudication_task"].id == adjudication.id
+
+
+def test_duplicate_blocker_in_progress_adjudication_is_waited_after_candidate_reuse(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.review_tasks import create_or_reuse_review_blocker_adjudication_task
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-blocker-in-progress-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(store, impl, review1, when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC))
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(store, impl, review2, when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC))
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+
+    reports = {
+        review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review2.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review3.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    first_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert first_action["type"] == "create_review_adjudication"
+    candidate = first_action["review_blocker_adjudication_candidate"]
+    adjudication, created_now = create_or_reuse_review_blocker_adjudication_task(
+        store,
+        review_task=review3,
+        impl_task=impl,
+        finding=candidate.finding,
+        dispute_metadata=candidate.dispute_metadata,
+        trigger_source="manual",
+    )
+    assert created_now is True
+    adjudication.status = "in_progress"
+    store.update(adjudication)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "wait_review_adjudication"
+    assert action["review_adjudication_task"].id == adjudication.id
 
 
 def test_duplicate_blocker_backstop_preempts_max_review_cycles(
@@ -8454,6 +8595,10 @@ def test_duplicate_blocker_backstop_preempts_max_review_cycles(
     review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
     _add_completed_improve_for_review(store, impl, review3, when=datetime(2026, 5, 14, 15, 0, tzinfo=UTC))
     review4 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 16, 0, tzinfo=UTC))
+    review4.review_verify_head_sha = "reviewed-sha"
+    store.update(review4)
+    review4.review_verify_head_sha = "reviewed-sha"
+    store.update(review4)
 
     reports = {
         review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
@@ -8469,9 +8614,380 @@ def test_duplicate_blocker_backstop_preempts_max_review_cycles(
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
+    assert action["type"] == "create_review_adjudication"
+    assert action.get("needs_attention_reason") is None
+
+
+def test_duplicate_blocker_streak_creates_review_adjudication_before_manual_park(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 10
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-blocker-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review1,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review2,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing guard\n"
+        "Evidence: the current code still misses the guard.\n"
+        "Open-state citation: `src/gza/foo.py:10`\n"
+        "Impact: invalid input still reaches the unsafe path.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: cover the empty-input case.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+
+    reports = {
+        review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review2.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review3.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "create_review_adjudication"
+    candidate = action["review_blocker_adjudication_candidate"]
+    assert candidate.dispute_artifact is None
+    assert candidate.finding.id == "B1"
+    assert candidate.dispute_metadata["reason"] == "repeated_reviewer_request"
+    assert review3.id in candidate.dispute_metadata["evidence"]
+    assert action.get("needs_attention_reason") is None
+
+
+def test_duplicate_blocker_without_head_binding_parks_instead_of_creating_adjudication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 10
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-blocker-missing-head-binding",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review1,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review2,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing guard\n"
+        "Evidence: the current code still misses the guard.\n"
+        "Open-state citation: `src/gza/foo.py:10`\n"
+        "Impact: invalid input still reaches the unsafe path.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: cover the empty-input case.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review3)
+
+    reports = {
+        review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review2.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review3.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
-    assert action.get("needs_attention_reason") != "review-max-cycles-reached"
+    assert action.get("review_blocker_adjudication_candidate") is None
+    assert action["type"] != "create_review_adjudication"
+    assert action["type"] != "merge"
+
+
+def test_duplicate_verify_only_blocker_stays_on_verify_only_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.review_verdict import parse_review_report
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 10
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-verify-only-blocker",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review1,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review2,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review1.output_content = _timeout_only_review_report()
+    store.update(review1)
+    review2.output_content = _timeout_only_review_report()
+    store.update(review2)
+    review3.output_content = _timeout_only_review_report()
+    store.update(review3)
+
+    reports = {
+        review1.id: parse_review_report(_timeout_only_review_report()),
+        review2.id: parse_review_report(_timeout_only_review_report()),
+        review3.id: parse_review_report(_timeout_only_review_report()),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+    assert action.get("review_blocker_adjudication_candidate") is None
+
+
+def test_invalid_duplicate_blocker_adjudication_clears_review_and_merges(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.review_tasks import build_review_blocker_adjudication_prompt
+    from gza.runner import _persist_review_blocker_adjudication_for_completed_task
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 10
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-blocker-invalid-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review1,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review2,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing guard\n"
+        "Evidence: the current code still misses the guard.\n"
+        "Open-state citation: `src/gza/foo.py:10`\n"
+        "Impact: invalid input still reaches the unsafe path.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: cover the empty-input case.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review3.review_verify_head_sha = "reviewed-sha"
+    store.update(review3)
+
+    reports = {
+        review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review2.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review3.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    initial_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    assert initial_action["type"] == "create_review_adjudication"
+    candidate = initial_action["review_blocker_adjudication_candidate"]
+
+    adjudication = store.add(
+        build_review_blocker_adjudication_prompt(
+            review3.id,
+            impl.id,
+            candidate.finding,
+            candidate.dispute_metadata,
+        ),
+        task_type="internal",
+        based_on=review3.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.output_content = "INVALID\n"
+    adjudication.completed_at = datetime(2026, 5, 14, 15, 0, tzinfo=UTC)
+    store.update(adjudication)
+    _persist_review_blocker_adjudication_for_completed_task(
+        config=config,
+        store=store,
+        completed_task=adjudication,
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "merge"
+
+
+def test_headless_repeated_review_adjudication_does_not_clear_review_or_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.runner import _persist_review_blocker_adjudication_for_completed_task
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 10
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/duplicate-blocker-headless-adjudication",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+    review1 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review1,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review2 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 12, 0, tzinfo=UTC))
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review2,
+        when=datetime(2026, 5, 14, 13, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    review3 = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 14, 0, tzinfo=UTC))
+    review3.output_content = (
+        "## Summary\n\n- Found a blocker.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing guard\n"
+        "Evidence: the current code still misses the guard.\n"
+        "Open-state citation: `src/gza/foo.py:10`\n"
+        "Impact: invalid input still reaches the unsafe path.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: cover the empty-input case.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review3)
+
+    reports = {
+        review1.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review2.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+        review3.id: _blocker_report("Missing guard", citation="src/gza/foo.py:10"),
+    }
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, review: reports[review.id],
+    )
+
+    adjudication = store.add(
+        (
+            f"Adjudicate blocker B1 from review {review3.id} for task {impl.id}: Missing guard\n\n"
+            f"Dispute source task: {impl.id}\n"
+            "Dispute reason: repeated_reviewer_request\n"
+            "Dispute evidence: The same blocker repeated across review cycles.\n"
+            "Current state citation: `src/gza/foo.py:10`\n"
+        ),
+        task_type="internal",
+        based_on=review3.id,
+        depends_on=impl.id,
+        same_branch=True,
+    )
+    adjudication.status = "completed"
+    adjudication.output_content = "INVALID\n"
+    adjudication.completed_at = datetime(2026, 5, 14, 15, 0, tzinfo=UTC)
+    store.update(adjudication)
+    _persist_review_blocker_adjudication_for_completed_task(
+        config=config,
+        store=store,
+        completed_task=adjudication,
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
+    assert action["type"] != "merge"
 
 
 def test_threshold_reached_with_in_progress_improve_still_waits(tmp_path: Path, monkeypatch) -> None:
@@ -10341,6 +10857,7 @@ def test_mixed_blockers_still_hit_duplicate_blocker_reason(tmp_path: Path) -> No
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
     assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "duplicate-blocker-no-progress"
 
 

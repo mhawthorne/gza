@@ -39,6 +39,16 @@ _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE = re.compile(
     r"^Dispute source head SHA:\s*(\S+)\s*$",
     re.MULTILINE,
 )
+_REVIEW_BLOCKER_ADJUDICATION_SOURCE_BRANCH_RE = re.compile(
+    r"^Dispute source branch:\s*(\S+)\s*$",
+    re.MULTILINE,
+)
+_REVIEW_BLOCKER_ADJUDICATION_REASON_RE = re.compile(r"^Reason:\s*(.+?)\s*$", re.MULTILINE)
+_REVIEW_BLOCKER_ADJUDICATION_EVIDENCE_RE = re.compile(r"^Evidence:\s*(.+?)\s*$", re.MULTILINE)
+_REVIEW_BLOCKER_ADJUDICATION_CURRENT_STATE_CITATION_RE = re.compile(
+    r"^Current-state citation:\s*(.+?)\s*$",
+    re.MULTILINE,
+)
 _DISPUTE_ARTIFACT_ID_RE = re.compile(r"^Dispute artifact id:\s*(\d+)\s*$", re.MULTILINE)
 _DISPUTE_SOURCE_TASK_ID_RE = re.compile(r"^Dispute source task:\s*(\S+)\s*$", re.MULTILINE)
 
@@ -776,6 +786,39 @@ def extract_review_blocker_adjudication_dispute_identity(
     return source_task_id, head_sha
 
 
+def extract_review_blocker_adjudication_dispute_metadata(
+    prompt: str,
+) -> dict[str, Any]:
+    """Return structured dispute metadata embedded in an adjudication prompt."""
+    artifact_id, source_task_id, head_sha = extract_review_blocker_adjudication_dispute_reference(prompt)
+    metadata: dict[str, Any] = {}
+    if artifact_id is not None:
+        metadata["disputed_artifact_id"] = artifact_id
+    if source_task_id is not None:
+        metadata["source_task_id"] = source_task_id
+        metadata["disputed_source_task_id"] = source_task_id
+    if head_sha is not None:
+        metadata["head_sha"] = head_sha
+
+    source_branch_match = _REVIEW_BLOCKER_ADJUDICATION_SOURCE_BRANCH_RE.search(prompt)
+    if source_branch_match is not None:
+        metadata["source_branch"] = source_branch_match.group(1)
+
+    reason_match = _REVIEW_BLOCKER_ADJUDICATION_REASON_RE.search(prompt)
+    if reason_match is not None:
+        metadata["reason"] = reason_match.group(1).strip()
+
+    evidence_match = _REVIEW_BLOCKER_ADJUDICATION_EVIDENCE_RE.search(prompt)
+    if evidence_match is not None:
+        metadata["evidence"] = evidence_match.group(1).strip()
+
+    citation_match = _REVIEW_BLOCKER_ADJUDICATION_CURRENT_STATE_CITATION_RE.search(prompt)
+    if citation_match is not None:
+        metadata["current_state_citation"] = citation_match.group(1).strip()
+
+    return metadata
+
+
 def _normalize_dispute_artifact_id(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -856,6 +899,9 @@ def review_blocker_dispute_references_match(
         expected_source_task_id = dispute_metadata.get("source_task_id")
         if not isinstance(expected_source_task_id, str) or not expected_source_task_id.strip():
             expected_source_task_id = None
+    expected_head_sha = dispute_metadata.get("head_sha")
+    if not isinstance(expected_head_sha, str) or not expected_head_sha.strip():
+        expected_head_sha = None
 
     prompt_artifact_id = None
     artifact_match = _DISPUTE_ARTIFACT_ID_RE.search(prompt)
@@ -866,11 +912,23 @@ def review_blocker_dispute_references_match(
     source_match = _DISPUTE_SOURCE_TASK_ID_RE.search(prompt)
     if source_match is not None:
         prompt_source_task_id = source_match.group(1)
+    prompt_head_sha = None
+    head_sha_match = _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE.search(prompt)
+    if head_sha_match is not None:
+        prompt_head_sha = head_sha_match.group(1)
 
     if expected_artifact_id is not None:
-        return prompt_artifact_id == expected_artifact_id
+        if prompt_artifact_id != expected_artifact_id:
+            return False
+        if expected_head_sha is not None:
+            return prompt_head_sha == expected_head_sha
+        return True
     if expected_source_task_id is not None:
-        return prompt_source_task_id == expected_source_task_id
+        if prompt_source_task_id != expected_source_task_id:
+            return False
+        if expected_head_sha is not None:
+            return prompt_head_sha == expected_head_sha
+        return True
     return False
 
 

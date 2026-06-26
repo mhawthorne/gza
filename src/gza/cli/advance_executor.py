@@ -867,7 +867,11 @@ def execute_advance_action(
                 message="review adjudication creation is unavailable",
             )
 
-        dispute_metadata = build_review_blocker_dispute_metadata(candidate.dispute_artifact)
+        dispute_metadata = (
+            dict(candidate.dispute_metadata)
+            if hasattr(candidate, "dispute_metadata")
+            else build_review_blocker_dispute_metadata(candidate.dispute_artifact)
+        )
         adjudication_task = context.create_review_adjudication_task(
             task,
             review_task,

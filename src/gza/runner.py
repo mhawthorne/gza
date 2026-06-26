@@ -127,6 +127,7 @@ from .review_tasks import (
     DuplicateReviewError,
     create_review_task,
     extract_followup_prompt_parts,
+    extract_review_blocker_adjudication_dispute_metadata,
     extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_prompt_parts,
 )
@@ -3173,12 +3174,19 @@ def _persist_review_blocker_adjudication_for_completed_task(
         return
 
     finding_id, review_task_id, impl_task_id = prompt_parts
+    prompt_dispute_metadata = extract_review_blocker_adjudication_dispute_metadata(completed_task.prompt)
     disputed_artifact_id, dispute_source_task_id, dispute_head_sha = (
         extract_review_blocker_adjudication_dispute_reference(
             completed_task.prompt
         )
     )
-    if disputed_artifact_id is None:
+    if disputed_artifact_id is None and prompt_dispute_metadata.get("reason") != "repeated_reviewer_request":
+        return
+    if (
+        disputed_artifact_id is None
+        and prompt_dispute_metadata.get("reason") == "repeated_reviewer_request"
+        and (not isinstance(dispute_head_sha, str) or not dispute_head_sha.strip())
+    ):
         return
     review_task = store.get(review_task_id)
     impl_task = store.get(impl_task_id)
@@ -3207,6 +3215,8 @@ def _persist_review_blocker_adjudication_for_completed_task(
     )
     if finding is None:
         return
+    if classify_review_blocker_finding(finding) != "code":
+        return None
 
     finding_fingerprint = get_review_finding_fingerprint(finding)
     if finding_fingerprint is None:
@@ -3223,10 +3233,10 @@ def _persist_review_blocker_adjudication_for_completed_task(
         source_task_id=dispute_source_task_id,
         head_sha=dispute_head_sha,
     )
-    if dispute_artifact is None:
+    if disputed_artifact_id is not None and dispute_artifact is None:
         return
 
-    dispute_metadata = dispute_artifact.metadata or {}
+    dispute_metadata = (dispute_artifact.metadata or {}) if dispute_artifact is not None else prompt_dispute_metadata
     _persist_review_blocker_resolution_artifact(
         store=store,
         config=config,
@@ -3236,7 +3246,7 @@ def _persist_review_blocker_adjudication_for_completed_task(
         state=adjudication.verdict.lower(),
         finding=finding,
         finding_fingerprint=finding_fingerprint,
-        head_sha=dispute_artifact.head_sha,
+        head_sha=dispute_head_sha if dispute_artifact is None else dispute_artifact.head_sha,
         reason=cast(str | None, dispute_metadata.get("reason")),
         evidence=cast(str | None, dispute_metadata.get("evidence")),
         current_state_citation=cast(str | None, dispute_metadata.get("current_state_citation")),

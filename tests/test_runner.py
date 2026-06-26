@@ -11356,6 +11356,134 @@ class TestExtractedRunInnerHelpers:
         assert "Source branch: feature/review-adjudication" in artifact_output
         assert "Head SHA: deadbeef" in artifact_output
 
+    def test_completed_review_adjudication_for_verify_only_blocker_is_ignored(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with verify-only blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/review-adjudication-verify-only"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before adjudication",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Summary\n\n- Verify timed out.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: full verification timed out\n"
+            "Evidence: lifecycle verify timed out at `120s` while running `./bin/tests`.\n"
+            "Open-state citation: `bin/tests:150-155`\n"
+            "Impact: the branch cannot be verified autonomously.\n"
+            "Required fix: investigate the test-performance regression or prove the timeout is environmental.\n"
+            "Required tests: rerun the exact verify command and add a narrow regression if this branch caused the slowdown.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review)
+
+        adjudication = store.add(
+            prompt=(
+                f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: "
+                "verify_command failure: full verification timed out\n\n"
+                "Dispute source task: gza-999\n"
+                "Dispute source head SHA: deadbeef\n"
+                "Dispute reason: repeated_reviewer_request\n"
+                "Dispute evidence: The same verify-only blocker repeated across review cycles.\n"
+                "Current state citation: `bin/tests:150-155`\n"
+            ),
+            task_type="internal",
+            based_on=review.id,
+            depends_on=impl.id,
+            same_branch=True,
+        )
+        adjudication.status = "completed"
+        adjudication.completed_at = datetime.now(UTC)
+        adjudication.output_content = "INVALID\n"
+        store.update(adjudication)
+
+        config = self._make_config(tmp_path)
+
+        _persist_review_blocker_adjudication_for_completed_task(
+            config=config,
+            store=store,
+            completed_task=adjudication,
+        )
+
+        artifacts = store.list_artifacts(review.id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+        assert artifacts == []
+
+    def test_completed_repeated_review_adjudication_without_head_sha_fails_closed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with repeated review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/review-adjudication-missing-head"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before adjudication",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = (
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing API guard\n"
+            "Evidence: the current code still accepts empty IDs.\n"
+            "Open-state citation: `src/api.py:12-18`\n"
+            "Impact: invalid requests can crash the handler.\n"
+            "Required fix: reject empty IDs before calling the service.\n"
+            "Required tests: add regression coverage for empty IDs.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review)
+
+        adjudication = store.add(
+            prompt=(
+                f"Adjudicate blocker B1 from review {review.id} for task {impl.id}: Missing API guard\n\n"
+                "Dispute source task: gza-999\n"
+                "Dispute reason: repeated_reviewer_request\n"
+                "Dispute evidence: The same blocker repeated across review cycles.\n"
+                "Current state citation: `src/api.py:12-18`\n"
+            ),
+            task_type="internal",
+            based_on=review.id,
+            depends_on=impl.id,
+            same_branch=True,
+        )
+        adjudication.status = "completed"
+        adjudication.completed_at = datetime.now(UTC)
+        adjudication.output_content = "INVALID\n"
+        store.update(adjudication)
+
+        config = self._make_config(tmp_path)
+
+        _persist_review_blocker_adjudication_for_completed_task(
+            config=config,
+            store=store,
+            completed_task=adjudication,
+        )
+
+        artifacts = store.list_artifacts(review.id, kind=REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND)
+        assert artifacts == []
+
     def test_completed_review_adjudication_without_dispute_artifact_id_fails_closed_with_multiple_matching_disputes(
         self,
         tmp_path: Path,

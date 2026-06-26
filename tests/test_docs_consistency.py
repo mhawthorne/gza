@@ -498,6 +498,7 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
     )
     assert adjudication_row_index < generic_noop_row_index
     assert "required lifecycle contract is adjudication before the generic `improve-no-op`," in workflow
+    assert "or once the same non-verify CODE blocker repeats across the duplicate-blocker review" in workflow_flat
     assert "`duplicate-blocker-no-progress`, and `review-max-cycles` parks." in workflow
     assert "lifecycle consumes those persisted outcomes immediately" in workflow
     assert "`NEEDS_HUMAN` parks with `review-blocker-adjudication-needed`" in workflow

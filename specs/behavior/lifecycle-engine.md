@@ -289,9 +289,15 @@ When a current review exists for the implementation lineage:
   - `NEEDS_HUMAN`, failed adjudication, or unparseable adjudication output MUST park with
     reason `review-blocker-adjudication-needed` and include the dispute/adjudication
     evidence.
-  This lane applies only to non-verify CODE blockers. Verify-only blocker clearing
-  remains governed by the verify-only rules above: rule A for same-head runner-owned
-  green recapture and rule A2 for the audited off-topic unblock contract.
+  The same adjudication lane also applies when the same non-verify CODE blocker repeats
+  across the duplicate-blocker bound of consecutive review cycles with no completed
+  rebase boundary between them. In that repeated-review case lifecycle MUST synthesize
+  dispute metadata from the repeated blocker evidence and the current reviewed branch
+  state, then run the same strict `VALID | INVALID | NEEDS_HUMAN` adjudication before
+  the generic `duplicate-blocker-no-progress` or `review-max-cycles` parks.
+  This lane applies only to non-verify CODE blockers. Verify-only blocker clearing remains
+  governed by the verify-only rules above: rule A for same-head runner-owned green
+  recapture and rule A2 for the audited off-topic unblock contract.
 - Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
   `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). This generic
   no-op park applies only after ruling out rule B adjudication-eligible disputed
@@ -306,7 +312,8 @@ When a current review exists for the implementation lineage:
   the blocker is treated as a genuine code issue and still requires a real code change
   before merge.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
-  review cycles with no progress → `needs_discussion` (reason
+  review cycles with no progress after rule B has already been exhausted or the
+  adjudication result was `NEEDS_HUMAN` → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the
   compared reviews, any non-`CHANGES_REQUESTED` review, or a changed blocker.
 - Last reviews fail only on verify timeout (no code issues) →
