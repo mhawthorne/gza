@@ -266,6 +266,41 @@ class TestGitRun:
             assert call_args.kwargs.get('input') == "test content"
 
 
+class TestGitStashPopIfClean:
+    """Tests for selective stash-pop conflict handling."""
+
+    def test_returns_false_when_pop_creates_conflicts(self, tmp_path: Path):
+        git = Git(tmp_path)
+        pop_result = MagicMock(returncode=1, stdout="", stderr="conflict output")
+        unmerged_result = MagicMock(returncode=0, stdout="conflicted.txt\n", stderr="")
+        reset_result = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(git, "_run", side_effect=[pop_result, unmerged_result, reset_result]) as mock_run:
+            assert git.stash_pop_if_clean("stash@{0}") is False
+
+        assert mock_run.call_args_list == [
+            call("stash", "pop", "--index", "stash@{0}", check=False),
+            call("diff", "--name-only", "--diff-filter=U", check=False),
+            call("reset", "--hard", "HEAD"),
+        ]
+
+    def test_raises_when_pop_fails_without_conflicts(self, tmp_path: Path):
+        git = Git(tmp_path)
+        pop_result = MagicMock(returncode=1, stdout="", stderr="fatal: bad stash ref")
+        unmerged_result = MagicMock(returncode=0, stdout="", stderr="")
+        reset_result = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(git, "_run", side_effect=[pop_result, unmerged_result, reset_result]) as mock_run:
+            with pytest.raises(GitError, match="git stash pop failed:\nfatal: bad stash ref"):
+                git.stash_pop_if_clean("stash@{9}")
+
+        assert mock_run.call_args_list == [
+            call("stash", "pop", "--index", "stash@{9}", check=False),
+            call("diff", "--name-only", "--diff-filter=U", check=False),
+            call("reset", "--hard", "HEAD"),
+        ]
+
+
 class TestGitWorktreeHealth:
     """Tests for shared worktree-health primitives."""
 

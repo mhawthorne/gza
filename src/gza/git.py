@@ -537,6 +537,14 @@ class Git:
         has_untracked = bool(untracked.stdout.strip())
         return has_tracked_changes or has_untracked
 
+    def has_unmerged_paths(self) -> bool:
+        """Return whether the index currently contains unmerged paths."""
+        result = self._run("diff", "--name-only", "--diff-filter=U", check=False)
+        if result.returncode != 0:
+            error_output = result.stderr or result.stdout
+            raise GitError(f"git diff --name-only --diff-filter=U failed:\n{error_output}")
+        return bool(result.stdout.strip())
+
     def status_porcelain(self) -> set[tuple[str, str]]:
         """Return set of (status, filepath) tuples from git status --porcelain.
 
@@ -1461,6 +1469,54 @@ class Git:
         """Remove untracked files and directories."""
         with self._mutation_scope():
             self._run("clean", "-fd")
+
+    def stash_push(self, message: str) -> str | None:
+        """Stash tracked changes and return the created stash ref, if any."""
+        with self._mutation_scope():
+            result = self._run("stash", "push", "--message", message, check=False)
+            if result.returncode != 0:
+                error_output = result.stderr or result.stdout
+                raise GitError(f"git stash push failed:\n{error_output}")
+            if "No local changes to save" in result.stdout:
+                return None
+            stash_ref = self._run("stash", "list", "-1", "--format=%gd").stdout.strip()
+            if not stash_ref:
+                raise GitError("git stash push succeeded but did not return a stash ref")
+            return stash_ref
+
+    def stash_pop_if_clean(self, stash_ref: str) -> bool:
+        """Pop ``stash_ref`` only when it applies cleanly.
+
+        Returns ``True`` when the stash was restored and dropped. On conflict,
+        any partial apply is undone, the stash is left intact, and ``False`` is
+        returned.
+        """
+        with self._mutation_scope():
+            result = self._run("stash", "pop", "--index", stash_ref, check=False)
+            if result.returncode == 0:
+                return True
+            error_output = result.stderr or result.stdout
+            conflict_probe_error: GitError | None = None
+            try:
+                produced_conflicts = self.has_unmerged_paths()
+            except GitError as probe_error:
+                produced_conflicts = False
+                conflict_probe_error = probe_error
+            try:
+                self._run("reset", "--hard", "HEAD")
+            except GitError as reset_error:
+                raise GitError(
+                    "git stash pop failed and cleanup reset also failed:\n"
+                    f"{error_output}\n{reset_error}"
+                ) from reset_error
+            if conflict_probe_error is not None:
+                raise GitError(
+                    "git stash pop failed and conflict detection also failed:\n"
+                    f"{error_output}\n{conflict_probe_error}"
+                ) from conflict_probe_error
+            if produced_conflicts:
+                return False
+            raise GitError(f"git stash pop failed:\n{error_output}")
 
     def rebase(self, branch: str) -> None:
         """Rebase the current branch onto another branch.

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -28,6 +29,7 @@ from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
     _PendingSquashBranchReconcile,
+    _promote_isolated_merge_to_target_branch,
     _ResolvedMergeSubject,
     ensure_watch_main_checkout,
 )
@@ -5348,6 +5350,69 @@ def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_ch
     assert execute_merge.call_args.kwargs["merge_current_branch"] == "main"
 
 
+@pytest.mark.parametrize("warning", ["restored stash@{3}", "parked stash@{9}"])
+def test_watch_cycle_emits_isolated_promotion_warning_lines(
+    tmp_path: Path,
+    warning: str,
+) -> None:
+    """Watch must mirror isolated promotion stash notices into watch.log WARN lines."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement", tags=("202606-recovery",))
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-warn"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+
+    def fake_execute_merge_action(*_args, **_kwargs):
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(
+            rc=0,
+            created_followups=[],
+            reused_followups=[],
+            promotion_warnings=(warning,),
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.watch._require_default_branch"),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    assert f"WARN      {warning}" in log_text
+    assert f"MERGE     {task.id} -> main" in log_text
+
+
 def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_failure_and_merges(
     tmp_path: Path,
 ) -> None:
@@ -5712,6 +5777,333 @@ def test_isolated_watch_merge_promotion_rollback_keeps_task_unmerged_when_attach
     refreshed_task = store.get(task.id)
     assert refreshed_task is not None
     assert refreshed_task.merge_status == "unmerged"
+
+
+def test_execute_merge_action_isolated_promotion_stashes_dirty_attached_checkout_and_marks_task_merged(
+    tmp_path: Path,
+) -> None:
+    """Dirty attached default-branch checkouts must not block isolated merge promotion."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Promotion stashes dirty checkout", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-stash"
+    task.merge_status = "unmerged"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.side_effect = [True, True]
+    attached_target_git.stash_push.return_value = "stash@{0}"
+    attached_target_git.stash_pop_if_clean.return_value = True
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch(
+            "gza.cli.git_ops.active_worktree_path_for_branch",
+            return_value=config.project_dir,
+        ),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    assert repo_git.update_ref.call_args_list == [
+        call("refs/heads/main", "isolated-merge-oid", "previous-main-oid"),
+    ]
+    assert attached_target_git.mock_calls == [
+        call.has_changes(include_untracked=False),
+        call.stash_push("gza isolated merge promotion for main"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{0}"),
+    ]
+    merge_git.reset_hard.assert_called_once_with("refs/heads/main")
+    assert result.promotion_warnings == (
+        f"Isolated merge promotion advanced 'main' while shared checkout '{config.project_dir}' "
+        "had tracked changes; stashed them as stash@{0} and restored them onto the new tip",
+    )
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "merged"
+
+
+def test_promote_isolated_merge_to_target_branch_restores_stashed_changes_onto_new_tip(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Clean stash restore should replay operator edits onto the advanced target tip."""
+    repo_git = MagicMock()
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.side_effect = [True, True]
+    attached_target_git.stash_push.return_value = "stash@{3}"
+    attached_target_git.stash_pop_if_clean.return_value = True
+
+    with (
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+        caplog.at_level(logging.WARNING),
+    ):
+        warnings = _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
+
+    assert repo_git.update_ref.call_args_list == [
+        call("refs/heads/main", "isolated-merge-oid", "previous-main-oid"),
+    ]
+    assert attached_target_git.mock_calls == [
+        call.has_changes(include_untracked=False),
+        call.stash_push("gza isolated merge promotion for main"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{3}"),
+    ]
+    merge_git.reset_hard.assert_called_once_with("refs/heads/main")
+    assert warnings == (
+        f"Isolated merge promotion advanced 'main' while shared checkout '{tmp_path}' "
+        "had tracked changes; stashed them as stash@{3} and restored them onto the new tip",
+    )
+    assert "stash@{3}" in caplog.text
+    assert "restored them onto the new tip" in caplog.text
+
+
+def test_promote_isolated_merge_to_target_branch_leaves_conflicting_stash_parked(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Conflicting stash restore must leave the stash parked and keep the checkout clean."""
+    repo_git = MagicMock()
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.side_effect = [True, False]
+    attached_target_git.stash_push.return_value = "stash@{9}"
+    attached_target_git.stash_pop_if_clean.return_value = False
+
+    with (
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+        caplog.at_level(logging.WARNING),
+    ):
+        warnings = _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
+
+    assert repo_git.update_ref.call_args_list == [
+        call("refs/heads/main", "isolated-merge-oid", "previous-main-oid"),
+    ]
+    assert attached_target_git.mock_calls == [
+        call.has_changes(include_untracked=False),
+        call.stash_push("gza isolated merge promotion for main"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{9}"),
+        call.has_changes(include_untracked=False),
+    ]
+    merge_git.reset_hard.assert_called_once_with("refs/heads/main")
+    assert warnings == (
+        f"Isolated merge promotion advanced 'main' while shared checkout '{tmp_path}' "
+        "had tracked changes; stash stash@{9} could not be restored cleanly and was left parked",
+    )
+    assert "stash@{9}" in caplog.text
+    assert "left parked" in caplog.text
+
+
+def test_promote_isolated_merge_to_target_branch_raises_on_non_conflict_stash_restore_failure(
+    tmp_path: Path,
+) -> None:
+    """Unexpected stash-pop failures must roll promotion back instead of parking success."""
+    repo_git = MagicMock()
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.side_effect = [True, False]
+    attached_target_git.stash_push.return_value = "stash@{4}"
+    attached_target_git.stash_pop_if_clean.side_effect = GitError("git stash pop failed:\nfatal: bad stash ref")
+
+    with (
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+    ):
+        with pytest.raises(
+            GitError,
+            match="failed to advance shared branch 'main' from isolated merge: git stash pop failed:\nfatal: bad stash ref",
+        ):
+            _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
+
+    assert repo_git.update_ref.call_args_list == [
+        call("refs/heads/main", "isolated-merge-oid", "previous-main-oid"),
+        call("refs/heads/main", "previous-main-oid", "isolated-merge-oid"),
+    ]
+    assert attached_target_git.mock_calls == [
+        call.has_changes(include_untracked=False),
+        call.stash_push("gza isolated merge promotion for main"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{4}"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{4}"),
+    ]
+    assert merge_git.reset_hard.call_args_list == [call("refs/heads/main")]
+
+
+def test_promote_isolated_merge_to_target_branch_does_not_repop_dropped_stash_on_rollback(
+    tmp_path: Path,
+) -> None:
+    """Rollback must not re-pop an already-restored stash ordinal."""
+    repo_git = MagicMock()
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+    merge_git.reset_hard.side_effect = [GitError("reset failed after promotion"), None]
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.side_effect = [True, True]
+    attached_target_git.stash_push.return_value = "stash@{0}"
+    attached_target_git.stash_pop_if_clean.return_value = True
+
+    with (
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+    ):
+        with pytest.raises(
+            GitError,
+            match="failed to advance shared branch 'main' from isolated merge: reset failed after promotion",
+        ):
+            _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
+
+    assert repo_git.update_ref.call_args_list == [
+        call("refs/heads/main", "isolated-merge-oid", "previous-main-oid"),
+        call("refs/heads/main", "previous-main-oid", "isolated-merge-oid"),
+    ]
+    assert attached_target_git.stash_pop_if_clean.call_args_list == [call("stash@{0}")]
+    assert attached_target_git.mock_calls == [
+        call.has_changes(include_untracked=False),
+        call.stash_push("gza isolated merge promotion for main"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{0}"),
+        call.reset_hard("refs/heads/main"),
+    ]
+    assert merge_git.reset_hard.call_args_list == [
+        call("refs/heads/main"),
+        call("refs/heads/main"),
+    ]
+
+
+def test_promote_isolated_merge_to_target_branch_surfaces_parked_stash_when_rollback_restore_fails(
+    tmp_path: Path,
+) -> None:
+    """A parked stash that still cannot be restored after rollback must be surfaced."""
+    repo_git = MagicMock()
+    repo_git.rev_parse.return_value = "previous-main-oid"
+
+    merge_git = MagicMock()
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+    merge_git.reset_hard.side_effect = [GitError("reset failed after promotion"), None]
+
+    attached_target_git = MagicMock()
+    attached_target_git.has_changes.side_effect = [True, False]
+    attached_target_git.stash_push.return_value = "stash@{7}"
+    attached_target_git.stash_pop_if_clean.side_effect = [False, False]
+
+    with (
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=tmp_path),
+        patch("gza.cli.git_ops.Git", return_value=attached_target_git),
+    ):
+        with pytest.raises(
+            GitError,
+            match=r"cleanup issues: stash stash@\{7\} could not be restored after rollback and remains parked",
+        ):
+            _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
+
+    assert attached_target_git.stash_pop_if_clean.call_args_list == [
+        call("stash@{7}"),
+        call("stash@{7}"),
+    ]
+    assert attached_target_git.mock_calls == [
+        call.has_changes(include_untracked=False),
+        call.stash_push("gza isolated merge promotion for main"),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{7}"),
+        call.has_changes(include_untracked=False),
+        call.reset_hard("refs/heads/main"),
+        call.stash_pop_if_clean("stash@{7}"),
+    ]
+
+
+def test_execute_merge_action_surfaces_isolated_promotion_warnings(tmp_path: Path) -> None:
+    """Isolated promotion stash notices should be returned to the caller."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+
+    task = store.add("Promotion warning plumbing", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-warning"
+    task.merge_status = "unmerged"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+    repo_git.rev_parse.return_value = "promoted-target-oid"
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch", return_value=("stash warning",)) as promote,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    assert result.promotion_warnings == ("stash warning",)
+    promote.assert_called_once_with(repo_git, merge_git, "main")
 
 
 def test_execute_merge_action_reconciles_pending_squash_only_after_isolated_promotion(

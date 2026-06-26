@@ -3577,6 +3577,9 @@ def _run_cycle(
                     ),
                 )
                 rc = merge_result.rc
+                if rc == 0:
+                    for warning in getattr(merge_result, "promotion_warnings", ()):
+                        log.emit("WARN", warning)
                 if rc == 0 and merge_event is not None:
                     merge_status_after = (
                         (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")

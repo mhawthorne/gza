@@ -9,7 +9,8 @@ When `main_checkout_isolate: true`, `gza watch` maintains a dedicated integratio
 
 - It is refreshed to a clean detached HEAD at the default-branch tip before watch-time merge execution.
 - On successful merge staging, watch fast-forwards the real default-branch ref to the detached merge commit before `merge_status` flips to `merged`.
-- If a real checkout currently has the default branch attached, watch hard-resets that checkout to the new branch tip so it stays clean instead of drifting dirty behind the moved ref.
+- If a real checkout currently has the default branch attached, watch resets that checkout to the new branch tip so it does not drift behind the moved ref. Tracked local edits in that attached checkout are stashed first; a clean restore is replayed onto the new tip, and a conflicting restore leaves the stash parked while the checkout stays clean at the new tip. Watch emits a `WARN` line naming the stash in both outcomes so operators can recover parked edits or confirm the replayed stash.
+- If promotion later rolls back, cleanup only attempts to restore a stash that is still parked; once a clean restore has dropped the promotion-created stash, watch must not reuse that saved `stash@{n}` ordinal against older stash entries. Cleanup failures that leave operator edits parked are surfaced on the promotion error.
 - If that startup refresh fails because the checkout is stale or conflicted, watch force-rebuilds it once before suppressing merge actions for that watch pass.
 - It never directly checks out the shared `refs/heads/<default>` ref, so a user checkout already on the default branch is not dirtied by watch-time merge staging.
 - It is reserved for merge staging only; task branches and provider-driven rebase resolution still use task worktrees.

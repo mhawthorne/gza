@@ -837,7 +837,7 @@ def _promote_isolated_merge_to_target_branch(
     repo_git: Git,
     merge_git: Git,
     target_branch: str,
-) -> None:
+) -> tuple[str, ...]:
     """Advance the real target-branch ref to the detached isolated merge result.
 
     Successful watch-time merges are staged in a detached integration checkout,
@@ -850,11 +850,16 @@ def _promote_isolated_merge_to_target_branch(
     merged_head_oid = merge_git.rev_parse("HEAD")
     attached_target_checkout = active_worktree_path_for_branch(repo_git, target_branch)
     attached_target_git = Git(attached_target_checkout) if attached_target_checkout is not None else None
+    attached_stash_ref: str | None = None
+    attached_stash_parked = False
+    attached_stash_restored_cleanly = False
+    promotion_warnings: list[str] = []
 
     if attached_target_git is not None and attached_target_git.has_changes(include_untracked=False):
-        raise GitError(
-            f"shared checkout '{attached_target_checkout}' for '{target_branch}' has tracked changes"
+        attached_stash_ref = attached_target_git.stash_push(
+            f"gza isolated merge promotion for {target_branch}"
         )
+        attached_stash_parked = attached_stash_ref is not None
 
     target_ref_updated = False
     try:
@@ -862,12 +867,47 @@ def _promote_isolated_merge_to_target_branch(
         target_ref_updated = True
         if attached_target_git is not None:
             attached_target_git.reset_hard(target_ref)
-            if attached_target_git.has_changes(include_untracked=False):
+            if attached_stash_ref is not None:
+                if attached_target_git.stash_pop_if_clean(attached_stash_ref):
+                    attached_stash_parked = False
+                    attached_stash_restored_cleanly = True
+                    warning = (
+                        f"Isolated merge promotion advanced '{target_branch}' while shared checkout "
+                        f"'{attached_target_checkout}' had tracked changes; stashed them as "
+                        f"{attached_stash_ref} and restored them onto the new tip"
+                    )
+                    promotion_warnings.append(warning)
+                    logger.warning(
+                        "Isolated merge promotion advanced '%s' while shared checkout '%s' "
+                        "had tracked changes; stashed them as %s and restored them onto the new tip",
+                        target_branch,
+                        attached_target_checkout,
+                        attached_stash_ref,
+                    )
+                else:
+                    warning = (
+                        f"Isolated merge promotion advanced '{target_branch}' while shared checkout "
+                        f"'{attached_target_checkout}' had tracked changes; stash {attached_stash_ref} "
+                        "could not be restored cleanly and was left parked"
+                    )
+                    promotion_warnings.append(warning)
+                    logger.warning(
+                        "Isolated merge promotion advanced '%s' while shared checkout '%s' "
+                        "had tracked changes; stash %s could not be restored cleanly and was left parked",
+                        target_branch,
+                        attached_target_checkout,
+                        attached_stash_ref,
+                    )
+            if (
+                not attached_stash_restored_cleanly
+                and attached_target_git.has_changes(include_untracked=False)
+            ):
                 raise GitError(
                     f"shared checkout '{attached_target_checkout}' for '{target_branch}' remained dirty"
                 )
         merge_git.reset_hard(target_ref)
     except GitError as exc:
+        cleanup_failures: list[str] = []
         if target_ref_updated:
             try:
                 repo_git.update_ref(target_ref, previous_target_oid, merged_head_oid)
@@ -878,15 +918,34 @@ def _promote_isolated_merge_to_target_branch(
             if attached_target_git is not None:
                 try:
                     attached_target_git.reset_hard(target_ref)
-                except GitError:
-                    pass
+                except GitError as reset_error:
+                    checkout_label = attached_target_checkout or str(attached_target_git.repo_dir)
+                    cleanup_failures.append(
+                        f"shared checkout '{checkout_label}' could not be reset to rolled-back tip: {reset_error}"
+                    )
+        if attached_target_git is not None and attached_stash_ref is not None and attached_stash_parked:
+            try:
+                if attached_target_git.stash_pop_if_clean(attached_stash_ref):
+                    attached_stash_parked = False
+                else:
+                    cleanup_failures.append(
+                        f"stash {attached_stash_ref} could not be restored after rollback and remains parked"
+                    )
+            except GitError as stash_error:
+                cleanup_failures.append(
+                    f"stash {attached_stash_ref} could not be restored after rollback: {stash_error}"
+                )
         try:
             merge_git.reset_hard(target_ref)
-        except GitError:
-            pass
-        raise GitError(
-            f"failed to advance shared branch '{target_branch}' from isolated merge: {exc}"
-        ) from exc
+        except GitError as reset_error:
+            cleanup_failures.append(
+                f"isolated merge checkout could not be reset after promotion failure: {reset_error}"
+            )
+        message = f"failed to advance shared branch '{target_branch}' from isolated merge: {exc}"
+        if cleanup_failures:
+            message = f"{message}; cleanup issues: {'; '.join(cleanup_failures)}"
+        raise GitError(message) from exc
+    return tuple(promotion_warnings)
 
 
 def _advance_uses_iterate(config: Config) -> bool:
@@ -2802,6 +2861,7 @@ class _MergeActionResult:
     reused_investigation_task_ids: list[str]
     status: str = "merged"
     block_reason: str | None = None
+    promotion_warnings: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2978,9 +3038,14 @@ def _execute_merge_action(
         )
     )
     rc = merge_result.rc
+    promotion_warnings: tuple[str, ...] = ()
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         try:
-            _promote_isolated_merge_to_target_branch(git, execution_git, target_branch)
+            promotion_warnings = _promote_isolated_merge_to_target_branch(
+                git,
+                execution_git,
+                target_branch,
+            )
             pending = real_pending_squash_reconcile or merge_result.pending_squash_reconcile
             if pending is not None:
                 _print_squash_reconcile_result(
@@ -3014,6 +3079,7 @@ def _execute_merge_action(
         reused_investigation_task_ids=reused_investigation_task_ids,
         status=merge_result.status,
         block_reason=merge_result.block_reason,
+        promotion_warnings=promotion_warnings,
     )
 
 
@@ -3846,6 +3912,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if reused_investigation_task_ids:
                 reused_ids = ", ".join(reused_investigation_task_ids)
                 console.print(f"      [{_c_warn}]↺ Reused investigation task(s): {reused_ids}[/{_c_warn}]")
+            for warning in getattr(merge_result, "promotion_warnings", ()):
+                console.print(f"      [{_c_warn}]WARN: {warning}[/{_c_warn}]")
             rc = merge_result.rc
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
