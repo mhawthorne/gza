@@ -1111,6 +1111,17 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "implement, improve, review, or fix" in normalized_output
 
+    def test_retry_help_no_longer_claims_no_docker_requires_background(self, tmp_path: Path) -> None:
+        """`retry --help` should reflect foreground `--run --no-docker` support."""
+        setup_config(tmp_path)
+
+        result = invoke_gza("retry", "--help", "--project", str(tmp_path))
+        normalized_output = " ".join(result.stdout.split())
+
+        assert result.returncode == 0
+        assert "Run Claude directly instead of in Docker" in normalized_output
+        assert "only with --background" not in normalized_output
+
     def test_implement_help_does_not_expose_depends_on_flag(self, tmp_path):
         """`implement --help` should match parser behavior and omit removed --depends-on."""
         setup_config(tmp_path)

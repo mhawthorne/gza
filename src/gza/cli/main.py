@@ -1997,7 +1997,7 @@ def main() -> int:
     retry_parser.add_argument(
         "--no-docker",
         action="store_true",
-        help="Run Claude directly instead of in Docker (only with --background)",
+        help="Run Claude directly instead of in Docker",
     )
     add_execution_mode_args(retry_parser)
     retry_parser.add_argument(
