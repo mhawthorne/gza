@@ -166,6 +166,18 @@ class TestHelpOutput:
         assert main_verify_help.returncode == 0
         assert "Force a fresh local main verify run now" in main_verify_help.stdout
 
+    def test_retry_help_describes_no_docker_for_background_and_immediate_runs(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+
+        result = invoke_gza("retry", "--help", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert (
+            "Run Claude directly instead of in Docker for background or immediate runs"
+            in result.stdout
+        )
+        assert "only with --background" not in " ".join(result.stdout.split())
+
     def test_history_and_search_help_list_negative_query_filters(self, tmp_path):
         """Query help should advertise the explicit negative filter flags."""
         setup_config(tmp_path)
