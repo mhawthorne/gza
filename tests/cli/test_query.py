@@ -8768,6 +8768,46 @@ class TestPsCommand:
         assert rows[0]["is_orphaned"] is False
         assert "orphaned" not in rows[0]["flags"]
 
+    def test_ps_treats_pending_task_with_live_worker_as_in_progress(self, tmp_path: Path):
+        """A pending task with a reconciled live worker stays live during preloop startup."""
+        import json
+        import os
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending task in worker preloop")
+        assert task.status == "pending"
+        assert task.running_pid is None
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-pending-live-worker",
+                pid=os.getpid(),
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["source"] == "both"
+        assert rows[0]["status"] == "in_progress"
+        assert rows[0]["is_stale"] is False
+        assert rows[0]["is_orphaned"] is False
+        assert "stale" not in rows[0]["flags"]
+
     def test_ps_includes_db_only_in_progress_and_flags_orphaned(self, tmp_path: Path):
         """PS includes in-progress DB rows even when no worker exists."""
         import json
@@ -8899,6 +8939,47 @@ class TestPsCommand:
         assert "orphaned" in rows[0]["flags"]
 
         registry.remove("w-test-stale-ps")
+
+    def test_ps_keeps_pending_task_stale_when_registered_worker_is_dead(self, tmp_path: Path):
+        """A pending task without task PID stays stale when its registered worker is dead."""
+        import json
+
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending task with dead worker")
+        assert task.status == "pending"
+        assert task.running_pid is None
+
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-test-pending-dead-worker",
+                pid=999999,
+                task_id=task.id,
+                task_slug=None,
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                log_file=None,
+                worktree=None,
+            )
+        )
+
+        result = invoke_gza("ps", "--json", "--project", str(tmp_path))
+        assert result.returncode == 0
+        rows = json.loads(result.stdout)
+        assert len(rows) == 1
+        assert rows[0]["task_id"] == task.id
+        assert rows[0]["source"] == "both"
+        assert rows[0]["status"] == "stale"
+        assert rows[0]["is_stale"] is True
+        assert rows[0]["is_orphaned"] is False
+        assert "stale" in rows[0]["flags"]
+
+        registry.remove("w-test-pending-dead-worker")
 
     def test_ps_marks_startup_failure_for_failed_worker_without_main_log(self, tmp_path: Path):
         """PS marks startup failures in table and JSON output."""

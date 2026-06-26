@@ -196,6 +196,11 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   explicitly associated with a registered running-status worker entry. A plain pending
   queue item with no registered worker remains runnable and MUST NOT be reaped just
   because it has no process metadata.
+- Query and triage surfaces that render runtime state from that reconciliation (including
+  `gza ps`) MUST treat a `pending` task with a registered `running` worker as live
+  in-flight work even when the task row has not yet stamped `running_pid` for the main
+  iterate loop. They MUST derive `stale` from reconciled worker liveness, not from the
+  task row's empty `running_pid` alone.
 - The effective watch worker target for a pass MUST be `min(batch, max_concurrent)`.
   When `max_concurrent` is unset, `gza watch` MUST derive the runtime cap from the
   effective watch batch for that run, including any CLI `--batch` override.
@@ -228,6 +233,8 @@ This is the process-level expression of overview invariant 1.
 
 - If the needed work for a lineage already exists as `pending` or `in_progress`, watch
   MUST wait/adopt that work rather than create another child for the same step.
+- While such a `pending` task is backed by a reconciled live registered worker, operator
+  runtime surfaces MUST present it as waiting/live startup work rather than `stale`.
 - A `pending` task with a registered worker that is dead/stale and silent past
   `watch.no_activity_timeout` is not live existing work. Watch MUST reconcile it to a
   terminal failure (`NO_ACTIVITY`) before treating the lineage as something to wait on

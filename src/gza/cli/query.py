@@ -3355,8 +3355,8 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         # Both worker and task exist.
         if task.status in ("completed", "failed"):
             status = task.status
-        elif not (task and task.running_pid):
-            status = "stale"
+        elif worker.status in ("stale", "failed", "completed"):
+            status = worker.status
         else:
             status = "in_progress"
     elif worker is not None:
