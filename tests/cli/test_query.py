@@ -2,6 +2,7 @@
 
 
 import argparse
+import contextlib
 import importlib
 import json
 import os
@@ -15875,6 +15876,83 @@ class TestIncompleteCommand:
                 "unresolved_ids": [followup.id],
             }
         ]
+
+    def test_incomplete_enters_git_cache_for_query_and_normalization(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        make_store(tmp_path)
+
+        class _TrackedGit:
+            def __init__(self) -> None:
+                self._cache: dict[object, object] | None = None
+
+            def default_branch(self) -> str:
+                return "main"
+
+        git = _TrackedGit()
+        cache_state = {"active": False}
+        phases: list[str] = []
+
+        @contextlib.contextmanager
+        def _tracked_cached():
+            assert cache_state["active"] is False
+            cache_state["active"] = True
+            git._cache = {}
+            phases.append("cache-enter")
+            try:
+                yield git
+            finally:
+                phases.append("cache-exit")
+                cache_state["active"] = False
+                git._cache = None
+
+        git.cached = _tracked_cached  # type: ignore[attr-defined]
+
+        def _fake_run(
+            _self: query_cli._TaskQueryService,  # noqa: SLF001
+            query: query_cli._TaskQuery,  # noqa: SLF001
+            *,
+            config: Config,
+            git: object,
+            target_branch: str | None,
+        ) -> query_cli._TaskQueryResult:  # noqa: SLF001
+            del config
+            assert cache_state["active"] is True
+            assert git is not None
+            assert target_branch == "main"
+            phases.append("run")
+            return query_cli._TaskQueryResult(query=query, rows=())
+
+        def _fake_normalize(
+            result: query_cli._TaskQueryResult,  # noqa: SLF001
+            *,
+            service: query_cli._TaskQueryService,  # noqa: SLF001
+            store: object,
+            config: Config,
+            git: object,
+            target_branch: str | None,
+        ) -> query_cli._TaskQueryResult:  # noqa: SLF001
+            del service, store, config
+            assert cache_state["active"] is True
+            assert git is not None
+            assert target_branch == "main"
+            phases.append("normalize")
+            return result
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch.object(query_cli._TaskQueryService, "run", autospec=True, side_effect=_fake_run),
+            patch("gza.cli.query._normalize_incomplete_result_rows", side_effect=_fake_normalize),
+        ):
+            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert phases == ["cache-enter", "run", "normalize", "cache-exit"]
+        assert captured.out.strip() == "No unresolved task lineages"
 
     def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
         setup_config(tmp_path)

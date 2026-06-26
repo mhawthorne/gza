@@ -4,6 +4,7 @@ Covers: next, history, unmerged, ps, kill, delete, show, attach.
 """
 
 import argparse
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -1547,16 +1548,20 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             git = None
             target_branch = None
 
-    result = service.run(query, config=config, git=git, target_branch=target_branch)
-    if not blocked_by_dropped_only:
-        result = _normalize_incomplete_result_rows(
-            result,
-            service=service,
-            store=store,
-            config=config,
-            git=git,
-            target_branch=target_branch,
-        )
+    cache_scope = (
+        git.cached() if git is not None and hasattr(git, "cached") else contextlib.nullcontext(git)
+    )
+    with cache_scope:
+        result = service.run(query, config=config, git=git, target_branch=target_branch)
+        if not blocked_by_dropped_only:
+            result = _normalize_incomplete_result_rows(
+                result,
+                service=service,
+                store=store,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
     if getattr(args, "json", False):
         _render_projection_result(result, use_json=True)
         return 0
