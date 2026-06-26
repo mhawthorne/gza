@@ -1,88 +1,20 @@
 """Tests for shared failure-reason resolution and ownership."""
 
-import ast
 from pathlib import Path
 
 import pytest
 
+from checks.failure_reason_ownership import check_file as check_failure_reason_ownership
 from gza.db import TaskStats
 from gza.failure_reasons import preserves_failure_reason_over_terminal_no_work, resolve_failure_reason
-
-_ALLOWED_FAILURE_REASON_MARK_FAILED_OWNERS = {
-    ("src/gza/failure_reasons.py", "mark_task_failed_from_cause"),
-}
-_ALLOWED_DIRECT_FAILURE_REASON_ASSIGNMENTS = {
-    ("src/gza/cli/execution.py", "cmd_set_status"),
-    ("src/gza/db.py", "mark_failed"),
-}
-
-class _FailureReasonOwnershipVisitor(ast.NodeVisitor):
-    def __init__(self, *, repo_root: Path, path: Path) -> None:
-        self._repo_root = repo_root
-        self._path = path
-        self._relative_path = path.relative_to(repo_root).as_posix()
-        self._function_stack: list[str] = []
-        self.violations: list[str] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._function_stack.append(node.name)
-        self.generic_visit(node)
-        self._function_stack.pop()
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._function_stack.append(node.name)
-        self.generic_visit(node)
-        self._function_stack.pop()
-
-    def visit_Call(self, node: ast.Call) -> None:
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "mark_failed":
-            if any(keyword.arg == "failure_reason" for keyword in node.keywords):
-                if not self._is_allowlisted(_ALLOWED_FAILURE_REASON_MARK_FAILED_OWNERS):
-                    self.violations.append(f"{self._relative_path}:{node.lineno}")
-        self.generic_visit(node)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        for target in node.targets:
-            self._check_failure_reason_assignment(target, node.value, node.lineno)
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self._check_failure_reason_assignment(node.target, node.value, node.lineno)
-        self.generic_visit(node)
-
-    def _check_failure_reason_assignment(
-        self,
-        target: ast.expr,
-        value: ast.expr | None,
-        lineno: int,
-    ) -> None:
-        if not isinstance(target, ast.Attribute) or target.attr != "failure_reason":
-            return
-        if self._is_none_literal(value):
-            return
-        if not self._is_allowlisted(_ALLOWED_DIRECT_FAILURE_REASON_ASSIGNMENTS):
-            self.violations.append(f"{self._relative_path}:{lineno}")
-
-    def _is_allowlisted(self, allowed_owners: set[tuple[str, str]]) -> bool:
-        current_function = self._function_stack[-1] if self._function_stack else None
-        return (self._relative_path, current_function) in allowed_owners
-
-    @staticmethod
-    def _is_none_literal(value: ast.expr | None) -> bool:
-        return isinstance(value, ast.Constant) and value.value is None
 
 
 def _find_failure_reason_ownership_violations(repo_root: Path, source_root: Path) -> list[str]:
     violations: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
-        source = path.read_text()
-        if "failure_reason" not in source and "mark_failed" not in source:
-            continue
-        tree = ast.parse(source, filename=str(path))
-        visitor = _FailureReasonOwnershipVisitor(repo_root=repo_root, path=path)
-        visitor.visit(tree)
-        violations.extend(visitor.violations)
+        for violation in check_failure_reason_ownership(path, "failure_reason_ownership"):
+            relative_path = violation.path.relative_to(repo_root).as_posix()
+            violations.append(f"{relative_path}:{violation.line}")
     return violations
 
 
@@ -219,12 +151,6 @@ def test_resolve_failure_reason_log_fallback_filters_terminal_no_work(tmp_path: 
         )
         == "UNKNOWN"
     )
-
-
-def test_production_failure_reason_persistence_uses_shared_helper() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    source_root = repo_root / "src" / "gza"
-    assert _find_failure_reason_ownership_violations(repo_root, source_root) == []
 
 
 def test_failure_reason_ownership_guard_flags_direct_production_assignment(tmp_path: Path) -> None:

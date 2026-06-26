@@ -20,7 +20,7 @@ def _load_module(path: Path, module_name: str):
     return module
 
 
-def _find_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
+def _format_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
     return [violation.format() for violation in find_unit_suite_boundary_violations(tests_root)]
 
 
@@ -503,15 +503,6 @@ def test_functional_subprocess_timeouts_within_watchdog() -> None:
     )
 
 
-@pytest.mark.cpu_budget(ms=2000)
-def test_unit_suite_keeps_subprocess_and_real_shell_tests_out_of_tests_dir() -> None:
-    """Unit tests and test fixtures should keep subprocesses and direct shell commands out."""
-    repo_root = Path(__file__).resolve().parents[1]
-    violations = _find_unit_suite_boundary_violations(repo_root / "tests")
-
-    assert not violations, "Unit suite boundary violations found:\n  " + "\n  ".join(violations)
-
-
 def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> None:
     tests_root = tmp_path / "tests"
     nested = tests_root / "cli"
@@ -524,7 +515,7 @@ def test_unit_suite_boundary_flags_unmarked_direct_git_run(tmp_path: Path) -> No
         "    git._run('init', '-b', 'main')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
@@ -543,7 +534,7 @@ def test_unit_suite_boundary_flags_whitespace_formatted_git_run(tmp_path: Path) 
         "    git._run ('status')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
@@ -562,7 +553,7 @@ def test_unit_suite_boundary_flags_spaced_dot_git_run(tmp_path: Path) -> None:
         "    git . _run('status')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
@@ -582,7 +573,7 @@ def test_unit_suite_boundary_flags_whitespace_formatted_cli_subprocess(tmp_path:
         f"    subprocess.run ([sys.executable, '-m', '{module_name}', 'next'])\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 CLI subprocess invocation belongs in tests_functional/"
@@ -600,7 +591,7 @@ def test_unit_suite_boundary_flags_direct_git_subprocess(tmp_path: Path) -> None
         "    subprocess.run(['git', 'status'], cwd=tmp_path)\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:4 direct git subprocess belongs in tests_functional/"
@@ -618,7 +609,7 @@ def test_unit_suite_boundary_flags_direct_subprocess_run_import_alias(tmp_path: 
         "    run(['git', 'status'], cwd=tmp_path)\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:1 direct subprocess callable imports are banned in tests/ because they bypass the unit-suite runtime guard; import subprocess and patch the seam instead, or move the test to tests_functional/",
@@ -637,7 +628,7 @@ def test_unit_suite_boundary_flags_generic_subprocess_popen(tmp_path: Path) -> N
         "    subprocess.Popen(['sleep', '1'])\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:4 subprocess-backed test belongs in tests_functional/"
@@ -655,7 +646,7 @@ def test_unit_suite_boundary_flags_subprocess_alias_popen(tmp_path: Path) -> Non
         "    sp.Popen(['sleep', '1'])\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:4 subprocess-backed test belongs in tests_functional/"
@@ -673,7 +664,7 @@ def test_unit_suite_boundary_flags_direct_subprocess_popen_import_alias(tmp_path
         "    pop(['git', 'status'], cwd=tmp_path)\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:1 direct subprocess callable imports are banned in tests/ because they bypass the unit-suite runtime guard; import subprocess and patch the seam instead, or move the test to tests_functional/",
@@ -692,7 +683,7 @@ def test_unit_suite_boundary_flags_direct_subprocess_check_output_import_alias(t
         "    check_output(['python', '-c', 'print(1)'], cwd=tmp_path)\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:1 direct subprocess callable imports are banned in tests/ because they bypass the unit-suite runtime guard; import subprocess and patch the seam instead, or move the test to tests_functional/",
@@ -712,7 +703,7 @@ def test_unit_suite_boundary_flags_looped_git_subprocess(tmp_path: Path) -> None
         "        subprocess.run(cmd, cwd=tmp_path)\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 direct git subprocess belongs in tests_functional/"
@@ -732,7 +723,7 @@ def test_unit_suite_boundary_flags_spaced_dot_cli_subprocess(tmp_path: Path) -> 
         f"    subprocess . run([sys.executable, '-m', '{module_name}', 'next'])\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 CLI subprocess invocation belongs in tests_functional/"
@@ -750,7 +741,7 @@ def test_unit_suite_boundary_flags_module_alias_subprocess_calls(tmp_path: Path)
         "    sp.run(['git', 'status'], cwd=tmp_path)\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:4 direct git subprocess belongs in tests_functional/"
@@ -769,7 +760,7 @@ def test_unit_suite_boundary_flags_nested_shell_backed_conftest(tmp_path: Path) 
         "    git._run('init')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_conftest}:5 direct Git._run shell command belongs in tests_functional/"
@@ -788,7 +779,7 @@ def test_unit_suite_boundary_flags_non_collected_helper_shell_body(tmp_path: Pat
         "    git._run('status')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:5 direct Git._run shell command belongs in tests_functional/"
@@ -808,7 +799,7 @@ def test_unit_suite_boundary_flags_subprocess_helper_definition(tmp_path: Path) 
         f"    return subprocess.run([sys.executable, '-m', '{module_name}', *args])\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{helper}:5 CLI subprocess invocation belongs in tests_functional/"
@@ -830,7 +821,7 @@ def test_unit_suite_boundary_flags_subprocess_helper_call_and_import(tmp_path: P
         f"    {helper_name}('next')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:1 CLI subprocess helper belongs in tests_functional/",
@@ -853,7 +844,7 @@ def test_unit_suite_boundary_flags_legacy_inprocess_cli_helper_name(tmp_path: Pa
         f"    {helper_name}('next')\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
     expected = "legacy " + ("run_" "gza") + " helper is banned in tests/; use invoke_gza or move the test to tests_functional/"
 
     assert violations == [
@@ -873,7 +864,7 @@ def test_unit_suite_boundary_flags_tests_functional_imports(tmp_path: Path) -> N
         "    assert init_basic_repo is not None\n"
     )
 
-    violations = _find_unit_suite_boundary_violations(tests_root)
+    violations = _format_unit_suite_boundary_violations(tests_root)
 
     assert violations == [
         f"{nested_test}:1 unit tests must not import tests_functional modules"
@@ -891,4 +882,4 @@ def test_unit_suite_boundary_allows_dedicated_git_run_unit_tests(tmp_path: Path)
         "        git._run('status')\n"
     )
 
-    assert _find_unit_suite_boundary_violations(tests_root) == []
+    assert _format_unit_suite_boundary_violations(tests_root) == []
