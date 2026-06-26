@@ -99,8 +99,10 @@ from ..task_query import (
     TaskQueryService as _TaskQueryService,
     TaskRow as _TaskRow,
     apply_projection_values as _apply_query_projection_values,
+    normalize_tag_filters,
     parse_csv as _parse_csv,
     projection_fields as _projection_fields,
+    task_matches_tag_filters,
 )
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import (
@@ -1508,6 +1510,12 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         field=cast(_QueryDateField, getattr(args, "date_field", "effective")),
         days=getattr(args, "days", None),
     )
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    normalized_tag_filters = normalize_tag_filters(tag_filters)
     if blocked_by_dropped_only:
         query = _TaskQuery(
             scope="tasks",
@@ -1515,6 +1523,8 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             statuses=("pending",),
             task_types=(task_type_filter,) if task_type_filter else None,
             dependency_state=("blocked_by_dropped_dep",),
+            tag_filters=normalized_tag_filters,
+            any_tag=any_tag,
             date_filter=date_filter,
             projection=_TaskProjectionSpec(fields=projection_fields or ("id", "prompt", "status", "task_type", "blocking_id")),
             presentation=_TaskPresentationSpec(mode="json" if getattr(args, "json", False) else "blocks"),
@@ -1523,6 +1533,8 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         query = _TaskQueryPresets.incomplete(
             limit=limit,
             task_types=(task_type_filter,) if task_type_filter else None,
+            tags=tag_filters,
+            any_tag=any_tag,
             date_filter=date_filter,
             mode=mode,
         )
@@ -1607,6 +1619,8 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         store,
         result,
         task_type_filter=task_type_filter,
+        tag_filters=normalized_tag_filters,
+        any_tag=any_tag,
     )
     if blocked_dependents:
         console.print()
@@ -1637,6 +1651,8 @@ def _collect_incomplete_blocked_dependents(
     result: _TaskQueryResult,
     *,
     task_type_filter: str | None,
+    tag_filters: tuple[str, ...] | None,
+    any_tag: bool,
 ) -> list[tuple[DbTask, DependencyReadiness]]:
     owner_ids = {
         row.owner_task.id
@@ -1654,6 +1670,8 @@ def _collect_incomplete_blocked_dependents(
         if task.task_type == "internal":
             continue
         if task_type_filter is not None and task.task_type != task_type_filter:
+            continue
+        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=tag_filters, any_tag=any_tag):
             continue
         readiness = store.get_dependency_readiness(task)
         if readiness.ready:
@@ -1727,6 +1745,8 @@ def _normalize_incomplete_result_rows(
     """Re-root incomplete rows on the implementation that owns the merge unit."""
     normalized_rows: list[_TaskRow | _LineageRow] = []
     changed = False
+    tag_filters = result.query.tag_filters
+    any_tag = result.query.any_tag
 
     for row in result.rows:
         if not isinstance(row, _LineageRow):
@@ -1763,6 +1783,13 @@ def _normalize_incomplete_result_rows(
         ):
             unresolved_tasks = (owner_task,)
         if not unresolved_tasks:
+            changed = True
+            continue
+        if not task_matches_tag_filters(
+            task_tags=owner_task.tags,
+            tag_filters=tag_filters,
+            any_tag=any_tag,
+        ):
             changed = True
             continue
 

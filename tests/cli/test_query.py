@@ -15596,10 +15596,13 @@ class TestIncompleteCommand:
         fields: str | None,
         json: bool = False,
         tree: bool = False,
+        tags: list[str] | None = None,
+        all_tags: bool = False,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             project_dir=tmp_path,
             last=5,
+            list_fields=False,
             blocked_by_dropped=False,
             tree=tree,
             type=None,
@@ -15608,6 +15611,8 @@ class TestIncompleteCommand:
             json=json,
             verbose=False,
             fields=fields,
+            tags=tags,
+            all_tags=all_tags,
         )
 
     @staticmethod
@@ -15652,6 +15657,121 @@ class TestIncompleteCommand:
         assert followup.id is not None
 
         return impl, followup
+
+    @staticmethod
+    def _setup_incomplete_tag_filter_fixture(tmp_path: Path) -> dict[str, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        alpha = store.add("Alpha owner", task_type="implement", tags=("alpha",))
+        alpha.status = "failed"
+        alpha.completed_at = datetime.now(UTC)
+        alpha.failure_reason = "TEST_FAILURE"
+        store.update(alpha)
+        assert alpha.id is not None
+
+        beta = store.add("Beta owner", task_type="implement", tags=("beta",))
+        beta.status = "failed"
+        beta.completed_at = datetime.now(UTC)
+        beta.failure_reason = "TEST_FAILURE"
+        store.update(beta)
+        assert beta.id is not None
+
+        both = store.add("Both owner", task_type="implement", tags=("alpha", "beta"))
+        both.status = "failed"
+        both.completed_at = datetime.now(UTC)
+        both.failure_reason = "TEST_FAILURE"
+        store.update(both)
+        assert both.id is not None
+
+        dependent_alpha = store.add(
+            "Scoped dependent",
+            task_type="implement",
+            depends_on=alpha.id,
+            tags=("alpha",),
+        )
+        assert dependent_alpha.id is not None
+
+        dependent_beta = store.add(
+            "Out of scope dependent",
+            task_type="implement",
+            depends_on=alpha.id,
+            tags=("beta",),
+        )
+        assert dependent_beta.id is not None
+
+        return {
+            "alpha": alpha,
+            "beta": beta,
+            "both": both,
+            "dependent_alpha": dependent_alpha,
+            "dependent_beta": dependent_beta,
+        }
+
+    @staticmethod
+    def _setup_incomplete_owner_tag_only_match_fixture(tmp_path: Path) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Owner row implementation", task_type="implement", tags=("alpha", "beta"))
+        owner.status = "in_progress"
+        owner.branch = "feature/cli-owner-tag-only-match"
+        owner.has_commits = True
+        store.update(owner)
+        assert owner.id is not None
+
+        orphan = store.add(
+            "Out-of-scope orphan rebase",
+            task_type="rebase",
+            based_on=owner.id,
+            same_branch=True,
+            tags=("gamma",),
+        )
+        orphan.status = "completed"
+        orphan.completed_at = datetime.now(UTC)
+        orphan.has_commits = True
+        orphan.branch = "feature/cli-owner-tag-only-match-orphan"
+        orphan.merge_status = "unmerged"
+        store.update(orphan)
+        assert orphan.id is not None
+
+        return owner, orphan
+
+    @staticmethod
+    def _setup_incomplete_re_root_tag_fixture(
+        tmp_path: Path,
+        *,
+        original_tags: tuple[str, ...],
+        rerooted_tags: tuple[str, ...],
+    ) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed tagged owner", task_type="implement", tags=original_tags)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "TEST_FAILURE"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/incomplete-reroot-tag-owner"
+        failed.has_commits = True
+        store.update(failed)
+
+        completed_retry = store.add(
+            "Completed retry carrier",
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+            tags=rerooted_tags,
+        )
+        assert completed_retry.id is not None
+        completed_retry.status = "completed"
+        completed_retry.completed_at = datetime.now(UTC)
+        completed_retry.branch = failed.branch
+        completed_retry.has_commits = True
+        completed_retry.merge_status = "unmerged"
+        store.update(completed_retry)
+
+        return failed, completed_retry
 
     def test_incomplete_text_fields_multi_field_uses_generic_blocks(
         self,
@@ -15795,6 +15915,285 @@ class TestIncompleteCommand:
         assert result.returncode == 0
         assert json.loads(result.stdout) == [{"id": task.id, "trigger_source": "watch"}]
         assert result.stderr == ""
+
+    def test_incomplete_tag_filters_text_and_json_match_owner_scope(self, tmp_path: Path) -> None:
+        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
+
+        text_result = invoke_gza("incomplete", "--tag", "alpha", "--project", str(tmp_path))
+        json_result = invoke_gza(
+            "incomplete",
+            "--tag",
+            "alpha",
+            "--json",
+            "--fields",
+            "id,tags",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert text_result.returncode == 0
+        assert tasks["alpha"].id in text_result.stdout
+        assert tasks["both"].id in text_result.stdout
+        assert tasks["beta"].id not in text_result.stdout
+
+        assert json_result.returncode == 0
+        json_rows = {(row["id"], tuple(row["tags"])) for row in json.loads(json_result.stdout)}
+        assert json_rows == {
+            (tasks["alpha"].id, ("alpha",)),
+            (tasks["both"].id, ("alpha", "beta")),
+        }
+        assert json_result.stderr == ""
+
+    def test_incomplete_repeated_tag_filters_default_to_or_and_support_all_tags(self, tmp_path: Path) -> None:
+        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
+
+        any_tag_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id",
+            "--last",
+            "0",
+            "--tag",
+            "alpha",
+            "--tag",
+            "beta",
+            "--project",
+            str(tmp_path),
+        )
+        all_tags_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id",
+            "--last",
+            "0",
+            "--tag",
+            "alpha",
+            "--tag",
+            "beta",
+            "--all-tags",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert any_tag_result.returncode == 0
+        assert {row["id"] for row in json.loads(any_tag_result.stdout)} == {
+            tasks["alpha"].id,
+            tasks["beta"].id,
+            tasks["both"].id,
+        }
+
+        assert all_tags_result.returncode == 0
+        assert json.loads(all_tags_result.stdout) == [{"id": tasks["both"].id}]
+
+    def test_incomplete_tag_filter_excludes_owner_when_only_descendant_matches_in_json(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Beta owner", task_type="implement", tags=("beta",))
+        owner.status = "failed"
+        owner.completed_at = datetime.now(UTC)
+        owner.failure_reason = "TEST_FAILURE"
+        store.update(owner)
+        assert owner.id is not None
+
+        descendant = store.add(
+            "Alpha descendant",
+            task_type="improve",
+            based_on=owner.id,
+            tags=("alpha",),
+        )
+        descendant.status = "failed"
+        descendant.completed_at = datetime.now(UTC)
+        descendant.failure_reason = "TEST_FAILURE"
+        store.update(descendant)
+        assert descendant.id is not None
+
+        result = invoke_gza(
+            "incomplete",
+            "--tag",
+            "alpha",
+            "--json",
+            "--fields",
+            "id,tags",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert result.stderr == ""
+
+    def test_incomplete_without_tag_filters_preserves_unfiltered_owner_rows(self, tmp_path: Path) -> None:
+        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
+
+        result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert {row["id"] for row in json.loads(result.stdout)} == {
+            tasks["alpha"].id,
+            tasks["beta"].id,
+            tasks["both"].id,
+        }
+
+    def test_incomplete_tag_filters_keep_blocked_dependents_scoped(self, tmp_path: Path) -> None:
+        tasks = self._setup_incomplete_tag_filter_fixture(tmp_path)
+
+        result = invoke_gza("incomplete", "--tag", "alpha", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Blocked dependents:" in result.stdout
+        assert tasks["dependent_alpha"].id in result.stdout
+        assert tasks["dependent_beta"].id not in result.stdout
+
+    def test_incomplete_json_tag_filters_keep_owner_when_only_owner_matches(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        impl, followup = self._setup_incomplete_owner_tag_only_match_fixture(tmp_path)
+
+        any_tag_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id,tags,unresolved_ids",
+            "--last",
+            "0",
+            "--tag",
+            "alpha",
+            "--project",
+            str(tmp_path),
+        )
+        all_tags_result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id,tags,unresolved_ids",
+            "--last",
+            "0",
+            "--tag",
+            "alpha",
+            "--tag",
+            "beta",
+            "--all-tags",
+            "--project",
+            str(tmp_path),
+        )
+
+        expected = [
+            {
+                "id": impl.id,
+                "tags": ["alpha", "beta"],
+                "unresolved_ids": [followup.id],
+            }
+        ]
+        assert any_tag_result.returncode == 0
+        assert json.loads(any_tag_result.stdout) == expected
+        assert any_tag_result.stderr == ""
+
+        assert all_tags_result.returncode == 0
+        assert json.loads(all_tags_result.stdout) == expected
+        assert all_tags_result.stderr == ""
+
+    def test_incomplete_json_tag_filter_drops_row_when_rerooted_owner_falls_out_of_scope(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        failed, completed_retry = self._setup_incomplete_re_root_tag_fixture(
+            tmp_path,
+            original_tags=("alpha",),
+            rerooted_tags=("beta",),
+        )
+
+        with (
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+        ):
+            result = query_cli.cmd_incomplete(
+                self._incomplete_args(
+                    tmp_path,
+                    fields="id,tags",
+                    json=True,
+                    tags=["alpha"],
+                )
+            )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == []
+        assert failed.id != completed_retry.id
+
+    def test_incomplete_json_tag_filter_keeps_rerooted_owner_when_final_owner_matches_all_tags(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        failed, completed_retry = self._setup_incomplete_re_root_tag_fixture(
+            tmp_path,
+            original_tags=("alpha", "beta"),
+            rerooted_tags=("alpha", "beta"),
+        )
+
+        with (
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.git.Git.branch_exists", return_value=True),
+            patch("gza.git.Git.rev_parse_if_exists", return_value="a" * 40),
+            patch(
+                "gza.git.Git.resolve_refs",
+                side_effect=lambda _self, refs, peel="commit": {str(ref): None for ref in refs},
+            ),
+            patch(
+                "gza.git.Git.refs_exist",
+                side_effect=lambda _self, refs: {str(ref): False for ref in refs},
+            ),
+        ):
+            result = query_cli.cmd_incomplete(
+                self._incomplete_args(
+                    tmp_path,
+                    fields="id,tags,unresolved_ids",
+                    json=True,
+                    tags=["alpha", "beta"],
+                    all_tags=True,
+                )
+            )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": completed_retry.id,
+                "tags": ["alpha", "beta"],
+                "unresolved_ids": [completed_retry.id],
+            }
+        ]
+        assert failed.id != completed_retry.id
 
     def test_incomplete_cli_json_hides_merged_owner_with_orphan_same_branch_descendant(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -16768,6 +17167,8 @@ class TestLineageOwnerParity:
             json=json,
             verbose=False,
             fields=fields,
+            tags=None,
+            all_tags=False,
         )
 
     @staticmethod

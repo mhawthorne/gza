@@ -327,6 +327,8 @@ class TaskQueryPresets:
         *,
         limit: int | None = 5,
         task_types: tuple[str, ...] | None = None,
+        tags: tuple[str, ...] | None = None,
+        any_tag: bool = True,
         date_filter: DateFilter | None = None,
         mode: PresentationMode = "one_line",
     ) -> TaskQuery:
@@ -335,6 +337,8 @@ class TaskQueryPresets:
             limit=limit,
             task_types=task_types,
             lifecycle_state=("incomplete",),
+            tag_filters=normalize_tag_filters(tags),
+            any_tag=any_tag,
             date_filter=date_filter,
             projection=ProjectionSpec(preset=TaskProjectionPreset.INCOMPLETE_SUMMARY),
             presentation=PresentationSpec(mode=mode),

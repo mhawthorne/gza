@@ -202,6 +202,40 @@ def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp
     assert "no branch" not in str(row.next_action.get("description", "")).lower()
 
 
+def test_query_lineage_owner_rows_tag_filter_excludes_owner_when_only_member_matches(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Beta owner", task_type="implement", tags=("beta",))
+    owner.status = "failed"
+    owner.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    owner.failure_reason = "TEST_FAILURE"
+    store.update(owner)
+    assert owner.id is not None
+
+    member = store.add(
+        "Alpha descendant",
+        task_type="improve",
+        based_on=owner.id,
+        tags=("alpha",),
+    )
+    member.status = "failed"
+    member.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    member.failure_reason = "TEST_FAILURE"
+    store.update(member)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=("alpha",), include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert not rows
+
+
 def test_collect_stale_unmerged_sweep_candidates_selects_only_old_unlinked_units(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

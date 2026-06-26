@@ -795,6 +795,8 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "### incomplete",
         "gza incomplete [options]",
         "Show unresolved task lineages that still need attention.",
+        "| `--tag TAG` | Only show unresolved lineage owners matching tag filters (repeatable) |",
+        "| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |",
         "| `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |",
         "### tv",
         "gza tv [task_id ...] [options]",

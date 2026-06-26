@@ -464,6 +464,19 @@ def main() -> int:
         help="Date field used by --days filters (default: effective)",
     )
     incomplete_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only show unresolved lineage owners matching tag filters (repeatable)",
+    )
+    incomplete_parser.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    incomplete_parser.add_argument(
         "--fields",
         metavar="CSV",
         help="Projection fields override (comma-separated; works in text or JSON mode)",

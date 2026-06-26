@@ -418,6 +418,8 @@ class TestHelpOutput:
         assert "--fields" in result.stdout
         assert "--list-fields" in result.stdout
         assert "--json" in result.stdout
+        assert "--tag TAG" in result.stdout
+        assert "--all-tags" in result.stdout
         assert "--blocked-by-dropped" in result.stdout
         assert "live shared lifecycle planner" in result.stdout
         assert "deprecated and no longer supported" not in result.stdout

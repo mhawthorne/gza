@@ -221,6 +221,7 @@ def _matches_task_filters(
     query: LineageOwnerQuery,
     *,
     tag_matcher: Any,
+    include_tag_filters: bool = True,
     merge_unit: MergeUnit | None = None,
 ) -> bool:
     if query.statuses is not None:
@@ -243,14 +244,34 @@ def _matches_task_filters(
         return False
     if query.exclude_task_types is not None and task.task_type in set(query.exclude_task_types):
         return False
-    if query.tags is not None and not tag_matcher(task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag):
+    if (
+        include_tag_filters
+        and query.tags is not None
+        and not tag_matcher(task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag)
+    ):
         return False
-    if query.exclude_tags is not None and tag_matcher(task_tags=task.tags, tag_filters=query.exclude_tags, any_tag=query.any_tag):
+    if (
+        include_tag_filters
+        and query.exclude_tags is not None
+        and tag_matcher(task_tags=task.tags, tag_filters=query.exclude_tags, any_tag=query.any_tag)
+    ):
         return False
     if query.date_filter is not None:
         if not _matches_date_filter(task, query.date_filter):
             return False
     if query.task_ids is not None and task.id not in set(query.task_ids):
+        return False
+    return True
+
+
+def _owner_matches_tag_filters(owner: DbTask, query: LineageOwnerQuery, *, tag_matcher: Any) -> bool:
+    if query.tags is not None and not tag_matcher(task_tags=owner.tags, tag_filters=query.tags, any_tag=query.any_tag):
+        return False
+    if query.exclude_tags is not None and tag_matcher(
+        task_tags=owner.tags,
+        tag_filters=query.exclude_tags,
+        any_tag=query.any_tag,
+    ):
         return False
     return True
 
@@ -1139,6 +1160,7 @@ def _query_lineage_owner_rows_with_context(
                 task,
                 query,
                 tag_matcher=task_matches_tag_filters,
+                include_tag_filters=False,
                 merge_unit=merge_unit,
             )
             if task.task_type in {"plan", "explore"} and task.status == "completed":
@@ -1207,6 +1229,7 @@ def _query_lineage_owner_rows_with_context(
                 task,
                 query,
                 tag_matcher=task_matches_tag_filters,
+                include_tag_filters=False,
                 merge_unit=merge_unit,
             ):
                 continue
@@ -1407,6 +1430,8 @@ def _query_lineage_owner_rows_with_context(
                     action = parked_attention
         lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
         if not query.include_skipped and lineage_status == "skipped":
+            continue
+        if not _owner_matches_tag_filters(owner, query, tag_matcher=task_matches_tag_filters):
             continue
 
         tree, rendered_members = _build_owner_tree(

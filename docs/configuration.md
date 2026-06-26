@@ -1339,6 +1339,8 @@ gza incomplete [options]
 | `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
 | `--days N` | Show only unresolved rows from the last N days |
 | `--date-field FIELD` | Date field for `--days`: `created`, `completed`, or `effective` (default: `effective`) |
+| `--tag TAG` | Only show unresolved lineage owners matching tag filters (repeatable) |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--tree` | Render unresolved lineages as trees instead of one-line summaries |
 | `--verbose` | In one-line mode, show owner task details beneath each unresolved lineage |
 | `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |

@@ -1181,6 +1181,142 @@ def test_incomplete_date_field_created_vs_effective_affects_lineage_selection(tm
     assert len(effective_result.rows) == 0
 
 
+def test_incomplete_preset_tag_filters_owner_rows_with_or_and_and_modes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    alpha = store.add("alpha owner", task_type="implement", tags=("alpha",))
+    alpha.status = "failed"
+    alpha.completed_at = datetime.now(UTC)
+    alpha.failure_reason = "TEST_FAILURE"
+    store.update(alpha)
+    assert alpha.id is not None
+
+    beta = store.add("beta owner", task_type="implement", tags=("beta",))
+    beta.status = "failed"
+    beta.completed_at = datetime.now(UTC)
+    beta.failure_reason = "TEST_FAILURE"
+    store.update(beta)
+    assert beta.id is not None
+
+    both = store.add("both owner", task_type="implement", tags=("alpha", "beta"))
+    both.status = "failed"
+    both.completed_at = datetime.now(UTC)
+    both.failure_reason = "TEST_FAILURE"
+    store.update(both)
+    assert both.id is not None
+
+    service = TaskQueryService(store)
+    unfiltered = service.run(TaskQueryPresets.incomplete(limit=None))
+    any_tag = service.run(TaskQueryPresets.incomplete(limit=None, tags=("alpha", "beta")))
+    all_tags = service.run(
+        TaskQueryPresets.incomplete(limit=None, tags=("alpha", "beta"), any_tag=False)
+    )
+
+    assert {
+        row.owner_task.id for row in unfiltered.rows if hasattr(row, "owner_task")
+    } == {alpha.id, beta.id, both.id}
+    assert {
+        row.owner_task.id for row in any_tag.rows if hasattr(row, "owner_task")
+    } == {alpha.id, beta.id, both.id}
+    assert {
+        row.owner_task.id for row in all_tags.rows if hasattr(row, "owner_task")
+    } == {both.id}
+
+
+def test_incomplete_preset_tag_filters_exclude_owner_when_only_descendant_matches(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    owner = store.add("beta owner", task_type="implement", tags=("beta",))
+    owner.status = "failed"
+    owner.completed_at = datetime.now(UTC)
+    owner.failure_reason = "TEST_FAILURE"
+    store.update(owner)
+    assert owner.id is not None
+
+    descendant = store.add("alpha descendant", task_type="improve", based_on=owner.id, tags=("alpha",))
+    descendant.status = "failed"
+    descendant.completed_at = datetime.now(UTC)
+    descendant.failure_reason = "TEST_FAILURE"
+    store.update(descendant)
+    assert descendant.id is not None
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.incomplete(limit=None, tags=("alpha",)))
+
+    assert not result.rows
+
+
+def test_incomplete_preset_tag_filters_keep_owner_when_only_owner_matches_actionable_descendant(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+
+    owner = store.add("alpha owner", task_type="implement", tags=("alpha",))
+    owner.status = "in_progress"
+    owner.branch = "feature/incomplete-owner-tag-match"
+    owner.has_commits = True
+    store.update(owner)
+    assert owner.id is not None
+
+    descendant = store.add(
+        "beta actionable descendant",
+        task_type="rebase",
+        based_on=owner.id,
+        same_branch=True,
+        tags=("beta",),
+    )
+    descendant.status = "completed"
+    descendant.completed_at = datetime.now(UTC)
+    descendant.has_commits = True
+    descendant.branch = "feature/incomplete-owner-tag-match-orphan"
+    descendant.merge_status = "unmerged"
+    store.update(descendant)
+    assert descendant.id is not None
+
+    both_owner = store.add("alpha beta owner", task_type="implement", tags=("alpha", "beta"))
+    both_owner.status = "in_progress"
+    both_owner.branch = "feature/incomplete-owner-all-tags"
+    both_owner.has_commits = True
+    store.update(both_owner)
+    assert both_owner.id is not None
+
+    all_tags_descendant = store.add(
+        "gamma actionable descendant",
+        task_type="rebase",
+        based_on=both_owner.id,
+        same_branch=True,
+        tags=("gamma",),
+    )
+    all_tags_descendant.status = "completed"
+    all_tags_descendant.completed_at = datetime.now(UTC)
+    all_tags_descendant.has_commits = True
+    all_tags_descendant.branch = "feature/incomplete-owner-all-tags-orphan"
+    all_tags_descendant.merge_status = "unmerged"
+    store.update(all_tags_descendant)
+    assert all_tags_descendant.id is not None
+
+    service = TaskQueryService(store)
+    any_tag_result = service.run(TaskQueryPresets.incomplete(limit=None, tags=("alpha",)), target_branch="main")
+    all_tags_result = service.run(
+        TaskQueryPresets.incomplete(limit=None, tags=("alpha", "beta"), any_tag=False),
+        target_branch="main",
+    )
+
+    assert {
+        (row.owner_task.id, tuple(row.values["tags"]), tuple(task.id for task in row.unresolved_tasks))
+        for row in any_tag_result.rows
+    } == {
+        (owner.id, ("alpha",), (descendant.id,)),
+        (both_owner.id, ("alpha", "beta"), (all_tags_descendant.id,)),
+    }
+    assert {
+        (row.owner_task.id, tuple(row.values["tags"]), tuple(task.id for task in row.unresolved_tasks))
+        for row in all_tags_result.rows
+    } == {
+        (both_owner.id, ("alpha", "beta"), (all_tags_descendant.id,))
+    }
+
+
 def test_task_row_plan_fanout_keeps_branch_owner_task_scoped(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
