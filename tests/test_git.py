@@ -8,11 +8,13 @@ import pytest
 from gza.git import (
     Git,
     GitError,
+    GitWorktreeHealthProbe,
     ResolvedGitRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
     parse_diff_numstat,
     resolve_ref_if_possible,
+    validate_host_worktree_admin_metadata,
 )
 
 
@@ -259,10 +261,90 @@ class TestGitRun:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             git._run("hash-object", "-w", "--stdin", stdin=b"test content")
 
-            # Verify stdin was passed
             call_args = mock_run.call_args
             assert call_args.kwargs.get('input') == "test content"
 
+
+class TestGitWorktreeHealth:
+    """Tests for shared worktree-health primitives."""
+
+    def test_worktree_health_probe_returns_command_and_outputs(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=128,
+                stdout="stdout text",
+                stderr="stderr text",
+            )
+
+            probe = git.worktree_health_probe()
+
+        assert probe == GitWorktreeHealthProbe(
+            command="git worktree list --porcelain",
+            returncode=128,
+            stdout="stdout text",
+            stderr="stderr text",
+        )
+        assert probe.failed is True
+
+    def test_validate_host_worktree_admin_metadata_detects_commondir_leak(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        common_dir = repo_dir / ".git"
+        registration_dir = common_dir / "worktrees" / "broken"
+        registration_dir.mkdir(parents=True)
+        (registration_dir / "commondir").write_text("/gza-git/common\n")
+        (registration_dir / "gitdir").write_text("/workspace/repo/.git\n")
+        git = Git(repo_dir)
+
+        with patch("gza.git._git_common_dir", return_value=common_dir):
+            validation = validate_host_worktree_admin_metadata(git)
+
+        assert validation.is_healthy is False
+        assert validation.suspected_container_path_marker == "/gza-git"
+        assert len(validation.issues) == 1
+        issue = validation.issues[0]
+        assert issue.admin_file == "commondir"
+        assert issue.problem == "containerized-commondir"
+        assert issue.expected_value == "../.."
+        assert issue.value == "/gza-git/common"
+
+    def test_validate_host_worktree_admin_metadata_detects_gitdir_leak(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        common_dir = repo_dir / ".git"
+        registration_dir = common_dir / "worktrees" / "broken"
+        registration_dir.mkdir(parents=True)
+        (registration_dir / "commondir").write_text("../..\n")
+        (registration_dir / "gitdir").write_text("/gza-git/repo/.git/worktrees/broken\n")
+        git = Git(repo_dir)
+
+        with patch("gza.git._git_common_dir", return_value=common_dir):
+            validation = validate_host_worktree_admin_metadata(git)
+
+        assert validation.is_healthy is False
+        assert len(validation.issues) == 1
+        issue = validation.issues[0]
+        assert issue.admin_file == "gitdir"
+        assert issue.problem == "containerized-gitdir"
+        assert issue.expected_value is None
+        assert issue.value == "/gza-git/repo/.git/worktrees/broken"
+
+    def test_validate_host_worktree_admin_metadata_accepts_host_valid_files(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        common_dir = repo_dir / ".git"
+        registration_dir = common_dir / "worktrees" / "healthy"
+        registration_dir.mkdir(parents=True)
+        (registration_dir / "commondir").write_text("../..\n")
+        (registration_dir / "gitdir").write_text("/workspace/repo/.git/worktrees/healthy\n")
+        git = Git(repo_dir)
+
+        with patch("gza.git._git_common_dir", return_value=common_dir):
+            validation = validate_host_worktree_admin_metadata(git)
+
+        assert validation.is_healthy is True
+        assert validation.issues == ()
 
 class TestBasicOperations:
     """Tests for basic git operations."""

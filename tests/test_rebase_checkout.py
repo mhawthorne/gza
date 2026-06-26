@@ -4,13 +4,14 @@ from types import SimpleNamespace
 import pytest
 
 from gza.config import Config
-from gza.git import GitError
+from gza.git import GitError, WorktreeAdminMetadataIssue, WorktreeAdminMetadataValidation
 from gza.rebase_checkout import (
     ImportedRebaseTip,
     IsolatedRebaseCheckout,
     cleanup_isolated_rebase_checkout,
     create_isolated_rebase_checkout,
     import_isolated_rebase_tip,
+    isolated_rebase_checkout,
 )
 
 
@@ -160,6 +161,165 @@ def test_create_isolated_rebase_checkout_removes_temp_dir_when_fetch_fails(monke
     assert excinfo.value is expected_error
     created_checkout_dirs = list(config.worktree_path.glob("*-rebase-git-*"))
     assert created_checkout_dirs == []
+
+
+def test_create_isolated_rebase_checkout_preserves_canonical_admin_files(monkeypatch, tmp_path: Path) -> None:
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = set()
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    source_repo.mkdir()
+    common_dir = source_repo / ".git"
+    registration_dir = common_dir / "worktrees" / "sibling"
+    registration_dir.mkdir(parents=True)
+    commondir_path = registration_dir / "commondir"
+    gitdir_path = registration_dir / "gitdir"
+    commondir_text = "../..\n"
+    gitdir_text = f"{tmp_path / 'sibling-worktree' / '.git'}\n"
+    commondir_path.write_text(commondir_text)
+    gitdir_path.write_text(gitdir_text)
+
+    source_git = _FakeGit(source_repo)
+    config = Config(
+        project_dir=source_repo,
+        project_name="repo",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+
+    validation = WorktreeAdminMetadataValidation(common_dir=common_dir, issues=())
+    with monkeypatch.context() as m:
+        m.setattr("gza.rebase_checkout.validate_host_worktree_admin_metadata", lambda _git: validation)
+        checkout = create_isolated_rebase_checkout(
+            config=config,
+            source_git=source_git,
+            branch="feature/private-rebase",
+            target_ref="main",
+            checkout_name="gza-6366-s2",
+        )
+
+        assert commondir_path.read_text() == commondir_text
+        assert gitdir_path.read_text() == gitdir_text
+
+        cleanup_isolated_rebase_checkout(checkout)
+
+    assert commondir_path.read_text() == commondir_text
+    assert gitdir_path.read_text() == gitdir_text
+
+
+def test_create_isolated_rebase_checkout_fails_closed_when_validation_detects_leak(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = set()
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    source_repo.mkdir()
+    source_git = _FakeGit(source_repo)
+    config = Config(
+        project_dir=source_repo,
+        project_name="repo",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+
+    leak_issue = WorktreeAdminMetadataIssue(
+        registration_name="broken",
+        admin_file="commondir",
+        admin_path=source_repo / ".git" / "worktrees" / "broken" / "commondir",
+        value="/gza-git/common",
+        problem="containerized-commondir",
+        details="container metadata leaked into canonical commondir",
+        expected_value="../..",
+        suspected_container_path_marker="/gza-git",
+    )
+    monkeypatch.setattr(
+        "gza.rebase_checkout.validate_host_worktree_admin_metadata",
+        lambda _git, _results=iter(
+            (
+                WorktreeAdminMetadataValidation(common_dir=source_repo / ".git", issues=()),
+                WorktreeAdminMetadataValidation(common_dir=source_repo / ".git", issues=(leak_issue,)),
+            )
+        ): next(_results),
+    )
+
+    with pytest.raises(GitError, match="/gza-git/common"):
+        create_isolated_rebase_checkout(
+            config=config,
+            source_git=source_git,
+            branch="feature/private-rebase",
+            target_ref="main",
+            checkout_name="gza-6366-leak",
+        )
+
+    created_checkout_dirs = list(config.worktree_path.glob("*-rebase-git-*"))
+    assert created_checkout_dirs == []
+
+
+def test_isolated_rebase_checkout_cleanup_detects_post_run_metadata_leak(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = set()
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    source_repo.mkdir()
+    source_git = _FakeGit(source_repo)
+    config = Config(
+        project_dir=source_repo,
+        project_name="repo",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+
+    leak_issue = WorktreeAdminMetadataIssue(
+        registration_name="broken",
+        admin_file="gitdir",
+        admin_path=source_repo / ".git" / "worktrees" / "broken" / "gitdir",
+        value="/gza-git/worktree",
+        problem="containerized-gitdir",
+        details="container metadata leaked into canonical gitdir",
+        expected_value=None,
+        suspected_container_path_marker="/gza-git",
+    )
+    validations = iter(
+        (
+            WorktreeAdminMetadataValidation(common_dir=source_repo / ".git", issues=()),
+            WorktreeAdminMetadataValidation(common_dir=source_repo / ".git", issues=()),
+            WorktreeAdminMetadataValidation(common_dir=source_repo / ".git", issues=(leak_issue,)),
+        )
+    )
+    monkeypatch.setattr(
+        "gza.rebase_checkout.validate_host_worktree_admin_metadata",
+        lambda _git: next(validations),
+    )
+
+    with pytest.raises(GitError, match="/gza-git/worktree"):
+        with isolated_rebase_checkout(
+            config=config,
+            source_git=source_git,
+            branch="feature/private-rebase",
+            target_ref="main",
+            checkout_name="gza-6366-cleanup",
+        ):
+            pass
 
 
 def test_import_isolated_rebase_tip_fetches_private_tip_and_updates_canonical_ref(monkeypatch, tmp_path: Path) -> None:

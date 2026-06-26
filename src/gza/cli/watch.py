@@ -4838,6 +4838,35 @@ def _system_can_run_tasks(config: Config) -> bool:
     return wait_for_docker_ready(config.docker_startup_timeout)
 
 
+def _emit_git_health_hold(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    log: _WatchLog,
+    persist: bool,
+    hold_active: bool,
+) -> bool:
+    """Check shared git health and emit HOLD/ATTENTION when dispatch must pause."""
+    git_health_check = check_git_health(
+        store,
+        Git(config.project_dir),
+        persist=persist,
+    )
+    if not git_health_check.dispatch_halted:
+        return False
+    if not hold_active:
+        log.emit(
+            "HOLD",
+            "Shared git worktree metadata unhealthy - holding dispatch, nothing started/failed",
+        )
+    log.emit_attention(
+        attention_key=f"git-health:{GIT_HEALTH_REASON}",
+        message=git_health_check.state.alert_message
+        or "git worktree health RED - dispatch halted",
+    )
+    return True
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Run continuous scheduler loop that maintains N concurrent workers."""
     config = Config.load(args.project_dir)
@@ -4955,13 +4984,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         # Preview the first watch pass and ask for confirmation before executing
         if dispatch_mode == "recovery_only" and dry_run:
-            git_health_check = check_git_health(store, Git(config.project_dir), persist=False)
-            if git_health_check.dispatch_halted:
-                log.emit_attention(
-                    attention_key=f"git-health:{GIT_HEALTH_REASON}",
-                    message=git_health_check.state.alert_message
-                    or "git worktree health RED - dispatch halted",
-                )
+            if _emit_git_health_hold(
+                store=store,
+                config=config,
+                log=log,
+                persist=False,
+                hold_active=git_health_hold_active,
+            ):
                 return 0
             _dry_run_git = Git(config.project_dir)
             _dry_run_target_branch = _dry_run_git.default_branch()
@@ -5053,22 +5082,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log.emit("RESUME", "Docker available again - resuming")
                 system_hold_active = False
 
-            git_health_check = check_git_health(
-                store,
-                Git(config.project_dir),
+            if _emit_git_health_hold(
+                store=store,
+                config=config,
+                log=log,
                 persist=not dry_run,
-            )
-            if git_health_check.dispatch_halted:
+                hold_active=git_health_hold_active,
+            ):
                 if preview_cycle_open:
                     log.end_cycle()
                     preview_cycle_open = False
                     pending_first_cycle_plan = None
                     needs_initial_preview = not skip_confirm
-                log.emit_attention(
-                    attention_key=f"git-health:{GIT_HEALTH_REASON}",
-                    message=git_health_check.state.alert_message
-                    or "git worktree health RED - dispatch halted",
-                )
                 if dry_run:
                     return 0
                 git_health_hold_active = True

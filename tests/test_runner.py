@@ -69,6 +69,7 @@ from gza.runner import (
     _get_task_output,
     _persist_review_blocker_adjudication_for_completed_task,
     _post_complete_code_task,
+    _prepare_docker_worktree_git_metadata,
     _resolve_code_task_branch_name,
     _resolve_review_verify_timeout_grace_seconds,
     _resolve_task_timeout_budget,
@@ -4670,10 +4671,60 @@ class TestReviewNextSteps:
 
 
 class TestRunNonCodeTaskDockerGitMetadata:
-    """Tests for Docker review execution when worktree git metadata is invalid."""
+    """Tests for Docker review execution with shared git-metadata preparation."""
 
-    def test_docker_review_hides_and_restores_invalid_worktree_git_file(self, tmp_path: Path):
-        """Invalid host gitdir metadata should be hidden during provider run and restored after."""
+    def test_prepare_docker_worktree_git_metadata_keeps_host_admin_files_byte_identical(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = Mock(spec=Config)
+        config.use_docker = True
+        target_config = Mock(spec=Config)
+        target_config.docker_volumes = ["existing-volume"]
+        target_config.docker_env = ["EXISTING=1"]
+
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir(parents=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / "slice-s2"
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        host_git_file = worktree_path / ".git"
+        host_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        host_git_file.write_text(host_git_text)
+        host_commondir = host_worktree_gitdir / "commondir"
+        host_commondir_text = f"{host_common_gitdir}\n"
+        host_commondir.write_text(host_commondir_text)
+        host_gitdir = host_worktree_gitdir / "gitdir"
+        host_gitdir_text = f"{worktree_path / '.git'}\n"
+        host_gitdir.write_text(host_gitdir_text)
+
+        metadata = _prepare_docker_worktree_git_metadata(
+            config=config,
+            target_config=target_config,
+            worktree_path=worktree_path,
+        )
+
+        assert metadata is not None
+        assert host_git_file.read_text() == host_git_text
+        assert host_commondir.read_text() == host_commondir_text
+        assert host_gitdir.read_text() == host_gitdir_text
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" in target_config.docker_volumes
+        assert f"{host_common_gitdir}:/gza-git/common" in target_config.docker_volumes
+        assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in target_config.docker_env
+        assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in target_config.docker_env
+
+        metadata.restore()
+
+        assert host_git_file.read_text() == host_git_text
+        assert host_commondir.read_text() == host_commondir_text
+        assert host_gitdir.read_text() == host_gitdir_text
+        assert target_config.docker_volumes == ["existing-volume"]
+        assert target_config.docker_env == ["EXISTING=1"]
+
+    def test_docker_review_uses_generated_git_metadata_without_touching_host_admin_files(
+        self,
+        tmp_path: Path,
+    ) -> None:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -4700,20 +4751,37 @@ class TestRunNonCodeTaskDockerGitMetadata:
         config.use_docker = True
         config.learnings_interval = 0
         config.learnings_window = 25
+        config.model = None
 
         worktree_path = config.worktree_path / f"{review_task.slug}-review"
         worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / review_task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
         original_git_file = worktree_path / ".git"
-        original_git_content = "gitdir: /nonexistent/host/path/.git/worktrees/review\n"
+        original_git_content = f"gitdir: {host_worktree_gitdir}\n"
         original_git_file.write_text(original_git_content)
+        host_commondir = host_worktree_gitdir / "commondir"
+        original_commondir_content = f"{host_common_gitdir}\n"
+        host_commondir.write_text(original_commondir_content)
+        host_gitdir = host_worktree_gitdir / "gitdir"
+        original_gitdir_content = f"{worktree_path / '.git'}\n"
+        host_gitdir.write_text(original_gitdir_content)
 
         worktree_review_dir = worktree_path / ".gza" / "reviews"
         worktree_review_dir.mkdir(parents=True, exist_ok=True)
         report_file = worktree_review_dir / f"{review_task.slug}.md"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
-            assert not (worktree_path / ".git").exists()
-            assert (worktree_path / ".git.gza-host-worktree").exists()
+            assert (worktree_path / ".git").read_text() == original_git_content
+            assert host_commondir.read_text() == original_commondir_content
+            assert host_gitdir.read_text() == original_gitdir_content
+            assert f"{host_worktree_gitdir}:/gza-git/worktree" in _config.docker_volumes
+            assert f"{host_common_gitdir}:/gza-git/common" in _config.docker_volumes
+            assert any(v.endswith(":/workspace/.git:ro") for v in _config.docker_volumes)
+            assert any(v.endswith(":/gza-git/worktree/commondir:ro") for v in _config.docker_volumes)
+            assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in getattr(_config, "docker_env", [])
+            assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in getattr(_config, "docker_env", [])
             report_file.write_text("# Review\n\nVerdict: APPROVED")
             return RunResult(
                 exit_code=0,
@@ -4746,9 +4814,80 @@ class TestRunNonCodeTaskDockerGitMetadata:
             )
 
         assert exit_code == 0
-        # The worktree is cleaned up on success; the hiding/restoring assertions are
-        # checked inside provider_run's side_effect above.
+        assert host_commondir.read_text() == original_commondir_content
+        assert host_gitdir.read_text() == original_gitdir_content
+        assert getattr(config, "docker_env", []) == []
         assert not worktree_path.exists()
+
+    def test_docker_review_detected_metadata_leak_fails_as_infrastructure_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.slug = "20260225-implement-feature"
+        impl_task.branch = "test/feature-branch"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.slug = "20260225-review-feature"
+        store.update(review_task)
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.log_path = tmp_path / "logs"
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path = tmp_path / "worktrees"
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+        config.use_docker = True
+        config.learnings_interval = 0
+        config.learnings_window = 25
+        config.docker_env = []
+        config.docker_volumes = []
+        config.model = None
+
+        worktree_path = config.worktree_path / f"{review_task.slug}-review"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / review_task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        (host_worktree_gitdir / "commondir").write_text(f"{tmp_path / 'repo.git'}\n")
+        (host_worktree_gitdir / "gitdir").write_text(f"{worktree_path / '.git'}\n")
+        (worktree_path / ".git").write_text(f"gitdir: {host_worktree_gitdir}\n")
+
+        provider = Mock()
+        provider.name = "MockProvider"
+
+        mock_git = Mock()
+        mock_git.default_branch.return_value = "main"
+        mock_git.worktree_remove.return_value = None
+
+        with patch(
+            "gza.runner._assert_host_worktree_admin_metadata_healthy",
+            side_effect=[
+                None,
+                GitError(
+                    "Canonical worktree admin metadata became invalid during "
+                    "non-code provider docker metadata preparation post-setup: "
+                    f"{tmp_path / 'repo.git' / 'worktrees' / 'broken' / 'commondir'} contains "
+                    "'/gza-git/common' (containerized-commondir). expected '../..'. "
+                    "container metadata leaked into canonical commondir"
+                ),
+            ],
+        ):
+            exit_code = _run_non_code_task(review_task, config, store, provider, mock_git, resume=False)
+
+        assert exit_code == 1
+        refreshed = store.get(review_task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
+        assert provider.run.call_count == 0
 
 
 class TestRunNonCodeTaskWorktreeReportDir:

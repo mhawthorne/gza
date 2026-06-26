@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .config import Config
-from .git import Git, GitError
+from .git import Git, GitError, validate_host_worktree_admin_metadata
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,21 @@ def _copy_git_identity(*, source_git: Git, checkout_git: Git) -> None:
         value = result.stdout.strip()
         if value:
             checkout_git._run("config", key, value)
+
+
+def _assert_canonical_worktree_admin_metadata_healthy(source_git: Git, *, phase: str) -> None:
+    """Fail closed if canonical worktree admin files contain container-only paths."""
+    validation = validate_host_worktree_admin_metadata(source_git)
+    if validation.is_healthy:
+        return
+
+    issue = validation.issues[0]
+    expected = f" expected {issue.expected_value!r}." if issue.expected_value is not None else ""
+    raise GitError(
+        "Canonical worktree admin metadata became invalid during "
+        f"{phase}: {issue.admin_path} contains {issue.value!r} ({issue.problem})."
+        f"{expected} {issue.details}"
+    )
 
 
 def _build_import_refspecs(source_git: Git, *, branch: str, target_ref: str) -> tuple[str, ...]:
@@ -91,6 +106,10 @@ def create_isolated_rebase_checkout(
     )
     checkout_git = Git(checkout_path)
     try:
+        _assert_canonical_worktree_admin_metadata_healthy(
+            source_git,
+            phase="isolated rebase checkout setup",
+        )
         checkout_git._run("init")
         _copy_git_identity(source_git=source_git, checkout_git=checkout_git)
 
@@ -104,6 +123,10 @@ def create_isolated_rebase_checkout(
         checkout_git.checkout(branch)
         checkout_git.reset_hard(branch)
         checkout_git.clean_force()
+        _assert_canonical_worktree_admin_metadata_healthy(
+            source_git,
+            phase="isolated rebase checkout setup",
+        )
     except Exception:
         shutil.rmtree(checkout_path, ignore_errors=True)
         raise
@@ -187,3 +210,7 @@ def isolated_rebase_checkout(
         yield checkout
     finally:
         cleanup_isolated_rebase_checkout(checkout)
+        _assert_canonical_worktree_admin_metadata_healthy(
+            source_git,
+            phase="isolated rebase checkout cleanup",
+        )

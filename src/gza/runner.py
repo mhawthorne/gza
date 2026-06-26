@@ -87,6 +87,7 @@ from .git import (
     git_error_indicates_containerized_worktree_metadata_failure,
     is_rebase_in_progress,
     parse_diff_numstat,
+    validate_host_worktree_admin_metadata,
 )
 from .github import GitHub, GitHubError, is_github_repo_unsupported_error
 from .improve_diff import (
@@ -542,6 +543,58 @@ class _DockerGitMetadataContext:
         self.target_config.docker_volumes = list(self.original_docker_volumes)
         setattr(self.target_config, "docker_env", list(self.original_docker_env))
         shutil.rmtree(self.metadata_tempdir, ignore_errors=True)
+
+
+def _assert_host_worktree_admin_metadata_healthy(git: Git | None, *, phase: str) -> None:
+    """Fail closed when canonical worktree admin files leak container-only metadata."""
+    repo_dir = getattr(git, "repo_dir", None)
+    if not isinstance(repo_dir, Path):
+        return
+    assert git is not None
+
+    validation = validate_host_worktree_admin_metadata(git)
+    if validation.is_healthy:
+        return
+
+    issue = validation.issues[0]
+    expected = f" expected {issue.expected_value!r}." if issue.expected_value is not None else ""
+    raise GitError(
+        "Canonical worktree admin metadata became invalid during "
+        f"{phase}: {issue.admin_path} contains {issue.value!r} ({issue.problem})."
+        f"{expected} {issue.details}"
+    )
+
+
+def _prepare_validated_docker_worktree_git_metadata(
+    *,
+    config: Config,
+    target_config: Config,
+    worktree_path: Path,
+    canonical_git: Git | None,
+    phase: str,
+) -> _DockerGitMetadataContext | None:
+    """Prepare Docker git metadata and assert host-visible admin files stay clean."""
+    _assert_host_worktree_admin_metadata_healthy(canonical_git, phase=f"{phase} pre-setup")
+    docker_git_metadata = _prepare_docker_worktree_git_metadata(
+        config=config,
+        target_config=target_config,
+        worktree_path=worktree_path,
+    )
+    _assert_host_worktree_admin_metadata_healthy(canonical_git, phase=f"{phase} post-setup")
+    return docker_git_metadata
+
+
+def _restore_validated_docker_worktree_git_metadata(
+    docker_git_metadata: _DockerGitMetadataContext | None,
+    *,
+    canonical_git: Git | None,
+    phase: str,
+) -> None:
+    """Restore Docker git metadata and assert host-visible admin files stay clean."""
+    if docker_git_metadata is None:
+        return
+    docker_git_metadata.restore()
+    _assert_host_worktree_admin_metadata_healthy(canonical_git, phase=f"{phase} post-restore")
 
 
 def _prepare_docker_worktree_git_metadata(
@@ -8411,10 +8464,12 @@ def _run_inner(
             fix_commits_ahead_before_run = None
 
     try:
-        docker_git_metadata = _prepare_docker_worktree_git_metadata(
+        docker_git_metadata = _prepare_validated_docker_worktree_git_metadata(
             config=config,
             target_config=task_config,
             worktree_path=worktree_path,
+            canonical_git=git,
+            phase="provider docker metadata preparation",
         )
         provider_run_kwargs: dict[str, Any] = {
             "resume_session_id": task.session_id if resume else None,
@@ -8436,8 +8491,11 @@ def _run_inner(
                 provider_run_kwargs=provider_run_kwargs,
             )
         finally:
-            if docker_git_metadata is not None:
-                docker_git_metadata.restore()
+            _restore_validated_docker_worktree_git_metadata(
+                docker_git_metadata,
+                canonical_git=git,
+                phase="provider docker metadata preparation",
+            )
 
         _apply_transcript_stats_fallback(
             result,
@@ -8847,15 +8905,13 @@ def _run_non_code_task(
             task.num_steps_computed = count
             store.update(task)
 
-        # When running in Docker, the worktree .git file contains a host-specific
-        # gitdir path that is invalid inside the container.  Hide it before the
-        # provider run and restore it afterwards so the host worktree stays valid.
-        host_git_file = worktree_path / ".git"
-        hidden_git_file = worktree_path / ".git.gza-host-worktree"
-        hide_git = config.use_docker and host_git_file.is_file()
-        if hide_git:
-            host_git_file.rename(hidden_git_file)
-
+        docker_git_metadata = _prepare_validated_docker_worktree_git_metadata(
+            config=config,
+            target_config=config,
+            worktree_path=worktree_path,
+            canonical_git=git,
+            phase="non-code provider docker metadata preparation",
+        )
         try:
             provider_run_kwargs: dict[str, Any] = {
                 "resume_session_id": task.session_id if resume else None,
@@ -8914,8 +8970,11 @@ def _run_non_code_task(
             console.print("\nInterrupted")
             return 130
         finally:
-            if hide_git and hidden_git_file.exists():
-                hidden_git_file.rename(host_git_file)
+            _restore_validated_docker_worktree_git_metadata(
+                docker_git_metadata,
+                canonical_git=git,
+                phase="non-code provider docker metadata preparation",
+            )
         exit_code = result.exit_code
         stats = _run_result_to_stats(result)
         assert task.id is not None
@@ -9155,6 +9214,7 @@ def _run_non_code_task(
 
     except GitError as e:
         message = str(e)
+        resolved_failure = _resolved_git_failure(e)
         error_message(f"Git error: {message}")
         _mark_workspace_setup_failure(
             task=task,
@@ -9165,6 +9225,7 @@ def _run_non_code_task(
             interaction_mode=interaction_mode,
             resume=resume,
             message=message,
+            failure_reason=resolved_failure.reason,
             phase="detached_worktree",
             prelude_written=True,
         )

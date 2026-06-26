@@ -85,6 +85,7 @@ from gza.git_health import (
     GIT_HEALTH_PROMPT,
     check_git_health as real_check_git_health,
     current_git_health_alert,
+    ensure_git_health_task,
     load_git_health_state,
 )
 from gza.lineage_query import LineageOwnerRow
@@ -19416,6 +19417,7 @@ def test_cmd_watch_git_health_halts_before_transitions_and_cycle(tmp_path: Path)
     assert refreshed is not None
     assert refreshed.status == "pending"
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
 
@@ -19480,6 +19482,7 @@ def test_cmd_watch_git_health_dedupes_attention_and_resumes(tmp_path: Path) -> N
     assert run_cycle.call_count == 1
     assert emit_transition_events.call_count == 2
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert log_text.count(" HOLD ") == 1
     assert log_text.count(" ATTENTION ") == 1
     assert "git worktree health RED - dispatch halted" in log_text
     assert "RESUME" in log_text
@@ -19542,6 +19545,7 @@ def test_cmd_watch_first_start_preview_waits_for_git_health(tmp_path: Path) -> N
     assert refreshed is not None
     assert refreshed.status == "pending"
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
 
 
@@ -19595,6 +19599,7 @@ def test_cmd_watch_dry_run_git_health_red_returns_without_hold_loop(tmp_path: Pa
     assert refreshed is not None
     assert refreshed.status == "pending"
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
 
@@ -19760,8 +19765,23 @@ def test_cmd_watch_recovery_only_dry_run_reports_git_health_hold(tmp_path: Path)
     assert rc == 0
     dry_run_report.assert_not_called()
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
+
+
+def test_task_snapshot_hides_synthetic_git_health_internal_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending implement", task_type="implement")
+    assert pending.id is not None
+    synthetic = ensure_git_health_task(store)
+    assert synthetic.id is not None
+
+    snapshot = _task_snapshot(store)
+
+    assert str(pending.id) in snapshot
+    assert str(synthetic.id) not in snapshot
 
 
 def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:

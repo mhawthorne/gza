@@ -44,6 +44,56 @@ class GitApplyResult:
 
 
 @dataclass(frozen=True)
+class GitWorktreeHealthProbe:
+    """Cheap non-raising probe for shared git worktree health."""
+
+    command: str
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def failed(self) -> bool:
+        """Return whether the probe detected a git-health failure."""
+        return self.returncode != 0
+
+
+@dataclass(frozen=True)
+class WorktreeAdminMetadataIssue:
+    """One host-side worktree admin metadata problem."""
+
+    registration_name: str
+    admin_file: str
+    admin_path: Path
+    value: str
+    problem: str
+    details: str
+    expected_value: str | None = None
+    suspected_container_path_marker: str | None = None
+
+
+@dataclass(frozen=True)
+class WorktreeAdminMetadataValidation:
+    """Validation outcome for shared ``.git/worktrees`` admin metadata."""
+
+    common_dir: Path
+    issues: tuple[WorktreeAdminMetadataIssue, ...]
+
+    @property
+    def suspected_container_path_marker(self) -> str | None:
+        """Return the first detected container-path marker, if any."""
+        for issue in self.issues:
+            if issue.suspected_container_path_marker:
+                return issue.suspected_container_path_marker
+        return None
+
+    @property
+    def is_healthy(self) -> bool:
+        """Return whether the scanned admin metadata is free of known issues."""
+        return not self.issues
+
+
+@dataclass(frozen=True)
 class ResolvedGitRef:
     """Best-effort ref resolution outcome for callers with different warning policy."""
 
@@ -672,6 +722,19 @@ class Git:
         if current:
             worktrees.append(current)
         return worktrees
+
+    def worktree_health_probe(self) -> GitWorktreeHealthProbe:
+        """Run a cheap non-raising shared worktree health probe."""
+        command = "git worktree list --porcelain"
+        result = self._run("worktree", "list", "--porcelain", check=False)
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        stderr = result.stderr if isinstance(result.stderr, str) else ""
+        return GitWorktreeHealthProbe(
+            command=command,
+            returncode=result.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
     def remote_branch_exists(self, branch: str, remote: str = "origin") -> bool:
         """Check if a branch exists on the remote.
@@ -1675,6 +1738,68 @@ def _worktree_registration_gitdir(registration_dir: Path) -> Path | None:
     else:
         recorded_path = recorded_path.resolve(strict=False)
     return recorded_path
+
+
+def _read_worktree_admin_file(path: Path) -> str | None:
+    """Return stripped admin-file content when readable."""
+    try:
+        content = path.read_text().strip()
+    except OSError:
+        return None
+    return content or None
+
+
+def _known_container_git_root_marker(value: str) -> str | None:
+    """Return the known container-only git root marker embedded in ``value``."""
+    return "/gza-git" if "/gza-git" in value else None
+
+
+def validate_host_worktree_admin_metadata(git: "Git") -> WorktreeAdminMetadataValidation:
+    """Inspect shared ``.git/worktrees`` admin files for host-invalid metadata."""
+    common_dir = _git_common_dir(git)
+    worktrees_dir = common_dir / "worktrees"
+    if not worktrees_dir.is_dir():
+        return WorktreeAdminMetadataValidation(common_dir=common_dir, issues=())
+
+    issues: list[WorktreeAdminMetadataIssue] = []
+    for registration_dir in sorted(worktrees_dir.iterdir()):
+        if not registration_dir.is_dir():
+            continue
+        registration_name = registration_dir.name
+        for admin_file, expected_value in (("commondir", "../.."), ("gitdir", None)):
+            admin_path = registration_dir / admin_file
+            value = _read_worktree_admin_file(admin_path)
+            if value is None:
+                continue
+            marker = _known_container_git_root_marker(value)
+            if marker is None:
+                continue
+            if admin_file == "commondir":
+                problem = "containerized-commondir"
+                details = (
+                    f"{admin_path} contains container-only path '{value}'; "
+                    "host commondir metadata should stay relative to the canonical repository."
+                )
+            else:
+                problem = "containerized-gitdir"
+                details = (
+                    f"{admin_path} contains container-only path '{value}'; "
+                    "host gitdir metadata must not point at container-only mounts."
+                )
+            issues.append(
+                WorktreeAdminMetadataIssue(
+                    registration_name=registration_name,
+                    admin_file=admin_file,
+                    admin_path=admin_path,
+                    value=value,
+                    problem=problem,
+                    details=details,
+                    expected_value=expected_value,
+                    suspected_container_path_marker=marker,
+                )
+            )
+
+    return WorktreeAdminMetadataValidation(common_dir=common_dir, issues=tuple(issues))
 
 
 def remove_worktree_registration_for_path(git: "Git", path: Path) -> Path | None:
