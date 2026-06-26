@@ -60,6 +60,21 @@ This invariant is narrower than the reclaim gate:
   sibling task's live worktree registration.
 - If a task needs agent-side git, it MUST run in a git context whose registry is private to
   that task rather than against the canonical shared worktree registry.
+- Provider containers MUST NOT expose the canonical checkout's shared `.git` as an ambient
+  gitdir path. Mutating provider-side git commands MUST be scoped to the prepared task
+  workspace and fail closed when launched from unrelated provider directories or when
+  gitdir/worktree-targeting environment overrides resolve outside the prepared task pair.
+  From a non-workspace cwd, `--work-tree /workspace` alone MUST NOT be treated as sufficient
+  pinning; the command MUST either run via `git -C /workspace ...` or provide the prepared
+  gitdir/worktree pair explicitly so git cannot infer a mounted metadata directory from
+  `PWD`. Any temporary host metadata rewrite used to prepare that task pair MUST be
+  restored immediately after provider execution leaves the runner/provider boundary, before
+  host-side completion, WIP capture, timeout checkpointing, or other host-owned git
+  bookkeeping runs.
+- Automation MUST check the configured canonical checkout after provider execution and
+  during watch passes. If it is no longer on the expected default branch, it MAY restore the
+  expected branch only when there are no tracked changes; with tracked changes present it
+  MUST leave the checkout untouched and surface `canonical-main-checkout-hijacked`.
 
 The goal is structural, not advisory: "another task's worktree disappeared from git's
 registry" MUST be impossible as a side effect of provider-side git for a different task.

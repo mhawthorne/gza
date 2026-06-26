@@ -476,6 +476,7 @@ class GeminiProvider(Provider):
             config.timeout_minutes,
             config.docker_volumes,
             config.docker_setup_command,
+            getattr(config, "docker_env", None),
             getattr(config, "docker_workdir", "/workspace"),
         )
         # Insert Gemini headless env before the image name (last element from build_docker_cmd).

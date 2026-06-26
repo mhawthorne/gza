@@ -738,7 +738,7 @@ class TestSkillContentValidation:
 
         assert "If the caller named a target branch (for example `master`), use that exact branch name." in content
         assert "Do not substitute `main` or any other default." in content
-        assert "git symbolic-ref --quiet --short refs/remotes/origin/HEAD" in content
+        assert 'git -C "$GZA_WORKTREE_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD' in content
         assert "whichever of `main` or `master` exists locally" in content
         assert "If no primary branch can be determined, stop and report the failure instead of assuming `main`." in content
 

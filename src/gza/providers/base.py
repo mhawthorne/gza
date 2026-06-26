@@ -78,6 +78,257 @@ chmod +x /tmp/gza-shims/gza
 export PATH="/tmp/gza-shims:/workspace/bin:$PATH"
 """
 
+GZA_GIT_GUARD_SETUP_COMMAND = """\
+mkdir -p /tmp/gza-shims
+cat > /tmp/gza-shims/git <<'EOF'
+#!/bin/sh
+real_git="${GZA_REAL_GIT:-/usr/bin/git}"
+worktree_root="${GZA_WORKTREE_ROOT:-/workspace}"
+container_gitdir="${GZA_CONTAINER_GITDIR:-}"
+container_common_gitdir="${GZA_CONTAINER_COMMON_GITDIR:-}"
+cmd=""
+explicit_chdir_workspace=0
+explicit_gitdir=""
+explicit_worktree=""
+
+path_is_workspace() {
+    case "$1" in
+        "$worktree_root"|"$worktree_root"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+path_is_allowed_gitdir() {
+    if [ -z "$container_gitdir" ]; then
+        return 1
+    fi
+    case "$1" in
+        "$container_gitdir"|"$container_gitdir"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+path_is_allowed_common_gitdir() {
+    if [ -z "$container_common_gitdir" ]; then
+        return 1
+    fi
+    case "$1" in
+        "$container_common_gitdir"|"$container_common_gitdir"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+path_is_prepared_metadata() {
+    path_is_allowed_gitdir "$1" || path_is_allowed_common_gitdir "$1"
+}
+
+expect_value=""
+seen_double_dash=0
+
+for arg in "$@"; do
+    if [ "$seen_double_dash" = 1 ]; then
+        cmd="$arg"
+        break
+    fi
+
+    if [ -n "$cmd" ]; then
+        continue
+    fi
+
+    if [ -n "$expect_value" ]; then
+        value="$arg"
+        case "$expect_value" in
+            -C)
+                if path_is_workspace "$value"; then
+                    explicit_chdir_workspace=1
+                fi
+                ;;
+            --work-tree)
+                explicit_worktree="$value"
+                ;;
+            --git-dir)
+                explicit_gitdir="$value"
+                ;;
+            -c|--namespace)
+                ;;
+        esac
+        expect_value=""
+        continue
+    fi
+
+    case "$arg" in
+        --)
+            seen_double_dash=1
+            continue
+            ;;
+        -c)
+            expect_value="-c"
+            continue
+            ;;
+        -c=*)
+            continue
+            ;;
+        -C)
+            expect_value="-C"
+            continue
+            ;;
+        -C?*)
+            value="${arg#-C}"
+            if path_is_workspace "$value"; then
+                explicit_chdir_workspace=1
+            fi
+            continue
+            ;;
+        --work-tree)
+            expect_value="--work-tree"
+            continue
+            ;;
+        --work-tree=*)
+            value="${arg#--work-tree=}"
+            explicit_worktree="$value"
+            continue
+            ;;
+        --git-dir)
+            expect_value="--git-dir"
+            continue
+            ;;
+        --git-dir=*)
+            explicit_gitdir="${arg#--git-dir=}"
+            continue
+            ;;
+        --namespace)
+            expect_value="--namespace"
+            continue
+            ;;
+        --namespace=*)
+            continue
+            ;;
+        -*)
+            continue
+            ;;
+        *)
+            cmd="$arg"
+            break
+            ;;
+    esac
+done
+
+case "$cmd" in
+    add|branch|checkout|cherry-pick|clean|commit|merge|mv|push|rebase|reset|restore|revert|rm|stash|switch|update-ref|worktree)
+        command_class="mutating"
+        ;;
+    annotate|blame|cat-file|describe|diff|diff-tree|grep|log|ls-files|ls-remote|name-rev|remote|rev-list|rev-parse|show|show-ref|status|symbolic-ref|tag|version|whatchanged)
+        command_class="read_only"
+        ;;
+    "")
+        command_class="unknown"
+        ;;
+    *)
+        command_class="unknown"
+        ;;
+esac
+
+case "$PWD" in
+    "$worktree_root"|"$worktree_root"/*)
+        cwd_workspace=1
+        ;;
+    *)
+        cwd_workspace=0
+        ;;
+esac
+
+if path_is_prepared_metadata "$PWD"; then
+    cwd_prepared_metadata=1
+else
+    cwd_prepared_metadata=0
+fi
+
+if [ -n "$explicit_gitdir" ] && ! path_is_allowed_gitdir "$explicit_gitdir"; then
+    echo "gza git guard: refusing explicit --git-dir outside prepared task metadata" >&2
+    exit 128
+fi
+
+if [ -n "$explicit_worktree" ] && ! path_is_workspace "$explicit_worktree"; then
+    echo "gza git guard: refusing explicit --work-tree outside $worktree_root" >&2
+    exit 128
+fi
+
+if [ -n "${GIT_DIR:-}" ] && ! path_is_allowed_gitdir "$GIT_DIR"; then
+    echo "gza git guard: refusing GIT_DIR outside prepared task metadata" >&2
+    exit 128
+fi
+
+if [ -n "${GIT_WORK_TREE:-}" ] && ! path_is_workspace "$GIT_WORK_TREE"; then
+    echo "gza git guard: refusing GIT_WORK_TREE outside $worktree_root" >&2
+    exit 128
+fi
+
+if [ -n "${GIT_COMMON_DIR:-}" ] && ! path_is_allowed_common_gitdir "$GIT_COMMON_DIR"; then
+    echo "gza git guard: refusing GIT_COMMON_DIR outside prepared task metadata" >&2
+    exit 128
+fi
+
+explicit_worktree_workspace=0
+if [ -n "$explicit_worktree" ] && path_is_workspace "$explicit_worktree"; then
+    explicit_worktree_workspace=1
+fi
+
+env_gitdir_allowed=0
+if [ -n "${GIT_DIR:-}" ] && path_is_allowed_gitdir "$GIT_DIR"; then
+    env_gitdir_allowed=1
+fi
+
+explicit_gitdir_allowed=0
+if [ -n "$explicit_gitdir" ] && path_is_allowed_gitdir "$explicit_gitdir"; then
+    explicit_gitdir_allowed=1
+fi
+
+env_worktree_workspace=0
+if [ -n "${GIT_WORK_TREE:-}" ] && path_is_workspace "$GIT_WORK_TREE"; then
+    env_worktree_workspace=1
+fi
+
+prepared_gitdir=0
+if [ "$explicit_gitdir_allowed" = 1 ] || [ "$env_gitdir_allowed" = 1 ]; then
+    prepared_gitdir=1
+fi
+
+prepared_worktree=0
+if [ "$explicit_worktree_workspace" = 1 ] || [ "$env_worktree_workspace" = 1 ]; then
+    prepared_worktree=1
+fi
+
+if [ "$prepared_gitdir" = 1 ] && [ "$prepared_worktree" = 1 ]; then
+    prepared_pair=1
+else
+    prepared_pair=0
+fi
+
+if [ "$cwd_workspace" = 0 ] && [ "$explicit_chdir_workspace" = 0 ] && [ "$prepared_pair" = 0 ]; then
+    case "$command_class" in
+        read_only)
+            echo "gza git guard: refusing read-only git '$cmd' outside $worktree_root without explicit workspace targeting" >&2
+            ;;
+        mutating)
+            if [ "$cwd_prepared_metadata" = 1 ]; then
+                echo "gza git guard: refusing mutating git '$cmd' from mounted git metadata without the prepared gitdir/worktree pair" >&2
+            else
+                echo "gza git guard: refusing mutating git '$cmd' outside $worktree_root" >&2
+            fi
+            ;;
+        *)
+            echo "gza git guard: refusing unknown git command '$cmd' outside $worktree_root" >&2
+            ;;
+    esac
+    echo "Run git from $worktree_root, pass -C $worktree_root explicitly, or pass both --git-dir $container_gitdir and --work-tree $worktree_root." >&2
+    exit 128
+fi
+
+exec "$real_git" "$@"
+EOF
+chmod +x /tmp/gza-shims/git
+"""
+
 _PROVIDER_CONFIG_ERROR_TYPES = frozenset(
     {
         "authentication_error",
@@ -365,6 +616,7 @@ def build_docker_cmd(
     timeout_minutes: int,
     docker_volumes: list[str] | None = None,
     docker_setup_command: str = "",
+    docker_env: list[str] | None = None,
     docker_workdir: str = "/workspace",
     interactive: bool = False,
 ) -> list[str]:
@@ -376,6 +628,7 @@ def build_docker_cmd(
         timeout_minutes: Timeout in minutes
         docker_volumes: Optional list of custom volume mounts (e.g., ["/host:/container:ro"])
         docker_setup_command: Optional setup command to run inside container before CLI starts
+        docker_env: Optional environment variable assignments to inject (e.g. ["KEY=value"])
         docker_workdir: Working directory inside the container
         interactive: If True, allocate a TTY (-it) for interactive use (e.g. attach handoff).
             When False, attach only stdin (-i) which is required for streaming-json pipe mode.
@@ -432,10 +685,17 @@ def build_docker_cmd(
                 pass
 
     # Always install a `gza` shim so bare `gza ...` works inside task containers.
-    setup_commands: list[str] = [GZA_SHIM_SETUP_COMMAND.strip()]
+    setup_commands: list[str] = [
+        GZA_SHIM_SETUP_COMMAND.strip(),
+        GZA_GIT_GUARD_SETUP_COMMAND.strip(),
+    ]
     if docker_setup_command.strip():
         setup_commands.append(docker_setup_command.strip())
     combined_setup_command = "\n".join(setup_commands)
+    if docker_env:
+        for env_value in docker_env:
+            cmd.extend(["-e", env_value])
+    cmd.extend(["-e", "GZA_WORKTREE_ROOT=/workspace"])
     cmd.extend(["-e", f"GZA_DOCKER_SETUP_COMMAND={combined_setup_command}"])
 
     cmd.append(docker_config.image_name)

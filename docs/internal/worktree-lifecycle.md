@@ -112,14 +112,28 @@ Post-approval comment handling in `gza watch` now re-enters the implementation c
 ## Docker and git ownership boundary
 
 Docker-backed providers do not receive an implicit bind mount of the canonical repository's
-shared `.git` directory. Ordinary task containers therefore cannot accidentally mutate the
-canonical `.git/worktrees` registry.
+shared `.git` directory. The canonical host-path `.git` is therefore not ambient inside
+provider containers. For ordinary code tasks whose worktree uses a
+`.git` file, the runner temporarily rewrites that file and its gitdir `commondir` to
+container-only `/gza-git/...` paths, mounts the matching metadata for the provider run, and
+restores the host metadata before host-side completion, WIP capture, timeout checkpointing,
+or other runner-owned git bookkeeping resumes.
 
 When agent-side git is required for rebase conflict resolution, gza creates a private
 checkout with its own `.git/` directory for that provider run. Any git housekeeping inside
 that checkout, including `git worktree prune`, is scoped to the private checkout's own
 registry. Canonical branch updates and publication still happen host-side after the result
 is imported back.
+
+Provider containers set `GZA_WORKTREE_ROOT=/workspace`, inject `GZA_CONTAINER_GITDIR` when
+task metadata is prepared, and install a `git` guard before the real git binary in `PATH`.
+Mutating git commands must run from `/workspace` or explicitly target it with `-C
+/workspace`, and explicit or env-based gitdir/worktree targets must match the prepared task
+metadata; commands launched from provider home/config paths fail closed. After Docker-backed provider
+runs and at watch pass boundaries, gza also checks that the configured canonical checkout is
+still on the expected default branch. Clean drift is restored and logged; dirty drift is
+left untouched and surfaced as
+`canonical-main-checkout-hijacked`.
 
 ## Cleanup safety
 

@@ -952,9 +952,9 @@ def test_gza_rebase_docs_match_final_verify_contract() -> None:
     assert "Do not report success yet." in skill_content
     assert "Do NOT use remote git operations." in skill_content
     assert "In default mode: if any exist, stop and ask the user to commit or stash them" in skill_content
-    assert "In `--auto` mode: if any exist, run `git stash` to save them." in skill_content
+    assert 'In `--auto` mode: if any exist, run `git -C "$GZA_WORKTREE_ROOT" stash push -u` to save them.' in skill_content
     assert "If the caller named a target branch (for example `master`), use that exact branch name." in skill_content
-    assert "git symbolic-ref --quiet --short refs/remotes/origin/HEAD" in skill_content
+    assert 'git -C "$GZA_WORKTREE_ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD' in skill_content
     assert "Do not substitute `main`" in skill_content
     assert "read `verify_command` directly from `gza.yaml`" in skill_content
 

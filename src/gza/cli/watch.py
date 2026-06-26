@@ -19,6 +19,7 @@ from rich.text import Text
 
 from .. import colors as _colors, lineage
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
+from ..canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canonical_checkout_invariant
 from ..concurrency import (
     LaunchPermit,
     MaxConcurrentTasksError,
@@ -2705,6 +2706,33 @@ def _run_cycle(
     started_task_ids: set[str] = set()
     step1_handled_child_task_ids: set[str] = set()
 
+    def _check_canonical_checkout_boundary(action: str) -> None:
+        if dry_run:
+            return
+        watch_ops_log = config.project_dir / ".gza" / "watch.ops.jsonl"
+        status = check_canonical_checkout_invariant(
+            config,
+            expected_branch=plan.analysis.target_branch,
+            action=action,
+            ops_log_file=watch_ops_log,
+            canonical_git=git,
+        )
+        if not status.restored and not status.needs_attention:
+            return
+        dirty = ", ".join(status.dirty_tracked_paths[:5])
+        if len(status.dirty_tracked_paths) > 5:
+            dirty += ", ..."
+        detail = f"; tracked changes: {dirty}" if dirty else ""
+        restored = " restored" if status.restored else ""
+        log.emit_attention(
+            attention_key=f"{CANONICAL_CHECKOUT_ATTENTION_REASON}:{action}",
+            message=(
+                f"{CANONICAL_CHECKOUT_ATTENTION_REASON}: canonical checkout was on "
+                f"{status.current_branch or 'unknown'}, expected {status.expected_branch};"
+                f"{restored or ' operator attention required'}{detail}"
+            ),
+        )
+
     if emit_cycle_header:
         log.emit(
             "WAKE",
@@ -2760,6 +2788,7 @@ def _run_cycle(
     git = Git(config.project_dir)
     analysis = plan.analysis
     target_branch = analysis.target_branch
+    _check_canonical_checkout_boundary("watch-pass-start")
     for gap in analysis.scope_gaps:
         log.emit_attention(
             attention_key=f"scope-gap:{gap.owner_id}:{gap.blocking_child_id}",
@@ -4273,6 +4302,7 @@ def _run_cycle(
                 )
 
     pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
+    _check_canonical_checkout_boundary("watch-pass-end")
     _emit_cycle_attention_summary(log)
     if end_cycle:
         log.end_cycle()

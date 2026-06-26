@@ -916,6 +916,7 @@ class CodexProvider(Provider):
             config.timeout_minutes,
             config.docker_volumes,
             config.docker_setup_command,
+            getattr(config, "docker_env", None),
             getattr(config, "docker_workdir", "/workspace"),
         )
 

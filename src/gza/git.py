@@ -463,6 +463,9 @@ class Git:
         The status codes follow git's porcelain format (M, A, D, ??, etc.).
         """
         result = self._run("status", "--porcelain", check=False)
+        if result.returncode != 0:
+            error_output = result.stderr or result.stdout
+            raise GitError(f"git status --porcelain failed:\n{error_output}")
         entries: set[tuple[str, str]] = set()
         for line in result.stdout.splitlines():
             if not line:
