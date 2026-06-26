@@ -8594,6 +8594,63 @@ class TestTaskClaimSafety:
         assert refreshed is not None
         assert refreshed.execution_mode == "foreground_inline"
 
+    def test_run_git_startup_failure_logs_canonical_payload(self, tmp_path: Path):
+        """Direct run startup git failures should populate the task log before failure marking."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Startup git failure", task_type="implement")
+
+        config = self._make_config(tmp_path, db_path)
+        setup_error = "fatal: not a git repository: .git"
+        with (
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider") as mock_get_provider,
+            patch("gza.runner.Git") as mock_git_class,
+        ):
+            mock_provider = Mock()
+            mock_provider.name = "TestProvider"
+            mock_provider.supports_interactive_foreground = False
+            mock_provider.check_credentials.return_value = True
+            mock_provider.verify_credentials.return_value = PreflightCheckResult.success()
+            mock_get_provider.return_value = mock_provider
+
+            mock_git = Mock()
+            mock_git.default_branch.side_effect = GitError(setup_error)
+            mock_git_class.return_value = mock_git
+
+            result = run(config, task_id=task.id, resume=False)
+
+        assert result == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.log_file is not None
+
+        log_file = tmp_path / refreshed.log_file
+        log_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        startup_failure = next(entry for entry in log_entries if entry.get("subtype") == "startup_failure")
+        assert startup_failure["message"] == setup_error
+        assert startup_failure["phase"] == "runner_startup"
+        assert startup_failure["setup_phase"] == "default_branch"
+        assert startup_failure["failure_reason"] == "GIT_ERROR"
+        assert startup_failure["error_detail"] == setup_error
+
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["message"] == setup_error
+        assert outcome["failure_reason"] == "GIT_ERROR"
+        assert any(entry.get("subtype") == "execution" for entry in ops_entries)
+
     @pytest.mark.parametrize(
         ("failure_stage", "invocation", "expected_reason", "expected_message"),
         [
@@ -18016,7 +18073,7 @@ class TestExceptionHandlerMarkFailed:
     """Tests that exception handlers in _run_inner and _run_non_code_task mark tasks as failed."""
 
     def test_code_task_worktree_setup_failure_writes_ops_outcome(self, tmp_path: Path):
-        """Code-task worktree setup failures should leave a canonical ops outcome."""
+        """Code-task worktree setup failures should populate the canonical task log and ops log."""
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
             "project_id: default\n"
@@ -18059,6 +18116,19 @@ class TestExceptionHandlerMarkFailed:
 
         log_file = config.project_dir / refreshed.log_file
         assert log_file.exists()
+        log_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        startup_failure = next(entry for entry in log_entries if entry.get("subtype") == "startup_failure")
+        assert startup_failure["message"] == setup_error
+        assert startup_failure["failure_reason"] == "GIT_ERROR"
+        assert startup_failure["phase"] == "workspace_setup"
+        assert startup_failure["setup_phase"] == "worktree_add"
+        assert startup_failure["branch"] == "feature/setup-logging"
+        assert startup_failure["error_detail"] == setup_error
+
         ops_entries = [
             json.loads(line)
             for line in ops_log_path_for(log_file).read_text().splitlines()
@@ -18074,6 +18144,7 @@ class TestExceptionHandlerMarkFailed:
 
     def test_code_task_empty_workspace_fails_before_provider_run_and_is_retryable_infra(self, tmp_path: Path) -> None:
         """An unpopulated prepared workspace must abort before any provider turn."""
+
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
             "project_id: default\n"
@@ -18143,6 +18214,59 @@ class TestExceptionHandlerMarkFailed:
         assert outcome["setup_phase"] == "workspace_population_probe"
         assert "before provider run" in outcome["message"]
         assert not any(entry.get("subtype") == "stats" for entry in ops_entries)
+
+    def test_code_task_worktree_setup_failure_preserves_infrastructure_reason_in_logs(self, tmp_path: Path):
+        """Container-metadata startup failures should stay classified as infrastructure errors."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement setup logging", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260626-implement-setup-logging-infra"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git._run.return_value = Mock(returncode=1)
+        setup_error = "fatal: cannot chdir to '/gza-git/common': No such file or directory"
+        git.worktree_add.side_effect = GitError(setup_error)
+
+        with patch("gza.runner._resolve_code_task_branch_name", return_value="feature/setup-logging"):
+            rc = _run_inner(task, config, config, store, provider, git, resume=False)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
+        assert refreshed.log_file is not None
+
+        log_file = config.project_dir / refreshed.log_file
+        log_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        startup_failure = next(entry for entry in log_entries if entry.get("subtype") == "startup_failure")
+        assert startup_failure["message"] == setup_error
+        assert startup_failure["failure_reason"] == "INFRASTRUCTURE_ERROR"
+        assert startup_failure["setup_phase"] == "worktree_add"
+        assert "/gza-git/common" in startup_failure["error_detail"]
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["failure_reason"] == "INFRASTRUCTURE_ERROR"
+        assert outcome["message"] == setup_error
 
     def test_code_task_workspace_probe_ignores_extra_source_marker_candidates(self, tmp_path: Path) -> None:
         """Extra marker-looking files in the source checkout must not fail a populated worktree."""
@@ -18354,6 +18478,18 @@ class TestExceptionHandlerMarkFailed:
 
         log_file = config.project_dir / refreshed.log_file
         assert log_file.exists()
+        log_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        startup_failure = next(entry for entry in log_entries if entry.get("subtype") == "startup_failure")
+        assert startup_failure["message"] == setup_error
+        assert startup_failure["failure_reason"] == "GIT_ERROR"
+        assert startup_failure["phase"] == "workspace_setup"
+        assert startup_failure["setup_phase"] == "detached_worktree"
+        assert startup_failure["error_detail"] == setup_error
+
         ops_entries = [
             json.loads(line)
             for line in ops_log_path_for(log_file).read_text().splitlines()

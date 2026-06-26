@@ -1581,12 +1581,72 @@ class WorkspaceSetupResult:
     failure_reason: str = "GIT_ERROR"
     phase: str = "workspace_setup"
     branch: str | None = None
+    error_type: str | None = None
+    error_detail: str | None = None
 
     def __bool__(self) -> bool:
         return self.ok
 
 
-def _mark_workspace_setup_failure(
+@dataclass(frozen=True)
+class StartupFailureRecord:
+    """Structured startup failure persisted before normal task execution begins."""
+
+    message: str
+    failure_reason: str
+    phase: str
+    setup_phase: str
+    branch: str | None = None
+    error_type: str | None = None
+    error_detail: str | None = None
+
+
+def _build_startup_failure_record(
+    *,
+    phase: str,
+    setup_phase: str,
+    message: str,
+    branch: str | None = None,
+    failure_reason: str | None = None,
+    error: BaseException | None = None,
+) -> StartupFailureRecord:
+    """Build a structured startup failure record with resolved classification."""
+    resolved_failure_reason = failure_reason
+    if resolved_failure_reason is None:
+        if error is not None:
+            resolved_failure_reason = _resolved_git_failure(error).reason
+        elif git_error_indicates_containerized_worktree_metadata_failure(message):
+            resolved_failure_reason = "INFRASTRUCTURE_ERROR"
+        else:
+            resolved_failure_reason = "GIT_ERROR"
+    detail = ""
+    if error is not None:
+        detail = str(error).strip()
+    if not detail:
+        detail = message.strip()
+    return StartupFailureRecord(
+        message=message,
+        failure_reason=resolved_failure_reason,
+        phase=phase,
+        setup_phase=setup_phase,
+        branch=branch,
+        error_type=error.__class__.__name__ if error is not None else None,
+        error_detail=detail or None,
+    )
+
+
+def _append_jsonl_entry(path: Path, payload: Mapping[str, Any]) -> None:
+    """Append one raw JSONL payload to ``path`` without rerouting to ops."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(dict(payload)) + "\n")
+            f.flush()
+    except Exception:
+        logger.warning("Failed to append JSONL entry to %s", path, exc_info=True)
+
+
+def _record_startup_failure(
     *,
     task: Task,
     config: Config,
@@ -1595,18 +1655,15 @@ def _mark_workspace_setup_failure(
     invocation: RunInvocationContext | None,
     interaction_mode: str,
     resume: bool,
-    message: str,
-    failure_reason: str = "GIT_ERROR",
-    phase: str = "workspace_setup",
-    branch: str | None = None,
+    failure: StartupFailureRecord,
     exit_code: int = 1,
     prelude_written: bool = False,
 ) -> None:
     """Write a canonical setup-failure outcome before marking the task failed."""
     log_file = ensure_task_log_path(config, store, task)
     provider_name = provider if isinstance(provider, str) else provider.name
-    if branch and not task.branch:
-        task.branch = branch
+    if failure.branch and not task.branch:
+        task.branch = failure.branch
         store.update(task)
 
     if not prelude_written:
@@ -1615,14 +1672,14 @@ def _mark_workspace_setup_failure(
             log_file,
             {"type": "gza", "subtype": "info", "message": f"Task: {task.id} {task.slug}"},
         )
-        if branch:
+        if failure.branch:
             write_log_entry(
                 log_file,
                 {
                     "type": "gza",
                     "subtype": "branch",
-                    "message": f"Branch: {branch}",
-                    "branch": branch,
+                    "message": f"Branch: {failure.branch}",
+                    "branch": failure.branch,
                 },
             )
         write_log_entry(
@@ -1641,17 +1698,35 @@ def _mark_workspace_setup_failure(
             resumed=resume,
         )
 
+    startup_payload: dict[str, Any] = {
+        "type": "gza",
+        "subtype": "startup_failure",
+        "message": failure.message,
+        "exit_code": exit_code,
+        "failure_reason": failure.failure_reason,
+        "phase": failure.phase,
+        "setup_phase": failure.setup_phase,
+    }
+    if failure.branch:
+        startup_payload["branch"] = failure.branch
+    if failure.error_type:
+        startup_payload["error_type"] = failure.error_type
+    if failure.error_detail:
+        startup_payload["error_detail"] = failure.error_detail
+
+    _append_jsonl_entry(log_file, startup_payload)
+    write_log_entry(log_file, startup_payload)
     write_log_entry(
         log_file,
         {
             "type": "gza",
             "subtype": "outcome",
-            "message": message,
+            "message": failure.message,
             "exit_code": exit_code,
-            "failure_reason": failure_reason,
-            "phase": "workspace_setup",
-            "setup_phase": phase,
-            **({"branch": branch} if branch else {}),
+            "failure_reason": failure.failure_reason,
+            "phase": failure.phase,
+            "setup_phase": failure.setup_phase,
+            **({"branch": failure.branch} if failure.branch else {}),
         },
     )
     _mark_task_failed(
@@ -1659,8 +1734,8 @@ def _mark_workspace_setup_failure(
         config=config,
         store=store,
         log_file=log_file,
-        branch=branch,
-        explicit_reason=failure_reason,
+        branch=failure.branch,
+        explicit_reason=failure.failure_reason,
         error_type=None,
         exit_code=exit_code,
     )
@@ -7241,7 +7316,27 @@ def run(
 
     # Setup git on the main repo (for worktree operations)
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
+    try:
+        default_branch = git.default_branch()
+    except GitError as exc:
+        message = str(exc)
+        error_message(f"Git error: {message}")
+        _record_startup_failure(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation_context,
+            interaction_mode=resolved_interaction_mode,
+            resume=resume,
+            failure=_build_startup_failure_record(
+                phase="runner_startup",
+                setup_phase="default_branch",
+                message=message,
+                error=exc,
+            ),
+        )
+        return 1
 
     # Refresh origin/default_branch when possible, then choose the worktree base later via
     # _select_worktree_base_ref(), which prefers the local default branch unless origin is
@@ -7255,20 +7350,40 @@ def run(
     # Always generate when slug is not set (new tasks, including new resume tasks).
     # Keep existing slug only when resuming a task that already has one assigned.
     if task.slug is None:
-        slug_override = _compute_slug_override(task, store)
-        task.slug = generate_slug(
-            task.prompt,
-            existing_id=None,
-            log_path=config.log_path,
-            git=git,
-            store=store,
-            exclude_task_id=task.id,
-            project_name=config.project_name,
-            project_prefix=config.project_prefix,
-            slug_override=slug_override,
-            branch_strategy=config.branch_strategy,
-            explicit_type=task.task_type_hint,
-        )
+        try:
+            slug_override = _compute_slug_override(task, store)
+            task.slug = generate_slug(
+                task.prompt,
+                existing_id=None,
+                log_path=config.log_path,
+                git=git,
+                store=store,
+                exclude_task_id=task.id,
+                project_name=config.project_name,
+                project_prefix=config.project_prefix,
+                slug_override=slug_override,
+                branch_strategy=config.branch_strategy,
+                explicit_type=task.task_type_hint,
+            )
+        except GitError as exc:
+            message = str(exc)
+            error_message(f"Git error: {message}")
+            _record_startup_failure(
+                task=task,
+                config=config,
+                store=store,
+                provider=provider,
+                invocation=invocation_context,
+                interaction_mode=resolved_interaction_mode,
+                resume=resume,
+                failure=_build_startup_failure_record(
+                    phase="runner_startup",
+                    setup_phase="slug_generation",
+                    message=message,
+                    error=exc,
+                ),
+            )
+            return 1
     if task.slug and task.log_file:
         startup_log = config.project_dir / Path(task.log_file)
         if startup_log.name.endswith(".startup.log"):
@@ -7532,11 +7647,15 @@ def _setup_code_task_worktree(
         except GitError as e:
             message = f"Could not check out branch {branch_name} in worktree: {e}"
             error_message(f"Error: {message}")
+            resolved_failure = _resolved_git_failure(e)
             return WorkspaceSetupResult(
                 ok=False,
                 message=message,
+                failure_reason=resolved_failure.reason,
                 phase="worktree_add_existing",
                 branch=branch_name,
+                error_type=e.__class__.__name__,
+                error_detail=str(e),
             )
 
     # Delete existing branch if in single mode (worktree_add will recreate it)
@@ -7553,11 +7672,15 @@ def _setup_code_task_worktree(
     except GitError as e:
         message = str(e)
         error_message(f"Git error: {message}")
+        resolved_failure = _resolved_git_failure(e)
         return WorkspaceSetupResult(
             ok=False,
             message=message,
+            failure_reason=resolved_failure.reason,
             phase="worktree_add",
             branch=branch_name,
+            error_type=e.__class__.__name__,
+            error_detail=message,
         )
 
 
@@ -8534,7 +8657,7 @@ def _run_inner(
     except GitError as exc:
         message = str(exc)
         error_message(f"Git error: {message}")
-        _mark_workspace_setup_failure(
+        _record_startup_failure(
             task=task,
             config=config,
             store=store,
@@ -8542,8 +8665,12 @@ def _run_inner(
             invocation=invocation,
             interaction_mode=interaction_mode,
             resume=resume,
-            message=message,
-            phase="default_branch",
+            failure=_build_startup_failure_record(
+                phase="workspace_setup",
+                setup_phase="default_branch",
+                message=message,
+                error=exc,
+            ),
         )
         return 1
 
@@ -8552,7 +8679,7 @@ def _run_inner(
     except GitError as exc:
         message = str(exc)
         error_message(f"Git error: {message}")
-        _mark_workspace_setup_failure(
+        _record_startup_failure(
             task=task,
             config=config,
             store=store,
@@ -8560,8 +8687,12 @@ def _run_inner(
             invocation=invocation,
             interaction_mode=interaction_mode,
             resume=resume,
-            message=message,
-            phase="branch_resolution",
+            failure=_build_startup_failure_record(
+                phase="workspace_setup",
+                setup_phase="branch_resolution",
+                message=message,
+                error=exc,
+            ),
         )
         return 1
     if branch_name is None:
@@ -8610,7 +8741,7 @@ def _run_inner(
         except (GitError, OSError, RuntimeError) as exc:
             message = str(exc)
             error_message(f"Git error: {message}")
-            _mark_workspace_setup_failure(
+            _record_startup_failure(
                 task=task,
                 config=config,
                 store=store,
@@ -8618,9 +8749,13 @@ def _run_inner(
                 invocation=invocation,
                 interaction_mode=interaction_mode,
                 resume=resume,
-                message=message,
-                phase="isolated_checkout",
-                branch=branch_name,
+                failure=_build_startup_failure_record(
+                    phase="workspace_setup",
+                    setup_phase="isolated_checkout",
+                    message=message,
+                    branch=branch_name,
+                    error=exc,
+                ),
             )
             return 1
         worktree_path = isolated_checkout.path
@@ -8638,15 +8773,24 @@ def _run_inner(
         if not setup_result:
             if isinstance(setup_result, WorkspaceSetupResult):
                 message = setup_result.message or f"Could not create worktree for branch {branch_name}"
-                failure_reason = setup_result.failure_reason
-                phase = setup_result.phase
-                failed_branch = setup_result.branch or branch_name
+                startup_failure = StartupFailureRecord(
+                    message=message,
+                    failure_reason=setup_result.failure_reason,
+                    phase="workspace_setup",
+                    setup_phase=setup_result.phase,
+                    branch=setup_result.branch or branch_name,
+                    error_type=setup_result.error_type,
+                    error_detail=setup_result.error_detail or message,
+                )
             else:
-                message = f"Could not create worktree for branch {branch_name}"
-                failure_reason = "GIT_ERROR"
-                phase = "worktree_add"
-                failed_branch = branch_name
-            _mark_workspace_setup_failure(
+                startup_failure = _build_startup_failure_record(
+                    phase="workspace_setup",
+                    setup_phase="worktree_add",
+                    message=f"Could not create worktree for branch {branch_name}",
+                    branch=branch_name,
+                    failure_reason="GIT_ERROR",
+                )
+            _record_startup_failure(
                 task=task,
                 config=config,
                 store=store,
@@ -8654,10 +8798,7 @@ def _run_inner(
                 invocation=invocation,
                 interaction_mode=interaction_mode,
                 resume=resume,
-                message=message,
-                failure_reason=failure_reason,
-                phase=phase,
-                branch=failed_branch,
+                failure=startup_failure,
             )
             return 1
 
@@ -9736,7 +9877,7 @@ def _run_non_code_task(
         message = str(e)
         resolved_failure = _resolved_git_failure(e)
         error_message(f"Git error: {message}")
-        _mark_workspace_setup_failure(
+        _record_startup_failure(
             task=task,
             config=config,
             store=store,
@@ -9744,9 +9885,14 @@ def _run_non_code_task(
             invocation=invocation,
             interaction_mode=interaction_mode,
             resume=resume,
-            message=message,
-            failure_reason=resolved_failure.reason,
-            phase="detached_worktree",
+            failure=StartupFailureRecord(
+                message=message,
+                failure_reason=resolved_failure.reason,
+                phase="workspace_setup",
+                setup_phase="detached_worktree",
+                error_type=e.__class__.__name__,
+                error_detail=message,
+            ),
             prelude_written=True,
         )
         return 1
