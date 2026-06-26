@@ -4243,6 +4243,149 @@ def test_collect_live_running_state_counts_anonymous_live_worker(tmp_path: Path)
     assert anonymous_worker_count == 1
 
 
+def test_watch_dispatch_start_state_treats_pending_task_with_live_registered_worker_as_started(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    pending_task = store.add("Pending worker-claimed soon", task_type="implement")
+    assert pending_task.id is not None
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = [
+        WorkerMetadata(worker_id="w-1", task_id=pending_task.id, pid=4242, status="running"),
+    ]
+    registry.is_running.return_value = True
+
+    with patch("gza.concurrency.WorkerRegistry", return_value=registry):
+        started, reason, refreshed = watch_module._watch_dispatch_start_state(
+            config=config,
+            store=store,
+            task_id=pending_task.id,
+        )
+
+    assert started is True
+    assert reason == f"task {pending_task.id} is pending with a live registered worker in preloop"
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+
+
+def test_watch_dispatch_start_state_treats_in_progress_task_with_live_running_pid_as_started(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Foreground child already marked in progress", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.running_pid = 5252
+    store.update(task)
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = []
+
+    with (
+        patch("gza.concurrency.WorkerRegistry", return_value=registry),
+        patch("gza.concurrency._pid_alive", side_effect=lambda pid: pid == 5252),
+    ):
+        started, reason, refreshed = watch_module._watch_dispatch_start_state(
+            config=config,
+            store=store,
+            task_id=task.id,
+        )
+
+    assert started is True
+    assert reason == f"task {task.id} reached running state"
+    assert refreshed is not None
+    assert refreshed.status == "in_progress"
+    assert refreshed.running_pid == 5252
+
+
+@pytest.mark.parametrize("initial_status", ["pending", "in_progress"])
+def test_watch_dispatch_start_state_treats_quick_terminal_outcome_as_started(
+    tmp_path: Path,
+    initial_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Dispatch target", task_type="implement")
+    assert task.id is not None
+    if initial_status == "in_progress":
+        task.status = "in_progress"
+        task.running_pid = 6161
+        task.started_at = datetime.now(UTC)
+        store.update(task)
+
+    task_before = watch_module._snapshot_watch_dispatch_task(store.get(task.id))
+    assert task_before is not None
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    refreshed.status = "failed"
+    refreshed.failure_reason = "TERMINATED"
+    refreshed.running_pid = None
+    refreshed.completed_at = datetime.now(UTC)
+    if refreshed.started_at is None:
+        refreshed.started_at = refreshed.completed_at
+    store.update(refreshed)
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = []
+
+    with (
+        patch("gza.concurrency.WorkerRegistry", return_value=registry),
+        patch("gza.concurrency._pid_alive", return_value=False),
+    ):
+        started, reason, terminal = watch_module._watch_dispatch_start_state(
+            config=config,
+            store=store,
+            task_id=task.id,
+            task_before=task_before,
+        )
+
+    assert started is True
+    assert reason == f"task {task.id} reached an observable terminal outcome after dispatch"
+    assert terminal is not None
+    assert terminal.status == "failed"
+
+
+def test_watch_dispatch_start_state_leaves_unchanged_completed_task_not_started(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Already completed child", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    task_before = watch_module._snapshot_watch_dispatch_task(store.get(task.id))
+    assert task_before is not None
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = []
+
+    with patch("gza.concurrency.WorkerRegistry", return_value=registry):
+        started, reason, refreshed = watch_module._watch_dispatch_start_state(
+            config=config,
+            store=store,
+            task_id=task.id,
+            task_before=task_before,
+        )
+
+    assert started is False
+    assert reason == f"task {task.id} remains completed with no live worker"
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+
+
 def test_watch_cycle_leaves_no_slots_when_terminal_task_worker_is_still_alive(
     tmp_path: Path,
 ) -> None:
