@@ -81,6 +81,12 @@ from gza.db import Task, WatchProgressObservation, WatchRecoveryBackoff
 from gza.plan_review_verdict import validate_plan_review_manifest
 import gza.recovery_engine as recovery_engine
 from gza.git import Git, GitError
+from gza.git_health import (
+    GIT_HEALTH_PROMPT,
+    check_git_health as real_check_git_health,
+    current_git_health_alert,
+    load_git_health_state,
+)
 from gza.lineage_query import LineageOwnerRow
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.watch_progress import (
@@ -132,6 +138,7 @@ def _make_watch_git() -> Git:
     git.branches_exist = MagicMock(return_value={})  # type: ignore[method-assign]
     git.ref_exists = MagicMock(return_value=False)  # type: ignore[method-assign]
     git.resolve_refs = MagicMock(return_value={})  # type: ignore[method-assign]
+    git.worktree_list = MagicMock(return_value=[{"path": str(git.repo_dir)}])  # type: ignore[method-assign]
     git.can_merge = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
     git.count_commits_ahead = MagicMock(return_value=1)  # type: ignore[method-assign]
@@ -16987,12 +16994,13 @@ def test_cmd_watch_yes_runs_exactly_one_cycle(tmp_path: Path) -> None:
     input_mock.assert_not_called()
 
 
-def test_cmd_watch_declining_first_start_aborts_without_mutations(tmp_path: Path) -> None:
+def test_cmd_watch_declining_first_start_aborts_without_dispatch_mutations(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     pending = store.add("Pending implement", task_type="implement")
     assert pending.id is not None
     before = _task_snapshot(store)
+    before_all_tasks = store.get_all()
 
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -17019,7 +17027,13 @@ def test_cmd_watch_declining_first_start_aborts_without_mutations(tmp_path: Path
     assert rc == 0
     assert snapshot_mock.call_count == 1
     assert log_text.count(" WAKE ") == 1
-    assert before == after
+    assert after[str(pending.id)] == before[str(pending.id)]
+    assert len(after) == len(before)
+    assert len(store.get_all()) == len(before_all_tasks)
+    assert current_git_health_alert(store) is None
+    assert load_git_health_state(store) is None
+    assert " DONE " not in log_text
+    assert GIT_HEALTH_PROMPT not in log_text
     spawn_iterate.assert_not_called()
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
@@ -19164,6 +19178,410 @@ def test_cmd_watch_no_docker_bypasses_system_probe(tmp_path: Path) -> None:
     assert run_cycle.call_count == 1
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "HOLD" not in log_text
+
+
+def test_cmd_watch_git_health_halts_before_transitions_and_cycle(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending plan", task_type="plan")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(
+            alert_message=(
+                "git worktree health RED - dispatch halted; `git worktree list` failed: "
+                "fatal: broken commondir /gza-git/common. Then rerun `uv run gza watch`."
+            )
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.check_git_health", return_value=red_check) as check_git_health,
+        patch("gza.cli.watch._emit_transition_events") as emit_transition_events,
+        patch("gza.cli.watch._run_cycle") as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert check_git_health.call_count == 1
+    emit_transition_events.assert_not_called()
+    run_cycle.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "ATTENTION" in log_text
+    assert "git worktree health RED - dispatch halted" in log_text
+
+
+def test_cmd_watch_git_health_dedupes_attention_and_resumes(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending plan", task_type="plan")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+    sleeps: list[int] = []
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(seconds: int, _stop_requested) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            handler = signal_handlers[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(
+            alert_message=(
+                "git worktree health RED - dispatch halted; `git worktree list` failed: "
+                "fatal: broken commondir /gza-git/common. Then rerun `uv run gza watch`."
+            )
+        ),
+    )
+    green_check = SimpleNamespace(
+        dispatch_halted=False,
+        state=SimpleNamespace(alert_message=None),
+    )
+
+    with (
+        patch("gza.cli.watch.check_git_health", side_effect=[red_check, red_check, green_check]),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 1)) as run_cycle,
+        patch("gza.cli.watch._emit_transition_events", return_value=()) as emit_transition_events,
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert sleeps == [5, 5, 5]
+    assert run_cycle.call_count == 1
+    assert emit_transition_events.call_count == 2
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert log_text.count(" ATTENTION ") == 1
+    assert "git worktree health RED - dispatch halted" in log_text
+    assert "RESUME" in log_text
+    assert "git worktree health restored - resuming dispatch" in log_text
+
+
+def test_cmd_watch_first_start_preview_waits_for_git_health(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending implement", task_type="implement")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(
+            alert_message=(
+                "git worktree health RED - dispatch halted; `git worktree list` failed: "
+                "fatal: broken commondir /gza-git/common. Then rerun `uv run gza watch`."
+            )
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.check_git_health", return_value=red_check),
+        patch("gza.cli.watch._preview_initial_watch_cycle") as preview_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    preview_cycle.assert_not_called()
+    input_mock.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "git worktree health RED - dispatch halted" in log_text
+
+
+def test_cmd_watch_dry_run_git_health_red_returns_without_hold_loop(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending implement", task_type="implement")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+        dispatch_mode=None,
+        group=None,
+    )
+
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(
+            alert_message=(
+                "git worktree health RED - dispatch halted; `git worktree list` failed: "
+                "fatal: broken commondir /gza-git/common. Then rerun `uv run gza watch`."
+            )
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.check_git_health", return_value=red_check),
+        patch("gza.cli.watch._preview_initial_watch_cycle") as preview_cycle,
+        patch("gza.cli.watch._emit_transition_events") as emit_transition_events,
+        patch("gza.cli.watch._run_cycle") as run_cycle,
+        patch(
+            "gza.cli.watch._sleep_interruptibly",
+            side_effect=AssertionError("ordinary dry-run should not enter hold sleep"),
+        ),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    preview_cycle.assert_not_called()
+    emit_transition_events.assert_not_called()
+    run_cycle.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "ATTENTION" in log_text
+    assert "git worktree health RED - dispatch halted" in log_text
+
+
+def test_cmd_watch_first_start_red_probe_persists_durable_git_health_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending implement", task_type="implement")
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+        group=None,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+    raw_failure = (
+        "fatal: invalid commondir /gza-git/common\n"
+        "fatal: not a git repository: /workspace/.git/worktrees/broken"
+    )
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch(
+            "gza.cli.watch.check_git_health",
+            side_effect=lambda store, _git, persist=True: real_check_git_health(
+                store,
+                SimpleNamespace(worktree_list=MagicMock(side_effect=GitError(raw_failure))),
+                persist=persist,
+            ),
+        ),
+        patch("gza.cli.watch._preview_initial_watch_cycle") as preview_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    preview_cycle.assert_not_called()
+    input_mock.assert_not_called()
+    state = current_git_health_alert(store)
+    assert state is not None
+    assert state.reason == watch_module.GIT_HEALTH_REASON
+    assert state.dispatch_halted is True
+    assert state.raw_failure_text == raw_failure
+    assert state.alert_message is not None
+    assert "git worktree health RED - dispatch halted" in state.alert_message
+
+
+def test_cmd_watch_first_start_green_probe_clears_prior_git_health_alert_before_prompt(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending implement", task_type="implement")
+    assert task.id is not None
+
+    seeded_git = MagicMock()
+    seeded_git.worktree_list.side_effect = GitError("fatal: broken commondir /gza-git/common")
+    seeded_check = watch_module.check_git_health(store, seeded_git)
+    assert seeded_check.dispatch_halted is True
+    assert current_git_health_alert(store) is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+        group=None,
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.check_git_health",
+            side_effect=lambda store, _git, persist=True: real_check_git_health(
+                store,
+                SimpleNamespace(worktree_list=MagicMock(return_value=[{"path": str(tmp_path)}])),
+                persist=persist,
+            ),
+        ),
+        patch(
+            "gza.cli.watch._preview_initial_watch_cycle",
+            return_value=(SimpleNamespace(work_done=True), None),
+        ) as preview_cycle,
+        patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    preview_cycle.assert_called_once()
+    input_mock.assert_called_once()
+    assert current_git_health_alert(store) is None
+    state = load_git_health_state(store)
+    assert state is not None
+    assert state.reason == watch_module.GIT_HEALTH_REASON
+    assert state.dispatch_halted is False
+    assert state.raw_failure_text is None
+    log_path = tmp_path / ".gza" / "watch.log"
+    if log_path.exists():
+        log_text = log_path.read_text()
+        assert " DONE " not in log_text
+        assert GIT_HEALTH_PROMPT not in log_text
+
+
+def test_cmd_watch_recovery_only_dry_run_reports_git_health_hold(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+        dispatch_mode="recovery_only",
+        recovery_slots=1,
+        max_resume_attempts=1,
+        group=None,
+    )
+
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(
+            alert_message=(
+                "git worktree health RED - dispatch halted; `git worktree list` failed: "
+                "fatal: broken commondir /gza-git/common. Then rerun `uv run gza watch`."
+            )
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.check_git_health", return_value=red_check),
+        patch("gza.cli.watch._emit_recovery_dry_run_report") as dry_run_report,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    dry_run_report.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "ATTENTION" in log_text
+    assert "git worktree health RED - dispatch halted" in log_text
 
 
 def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:

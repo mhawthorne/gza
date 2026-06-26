@@ -1384,6 +1384,10 @@ class TestCommandAliases:
             ),
             patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
             patch("gza.cli.watch.wait_for_docker_ready", return_value=True),
+            patch(
+                "gza.cli.watch.check_git_health",
+                return_value=MagicMock(dispatch_halted=False, state=MagicMock(alert_message=None)),
+            ),
             patch("gza.cli.watch._run_cycle", side_effect=fake_run_cycle),
         ):
             rc = main()

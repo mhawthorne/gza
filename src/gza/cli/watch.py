@@ -47,6 +47,7 @@ from ..dispatch_preview import (
     plan_watch_dispatch_entries,
 )
 from ..git import Git, GitError
+from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
 from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage_query import (
     LineageOwnerQuery,
@@ -1788,6 +1789,7 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
                 id,
                 status,
                 task_type,
+                prompt,
                 started_at,
                 completed_at,
                 failure_reason,
@@ -1824,6 +1826,8 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
             """
         )
         for row in cur.fetchall():
+            if row["task_type"] == "internal" and row["prompt"] == GIT_HEALTH_PROMPT:
+                continue
             task_id = str(row["id"])
             snap[task_id] = {
                 "status": row["status"],
@@ -4887,9 +4891,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
         previous_snapshot = _task_snapshot(store)
         expected_starts: dict[str, _ExpectedStart] = {}
         system_hold_active = False
+        git_health_hold_active = False
 
         # Preview the first watch pass and ask for confirmation before executing
         if dispatch_mode == "recovery_only" and dry_run:
+            git_health_check = check_git_health(store, Git(config.project_dir), persist=False)
+            if git_health_check.dispatch_halted:
+                log.emit_attention(
+                    attention_key=f"git-health:{GIT_HEALTH_REASON}",
+                    message=git_health_check.state.alert_message
+                    or "git worktree health RED - dispatch halted",
+                )
+                return 0
             _dry_run_git = Git(config.project_dir)
             _dry_run_target_branch = _dry_run_git.default_branch()
             _emit_recovery_dry_run_report(
@@ -4905,14 +4918,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         resumed_reexec = bool(getattr(args, "resumed_reexec", False))
         skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
+        needs_initial_preview = not skip_confirm
         pending_first_cycle_plan: _WatchCyclePlan | None = None
         preview_cycle_open = False
-        if resumed_reexec:
-            log.emit(
-                "INFO",
-                "auto-resumed after code update (skipping first-pass confirmation)",
-            )
-        if not skip_confirm:
+
+        def _preview_initial_cycle_and_confirm() -> bool:
+            nonlocal needs_initial_preview, pending_first_cycle_plan, preview_cycle_open
             preview_result, preview_plan = _preview_initial_watch_cycle(
                 config=config,
                 store=store,
@@ -4928,6 +4939,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 auto_restart_on_drift=auto_restart_on_drift,
                 installed_package_drift=installed_package_drift,
             )
+            needs_initial_preview = False
             if preview_result.work_done:
                 try:
                     answer = input("\nProceed? [y/N] ").strip().lower()
@@ -4938,11 +4950,19 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 if answer not in ("y", "yes"):
                     log.end_cycle()
                     print("Aborted.")
-                    return 0
+                    return False
                 pending_first_cycle_plan = preview_plan
                 preview_cycle_open = True
-            else:
-                log.end_cycle()
+                return True
+
+            log.end_cycle()
+            return True
+
+        if resumed_reexec:
+            log.emit(
+                "INFO",
+                "auto-resumed after code update (skipping first-pass confirmation)",
+            )
 
         while True:
             if stop_requested:
@@ -4972,6 +4992,39 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if system_hold_active:
                 log.emit("RESUME", "Docker available again - resuming")
                 system_hold_active = False
+
+            git_health_check = check_git_health(
+                store,
+                Git(config.project_dir),
+                persist=not dry_run,
+            )
+            if git_health_check.dispatch_halted:
+                if preview_cycle_open:
+                    log.end_cycle()
+                    preview_cycle_open = False
+                    pending_first_cycle_plan = None
+                    needs_initial_preview = not skip_confirm
+                log.emit_attention(
+                    attention_key=f"git-health:{GIT_HEALTH_REASON}",
+                    message=git_health_check.state.alert_message
+                    or "git worktree health RED - dispatch halted",
+                )
+                if dry_run:
+                    return 0
+                git_health_hold_active = True
+                if stop_requested:
+                    break
+                _sleep_interruptibly(poll, lambda: stop_requested)
+                continue
+
+            if git_health_hold_active:
+                log.emit("RESUME", "git worktree health restored - resuming dispatch")
+                git_health_hold_active = False
+
+            if needs_initial_preview:
+                if not _preview_initial_cycle_and_confirm():
+                    return 0
+                continue
 
             pre_cycle_snapshot = _task_snapshot(store)
             pre_cycle_confirmed_start_ids = _emit_transition_events(

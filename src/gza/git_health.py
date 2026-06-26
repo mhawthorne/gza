@@ -26,7 +26,8 @@ _KNOWN_METADATA_FAILURE_HINTS = (
 class GitHealthState:
     """Persisted git-health probe state."""
 
-    task: Task
+    task: Task | None
+    reason: str
     dispatch_halted: bool
     probe_command: str
     compact_failure: str | None
@@ -118,6 +119,7 @@ def _persist_git_health_payload(
     store: SqliteTaskStore,
     task: Task,
     *,
+    reason: str,
     dispatch_halted: bool,
     compact_failure: str | None,
     raw_failure_text: str | None,
@@ -132,6 +134,7 @@ def _persist_git_health_payload(
             "dispatch_halted": dispatch_halted,
             "probe_command": "git worktree list --porcelain",
             "raw_failure_text": raw_failure_text,
+            "reason": reason,
         },
         sort_keys=True,
     )
@@ -157,6 +160,7 @@ def load_git_health_state(store: SqliteTaskStore) -> GitHealthState | None:
     dispatch_halted = payload.get("dispatch_halted")
     return GitHealthState(
         task=task,
+        reason=_coerce_optional_str(payload.get("reason")) or GIT_HEALTH_REASON,
         dispatch_halted=bool(dispatch_halted) if isinstance(dispatch_halted, bool) else False,
         probe_command=_coerce_optional_str(payload.get("probe_command")) or "git worktree list --porcelain",
         compact_failure=_coerce_optional_str(payload.get("compact_failure")),
@@ -166,38 +170,69 @@ def load_git_health_state(store: SqliteTaskStore) -> GitHealthState | None:
     )
 
 
-def check_git_health(store: SqliteTaskStore, git: Git) -> GitHealthCheck:
-    """Probe host-side git worktree health and persist the current verdict."""
-    task = ensure_git_health_task(store)
+def check_git_health(store: SqliteTaskStore, git: Git, *, persist: bool = True) -> GitHealthCheck:
+    """Probe host-side git worktree health and optionally persist the current verdict."""
     captured_at = datetime.now(UTC)
+    existing_task = _find_git_health_task(store) if persist else None
     try:
         git.worktree_list()
     except (GitError, OSError) as error:
         raw_failure_text = str(error).strip() or error.__class__.__name__
         compact_failure = _compact_failure_text(raw_failure_text)
         alert_message = _build_alert_message(compact_failure, raw_failure_text)
-        _persist_git_health_payload(
-            store,
-            task,
+        if persist:
+            task = existing_task or ensure_git_health_task(store)
+            _persist_git_health_payload(
+                store,
+                task,
+                reason=GIT_HEALTH_REASON,
+                dispatch_halted=True,
+                compact_failure=compact_failure,
+                raw_failure_text=raw_failure_text,
+                alert_message=alert_message,
+                captured_at=captured_at,
+            )
+            state = load_git_health_state(store)
+            assert state is not None
+            return GitHealthCheck(state=state, dispatch_halted=state.dispatch_halted)
+
+        state = GitHealthState(
+            task=None,
+            reason=GIT_HEALTH_REASON,
             dispatch_halted=True,
+            probe_command="git worktree list --porcelain",
             compact_failure=compact_failure,
             raw_failure_text=raw_failure_text,
             alert_message=alert_message,
             captured_at=captured_at,
         )
-    else:
+        return GitHealthCheck(state=state, dispatch_halted=True)
+
+    if persist and existing_task is not None:
         _persist_git_health_payload(
             store,
-            task,
+            existing_task,
+            reason=GIT_HEALTH_REASON,
             dispatch_halted=False,
             compact_failure=None,
             raw_failure_text=None,
             alert_message=None,
             captured_at=captured_at,
         )
+        state = load_git_health_state(store)
+        assert state is not None
+        return GitHealthCheck(state=state, dispatch_halted=state.dispatch_halted)
 
-    state = load_git_health_state(store)
-    assert state is not None
+    state = GitHealthState(
+        task=None,
+        reason=GIT_HEALTH_REASON,
+        dispatch_halted=False,
+        probe_command="git worktree list --porcelain",
+        compact_failure=None,
+        raw_failure_text=None,
+        alert_message=None,
+        captured_at=captured_at,
+    )
     return GitHealthCheck(state=state, dispatch_halted=state.dispatch_halted)
 
 
