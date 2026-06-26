@@ -15574,7 +15574,7 @@ class TestExtractedRunInnerHelpers:
         assert canonical_check.call_args.kwargs["task_id"] == task.id
         assert canonical_check.call_args.kwargs["canonical_git"] is mock_main_git
 
-    def test_run_inner_docker_code_task_rewrites_git_metadata_and_restores_it(
+    def test_run_inner_docker_code_task_drives_container_git_via_env_without_touching_host(
         self,
         tmp_path: Path,
     ) -> None:
@@ -15606,12 +15606,27 @@ class TestExtractedRunInnerHelpers:
 
         def provider_run(run_config, _prompt, _log_file, work_dir, **_kwargs):
             assert work_dir == worktree_path
-            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
-            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            # Host git metadata must stay byte-for-byte untouched during the run:
+            # the commondir is shared state read by every other worktree's git.
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == f"{host_common_gitdir}\n"
             assert f"{host_worktree_gitdir}:/gza-git/worktree" in run_config.docker_volumes
             assert f"{host_common_gitdir}:/gza-git/common" in run_config.docker_volumes
-            assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in getattr(run_config, "docker_env", [])
-            assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in getattr(run_config, "docker_env", [])
+            # Container-valid metadata is supplied via bind-mounted *generated*
+            # files (host files untouched), not by rewriting host files or by a
+            # global GIT_DIR/GIT_COMMON_DIR env (which would hijack nested repos).
+            run_env = getattr(run_config, "docker_env", [])
+            assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in run_env
+            assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in run_env
+            assert not any(v.startswith(("GIT_DIR=", "GIT_COMMON_DIR=", "GIT_WORK_TREE=")) for v in run_env)
+            shadow_git = [v for v in run_config.docker_volumes if v.endswith(":/workspace/.git:ro")]
+            assert len(shadow_git) == 1
+            assert Path(shadow_git[0].split(":")[0]).read_text() == "gitdir: /gza-git/worktree\n"
+            shadow_commondir = [
+                v for v in run_config.docker_volumes if v.endswith(":/gza-git/worktree/commondir:ro")
+            ]
+            assert len(shadow_commondir) == 1
+            assert Path(shadow_commondir[0].split(":")[0]).read_text() == "/gza-git/common\n"
             return RunResult(
                 exit_code=0,
                 duration_seconds=2.0,
@@ -15659,7 +15674,7 @@ class TestExtractedRunInnerHelpers:
         assert getattr(config, "docker_env", []) == []
         assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
 
-    def test_run_inner_docker_code_task_restores_git_metadata_before_timeout_bookkeeping(
+    def test_run_inner_docker_code_task_leaves_host_git_metadata_untouched_on_timeout(
         self,
         tmp_path: Path,
     ) -> None:
@@ -15691,8 +15706,10 @@ class TestExtractedRunInnerHelpers:
         mock_provider.name = "TestProvider"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, **_kwargs):
-            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
-            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            # Host metadata untouched; container git via mounted generated files.
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+            assert any(v.endswith(":/workspace/.git:ro") for v in getattr(_config, "docker_volumes", []))
             return RunResult(
                 exit_code=124,
                 duration_seconds=120.0,
@@ -15760,7 +15777,7 @@ class TestExtractedRunInnerHelpers:
         assert getattr(config, "docker_env", []) == []
         assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
 
-    def test_run_inner_docker_code_task_restores_git_metadata_after_provider_exception(
+    def test_run_inner_docker_code_task_leaves_host_git_metadata_untouched_on_provider_exception(
         self,
         tmp_path: Path,
     ) -> None:
@@ -15792,8 +15809,10 @@ class TestExtractedRunInnerHelpers:
         mock_provider.name = "TestProvider"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, **_kwargs):
-            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
-            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            # Host metadata untouched even when the provider raises mid-run.
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+            assert any(v.endswith(":/workspace/.git:ro") for v in getattr(_config, "docker_volumes", []))
             raise RuntimeError("provider exploded")
 
         mock_provider.run.side_effect = provider_run
@@ -15828,7 +15847,7 @@ class TestExtractedRunInnerHelpers:
         assert getattr(config, "docker_env", []) == []
         assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
 
-    def test_run_inner_docker_code_task_restores_git_metadata_before_interrupt_wip_save(
+    def test_run_inner_docker_code_task_leaves_host_git_metadata_untouched_on_interrupt(
         self,
         tmp_path: Path,
     ) -> None:
@@ -15860,8 +15879,10 @@ class TestExtractedRunInnerHelpers:
         mock_provider.name = "TestProvider"
 
         def provider_run(_config, _prompt, _log_file, _work_dir, **_kwargs):
-            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
-            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            # Host metadata untouched; container git via mounted generated files.
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+            assert any(v.endswith(":/workspace/.git:ro") for v in getattr(_config, "docker_volumes", []))
             return RunResult(
                 exit_code=0,
                 duration_seconds=2.0,
