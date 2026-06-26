@@ -5,6 +5,7 @@ import pytest
 
 from gza.cli._common import (
     _build_failure_diagnostics,
+    _create_implementation_task_from_source,
     _create_improve_task,
     _create_plan_improve_task,
     _create_plan_review_task,
@@ -206,6 +207,54 @@ class TestRunWithResume:
 
 
 class TestDerivedTaskReviewScopePropagation:
+    def test_create_implementation_task_inherits_parent_tags(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add(
+            "Plan scoped slice",
+            task_type="plan",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+
+        impl_task = _create_implementation_task_from_source(
+            store,
+            plan_task,
+            prompt="Implement scoped slice",
+            trigger_source="manual",
+        )
+
+        assert impl_task.tags == plan_task.tags
+
+    def test_create_implementation_task_explicit_tags_replace_parent_tags(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add(
+            "Plan scoped slice",
+            task_type="plan",
+            tags=("202606-recovery", "v0.5.0"),
+        )
+
+        impl_task = _create_implementation_task_from_source(
+            store,
+            plan_task,
+            prompt="Implement scoped slice",
+            trigger_source="manual",
+            tags=("manual-override",),
+        )
+
+        assert impl_task.tags == ("manual-override",)
+
+    def test_create_implementation_task_stays_untagged_for_untagged_parent(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add("Plan scoped slice", task_type="plan")
+
+        impl_task = _create_implementation_task_from_source(
+            store,
+            plan_task,
+            prompt="Implement scoped slice",
+            trigger_source="manual",
+        )
+
+        assert impl_task.tags == ()
+
     def test_create_plan_review_task_inherits_parent_tags(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         plan_task = store.add(

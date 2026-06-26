@@ -175,6 +175,18 @@ def test_format_iterate_terminal_merge_state_message_hides_pending_redundant_res
     )
 
 
+class TestDerivedTaskTagSelection:
+    def test_selected_tag_override_for_derived_task_preserves_omission(self) -> None:
+        args = argparse.Namespace(tags=None, all_tags=False)
+
+        assert _execution_module._selected_tag_override_for_derived_task(args) is None
+
+    def test_selected_tag_override_for_derived_task_returns_explicit_tags(self) -> None:
+        args = argparse.Namespace(tags=["manual-override"], all_tags=False)
+
+        assert _execution_module._selected_tag_override_for_derived_task(args) == ("manual-override",)
+
+
 def _background_implement_status_error(tmp_path: Path) -> tuple[list[str], str]:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -8241,6 +8253,54 @@ class TestReviewCommand:
         review_task = [t for t in all_tasks if t.task_type == "review"][0]
         assert review_task is not None
         assert review_task.provider == "gemini"
+
+
+def test_advance_create_implement_preserves_source_tags(tmp_path: Path) -> None:
+    from gza.cli._common import _create_implementation_task_from_source
+    from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan_task = store.add("Plan authentication rollout", task_type="plan", tags=("202606-recovery", "v0.5.0"))
+    plan_task.status = "completed"
+    plan_task.completed_at = datetime.now(UTC)
+    store.update(plan_task)
+
+    spawned: list[tuple[object, str]] = []
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=0,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda task: _create_implementation_task_from_source(
+            store,
+            task,
+            prompt=f"Implement plan from task {task.id}",
+            trigger_source="manual",
+        ),
+        spawn_worker=lambda task, kind: spawned.append((task, kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=plan_task,
+        action={"type": "create_implement"},
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert result.created_task is not None
+    assert result.created_task.tags == plan_task.tags
+    assert spawned == [(result.created_task, "implement")]
 
 
 class TestIterateCommand:
