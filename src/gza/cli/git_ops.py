@@ -3306,6 +3306,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         config=config,
                         git=git,
                         target_branch=target_branch,
+                        reuse_recovery_merge_context=True,
                     )
                 )
                 dropped_owner_lineage = False
@@ -3324,6 +3325,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             config=config,
                             git=git,
                             target_branch=target_branch,
+                            reuse_recovery_merge_context=True,
                         )
                         if row.owner_task.status == "dropped"
                     ]
@@ -3380,6 +3382,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         config=config,
                         git=git,
                         target_branch=target_branch,
+                        reuse_recovery_merge_context=True,
                     )
                 )
                 return owner_rows

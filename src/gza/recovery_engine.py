@@ -1374,6 +1374,7 @@ def decide_failed_task_recovery(
         prerequisite_reconciliation = _reconcile_historical_prerequisite_unmerged_failure(
             store,
             task,
+            merge_context=merge_context,
             read_context=read_context,
         )
         expected_action = _expected_recovery_action(

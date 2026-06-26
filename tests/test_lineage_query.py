@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-import subprocess
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
-from gza import dependency_preconditions as dependency_preconditions_module
 import gza.recovery_engine as recovery_engine
+from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -21,8 +21,8 @@ from gza.lineage_query import (
     query_lineage_owner_rows,
 )
 from gza.operator_state import blocked_by_empty_prereq_label
-from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import list_failed_tasks_for_recovery
+from gza.recovery_read_context import RecoveryReadContext
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -66,6 +66,50 @@ def _read_context_for_store(store: SqliteTaskStore) -> RecoveryReadContext:
         merge_units_by_task_id=indexes.merge_units_by_task_id,
         allow_reconcile_mutation=False,
     )
+
+
+class _LineageMergeStateGit:
+    def __init__(
+        self,
+        *,
+        source_ref: str,
+        source_sha: str,
+        target_sha: str,
+        ahead_count: int | None,
+        merged: bool = False,
+        net_diff: bool | None = None,
+    ) -> None:
+        self.source_ref = source_ref
+        self.source_sha = source_sha
+        self.target_sha = target_sha
+        self.ahead_count = ahead_count
+        self.merged = merged
+        self.net_diff = net_diff
+        self.probes: list[tuple[str, str]] = []
+
+    def resolve_fresh_merge_source(self, branch: str):
+        self.probes.append(("resolve_fresh_merge_source", branch))
+        return ResolvedMergeSourceRef(self.source_ref)
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        self.probes.append(("rev_parse_if_exists", ref))
+        if ref == self.source_ref:
+            return self.source_sha
+        if ref == "main":
+            return self.target_sha
+        return None
+
+    def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:
+        self.probes.append(("count_commits_ahead_checked", f"{source_ref}->{target_ref}"))
+        return self.ahead_count
+
+    def is_merged(self, branch: str, into: str) -> bool:
+        self.probes.append(("is_merged", f"{branch}->{into}"))
+        return self.merged
+
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
+        self.probes.append(("has_non_empty_source_diff_against_target", f"{source_ref}->{target}"))
+        return self.net_diff
 
 
 def _build_tag_filtered_merge_unit_case(tmp_path: Path) -> tuple[SqliteTaskStore, str, str, str]:
@@ -1808,6 +1852,132 @@ def test_query_lineage_owner_rows_hides_failed_root_resolved_by_completed_recove
     assert rows == ()
 
 
+def test_query_lineage_owner_rows_keeps_terminal_owner_visible_when_same_unit_leaf_is_live_unmerged(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with stale terminal unit", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 17, 9, 0, tzinfo=UTC),
+        branch="feature/stale-terminal-owner",
+        has_commits=True,
+    )
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_leaf = store.add(
+        "Failed implement leaf advanced owner branch",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+        same_branch=True,
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = owner.branch
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 5, 17, 10, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+    store.attach_task_to_merge_unit(failed_leaf.id, owner_unit.id, "implement")
+
+    assert owner.branch is not None
+    git = _LineageMergeStateGit(
+        source_ref=owner.branch,
+        source_sha="advanced-owner-sha",
+        target_sha="target-sha",
+        ahead_count=1,
+        merged=False,
+        net_diff=True,
+    )
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == owner.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed_leaf.id
+    assert ("count_commits_ahead_checked", f"{owner.branch}->main") in git.probes
+
+
+def test_query_lineage_owner_rows_keeps_terminal_owner_visible_when_same_unit_leaf_probe_unavailable(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner without live proof", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 17, 9, 0, tzinfo=UTC),
+        branch="feature/unavailable-terminal-proof",
+        has_commits=True,
+    )
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_leaf = store.add(
+        "Failed implement leaf with unavailable proof",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+        same_branch=True,
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = owner.branch
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 5, 17, 10, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+    store.attach_task_to_merge_unit(failed_leaf.id, owner_unit.id, "implement")
+
+    assert owner.branch is not None
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == owner.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed_leaf.id
+
+
 def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant_actionable(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -2163,15 +2333,86 @@ def test_query_lineage_owner_rows_hides_empty_owner_with_failed_same_branch_desc
     store.update(improve)
     store.attach_task_to_merge_unit(improve.id, impl_unit.id, "improve")
 
+    assert impl.branch is not None
+    git = _LineageMergeStateGit(
+        source_ref=impl.branch,
+        source_sha="impl-sha",
+        target_sha="target-sha",
+        ahead_count=0,
+        merged=False,
+        net_diff=False,
+    )
+
     rows = query_lineage_owner_rows(
         store,
         LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
         config=config,
-        git=MagicMock(),
+        git=git,
         target_branch="main",
     )
 
     assert rows == ()
+    assert ("count_commits_ahead_checked", f"{impl.branch}->main") in git.probes
+    assert ("has_non_empty_source_diff_against_target", f"{impl.branch}->main") in git.probes
+
+
+def test_query_lineage_owner_rows_hides_terminal_owner_with_moot_failed_implement_leaf(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Completed redundant implement", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 17, 9, 0, tzinfo=UTC),
+        branch="feature/redundant-owner",
+        has_commits=True,
+    )
+    store.update(owner)
+
+    owner_unit = store.get_or_create_merge_unit_for_task(owner)
+    assert owner_unit is not None
+    store.set_merge_unit_state(owner_unit.id, "redundant")
+
+    failed_leaf = store.add(
+        "Failed implement follow-up on landed branch",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "NO_ACTIVITY"
+    failed_leaf.branch = owner.branch
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 5, 17, 10, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+    store.attach_task_to_merge_unit(failed_leaf.id, owner_unit.id, "implement")
+
+    assert owner.branch is not None
+    git = _LineageMergeStateGit(
+        source_ref=owner.branch,
+        source_sha="owner-sha",
+        target_sha="target-sha",
+        ahead_count=0,
+        merged=False,
+        net_diff=False,
+    )
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows == ()
+    assert ("count_commits_ahead_checked", f"{owner.branch}->main") in git.probes
+    assert ("has_non_empty_source_diff_against_target", f"{owner.branch}->main") in git.probes
 
 
 def test_query_lineage_owner_rows_keeps_empty_failed_owner_visible_for_recovery_lane(
@@ -2782,6 +3023,129 @@ def test_query_lineage_owner_rows_hides_branchless_moot_prerequisite_unmerged_fa
     assert [entry.task.id for entry in entries] == []
 
 
+def test_query_lineage_owner_rows_keeps_terminal_owner_visible_for_failed_leaf_with_unique_unmerged_work(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 18, 8, 0, tzinfo=UTC),
+        branch="feature/merged-owner-visible",
+        has_commits=True,
+    )
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_leaf = store.add(
+        "Failed implement leaf with distinct unmerged work",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = "feature/merged-owner-visible-followup"
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    failed_leaf_unit = store.create_merge_unit(
+        source_branch=failed_leaf.branch,
+        target_branch="main",
+        owner_task_id=failed_leaf.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed_leaf.id, failed_leaf_unit.id, "implement")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == failed_leaf.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed_leaf.id
+    assert failed_leaf in row.unresolved_tasks
+
+
+def test_query_lineage_owner_rows_hides_terminal_owner_for_self_owned_failed_leaf_without_unique_work(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 18, 8, 0, tzinfo=UTC),
+        branch="feature/merged-owner-hidden",
+        has_commits=True,
+    )
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_leaf = store.add(
+        "Failed implement leaf with self-owned empty merge unit",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = "feature/merged-owner-hidden-followup"
+    failed_leaf.has_commits = False
+    failed_leaf.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    failed_leaf_unit = store.create_merge_unit(
+        source_branch=failed_leaf.branch,
+        target_branch="main",
+        owner_task_id=failed_leaf.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(failed_leaf.id, failed_leaf_unit.id, "implement")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    assert not rows
+
+
 def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_sibling(
     tmp_path: Path,
 ) -> None:
@@ -2830,11 +3194,21 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
 
     assert list_failed_tasks_for_recovery(store) == []
 
+    assert failed.branch is not None
+    git = _LineageMergeStateGit(
+        source_ref=failed.branch,
+        source_sha="failed-sha",
+        target_sha="target-sha",
+        ahead_count=0,
+        merged=False,
+        net_diff=False,
+    )
+
     rows = query_lineage_owner_rows(
         store,
         LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
         config=config,
-        git=MagicMock(),
+        git=git,
         target_branch="main",
     )
 
@@ -2844,6 +3218,7 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
     assert failed.id not in failed_leaf_ids
+    assert ("count_commits_ahead_checked", f"{failed.branch}->main") in git.probes
 
     entries = collect_recovery_lane_entries(
         store,

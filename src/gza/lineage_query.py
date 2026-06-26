@@ -16,6 +16,7 @@ from .lifecycle_completion import (
     task_is_complete_for_lifecycle,
 )
 from .main_integration_verify import MAIN_INTEGRATION_VERIFY_REASON, current_main_integration_verify_alert
+from .merge_state import classify_branch_merge_state_for_target
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
@@ -784,6 +785,85 @@ def _resolve_owner_merge_unit(
     return max(units.values(), key=lambda unit: (unit.updated_at, unit.id))
 
 
+def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+    *,
+    failed_task: DbTask,
+    owner_merge_unit: MergeUnit | None,
+    leaf_merge_unit: MergeUnit | None,
+    git: Git | None,
+) -> bool:
+    if owner_merge_unit is None:
+        return failed_task.task_type not in {"review", "improve", "rebase"}
+    if not merge_state_is_terminal_for_lifecycle(owner_merge_unit.state):
+        return True
+
+    owner_target = owner_merge_unit.target_branch
+    if not owner_target:
+        return True
+
+    leaf_targets_owner = (
+        leaf_merge_unit is not None and leaf_merge_unit.target_branch == owner_target
+    )
+    leaf_has_own_merge_unit = (
+        leaf_merge_unit is not None and leaf_merge_unit.owner_task_id == failed_task.id
+    )
+    if failed_task.branch is None and not leaf_has_own_merge_unit:
+        return False
+    if leaf_targets_owner and leaf_has_own_merge_unit and leaf_merge_unit is not None:
+        if leaf_merge_unit.state == "unmerged" and git is None:
+            # Persisted unmerged state on the failed leaf's own merge unit is enough to keep
+            # the work visible unless live merge truth later disproves it.
+            return True
+        if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state) and git is None:
+            return False
+
+    source_branch = failed_task.branch
+    if source_branch is None and leaf_targets_owner and leaf_merge_unit is not None:
+        source_branch = leaf_merge_unit.source_branch
+    if not source_branch:
+        return (
+            True
+            if leaf_targets_owner
+            and leaf_has_own_merge_unit
+            and leaf_merge_unit is not None
+            and leaf_merge_unit.state == "unmerged"
+            else False
+        )
+
+    if git is None:
+        return True
+
+    try:
+        classification = classify_branch_merge_state_for_target(
+            git=git,
+            source_branch=source_branch,
+            target_branch=owner_target,
+            persisted_state=None,
+            merged_proof=None,
+            source_has_commits=failed_task.has_commits,
+            on_warning=_LOG.warning,
+        )
+    except Exception as exc:
+        _LOG.warning(
+            "Could not prove failed leaf %s merge state against terminal owner target %s: %s",
+            failed_task.id,
+            owner_target,
+            exc,
+        )
+        return True
+
+    if merge_state_is_terminal_for_lifecycle(classification.state):
+        return False
+    if classification.state == "unmerged":
+        return True
+    if leaf_targets_owner and leaf_has_own_merge_unit and leaf_merge_unit is not None:
+        if leaf_merge_unit.state == "unmerged":
+            return True
+        if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
+            return False
+    return True
+
+
 def resolve_lineage_owner_task_id(store: SqliteTaskStore, task_id: str) -> str | None:
     """Return the lineage owner id for a task without planning every owner row."""
     owner = _load_indexes(store).owner_by_task_id.get(task_id)
@@ -1002,6 +1082,7 @@ def query_lineage_owner_rows(
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    reuse_recovery_merge_context: bool = False,
 ) -> tuple[LineageOwnerRow, ...]:
     rows, read_context = _query_lineage_owner_rows_with_context(
         store,
@@ -1011,6 +1092,7 @@ def query_lineage_owner_rows(
         target_branch=target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
+        reuse_recovery_merge_context=reuse_recovery_merge_context,
     )
     if not read_context.allow_reconcile_mutation:
         _record_pending_recovery_reconciliation_context(store, read_context)
@@ -1048,6 +1130,7 @@ def query_lineage_owner_rows_in_read_session(
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    reuse_recovery_merge_context: bool = False,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .recovery_engine import apply_pending_recovery_reconciliations
 
@@ -1060,6 +1143,7 @@ def query_lineage_owner_rows_in_read_session(
             target_branch=target_branch,
             persist_post_merge_rebase_state=persist_post_merge_rebase_state,
             persist_review_clearance=persist_review_clearance,
+            reuse_recovery_merge_context=reuse_recovery_merge_context,
         )
     apply_pending_recovery_reconciliations(store, read_context=read_context)
     return rows, read_context
@@ -1073,6 +1157,7 @@ def _query_lineage_owner_rows_with_context(
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    reuse_recovery_merge_context: bool = False,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .cli.advance_engine import determine_next_action, failed_recovery_decision_to_attention_action
     from .query import is_lineage_complete
@@ -1141,6 +1226,7 @@ def _query_lineage_owner_rows_with_context(
         unresolved_tasks: list[DbTask] = []
         orphaned_same_branch_tasks: list[DbTask] = []
         skipped_same_branch_members = indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
+        owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
 
         merged_owner_branch = any(
             _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_member)
@@ -1197,9 +1283,17 @@ def _query_lineage_owner_rows_with_context(
                 if completed_sibling_recovery is not None:
                     recovery_completed_by_failed_id[task.id] = completed_sibling_recovery
                     continue
-                if merged_owner_branch and task.task_type in {"review", "improve", "rebase"}:
+                keep_failed_leaf_visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+                    failed_task=task,
+                    owner_merge_unit=owner_merge_unit,
+                    leaf_merge_unit=merge_unit,
+                    git=git,
+                )
+                if task.id == owner.id and task.id in visible_failed_ids:
+                    keep_failed_leaf_visible = True
+                if merged_owner_branch and not keep_failed_leaf_visible:
                     continue
-                if task.id not in visible_failed_ids:
+                if task.id not in visible_failed_ids and not (merged_owner_branch and keep_failed_leaf_visible):
                     continue
                 failed_leaves.append(task)
                 if matches:
@@ -1245,7 +1339,6 @@ def _query_lineage_owner_rows_with_context(
             failed_leaves=tuple(failed_leaves),
             recovery_completed_by_failed_id=recovery_completed_by_failed_id,
         )
-        owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
         has_empty_prereq_blocked_pending = any(
             blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None for task in unresolved_tasks
         )
@@ -1312,6 +1405,12 @@ def _query_lineage_owner_rows_with_context(
         max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
         failed_action_candidate: DbTask | None = None
         failed_action_candidate_decision = None
+        recovery_merge_context = None
+        if reuse_recovery_merge_context:
+            from .recovery_engine import _MergeContext
+
+            if isinstance(read_context.merge_context, _MergeContext):
+                recovery_merge_context = read_context.merge_context
         for failed_task in sorted(
             failed_leaves,
             key=lambda task: (
@@ -1324,6 +1423,7 @@ def _query_lineage_owner_rows_with_context(
                 store,
                 failed_task,
                 max_recovery_attempts=max_recovery_attempts,
+                merge_context=recovery_merge_context,
                 read_context=read_context,
             )
             attention_action = failed_recovery_decision_to_attention_action(
