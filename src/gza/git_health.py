@@ -13,6 +13,7 @@ from .config import Config
 from .db import SqliteTaskStore, Task
 from .git import (
     Git,
+    GitError,
     GitWorktreeHealthProbe,
     WorktreeAdminMetadataIssue,
     WorktreeAdminMetadataValidation,
@@ -58,6 +59,7 @@ class GitWorktreeHealthState:
     compact_failure: str | None
     suspected_container_path_marker: str | None
     metadata_findings: tuple[GitWorktreeHealthFinding, ...]
+    metadata_scan_error: str | None
     remediation_message: str | None
     alert_message: str | None
     captured_at: datetime | None
@@ -219,6 +221,7 @@ def load_git_worktree_health_state(store: SqliteTaskStore) -> GitWorktreeHealthS
         compact_failure=_coerce_optional_str(payload.get("compact_failure")),
         suspected_container_path_marker=_coerce_optional_str(payload.get("suspected_container_path_marker")),
         metadata_findings=_parse_findings(payload),
+        metadata_scan_error=_coerce_optional_str(payload.get("metadata_scan_error")),
         remediation_message=_coerce_optional_str(payload.get("remediation_message")),
         alert_message=_coerce_optional_str(payload.get("alert_message")),
         captured_at=captured_at or task.completed_at,
@@ -236,7 +239,7 @@ def _probe_git_worktree_health(git: Git) -> GitWorktreeHealthProbe:
         command = "git worktree list --porcelain"
         try:
             worktree_list_attr()
-        except BaseException as error:
+        except GitError as error:
             return GitWorktreeHealthProbe(
                 command=command,
                 returncode=1,
@@ -256,7 +259,7 @@ def _probe_git_worktree_health(git: Git) -> GitWorktreeHealthProbe:
     if callable(worktree_list):
         try:
             worktree_list()
-        except BaseException as error:
+        except GitError as error:
             return GitWorktreeHealthProbe(
                 command=command,
                 returncode=1,
@@ -274,12 +277,12 @@ def _probe_git_worktree_health(git: Git) -> GitWorktreeHealthProbe:
 
 
 def _validate_admin_metadata(git: Git) -> WorktreeAdminMetadataValidation:
-    try:
-        return validate_host_worktree_admin_metadata(git)
-    except Exception:
-        repo_dir = getattr(git, "repo_dir", Path("."))
-        common_dir = repo_dir / ".git" if isinstance(repo_dir, Path) else Path(".git")
-        return WorktreeAdminMetadataValidation(common_dir=common_dir, issues=())
+    return validate_host_worktree_admin_metadata(git)
+
+
+def _format_metadata_scan_error(error: BaseException) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    return f"{error.__class__.__name__}: {message}"
 
 
 def _combine_probe_failure_text(probe: GitWorktreeHealthProbe) -> str:
@@ -304,11 +307,17 @@ def _build_remediation_message(
     *,
     repo_dir: Path | None,
     findings: tuple[GitWorktreeHealthFinding, ...],
+    metadata_scan_error: str | None,
 ) -> str:
     parts = [
         "Inspect `.git/worktrees/*/commondir` for container-only paths such as `/gza-git/common`."
         " Inspect `.git/worktrees/*/gitdir` for container-only paths such as `/gza-git`."
     ]
+    if metadata_scan_error is not None:
+        parts.append(
+            "The host admin metadata scanner failed before it could complete, so suspect-file evidence may be incomplete: "
+            f"{metadata_scan_error}."
+        )
     if findings:
         suspect_parts = []
         for finding in findings:
@@ -328,7 +337,14 @@ def _build_alert_message(
     probe: GitWorktreeHealthProbe,
     compact_failure: str,
     remediation_message: str,
+    metadata_scan_error: str | None,
 ) -> str:
+    if metadata_scan_error is not None and not probe.failed:
+        return (
+            "git worktree health RED - dispatch halted; "
+            f"host worktree metadata scan failed: {metadata_scan_error}. "
+            f"{remediation_message} No tasks were started or marked failed by this halt."
+        )
     return (
         "git worktree health RED - dispatch halted; "
         f"`git worktree list` failed (exit {probe.returncode}): {compact_failure}. "
@@ -347,6 +363,7 @@ def _persist_git_worktree_health_payload(
     compact_failure: str | None,
     suspected_container_path_marker: str | None,
     metadata_findings: tuple[GitWorktreeHealthFinding, ...],
+    metadata_scan_error: str | None,
     remediation_message: str | None,
     alert_message: str | None,
     captured_at: datetime,
@@ -370,6 +387,7 @@ def _persist_git_worktree_health_payload(
                 }
                 for finding in metadata_findings
             ],
+            "metadata_scan_error": metadata_scan_error,
             "probe_command": probe.command,
             "probe_returncode": probe.returncode,
             "probe_stderr": _tail_text(probe.stderr) or None,
@@ -397,6 +415,7 @@ def _build_state(
     compact_failure: str | None,
     suspected_container_path_marker: str | None,
     metadata_findings: tuple[GitWorktreeHealthFinding, ...],
+    metadata_scan_error: str | None,
     remediation_message: str | None,
     alert_message: str | None,
     captured_at: datetime,
@@ -413,6 +432,7 @@ def _build_state(
         compact_failure=compact_failure,
         suspected_container_path_marker=suspected_container_path_marker,
         metadata_findings=metadata_findings,
+        metadata_scan_error=metadata_scan_error,
         remediation_message=remediation_message,
         alert_message=alert_message,
         captured_at=captured_at,
@@ -431,19 +451,35 @@ def check_git_worktree_health(
     del config  # reserved for future config-driven container path roots
     captured_at = datetime.now(UTC)
     probe = _probe_git_worktree_health(git)
-    validation = _validate_admin_metadata(git)
-    findings = tuple(_issue_to_finding(issue) for issue in validation.issues)
+    metadata_scan_error = None
+    validation: WorktreeAdminMetadataValidation | None
+    try:
+        validation = _validate_admin_metadata(git)
+    except (GitError, OSError) as error:
+        metadata_scan_error = _format_metadata_scan_error(error)
+        validation = None
     repo_dir = getattr(git, "repo_dir", None)
     repo_path = repo_dir if isinstance(repo_dir, Path) else None
 
-    if probe.failed:
-        raw_failure_text = _combine_probe_failure_text(probe)
+    findings = tuple(_issue_to_finding(issue) for issue in validation.issues) if validation is not None else ()
+    suspected_container_path_marker = (
+        validation.suspected_container_path_marker if validation is not None else None
+    )
+
+    if probe.failed or metadata_scan_error is not None:
+        raw_failure_text = _combine_probe_failure_text(probe) if probe.failed else metadata_scan_error
+        assert raw_failure_text is not None
         compact_failure = _compact_failure_text(raw_failure_text)
-        remediation_message = _build_remediation_message(repo_dir=repo_path, findings=findings)
+        remediation_message = _build_remediation_message(
+            repo_dir=repo_path,
+            findings=findings,
+            metadata_scan_error=metadata_scan_error,
+        )
         alert_message = _build_alert_message(
             probe=probe,
             compact_failure=compact_failure,
             remediation_message=remediation_message,
+            metadata_scan_error=metadata_scan_error,
         )
         if persist:
             task = ensure_git_worktree_health_task(store)
@@ -455,8 +491,9 @@ def check_git_worktree_health(
                 probe=probe,
                 raw_failure_text=raw_failure_text,
                 compact_failure=compact_failure,
-                suspected_container_path_marker=validation.suspected_container_path_marker,
+                suspected_container_path_marker=suspected_container_path_marker,
                 metadata_findings=findings,
+                metadata_scan_error=metadata_scan_error,
                 remediation_message=remediation_message,
                 alert_message=alert_message,
                 captured_at=captured_at,
@@ -471,8 +508,9 @@ def check_git_worktree_health(
             probe=probe,
             raw_failure_text=raw_failure_text,
             compact_failure=compact_failure,
-            suspected_container_path_marker=validation.suspected_container_path_marker,
+            suspected_container_path_marker=suspected_container_path_marker,
             metadata_findings=findings,
+            metadata_scan_error=metadata_scan_error,
             remediation_message=remediation_message,
             alert_message=alert_message,
             captured_at=captured_at,
@@ -491,6 +529,7 @@ def check_git_worktree_health(
             compact_failure=None,
             suspected_container_path_marker=None,
             metadata_findings=(),
+            metadata_scan_error=None,
             remediation_message=None,
             alert_message=None,
             captured_at=captured_at,
@@ -508,6 +547,7 @@ def check_git_worktree_health(
         compact_failure=None,
         suspected_container_path_marker=None,
         metadata_findings=(),
+        metadata_scan_error=None,
         remediation_message=None,
         alert_message=None,
         captured_at=captured_at,

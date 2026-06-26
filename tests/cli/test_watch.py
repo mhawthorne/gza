@@ -173,6 +173,8 @@ def _make_watch_git() -> Git:
             )
 
         def _run(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            if args == ("rev-parse", "--git-common-dir"):
+                return SimpleNamespace(stdout=".git")
             raise self._unexpected_git_subprocess("_run")
 
         def _run_readonly_cached(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
@@ -198,6 +200,12 @@ def _make_watch_git() -> Git:
     git.get_diff_name_status = MagicMock(return_value="M\tfeature.txt\n")  # type: ignore[method-assign]
     git.get_diff_stat_parsed = MagicMock(return_value=(1, 1, 0))  # type: ignore[method-assign]
     git.get_diff_numstat = MagicMock(return_value="1\t0\tfeature.txt\n")  # type: ignore[method-assign]
+    return git
+
+
+def _watch_git_with_worktree_list(worktree_list: MagicMock) -> Git:
+    git = _make_watch_git()
+    git.worktree_list = worktree_list  # type: ignore[method-assign]
     return git
 
 
@@ -22257,7 +22265,7 @@ def test_cmd_watch_first_start_red_probe_persists_durable_git_health_state(tmp_p
             "gza.cli.watch.check_git_health",
             side_effect=lambda store, _git, persist=True: real_check_git_health(
                 store,
-                SimpleNamespace(worktree_list=MagicMock(side_effect=GitError(raw_failure))),
+                _watch_git_with_worktree_list(MagicMock(side_effect=GitError(raw_failure))),
                 persist=persist,
             ),
         ),
@@ -22288,8 +22296,9 @@ def test_cmd_watch_first_start_green_probe_clears_prior_git_health_alert_before_
     task = store.add("Pending implement", task_type="implement")
     assert task.id is not None
 
-    seeded_git = MagicMock()
-    seeded_git.worktree_list.side_effect = GitError("fatal: broken commondir /gza-git/common")
+    seeded_git = _watch_git_with_worktree_list(
+        MagicMock(side_effect=GitError("fatal: broken commondir /gza-git/common"))
+    )
     seeded_check = watch_module.check_git_health(store, seeded_git)
     assert seeded_check.dispatch_halted is True
     assert current_git_health_alert(store) is not None
@@ -22312,7 +22321,7 @@ def test_cmd_watch_first_start_green_probe_clears_prior_git_health_alert_before_
             "gza.cli.watch.check_git_health",
             side_effect=lambda store, _git, persist=True: real_check_git_health(
                 store,
-                SimpleNamespace(worktree_list=MagicMock(return_value=[{"path": str(tmp_path)}])),
+                _watch_git_with_worktree_list(MagicMock(return_value=[{"path": str(tmp_path)}])),
                 persist=persist,
             ),
         ),

@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from gza.git import GitError
 from gza.git import GitWorktreeHealthProbe, WorktreeAdminMetadataIssue, WorktreeAdminMetadataValidation
 from gza.git_health import (
     GIT_WORKTREE_HEALTH_PROMPT,
@@ -54,6 +57,7 @@ def test_check_git_worktree_health_pass_without_existing_alert_keeps_state_ephem
     assert check.state.probe_command == "git worktree list --porcelain"
     assert check.state.probe_returncode == 0
     assert check.state.metadata_findings == ()
+    assert check.state.metadata_scan_error is None
     assert check.state.alert_message is None
     assert load_git_worktree_health_state(store) is None
     assert current_git_health_alert(store) is None
@@ -104,6 +108,7 @@ def test_check_git_worktree_health_failure_persists_payload_and_alert(tmp_path) 
     assert state.suspected_container_path_marker == "/gza-git"
     assert len(state.metadata_findings) == 1
     assert state.metadata_findings[0].admin_file == "commondir"
+    assert state.metadata_scan_error is None
     assert state.remediation_message is not None
     assert "Inspect `.git/worktrees/*/commondir`" in state.remediation_message
     assert ".git/worktrees/broken/commondir" in state.remediation_message
@@ -132,6 +137,7 @@ def test_check_git_worktree_health_failure_persists_payload_and_alert(tmp_path) 
                 "value": "/gza-git/common",
             }
         ],
+        "metadata_scan_error": None,
         "probe_command": "git worktree list --porcelain",
         "probe_returncode": 128,
         "probe_stderr": probe.stderr,
@@ -217,3 +223,78 @@ def test_load_git_worktree_health_state_defaults_reason_for_legacy_payload(tmp_p
     assert state.dispatch_halted is True
     assert state.probe_returncode == 128
     assert state.metadata_findings == ()
+
+
+def test_check_git_worktree_health_metadata_scanner_failure_is_durable_alert(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = SimpleNamespace(repo_dir=tmp_path)
+    probe = GitWorktreeHealthProbe(
+        command="git worktree list --porcelain",
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    with (
+        patch("gza.git_health.datetime") as mocked_datetime,
+        patch("gza.git_health._probe_git_worktree_health", return_value=probe),
+        patch(
+            "gza.git_health.validate_host_worktree_admin_metadata",
+            side_effect=OSError("permission denied reading .git/worktrees"),
+        ),
+    ):
+        mocked_datetime.now.return_value = datetime(2026, 6, 26, tzinfo=UTC)
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        check = check_git_worktree_health(None, store, git)
+
+    assert check.dispatch_halted is True
+    state = check.state
+    assert state.probe_returncode == 0
+    assert state.metadata_findings == ()
+    assert state.metadata_scan_error == "OSError: permission denied reading .git/worktrees"
+    assert state.raw_failure_text == state.metadata_scan_error
+    assert state.alert_message is not None
+    assert "host worktree metadata scan failed" in state.alert_message
+    assert state.remediation_message is not None
+    assert "scanner failed before it could complete" in state.remediation_message
+    assert current_git_health_alert(store) == state
+
+    persisted_task = ensure_git_worktree_health_task(store)
+    payload = json.loads(persisted_task.output_content or "{}")
+    assert payload["metadata_findings"] == []
+    assert payload["metadata_scan_error"] == "OSError: permission denied reading .git/worktrees"
+    assert payload["dispatch_halted"] is True
+
+
+@pytest.mark.parametrize("control_flow_error", [KeyboardInterrupt(), SystemExit(2)])
+def test_probe_worktree_list_control_flow_exceptions_propagate(tmp_path, control_flow_error) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    def worktree_list():
+        raise control_flow_error
+
+    git = SimpleNamespace(repo_dir=tmp_path, worktree_list=worktree_list)
+
+    with pytest.raises(type(control_flow_error)):
+        check_git_worktree_health(None, store, git)
+
+    assert load_git_worktree_health_state(store) is None
+
+
+def test_probe_worktree_list_git_error_becomes_red_probe(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    def worktree_list():
+        raise GitError("fatal: invalid commondir /gza-git/common")
+
+    git = SimpleNamespace(repo_dir=tmp_path, worktree_list=worktree_list)
+
+    with patch("gza.git_health.validate_host_worktree_admin_metadata", return_value=_validation(tmp_path)):
+        check = check_git_worktree_health(None, store, git)
+
+    assert check.dispatch_halted is True
+    assert check.probe.returncode == 1
+    assert check.probe.stderr == "fatal: invalid commondir /gza-git/common"

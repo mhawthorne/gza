@@ -325,17 +325,23 @@ def test_cmd_watch_global_git_health_halt_avoids_task_cascade_and_resumes_dispat
 
     signal_handlers: dict[signal.Signals, object] = {}
     sleep_calls: list[int] = []
+
+    def git_with_worktree_list(worktree_list: MagicMock) -> Git:
+        git = Git(tmp_path)
+        git.worktree_list = worktree_list  # type: ignore[method-assign]
+        return git
+
     probe_failures = [
-        SimpleNamespace(
-            worktree_list=MagicMock(
+        git_with_worktree_list(
+            MagicMock(
                 side_effect=GitError(
                     "fatal: invalid commondir /gza-git/common\n"
                     "fatal: not a git repository: /workspace/.git/worktrees/broken"
                 )
             )
         ),
-        SimpleNamespace(worktree_list=MagicMock(return_value=[{"path": str(tmp_path)}])),
-        SimpleNamespace(worktree_list=MagicMock(return_value=[{"path": str(tmp_path)}])),
+        git_with_worktree_list(MagicMock(return_value=[{"path": str(tmp_path)}])),
+        git_with_worktree_list(MagicMock(return_value=[{"path": str(tmp_path)}])),
     ]
 
     def register_signal(sig: signal.Signals, handler: object) -> object:
