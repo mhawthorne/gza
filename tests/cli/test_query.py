@@ -6085,6 +6085,77 @@ class TestShowCommand:
         assert "Warning: Worktree lookup failed:" in output
         assert "simulated os error" in output
 
+    @pytest.mark.parametrize("page", [False, True])
+    def test_show_escapes_bracketed_task_text_in_prompt_and_comments(self, tmp_path: Path, page: bool) -> None:
+        """Show should render bracketed task text literally instead of interpreting Rich markup."""
+        from contextlib import nullcontext
+
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        prompt = "keys: [l]ineage [d]ate [s]tatus [t]oggle [q]uit"
+        task = store.add(prompt, task_type="implement")
+        assert task.id is not None
+        task.slug = "20260626-gza-[s]tatus"
+        store.update(task)
+        store.add_comment(
+            task.id,
+            "scope [b]bold [i]italics [q]uit",
+            source="github",
+            author="qa[s]",
+            kind="review_scope",
+        )
+
+        console = Console(record=True, force_terminal=True, color_system="standard", width=300)
+        show_colors = dict(query_cli.SHOW_COLORS_DICT)
+        show_colors.update(
+            {
+                "heading": "white",
+                "section": "white",
+                "label": "white",
+                "value": "white",
+                "prompt": "white",
+                "stats": "white",
+                "branch": "white",
+                "status_running": "blue",
+                "status_completed": "green",
+                "status_failed": "red",
+                "status_default": "white",
+            }
+        )
+
+        with (
+            patch.object(query_cli, "console", console),
+            patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
+            patch("gza.cli.query._summarize_lifecycle", return_value=None),
+            patch("gza.cli.query.pager_context", return_value=nullcontext()),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=page,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        rendered = console.export_text(styles=True, clear=False)
+        plain = console.export_text(clear=False)
+
+        assert exit_code == 0
+        assert prompt in plain
+        assert "Slug: 20260626-gza-[s]tatus" in plain
+        assert "author=qa[s]" in plain
+        assert "scope [b]bold [i]italics [q]uit" in plain
+        assert "\x1b[9m" not in rendered
+        assert "\x1b[2m" not in rendered
+
     def test_show_recovered_parent_reports_lifecycle_and_lineage_statuses(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
