@@ -5005,6 +5005,94 @@ class TestQueueCommand:
         assert _span_styles(blocked_line) == ["green", "cyan", "magenta", "white"]
         assert _span_styles(blocked_meta) == ["blue"]
 
+    def test_queue_command_themes_recovery_lane_task_fields(self, tmp_path: Path) -> None:
+        from gza.colors import QueueColors
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(
+            store,
+            prompt="Recovery row prompt",
+            task_type="plan",
+            failure_reason="INFRASTRUCTURE_ERROR",
+            session_id=None,
+        )
+
+        recording_console = _RecordingConsole()
+        config = Config.load(tmp_path)
+        queue_colors = QueueColors(
+            task_id="bold cyan",
+            task_type="italic magenta",
+            prompt="underline yellow",
+        )
+        with (
+            patch.object(watch_cli._colors, "QUEUE_COLORS", queue_colors),  # noqa: SLF001
+            patch.object(watch_cli, "console", recording_console),
+            patch.object(watch_cli.Config, "load", return_value=config),
+        ):
+            exit_code = watch_cli.cmd_queue(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    queue_action=None,
+                    limit=10,
+                    all=True,
+                    tags=None,
+                    any_tag=False,
+                    full=True,
+                )
+            )
+
+        text_outputs = [output for output in recording_console.outputs if isinstance(output, Text)]
+        assert exit_code == 0
+        recovery_line = next(text for text in text_outputs if "Recovery row prompt" in text.plain)
+        styled = _styled_substrings(recovery_line)
+
+        assert styled[str(failed.id)] == queue_colors.task_id
+        assert styled[f"[{failed.task_type}]"] == queue_colors.task_type
+        assert styled["Recovery row prompt"] == queue_colors.prompt
+
+    def test_format_queue_recovery_lane_detail_themes_needs_attention_fields(self, tmp_path: Path) -> None:
+        from gza.cli._recovery_lane import RecoveryLaneEntry
+        from gza.colors import QueueColors
+        from gza.recovery_engine import FailedRecoveryDecision
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Attention recovery prompt", task_type="plan")
+        assert task.id is not None
+        decision = FailedRecoveryDecision(
+            task_id=task.id,
+            action="skip",
+            reason_code="retry-limit-reached",
+            reason_text="retry limit reached",
+            launch_mode="none",
+            attempt_index=3,
+            attempt_limit=3,
+        )
+        entry = RecoveryLaneEntry(
+            owner_task=task,
+            task=task,
+            decision=decision,
+            attention_action={
+                "needs_attention_reason": "retry-limit-reached",
+                "description": "Manual review required",
+            },
+        )
+        queue_colors = QueueColors(
+            task_id="bold cyan",
+            task_type="italic magenta",
+            prompt="underline yellow",
+        )
+
+        with patch.object(watch_cli._colors, "QUEUE_COLORS", queue_colors):  # noqa: SLF001
+            rendered = watch_cli._format_queue_recovery_lane_detail(entry)
+
+        assert isinstance(rendered, Text)
+        styled = _styled_substrings(rendered)
+        assert styled[str(task.id)] == queue_colors.task_id
+        assert styled[task.task_type] == queue_colors.task_type
+        assert styled["Attention recovery prompt"] == queue_colors.prompt
+
     def test_next_tag_filters_pending_and_blocked_counts(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)

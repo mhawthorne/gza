@@ -5552,13 +5552,41 @@ def cmd_queue(args: argparse.Namespace) -> int:
     return 0
 
 
-def _format_queue_recovery_lane_detail(entry: RecoveryLaneEntry) -> str:
+def _format_queue_recovery_lane_detail(entry: RecoveryLaneEntry) -> Text:
+    colors = _colors.QUEUE_COLORS
+    task = entry.task
+    task_id = str(task.id or "unknown")
+    task_type = task.task_type or "task"
+
     if entry.attention_action is not None:
-        return format_needs_attention_entry_for_display(entry.task, action=entry.attention_action)
+        rendered = Text(
+            format_needs_attention_entry_for_display(task, action=entry.attention_action)
+        )
+        task_type_start = rendered.plain.find(task_type, len(task_id) + 1)
+        if rendered.plain.startswith(task_id):
+            rendered.stylize(colors.task_id, 0, len(task_id))
+        if task_type_start != -1:
+            rendered.stylize(colors.task_type, task_type_start, task_type_start + len(task_type))
+        prompt_start = rendered.plain.find('"', task_type_start + len(task_type))
+        if prompt_start != -1:
+            prompt_end = rendered.plain.find('"', prompt_start + 1)
+            if prompt_end > prompt_start + 1:
+                rendered.stylize(colors.prompt, prompt_start + 1, prompt_end)
+        return rendered
+
     decision = entry.decision
-    return (
-        f"{decision.action:<6} {entry.task.id} [{entry.task.task_type}] "
-        f"{shorten_prompt(entry.task.prompt, prompt_available_width(prefix=32, suffix=0))} "
-        f"via {decision.launch_mode} reason={decision.reason_code} "
+    type_chip = f"[{task_type}]"
+    prefix = f"{decision.action:<6} {task_id} {type_chip} "
+    prompt = shorten_prompt(task.prompt, prompt_available_width(prefix=len(prefix), suffix=0))
+    rendered = Text()
+    rendered.append(f"{decision.action:<6} ")
+    rendered.append(task_id, style=colors.task_id)
+    rendered.append(" ")
+    rendered.append(type_chip, style=colors.task_type)
+    rendered.append(" ")
+    rendered.append(prompt, style=colors.prompt)
+    rendered.append(
+        f" via {decision.launch_mode} reason={decision.reason_code} "
         f"attempt={decision.attempt_index}/{decision.attempt_limit}"
     )
+    return rendered
