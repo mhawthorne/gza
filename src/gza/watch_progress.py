@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .db import SqliteTaskStore, Task as DbTask, WatchProgressObservation, task_id_numeric_key
+from .lineage import resolve_lineage_root
 from .runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
 
 WATCH_NO_PROGRESS_BACKSTOP_REASON = "watch-no-progress-backstop"
@@ -59,40 +60,6 @@ def _normalize_time(value: datetime | None) -> datetime:
     return value.replace(tzinfo=UTC)
 
 
-def _resolve_lineage_root(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    if task.id is None:
-        return task
-    graph_nodes: dict[str, DbTask] = {task.id: task}
-    visited: set[str] = set()
-    stack: list[str] = [parent_id for parent_id in (task.based_on, task.depends_on) if parent_id]
-    while stack:
-        ancestor_id = stack.pop()
-        if ancestor_id in visited:
-            continue
-        visited.add(ancestor_id)
-        ancestor = store.get(ancestor_id)
-        if ancestor is None or ancestor.id is None:
-            continue
-        graph_nodes[ancestor.id] = ancestor
-        for parent_id in (ancestor.based_on, ancestor.depends_on):
-            if parent_id:
-                stack.append(parent_id)
-    node_ids = set(graph_nodes)
-    roots = [
-        candidate
-        for candidate in graph_nodes.values()
-        if not any(parent_id in node_ids for parent_id in (candidate.based_on, candidate.depends_on) if parent_id)
-    ]
-    candidates = roots or list(graph_nodes.values())
-    return min(
-        candidates,
-        key=lambda candidate: (
-            _normalize_time(candidate.created_at),
-            task_id_numeric_key(candidate.id),
-        ),
-    )
-
-
 def _resolve_subject(
     store: SqliteTaskStore,
     *,
@@ -109,7 +76,7 @@ def _resolve_subject(
             merge_unit.state,
             merge_unit.head_sha,
         )
-    root = _resolve_lineage_root(store, subject_task)
+    root = resolve_lineage_root(store, subject_task)
     if root.id is None:
         raise AssertionError("watch progress lineage root must be persisted")
     return ("lineage", root.id, None, None, None)

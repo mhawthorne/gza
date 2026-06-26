@@ -845,6 +845,8 @@ gza ps [options]
 | `--quiet`, `-q` | Only show worker IDs |
 | `--json` | Output as JSON |
 | `--poll [SECS]` | Refresh output every `SECS` seconds (default: `5` when flag is present without a value) |
+| `--sort {status,lineage,date}` | Choose the display sort mode (`status` keeps the existing status-grouped view) |
+| `--order {asc,desc}` | Set ascending or descending time order for the selected sort mode |
 | `--recent-minutes MINUTES` | In poll mode, keep first-seen terminal rows visible when they ended within the last `MINUTES` (default: `1`, `0` disables) |
 
 Runtime reconciliation notes:
@@ -856,6 +858,7 @@ Runtime reconciliation notes:
 - `gza ps` merges worker rows and DB in-progress tasks by task ownership, so healthy background runs appear as one active task row.
 - When available, `gza ps` shows the full stored execution model ID in a dedicated `MODEL` column; tasks that have never run render `-`.
 - `gza ps` shows the task merge unit in a dedicated `MERGE UNIT` column as `<merge-unit-id> / <owner-task-id>`; tasks not attached to a merge unit render `-`.
+- In `--poll` mode on a real TTY, live keys are available: `l` = lineage, `d` = date, `s` = status, `t` = toggle order, `q` = quit.
 
 ### kill
 

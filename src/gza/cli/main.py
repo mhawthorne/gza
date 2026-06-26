@@ -2776,6 +2776,18 @@ def main() -> int:
         help="Refresh output every SECS seconds (default: 5 if flag given without value)",
     )
     ps_parser.add_argument(
+        "--sort",
+        choices=("status", "lineage", "date"),
+        default="status",
+        help="Sort rows by status, lineage, or date (default: status)",
+    )
+    ps_parser.add_argument(
+        "--order",
+        choices=("asc", "desc"),
+        default="desc",
+        help="Sort order for date-based tiebreaks and active sort modes (default: desc)",
+    )
+    ps_parser.add_argument(
         "--recent-minutes",
         type=int,
         default=1,

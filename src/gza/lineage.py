@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
-from .db import SqliteTaskStore, Task
+from .db import SqliteTaskStore, Task, task_id_numeric_key
 
 
 def walk_based_on_descendants(
@@ -115,6 +116,56 @@ def get_root_impl(store: SqliteTaskStore, task: Task) -> Task:
             break
         current = parent
     return current
+
+
+def _normalize_lineage_time(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=UTC)
+    if value.tzinfo is not None:
+        return value.astimezone(UTC)
+    return value.replace(tzinfo=UTC)
+
+
+def _task_time_for_lineage(task: Task) -> datetime | None:
+    return task.created_at
+
+
+def _parent_ids(task: Task) -> list[str]:
+    parent_ids: list[str] = []
+    if task.based_on is not None:
+        parent_ids.append(task.based_on)
+    if task.depends_on is not None:
+        parent_ids.append(task.depends_on)
+    return parent_ids
+
+
+def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
+    """Resolve the root task across based_on + depends_on lineage links."""
+    if task.id is None:
+        return task
+
+    graph_nodes: dict[str, Task] = {task.id: task}
+    for ancestor in walk_ancestors(store, task, follow_based_on=True, follow_depends_on=True):
+        if ancestor.id is not None:
+            graph_nodes[ancestor.id] = ancestor
+
+    if len(graph_nodes) == 1:
+        return task
+
+    node_ids = set(graph_nodes)
+    root_candidates = [
+        candidate
+        for candidate in graph_nodes.values()
+        if not any(parent_id in node_ids for parent_id in _parent_ids(candidate))
+    ]
+    candidates = root_candidates or list(graph_nodes.values())
+    return min(
+        candidates,
+        key=lambda candidate: (
+            _normalize_lineage_time(_task_time_for_lineage(candidate)),
+            task_id_numeric_key(candidate.id),
+        ),
+    )
 
 
 def resolve_impl_task(

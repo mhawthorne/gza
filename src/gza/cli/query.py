@@ -7,18 +7,21 @@ import argparse
 import datetime as _dt
 import json
 import os
+import select
 import shlex
 import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import termios
 import time
+import tty
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from rich.markup import escape as rich_escape
 
@@ -49,7 +52,7 @@ from ..failure_reasons import mark_task_failed_from_cause
 from ..git import Git, GitError, active_worktree_path_for_branch
 from ..github import GitHub
 from ..lifecycle_completion import TERMINAL_MERGE_STATES
-from ..lineage import walk_based_on_descendants
+from ..lineage import resolve_lineage_root as _resolve_lineage_root_task, walk_based_on_descendants
 from ..lineage_query import (
     StaleUnmergedSweepCandidate,
     collect_stale_unmerged_sweep_candidates,
@@ -72,7 +75,6 @@ from ..query import (
     flatten_lineage_tree as _flatten_query_lineage_tree,
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
-    resolve_lineage_root as _resolve_lineage_root_task,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
 from ..status_ops import apply_manual_task_status
@@ -2950,6 +2952,8 @@ def _print_ps_output(
     recent_minutes: int = 1,
     poll_started_at: "_dt.datetime | None" = None,
     last_poll_at: "_dt.datetime | None" = None,
+    sort_mode: str = "status",
+    order: str = "desc",
 ) -> None:
     """Print ps output once. Used by cmd_ps directly and in poll loop.
 
@@ -3008,7 +3012,6 @@ def _print_ps_output(
                     row["status"] = task.status
 
         rows = list(seen_tasks.values())
-        rows.sort(key=_ps_sort_key)
     else:
         rows = live_rows
 
@@ -3021,6 +3024,7 @@ def _print_ps_output(
             for r in rows
             if r["status"] not in ("completed", "failed") or r.get("startup_failure", False)
         ]
+    _ps_sort_rows(rows, store, mode=sort_mode, descending=(order == "desc"))
 
     if poll_interval is not None:
         now = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -3033,6 +3037,8 @@ def _print_ps_output(
             f"Refreshing every {poll_interval}s — started: {started_str} — "
             f"last updated: {now}  (Ctrl+C to exit)"
         )
+        if _ps_poll_is_interactive(sys.stdin, sys.stdout):
+            print(f"keys: [l]ineage [d]ate [s]tatus  [t]oggle order  [q]uit   sort: {sort_mode} {order}")
         print()
 
     if not rows:
@@ -3120,6 +3126,8 @@ def cmd_ps(args: argparse.Namespace) -> int:
     poll_interval: int | None = getattr(args, "poll", None)
     show_all: bool = getattr(args, "all", False)
     recent_minutes = getattr(args, "recent_minutes", 1)
+    sort_mode = getattr(args, "sort", "status")
+    order = getattr(args, "order", "desc")
     if recent_minutes < 0:
         print(
             f"error: --recent-minutes must be >= 0 (got {recent_minutes})",
@@ -3137,7 +3145,12 @@ def cmd_ps(args: argparse.Namespace) -> int:
         seen_tasks: dict = {}
         poll_started_at = _dt.datetime.now(_dt.UTC)
         last_poll_at: _dt.datetime | None = None
+        interactive_poll = _ps_poll_is_interactive(sys.stdin, sys.stdout)
+        original_term_attrs: Any = None
         try:
+            if interactive_poll:
+                original_term_attrs = termios.tcgetattr(sys.stdin.fileno())
+                tty.setcbreak(sys.stdin.fileno())
             while True:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")  # clear screen, move cursor to top
@@ -3149,13 +3162,46 @@ def cmd_ps(args: argparse.Namespace) -> int:
                     recent_minutes=recent_minutes,
                     poll_started_at=poll_started_at,
                     last_poll_at=last_poll_at,
+                    sort_mode=sort_mode,
+                    order=order,
                 )
                 last_poll_at = _dt.datetime.now(_dt.UTC)
-                time.sleep(poll_interval)
+                if not interactive_poll:
+                    time.sleep(poll_interval)
+                    continue
+
+                deadline = time.monotonic() + poll_interval
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    ready, _, _ = select.select([sys.stdin], [], [], remaining)
+                    if not ready:
+                        break
+                    key = sys.stdin.read(1)
+                    next_mode, next_order, refresh_now = _apply_ps_key(key, sort_mode, order)
+                    if key == "q":
+                        return 0
+                    if not refresh_now:
+                        continue
+                    sort_mode = next_mode
+                    order = next_order
+                    break
         except KeyboardInterrupt:
             return 0
+        finally:
+            if original_term_attrs is not None:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, original_term_attrs)
     else:
-        _print_ps_output(args, registry, store, show_all=show_all, recent_minutes=recent_minutes)
+        _print_ps_output(
+            args,
+            registry,
+            store,
+            show_all=show_all,
+            recent_minutes=recent_minutes,
+            sort_mode=sort_mode,
+            order=order,
+        )
 
     return 0
 
@@ -3287,6 +3333,185 @@ def _ps_sort_key(row: dict) -> tuple[int, bool, float, int, str]:
         task_id_sort = sys.maxsize  # worker-only rows (no task) sort last
     worker_id = row.get("worker_id", "")
     return (status_group, has_no_timestamp, ts_numeric, task_id_sort, worker_id)
+
+
+def _ps_sort_rows(
+    rows: list[dict],
+    store: SqliteTaskStore,
+    *,
+    mode: str = "status",
+    descending: bool = True,
+) -> None:
+    """Sort ps rows in place for the selected presentation mode."""
+    if mode == "status":
+        rows.sort(key=lambda row: _ps_status_sort_key(row, descending=descending))
+        return
+
+    if mode == "date":
+        rows.sort(key=lambda row: _ps_date_sort_key(row, descending=descending))
+        return
+
+    if mode != "lineage":
+        raise ValueError(f"Unsupported ps sort mode: {mode}")
+
+    task_cache: dict[str, DbTask | None] = {}
+    root_cache: dict[str, str | None] = {}
+    group_recency: dict[str, float] = {}
+    group_is_worker_only: dict[str, bool] = {}
+    root_numeric_sort: dict[str, int] = {}
+    root_text_sort: dict[str, str] = {}
+
+    for row in rows:
+        task_id = row.get("task_id")
+        ts_numeric = _ps_sort_timestamp_numeric(row)
+        if isinstance(task_id, str):
+            task = task_cache.get(task_id)
+            if task_id not in task_cache:
+                task = store.get(task_id)
+                task_cache[task_id] = task
+            root_id = root_cache.get(task_id)
+            if task_id not in root_cache:
+                root_task = _resolve_lineage_root_task(store, task) if task is not None else None
+                root_id = root_task.id if root_task is not None else task_id
+                root_cache[task_id] = root_id
+            assert root_id is not None
+            group_id = root_id
+            group_is_worker_only[group_id] = False
+            root_numeric_sort[group_id] = _task_id_sort_value(root_id)
+            root_text_sort[group_id] = root_id
+        else:
+            worker_id = str(row.get("worker_id", ""))
+            group_id = f"~worker:{worker_id}"
+            group_is_worker_only[group_id] = True
+            root_numeric_sort[group_id] = sys.maxsize
+            root_text_sort[group_id] = worker_id
+
+        row["_ps_group_id"] = group_id
+        group_recency[group_id] = max(group_recency.get(group_id, float("-inf")), ts_numeric)
+
+    rows.sort(
+        key=lambda row: _ps_lineage_sort_key(
+            row,
+            descending=descending,
+            group_recency=group_recency,
+            group_is_worker_only=group_is_worker_only,
+            root_numeric_sort=root_numeric_sort,
+            root_text_sort=root_text_sort,
+        )
+    )
+    for row in rows:
+        row.pop("_ps_group_id", None)
+
+
+def _apply_ps_key(key: str, mode: str, order: str) -> tuple[str, str, bool]:
+    """Apply a single poll-mode keypress to ps sort state."""
+    if key == "l":
+        return ("lineage", order, True)
+    if key == "d":
+        return ("date", order, True)
+    if key == "s":
+        return ("status", order, True)
+    if key == "t":
+        return (mode, "asc" if order == "desc" else "desc", True)
+    if key == "q":
+        return (mode, order, True)
+    return (mode, order, False)
+
+
+def _ps_poll_is_interactive(stdin: Any, stdout: Any) -> bool:
+    """Return whether ps poll may safely use live terminal key handling."""
+    stdin_is_tty = getattr(stdin, "isatty", lambda: False)
+    stdout_is_tty = getattr(stdout, "isatty", lambda: False)
+    return bool(stdin_is_tty() and stdout_is_tty())
+
+
+def _ps_status_group(status: str) -> int:
+    if status == "in_progress":
+        return 0
+    if status == "failed":
+        return 1
+    if status == "completed":
+        return 2
+    return 3
+
+
+def _ps_sort_timestamp_numeric(row: Mapping[str, object]) -> float:
+    sort_timestamp = row.get("sort_timestamp") or ""
+    if isinstance(sort_timestamp, str) and sort_timestamp:
+        try:
+            return datetime.fromisoformat(sort_timestamp).timestamp()
+        except (ValueError, OSError):
+            return 0.0
+    return 0.0
+
+
+def _ps_row_has_no_timestamp(row: Mapping[str, object]) -> bool:
+    return (row.get("sort_timestamp") or "") == ""
+
+
+def _task_id_sort_value(raw_task_id: object) -> int:
+    if isinstance(raw_task_id, str):
+        decoded = _task_id_numeric_key(raw_task_id)
+        if decoded != 0:
+            return decoded
+        try:
+            return int(raw_task_id)
+        except (ValueError, TypeError):
+            return sys.maxsize
+    if isinstance(raw_task_id, int):
+        return raw_task_id
+    return sys.maxsize
+
+
+def _ps_status_sort_key(row: dict, *, descending: bool) -> tuple[int, bool, float, int, str]:
+    status_group = _ps_status_group(str(row.get("status", "")))
+    ts_numeric = _ps_sort_timestamp_numeric(row)
+    if status_group == 0:
+        time_key = ts_numeric if descending else -ts_numeric
+    else:
+        time_key = -ts_numeric if descending else ts_numeric
+    return (
+        status_group,
+        _ps_row_has_no_timestamp(row),
+        time_key,
+        _task_id_sort_value(row.get("task_id")),
+        str(row.get("worker_id", "")),
+    )
+
+
+def _ps_date_sort_key(row: dict, *, descending: bool) -> tuple[bool, float, int, int, str]:
+    ts_numeric = _ps_sort_timestamp_numeric(row)
+    return (
+        _ps_row_has_no_timestamp(row),
+        -ts_numeric if descending else ts_numeric,
+        _ps_status_group(str(row.get("status", ""))),
+        _task_id_sort_value(row.get("task_id")),
+        str(row.get("worker_id", "")),
+    )
+
+
+def _ps_lineage_sort_key(
+    row: dict,
+    *,
+    descending: bool,
+    group_recency: Mapping[str, float],
+    group_is_worker_only: Mapping[str, bool],
+    root_numeric_sort: Mapping[str, int],
+    root_text_sort: Mapping[str, str],
+) -> tuple[bool, float, int, str, bool, float, int, int, str]:
+    group_id = str(row["_ps_group_id"])
+    ts_numeric = _ps_sort_timestamp_numeric(row)
+    return (
+        group_is_worker_only.get(group_id, False),
+        -(group_recency.get(group_id, 0.0)) if descending else group_recency.get(group_id, 0.0),
+        root_numeric_sort.get(group_id, sys.maxsize),
+        root_text_sort.get(group_id, ""),
+        _ps_row_has_no_timestamp(row),
+        -ts_numeric if descending else ts_numeric,
+        _ps_status_group(str(row.get("status", ""))),
+        _task_id_sort_value(row.get("task_id")),
+        str(row.get("worker_id", "")),
+    )
 
 
 def _worker_failed_during_startup(worker: WorkerMetadata | None, task: DbTask | None) -> bool:

@@ -14,7 +14,12 @@ from typing import Literal
 
 from gza.db import SqliteTaskStore, Task, task_id_numeric_key
 from gza.lifecycle_completion import task_is_complete_for_lifecycle
-from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
+from gza.lineage import (
+    resolve_impl_task,
+    resolve_lineage_root as _resolve_lineage_root,
+    walk_ancestors,
+    walk_based_on_descendants,
+)
 from gza.task_query import (
     DateFilter,
     TaskQuery,
@@ -889,30 +894,7 @@ def _get_parent_ids(task: Task) -> list[str]:
 
 def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:
     """Resolve the root task for lineage display across based_on + depends_on chains."""
-    if task.id is None:
-        return task
-
-    graph_nodes: dict[str, Task] = {task.id: task}
-    for ancestor in walk_ancestors(store, task, follow_based_on=True, follow_depends_on=True):
-        if ancestor.id is not None:
-            graph_nodes[ancestor.id] = ancestor
-
-    if len(graph_nodes) == 1:
-        return task
-
-    node_ids = set(graph_nodes.keys())
-    root_candidates = [
-        candidate
-        for candidate in graph_nodes.values()
-        if not any(parent_id in node_ids for parent_id in _get_parent_ids(candidate))
-    ]
-    candidates = root_candidates or list(graph_nodes.values())
-
-    def _root_order_key(candidate: Task) -> tuple[datetime, int]:
-        ts = _normalize_lineage_time(task_time_for_lineage(candidate))
-        return (ts, task_id_numeric_key(candidate.id))
-
-    return sorted(candidates, key=_root_order_key)[0]
+    return _resolve_lineage_root(store, task)
 
 
 def resolve_same_branch_lineage_root(store: SqliteTaskStore, task: Task) -> Task:

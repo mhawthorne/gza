@@ -2,10 +2,12 @@
 
 
 import argparse
+import importlib
 import json
 import os
 import re
 import sqlite3
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9686,6 +9688,83 @@ class TestPsCommand:
         assert "\033[2J" not in captured.out
         assert "\033[H" not in captured.out
 
+    def test_ps_poll_piped_stdout_skips_live_key_handling(self, tmp_path: Path):
+        """Piped stdout must use the sleep fallback even when stdin is a TTY."""
+        import argparse
+        import unittest.mock as mock
+
+        from gza.cli import cmd_ps
+
+        class _TTYInput:
+            def isatty(self) -> bool:
+                return True
+
+            def fileno(self) -> int:
+                return 0
+
+        class _PipedOutput:
+            def isatty(self) -> bool:
+                return False
+
+        setup_config(tmp_path)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            quiet=False,
+            json=False,
+            poll=2,
+            sort="date",
+            order="asc",
+        )
+
+        with (
+            mock.patch.object(query_cli.sys, "stdin", _TTYInput()),
+            mock.patch.object(query_cli.sys, "stdout", _PipedOutput()),
+            mock.patch.object(query_cli, "_print_ps_output") as print_ps,
+            mock.patch.object(query_cli.tty, "setcbreak") as setcbreak,
+            mock.patch.object(query_cli.termios, "tcgetattr") as tcgetattr,
+            mock.patch.object(query_cli.select, "select") as select_call,
+            mock.patch("time.sleep", side_effect=KeyboardInterrupt) as sleep,
+        ):
+            result = cmd_ps(args)
+
+        assert result == 0
+        setcbreak.assert_not_called()
+        tcgetattr.assert_not_called()
+        select_call.assert_not_called()
+        sleep.assert_called_once_with(2)
+        assert print_ps.call_args.kwargs["sort_mode"] == "date"
+        assert print_ps.call_args.kwargs["order"] == "asc"
+
+    def test_print_ps_output_poll_omits_live_keys_when_stdout_not_tty(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """The live-key footer is only shown for fully interactive poll output."""
+        import argparse
+
+        from gza.workers import WorkerRegistry
+
+        class _TTYInput:
+            def isatty(self) -> bool:
+                return True
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        workers_dir = tmp_path / ".gza" / "workers"
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        registry = WorkerRegistry(workers_dir)
+
+        args = argparse.Namespace(project_dir=tmp_path, quiet=False, json=False, poll=2)
+        with patch.object(query_cli.sys, "stdin", _TTYInput()):
+            query_cli._print_ps_output(args, registry, store, poll_interval=2, sort_mode="lineage", order="asc")
+
+        captured = capsys.readouterr()
+        assert "Refreshing every 2s" in captured.out
+        assert "keys:" not in captured.out
+        assert "sort: lineage asc" not in captured.out
+
     def test_ps_poll_json_prefers_task_started_at_over_older_worker(self, tmp_path: Path, capsys, monkeypatch):
         """Poll-mode task rows should keep using task timing in JSON snapshots."""
         import argparse
@@ -14858,6 +14937,191 @@ class TestPsSortKey:
 
         sorted_rows = sorted([early, late], key=_ps_sort_key)
         assert [r["task_id"] for r in sorted_rows] == ["gza-1", "gza-2"]
+
+
+class TestPsSortRows:
+    def _make_row(
+        self,
+        *,
+        task_id: str | None,
+        status: str,
+        sort_timestamp: str,
+        worker_id: str,
+    ) -> dict:
+        return {
+            "task_id": task_id,
+            "status": status,
+            "sort_timestamp": sort_timestamp,
+            "worker_id": worker_id,
+        }
+
+    def test_status_mode_default_matches_existing_sort_key(self):
+        rows = [
+            self._make_row(
+                task_id="gza-3",
+                status="completed",
+                sort_timestamp="2026-01-03T00:00:00+00:00",
+                worker_id="w-3",
+            ),
+            self._make_row(
+                task_id="gza-1",
+                status="in_progress",
+                sort_timestamp="2026-01-01T00:00:00+00:00",
+                worker_id="w-1",
+            ),
+            self._make_row(
+                task_id="gza-2",
+                status="failed",
+                sort_timestamp="2026-01-02T00:00:00+00:00",
+                worker_id="w-2",
+            ),
+        ]
+        expected = sorted(rows, key=query_cli._ps_sort_key)
+
+        query_cli._ps_sort_rows(rows, MagicMock(), mode="status", descending=True)
+
+        assert rows == expected
+
+    @pytest.mark.parametrize(
+        ("descending", "expected_ids"),
+        [
+            (True, ["gza-2", "gza-3", "gza-1"]),
+            (False, ["gza-1", "gza-3", "gza-2"]),
+        ],
+    )
+    def test_date_mode_orders_global_timeline(self, descending: bool, expected_ids: list[str]):
+        rows = [
+            self._make_row(
+                task_id="gza-1",
+                status="completed",
+                sort_timestamp="2026-01-01T00:00:00+00:00",
+                worker_id="w-1",
+            ),
+            self._make_row(
+                task_id="gza-2",
+                status="failed",
+                sort_timestamp="2026-01-03T00:00:00+00:00",
+                worker_id="w-2",
+            ),
+            self._make_row(
+                task_id="gza-3",
+                status="in_progress",
+                sort_timestamp="2026-01-02T00:00:00+00:00",
+                worker_id="w-3",
+            ),
+        ]
+
+        query_cli._ps_sort_rows(rows, MagicMock(), mode="date", descending=descending)
+
+        assert [row["task_id"] for row in rows] == expected_ids
+
+    def test_lineage_mode_groups_same_root_and_orders_groups_by_recency(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root_a = store.add("root a")
+        root_b = store.add("root b")
+        child_a = store.add("child a", based_on=root_a.id)
+
+        rows = [
+            self._make_row(
+                task_id=root_b.id,
+                status="completed",
+                sort_timestamp="2026-01-03T00:00:00+00:00",
+                worker_id="w-b",
+            ),
+            self._make_row(
+                task_id=root_a.id,
+                status="completed",
+                sort_timestamp="2026-01-01T00:00:00+00:00",
+                worker_id="w-a-root",
+            ),
+            self._make_row(
+                task_id=child_a.id,
+                status="failed",
+                sort_timestamp="2026-01-05T00:00:00+00:00",
+                worker_id="w-a-child",
+            ),
+            self._make_row(
+                task_id=None,
+                status="failed",
+                sort_timestamp="2026-01-06T00:00:00+00:00",
+                worker_id="w-worker-only",
+            ),
+        ]
+
+        query_cli._ps_sort_rows(rows, store, mode="lineage", descending=True)
+
+        assert [row["task_id"] for row in rows[:3]] == [child_a.id, root_a.id, root_b.id]
+        assert rows[3]["task_id"] is None
+
+        query_cli._ps_sort_rows(rows, store, mode="lineage", descending=False)
+
+        assert [row["task_id"] for row in rows[:3]] == [root_b.id, root_a.id, child_a.id]
+        assert rows[3]["task_id"] is None
+
+
+class TestPsKeyHandling:
+    @pytest.mark.parametrize(
+        ("key", "mode", "order", "expected"),
+        [
+            ("l", "status", "desc", ("lineage", "desc", True)),
+            ("d", "status", "desc", ("date", "desc", True)),
+            ("s", "lineage", "asc", ("status", "asc", True)),
+            ("q", "date", "desc", ("date", "desc", True)),
+            ("x", "date", "asc", ("date", "asc", False)),
+        ],
+    )
+    def test_apply_ps_key(self, key: str, mode: str, order: str, expected: tuple[str, str, bool]):
+        assert query_cli._apply_ps_key(key, mode, order) == expected
+
+    def test_apply_ps_key_toggles_order_back_and_forth(self):
+        mode, order, refresh = query_cli._apply_ps_key("t", "date", "desc")
+        assert (mode, order, refresh) == ("date", "asc", True)
+
+        mode, order, refresh = query_cli._apply_ps_key("t", mode, order)
+        assert (mode, order, refresh) == ("date", "desc", True)
+
+
+class TestPsArgparse:
+    def test_ps_sort_and_order_flags_parse(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        setup_config(tmp_path)
+        cli_main_module = importlib.import_module("gza.cli.main")
+        captured: dict[str, object] = {}
+
+        def fake_cmd_ps(args: argparse.Namespace) -> int:
+            captured["sort"] = args.sort
+            captured["order"] = args.order
+            captured["command"] = args.command
+            return 0
+
+        monkeypatch.setattr(cli_main_module, "cmd_ps", fake_cmd_ps)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["gza", "ps", "--sort", "date", "--order", "asc", "--project", str(tmp_path)],
+        ):
+            result = cli_main_module.main()
+
+        assert result == 0
+        assert captured == {"sort": "date", "order": "asc", "command": "ps"}
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["gza", "ps", "--sort", "invalid"],
+            ["gza", "ps", "--order", "sideways"],
+        ],
+    )
+    def test_ps_sort_and_order_flags_reject_invalid_choices(self, tmp_path: Path, argv: list[str]):
+        setup_config(tmp_path)
+        cli_main_module = importlib.import_module("gza.cli.main")
+
+        with patch.object(sys, "argv", [*argv, "--project", str(tmp_path)]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli_main_module.main()
+
+        assert excinfo.value.code == 2
 
 
 class TestIncompleteCommand:
