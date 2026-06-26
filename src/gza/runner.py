@@ -6684,7 +6684,7 @@ def run(
             return 1
         task = None
         while True:
-            candidate = store.get_next_pending()
+            candidate = store.get_next_pending(quiet_seconds=config.quiet_period_seconds)
             if candidate is None:
                 break
             assert candidate.id is not None

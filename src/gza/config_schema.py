@@ -87,7 +87,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "quiet_period_seconds",
         "int",
         300,
-        "Seconds reserved for the upcoming newly-created-task quiet-period pickup/display implementation; current releases expose the setting only and do not yet hold tasks from execution, and `0` keeps the future hold disabled.",
+        "Seconds a newly created task stays in the Quiet lane of `gza queue` / `gza next` before rejoining normal pending display order; current releases still do not change worker pickup eligibility, and `0` disables the quiet lane.",
     ),
     ConfigKeySpec("colors.*", "str", None, "Ad-hoc color override map keyed by output field."),
     ConfigKeySpec("defaults.max_steps", "int", 50, "Default step budget for task execution."),

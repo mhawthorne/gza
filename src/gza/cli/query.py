@@ -129,6 +129,8 @@ from ._queue_render import (
     QueueRenderRow as _QueueRenderRow,
     build_blocked_count_summary as _build_blocked_count_summary,
     build_queue_summary as _build_queue_summary,
+    format_quiet_available_at as _format_quiet_available_at,
+    partition_queue_rows as _partition_queue_rows,
     print_queue_rows as _print_queue_rows,
     queue_render_widths as _queue_render_widths,
 )
@@ -754,6 +756,15 @@ def _print_pending_lane_header(*, preview_label: str) -> None:
     )
 
 
+def _print_quiet_lane_header(*, preview_label: str) -> None:
+    console.print()
+    console.print(
+        _build_queue_summary(
+            f"Quiet lane: `{preview_label}` shows held tasks without giving them runnable positions."
+        )
+    )
+
+
 def _print_lifecycle_action_section(entries) -> None:
     console.print()
     console.print(
@@ -801,12 +812,12 @@ def cmd_next(args: argparse.Namespace) -> int:
     queue_rows = [
         row
         for row in service.run(
-            _TaskQueryPresets.queue_listing(limit=None, tags=tag_filters, any_tag=any_tag)
+            _TaskQueryPresets.queue_listing(limit=None, tags=tag_filters, any_tag=any_tag),
+            config=config,
         ).rows
         if isinstance(row, _TaskRow)
     ]
-    runnable_rows = [row for row in queue_rows if not bool(row.values.get("blocked"))]
-    blocked_rows = [row for row in queue_rows if bool(row.values.get("blocked"))]
+    runnable_rows, quiet_rows, blocked_rows = _partition_queue_rows(queue_rows)
 
     # Check for orphaned/stale tasks once, regardless of whether pending tasks exist
     registry = WorkerRegistry(config.workers_path)
@@ -831,6 +842,26 @@ def cmd_next(args: argparse.Namespace) -> int:
         _QueueRenderRow(task=row.task, position_text=str(index))
         for index, row in enumerate(runnable_rows, 1)
     ]
+    quiet_rendered_rows = [
+        _QueueRenderRow(
+            task=row.task,
+            position_text="-",
+            blocked_by_text=(
+                _format_blocked_dependency_label(
+                    cast(str | None, row.values.get("blocking_id")),
+                    cast(str | None, row.values.get("blocking_status")),
+                    blocking_merge_state=cast(str | None, row.values.get("blocking_merge_state")),
+                    blocking_merge_owner_id=cast(str | None, row.values.get("blocking_merge_owner_id")),
+                    blocking_source_branch=cast(str | None, row.values.get("blocking_source_branch")),
+                    blocking_target_branch=cast(str | None, row.values.get("blocking_target_branch")),
+                )[1:-1]
+                if bool(row.values.get("blocked"))
+                else None
+            ),
+            quiet_available_text=_format_quiet_available_at(row.values.get("quiet_available_at")),
+        )
+        for row in quiet_rows
+    ]
     if show_all:
         rendered_rows.extend(
             _QueueRenderRow(
@@ -851,7 +882,7 @@ def cmd_next(args: argparse.Namespace) -> int:
             )
             for row in blocked_rows
         )
-    widths = _queue_render_widths(rendered_rows)
+    widths = _queue_render_widths(rendered_rows + quiet_rendered_rows)
 
     # Show runnable tasks
     if rendered_rows:
@@ -867,9 +898,13 @@ def cmd_next(args: argparse.Namespace) -> int:
             else:
                 console.print("No runnable tasks")
 
+    if quiet_rendered_rows:
+        _print_quiet_lane_header(preview_label="gza next")
+        _print_queue_rows(console, quiet_rendered_rows, widths=widths)
+
     # Show blocked tasks if --all is specified
     if show_all and blocked_rows:
-        if runnable_rows:
+        if runnable_rows or quiet_rendered_rows:
             console.print()
         _print_queue_rows(
             console,

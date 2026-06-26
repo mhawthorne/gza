@@ -63,7 +63,12 @@ from ..main_integration_verify import (
 )
 from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
-from ..pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
+from ..pickup import (
+    effective_edit_time,
+    get_runnable_pending_tasks,
+    is_in_quiet_period,
+    is_worker_consuming_advance_action,
+)
 from ..providers.base import wait_for_docker_ready
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -132,6 +137,8 @@ from ._lifecycle_actions import (
 from ._queue_render import (
     QueueRenderRow,
     build_queue_summary,
+    format_quiet_available_at,
+    partition_queue_rows,
     print_queue_rows,
     queue_render_widths,
 )
@@ -2049,10 +2056,46 @@ def _format_wake_message(
 def _pending_runnable_tasks(
     store: SqliteTaskStore,
     *,
+    config: Config | None = None,
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
 ) -> list[DbTask]:
-    return get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag)
+    quiet_seconds = int(getattr(config, "quiet_period_seconds", 0) or 0)
+    return get_runnable_pending_tasks(
+        store,
+        tags=tags,
+        any_tag=any_tag,
+        quiet_seconds=quiet_seconds,
+    )
+
+
+def _top_quiet_pending_task(
+    store: SqliteTaskStore,
+    *,
+    config: Config | None = None,
+    excluded_task_ids: set[str] | None = None,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+) -> tuple[DbTask, datetime] | None:
+    quiet_seconds = int(getattr(config, "quiet_period_seconds", 0) or 0)
+    if quiet_seconds <= 0:
+        return None
+    excluded_ids = excluded_task_ids or set()
+    now = datetime.now(UTC)
+    for task in store.get_pending(limit=None, tags=tags, any_tag=any_tag):
+        if task.id is None or task.task_type == "internal":
+            continue
+        if str(task.id) in excluded_ids:
+            continue
+        if store.is_task_blocked(task)[0]:
+            continue
+        if not is_in_quiet_period(task, now=now, quiet_seconds=quiet_seconds):
+            return None
+        effective_at = effective_edit_time(task)
+        if effective_at is None:
+            return None
+        return task, effective_at + timedelta(seconds=quiet_seconds)
+    return None
 
 
 def _run_with_optional_stdout_suppressed(quiet: bool, fn: Callable[[], T]) -> T:
@@ -4493,6 +4536,22 @@ def _run_cycle(
         pending_slots -= 1
         slots = max(0, slots - 1)
 
+    quiet_skip = _top_quiet_pending_task(
+        store,
+        config=config,
+        excluded_task_ids=started_task_ids | pending_recovery_task_ids | step1_handled_child_task_ids,
+        tags=tags,
+        any_tag=any_tag,
+    )
+    if quiet_skip is not None:
+        quiet_task, quiet_available_at = quiet_skip
+        quiet_available_text = format_quiet_available_at(quiet_available_at) or quiet_available_at.isoformat()
+        log.emit(
+            "SKIP",
+            f"{quiet_task.id} held by quiet period until {quiet_available_text}",
+            dedupe_key=f"quiet:{quiet_task.id}:{quiet_available_at.astimezone(UTC).isoformat()}",
+        )
+
     if pending_slots > 0:
         log.emit("QUEUE", "pending queue active")
     if pending_slots > 0:
@@ -4705,7 +4764,7 @@ def _run_cycle(
                     message=_watch_needs_attention_message(task, no_progress_attention),
                 )
 
-    pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
+    pending_count = len(_pending_runnable_tasks(store, config=config, tags=tags, any_tag=any_tag))
     _check_canonical_checkout_boundary("watch-pass-end")
     _emit_cycle_attention_summary(log)
     if end_cycle:
@@ -4976,7 +5035,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     log.end_cycle()
                     preview_cycle_open = False
                     pending_first_cycle_plan = None
-                pending_count = len(_pending_runnable_tasks(store, tags=tag_filters, any_tag=any_tag))
+                pending_count = len(_pending_runnable_tasks(store, config=config, tags=tag_filters, any_tag=any_tag))
                 log.emit(
                     "HOLD",
                     (
@@ -5279,9 +5338,15 @@ def cmd_queue(args: argparse.Namespace) -> int:
         runnable_pending_ids = {
             str(row.task.id)
             for row in service.run(
-                TaskQueryPresets.queue(limit=None, tags=normalized_tag_filters, any_tag=any_tag)
+                TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag),
+                config=config,
             ).rows
-            if isinstance(row, TaskRow) and row.task.id is not None
+            if (
+                isinstance(row, TaskRow)
+                and row.task.id is not None
+                and not bool(row.values.get("blocked"))
+                and not bool(row.values.get("quiet"))
+            )
         }
         is_currently_runnable = str(task_id) in runnable_pending_ids
 
@@ -5379,31 +5444,18 @@ def cmd_queue(args: argparse.Namespace) -> int:
                 max_recovery_attempts=config.max_resume_attempts,
                 persist_post_merge_rebase_state=False,
             )
-    if show_pending:
-        dispatch_preview = build_dispatch_preview(
-            store,
-            tags=normalized_tag_filters,
-            any_tag=any_tag,
-            max_recovery_attempts=config.max_resume_attempts,
-            selection_mode=dispatch_mode,
-            include_recovery=False,
-        )
-        runnable_pending = [entry.task for entry in dispatch_preview.pending_entries]
-        queue_rows = [
-            row
-            for row in service.run(
-                TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag)
-            ).rows
-            if isinstance(row, TaskRow)
-        ]
-        blocked_pending = [row for row in queue_rows if bool(row.values.get("blocked"))]
-    if not runnable_pending and not blocked_pending and not recovery_entries and not lifecycle_entries:
-        if dispatch_mode == "recovery_only":
-            if tag_filters:
-                print(f"No recovery candidates matching tags: {', '.join(tag_filters)}")
-            else:
-                print("No recovery candidates")
-        elif tag_filters:
+    queue_rows = [
+        row
+        for row in service.run(
+            TaskQueryPresets.queue_listing(limit=None, tags=normalized_tag_filters, any_tag=any_tag),
+            config=config,
+        ).rows
+        if isinstance(row, TaskRow)
+    ]
+    runnable_rows, quiet_rows, blocked_pending = partition_queue_rows(queue_rows)
+    runnable_pending = [row.task for row in runnable_rows]
+    if not runnable_pending and not quiet_rows and not blocked_pending and not recovery_entries and not lifecycle_entries:
+        if tag_filters:
             print(f"No pending tasks matching tags: {', '.join(tag_filters)}")
         else:
             print("No pending tasks")
@@ -5476,6 +5528,16 @@ def cmd_queue(args: argparse.Namespace) -> int:
         )
         return f"blocked by {blocking}" if blocking else "blocked by dependency"
 
+    quiet_rendered_rows = [
+        QueueRenderRow(
+            task=row.task,
+            position_text="-",
+            blocked_by_text=_blocked_by_text(row) if bool(row.values.get("blocked")) else None,
+            quiet_available_text=format_quiet_available_at(row.values.get("quiet_available_at")),
+        )
+        for row in quiet_rows
+    ]
+
     rendered_rows.extend(
         QueueRenderRow(
             task=row.task,
@@ -5485,7 +5547,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         )
         for row in blocked_pending
     )
-    widths = queue_render_widths(rendered_rows)
+    widths = queue_render_widths(rendered_rows + quiet_rendered_rows)
 
     if show_recovery:
         console.print(
@@ -5516,7 +5578,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             "Pending lane: `gza queue` preview only. `gza work` / `watch` start from this lane."
         )
     )
-    if not runnable_pending and not blocked_pending:
+    if not runnable_pending and not quiet_rows and not blocked_pending:
         console.print("No pending tasks")
         if show_recovery or show_lifecycle:
             _print_queue_scope_gaps(
@@ -5525,11 +5587,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
                 any_tag=any_tag,
             )
         return 0
-    print_queue_rows(
-        console,
-        [row for row in rendered_rows if not row.blocked],
-        widths=widths,
-    )
+    runnable_rendered_rows = [row for row in rendered_rows if not row.blocked]
+    if runnable_rendered_rows:
+        print_queue_rows(console, runnable_rendered_rows, widths=widths)
+    elif quiet_rendered_rows or blocked_pending:
+        console.print("No runnable tasks")
 
     if display_limit is not None and len(runnable_pending) > display_limit:
         remaining = len(runnable_pending) - display_limit
@@ -5537,6 +5599,15 @@ def cmd_queue(args: argparse.Namespace) -> int:
         console.print(build_queue_summary(
             f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)"
         ))
+
+    if quiet_rendered_rows:
+        console.print()
+        console.print(
+            build_queue_summary(
+                "Quiet lane: `gza queue` shows held tasks without giving them runnable positions."
+            )
+        )
+        print_queue_rows(console, quiet_rendered_rows, widths=widths)
 
     print_queue_rows(
         console,

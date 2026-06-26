@@ -3781,6 +3781,59 @@ class TestQueueCommand:
         assert "Task 3" not in result.stdout
         assert "3 more runnable tasks" in result.stdout
 
+    def test_queue_shows_quiet_lane_without_numbering_quiet_tasks(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
+        store = make_store(tmp_path)
+
+        runnable = store.add("Older runnable task")
+        quiet = store.add("Fresh quiet task")
+        assert runnable.id is not None
+        assert quiet.id is not None
+        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
+        quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=45)
+        store.update(runnable)
+        store.update(quiet)
+
+        result = invoke_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending lane:" in result.stdout
+        assert "Quiet lane:" in result.stdout
+        assert f"1  {runnable.id}" in result.stdout
+        assert "Fresh quiet task" in result.stdout
+        quiet_line = next(line for line in result.stdout.splitlines() if "Fresh quiet task" in line)
+        assert quiet_line.lstrip().startswith("-")
+        assert "held until" in result.stdout
+
+    def test_queue_keeps_dependency_blocked_quiet_task_out_of_quiet_lane(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
+        store = make_store(tmp_path)
+
+        runnable = store.add("Runnable queue task")
+        blocker = store.add("Blocking queue dependency")
+        blocked_quiet = store.add("Blocked fresh queue task", depends_on=blocker.id)
+        assert runnable.id is not None
+        assert blocker.id is not None
+        assert blocked_quiet.id is not None
+        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
+        blocker.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
+        blocked_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=20)
+        store.update(runnable)
+        store.update(blocker)
+        store.update(blocked_quiet)
+
+        result = invoke_gza("queue", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Quiet lane:" not in result.stdout
+        assert f"1  {runnable.id}" in result.stdout
+        blocked_line = next(line for line in result.stdout.splitlines() if "Blocked fresh queue task" in line)
+        assert blocked_line.lstrip().startswith("-")
+        assert "blocked by" in result.stdout
+        assert "held until" not in result.stdout
+
     def test_queue_bump_and_unbump(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -5207,6 +5260,58 @@ class TestQueueCommand:
         assert _styled_substrings(urgent_meta)["[#1]"] == "bright_black"
         assert _span_styles(blocked_line) == ["green", "cyan", "magenta", "white"]
         assert _span_styles(blocked_meta) == ["blue"]
+
+    def test_next_shows_quiet_lane_and_excludes_quiet_tasks_from_runnable_positions(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
+        store = make_store(tmp_path)
+
+        runnable = store.add("Older next task")
+        quiet = store.add("Fresh quiet next task")
+        assert runnable.id is not None
+        assert quiet.id is not None
+        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
+        quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=20)
+        store.update(runnable)
+        store.update(quiet)
+
+        result = invoke_gza("next", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending lane:" in result.stdout
+        assert "Quiet lane:" in result.stdout
+        assert f"1  {runnable.id}" in result.stdout
+        quiet_line = next(line for line in result.stdout.splitlines() if "Fresh quiet next task" in line)
+        assert quiet_line.lstrip().startswith("-")
+        assert "held until" in result.stdout
+
+    def test_next_all_keeps_dependency_blocked_quiet_task_out_of_quiet_lane(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
+        store = make_store(tmp_path)
+
+        runnable = store.add("Runnable next task")
+        blocker = store.add("Blocking next dependency")
+        blocked_quiet = store.add("Blocked fresh next task", depends_on=blocker.id)
+        assert runnable.id is not None
+        assert blocker.id is not None
+        assert blocked_quiet.id is not None
+        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
+        blocker.last_edited_at = datetime.now(UTC) - timedelta(minutes=15)
+        blocked_quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=20)
+        store.update(runnable)
+        store.update(blocker)
+        store.update(blocked_quiet)
+
+        result = invoke_gza("next", "--all", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Quiet lane:" not in result.stdout
+        assert f"1  {runnable.id}" in result.stdout
+        blocked_line = next(line for line in result.stdout.splitlines() if "Blocked fresh next task" in line)
+        assert blocked_line.lstrip().startswith("-")
+        assert "blocked-by-pending" in result.stdout
+        assert "held until" not in result.stdout
 
     def test_queue_and_next_tag_filters_are_case_insensitive(self, tmp_path: Path):
         """queue/next should match lowercase-stored tags for mixed-case --tag values."""

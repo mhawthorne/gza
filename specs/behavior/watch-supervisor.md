@@ -128,6 +128,14 @@ Each watch cycle MUST execute these phases in order:
    pending pickup, and `--recovery-only` MUST gate pending pickup entirely while any
    actionable in-scope recovery remains, even if that recovery action is direct and does
    not consume a worker slot.
+   Before pending pickup begins, the supervisor MUST examine pending work in the same
+   priority order the pickup lane would use if quiet-period holds were ignored. If the
+   first otherwise-pickable pending task is currently held only by the quiet-period
+   policy, watch MUST emit at most one operator-visible `SKIP` for that hold window and
+   MUST NOT emit separate quiet `SKIP` lines for lower-priority quiet tasks in the same
+   cycle. The dedupe identity for that quiet `SKIP` MUST include the task and its
+   current hold-until time so a later meaningful edit that moves the quiet window causes
+   exactly one new `SKIP`.
 5. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
    parked states, recovery decisions, and failures. Snapshot-based transition detection
    remains responsible for repaired or otherwise out-of-band merge transitions, but it

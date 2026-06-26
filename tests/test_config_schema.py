@@ -196,22 +196,22 @@ def test_config_load_accepts_zero_quiet_period_seconds(tmp_path) -> None:
     assert config.quiet_period_seconds == 0
 
 
-def test_quiet_period_registry_description_marks_setting_as_upcoming_not_enforced() -> None:
-    """Discoverable metadata must not claim quiet-period enforcement before runtime wiring lands."""
+def test_quiet_period_registry_description_matches_display_only_quiet_lane_behavior() -> None:
+    """Discoverable metadata should describe the quiet lane without overstating pickup behavior."""
     quiet_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "quiet_period_seconds")
 
-    assert "upcoming" in quiet_spec.description
-    assert "do not yet hold tasks from execution" in quiet_spec.description
+    assert "Quiet lane" in quiet_spec.description
+    assert "do not change worker pickup eligibility" in quiet_spec.description
     assert "0" in quiet_spec.description
 
 
-def test_quiet_period_docs_match_config_only_scope() -> None:
-    """Operator docs must describe quiet_period_seconds as config plumbing, not active behavior."""
+def test_quiet_period_docs_match_display_only_scope() -> None:
+    """Operator docs should describe the shipped quiet-lane display semantics."""
     docs_text = (Path(__file__).resolve().parents[1] / "docs" / "configuration.md").read_text()
 
     assert "quiet_period_seconds" in docs_text
-    assert "upcoming newly-created-task quiet-period pickup/display implementation" in docs_text
-    assert "do not yet hold tasks from execution" in docs_text
+    assert "Quiet lane of `gza queue` / `gza next`" in docs_text
+    assert "do not change worker pickup eligibility" in docs_text
 
 
 @pytest.mark.parametrize("value, expected", [
