@@ -2021,6 +2021,12 @@ def cmd_merged(args: argparse.Namespace) -> int:
     if getattr(args, "fields", None) is not None and projection_fields is None:
         return 2
     use_json = bool(getattr(args, "json", False))
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    normalized_tag_filters = normalize_tag_filters(tag_filters)
 
     after: datetime | None = None
     since_value = getattr(args, "since", None)
@@ -2041,6 +2047,19 @@ def cmd_merged(args: argparse.Namespace) -> int:
         source=getattr(args, "source", None),
         after=after,
     )
+    if normalized_tag_filters is not None:
+        filtered_units: list[MergeUnit] = []
+        for unit in units:
+            owner = store.resolve_merge_unit_owner_task(unit)
+            if owner is None:
+                continue
+            if task_matches_tag_filters(
+                task_tags=owner.tags,
+                tag_filters=normalized_tag_filters,
+                any_tag=any_tag,
+            ):
+                filtered_units.append(unit)
+        units = filtered_units
     if not units:
         _print_merged_empty(use_json=use_json)
         return 0
@@ -2591,6 +2610,12 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     git_client: _UnmergedGit = git if git is not None else cast(_UnmergedGit, Git(config.project_dir))
     default_branch = git_client.default_branch()
     current_branch = git_client.current_branch()
+    try:
+        tag_filters, any_tag = parse_cli_tag_filters(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    normalized_tag_filters = normalize_tag_filters(tag_filters)
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
         command_name="unmerged",
@@ -2711,12 +2736,26 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         _print_unmerged_empty(use_json=use_json)
         return 0
 
+    owner_selected_pairs = [
+        (_resolve_lineage_owner_task(store, task), task)
+        for task in selected_tasks
+    ]
+    if normalized_tag_filters is not None:
+        owner_selected_pairs = [
+            (owner, task)
+            for owner, task in owner_selected_pairs
+            if task_matches_tag_filters(
+                task_tags=owner.tags,
+                tag_filters=normalized_tag_filters,
+                any_tag=any_tag,
+            )
+        ]
+    if not owner_selected_pairs:
+        _print_unmerged_empty(use_json=use_json)
+        return 0
+
     owner_ids = tuple(
-        dict.fromkeys(
-            owner.id
-            for owner in (_resolve_lineage_owner_task(store, task) for task in selected_tasks)
-            if owner.id is not None
-        )
+        dict.fromkeys(owner.id for owner, _task in owner_selected_pairs if owner.id is not None)
     )
     if not owner_ids:
         _print_unmerged_empty(use_json=use_json)
@@ -2726,7 +2765,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     merge_unit_ids: tuple[str, ...] | None = None
     if not live_target:
         merge_unit_ids_list: list[str] = []
-        for task in selected_tasks:
+        for _owner, task in owner_selected_pairs:
             if task.id is None:
                 continue
             resolved_unit = store.resolve_merge_unit_for_task(task.id)
@@ -2740,7 +2779,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     query = _TaskQueryPresets.unmerged(
         branch_owner_ids=owner_ids,
         merge_unit_ids=merge_unit_ids,
-        task_ids=tuple(task.id for task in selected_tasks if task.id is not None),
+        task_ids=tuple(task.id for _owner, task in owner_selected_pairs if task.id is not None),
         limit=limit,
         mode=view_mode,
         projection=projection,

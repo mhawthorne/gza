@@ -13406,6 +13406,124 @@ class TestUnmergedUnifiedQueryOutput:
             },
         ]
 
+    def test_merged_json_tag_filters_match_resolved_owner_and_preserve_schema(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        alpha_owner = store.add("Alpha merged owner", task_type="implement", tags=("alpha",))
+        store.mark_completed(alpha_owner, has_commits=True, branch="feature/merged-alpha-owner")
+        assert alpha_owner.id is not None
+        alpha_unit = store.resolve_merge_unit_for_task(alpha_owner.id)
+        assert alpha_unit is not None
+        store.set_merge_unit_state(
+            alpha_unit.id,
+            "merged",
+            merge_source="manual",
+            merged_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        alpha_unit = store.get_merge_unit(alpha_unit.id)
+        assert alpha_unit is not None
+
+        beta_owner = store.add("Beta merged owner", task_type="implement", tags=("beta",))
+        store.mark_completed(beta_owner, has_commits=True, branch="feature/merged-beta-owner")
+        assert beta_owner.id is not None
+        beta_unit = store.resolve_merge_unit_for_task(beta_owner.id)
+        assert beta_unit is not None
+        store.set_merge_unit_state(
+            beta_unit.id,
+            "merged",
+            merge_source="manual",
+            merged_at=datetime.now(UTC) - timedelta(hours=2),
+        )
+        beta_unit = store.get_merge_unit(beta_unit.id)
+        assert beta_unit is not None
+
+        unresolved_owner = store.add("Legacy unresolved owner", task_type="implement", tags=("alpha",))
+        store.mark_completed(unresolved_owner, has_commits=True, branch="feature/merged-legacy-owner")
+        assert unresolved_owner.id is not None
+        unresolved_unit = store.resolve_merge_unit_for_task(unresolved_owner.id)
+        assert unresolved_unit is not None
+        store.set_merge_unit_state(
+            unresolved_unit.id,
+            "merged",
+            merge_source="manual",
+            merged_at=datetime.now(UTC) - timedelta(hours=3),
+        )
+        unresolved_unit = store.get_merge_unit(unresolved_unit.id)
+        assert unresolved_unit is not None
+        conn = sqlite3.connect(store.db_path)
+        try:
+            conn.execute("DELETE FROM merge_unit_tasks WHERE merge_unit_id = ?", (unresolved_unit.id,))
+            conn.execute("DELETE FROM tasks WHERE id = ?", (unresolved_owner.id,))
+            conn.execute("UPDATE merge_units SET owner_task_id = ? WHERE id = ?", ("gza-999999", unresolved_unit.id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        unfiltered_args = argparse.Namespace(
+            project_dir=tmp_path,
+            source=None,
+            all=True,
+            last_days=None,
+            since=None,
+            fields=None,
+            list_fields=False,
+            json=True,
+            tags=None,
+            all_tags=False,
+        )
+
+        unfiltered_result = query_cli.cmd_merged(unfiltered_args)
+        unfiltered_captured = capsys.readouterr()
+
+        assert unfiltered_result == 0
+        unfiltered_rows = json.loads(unfiltered_captured.out)
+        assert {row["merge_unit_id"] for row in unfiltered_rows} == {
+            alpha_unit.id,
+            beta_unit.id,
+            unresolved_unit.id,
+        }
+        assert set(unfiltered_rows[0].keys()) == {
+            "merge_unit_id",
+            "owner_task_id",
+            "merge_source",
+            "merged_at",
+            "branch",
+            "target_branch",
+        }
+
+        filtered_args = argparse.Namespace(
+            project_dir=tmp_path,
+            source=None,
+            all=True,
+            last_days=None,
+            since=None,
+            fields=None,
+            list_fields=False,
+            json=True,
+            tags=["alpha"],
+            all_tags=False,
+        )
+
+        filtered_result = query_cli.cmd_merged(filtered_args)
+        filtered_captured = capsys.readouterr()
+
+        assert filtered_result == 0
+        assert json.loads(filtered_captured.out) == [
+            {
+                "merge_unit_id": alpha_unit.id,
+                "owner_task_id": alpha_owner.id,
+                "merge_source": "manual",
+                "merged_at": query_cli._format_merged_timestamp(alpha_unit.merged_at),  # noqa: SLF001
+                "branch": "feature/merged-alpha-owner",
+                "target_branch": "main",
+            }
+        ]
+
     def test_unmerged_text_fields_unknown_field_errors_clearly(
         self,
         tmp_path: Path,
@@ -17180,6 +17298,29 @@ class TestLineageOwnerParity:
         first_line = next(line for line in output.splitlines() if line.strip() and not set(line.strip()) == {"-"})
         return first_line.split()[1]
 
+    @staticmethod
+    def _unmerged_args(
+        tmp_path: Path,
+        *,
+        fields: str,
+        json: bool = True,
+        tags: list[str] | None = None,
+        all_tags: bool = False,
+        into_current: bool = False,
+        target: str | None = None,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            project_dir=tmp_path,
+            into_current=into_current,
+            target=target,
+            fetch=False,
+            limit=5,
+            json=json,
+            fields=fields,
+            tags=tags,
+            all_tags=all_tags,
+        )
+
     def test_unmerged_keeps_impl_owner_identity_for_mixed_followup_lineage(
         self,
         tmp_path: Path,
@@ -17188,21 +17329,100 @@ class TestLineageOwnerParity:
         tasks = _setup_lineage_owner_parity_fixture(tmp_path)
         impl = tasks["impl"]
 
-        args = argparse.Namespace(
-            project_dir=tmp_path,
-            into_current=False,
-            target=None,
-            fetch=False,
-            limit=5,
-            json=True,
-            fields="id,prompt",
-        )
+        args = self._unmerged_args(tmp_path, fields="id,prompt")
 
         result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
         captured = capsys.readouterr()
 
         assert result == 0
         assert json.loads(captured.out) == [{"id": impl.id, "prompt": impl.prompt}]
+
+    def test_unmerged_tag_filters_match_owner_not_representative_on_canonical_target(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Beta owner", task_type="implement", tags=("beta",))
+        store.mark_completed(owner, has_commits=True, branch="feature/unmerged-owner-filter")
+        assert owner.id is not None
+
+        descendant = store.add(
+            "Alpha representative descendant",
+            task_type="rebase",
+            based_on=owner.id,
+            same_branch=True,
+            tags=("alpha",),
+        )
+        descendant.status = "completed"
+        descendant.completed_at = datetime.now(UTC)
+        descendant.branch = owner.branch
+        descendant.has_commits = True
+        descendant.merge_status = "unmerged"
+        store.update(descendant)
+        assert descendant.id is not None
+
+        unit = store.resolve_merge_unit_for_task(owner.id)
+        assert unit is not None
+        store.attach_task_to_merge_unit(descendant.id, unit.id, "rebase")
+
+        result = query_cli.cmd_unmerged(
+            self._unmerged_args(tmp_path, fields="id,prompt", tags=["alpha"]),
+            git=_FastUnmergedGit(),
+        )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == []
+
+    def test_unmerged_tag_filters_match_owner_on_live_target_not_representative(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Alpha owner", task_type="implement", tags=("alpha",))
+        store.mark_completed(owner, has_commits=True, branch="feature/live-target-owner-alpha")
+        assert owner.id is not None
+
+        descendant = store.add(
+            "Beta live-target descendant",
+            task_type="rebase",
+            based_on=owner.id,
+            same_branch=True,
+            tags=("beta",),
+        )
+        descendant.status = "completed"
+        descendant.completed_at = datetime.now(UTC)
+        descendant.branch = owner.branch
+        descendant.has_commits = True
+        descendant.merge_status = "unmerged"
+        store.update(descendant)
+        assert descendant.id is not None
+
+        unit = store.resolve_merge_unit_for_task(owner.id)
+        assert unit is not None
+        store.attach_task_to_merge_unit(descendant.id, unit.id, "rebase")
+
+        fast_git = _FastUnmergedGit()
+        fast_git._branches.update({owner.branch, "release"})
+        result = query_cli.cmd_unmerged(
+            self._unmerged_args(
+                tmp_path,
+                fields="id,prompt",
+                tags=["alpha"],
+                target="release",
+            ),
+            git=fast_git,
+        )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": owner.id, "prompt": owner.prompt}]
 
     @pytest.mark.parametrize("focus_key", ["review", "improve", "dropped_two"])
     def test_lineage_re_roots_branch_owned_descendants_at_implement_owner(
@@ -17417,15 +17637,7 @@ class TestLineageOwnerParity:
         assert json.loads(incomplete_captured.out) == [{"id": impl.id}]
 
         unmerged_result = query_cli.cmd_unmerged(
-            argparse.Namespace(
-                project_dir=tmp_path,
-                into_current=False,
-                target=None,
-                fetch=False,
-                limit=5,
-                json=True,
-                fields="id",
-            ),
+            self._unmerged_args(tmp_path, fields="id"),
             git=_FastUnmergedGit(),
         )
         unmerged_captured = capsys.readouterr()

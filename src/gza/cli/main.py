@@ -161,6 +161,17 @@ class _TrackAutoImplementAliasAction(argparse.Action):
         setattr(namespace, "hold_for_review_flags", used_flags)
 
 
+class _RejectedLegacyFlagAction(argparse.Action):
+    """Raise the standard argparse unknown-flag error for removed compatibility aliases."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        del namespace, values
+        parser.error(f"unrecognized arguments: {option_string}")
+
+
 HIDDEN_COMMANDS: set[str] = set()
 TASK_NO_DOCKER_HELP = "Run Claude directly instead of in Docker for background or immediate runs"
 
@@ -652,6 +663,24 @@ def main() -> int:
         help="Projection fields override (comma-separated; works in text or JSON mode)",
     )
     unmerged_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only list unmerged units whose resolved owner carries a matching tag (repeatable)",
+    )
+    unmerged_parser.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    unmerged_parser.add_argument(
+        "--all",
+        action=_RejectedLegacyFlagAction,
+        help=argparse.SUPPRESS,
+    )
+    unmerged_parser.add_argument(
         "--list-fields",
         action="store_true",
         help="List valid --fields values for this command and exit",
@@ -728,6 +757,19 @@ def main() -> int:
         "--fields",
         metavar="CSV",
         help="Projection fields override (comma-separated; works in text or JSON mode)",
+    )
+    merged_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only list merged units whose resolved owner carries a matching tag (repeatable)",
+    )
+    merged_parser.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
     )
     merged_parser.add_argument(
         "--list-fields",
