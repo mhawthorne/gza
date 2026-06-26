@@ -195,6 +195,16 @@ def _default_watch_dispatch_start_liveness(monkeypatch: pytest.MonkeyPatch) -> N
     )
 
 
+def _mark_watch_task_running(store, task_id: str, *, pid: int | None = None) -> int:
+    task = store.get(task_id)
+    assert task is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC)
+    task.running_pid = os.getpid() if pid is None else pid
+    store.update(task)
+    return 0
+
+
 def _run_cycle_and_emit_transition_events(
     *,
     config: Config,
@@ -205,7 +215,16 @@ def _run_cycle_and_emit_transition_events(
     before = _task_snapshot(store)
     result = _run_cycle(config=config, store=store, log=log, **run_cycle_kwargs)
     after = _task_snapshot(store)
-    _emit_transition_events(before, after, store=store, config=config, log=log)
+    confirmed_start_ids = _emit_transition_events(before, after, store=store, config=config, log=log)
+    if result.expected_starts:
+        result.confirmed_start_count += watch_module._process_expected_start_boundary(
+            store=store,
+            config=config,
+            log=log,
+            expected_starts=result.expected_starts,
+            snapshot=after,
+            confirmed_start_ids=confirmed_start_ids,
+        )
     return result
 
 
@@ -1266,7 +1285,8 @@ def test_watch_cycle_plain_mode_batch_one_defaults_to_recovery_first(
         assert spawned_task.id == prepared_child_id
     assert store.get(pending_impl.id).status == "pending"
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert any("RECOVR" in line and failed.id in line for line in log_text.splitlines())
+    assert result.expected_starts
+    assert "RECOVR" not in log_text
 
 
 def test_watch_cycle_default_mode_reuses_existing_pending_resume_child(tmp_path: Path) -> None:
@@ -1444,9 +1464,12 @@ def test_watch_cycle_default_mode_suppresses_existing_in_progress_resume_child(t
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=lambda _args, _config, task_id, **_kwargs: _mark_watch_task_running(store, str(task_id)),
+        ) as spawn_resume,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -1974,9 +1997,11 @@ def test_watch_cycle_manual_failed_recovery_emits_one_steady_attention_per_cycle
     text = log_path.read_text()
     stdout = capsys.readouterr().out
     assert text.count("ATTENTION") == 1
-    assert text.count("Needs attention (1 task):") == 2
-    assert stdout.count("Needs attention (1 task):") == 2
-    assert text.count(f"{failed_leaf.id} implement") == 3
+    assert text.count("Needs attention (1 task):") == 1
+    assert text.count("1 task still need attention (unchanged)") == 1
+    assert stdout.count("Needs attention (1 task):") == 1
+    assert stdout.count("1 task still need attention (unchanged)") == 1
+    assert text.count(f"{failed_leaf.id} implement") == 2
 
 
 def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tmp_path: Path) -> None:
@@ -1998,10 +2023,14 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-        patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=lambda _args, _config, _task, *, prepared_task_id, **_kwargs: (
+                _mark_watch_task_running(store, prepared_task_id)
+            ),
+        ) as spawn_iterate,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -2025,8 +2054,16 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     assert spawn_iterate.call_args.kwargs["prepared_phase"] == "preloop"
     assert spawn_iterate.call_args.kwargs["startup_quiet"] is True
     log_text = log_path.read_text()
-    assert any("RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
-    assert not any("RECOVR" in line and f"{failed.id} resume via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
+    assert result.running == 1
+    assert result.confirmed_start_count == 1
+    assert not any("RECOVR" in line and spawned_child_id in line for line in log_text.splitlines())
+    assert any(
+        line.split(maxsplit=2)[1] == "START"
+        and spawned_child_id in line
+        and failed.id in line
+        and "[retry of " in line
+        for line in log_text.splitlines()
+    )
 
 
 def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before_next_bounded_attempt(
@@ -2096,6 +2133,214 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "BACKOFF" in log_text
     assert f"{failed.id} retry delayed" in log_text
+
+
+def test_watch_cycle_recovery_launch_no_show_emits_start_failed_instead_of_start(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-no-show"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            side_effect=AssertionError("recovery launch should use boundary-owned confirmation"),
+        ),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    assert len(children) == 1
+    child = children[0]
+    assert child.id is not None
+    assert result.confirmed_start_count == 0
+    assert child.id in result.expected_starts
+    first_boundary_lines = log_path.read_text().splitlines()
+    assert not any("START_FAILED" in line and child.id in line for line in first_boundary_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and child.id in line for line in first_boundary_lines)
+    assert not any("RECOVR" in line and child.id in line for line in first_boundary_lines)
+
+    second_boundary_count = watch_module._process_expected_start_boundary(
+        store=store,
+        config=config,
+        log=log,
+        expected_starts=result.expected_starts,
+        snapshot=_task_snapshot(store),
+    )
+
+    assert second_boundary_count == 0
+    log_lines = log_path.read_text().splitlines()
+    assert any("START_FAILED" in line and child.id in line and failed.id in line for line in log_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and child.id in line for line in log_lines)
+    assert not any("RECOVR" in line and child.id in line for line in log_lines)
+
+
+def test_watch_cycle_recovery_launch_pending_then_running_next_boundary_emits_start_without_start_failed(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-delayed-start"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            side_effect=AssertionError("recovery launch should use boundary-owned confirmation"),
+        ),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    assert len(children) == 1
+    child = children[0]
+    assert child.id is not None
+    assert result.confirmed_start_count == 0
+    assert child.id in result.expected_starts
+    first_boundary_lines = log_path.read_text().splitlines()
+    assert not any("START_FAILED" in line and child.id in line for line in first_boundary_lines)
+    assert not any(line.split(maxsplit=2)[1] == "START" and child.id in line for line in first_boundary_lines)
+
+    _mark_watch_task_running(store, child.id)
+    second_boundary_count = watch_module._process_expected_start_boundary(
+        store=store,
+        config=config,
+        log=log,
+        expected_starts=result.expected_starts,
+        snapshot=_task_snapshot(store),
+    )
+
+    assert second_boundary_count == 1
+    log_lines = log_path.read_text().splitlines()
+    assert any(
+        line.split(maxsplit=2)[1] == "START"
+        and child.id in line
+        and failed.id in line
+        and " of " in line
+        for line in log_lines
+    )
+    assert not any("START_FAILED" in line and child.id in line for line in log_lines)
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_watch_cycle_recovery_launch_terminal_before_confirmation_boundary_does_not_emit_start_failed(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-terminal-before-confirm"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            side_effect=AssertionError("recovery launch should use boundary-owned confirmation"),
+        ),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    children = store.get_based_on_children(failed.id)
+    assert len(children) == 1
+    child = children[0]
+    assert child.id is not None
+    assert child.id in result.expected_starts
+
+    previous_snapshot = _task_snapshot(store)
+    refreshed_child = store.get(child.id)
+    assert refreshed_child is not None
+    refreshed_child.status = terminal_status
+    refreshed_child.completed_at = datetime.now(UTC)
+    if terminal_status == "failed":
+        refreshed_child.failure_reason = "NO_ACTIVITY"
+    store.update(refreshed_child)
+    current_snapshot = _task_snapshot(store)
+
+    _emit_transition_events(previous_snapshot, current_snapshot, store=store, config=config, log=log)
+    second_boundary_count = watch_module._process_expected_start_boundary(
+        store=store,
+        config=config,
+        log=log,
+        expected_starts=result.expected_starts,
+        snapshot=current_snapshot,
+    )
+
+    assert second_boundary_count == 0
+    log_lines = log_path.read_text().splitlines()
+    expected_event = "DONE" if terminal_status == "completed" else "FAIL"
+    assert any(line.split(maxsplit=2)[1] == expected_event and child.id in line for line in log_lines)
+    assert not any("START_FAILED" in line and child.id in line for line in log_lines)
 
 
 def test_watch_cycle_repeated_recovery_evaluation_does_not_park_pending_descendant(tmp_path: Path) -> None:
@@ -3834,9 +4079,12 @@ def test_watch_cycle_restart_failed_hides_skipped_logs_by_default(tmp_path: Path
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=lambda _args, _config, task_id, **_kwargs: _mark_watch_task_running(store, str(task_id)),
+        ) as spawn_resume,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -3851,7 +4099,9 @@ def test_watch_cycle_restart_failed_hides_skipped_logs_by_default(tmp_path: Path
     assert spawn_resume.call_count == 1
     text = log_path.read_text()
     assert "recovery-skip" not in text
-    assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
+    assert result.confirmed_start_count == 1
+    assert any("START" in line and failed.id in line and "[resume of " in line for line in text.splitlines())
+    assert "RECOVR" not in text
 
 
 def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Path) -> None:
@@ -3877,9 +4127,12 @@ def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Pa
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0) as spawn_resume,
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=lambda _args, _config, task_id, **_kwargs: _mark_watch_task_running(store, str(task_id)),
+        ) as spawn_resume,
     ):
-        result = _run_cycle(
+        result = _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=1,
@@ -3895,7 +4148,9 @@ def test_watch_cycle_restart_failed_show_skipped_emits_skipped_logs(tmp_path: Pa
     assert spawn_resume.call_count == 1
     text = log_path.read_text()
     assert "SKIP" not in text
-    assert any("RECOVR" in line and f"{failed.id} resume via worker" in line for line in text.splitlines())
+    assert result.confirmed_start_count == 1
+    assert any("START" in line and failed.id in line and "[resume of " in line for line in text.splitlines())
+    assert "RECOVR" not in text
 
 
 def test_watch_cycle_recovery_only_running_recovery_child_keeps_pending_queue_blocked_without_execution(
@@ -8341,7 +8596,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     assert kwargs["quiet_mechanics"] is True
     assert log_path.read_text().count(f"MERGE     {task.id} -> main") == 1
     assert any(
-        line.split(maxsplit=2)[1] == "FOLLOW" and "gza-999 created from" in line
+        line.split(maxsplit=2)[1] == "FOLLOW" and "gza-999 queued (created, from" in line
         for line in log_path.read_text().splitlines()
     )
 
@@ -8407,8 +8662,8 @@ def test_watch_cycle_logs_off_topic_investigation_ids_for_cleared_merge(tmp_path
     assert result.work_done is True
     log_text = log_path.read_text()
     assert f"MERGE     {task.id} -> main" in log_text
-    assert "FOLLOW    gza-7001 investigation created from" in log_text
-    assert "FOLLOW    gza-7000 investigation reused from" in log_text
+    assert "FOLLOW    gza-7001 investigation queued (created, from" in log_text
+    assert "FOLLOW    gza-7000 investigation queued (reused, from" in log_text
 
 
 def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_followup_tasks(tmp_path: Path) -> None:
@@ -10682,7 +10937,8 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
 
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
-    assert text.count("Needs attention (1 task):") == 2
+    assert text.count("Needs attention (1 task):") == 1
+    assert text.count("1 task still need attention (unchanged)") == 1
     assert str(impl.id) in text
     assert "SKIP" not in text
 
@@ -12493,7 +12749,7 @@ def test_watch_cycle_recovery_relaunch_launch_success_without_terminal_outcome_d
     assert observations[0].parked_reason is None
     text = log_path.read_text()
     assert "ATTENTION" not in text
-    assert any("RECOVR" in line and f"{failed.id} resume via iterate" in line for line in text.splitlines())
+    assert "RECOVR" not in text
 
 
 def test_recovery_deferred_background_terminal_no_progress_parks_after_repeated_outcomes(
@@ -14900,7 +15156,7 @@ def test_watch_cycle_parked_recovery_head_does_not_starve_later_candidate(tmp_pa
     assert len(store.get_based_on_children(actionable.id)) == 1
     text = log_path.read_text()
     assert f"{blocked.id}" in text
-    assert any("RECOVR" in line and actionable.id in line for line in text.splitlines())
+    assert "RECOVR" not in text
 
 
 def test_watch_cycle_parked_pending_recovery_child_is_excluded_from_plain_pending_pickup(
@@ -15616,7 +15872,8 @@ def test_watch_cycle_dedupes_attempt_cap_skip_across_cycles(tmp_path: Path) -> N
     text = log_path.read_text()
     assert text.count("ATTENTION") == 1
     assert text.count("SKIP") == 0
-    assert text.count("Needs attention (1 task):") == 2
+    assert text.count("Needs attention (1 task):") == 1
+    assert text.count("1 task still need attention (unchanged)") == 1
     assert (
         f'{failed.id} implement "Failed resume attempt" reason=automatic-recovery-disabled '
         "automatic recovery is disabled"
@@ -15716,16 +15973,18 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
         f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
         f'{exec_result.message}; will not run automatically'
     ) in attention_lines[0]
-    assert text.count("Needs attention (1 task):") == 2
+    assert text.count("Needs attention (1 task):") == 1
+    assert text.count("1 task still need attention (unchanged)") == 1
     assert "Summary:" not in text
     assert (
         text.count(
             f'{pending_review.id} review "Pending review" reason=guarded-pending-skip '
             f'{exec_result.message}; will not run automatically'
         )
-        == 3
+        == 2
     )
-    assert stdout.count("Needs attention (1 task):") == 2
+    assert stdout.count("Needs attention (1 task):") == 1
+    assert stdout.count("1 task still need attention (unchanged)") == 1
     assert text.count("SKIP") == 1
 
 
@@ -16322,8 +16581,9 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     assert len(attention_lines) == 2
     assert attention_lines[0].startswith("18:08:47 ATTENTION")
     assert attention_lines[1].startswith("18:18:47 ATTENTION")
-    assert text.count("INFO      Needs attention (1 task):") == 3
-    assert text.count("  gza-1 review needs manual attention") == 2
+    assert text.count("INFO      Needs attention (1 task):") == 2
+    assert text.count("INFO      1 task still need attention (unchanged)") == 1
+    assert text.count("  gza-1 review needs manual attention") == 1
     assert text.count("  gza-1 review still needs manual attention") == 1
 
 
@@ -19492,7 +19752,142 @@ def test_cmd_watch_uses_startup_quiet_and_emits_sleep_for_productive_and_idle_cy
         if line.strip() and line.split(maxsplit=2)[1] == "SLEEP"
     ]
     assert len(sleep_lines) == 2
-    assert all("sleeping 1s (0 pending, 0 running)" in line for line in sleep_lines)
+    assert "sleeping 1s (0 pending, 0 running; +2 started)" in sleep_lines[0]
+    assert "sleeping 1s (0 pending, 0 running)" in sleep_lines[1]
+
+
+@pytest.mark.parametrize("task_type", ["implement", "plan"])
+def test_cmd_watch_dry_run_pending_preview_does_not_report_started_in_sleep_delta(
+    tmp_path: Path,
+    task_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add(f"Pending {task_type}", task_type=task_type)
+    assert task.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=1,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=True,
+        quiet=True,
+        yes=True,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+
+    log_lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    assert any(
+        line.strip()
+        and len(line.split(maxsplit=2)) >= 2
+        and line.split(maxsplit=2)[1] == "START"
+        and task.id in line
+        and "[dry-run]" in line
+        for line in log_lines
+    )
+    sleep_lines = [
+        line
+        for line in log_lines
+        if line.strip() and len(line.split(maxsplit=2)) >= 2 and line.split(maxsplit=2)[1] == "SLEEP"
+    ]
+    assert len(sleep_lines) == 1
+    assert "sleeping 1s (1 pending, 0 running)" in sleep_lines[0]
+    assert "started" not in sleep_lines[0]
+
+
+def test_cmd_watch_counts_next_cycle_start_boundary_confirmation_in_sleep_delta(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-next-boundary-start"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=1,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    def mark_recovery_running_after_first_sleep(_poll: int, _stop_requested) -> None:
+        if getattr(mark_recovery_running_after_first_sleep, "called", False):
+            return
+        mark_recovery_running_after_first_sleep.called = True  # type: ignore[attr-defined]
+        children = store.get_based_on_children(failed.id)
+        assert len(children) == 1
+        child_id = children[0].id
+        assert child_id is not None
+        _mark_watch_task_running(store, str(child_id))
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            side_effect=AssertionError("recovery launch should use boundary-owned confirmation"),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=mark_recovery_running_after_first_sleep),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    log_lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    assert any(
+        line.strip()
+        and len(line.split(maxsplit=2)) >= 2
+        and line.split(maxsplit=2)[1] == "START"
+        and failed.id in line
+        and " of " in line
+        for line in log_lines
+    )
+    sleep_lines = [
+        line
+        for line in log_lines
+        if line.strip() and line.split(maxsplit=2)[1] == "SLEEP"
+    ]
+    assert len(sleep_lines) == 2
+    assert "sleeping 1s (1 pending, 0 running)" in sleep_lines[0]
+    assert "sleeping 1s (0 pending, 1 running; +1 started)" in sleep_lines[1]
 
 
 def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(

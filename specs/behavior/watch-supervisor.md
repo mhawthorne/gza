@@ -133,7 +133,16 @@ Each watch cycle MUST execute these phases in order:
    remains responsible for repaired or otherwise out-of-band merge transitions, but it
    MUST emit at most one `MERGE` line per merge unit per cycle and MUST NOT duplicate a
    `MERGE` line that was already emitted inline for the same merge unit owner when the
-   direct merge action landed.
+   direct merge action landed. A `START` event MUST be emitted only once the launched
+   task reaches `in_progress` or a live worker is confirmed under the same live-running
+   accounting used for supervisor capacity, never merely because a spawn call returned
+   success. Recovery launches first registered during a cycle MUST get that cycle's
+   end-of-cycle observation and, if still unconfirmed, the next cycle's start-of-cycle
+   observation before watch declares a no-show. A launch that never reaches
+   `in_progress` within that window and remains pending/non-live MUST surface an explicit
+   operator warning rather than a clean `START`; terminal outcomes observed before then
+   stand on their own and MUST NOT also emit a contradictory no-show warning. This is
+   required by invariant S6's outcome-over-launch rule.
 6. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
    next poll interval.
 

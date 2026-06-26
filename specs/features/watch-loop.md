@@ -137,14 +137,17 @@ This avoids numeric priorities (which are a waste of time to manage) while solvi
 
 | Event | Trigger | Example |
 |-------|---------|---------|
-| `START` | Worker spawned for a task | `12:03:04 START  gza-42 implement "Add JWT auth"` |
+| `START` | Task confirmed running (`in_progress` or live worker confirmed) | `12:03:04 START  gza-42 implement "Add JWT auth"` |
 | `DONE` | Task completed | `12:14:22 DONE   gza-42 implement (11m18s)` |
 | `FAIL` | Task failed | `12:08:44 FAIL   gza-42 implement: TEST_FAILURE (5m40s)` |
-| `RESUME` | Resuming a failed task | `12:09:00 RESUME gza-42 → gza-55 (attempt 2/3)` |
+| `START` | Recovery task confirmed running after retry/resume | `12:09:00 START  gza-55 implement "Retry flaky test" [retry of gza-42]` |
+| `START` | Recovery task confirmed running after resume | `12:09:00 START  gza-55 implement "Finish auth fix" [resume of gza-42]` |
 | `REVIEW` | Review completed | `12:16:01 REVIEW gza-43 for gza-42: APPROVED` |
 | `MERGE` | Task merged | `12:16:05 MERGE  gza-42 → main` |
 | `SKIP` | Task skipped | `12:16:03 SKIP   gza-45: needs_discussion` |
-| `IDLE` | No work, sleeping | `12:16:05 IDLE   sleeping 300s (0 pending, 3 running)` |
+| `RECOVR` | Dry-run preview of a recovery decision only | `12:09:00 RECOVR gza-42 retry via iterate -> (new task) (reason=NO_ACTIVITY, attempt 1/2) [dry-run]` |
+| `START_FAILED` | Recovery launch never became confirmed running | `12:09:01 START_FAILED gza-55 [retry of gza-42]: spawned worker never reached in_progress` |
+| `SLEEP` | Cycle finished and watch is sleeping | `12:16:05 SLEEP  sleeping 300s (0 pending, 3 running; +1 started)` |
 | `WAKE` | Woke from sleep | `12:16:35 WAKE   checking... (3 running, 2 slots)` |
 
 ### Format

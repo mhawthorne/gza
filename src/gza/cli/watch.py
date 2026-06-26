@@ -10,7 +10,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -1914,11 +1914,13 @@ def _emit_transition_events(
     log: _WatchLog,
     restart_failed_mode: bool = False,
     max_recovery_attempts: int = 1,
-) -> None:
-    # Detector-owned event tags come from snapshot diffs, regardless of which
-    # process caused the state change: REVIEW, DONE, FAIL, and MERGE. Inline
-    # emits remain watch's own action/decision events such as START, SKIP,
-    # ATTENTION, INFO, PHASE, WAKE, and IDLE.
+) -> tuple[str, ...]:
+    # Detector-owned transitions come from snapshot diffs, regardless of which
+    # process caused the state change. START remains detector-owned for the
+    # confirmed pending->in_progress seam, but the actual formatted START emit
+    # is handled by the caller so recovery annotations can reuse the shared
+    # formatter without forking transition detection.
+    confirmed_start_ids: list[str] = []
     for task_id in sorted(new.keys()):
         old_row = old.get(task_id) or {}
         old_status = old_row.get("status")
@@ -1929,6 +1931,8 @@ def _emit_transition_events(
         elapsed = _format_elapsed(new_row.get("started_at"), new_row.get("completed_at"))
         elapsed_suffix = f" ({elapsed})" if elapsed else ""
         if old_status != new_status:
+            if old_status == "pending" and new_status == "in_progress":
+                confirmed_start_ids.append(task_id)
             if new_status == "completed":
                 completion_reason = new_row.get("completion_reason")
                 reason_suffix = f": {completion_reason}" if completion_reason else ""
@@ -1965,6 +1969,7 @@ def _emit_transition_events(
             if merge_event is not None and not log.was_merge_logged(merge_event.merge_key):
                 log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
                 log.note_merge_logged(merge_event.merge_key)
+    return tuple(confirmed_start_ids)
 
 
 @dataclass(frozen=True)
@@ -2221,11 +2226,78 @@ def _confirm_watch_dispatch_start(
     return True, refreshed_task
 
 
+def _format_expected_start_annotation(expected_start: "_ExpectedStart") -> str:
+    return f"[{expected_start.recovery_action} of {expected_start.parent_failed_id}]"
+
+
+def _format_start_line(
+    task: DbTask,
+    *,
+    recovery_annotation: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    assert task.id is not None
+    task_type = task.task_type or "implement"
+    suffix = ""
+    if recovery_annotation is not None:
+        suffix += f" {recovery_annotation}"
+    if dry_run:
+        suffix += " [dry-run]"
+    prompt = _format_prompt_for_width(
+        task.prompt,
+        prefix=16 + len(f"{task.id} {task_type} \""),
+        suffix=len(f'"{suffix}'),
+    )
+    return f'{task.id} {task_type} "{prompt}"{suffix}'
+
+
+def _format_expected_start_failed_line(task_id: str, expected_start: "_ExpectedStart") -> str:
+    return (
+        f"{task_id} {_format_expected_start_annotation(expected_start)}: "
+        "spawned worker never reached in_progress"
+    )
+
+
+def _format_follow_line(
+    task_id: str,
+    source_task_id: str,
+    *,
+    reused: bool,
+    investigation: bool = False,
+) -> str:
+    subject = f"{task_id} investigation" if investigation else task_id
+    status = "reused" if reused else "created"
+    return f"{subject} queued ({status}, from {source_task_id})"
+
+
+def _format_sleep_message(
+    *,
+    poll: int,
+    pending: int,
+    running: int,
+    confirmed_start_count: int,
+) -> str:
+    message = f"sleeping {poll}s ({pending} pending, {running} running"
+    if confirmed_start_count > 0:
+        message += f"; +{confirmed_start_count} started"
+    return message + ")"
+
+
 @dataclass
 class _CycleResult:
     work_done: bool
     running: int
     pending: int
+    expected_starts: dict[str, "_ExpectedStart"] = field(default_factory=dict)
+    confirmed_start_count: int = 0
+
+
+@dataclass(frozen=True)
+class _ExpectedStart:
+    recovery_action: str
+    parent_failed_id: str
+    launch_mode: str
+    confirmation_boundaries_seen: int = 0
 
 
 @dataclass(frozen=True)
@@ -2468,10 +2540,70 @@ def _emit_cycle_attention_summary(log: _WatchLog) -> None:
     messages = log.visible_attention_messages()
     if not messages:
         return
+    if log._sticky_attention_this_cycle == log._sticky_attention_prev_cycle:  # noqa: SLF001 - watch-local sticky state
+        plural = "s" if len(messages) != 1 else ""
+        log.emit("INFO", f"{len(messages)} task{plural} still need attention (unchanged)")
+        return
     plural = "s" if len(messages) != 1 else ""
     lines = [f"{NEEDS_ATTENTION_LABEL} ({len(messages)} task{plural}):"]
     lines.extend(f"  {message}" for message in messages)
     log.emit("INFO", "\n".join(lines))
+
+
+def _process_expected_start_boundary(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    log: _WatchLog,
+    expected_starts: dict[str, _ExpectedStart],
+    snapshot: Mapping[str, dict[str, str | None]],
+    confirmed_start_ids: Sequence[str] = (),
+) -> int:
+    if not expected_starts:
+        return 0
+    _live_pids, running_task_ids, _anonymous_worker_count = _collect_live_running_state(config, store)
+    confirmed_transition_ids = set(confirmed_start_ids)
+    confirmed_running_task_ids = set(running_task_ids)
+    confirmed_count = 0
+    for task_id in list(expected_starts):
+        expected_start = expected_starts[task_id]
+        row = snapshot.get(task_id) or {}
+        status = row.get("status")
+        confirmed = (
+            task_id in confirmed_transition_ids
+            or status == "in_progress"
+            or task_id in confirmed_running_task_ids
+        )
+        if confirmed:
+            task = store.get(task_id)
+            if task is not None and task.id is not None:
+                log.emit(
+                    "START",
+                    _format_start_line(
+                        task,
+                        recovery_annotation=_format_expected_start_annotation(expected_start),
+                    ),
+                )
+                confirmed_count += 1
+            expected_starts.pop(task_id, None)
+            continue
+        if status in {"completed", "failed", "dropped"}:
+            expected_starts.pop(task_id, None)
+            continue
+        if status == "pending" and task_id not in confirmed_running_task_ids:
+            if expected_start.confirmation_boundaries_seen == 0:
+                expected_starts[task_id] = replace(
+                    expected_start,
+                    confirmation_boundaries_seen=1,
+                )
+                continue
+            log.emit(
+                "START_FAILED",
+                _format_expected_start_failed_line(task_id, expected_start),
+                dedupe_key=f"expected-start-no-show:{task_id}:{expected_start.parent_failed_id}",
+            )
+            expected_starts.pop(task_id, None)
+    return confirmed_count
 
 
 def _emit_recovery_dry_run_report(
@@ -2886,7 +3018,9 @@ def _run_cycle(
     running = plan.running
     slots = plan.slots
     work_done = False
+    confirmed_start_count = 0
     started_task_ids: set[str] = set()
+    expected_starts: dict[str, _ExpectedStart] = {}
     step1_handled_child_task_ids: set[str] = set()
 
     def _check_canonical_checkout_boundary(action: str) -> None:
@@ -3433,13 +3567,43 @@ def _run_cycle(
                                 message=main_verify.state.alert_message or "main verify is red; merges halted",
                             )
                 for followup_task in merge_result.created_followups:
-                    log.emit("FOLLOW", f"{followup_task.id} created from {display_task.id}")
+                    log.emit(
+                        "FOLLOW",
+                        _format_follow_line(
+                            str(followup_task.id),
+                            str(display_task.id),
+                            reused=False,
+                        ),
+                    )
                 for followup_task in merge_result.reused_followups:
-                    log.emit("FOLLOW", f"{followup_task.id} reused from {display_task.id}")
+                    log.emit(
+                        "FOLLOW",
+                        _format_follow_line(
+                            str(followup_task.id),
+                            str(display_task.id),
+                            reused=True,
+                        ),
+                    )
                 for investigation_task_id in getattr(merge_result, "created_investigation_task_ids", ()):
-                    log.emit("FOLLOW", f"{investigation_task_id} investigation created from {display_task.id}")
+                    log.emit(
+                        "FOLLOW",
+                        _format_follow_line(
+                            str(investigation_task_id),
+                            str(display_task.id),
+                            reused=False,
+                            investigation=True,
+                        ),
+                    )
                 for investigation_task_id in getattr(merge_result, "reused_investigation_task_ids", ()):
-                    log.emit("FOLLOW", f"{investigation_task_id} investigation reused from {display_task.id}")
+                    log.emit(
+                        "FOLLOW",
+                        _format_follow_line(
+                            str(investigation_task_id),
+                            str(display_task.id),
+                            reused=True,
+                            investigation=True,
+                        ),
+                    )
                 if getattr(merge_result, "status", None) == "blocked_dirty_checkout":
                     log.emit_attention(
                         attention_key="merge-blocked-dirty-checkout",
@@ -4112,7 +4276,6 @@ def _run_cycle(
                 )
                 if prepared_recovered_task is None:
                     continue
-                recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -4152,7 +4315,6 @@ def _run_cycle(
                     continue
                 resume_recovered_task = prepared_recovered_task
                 recovered_task_id = str(prepared_recovered_task.id)
-                recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -4225,7 +4387,6 @@ def _run_cycle(
                 continue
             retry_recovered_task = prepared_recovered_task
             recovered_task_id = str(prepared_recovered_task.id)
-            recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
                 _spawn_worker_with_failure_log(
@@ -4269,17 +4430,7 @@ def _run_cycle(
 
         if rc != 0:
             continue
-        started, refreshed_recovered_task = _confirm_watch_dispatch_start(
-            config=config,
-            store=store,
-            log=log,
-            task_id=recovered_task_id,
-            task_before=recovered_task_before,
-            start_label=f"{failed.id} -> {recovered_task_id}",
-            dedupe_key=f"recovery-undispatched:{failed.id}:{recovered_task_id}",
-        )
-        if not started:
-            continue
+        refreshed_recovered_task = store.get(recovered_task_id)
         no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
             config=config,
             store=store,
@@ -4292,16 +4443,14 @@ def _run_cycle(
         )
         recovery_started_this_cycle = True
         started_task_ids.add(recovered_task_id)
+        expected_starts[recovered_task_id] = _ExpectedStart(
+            recovery_action=decision.action,
+            parent_failed_id=str(failed.id),
+            launch_mode=decision.launch_mode,
+        )
         slots -= 1
         reserved_recovery_slots -= 1
         work_done = True
-        log.emit(
-            "RECOVR",
-            (
-                f"{failed.id} {decision.action} via {decision.launch_mode} -> {recovered_task_id} "
-                f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
-            ),
-        )
         if no_progress_attention is not None:
             log.emit_attention(
                 attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
@@ -4356,12 +4505,7 @@ def _run_cycle(
             pending_action = _pending_queue_dispatch_action(task)
             if task_type == "implement":
                 if dry_run:
-                    dry_run_prompt = _format_prompt_for_width(
-                        task.prompt,
-                        prefix=16 + len(f"{task.id} {task_type} \""),
-                        suffix=len('" [dry-run]'),
-                    )
-                    log.emit("START", f"{task.id} {task_type} \"{dry_run_prompt}\" [dry-run]")
+                    log.emit("START", _format_start_line(task, dry_run=True))
                     started_task_ids.add(str(task.id))
                     consume_pending_slot()
                     work_done = True
@@ -4462,12 +4606,8 @@ def _run_cycle(
                 consume_pending_slot()
                 work_done = True
                 started_task_ids.add(str(task.id))
-                started_prompt = _format_prompt_for_width(
-                    task.prompt,
-                    prefix=16 + len(f"{task.id} {task_type} \""),
-                    suffix=len('"'),
-                )
-                log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
+                log.emit("START", _format_start_line(task))
+                confirmed_start_count += 1
                 if no_progress_attention is not None:
                     log.emit_attention(
                         attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
@@ -4476,12 +4616,7 @@ def _run_cycle(
                 continue
 
             if dry_run:
-                dry_run_prompt = _format_prompt_for_width(
-                    task.prompt,
-                    prefix=16 + len(f"{task.id} {task_type} \""),
-                    suffix=len('" [dry-run]'),
-                )
-                log.emit("START", f"{task.id} {task_type} \"{dry_run_prompt}\" [dry-run]")
+                log.emit("START", _format_start_line(task, dry_run=True))
                 started_task_ids.add(str(task.id))
                 consume_pending_slot()
                 work_done = True
@@ -4557,12 +4692,8 @@ def _run_cycle(
             consume_pending_slot()
             work_done = True
             started_task_ids.add(str(task.id))
-            started_prompt = _format_prompt_for_width(
-                task.prompt,
-                prefix=16 + len(f"{task.id} {task_type} \""),
-                suffix=len('"'),
-            )
-            log.emit("START", f"{task.id} {task_type} \"{started_prompt}\"")
+            log.emit("START", _format_start_line(task))
+            confirmed_start_count += 1
             if no_progress_attention is not None:
                 log.emit_attention(
                     attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
@@ -4578,6 +4709,8 @@ def _run_cycle(
         work_done=work_done,
         running=_count_live_workers(config, store),
         pending=pending_count,
+        expected_starts=expected_starts,
+        confirmed_start_count=confirmed_start_count,
     )
 
 
@@ -4752,6 +4885,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         idle_seconds = 0
         failure_streak = 0
         previous_snapshot = _task_snapshot(store)
+        expected_starts: dict[str, _ExpectedStart] = {}
         system_hold_active = False
 
         # Preview the first watch pass and ask for confirmation before executing
@@ -4840,7 +4974,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 system_hold_active = False
 
             pre_cycle_snapshot = _task_snapshot(store)
-            _emit_transition_events(
+            pre_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
                 pre_cycle_snapshot,
                 store=store,
@@ -4848,6 +4982,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
+            )
+            cycle_confirmed_start_count = _process_expected_start_boundary(
+                store=store,
+                config=config,
+                log=log,
+                expected_starts=expected_starts,
+                snapshot=pre_cycle_snapshot,
+                confirmed_start_ids=pre_cycle_confirmed_start_ids,
             )
             previous_snapshot = pre_cycle_snapshot
 
@@ -4875,9 +5017,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
             pending_first_cycle_plan = None
             preview_cycle_open = False
+            cycle_result.confirmed_start_count += cycle_confirmed_start_count
+            if cycle_result.expected_starts:
+                expected_starts.update(cycle_result.expected_starts)
 
             current_snapshot = _task_snapshot(store)
-            _emit_transition_events(
+            post_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
                 current_snapshot,
                 store=store,
@@ -4885,6 +5030,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
+            )
+            cycle_result.confirmed_start_count += _process_expected_start_boundary(
+                store=store,
+                config=config,
+                log=log,
+                expected_starts=expected_starts,
+                snapshot=current_snapshot,
+                confirmed_start_ids=post_cycle_confirmed_start_ids,
             )
             completed_ids = _collect_completed_transition_ids(
                 previous_snapshot,
@@ -4966,7 +5119,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 idle_seconds = 0
             log.emit(
                 "SLEEP",
-                f"sleeping {poll}s ({cycle_result.pending} pending, {cycle_result.running} running)",
+                _format_sleep_message(
+                    poll=poll,
+                    pending=cycle_result.pending,
+                    running=cycle_result.running,
+                    confirmed_start_count=cycle_result.confirmed_start_count,
+                ),
             )
             if not cycle_result.work_done:
                 idle_seconds += poll
