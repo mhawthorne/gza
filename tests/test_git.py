@@ -1660,6 +1660,17 @@ class TestStatusPorcelain:
 
         assert result == {("R", "new -> name.txt")}
 
+    def test_raises_on_nonzero_status_probe(self, tmp_path: Path):
+        """A failed porcelain probe must not be treated as a clean tree."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="", stderr="not a git repository")
+            with pytest.raises(GitError, match="git status --porcelain failed"):
+                git.status_porcelain()
+
 
 class TestExtractionGitHelpers:
     """Tests for git helpers used by extraction orchestration."""

@@ -3994,6 +3994,9 @@ def _cmd_show_output(
 
     status_color = _show_status_color(task, c)
 
+    def _escaped(value: object) -> str:
+        return rich_escape(str(value))
+
     def _format_utc_timestamp(value: datetime) -> str:
         ts = value.astimezone(UTC) if value.tzinfo is not None else value
         return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
@@ -4013,23 +4016,25 @@ def _cmd_show_output(
         elif lifecycle_summary.severity == "running":
             lifecycle_color = c["status_running"]
         console.print(
-            f"[{c['label']}]Lifecycle:[/{c['label']}] [{lifecycle_color}]{lifecycle_summary.text}[/{lifecycle_color}]"
+            f"[{c['label']}]Lifecycle:[/{c['label']}] [{lifecycle_color}]{_escaped(lifecycle_summary.text)}[/{lifecycle_color}]"
         )
     if task.failure_reason:
-        console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
+        console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{_escaped(task.failure_reason)}[/{c['value']}]")
     if task.completion_reason:
-        console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
+        console.print(
+            f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{_escaped(task.completion_reason)}[/{c['value']}]"
+        )
     if task.task_type in {"rebase", "improve"}:
         console.print(
             f"[{c['label']}]Changed Diff:[/{c['label']}] "
-            f"[{c['value']}]{_format_changed_diff_label(task.changed_diff)}[/{c['value']}]"
+            f"[{c['value']}]{_escaped(_format_changed_diff_label(task.changed_diff))}[/{c['value']}]"
         )
     merge_status = _task_show_merge_status(store, task)
     if merge_status:
-        console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{merge_status}[/{c['value']}]")
+        console.print(f"[{c['label']}]Merge Status:[/{c['label']}] [{c['value']}]{_escaped(merge_status)}[/{c['value']}]")
     console.print(f"[{c['label']}]Type:[/{c['label']}] [{c['value']}]{task.task_type}[/{c['value']}]")
-    console.print(f"[{c['label']}]Provider:[/{c['label']}] [{c['value']}]{task.provider or '-'}[/{c['value']}]")
-    console.print(f"[{c['label']}]Model:[/{c['label']}] [{c['value']}]{task.model or '-'}[/{c['value']}]")
+    console.print(f"[{c['label']}]Provider:[/{c['label']}] [{c['value']}]{_escaped(task.provider or '-')}[/{c['value']}]")
+    console.print(f"[{c['label']}]Model:[/{c['label']}] [{c['value']}]{_escaped(task.model or '-')}[/{c['value']}]")
     if task.task_type == "plan":
         auto_implement_detail = "yes"
         if task.auto_implement is False:
@@ -4040,16 +4045,18 @@ def _cmd_show_output(
             )
         console.print(
             f"[{c['label']}]Auto Implement:[/{c['label']}] "
-            f"[{c['value']}]{auto_implement_detail}[/{c['value']}]"
+            f"[{c['value']}]{_escaped(auto_implement_detail)}[/{c['value']}]"
         )
     if task.execution_mode:
-        console.print(f"[{c['label']}]Execution Mode:[/{c['label']}] [{c['value']}]{task.execution_mode}[/{c['value']}]")
+        console.print(
+            f"[{c['label']}]Execution Mode:[/{c['label']}] [{c['value']}]{_escaped(task.execution_mode)}[/{c['value']}]"
+        )
     console.print(
         f"[{c['label']}]Trigger Source:[/{c['label']}] "
-        f"[{c['value']}]{task.trigger_source or 'unknown'}[/{c['value']}]"
+        f"[{c['value']}]{_escaped(task.trigger_source or 'unknown')}[/{c['value']}]"
     )
     if task.slug:
-        console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{task.slug}[/{c['value']}]")
+        console.print(f"[{c['label']}]Slug:[/{c['label']}] [{c['value']}]{_escaped(task.slug)}[/{c['value']}]")
     if task.based_on:
         console.print(f"[{c['label']}]Based on:[/{c['label']}] [{c['value']}]task {task.based_on}[/{c['value']}]")
     if task.depends_on:
@@ -4061,11 +4068,13 @@ def _cmd_show_output(
         ]
         if depended_on_by:
             dep_parts = [f"{t.id}[{t.task_type}]" for t in depended_on_by if t.id is not None]
-            console.print(f"[{c['label']}]Depended on by:[/{c['label']}] [{c['value']}]{', '.join(dep_parts)}[/{c['value']}]")
+            console.print(
+                f"[{c['label']}]Depended on by:[/{c['label']}] [{c['value']}]{_escaped(', '.join(dep_parts))}[/{c['value']}]"
+            )
     if task.tags:
-        console.print(f"[{c['label']}]Tags:[/{c['label']}] [{c['value']}]{', '.join(task.tags)}[/{c['value']}]")
+        console.print(f"[{c['label']}]Tags:[/{c['label']}] [{c['value']}]{_escaped(', '.join(task.tags))}[/{c['value']}]")
     if task.spec:
-        console.print(f"[{c['label']}]Spec:[/{c['label']}] [{c['value']}]{task.spec}[/{c['value']}]")
+        console.print(f"[{c['label']}]Spec:[/{c['label']}] [{c['value']}]{_escaped(task.spec)}[/{c['value']}]")
     console.print(
         f"[{c['label']}]Create PR:[/{c['label']}] "
         f"[{c['value']}]{'yes' if task.create_pr else 'no'}[/{c['value']}]"
@@ -4073,23 +4082,25 @@ def _cmd_show_output(
     if task.pr_number is not None:
         console.print(f"[{c['label']}]PR Number:[/{c['label']}] [{c['value']}]{task.pr_number}[/{c['value']}]")
     if task.pr_state is not None:
-        console.print(f"[{c['label']}]PR State:[/{c['label']}] [{c['value']}]{task.pr_state}[/{c['value']}]")
+        console.print(f"[{c['label']}]PR State:[/{c['label']}] [{c['value']}]{_escaped(task.pr_state)}[/{c['value']}]")
     review_rebase_detail = _implementation_review_rebase_detail(task, config=config, store=store)
     if review_rebase_detail is not None:
-        console.print(f"[{c['label']}]Review:[/{c['label']}] [{c['value']}]{review_rebase_detail}[/{c['value']}]")
+        console.print(f"[{c['label']}]Review:[/{c['label']}] [{c['value']}]{_escaped(review_rebase_detail)}[/{c['value']}]")
     if task.skip_learnings:
         console.print(f"[{c['label']}]Skip Learnings:[/{c['label']}] [green]yes[/green]")
     if task.branch:
-        console.print(f"[{c['label']}]Branch:[/{c['label']}] [{c['branch']}]{task.branch}[/{c['branch']}]")
+        console.print(f"[{c['label']}]Branch:[/{c['label']}] [{c['branch']}]{_escaped(task.branch)}[/{c['branch']}]")
         active_worktree_path, worktree_lookup_error = _find_active_worktree_path_for_branch(config, task.branch)
         if active_worktree_path:
-            console.print(f"[{c['label']}]Worktree:[/{c['label']}] [{c['value']}]{active_worktree_path}[/{c['value']}]")
+            console.print(
+                f"[{c['label']}]Worktree:[/{c['label']}] [{c['value']}]{_escaped(active_worktree_path)}[/{c['value']}]"
+            )
         elif worktree_lookup_error:
             console.print(f"[yellow]Warning: Worktree lookup failed: {rich_escape(worktree_lookup_error)}[/yellow]")
     if task.log_file:
-        console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{task.log_file}[/{c['value']}]")
+        console.print(f"[{c['label']}]Log:[/{c['label']}] [{c['value']}]{_escaped(task.log_file)}[/{c['value']}]")
     if task.report_file:
-        console.print(f"[{c['label']}]Report:[/{c['label']}] [{c['value']}]{task.report_file}[/{c['value']}]")
+        console.print(f"[{c['label']}]Report:[/{c['label']}] [{c['value']}]{_escaped(task.report_file)}[/{c['value']}]")
         # Detect if disk file is newer than task completion (drift warning)
         if task.completed_at and task.output_content:
             report_path = config.project_dir / task.report_file
@@ -4101,11 +4112,13 @@ def _cmd_show_output(
     if task_artifacts:
         console.print(f"[{c['label']}]Artifacts:[/{c['label']}]")
         for artifact in task_artifacts:
-            console.print(f"  - [{c['value']}]{_format_task_artifact_summary(artifact, config=config)}[/{c['value']}]")
+            console.print(
+                f"  - [{c['value']}]{_escaped(_format_task_artifact_summary(artifact, config=config))}[/{c['value']}]"
+            )
     if task.task_type == "review":
         verdict = get_review_verdict(config, task)
         if verdict:
-            console.print(f"[{c['label']}]Verdict:[/{c['label']}] [{c['value']}]{verdict}[/{c['value']}]")
+            console.print(f"[{c['label']}]Verdict:[/{c['label']}] [{c['value']}]{_escaped(verdict)}[/{c['value']}]")
         score = task.review_score
         if score is None and task.status == "completed":
             score = get_review_score(config, task)
@@ -4119,7 +4132,7 @@ def _cmd_show_output(
         if task.review_verify_status or task.review_verify_markdown or task.review_verify_artifact_file or latest_verify_artifact:
             console.print(
                 f"[{c['label']}]Review Verify Status:[/{c['label']}] "
-                f"[{c['value']}]{task.review_verify_status or 'unknown'}[/{c['value']}]"
+                f"[{c['value']}]{_escaped(task.review_verify_status or 'unknown')}[/{c['value']}]"
             )
             if task.review_verify_exit_status:
                 console.print(
@@ -4134,22 +4147,22 @@ def _cmd_show_output(
             if task.review_verify_branch:
                 console.print(
                     f"[{c['label']}]Review Verify Branch:[/{c['label']}] "
-                    f"[{c['value']}]{task.review_verify_branch}[/{c['value']}]"
+                    f"[{c['value']}]{_escaped(task.review_verify_branch)}[/{c['value']}]"
                 )
             if task.review_verify_head_sha:
                 console.print(
                     f"[{c['label']}]Review Verify Head:[/{c['label']}] "
-                    f"[{c['value']}]{task.review_verify_head_sha}[/{c['value']}]"
+                    f"[{c['value']}]{_escaped(task.review_verify_head_sha)}[/{c['value']}]"
                 )
             if task.review_verify_base_sha:
                 console.print(
                     f"[{c['label']}]Review Verify Base:[/{c['label']}] "
-                    f"[{c['value']}]{task.review_verify_base_sha}[/{c['value']}]"
+                    f"[{c['value']}]{_escaped(task.review_verify_base_sha)}[/{c['value']}]"
                 )
             if task.review_verify_cwd:
                 console.print(
                     f"[{c['label']}]Review Verify Cwd:[/{c['label']}] "
-                    f"[{c['value']}]{task.review_verify_cwd}[/{c['value']}]"
+                    f"[{c['value']}]{_escaped(task.review_verify_cwd)}[/{c['value']}]"
                 )
             verify_artifact_path = (
                 latest_verify_artifact.artifact.path if latest_verify_artifact is not None else task.review_verify_artifact_file
@@ -4168,24 +4181,24 @@ def _cmd_show_output(
                             verify_artifact_text = f"{verify_artifact_text} (missing)"
                 console.print(
                     f"[{c['label']}]Review Verify Artifact:[/{c['label']}] "
-                    f"[{c['value']}]{verify_artifact_text}[/{c['value']}]"
+                    f"[{c['value']}]{_escaped(verify_artifact_text)}[/{c['value']}]"
                 )
             if task.review_verify_failure:
                 console.print(
                     f"[{c['label']}]Review Verify Failure:[/{c['label']}] "
-                    f"[{c['value']}]{task.review_verify_failure}[/{c['value']}]"
+                    f"[{c['value']}]{_escaped(task.review_verify_failure)}[/{c['value']}]"
                 )
     if task.task_type == "plan_review":
         verdict, manifest_detail = _plan_review_detail(task=task, config=config, store=store)
         if verdict:
-            console.print(f"[{c['label']}]Verdict:[/{c['label']}] [{c['value']}]{verdict}[/{c['value']}]")
+            console.print(f"[{c['label']}]Verdict:[/{c['label']}] [{c['value']}]{_escaped(verdict)}[/{c['value']}]")
         if manifest_detail:
             console.print(
                 f"[{c['label']}]Slice Manifest:[/{c['label']}] "
-                f"[{c['value']}]{manifest_detail}[/{c['value']}]"
+                f"[{c['value']}]{_escaped(manifest_detail)}[/{c['value']}]"
             )
     if task.session_id:
-        console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
+        console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{_escaped(task.session_id)}[/{c['value']}]")
 
     root_task = _resolve_lineage_root_task(store, task)
     lineage_tree = _build_lineage_tree_for_root(store, root_task)
@@ -4203,7 +4216,7 @@ def _cmd_show_output(
         console.print()
         console.print(f"[{c['label']}]Prompt:[/{c['label']}]")
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
-        console.print(f"[{c['prompt']}]{task.prompt}[/{c['prompt']}]")
+        console.print(f"[{c['prompt']}]{_escaped(task.prompt)}[/{c['prompt']}]")
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
         console.print()
         if task.task_type == "review" and task.review_verify_markdown:
@@ -4239,7 +4252,7 @@ def _cmd_show_output(
                 if comment.resolved_at is not None:
                     meta_parts.append(f"resolved={_format_utc_timestamp(comment.resolved_at)}")
                 meta = ", ".join(meta_parts)
-                console.print(f"  [{c['stats']}]({meta})[/{c['stats']}] {comment.content}")
+                console.print(f"  [{c['stats']}]({_escaped(meta)})[/{c['stats']}] {_escaped(comment.content)}")
             console.print()
     if task.created_at:
         console.print(f"[{c['label']}]Created:[/{c['label']}] [{c['value']}]{task.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC[/{c['value']}]")
@@ -4249,7 +4262,7 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Completed:[/{c['label']}] [{c['value']}]{task.completed_at.strftime('%Y-%m-%d %H:%M:%S')} UTC[/{c['value']}]")
     stats_str = format_stats(task)
     if stats_str:
-        console.print(f"[{c['label']}]Stats:[/{c['label']}] [{c['stats']}]{stats_str}[/{c['stats']}]")
+        console.print(f"[{c['label']}]Stats:[/{c['label']}] [{c['stats']}]{_escaped(stats_str)}[/{c['stats']}]")
 
     if task.id is not None:
         latest_worker = _latest_worker_for_task(WorkerRegistry(config.workers_path), task.id)

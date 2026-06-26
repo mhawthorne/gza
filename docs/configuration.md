@@ -626,6 +626,8 @@ gza work [task_id...] [options]
 
 `uv run gza work` starts pending tasks only. It does not run failed-task recovery (`resume` / `retry` / manual-review parking) and it does not progress review/rebase/merge lifecycle work for already-started lineages. If recovery candidates exist, `work` leaves them untouched and starts from the pending lane anyway.
 
+When `uv run gza work --background` starts a detached worker that then exits before the task actually begins running, the startup refusal is mirrored into the task log path (or startup fallback) so `uv run gza log <task-id>` surfaces the reason instead of leaving a silent 0-byte log.
+
 ### work / advance / watch operating surface
 
 Use this matrix when deciding "what will this command actually touch?"
@@ -674,6 +676,11 @@ gza add [prompt] [options]
 | `--no-learnings` | Skip injecting `.gza/learnings.md` context into this task's prompt |
 | `--next` | Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump) |
 
+Held completed plans are not valid sources for pre-created implement children. If `--type implement`
+uses `--depends-on <plan-id>` and that plan is held for review, or `--based-on` points into a lineage
+rooted at a held plan, `gza add` fails and tells you to release the plan first with
+`uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review`.
+
 ### edit
 
 Edit an existing task.
@@ -707,6 +714,7 @@ gza edit <task_id> [options]
 Pending tasks may use any supported edit flag. Non-pending tasks may only use tag mutation flags (`--add-tag`, `--remove-tag`, `--clear-tags`, or `--set-tags`).
 Pending plan tasks may use `--hold-for-review` or `--no-hold-for-review`. Completed plan tasks may also use `--no-hold-for-review` (preferred) or `--auto-implement` (compatibility alias) to release a hold-for-review plan without rerunning it.
 All other edit flags (`--based-on`, `--depends-on`, `--clear-depends-on`, `--explore`, `--task`, `--review`, `--pr`, `--prompt`, `--prompt-file`, `--model`, `--provider`, `--no-learnings`, and completed-plan `--hold-for-review`) remain pending-only.
+Pending `implement` tasks also cannot be edited onto a held-plan dependency or a `based_on` lineage rooted at a held plan; release the plan first.
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 
@@ -1648,6 +1656,7 @@ gza implement <plan_task_id> [prompt] [options]
 
 When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
 Using `uv run gza edit <plan-id> --no-hold-for-review` also clears the hold, but that path releases the completed plan back into the automated `plan_review` lifecycle rather than directly creating implementation work.
+This explicit release step is mandatory: pre-creating an `implement` task behind a held plan via `gza add --type implement --depends-on <plan-id>` or a `--based-on` lineage rooted at that held plan is rejected instead of leaving a blocked child behind.
 
 ### plan-review
 
@@ -1818,6 +1827,8 @@ When a human runs `uv run gza iterate` against a failed implementation or failed
 Before `--background` detaches, iterate now also evaluates the current lifecycle decision for completed implementations. If the decision is a true no-worker outcome (for example already merged, no remaining commits to land, plain `merge` readiness, max review cycles reached, waiting on existing work, or another shared skip/needs-attention outcome), iterate prints that decision synchronously to the caller and exits without creating a worker row. `merge_with_followups` is not treated as a no-op here: background iterate still detaches into the normal iterate worker so the shared follow-up task materialization path runs before the implementation becomes merge-ready.
 
 If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant instead of leaving the capped failed row as the active unit of work. The older failed row remains in task history, but shared lineage/lifecycle surfaces treat it as recovered: owner-row listings continue from the descendant, and `uv run gza show` on the older failed row renders `Lifecycle: recovered, ...` based on the descendant's next action or terminal state.
+
+Detached `uv run gza iterate --background` runs follow the same observability rule: if the background worker stops during startup or another no-run preflight path, the task log path and `uv run gza log <impl-task-id>` now retain the refusal reason rather than silently exiting.
 
 When iterate stops with `max_cycles_reached`, it now prints review-iteration accounting with:
 - task `completed` review-iteration count

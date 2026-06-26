@@ -14,6 +14,8 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 import pytest
 
 from gza.advance_engine import evaluate_advance_rules
+from gza.canonical_checkout import CanonicalCheckoutStatus
+from gza.cli import _create_improve_task, _create_rebase_task
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError, ResolvedMergeSourceRef
@@ -28,33 +30,32 @@ from gza.rebase_diff import RebaseDiffBaseline
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
-from gza.cli import _create_improve_task, _create_rebase_task
 from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
-    CompletedCodeTaskPrPublicationOutcome,
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
-    ProjectReviewVerifyResult,
+    REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
+    REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
     SUMMARY_DIR,
     WIP_DIR,
+    CompletedCodeTaskPrPublicationOutcome,
     CrossProjectReviewVerifyResult,
-    ProjectBoundary,
-    REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
-    REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
-    ReviewVerifyResult,
     ExtractionSeedResult,
+    ProjectBoundary,
+    ProjectReviewVerifyResult,
     ResolvedTimeoutBudget,
+    ReviewVerifyResult,
     RunInvocationContext,
     _apply_transcript_stats_fallback,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
     _build_timeout_resume_context,
+    _capture_noop_improve_review_verify_result,
     _check_dependency_merge_precondition,
     _complete_code_task,
-    _capture_noop_improve_review_verify_result,
     _compute_slug_override,
     _compute_tree_fingerprint,
     _copy_learnings_to_worktree,
@@ -65,10 +66,10 @@ from gza.runner import (
     _format_review_verify_failure,
     _format_review_verify_result,
     _get_task_output,
-    _post_complete_code_task,
     _persist_review_blocker_adjudication_for_completed_task,
-    _resolve_review_verify_timeout_grace_seconds,
+    _post_complete_code_task,
     _resolve_code_task_branch_name,
+    _resolve_review_verify_timeout_grace_seconds,
     _resolve_task_timeout_budget,
     _restore_wip_changes,
     _run_inner,
@@ -14827,6 +14828,7 @@ class TestExtractedRunInnerHelpers:
 
         mock_worktree_git = Mock(spec=Git)
         mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.has_changes.return_value = False
         mock_worktree_git.status_porcelain.return_value = set()
         mock_worktree_git.has_changes.return_value = False
         mock_worktree_git.rev_parse.return_value = "same-head"
@@ -15314,6 +15316,7 @@ class TestExtractedRunInnerHelpers:
 
         mock_worktree_git = Mock(spec=Git)
         mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.has_changes.return_value = False
         mock_worktree_git.status_porcelain.return_value = set()
 
         def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
@@ -15409,6 +15412,7 @@ class TestExtractedRunInnerHelpers:
 
         mock_worktree_git = Mock(spec=Git)
         mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.has_changes.return_value = False
         mock_worktree_git.status_porcelain.return_value = set()
 
         def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
@@ -15542,6 +15546,10 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.is_rebase_in_progress", return_value=False),
             patch("gza.runner.import_isolated_rebase_tip") as import_tip,
             patch("gza.runner._complete_code_task", side_effect=complete_code_task) as mock_complete,
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ) as canonical_check,
         ):
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
 
@@ -15561,6 +15569,416 @@ class TestExtractedRunInnerHelpers:
             temp_ref_name=task.slug,
         )
         assert mock_complete.call_count == 1
+        canonical_check.assert_called_once()
+        assert canonical_check.call_args.kwargs["expected_branch"] == "main"
+        assert canonical_check.call_args.kwargs["task_id"] == task.id
+        assert canonical_check.call_args.kwargs["canonical_git"] is mock_main_git
+
+    def test_run_inner_docker_code_task_rewrites_git_metadata_and_restores_it(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260625-docker-git-metadata"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        (host_worktree_gitdir / "commondir").write_text(f"{host_common_gitdir}\n")
+        original_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        (worktree_path / ".git").write_text(original_git_text)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        def provider_run(run_config, _prompt, _log_file, work_dir, **_kwargs):
+            assert work_dir == worktree_path
+            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
+            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            assert f"{host_worktree_gitdir}:/gza-git/worktree" in run_config.docker_volumes
+            assert f"{host_common_gitdir}:/gza-git/common" in run_config.docker_volumes
+            assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in getattr(run_config, "docker_env", [])
+            assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in getattr(run_config, "docker_env", [])
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                error_type=None,
+            )
+
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        def complete_code_task(*_args, **_kwargs):
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == f"{host_common_gitdir}\n"
+            assert getattr(config, "docker_env", []) == []
+            assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+            return 0
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/docker-git-metadata"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner._complete_code_task", side_effect=complete_code_task),
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 0
+        assert (worktree_path / ".git").read_text() == original_git_text
+        assert (host_worktree_gitdir / "commondir").read_text() == f"{host_common_gitdir}\n"
+        assert getattr(config, "docker_env", []) == []
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+
+    def test_run_inner_docker_code_task_restores_git_metadata_before_timeout_bookkeeping(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260625-docker-git-metadata-timeout"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        original_commondir_text = f"{host_common_gitdir}\n"
+        (host_worktree_gitdir / "commondir").write_text(original_commondir_text)
+        original_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        (worktree_path / ".git").write_text(original_git_text)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, **_kwargs):
+            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
+            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            return RunResult(
+                exit_code=124,
+                duration_seconds=120.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                error_type=None,
+            )
+
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        def assert_restored() -> None:
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+            assert getattr(config, "docker_env", []) == []
+            assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+
+        def compute_tree_fingerprint(_git: Git) -> str:
+            assert _git is mock_worktree_git
+            assert_restored()
+            return "fingerprint"
+
+        def save_wip_changes(_task: Task, _git: Git, _config: Config, _branch_name: str) -> str:
+            assert _task is task
+            assert _git is mock_worktree_git
+            assert _config is config
+            assert _branch_name == "feature/docker-git-metadata"
+            assert_restored()
+            return "none"
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/docker-git-metadata"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner._compute_tree_fingerprint", side_effect=compute_tree_fingerprint) as compute_fingerprint,
+            patch("gza.runner._save_wip_changes", side_effect=save_wip_changes) as save_wip,
+            patch("gza.runner._persist_timeout_resume_checkpoint") as persist_checkpoint,
+            patch("gza.runner._record_run_failure") as record_failure,
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 0
+        compute_fingerprint.assert_called_once_with(mock_worktree_git)
+        save_wip.assert_called_once_with(task, mock_worktree_git, config, "feature/docker-git-metadata")
+        persist_checkpoint.assert_called_once()
+        record_failure.assert_called_once()
+        assert (worktree_path / ".git").read_text() == original_git_text
+        assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+        assert getattr(config, "docker_env", []) == []
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+
+    def test_run_inner_docker_code_task_restores_git_metadata_after_provider_exception(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260625-docker-git-metadata-exception"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        original_commondir_text = f"{host_common_gitdir}\n"
+        (host_worktree_gitdir / "commondir").write_text(original_commondir_text)
+        original_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        (worktree_path / ".git").write_text(original_git_text)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, **_kwargs):
+            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
+            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            raise RuntimeError("provider exploded")
+
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/docker-git-metadata"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="provider exploded"):
+                _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert (worktree_path / ".git").read_text() == original_git_text
+        assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+        assert getattr(config, "docker_env", []) == []
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+
+    def test_run_inner_docker_code_task_restores_git_metadata_before_interrupt_wip_save(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260625-docker-git-metadata-post-provider-interrupt"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        original_commondir_text = f"{host_common_gitdir}\n"
+        (host_worktree_gitdir / "commondir").write_text(original_commondir_text)
+        original_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        (worktree_path / ".git").write_text(original_git_text)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, **_kwargs):
+            assert (worktree_path / ".git").read_text() == "gitdir: /gza-git/worktree\n"
+            assert (host_worktree_gitdir / "commondir").read_text() == "/gza-git/common\n"
+            return RunResult(
+                exit_code=0,
+                duration_seconds=2.0,
+                num_turns_reported=1,
+                cost_usd=0.01,
+                error_type=None,
+            )
+
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        def save_wip_changes(_task: Task, _git: Git, _config: Config, _branch_name: str) -> str:
+            assert _task is task
+            assert _git is mock_worktree_git
+            assert _config is config
+            assert _branch_name == "feature/docker-git-metadata"
+            assert (worktree_path / ".git").read_text() == original_git_text
+            assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+            assert getattr(config, "docker_env", []) == []
+            assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+            return "none"
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/docker-git-metadata"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner._resolve_run_failure", side_effect=KeyboardInterrupt),
+            patch("gza.runner._save_wip_changes", side_effect=save_wip_changes) as save_wip,
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 130
+        save_wip.assert_called_once_with(task, mock_worktree_git, config, "feature/docker-git-metadata")
+        assert (worktree_path / ".git").read_text() == original_git_text
+        assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+        assert getattr(config, "docker_env", []) == []
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
+
+    def test_run_inner_docker_code_task_restores_git_metadata_after_pre_provider_interrupt(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260625-docker-git-metadata-pre-provider-interrupt"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        original_commondir_text = f"{host_common_gitdir}\n"
+        (host_worktree_gitdir / "commondir").write_text(original_commondir_text)
+        original_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        (worktree_path / ".git").write_text(original_git_text)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/docker-git-metadata"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner.sanitize_provider_prompt", side_effect=KeyboardInterrupt),
+            patch("gza.runner._call_provider_run", side_effect=AssertionError("provider should not run")),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should not complete")),
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 130
+        assert (worktree_path / ".git").read_text() == original_git_text
+        assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+        assert getattr(config, "docker_env", []) == []
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
 
     def test_run_inner_docker_rebase_fails_closed_when_import_old_sha_is_stale(
         self,
@@ -15631,6 +16049,7 @@ class TestExtractedRunInnerHelpers:
 
         mock_main_git = Mock(spec=Git)
         mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),

@@ -2362,6 +2362,24 @@ class TestCleanCommand:
         config = Config.load(tmp_path)
         assert config.cleanup_days == 7
 
+    def test_clean_archive_uses_config_cleanup_days(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\ncleanup_days: 7\n", encoding="utf-8")
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_file = logs_dir / "archive-by-config.txt"
+        log_file.write_text("archive me\n", encoding="utf-8")
+        old_time = (datetime.now(UTC) - timedelta(days=8)).timestamp()
+        os.utime(log_file, (old_time, old_time))
+
+        result = invoke_gza("clean", "--archive", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Archived files older than 7 days" in result.stdout
+        assert log_file.exists() is False
+        assert (tmp_path / ".gza" / "archives" / "logs" / log_file.name).exists()
+
     def test_clean_logs_also_removes_old_task_artifacts(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -3092,7 +3110,7 @@ class TestCleanArchiveCommand:
 
         assert result.returncode == 0
         assert "Dry run: would archive files older than 30 days" in result.stdout
-        assert "old_log.txt" in result.stdout
+        assert "Logs: 1 files" in result.stdout
 
         # Verify file was NOT archived
         assert old_log.exists()
@@ -3295,7 +3313,7 @@ class TestCleanArchiveCommand:
 
         assert result.returncode == 0
         assert "Dry run: would purge archived files older than 365 days" in result.stdout
-        assert "old_archived.txt" in result.stdout
+        assert "Archived logs: 1 files" in result.stdout
 
         # Verify file was NOT deleted
         assert old_archived.exists()
@@ -3374,7 +3392,7 @@ class TestCleanArchiveCommand:
         result = invoke_gza("clean", "--archive", "--dry-run", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "gza-2026010100.db" in result.stdout
+        assert "Backups deleted: 1 files" in result.stdout
         # File should NOT have been deleted (dry run)
         assert old_backup.exists()
 

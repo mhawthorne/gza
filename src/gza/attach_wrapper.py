@@ -79,6 +79,7 @@ def _build_docker_interactive_cmd(
         config.timeout_minutes,
         config.docker_volumes,
         config.docker_setup_command,
+        getattr(config, "docker_env", None),
         interactive=True,
     )
     cmd.append("claude")

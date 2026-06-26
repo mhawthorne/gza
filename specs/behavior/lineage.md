@@ -86,6 +86,9 @@ A task `T` with `depends_on = D` MUST NOT run until `D`'s work is **satisfied**.
   the target). A completed held plan
   (`task_type == "plan"` with `auto_implement == false`) is a distinct exception:
   direct dependents MUST stay blocked until the hold is explicitly released.
+  New `implement` tasks MUST NOT be created or rewired into that state through
+  `--depends-on <plan-id>` or a `--based-on` lineage rooted at the held plan; the CLI
+  MUST refuse those attempts and direct the operator to the explicit release commands.
 - **Completed terminal no-work is dependency-satisfying.** A prerequisite with
   `status == "completed"` and authoritative merge-unit state `empty` or `redundant`
   MUST satisfy merge-required `depends_on` exactly like `merged`: the work unit is

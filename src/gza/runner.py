@@ -31,6 +31,7 @@ from .branch_publication import (
     persist_branch_publication_state,
 )
 from .branch_resolution import resolve_rebase_target_branch
+from .canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canonical_checkout_invariant
 from .commit_messages import build_task_commit_message
 from .config import (
     APP_NAME,
@@ -99,6 +100,7 @@ from .lifecycle_completion import (
 from .lineage import get_plan_for_task
 from .log_paths import TaskLogPaths, ops_log_path_for, resolve_ops_log_path, resolve_task_log_paths
 from .merge_state import resolve_task_merge_state_for_target
+from .operator_state import blocked_dependency_error_message
 from .pr_ops import build_task_pr_content, ensure_task_pr, sync_task_branch_if_live_pr
 from .project_discovery import (
     RepoProjectConfig,
@@ -490,6 +492,99 @@ def _build_runtime_docker_volumes(config: Config) -> list[str]:
         if mount not in volumes:
             volumes.append(mount)
     return volumes
+
+
+_CONTAINER_WORKTREE_GITDIR = "/gza-git/worktree"
+_CONTAINER_COMMON_GITDIR = "/gza-git/common"
+
+
+@dataclass
+class _DockerGitMetadataContext:
+    """Temporarily rewrite worktree git metadata for Docker-backed provider runs."""
+
+    host_git_file: Path
+    host_commondir_file: Path
+    original_git_file_text: str
+    original_commondir_text: str
+    original_docker_volumes: list[str]
+    original_docker_env: list[str]
+    target_config: Config
+
+    def restore(self) -> None:
+        self.host_git_file.write_text(self.original_git_file_text, encoding="utf-8")
+        self.host_commondir_file.write_text(self.original_commondir_text, encoding="utf-8")
+        self.target_config.docker_volumes = list(self.original_docker_volumes)
+        setattr(self.target_config, "docker_env", list(self.original_docker_env))
+
+
+def _prepare_docker_worktree_git_metadata(
+    *,
+    config: Config,
+    target_config: Config,
+    worktree_path: Path,
+) -> _DockerGitMetadataContext | None:
+    """Make a worktree `.git` file container-valid for the duration of a provider run."""
+    if not config.use_docker:
+        return None
+
+    host_git_file = worktree_path / ".git"
+    if not host_git_file.is_file():
+        return None
+
+    git_file_text = host_git_file.read_text(encoding="utf-8").strip()
+    if not git_file_text.startswith("gitdir: "):
+        return None
+
+    raw_gitdir = git_file_text[len("gitdir: "):].strip()
+    host_worktree_gitdir = Path(raw_gitdir)
+    if not host_worktree_gitdir.is_absolute():
+        host_worktree_gitdir = (worktree_path / host_worktree_gitdir).resolve()
+
+    host_commondir_file = host_worktree_gitdir / "commondir"
+    commondir_text = host_commondir_file.read_text(encoding="utf-8").strip()
+    if not commondir_text:
+        raise GitError(f"Missing commondir content for worktree gitdir {host_worktree_gitdir}")
+
+    host_common_gitdir = Path(commondir_text)
+    if not host_common_gitdir.is_absolute():
+        host_common_gitdir = (host_worktree_gitdir / host_common_gitdir).resolve()
+
+    original_docker_volumes = list(getattr(target_config, "docker_volumes", []))
+    original_docker_env = list(getattr(target_config, "docker_env", []))
+    try:
+        target_config.docker_volumes = [
+            *original_docker_volumes,
+            f"{host_worktree_gitdir}:{_CONTAINER_WORKTREE_GITDIR}",
+            f"{host_common_gitdir}:{_CONTAINER_COMMON_GITDIR}",
+        ]
+        setattr(
+            target_config,
+            "docker_env",
+            [
+                *original_docker_env,
+                f"GZA_CONTAINER_GITDIR={_CONTAINER_WORKTREE_GITDIR}",
+                f"GZA_CONTAINER_COMMON_GITDIR={_CONTAINER_COMMON_GITDIR}",
+            ],
+        )
+
+        host_git_file.write_text(f"gitdir: {_CONTAINER_WORKTREE_GITDIR}\n", encoding="utf-8")
+        host_commondir_file.write_text(f"{_CONTAINER_COMMON_GITDIR}\n", encoding="utf-8")
+    except Exception:
+        host_git_file.write_text(git_file_text + "\n", encoding="utf-8")
+        host_commondir_file.write_text(commondir_text + "\n", encoding="utf-8")
+        target_config.docker_volumes = list(original_docker_volumes)
+        setattr(target_config, "docker_env", list(original_docker_env))
+        raise
+
+    return _DockerGitMetadataContext(
+        host_git_file=host_git_file,
+        host_commondir_file=host_commondir_file,
+        original_git_file_text=git_file_text + "\n",
+        original_commondir_text=commondir_text + "\n",
+        original_docker_volumes=original_docker_volumes,
+        original_docker_env=original_docker_env,
+        target_config=target_config,
+    )
 
 
 def _path_is_under_any_scope(path: Path, allowed_roots: frozenset[Path]) -> bool:
@@ -6366,10 +6461,7 @@ def run(
                     refreshed = store.get(task.id)
                     status = refreshed.status if refreshed else "unknown"
                     if claim is not None and claim.refusal_reason == "blocked":
-                        error_message(
-                            f"Error: Task {task_id} is blocked by task "
-                            f"{claim.blocking_task_id} ({claim.blocking_task_status})"
-                        )
+                        error_message(f"Error: {blocked_dependency_error_message(store, task)}")
                         return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                     error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                     return 1
@@ -6396,7 +6488,8 @@ def run(
                 and get_unmerged_dependency_precondition(store, task) is not None
             )
             if is_blocked and not merge_precondition_blocked:
-                error_message(f"Error: Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
+                del blocking_id, blocking_status
+                error_message(f"Error: {blocked_dependency_error_message(store, task)}")
                 return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
             requested_create_pr = bool(create_pr or task.create_pr)
             allow_pr_retry = (
@@ -6438,10 +6531,7 @@ def run(
                         refreshed = store.get(task.id)
                         status = refreshed.status if refreshed else "unknown"
                         if claim is not None and claim.refusal_reason == "blocked":
-                            error_message(
-                                f"Error: Task {task_id} is blocked by task "
-                                f"{claim.blocking_task_id} ({claim.blocking_task_status})"
-                            )
+                            error_message(f"Error: {blocked_dependency_error_message(store, task)}")
                             return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                         error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
                         return 1
@@ -8098,6 +8188,11 @@ def _run_inner(
             fix_commits_ahead_before_run = None
 
     try:
+        docker_git_metadata = _prepare_docker_worktree_git_metadata(
+            config=config,
+            target_config=task_config,
+            worktree_path=worktree_path,
+        )
         provider_run_kwargs: dict[str, Any] = {
             "resume_session_id": task.session_id if resume else None,
             "on_session_id": _on_session_id,
@@ -8107,15 +8202,20 @@ def _run_inner(
             provider_run_kwargs["interactive"] = True
         if _provider_accepts_ops_log_file(provider):
             provider_run_kwargs["ops_log_file"] = resolve_ops_log_path(config, log_file)
-        provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
-        result = _call_provider_run(
-            provider,
-            task_config,
-            provider_prompt,
-            log_file,
-            worktree_path,
-            provider_run_kwargs=provider_run_kwargs,
-        )
+        try:
+            provider_prompt = sanitize_provider_prompt(prompt, task_type=task.task_type)
+            result = _call_provider_run(
+                provider,
+                task_config,
+                provider_prompt,
+                log_file,
+                worktree_path,
+                provider_run_kwargs=provider_run_kwargs,
+            )
+        finally:
+            if docker_git_metadata is not None:
+                docker_git_metadata.restore()
+
         _apply_transcript_stats_fallback(
             result,
             log_file=log_file,
@@ -8148,7 +8248,9 @@ def _run_inner(
         )
 
         if resolved_failure is not None:
-            # Save WIP changes before marking failed
+            # Save WIP changes before marking failed.
+            # The temporary Docker git metadata must already be restored here so
+            # host-side Git bookkeeping stays on host-valid paths.
             pre_save_tree_fingerprint = None
             if resolved_failure.reason == "TIMEOUT" and task.id is not None:
                 pre_save_tree_fingerprint = _compute_tree_fingerprint(worktree_git)
@@ -8275,6 +8377,34 @@ def _run_inner(
         console.print("\nInterrupted")
         return 130
     finally:
+        if config.use_docker and git is not None:
+            canonical_status = check_canonical_checkout_invariant(
+                config,
+                expected_branch=default_branch,
+                action=f"provider task {task.id or task.slug or task.task_type}",
+                task_id=task.id,
+                ops_log_file=resolve_ops_log_path(config, log_file),
+                canonical_git=git,
+            )
+            if canonical_status.restored:
+                console.print(
+                    "[yellow]"
+                    f"{CANONICAL_CHECKOUT_ATTENTION_REASON}: restored canonical checkout "
+                    f"from {canonical_status.current_branch} to {canonical_status.expected_branch}"
+                    "[/yellow]"
+                )
+            elif canonical_status.needs_attention:
+                dirty = ", ".join(canonical_status.dirty_tracked_paths[:5])
+                if len(canonical_status.dirty_tracked_paths) > 5:
+                    dirty += ", ..."
+                detail = f"; tracked changes: {dirty}" if dirty else ""
+                console.print(
+                    "[red]"
+                    f"{CANONICAL_CHECKOUT_ATTENTION_REASON}: canonical checkout is on "
+                    f"{canonical_status.current_branch or 'unknown'}, expected "
+                    f"{canonical_status.expected_branch}{detail}"
+                    "[/red]"
+                )
         if isolated_checkout_cm is not None:
             isolated_checkout_cm.__exit__(None, None, None)
 

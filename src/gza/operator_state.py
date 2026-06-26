@@ -103,6 +103,31 @@ def blocked_dependency_label(
     )
 
 
+def blocked_dependency_error_message(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+    readiness: DependencyReadiness | None = None,
+) -> str:
+    """Return the shared operator-facing dependency block error for task execution."""
+    if readiness is None:
+        from .dependency_preconditions import dependency_readiness
+
+        readiness = dependency_readiness(store, task, read_context=read_context)
+    specialized = blocked_dependency_label(
+        store,
+        task,
+        read_context=read_context,
+        readiness=readiness,
+    )
+    if specialized is not None:
+        return f"Task {task.id} is {specialized}"
+    blocking_id = readiness.blocking_task_id or task.depends_on or "unknown"
+    blocking_status = readiness.blocking_task_status or readiness.reason or "unknown"
+    return f"Task {task.id} is blocked by task {blocking_id} ({blocking_status})"
+
+
 def _resolve_empty_prereq_candidate(
     store: SqliteTaskStore,
     task: DbTask,

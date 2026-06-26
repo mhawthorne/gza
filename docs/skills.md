@@ -159,7 +159,8 @@ Use `/gza-rebase` when your branch has fallen behind its merge target and needs 
 - In default mode, checks for uncommitted changes before starting and stops if any exist
 - Honors the caller-provided local target branch; if none is provided, resolves the repo primary branch from `origin/HEAD` first and then local `main`/`master`
 - Uses `origin/<resolved-target>` only for explicit remote rebases outside `--auto`
-- In `--auto` mode, stashes uncommitted changes before rebasing, restores them before final verification, and relies only on local refs already present unless the caller explicitly requested a remote rebase outside auto mode
+- Pins git operations to `GZA_WORKTREE_ROOT` (Docker default: `/workspace`) instead of relying on the shell's current directory
+- In `--auto` mode, stashes uncommitted changes before rebasing, restores them before final verification, stops on confused worktree metadata, and relies only on local refs already present unless the caller explicitly requested a remote rebase outside auto mode
 - For each conflict: explains what both sides are doing, proposes a resolution, asks for approval, edits the file, and stages the file
 - Reads the configured project `verify_command` from `gza.yaml` for the final rebased checkout, may use `uv run gza config` only as an optional confirmation, and runs the configured full verify after any stash restoration before declaring success
 - Supports `--auto` mode for automation: resolves conflicts using best judgment, aborts on low-confidence conflicts, and avoids remote creativity when the local target ref is missing

@@ -55,7 +55,7 @@ from ..failure_policy import is_resumable_failure_reason
 from ..failure_reasons import mark_task_failed_from_cause
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
-from ..operator_state import inspect_empty_merge_unit
+from ..operator_state import blocked_dependency_error_message, inspect_empty_merge_unit
 from ..plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
@@ -93,6 +93,7 @@ from ..runner import (
     prepare_task_startup_phase,
     remove_task_startup_artifacts,
     run,
+    write_ops_entry,
 )
 from ..task_types import CLI_FILTER_TASK_TYPES
 from ..tmux_proxy import get_tmux_session_pid
@@ -707,6 +708,76 @@ def startup_log_path_for_task(config: Config, task: DbTask) -> Path | None:
     return startup_log_path
 
 
+def _startup_capture_path_for_worker(
+    config: Config,
+    registry: WorkerRegistry,
+    worker_id: str | None,
+) -> Path | None:
+    """Return the raw detached-worker startup capture path, if available."""
+    if worker_id is None:
+        return None
+    meta = registry.get(worker_id)
+    if meta is None or not meta.startup_log_file:
+        return None
+    startup_path = Path(meta.startup_log_file)
+    if startup_path.is_absolute():
+        return startup_path
+    return config.project_dir / startup_path
+
+
+def _record_preclaim_startup_failure(
+    *,
+    config: Config,
+    registry: WorkerRegistry,
+    worker_id: str | None,
+    task: DbTask | None,
+    exit_code: int,
+) -> None:
+    """Mirror detached pre-claim failures into the task-visible startup log."""
+    capture_path = _startup_capture_path_for_worker(config, registry, worker_id)
+    startup_log_path = startup_log_path_for_task(config, task) if task is not None else None
+    if startup_log_path is None:
+        startup_log_path = capture_path
+    if startup_log_path is None:
+        return
+    mirror_paths: list[Path] = [startup_log_path]
+    if task is not None and task.log_file:
+        main_log_path = Path(task.log_file)
+        if not main_log_path.is_absolute():
+            main_log_path = config.project_dir / main_log_path
+        if main_log_path not in mirror_paths:
+            mirror_paths.append(main_log_path)
+    capture_text = ""
+    if capture_path is not None and capture_path.exists():
+        capture_text = capture_path.read_text(errors="replace").strip()
+    message = capture_text.splitlines()[-1].strip() if capture_text else (
+        f"Worker exited before claiming the task (exit code {exit_code})."
+    )
+    for mirror_path in mirror_paths:
+        if capture_text and mirror_path != capture_path:
+            with mirror_path.open("a", encoding="utf-8") as handle:
+                handle.write(capture_text)
+                if not capture_text.endswith("\n"):
+                    handle.write("\n")
+        elif not capture_text:
+            with mirror_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"[{datetime.now(UTC).isoformat()}] {message}\n")
+    entry = {
+        "subtype": "worker_lifecycle",
+        "event": "start_failed",
+        "worker_id": worker_id,
+        "task_id": task.id if task is not None else None,
+        "task_status": task.status if task is not None else None,
+        "exit_code": exit_code,
+        "message": message,
+    }
+    ops_paths = {ops_log_path_for(path) for path in mirror_paths}
+    if capture_path is not None:
+        ops_paths.add(ops_log_path_for(capture_path))
+    for ops_path in ops_paths:
+        write_ops_entry(ops_path, entry)
+
+
 def _print_work_message(message: str, *, color: str | None = None) -> None:
     """Print a themed work/worker message via the shared Rich console."""
     wc = _colors.WORK_COLORS
@@ -1219,9 +1290,8 @@ def _spawn_background_worker(
             # Check if task is blocked
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                _print_background_phase1_error(
-                    f"Task {explicit_task_id} is blocked by task {blocking_id} ({blocking_status})"
-                )
+                del blocking_id, blocking_status
+                _print_background_phase1_error(blocked_dependency_error_message(store, task))
                 return 1
         selected_task = task
     else:
@@ -1546,6 +1616,14 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         os.environ["GZA_WORKER_ID"] = worker_id
         os.environ["GZA_WORKER_MODE"] = "1"
 
+    def _startup_failed_without_running() -> bool:
+        if not task_claimed:
+            return True
+        if startup_task is None or startup_task.id is None:
+            return False
+        refreshed = store.get(startup_task.id)
+        return refreshed is not None and refreshed.status == "pending"
+
     try:
         if startup_log_path:
             startup_log_path.write_text(
@@ -1576,6 +1654,15 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             # Worker mode only runs one task at a time
             run_kwargs["task_id"] = args.task_ids[0]
         exit_code = run(config, **run_kwargs)
+        startup_failed_without_running = exit_code != 0 and _startup_failed_without_running()
+        if startup_failed_without_running:
+            _record_preclaim_startup_failure(
+                config=config,
+                registry=registry,
+                worker_id=worker_id,
+                task=startup_task,
+                exit_code=exit_code,
+            )
 
         # Update worker status on completion
         if worker_id:
@@ -1584,7 +1671,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
                 worker_id,
                 exit_code=exit_code,
                 status=status,
-                completion_reason="startup failure before task claim" if status == "failed" and not task_claimed else None,
+                completion_reason="startup failure before task claim" if status == "failed" and startup_failed_without_running else None,
             )
 
         return exit_code

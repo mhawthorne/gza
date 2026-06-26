@@ -56,15 +56,30 @@ container gets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
 in `providers/base.py`).
 
 Normal Docker-backed tasks no longer receive an implicit bind mount of the canonical
-repository's shared `.git`. That is intentional: provider-side git must not be able to
-mutate another task's worktree registration by touching the canonical `.git/worktrees`
-registry.
+repository's shared `.git` at its host path. When a code-task worktree uses a `.git` file,
+the runner rewrites that file and its gitdir `commondir` temporarily to container-only
+`/gza-git/...` paths, mounts the matching metadata there for the provider run, and restores
+the host metadata before host-side completion, WIP capture, timeout checkpointing, or other
+runner-owned git bookkeeping resumes.
 
 When rebase conflict resolution needs agent-side git, the provider runs in the isolated
-private checkout instead. The worktree there may still have uncommitted changes (for
-example, from provider initialization). The `/gza-rebase --auto` skill handles this by
-stashing changes before rebasing, restoring them with `git stash pop` after the rebase, and
+private checkout instead. Provider containers also install a lightweight `git` shim before
+the real binary in `PATH`; mutating git commands are allowed only from `/workspace` (or
+with `-C /workspace`). From a non-workspace cwd, `--work-tree /workspace` alone is
+rejected; the command must either use `-C /workspace` or provide the prepared
+`--git-dir`/`--work-tree` pair so git cannot rediscover mounted metadata from `PWD`.
+Explicit or env-based gitdir/worktree targets must match the prepared task metadata, so
+accidental commands from provider home/config directories fail closed. The
+worktree there may still have uncommitted changes (for example, from provider
+initialization). The `/gza-rebase --auto` skill handles this by pinning all git commands to
+`GZA_WORKTREE_ROOT`, stashing changes before rebasing, restoring them after the rebase, and
 only then running the final project `verify_command`.
+
+As a backstop, Docker-backed provider runs check the configured canonical checkout after
+the provider exits. If it moved off the expected default branch and has no tracked changes,
+gza checks the expected branch back out and logs a `canonical-main-checkout-hijacked` ops
+event. If tracked changes are present, gza leaves the checkout untouched and surfaces the
+same reason for operator attention.
 
 ## Failure handling
 

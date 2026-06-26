@@ -13,7 +13,7 @@ import pytest
 from rich.console import Console
 
 from gza.colors import TaskStreamColors, build_rich_theme
-from gza.config import ClaudeConfig, Config, ConfigError, DEFAULT_DOCKER_STARTUP_TIMEOUT
+from gza.config import DEFAULT_DOCKER_STARTUP_TIMEOUT, ClaudeConfig, Config, ConfigError
 from gza.providers import (
     ClaudeProvider,
     CodexProvider,
@@ -24,6 +24,7 @@ from gza.providers import (
 from gza.providers.base import (
     DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT,
     DOCKERFILE_TEMPLATE,
+    GZA_GIT_GUARD_SETUP_COMMAND,
     GZA_SHIM_SETUP_COMMAND,
     _extract_startup_log_line,
     _format_command_for_log,
@@ -35,8 +36,8 @@ from gza.providers.base import (
     classify_provider_api_error,
     ensure_docker_image,
     is_docker_running,
-    wait_for_docker_ready,
     verify_docker_credentials,
+    wait_for_docker_ready,
 )
 from gza.providers.claude import (
     CLAUDE_EVENT_REGISTRY,
@@ -677,6 +678,45 @@ class TestBuildDockerCmd:
         assert volume_mounts[0] == f"{worktree_dir}:/workspace"
         assert any(".testconfig" in mount for mount in volume_mounts)
 
+    def test_worktree_git_metadata_mounts_use_container_only_paths(self, tmp_path):
+        """Prepared git metadata mounts should target container-only paths, not host paths."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        host_worktree_gitdir = tmp_path / "repo" / ".git" / "worktrees" / "my-task"
+        host_worktree_gitdir.mkdir(parents=True)
+        host_common_gitdir = tmp_path / "repo" / ".git"
+        worktree_dir = tmp_path / "worktree"
+        worktree_dir.mkdir()
+
+        cmd = build_docker_cmd(
+            docker_config,
+            worktree_dir,
+            timeout_minutes=10,
+            docker_volumes=[
+                f"{host_worktree_gitdir}:/gza-git/worktree",
+                f"{host_common_gitdir}:/gza-git/common",
+            ],
+            docker_env=[
+                "GZA_CONTAINER_GITDIR=/gza-git/worktree",
+                "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common",
+            ],
+        )
+
+        volume_mounts = [cmd[i + 1] for i, token in enumerate(cmd) if token == "-v"]
+        env_values = [cmd[i + 1] for i, token in enumerate(cmd) if token == "-e"]
+
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" in volume_mounts
+        assert f"{host_common_gitdir}:/gza-git/common" in volume_mounts
+        assert f"{host_common_gitdir}:{host_common_gitdir}" not in volume_mounts
+        assert "GZA_CONTAINER_GITDIR=/gza-git/worktree" in env_values
+        assert "GZA_CONTAINER_COMMON_GITDIR=/gza-git/common" in env_values
+
     def test_no_git_mount_for_regular_repo(self, tmp_path):
         """Should not add extra mount when .git is a directory (regular repo)."""
         docker_config = DockerConfig(
@@ -960,7 +1000,8 @@ class TestBuildDockerCmd:
         env_values = [cmd[i + 1] for i in e_indices]
         setup_value = next(v for v in env_values if v.startswith("GZA_DOCKER_SETUP_COMMAND="))
         setup_cmd = setup_value.split("=", 1)[1]
-        assert setup_cmd == GZA_SHIM_SETUP_COMMAND.strip()
+        assert GZA_SHIM_SETUP_COMMAND.strip() in setup_cmd
+        assert GZA_GIT_GUARD_SETUP_COMMAND.strip() in setup_cmd
 
     def test_setup_command_placed_before_image_name(self, tmp_path):
         """GZA_DOCKER_SETUP_COMMAND should be added before image name."""
@@ -1019,6 +1060,45 @@ class TestBuildDockerCmd:
         assert "Supported options:" in setup_cmd
         assert "Set docker_setup_command in gza.yaml to install gza into PATH" in setup_cmd
         assert 'exec uv run --directory /workspace gza "$@"' not in setup_cmd
+        assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
+
+    def test_default_setup_command_installs_git_guard_before_real_git(self, tmp_path):
+        """Default setup command should install a fail-closed git guard in the shim dir."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+
+        cmd = build_docker_cmd(
+            docker_config,
+            tmp_path,
+            timeout_minutes=10,
+            docker_setup_command="",
+        )
+
+        env_values = [cmd[i + 1] for i, token in enumerate(cmd) if token == "-e"]
+        setup_value = next(v for v in env_values if v.startswith("GZA_DOCKER_SETUP_COMMAND="))
+        setup_cmd = setup_value.split("=", 1)[1]
+        assert "GZA_WORKTREE_ROOT=/workspace" in env_values
+        assert "cat > /tmp/gza-shims/git <<'EOF'" in setup_cmd
+        assert 'real_git="${GZA_REAL_GIT:-/usr/bin/git}"' in setup_cmd
+        assert 'container_gitdir="${GZA_CONTAINER_GITDIR:-}"' in setup_cmd
+        assert 'container_common_gitdir="${GZA_CONTAINER_COMMON_GITDIR:-}"' in setup_cmd
+        assert "add|branch|checkout|cherry-pick|clean|commit|merge|mv|push|rebase|reset|restore|revert|rm|stash|switch|update-ref|worktree" in setup_cmd
+        assert "annotate|blame|cat-file|describe|diff|diff-tree|grep|log|ls-files|ls-remote|name-rev|remote|rev-list|rev-parse|show|show-ref|status|symbolic-ref|tag|version|whatchanged" in setup_cmd
+        assert "gza git guard: refusing mutating git" in setup_cmd
+        assert "gza git guard: refusing read-only git" in setup_cmd
+        assert "gza git guard: refusing unknown git command" in setup_cmd
+        assert "from mounted git metadata without the prepared gitdir/worktree pair" in setup_cmd
+        assert "gza git guard: refusing explicit --git-dir outside prepared task metadata" in setup_cmd
+        assert "gza git guard: refusing GIT_DIR outside prepared task metadata" in setup_cmd
+        assert "gza git guard: refusing GIT_WORK_TREE outside $worktree_root" in setup_cmd
+        assert "gza git guard: refusing GIT_COMMON_DIR outside prepared task metadata" in setup_cmd
+        assert "pass both --git-dir $container_gitdir and --work-tree $worktree_root" in setup_cmd
+        assert setup_cmd.index("cat > /tmp/gza-shims/git <<'EOF'") > setup_cmd.index("cat > /tmp/gza-shims/gza <<'EOF'")
         assert 'export PATH="/tmp/gza-shims:/workspace/bin:$PATH"' in setup_cmd
 
 

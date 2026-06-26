@@ -49,6 +49,7 @@ from ..db import (
     task_id_numeric_key,
     validate_prompt,
 )
+from ..dependency_preconditions import plan_dependency_awaits_review
 from ..derived_tags import resolve_derived_task_tags
 from ..extractions import (
     ExtractionDraft,
@@ -67,6 +68,7 @@ from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
+from ..operator_state import blocked_dependency_error_message
 from ..plan_review_verdict import get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
 from ..query import (
@@ -111,6 +113,7 @@ from ._common import (
     _plan_review_timeout_budget_minutes,
     _prepare_task_for_immediate_execution,
     _prepare_task_for_reserved_launch,
+    _record_preclaim_startup_failure,
     _resolved_review_scope_metadata,
     _run_as_worker,
     _run_foreground,
@@ -154,6 +157,54 @@ from .log import _latest_worker_for_task, _running_worker_id_for_task
 from .query import _get_orphaned_tasks, _print_orphaned_warning
 
 _ITERATE_TERMINAL_NO_WORK_REASON_CODES = frozenset({"merge_unit_empty", "merge_unit_redundant"})
+
+
+def _find_held_plan_in_based_on_lineage(
+    store: SqliteTaskStore,
+    *,
+    based_on_id: str | None,
+) -> DbTask | None:
+    """Return the held plan found in a based_on lineage, if any."""
+    current_id = based_on_id
+    seen: set[str] = set()
+    while current_id is not None and current_id not in seen:
+        seen.add(current_id)
+        current = store.get(current_id)
+        if current is None:
+            return None
+        if plan_dependency_awaits_review(current):
+            return current
+        current_id = current.based_on
+    return None
+
+
+def _held_plan_implement_creation_error(plan_id: str) -> str:
+    """Return the operator-facing refusal for implement tasks sourced from a held plan."""
+    return (
+        f"Error: plan {plan_id} is held for review; release it with "
+        f"uv run gza implement {plan_id} or uv run gza edit {plan_id} --no-hold-for-review "
+        "before creating implement dependents."
+    )
+
+
+def _validate_new_implement_source_not_held_for_review(
+    store: SqliteTaskStore,
+    *,
+    based_on_id: str | None,
+    depends_on_id: str | None,
+) -> str | None:
+    """Return a refusal message when a new implement task would source from a held plan."""
+    if depends_on_id is not None:
+        dep_task = store.get(depends_on_id)
+        if dep_task is not None and plan_dependency_awaits_review(dep_task):
+            assert dep_task.id is not None
+            return _held_plan_implement_creation_error(dep_task.id)
+
+    held_plan = _find_held_plan_in_based_on_lineage(store, based_on_id=based_on_id)
+    if held_plan is None:
+        return None
+    assert held_plan.id is not None
+    return _held_plan_implement_creation_error(held_plan.id)
 
 
 def _foreground_command_invocation(command: str) -> RunInvocationContext:
@@ -562,12 +613,26 @@ def _run_with_registered_worker(
 
     try:
         rc = run_command()
+        startup_failed_without_running = False
+        worker = registry.get(worker_id)
+        if rc != 0 and worker is not None and worker.task_id is not None:
+            startup_task = get_store(config).get(worker.task_id)
+            startup_failed_without_running = startup_task is not None and startup_task.status == "pending"
+            if startup_failed_without_running:
+                _record_preclaim_startup_failure(
+                    config=config,
+                    registry=registry,
+                    worker_id=worker_id,
+                    task=startup_task,
+                    exit_code=rc,
+                )
         if _finalize_idle_wrapper_registration():
             return rc
         registry.mark_completed(
             worker_id,
             exit_code=rc,
             status="completed" if rc == 0 else "failed",
+            completion_reason="startup failure before task claim" if rc != 0 and startup_failed_without_running else None,
         )
         return rc
     except Exception:
@@ -972,7 +1037,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             # Check if task is blocked by a dependency
             is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
             if is_blocked:
-                return phase1_error(args, f"Task {task_id} is blocked by task {blocking_id} ({blocking_status})")
+                del blocking_id, blocking_status
+                return phase1_error(args, blocked_dependency_error_message(store, task))
     else:
         git = Git(config.project_dir)
         target_branch = git.default_branch()
@@ -2199,6 +2265,16 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("Error: plan_improve must be based on the same plan source reviewed by its plan_review dependency")
             return 1
 
+    if task_type == "implement":
+        held_plan_error = _validate_new_implement_source_not_held_for_review(
+            store,
+            based_on_id=based_on,
+            depends_on_id=depends_on,
+        )
+        if held_plan_error is not None:
+            print(held_plan_error)
+            return 1
+
     # Handle --prompt-file argument
     if hasattr(args, 'prompt_file') and args.prompt_file is not None:
         if args.prompt:
@@ -2428,6 +2504,26 @@ def cmd_edit(args: argparse.Namespace) -> int:
         dep_task = store.get(depends_on_id)
         if not dep_task:
             print(f"Error: Task {depends_on_id} not found")
+            return 1
+
+    if task.task_type == "implement" and (
+        based_on_id is not None
+        or depends_on_id is not None
+        or getattr(args, "clear_depends_on", False)
+    ):
+        effective_based_on_id = based_on_id if based_on_id is not None else task.based_on
+        effective_depends_on_id = (
+            None
+            if getattr(args, "clear_depends_on", False)
+            else depends_on_id if depends_on_id is not None else task.depends_on
+        )
+        held_plan_error = _validate_new_implement_source_not_held_for_review(
+            store,
+            based_on_id=effective_based_on_id,
+            depends_on_id=effective_depends_on_id,
+        )
+        if held_plan_error is not None:
+            print(held_plan_error)
             return 1
 
     prompt_requested = False

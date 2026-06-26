@@ -121,6 +121,10 @@ Stats: Runtime: 3m 18s | Turns: 8 | Cost: $0.28
 > $ uv run gza add --type implement --based-on gza-1 --review "Implement..."
 > ```
 >
+> If `gza-1` is a completed plan still held for review, this command is rejected on purpose.
+> Release the plan first with `uv run gza implement gza-1` or
+> `uv run gza edit gza-1 --no-hold-for-review`, then create follow-up implementation work.
+>
 > Add `--pr` as well if you want the implementation to request PR creation or reuse after it completes successfully. That request is evaluated at completion time and skipped without failing when PRs are unavailable, so later `uv run gza review` runs can post PR comments automatically when a PR exists:
 > ```bash
 > $ uv run gza add --type implement --based-on gza-1 --review --pr "Implement..."

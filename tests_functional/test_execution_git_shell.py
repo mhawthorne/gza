@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import UTC, datetime
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -143,6 +144,146 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
     assert "would iterate implementation" in result.stdout.lower()
     assert "first iteration 1/3 action: create_review" in result.stdout.lower()
     assert "code changed since the last review" in result.stdout.lower()
+
+
+@pytest.mark.functional
+@pytest.mark.parametrize("flag", ["--depends-on", "--based-on"])
+def test_add_implement_from_held_plan_refuses_precreated_child(tmp_path, flag: str) -> None:
+    """Subprocess add must reject implement tasks sourced from a held completed plan."""
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    result = invoke_gza(
+        "add",
+        "--type",
+        "implement",
+        flag,
+        str(plan.id),
+        "Blocked implement",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 1
+    normalized = " ".join(result.stdout.split())
+    assert f"plan {plan.id} is held for review" in normalized
+    assert f"uv run gza implement {plan.id}" in normalized
+    assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized
+    assert not any(task.prompt == "Blocked implement" for task in store.get_all())
+
+
+@pytest.mark.functional
+def test_incomplete_surfaces_release_guidance_for_existing_held_plan_child_deadlock(tmp_path) -> None:
+    """Older inconsistent rows still surface explicit held-plan release guidance."""
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+    child = store.add("Precreated implement child", task_type="implement", depends_on=plan.id)
+    assert child.id is not None
+
+    result = invoke_gza("incomplete", "--project", str(tmp_path))
+
+    assert result.returncode == 0
+    normalized = " ".join(result.stdout.split())
+    assert child.id in normalized
+    assert f"blocked: awaiting plan review for {plan.id}" in normalized
+    assert f"release with uv run gza implement {plan.id}" in normalized
+    assert f"or uv run gza edit {plan.id} --no-hold-for-review" in normalized
+
+
+@pytest.mark.functional
+def test_iterate_foreground_held_plan_block_surfaces_release_guidance(tmp_path) -> None:
+    """Foreground iterate should report held-plan dependency blocks with release guidance."""
+
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    impl = store.add("Blocked implement", task_type="implement", depends_on=plan.id)
+    assert impl.id is not None
+
+    result = invoke_gza("iterate", str(impl.id), "--project", str(tmp_path))
+
+    assert result.returncode == 3
+    normalized = " ".join(result.stdout.split())
+    assert f"Task {impl.id} is blocked: awaiting plan review for {plan.id}" in normalized
+    assert f"uv run gza implement {plan.id}" in normalized
+    assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized
+
+
+@pytest.mark.functional
+def test_iterate_background_held_plan_block_writes_discoverable_startup_reason(tmp_path) -> None:
+    """Background iterate should log pre-claim held-plan blocks to the task startup log."""
+
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    impl = store.add("Blocked implement", task_type="implement", depends_on=plan.id)
+    assert impl.id is not None
+
+    result = invoke_gza(
+        "iterate",
+        str(impl.id),
+        "--background",
+        "--no-docker",
+        "--project",
+        str(tmp_path),
+    )
+
+    assert result.returncode == 0
+    assert f"Started task {impl.id} in background" in result.stdout
+
+    config = Config.load(tmp_path)
+    registry = WorkerRegistry(config.workers_path)
+    deadline = time.monotonic() + 10
+    worker = None
+    while time.monotonic() < deadline:
+        workers = [w for w in registry.list_all(include_completed=True) if w.task_id == impl.id]
+        if workers and workers[0].status == "failed":
+            worker = workers[0]
+            break
+        time.sleep(0.1)
+
+    assert worker is not None
+    assert worker.status == "failed"
+    assert worker.exit_code == 3
+
+    assert worker.startup_log_file is not None
+    startup_log = tmp_path / worker.startup_log_file
+    assert startup_log.exists()
+    startup_text = startup_log.read_text()
+    normalized_startup = " ".join(startup_text.split())
+    assert f"Task {impl.id} is blocked: awaiting plan review for {plan.id}" in normalized_startup
+    assert f"uv run gza implement {plan.id}" in normalized_startup
+    assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized_startup
+
+    log_result = invoke_gza("log", str(impl.id), "--project", str(tmp_path))
+    assert log_result.returncode == 0
+    normalized_log = " ".join(log_result.stdout.split())
+    assert f"Task {impl.id}" in normalized_log
+    assert f"awaiting plan review for {plan.id}" in normalized_log
 
 
 @pytest.mark.functional

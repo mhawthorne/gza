@@ -165,6 +165,18 @@ def _update_task_artifact_path(store: SqliteTaskStore, artifact: TaskArtifact, *
     )
 
 
+def _resolve_clean_days(
+    args: argparse.Namespace,
+    config: Config,
+    *,
+    default_days: int,
+) -> int:
+    """Resolve the retention window for clean/archive operations."""
+    if args.days is not None:
+        return args.days
+    return config.cleanup_days if default_days == 30 else default_days
+
+
 def _percentile(sorted_vals: list[int], p: float) -> int:
     """Return the value at the p-th percentile (nearest-rank method)."""
     if not sorted_vals:
@@ -2146,7 +2158,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     git = Git(config.project_dir)
     registry = WorkerRegistry(config.workers_path)
 
-    days = args.days if args.days is not None else config.cleanup_days
+    days = _resolve_clean_days(args, config, default_days=30)
     cutoff_time = datetime.now(UTC) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
@@ -2165,7 +2177,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if args.worktrees or no_scope:
         from gza.query import build_lineage, resolve_lineage_root, task_time_for_lineage
 
-        print("Scanning worktrees...")
         worktree_dir = config.worktree_path
         # Collect worktrees to remove (with reasons) before prompting
         pending_worktree_removals: list[tuple[Path, str]] = []
@@ -2237,7 +2248,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # 2. Clean up old log files
     if args.logs or no_scope:
-        print("Scanning logs...")
         unmerged_task_ids: set[str] = set()
         unmerged_task_slugs: set[str] = set()
         if args.keep_unmerged:
@@ -2327,10 +2337,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # 3. Clean up worker metadata for finished/stale/zombie workers
     if args.workers or no_scope:
-        print("Scanning workers...")
         removable = _find_removable_workers(registry, store)
-        if removable:
-            print(f"Found {len(removable)} worker file(s) to clean up...")
         if args.dry_run:
             cleaned_workers = len(removable)
         else:
@@ -2365,8 +2372,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if args.worktrees or no_scope:
         if cleaned_worktrees:
             print(f"Worktrees cleaned: {len(cleaned_worktrees)}")
-            for name, reason in cleaned_worktrees:
-                print(f"  - {name} ({reason})")
         else:
             print("Worktrees: nothing to clean")
         print()
@@ -2412,7 +2417,7 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
     """Delete previously archived files older than N days."""
     from datetime import timedelta
 
-    days = args.days if args.days is not None else 365
+    days = _resolve_clean_days(args, config, default_days=365)
     cutoff_time = datetime.now(UTC) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
@@ -2470,28 +2475,9 @@ def _clean_purge(config: Config, args: argparse.Namespace) -> int:
     # Report results
     if args.dry_run:
         print(f"Dry run: would purge archived files older than {days} days")
-        print()
-        if deleted_logs:
-            print(f"Archived logs ({len(deleted_logs)} files):")
-            for log_file in deleted_logs:
-                print(f"  - {log_file.name}")
-        else:
-            print("Archived logs: no files to purge")
-
-        print()
-        if deleted_workers:
-            print(f"Archived workers ({len(deleted_workers)} files):")
-            for worker_file in deleted_workers:
-                print(f"  - {worker_file.name}")
-        else:
-            print("Archived workers: no files to purge")
-        print()
-        if deleted_artifacts:
-            print(f"Archived artifacts ({len(deleted_artifacts)} files):")
-            for artifact_file in deleted_artifacts:
-                print(f"  - {artifact_file.relative_to(archives_artifacts_dir)}")
-        else:
-            print("Archived artifacts: no files to purge")
+        print(f"  - Archived logs: {len(deleted_logs)} files")
+        print(f"  - Archived workers: {len(deleted_workers)} files")
+        print(f"  - Archived artifacts: {len(deleted_artifacts)} files")
     else:
         print(f"Purged archived files older than {days} days:")
         print(f"  - Archived logs: {len(deleted_logs)} files")
@@ -2512,7 +2498,7 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
     import shutil
     from datetime import timedelta
 
-    days = args.days if args.days is not None else 30
+    days = _resolve_clean_days(args, config, default_days=30)
     cutoff_time = datetime.now(UTC) - timedelta(days=days)
     cutoff_timestamp = cutoff_time.timestamp()
 
@@ -2661,37 +2647,10 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
     # Report results
     if args.dry_run:
         print(f"Dry run: would archive files older than {days} days")
-        print()
-        if archived_logs:
-            print(f"Logs ({len(archived_logs)} files):")
-            for log_file in archived_logs:
-                print(f"  - {log_file.name}")
-        else:
-            print("Logs: no files to archive")
-
-        print()
-        if archived_workers:
-            print(f"Workers ({len(archived_workers)} files):")
-            for worker_file in archived_workers:
-                print(f"  - {worker_file.name}")
-        else:
-            print("Workers: no files to archive")
-
-        print()
-        if archived_artifacts:
-            print(f"Artifacts ({len(archived_artifacts)} files):")
-            for artifact_file in archived_artifacts:
-                print(f"  - {artifact_file.name}")
-        else:
-            print("Artifacts: no files to archive")
-
-        print()
-        if deleted_backups:
-            print(f"Backups ({len(deleted_backups)} files):")
-            for backup_file in deleted_backups:
-                print(f"  - {backup_file.name}")
-        else:
-            print("Backups: no files to delete")
+        print(f"  - Logs: {len(archived_logs)} files")
+        print(f"  - Workers: {len(archived_workers)} files")
+        print(f"  - Artifacts: {len(archived_artifacts)} files")
+        print(f"  - Backups deleted: {len(deleted_backups)} files")
     else:
         print(f"Archived files older than {days} days:")
         print(f"  - Logs: {len(archived_logs)} files")
