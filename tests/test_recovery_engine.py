@@ -287,7 +287,7 @@ def test_recovery_engine_keeps_failed_sidequests_visible_when_target_impl_is_not
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
 
-def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_already_on_main(
+def test_list_failed_tasks_for_recovery_keeps_failed_impl_when_zero_ahead_work_lacks_tree_proof(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,7 +312,7 @@ def test_list_failed_tasks_for_recovery_filters_failed_impl_when_landed_work_is_
     store.update(unrelated)
 
     assert is_chain_resolved_by_recovery(store, failed) is False
-    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [unrelated.id]
+    assert {task.id for task in list_failed_tasks_for_recovery(store)} == {failed.id, unrelated.id}
 
 
 def test_list_failed_tasks_for_recovery_keeps_empty_failed_worker_died_branch_for_shared_retry(
@@ -1309,7 +1309,7 @@ def test_empty_task_with_provider_output_remains_visible_when_branch_has_no_uniq
 
 
 @pytest.mark.parametrize("landed_created_first", [True, False])
-def test_list_failed_tasks_for_recovery_recomputes_reachable_empty_branch_resolution_per_task(
+def test_list_failed_tasks_for_recovery_keeps_distinct_reachable_empty_branch_resolution_per_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1352,8 +1352,8 @@ def test_list_failed_tasks_for_recovery_recomputes_reachable_empty_branch_resolu
 
     failed = list_failed_tasks_for_recovery(store)
 
-    assert [task.id for task in failed] == [recoverable_empty.id]
-    assert landed not in failed
+    assert {task.id for task in failed} == {landed.id, recoverable_empty.id}
+    assert recoverable_empty in failed
 
 
 def test_recovery_engine_resumable_with_session_chooses_resume(tmp_path: Path) -> None:
@@ -2711,7 +2711,7 @@ def test_recovery_engine_prerequisite_unmerged_empty_session_backed_failure_stay
     assert unit.state == "empty"
 
 
-def test_recovery_engine_prerequisite_unmerged_live_redundant_branch_persists_redundant_after_dependency_merge(
+def test_recovery_engine_prerequisite_unmerged_live_zero_ahead_branch_without_tree_proof_retries_after_dependency_merge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2737,14 +2737,12 @@ def test_recovery_engine_prerequisite_unmerged_live_redundant_branch_persists_re
     _stub_merge_context(monkeypatch, empty_merged_branches={"feature/prereq-redundant"})
 
     decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
-    assert decision.action == "skip"
-    assert decision.reason_code == "merge_unit_redundant"
-    assert decision.reason_text == MOOT_REDUNDANT_LIFECYCLE_DETAIL
-    assert decision.reason_text != MOOT_EMPTY_LIFECYCLE_DETAIL
+    assert decision.action == "retry"
+    assert decision.reason_code == "PREREQUISITE_UNMERGED"
+    assert decision.reason_text == "dependency merge prerequisite now satisfied"
 
     unit = store.resolve_merge_unit_for_task(failed.id)
-    assert unit is not None
-    assert unit.state == "redundant"
+    assert unit is None
 
 
 def test_recovery_engine_prerequisite_unmerged_with_commits_retries_after_dependency_merge(

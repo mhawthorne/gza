@@ -1139,6 +1139,20 @@ class Git:
             raise GitError(f"git diff --name-status {revision_range} failed:\n{error_output}")
         return result.stdout.strip()
 
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target_ref: str) -> bool | None:
+        """Return whether ``source_ref`` has a non-empty three-dot diff from ``target_ref``."""
+        result = self._run_readonly_cached(
+            "diff",
+            "--quiet",
+            f"{target_ref}...{source_ref}",
+            check=False,
+        )
+        if result.returncode == 0:
+            return False
+        if result.returncode == 1:
+            return True
+        return None
+
     def get_commit_name_status(self, commit_ref: str, paths: tuple[str, ...] | list[str] = ()) -> str:
         """Get machine-readable name/status output for a single committed revision."""
         args = [

@@ -53,6 +53,20 @@ def classify_proven_merged_state(
         if isinstance(ahead_count, Integral) and ahead_count <= 0:
             source_sha = resolve_ref_if_possible(git, source_ref).sha
             target_sha = resolve_ref_if_possible(git, target_branch).sha
+            net_diff = _source_has_remaining_net_diff(
+                git,
+                source_ref,
+                target_branch,
+                on_warning=on_warning,
+            )
+            if net_diff is None and source_has_commits is not False and source_sha != target_sha:
+                if on_warning is not None:
+                    on_warning(
+                        f"Could not prove remaining diff for merged source {source_ref!r} against "
+                        f"{target_branch!r}; keeping merge state at 'merged' instead of "
+                        "classifying a no-work state"
+                    )
+                return "merged"
             side_branch_probe = None
             if source_sha is not None and target_sha is not None and source_sha != target_sha:
                 side_branch_probe = _source_is_merged_in_side_branch(
@@ -110,6 +124,60 @@ def _source_is_merged_in_side_branch(
                 f"against {target_branch!r}: {detail}; classifying by task provenance instead"
             )
         return None
+
+
+def _source_has_remaining_net_diff(
+    git: Any,
+    source_ref: str,
+    target_branch: str,
+    *,
+    on_warning: Callable[[str], None] | None = None,
+) -> bool | None:
+    """Return whether ``source_ref`` still has a non-empty diff against ``target_branch``."""
+    has_net_diff = getattr(git, "has_non_empty_source_diff_against_target", None)
+    if callable(has_net_diff):
+        try:
+            result = has_net_diff(source_ref, target_branch)
+        except Exception as exc:
+            if on_warning is not None:
+                detail = " ".join(str(exc).split()) or exc.__class__.__name__
+                on_warning(
+                    f"Could not compare remaining diff for {source_ref!r} against {target_branch!r}: "
+                    f"{detail}; classifying by remaining provenance checks instead"
+                )
+            return None
+        if isinstance(result, bool):
+            return result
+
+    resolve_refs = getattr(git, "resolve_refs", None)
+    if callable(resolve_refs):
+        try:
+            resolved = resolve_refs((target_branch, source_ref), peel="tree")
+        except Exception as exc:
+            if on_warning is not None:
+                detail = " ".join(str(exc).split()) or exc.__class__.__name__
+                on_warning(
+                    f"Could not compare remaining diff for {source_ref!r} against {target_branch!r}: "
+                    f"{detail}; classifying by remaining provenance checks instead"
+                )
+            return None
+        source_tree = resolved.get(source_ref)
+        target_tree = resolved.get(target_branch)
+        if source_tree is not None and target_tree is not None and source_tree == target_tree:
+            return False
+        if on_warning is not None:
+            on_warning(
+                f"Could not compare remaining diff for {source_ref!r} against {target_branch!r}: "
+                "diff proof unavailable; classifying by remaining provenance checks instead"
+            )
+        return None
+
+    if on_warning is not None:
+        on_warning(
+            f"Could not compare remaining diff for {source_ref!r} against {target_branch!r}: "
+            "diff proof unavailable; classifying by remaining provenance checks instead"
+        )
+    return None
 
 
 def resolve_task_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
@@ -211,9 +279,13 @@ def classify_branch_merge_state_for_target(
             return BranchMergeClassification(
                 state=state,
                 reason=(
-                    "content-equivalent-unresolved-source-sha"
-                    if state == "merged"
-                    else "no-unique-commits-unresolved-source-sha"
+                        "content-equivalent-unresolved-source-sha"
+                        if state == "merged"
+                        else (
+                            "net-diff-unresolved-source-sha"
+                            if state == "unmerged"
+                            else "no-unique-commits-unresolved-source-sha"
+                        )
                 ),
                 source_ref=source_ref,
                 target_ref=target_branch,
@@ -253,9 +325,13 @@ def classify_branch_merge_state_for_target(
             return BranchMergeClassification(
                 state=state,
                 reason=(
-                    "content-equivalent-unresolved-target-sha"
-                    if state == "merged"
-                    else "no-unique-commits-unresolved-target-sha"
+                        "content-equivalent-unresolved-target-sha"
+                        if state == "merged"
+                        else (
+                            "net-diff-unresolved-target-sha"
+                            if state == "unmerged"
+                            else "no-unique-commits-unresolved-target-sha"
+                        )
                 ),
                 source_ref=source_ref,
                 target_ref=target_branch,
@@ -300,6 +376,47 @@ def classify_branch_merge_state_for_target(
         unique_commits = 0
 
     if unique_commits == 0:
+        net_diff = _source_has_remaining_net_diff(
+            git,
+            source_ref,
+            target_branch,
+            on_warning=on_warning,
+        )
+        if net_diff is True and source_has_commits is not False and not merged_proof:
+            return BranchMergeClassification(
+                state="unmerged",
+                reason="net-diff-despite-zero-unique-commits",
+                source_ref=source_ref,
+                target_ref=target_branch,
+                source_sha=source_sha,
+                target_sha=target_sha,
+            )
+        if net_diff is None and source_has_commits is not False:
+            if source_sha != target_sha:
+                if merged_proof:
+                    side_branch_tree_proof = _source_is_merged_in_side_branch(
+                        git,
+                        source_ref,
+                        target_branch,
+                        on_warning=on_warning,
+                    )
+                    if side_branch_tree_proof is True:
+                        return BranchMergeClassification(
+                            state="merged",
+                            reason="merged-side-branch-no-tree-proof",
+                            source_ref=source_ref,
+                            target_ref=target_branch,
+                            source_sha=source_sha,
+                            target_sha=target_sha,
+                        )
+                return BranchMergeClassification(
+                    state="unknown",
+                    reason="net-diff-unavailable-for-zero-unique-commits",
+                    source_ref=source_ref,
+                    target_ref=target_branch,
+                    source_sha=source_sha,
+                    target_sha=target_sha,
+                )
         # Zero commits ahead of the merge base can mean two topologically
         # identical-but-different things once a branch is an ancestor of the
         # target: (a) a stale *empty* branch whose tip sits on the target's
@@ -424,9 +541,8 @@ def resolve_task_merge_state_for_target(
     if resolved_merge_unit is not None and resolved_merge_unit.target_branch == target_branch:
         resolved_no_work_state = effective_no_work_merge_state(task, resolved_merge_unit.state)
         if resolved_no_work_state in {"empty", "redundant"}:
-            if source_merge_ref is None and resolved_merge_unit.state == "empty":
-                return "empty"
-            return resolved_no_work_state
+            if source_merge_ref is None:
+                return resolved_merge_unit.state
         if resolved_merge_unit.state == "merged" and not merged_proof:
             return "merged"
 
@@ -461,6 +577,11 @@ def resolve_task_merge_state_for_target(
 
     if resolved_merge_unit is not None:
         if resolved_merge_unit.target_branch == target_branch:
+            if (
+                effective_no_work_merge_state(task, resolved_merge_unit.state) in {"empty", "redundant"}
+                and classification.state == "unmerged"
+            ):
+                return "unmerged"
             if resolved_merge_unit.state == "merged":
                 return current_target_state or "merged"
             if current_target_state is not None:

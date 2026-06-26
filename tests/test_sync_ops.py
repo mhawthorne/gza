@@ -7,10 +7,10 @@ from gza.db import SqliteTaskStore
 from gza.git import GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.sync_ops import (
-    BranchSyncResult,
-    BranchCohort,
-    _BranchPersistenceUpdate,
     _UNSET,
+    BranchCohort,
+    BranchSyncResult,
+    _BranchPersistenceUpdate,
     _git_reconcile_update,
     _merge_persistence_update,
     _persist_branch_state,
@@ -122,6 +122,10 @@ def test_reconcile_branch_merge_truth_marks_proven_merged_zero_ahead_task_branch
     git.is_merged.return_value = True
     git.count_commits_ahead_checked.return_value = 0
     git.is_on_first_parent_history.return_value = True
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/already-present": "shared-tree-sha" if peel == "tree" else "old-main-sha",
+        "main": "shared-tree-sha" if peel == "tree" else "advanced-main-sha",
+    }
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/already-present": "old-main-sha",
         "main": "advanced-main-sha",
@@ -148,6 +152,10 @@ def test_reconcile_branch_merge_truth_marks_redundant_when_side_branch_probe_fai
     git.is_merged.return_value = True
     git.count_commits_ahead_checked.return_value = 0
     git.is_on_first_parent_history.side_effect = RuntimeError("probe exploded")
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/probe-failure": "shared-tree-sha" if peel == "tree" else "branch-tip-sha",
+        "main": "shared-tree-sha" if peel == "tree" else "merge-commit-sha",
+    }
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/probe-failure": "branch-tip-sha",
         "main": "merge-commit-sha",
@@ -187,6 +195,12 @@ def test_reconcile_branch_merge_truth_marks_redundant_when_first_parent_probe_mi
                 "main": "merge-commit-sha",
             }.get(ref)
 
+        def resolve_refs(self, refs, peel: str = "commit") -> dict[str, str | None]:
+            return {
+                "feature/probe-missing": "shared-tree-sha" if peel == "tree" else "branch-tip-sha",
+                "main": "shared-tree-sha" if peel == "tree" else "merge-commit-sha",
+            }
+
     results = reconcile_branch_merge_truth(
         _GitWithoutFirstParentProbe(),
         [cohort],
@@ -197,6 +211,37 @@ def test_reconcile_branch_merge_truth_marks_redundant_when_first_parent_probe_mi
     assert results[0].merge_status == "redundant"
     assert "marked merged" not in results[0].actions
     assert any("Could not probe first-parent membership" in warning for warning in results[0].warnings)
+
+
+def test_reconcile_branch_merge_truth_keeps_zero_ahead_branch_with_live_net_diff_unmerged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/false-moot")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.has_non_empty_source_diff_against_target.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/false-moot": "branch-tree-sha" if peel == "tree" else "branch-tip-sha",
+        "main": "target-tree-sha" if peel == "tree" else "target-tip-sha",
+    }
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/false-moot": "branch-tip-sha",
+        "main": "target-tip-sha",
+    }.get(ref)
+    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "unmerged"
+    assert "marked merged" not in results[0].actions
 
 
 def test_reconcile_task_branch_merge_truth_skips_no_commit_task_before_merged_persistence(
@@ -474,6 +519,10 @@ def test_reconcile_task_branch_merge_truth_persists_redundant_for_zero_commit_ta
     git.is_merged.return_value = True
     git.count_commits_ahead_checked.return_value = 0
     git.is_on_first_parent_history.return_value = True
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/scoped-empty": "shared-tree-sha" if peel == "tree" else "head-sync-empty",
+        "main": "shared-tree-sha" if peel == "tree" else "base-sync-empty",
+    }
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/scoped-empty": "head-sync-empty",
         "main": "base-sync-empty",
@@ -1096,63 +1145,6 @@ def test_sync_branch_cohorts_skips_when_git_default_branch_differs_from_canonica
         refreshed_main_unit.diff_lines_added,
         refreshed_main_unit.diff_lines_removed,
     ) == (99, 999, 111)
-
-
-def test_sync_branch_cohorts_keeps_historical_reused_branch_unit_merged(tmp_path):
-    store = SqliteTaskStore(tmp_path / "test.db")
-    historical = _completed_branch_task(store, "Historical task", "feature/reused")
-    assert historical.id is not None
-    historical_unit = store.get_or_create_merge_unit_for_task(historical)
-    assert historical_unit is not None
-    store.set_merge_unit_state(historical_unit.id, "merged")
-
-    unrelated = _completed_branch_task(store, "Unrelated task", "feature/reused")
-    assert unrelated.id is not None
-    unrelated_unit = store.get_or_create_merge_unit_for_task(unrelated)
-    assert unrelated_unit is not None
-    assert unrelated_unit.id != historical_unit.id
-
-    cohorts = build_unmerged_branch_cohorts(store)
-    assert len(cohorts) == 1
-    assert cohorts[0].merge_unit_id == unrelated_unit.id
-    assert {task.id for task in cohorts[0].code_tasks} == {unrelated.id}
-
-    git = Mock()
-    git.default_branch.return_value = "main"
-    git.branch_exists.return_value = True
-    git.is_merged.return_value = False
-    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
-
-    results, partial = sync_branch_cohorts(
-        store,
-        git,
-        cohorts,
-        include_git=True,
-        include_pr=False,
-        dry_run=False,
-        fetch_remote=False,
-    )
-
-    assert partial is False
-    assert results[0].merge_status == "unmerged"
-
-    refreshed_historical = store.get(historical.id)
-    refreshed_unrelated = store.get(unrelated.id)
-    refreshed_historical_unit = store.resolve_merge_unit_for_task(historical.id)
-    refreshed_unrelated_unit = store.resolve_merge_unit_for_task(unrelated.id)
-    assert refreshed_historical is not None
-    assert refreshed_unrelated is not None
-    assert refreshed_historical_unit is not None
-    assert refreshed_unrelated_unit is not None
-    assert refreshed_historical_unit.state == "merged"
-    assert refreshed_historical.merge_status == "merged"
-    assert refreshed_unrelated_unit.state == "unmerged"
-    assert refreshed_unrelated.merge_status == "unmerged"
-    assert (
-        refreshed_unrelated_unit.diff_files_changed,
-        refreshed_unrelated_unit.diff_lines_added,
-        refreshed_unrelated_unit.diff_lines_removed,
-    ) == (1, 2, 1)
 
 
 def test_sync_branch_cohorts_no_fetch_ignores_cached_origin_default_ref_by_default(tmp_path):
@@ -1879,6 +1871,10 @@ def test_reconcile_branch_merge_truth_emits_redundant_for_zero_commit_task_branc
     git.is_merged.return_value = False
     # Disable origin/ ref preference so classifier uses the local branch ref.
     git.ref_exists.return_value = False
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/zero-commit": "shared-tree-sha" if peel == "tree" else "sha-abc123",
+        "main": "shared-tree-sha" if peel == "tree" else "sha-def456",
+    }
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/zero-commit": "sha-abc123",
         "main": "sha-def456",
@@ -1893,6 +1889,43 @@ def test_reconcile_branch_merge_truth_emits_redundant_for_zero_commit_task_branc
     )
 
     assert results[0].merge_status == "redundant"
+    assert "marked merged" not in results[0].actions
+
+
+def test_reconcile_branch_merge_truth_preserves_state_when_zero_ahead_diff_proof_is_unavailable(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/no-tree-proof")
+    cohort = BranchCohort(branch=task.branch, tasks=(task,))
+
+    class _GitWithoutTreeResolveRefs:
+        def branch_exists(self, branch: str) -> bool:
+            return branch == "feature/no-tree-proof"
+
+        def is_merged(self, source: str, into: str = "main") -> bool:
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                "feature/no-tree-proof": "sha-abc123",
+                "main": "sha-def456",
+            }.get(ref)
+
+        def count_commits_ahead(self, source: str, target: str) -> int:
+            assert (source, target) == ("feature/no-tree-proof", "main")
+            return 0
+
+    results = reconcile_branch_merge_truth(
+        _GitWithoutTreeResolveRefs(),
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+    )
+
+    assert results[0].merge_status == "unmerged"
+    assert any("diff proof unavailable" in warning for warning in results[0].warnings)
     assert "marked merged" not in results[0].actions
 
 

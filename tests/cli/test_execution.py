@@ -11347,6 +11347,16 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
         mock_git.can_merge.return_value = True
+        mock_git.resolve_fresh_merge_source.return_value = impl.branch
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "branch-tip-sha",
+            "main": "target-tip-sha",
+        }.get(ref)
+        mock_git.count_commits_ahead.return_value = 0
+        mock_git.count_commits_ahead_checked.return_value = 0
+        mock_git.is_merged.return_value = True
+        mock_git.is_on_first_parent_history.return_value = True
+        mock_git.has_non_empty_source_diff_against_target.return_value = False
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
@@ -12872,6 +12882,16 @@ class TestIterateCommand:
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.resolve_fresh_merge_source.return_value = recovered_impl.branch
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: {
+            recovered_impl.branch: "branch-tip-sha",
+            "main": "target-tip-sha",
+        }.get(ref)
+        mock_git.count_commits_ahead.return_value = 0
+        mock_git.count_commits_ahead_checked.return_value = 0
+        mock_git.is_merged.return_value = True
+        mock_git.is_on_first_parent_history.return_value = True
+        mock_git.has_non_empty_source_diff_against_target.return_value = False
 
         args = argparse.Namespace(
             impl_task_id=failed_impl.id,
