@@ -2,7 +2,9 @@
 
 import argparse
 import sys
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from ..config import (
     KNOWN_PROVIDERS,
@@ -99,6 +101,25 @@ from .query import (
 )
 from .tv import cmd_tv
 from .watch import cmd_main_verify, cmd_queue, cmd_watch
+
+
+class _LegacyRestartFailedAction(argparse.Action):
+    """Track legacy `--restart-failed` usage while preserving dispatch-mode semantics."""
+
+    def __init__(self, option_strings: list[str], dest: str, **kwargs: Any) -> None:
+        kwargs.setdefault("nargs", 0)
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, values, option_string
+        setattr(namespace, self.dest, self.const)
+        setattr(namespace, "restart_failed", True)
 
 
 def _parse_search_last(value: str) -> int:
@@ -895,9 +916,19 @@ def main() -> int:
     watch_parser = subparsers.add_parser(
         "watch",
         help="Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch",
-        description="Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch.",
+        description=(
+            "Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch. "
+            "Optionally pass task IDs to drive only those merge units."
+        ),
     )
     add_common_args(watch_parser)
+    watch_parser.add_argument(
+        "task_ids",
+        nargs="*",
+        type=str,
+        help="Specific task ID(s) whose merge units should be driven",
+    )
+    watch_parser.set_defaults(restart_failed=False)
     watch_parser.add_argument(
         "--batch",
         type=int,
@@ -955,7 +986,7 @@ def main() -> int:
     )
     watch_recovery_mode.add_argument(
         "--restart-failed",
-        action="store_const",
+        action=_LegacyRestartFailedAction,
         const="recovery_only",
         dest="dispatch_mode",
         help=argparse.SUPPRESS,

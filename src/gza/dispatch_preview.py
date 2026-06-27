@@ -164,6 +164,7 @@ def plan_watch_dispatch_entries(
     slots: int,
     recovery_slot_cap: int,
     selection_mode: DispatchSelectionMode,
+    include_pending: bool = True,
 ) -> WatchDispatchPlan:
     """Return the watch execution slice for one ordered preview candidate set."""
     _validate_dispatch_preview_policy(
@@ -186,6 +187,12 @@ def plan_watch_dispatch_entries(
             slots,
             sum(1 for entry in runnable_entries if entry.lane == "pending"),
         )
+    elif not include_pending:
+        recovery_worker_slots = min(
+            slots,
+            sum(1 for entry in runnable_entries if entry.lane == "recovery" and entry.worker_consuming),
+        )
+        pending_slots = 0
     else:
         recovery_worker_slots = min(
             slots,

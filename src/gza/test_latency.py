@@ -276,6 +276,7 @@ class _SigtermSummaryState:
     plugin: _TimingPlugin
     started: float
     previous_handler: SignalHandler
+    emitted: bool = False
 
 
 SignalHandler: TypeAlias = Callable[[int, FrameType | None], Any] | int | None
@@ -299,7 +300,7 @@ def _reemit_sigterm(signum: int, frame: FrameType | None, previous_handler: Sign
         os.kill(os.getpid(), signum)
 
 
-def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> SignalHandler:
+def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> _SigtermSummaryState | None:
     if not hasattr(signal, "SIGTERM"):
         return None
     previous_handler = signal.getsignal(signal.SIGTERM)
@@ -309,10 +310,11 @@ def _install_sigterm_summary_handler(plugin: _TimingPlugin, started: float) -> S
         sys.stderr.write(_build_partial_summary(state) + "\n")
         sys.stderr.flush()
         sys.stdout.flush()
+        state.emitted = True
         _reemit_sigterm(signum, frame, state.previous_handler)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    return previous_handler
+    return state
 
 
 def run_pytest(
@@ -320,26 +322,31 @@ def run_pytest(
     *,
     emit_sigterm_summary: bool = False,
     extra_plugins: list[object] | None = None,
-) -> tuple[int, list[MeasuredTest], float]:
+) -> tuple[int, list[MeasuredTest], float, bool]:
     """Run pytest and capture call-phase durations."""
     plugin = _TimingPlugin()
     plugins: list[object] = [plugin]
     if extra_plugins:
         plugins.extend(extra_plugins)
     started = time.perf_counter()
-    previous_sigterm_handler: SignalHandler = None
+    sigterm_summary_state: _SigtermSummaryState | None = None
     if emit_sigterm_summary:
-        previous_sigterm_handler = _install_sigterm_summary_handler(plugin, started)
+        sigterm_summary_state = _install_sigterm_summary_handler(plugin, started)
     # Redirect pytest's stdout to stderr so progress is visible on the terminal
     # while keeping our rendered report (markdown/JSON) on stdout pipeable.
     try:
         with redirect_stdout(sys.stderr):
             exit_code = pytest.main(pytest_args, plugins=plugins)
     finally:
-        if emit_sigterm_summary and hasattr(signal, "SIGTERM") and previous_sigterm_handler is not None:
-            signal.signal(signal.SIGTERM, previous_sigterm_handler)
+        if emit_sigterm_summary and hasattr(signal, "SIGTERM") and sigterm_summary_state is not None:
+            signal.signal(signal.SIGTERM, sigterm_summary_state.previous_handler)
     finished = time.perf_counter()
-    return int(exit_code), plugin.test_durations, finished - started
+    return (
+        int(exit_code),
+        plugin.test_durations,
+        finished - started,
+        bool(sigterm_summary_state and sigterm_summary_state.emitted),
+    )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -395,11 +402,11 @@ def _default_report_path(json_mode: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     pytest_args = _default_pytest_args(args.pytest_args)
-    exit_code, test_durations, total_wall_time_seconds = run_pytest(
+    exit_code, test_durations, total_wall_time_seconds, sigterm_summary_emitted = run_pytest(
         pytest_args,
         emit_sigterm_summary=args.summary,
     )
-    if args.summary and exit_code != 0 and test_durations:
+    if args.summary and exit_code != 0 and test_durations and not sigterm_summary_emitted:
         report = build_report(test_durations, total_wall_time_seconds, _current_timestamp())
         sys.stderr.write(render_summary(report) + "\n")
         sys.stderr.flush()

@@ -107,7 +107,7 @@ def _override_options(pytest_args: list[str]) -> list[str]:
 
 def _run_pytest_pass(pytest_args: list[str], *, emit_sigterm_summary: bool) -> tuple[_PytestPassResult, str | None]:
     capture = _FailureCapturePlugin()
-    exit_code, durations, total_wall_time_seconds = run_pytest(
+    exit_code, durations, total_wall_time_seconds, _sigterm_summary_emitted = run_pytest(
         pytest_args,
         emit_sigterm_summary=emit_sigterm_summary,
         extra_plugins=[capture],

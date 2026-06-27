@@ -48,11 +48,12 @@ from ..dispatch_preview import (
 )
 from ..git import Git, GitError
 from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
-from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
+from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_is_complete_for_lifecycle
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
     query_lineage_owner_rows_in_read_session,
+    resolve_lineage_owner_task_id,
 )
 from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
@@ -70,6 +71,7 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..providers.base import wait_for_docker_ready
+from ..query import resolve_lineage_owner_task
 from ..recovery_engine import (
     FailedRecoveryDecision,
     decide_failed_task_recovery,
@@ -683,6 +685,8 @@ def _query_owner_rows_with_context(
     target_branch: str | None = None,
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
+    owner_task_ids: tuple[str, ...] | None = None,
+    task_ids: tuple[str, ...] | None = None,
     max_recovery_attempts: int,
     include_skipped: bool,
 ) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
@@ -695,6 +699,8 @@ def _query_owner_rows_with_context(
             include_skipped=include_skipped,
             exclude_dropped_from_planning=True,
             max_recovery_attempts=max_recovery_attempts,
+            owner_task_ids=owner_task_ids,
+            task_ids=task_ids,
         ),
         config=config,
         git=git,
@@ -703,6 +709,73 @@ def _query_owner_rows_with_context(
     return list(rows), read_context
 
 
+def _query_owner_rows(
+    *,
+    store: SqliteTaskStore,
+    config: Config | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+    owner_task_ids: tuple[str, ...] | None = None,
+    task_ids: tuple[str, ...] | None = None,
+    max_recovery_attempts: int,
+    include_skipped: bool,
+) -> list[LineageOwnerRow]:
+    rows, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        tags=tags,
+        any_tag=any_tag,
+        owner_task_ids=owner_task_ids,
+        task_ids=task_ids,
+        max_recovery_attempts=max_recovery_attempts,
+        include_skipped=include_skipped,
+    )
+    return rows
+
+
+def _resolve_watch_scope_owner_ids(
+    store: SqliteTaskStore,
+    task_ids: tuple[str, ...],
+    *,
+    max_recovery_attempts: int,
+    config: Config | None = None,
+    git: Git | None = None,
+    target_branch: str | None = None,
+) -> tuple[str, ...]:
+    """Resolve explicit watch task IDs to canonical owner IDs, preserving order."""
+    owner_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_task_id in task_ids:
+        if not _TASK_ID_RE.match(raw_task_id):
+            raise ValueError(f"invalid task ID: {raw_task_id}")
+        task = store.get(raw_task_id)
+        if task is None:
+            raise ValueError(f"unknown task ID: {raw_task_id}")
+
+        rows = _query_owner_rows(
+            store=store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            max_recovery_attempts=max_recovery_attempts,
+            include_skipped=True,
+            task_ids=(raw_task_id,),
+        )
+        if rows:
+            owner_task = _resolve_incomplete_owner_task(store, cast(Any, rows[0]))
+        else:
+            owner_task = resolve_lineage_owner_task(store, task)
+        if owner_task.id is None:
+            raise ValueError(f"unable to resolve owner for task ID: {raw_task_id}")
+        if owner_task.id in seen:
+            continue
+        seen.add(owner_task.id)
+        owner_ids.append(owner_task.id)
+    return tuple(owner_ids)
 def _watch_iterate_result(
     *,
     action_type: str,
@@ -763,10 +836,7 @@ def _watch_iterate_impl_target(
             return _watch_iterate_result(
                 action_type=action_type,
                 status="skip",
-                message=(
-                    f"review task {review_task.id} points to non-implementation task "
-                    f"{review_task.depends_on}"
-                ),
+                message=(f"review task {review_task.id} points to non-implementation task {review_task.depends_on}"),
                 guarded_pending_task_id=guarded_pending_task_id,
             )
         anchor_impl = impl_task if task.id == review_task.id else _resolve_watch_iterate_impl_for_task(store, task)
@@ -774,10 +844,7 @@ def _watch_iterate_impl_target(
             return _watch_iterate_result(
                 action_type=action_type,
                 status="skip",
-                message=(
-                    f"review task {review_task.id} resolves to {impl_task.id}, "
-                    f"not completed task {task.id}"
-                ),
+                message=(f"review task {review_task.id} resolves to {impl_task.id}, not completed task {task.id}"),
                 guarded_pending_task_id=guarded_pending_task_id,
             )
     else:
@@ -803,10 +870,7 @@ def _watch_iterate_impl_target(
             return _watch_iterate_result(
                 action_type=action_type,
                 status="skip",
-                message=(
-                    f"improve task {improve_task.id} resolves to {impl_task.id}, "
-                    f"not completed task {task.id}"
-                ),
+                message=(f"improve task {improve_task.id} resolves to {impl_task.id}, not completed task {task.id}"),
                 guarded_pending_task_id=guarded_pending_task_id,
             )
 
@@ -1395,11 +1459,7 @@ def _resolve_pending_improve_backoff_candidate_from_rows(
             subject_id=subject_candidate.subject_id,
         )
         if backoff.action_type in {"improve", "run_improve"}
-        and (
-            failed_improve is None
-            or failed_improve.id is None
-            or backoff.last_failure_task_id == failed_improve.id
-        )
+        and (failed_improve is None or failed_improve.id is None or backoff.last_failure_task_id == failed_improve.id)
     ]
     if not matching_backoffs:
         return None
@@ -1692,6 +1752,7 @@ def _should_reexec_watch(
 
 def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     argv = [sys.executable, "-m", "gza", "watch", "--project", str(args.project_dir)]
+    scoped_mode = bool(getattr(args, "task_ids", None))
     if getattr(args, "batch", None) is not None:
         argv.extend(["--batch", str(args.batch)])
     if getattr(args, "poll", None) is not None:
@@ -1708,6 +1769,7 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     dispatch_mode = _normalize_watch_dispatch_selection_mode(
         dispatch_mode=cast(str | None, requested_dispatch_mode),
         recovery_slots=getattr(args, "recovery_slots", None),
+        scoped_mode=scoped_mode,
     )
     if dispatch_mode == "recovery_only":
         argv.append("--recovery-only")
@@ -1734,11 +1796,20 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
         argv.append("--all-tags")
     if not getattr(args, "auto_restart_on_drift", True):
         argv.append("--no-auto-restart-on-drift")
+    for task_id in getattr(args, "task_ids", None) or ():
+        argv.append(str(task_id))
     return argv
 
 
-def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str | None:
-    """Return a stable watch-scope message when tag filtering is active."""
+def _format_scope_message(
+    tags: tuple[str, ...] | None,
+    *,
+    any_tag: bool,
+    scoped_owner_ids: tuple[str, ...] | None = None,
+) -> str | None:
+    """Return a stable watch-scope message when an explicit scope is active."""
+    if scoped_owner_ids:
+        return f"scope: owners={','.join(scoped_owner_ids)} mode=explicit"
     if not tags:
         return None
     mode = "any" if any_tag else "all"
@@ -1748,10 +1819,7 @@ def _format_scope_message(tags: tuple[str, ...] | None, *, any_tag: bool) -> str
 def _format_queue_scope_error(task_id: str, tags: tuple[str, ...], *, any_tag: bool) -> str:
     """Return consistent fail-closed messaging for queue ordering scope mismatch."""
     mode = "any" if any_tag else "all"
-    return (
-        f"Error: Task {task_id} does not match tag scope ({mode}: {', '.join(tags)}); "
-        "queue ordering was not changed"
-    )
+    return f"Error: Task {task_id} does not match tag scope ({mode}: {', '.join(tags)}); queue ordering was not changed"
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -1788,6 +1856,8 @@ def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, qu
         step = min(quantum, remaining)
         time.sleep(step)
         remaining -= step
+
+
 def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
     snap: dict[str, dict[str, str | None]] = {}
     with store._connect() as conn:  # noqa: SLF001 - CLI internal polling helper
@@ -1908,8 +1978,7 @@ class _WatchLog:
         continuation_prefix = " " * len(prefix)
         parts = message.splitlines() or [""]
         line = "\n".join(
-            (prefix if idx == 0 else continuation_prefix) + part.rstrip()
-            for idx, part in enumerate(parts)
+            (prefix if idx == 0 else continuation_prefix) + part.rstrip() for idx, part in enumerate(parts)
         ).rstrip()
         with open(self.path, "a") as f:
             f.write(line + "\n")
@@ -1926,6 +1995,7 @@ def _emit_transition_events(
     log: _WatchLog,
     restart_failed_mode: bool = False,
     max_recovery_attempts: int = 1,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     # Detector-owned transitions come from snapshot diffs, regardless of which
     # process caused the state change. START remains detector-owned for the
@@ -1938,6 +2008,8 @@ def _emit_transition_events(
         old_status = old_row.get("status")
         new_row = new[task_id]
         new_status = new_row.get("status")
+        if not _transition_task_matches_scope(store, task_id, scoped_owner_ids):
+            continue
 
         task_type = new_row.get("task_type") or "implement"
         elapsed = _format_elapsed(new_row.get("started_at"), new_row.get("completed_at"))
@@ -1951,11 +2023,7 @@ def _emit_transition_events(
                 if task_type == "review":
                     task = store.get(task_id)
                     impl_id = new_row.get("depends_on") or "unknown"
-                    verdict = (
-                        format_review_outcome(config, task)
-                        if task is not None
-                        else "UNKNOWN"
-                    )
+                    verdict = format_review_outcome(config, task) if task is not None else "UNKNOWN"
                     log.emit("REVIEW", f"{task_id} for {impl_id}: {verdict}{reason_suffix}")
                 else:
                     log.emit("DONE", f"{task_id} {task_type}{reason_suffix}{elapsed_suffix}")
@@ -2336,6 +2404,8 @@ class _CycleResult:
     work_done: bool
     running: int
     pending: int
+    scoped_done: bool | None = None
+    scoped_active: int = 0
     expected_starts: dict[str, "_ExpectedStart"] = field(default_factory=dict)
     confirmed_start_count: int = 0
 
@@ -2399,10 +2469,14 @@ class _WatchCycleAnalysis:
     pending_recovery_task_ids: frozenset[str]
 
 
+SCOPED_WATCH_COMPLETE_MESSAGE = "scoped watch complete; all named owner units are terminal or parked"
+
+
 def _normalize_watch_dispatch_selection_mode(
     *,
     dispatch_mode: str | None,
     recovery_slots: int | None,
+    scoped_mode: bool = False,
 ) -> DispatchSelectionMode:
     if dispatch_mode == "recovery-only":
         dispatch_mode = "recovery_only"
@@ -2410,6 +2484,8 @@ def _normalize_watch_dispatch_selection_mode(
         dispatch_mode = "pending_only"
     elif dispatch_mode == "recovery-first":
         dispatch_mode = "recovery_first_explicit"
+    if scoped_mode and dispatch_mode is None:
+        return "default"
     return normalize_dispatch_selection_mode(
         cast(DispatchSelectionMode | None, dispatch_mode),
         recovery_slots=recovery_slots,
@@ -2429,8 +2505,7 @@ def _filter_watch_dispatch_preview_entries(
         if task_id is None or str(task_id) in started_task_ids:
             continue
         if entry.lane == "pending" and (
-            str(task_id) in pending_recovery_task_ids
-            or str(task_id) in step1_handled_child_task_ids
+            str(task_id) in pending_recovery_task_ids or str(task_id) in step1_handled_child_task_ids
         ):
             continue
         filtered.append(entry)
@@ -2449,11 +2524,7 @@ def allocate_watch_slots(
     del pending_count
     recovery_slots = min(slots, recovery_slots_config, worker_consuming_recovery_count)
     pending_slots = max(0, slots - recovery_slots)
-    if (
-        gate_pending_on_actionable_recovery
-        and recovery_slots_config > 0
-        and actionable_recovery_count > 0
-    ):
+    if gate_pending_on_actionable_recovery and recovery_slots_config > 0 and actionable_recovery_count > 0:
         pending_slots = 0
     return WatchSlotAllocation(
         recovery_slots=recovery_slots,
@@ -2524,9 +2595,7 @@ def _print_queue_scope_gaps(
     any_tag: bool,
 ) -> None:
     for gap in gaps:
-        console.print(
-            f"Scope gap: {_format_scope_gap_message(gap, tags=tags, any_tag=any_tag)}"
-        )
+        console.print(f"Scope gap: {_format_scope_gap_message(gap, tags=tags, any_tag=any_tag)}")
 
 
 def _collect_completed_transition_ids(
@@ -2536,10 +2605,13 @@ def _collect_completed_transition_ids(
     store: SqliteTaskStore,
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> list[str]:
     completed_ids: list[str] = []
     for task_id, _old_status, new_row in _iter_status_transitions(old, new):
         if new_row.get("status") != "completed":
+            continue
+        if not _transition_task_matches_scope(store, task_id, scoped_owner_ids):
             continue
         if not _task_matches_tags(store, task_id, tags, any_tag):
             continue
@@ -2557,10 +2629,13 @@ def _collect_unhandled_failures(
     restart_failed_mode: bool = False,
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> list[_ObservedFailure]:
     failures: list[_ObservedFailure] = []
     for task_id, _old_status, new_row in _iter_status_transitions(old, new):
         if new_row.get("status") != "failed":
+            continue
+        if not _transition_task_matches_scope(store, task_id, scoped_owner_ids):
             continue
         if not _task_matches_tags(store, task_id, tags, any_tag):
             continue
@@ -2698,7 +2773,9 @@ def _emit_recovery_dry_run_report(
     ]
     failed_rows.sort(
         key=lambda row: (
-            row.recovery_leaf_task.created_at if row.recovery_leaf_task and row.recovery_leaf_task.created_at else datetime.min.replace(tzinfo=UTC),
+            row.recovery_leaf_task.created_at
+            if row.recovery_leaf_task and row.recovery_leaf_task.created_at
+            else datetime.min.replace(tzinfo=UTC),
             task_id_numeric_key(row.owner_task.id),
         )
     )
@@ -2716,7 +2793,9 @@ def _emit_recovery_dry_run_report(
                 attention_rows.append((task, visible_entry.attention_action))
                 continue
         else:
-            decision = decide_failed_task_recovery(store, task, max_recovery_attempts=max_recovery_attempts, read_context=report_read_context)
+            decision = decide_failed_task_recovery(
+                store, task, max_recovery_attempts=max_recovery_attempts, read_context=report_read_context
+            )
         if decision.action in {"resume", "retry", "reconcile"}:
             launch = decision.launch_mode
             print(
@@ -2762,6 +2841,54 @@ def _emit_recovery_dry_run_report(
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
 
 
+def _collect_scoped_recovery_lane_entries(
+    *,
+    store: SqliteTaskStore,
+    recovery_rows: list[LineageOwnerRow],
+    read_context: RecoveryReadContext,
+    max_recovery_attempts: int,
+) -> dict[str, RecoveryLaneEntry]:
+    entries: dict[str, RecoveryLaneEntry] = {}
+    for row in recovery_rows:
+        failed = row.recovery_leaf_task
+        if (
+            failed is None
+            or failed.id is None
+            or row.recovery_action_task is None
+            or row.recovery_action_task.id != failed.id
+        ):
+            continue
+        decision = decide_failed_task_recovery(
+            store,
+            failed,
+            max_recovery_attempts=max_recovery_attempts,
+            read_context=read_context,
+        )
+        if decision.action in {"resume", "retry"}:
+            entries[str(failed.id)] = RecoveryLaneEntry(
+                owner_task=row.owner_task,
+                task=failed,
+                decision=decision,
+            )
+            continue
+        attention_action = _owner_failed_recovery_attention_action(
+            store=store,
+            owner_task=row.owner_task,
+            failed_task=failed,
+            decision=decision,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+        if attention_action is None:
+            continue
+        entries[str(failed.id)] = RecoveryLaneEntry(
+            owner_task=row.owner_task,
+            task=failed,
+            decision=decision,
+            attention_action=attention_action,
+        )
+    return entries
+
+
 def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
     if streak <= 0:
         return 0
@@ -2781,6 +2908,7 @@ def _analyze_watch_cycle(
     recovery_slots: int,
     recovery_mode: DispatchSelectionMode | None,
     max_recovery_attempts: int,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> _WatchCycleAnalysis:
     del slots, recovery_slots, recovery_mode
     cache_scope = git.cached() if hasattr(git, "cached") else contextlib.nullcontext(git)
@@ -2804,6 +2932,7 @@ def _analyze_watch_cycle(
             target_branch=target_branch,
             tags=tags,
             any_tag=any_tag,
+            owner_task_ids=scoped_owner_ids,
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=True,
         )
@@ -2828,18 +2957,26 @@ def _analyze_watch_cycle(
                 task_id_numeric_key(row.owner_task.id),
             )
         )
-        recovery_lane_entry_by_failed_id: dict[str, RecoveryLaneEntry] = {
-            entry.task.id: entry
-            for entry in collect_recovery_lane_entries(
-                store,
-                tags=tags,
-                any_tag=any_tag,
+        if scoped_owner_ids is None:
+            recovery_lane_entry_by_failed_id: dict[str, RecoveryLaneEntry] = {
+                entry.task.id: entry
+                for entry in collect_recovery_lane_entries(
+                    store,
+                    tags=tags,
+                    any_tag=any_tag,
+                    max_recovery_attempts=max_recovery_attempts,
+                    git=git,
+                    target_branch=target_branch,
+                )
+                if entry.task.id is not None
+            }
+        else:
+            recovery_lane_entry_by_failed_id = _collect_scoped_recovery_lane_entries(
+                store=store,
+                recovery_rows=recovery_rows,
+                read_context=watch_read_context,
                 max_recovery_attempts=max_recovery_attempts,
-                git=git,
-                target_branch=target_branch,
             )
-            if entry.task.id is not None
-        }
 
         action_plan: list[tuple[LineageOwnerRow, DbTask, dict[str, Any]]] = []
         for row in lifecycle_rows:
@@ -2910,10 +3047,7 @@ def _analyze_watch_cycle(
                         max_recovery_attempts=max_recovery_attempts,
                     )
                 )
-                if (
-                    attention_action is not None
-                    and classify_advance_action(attention_action) == "needs_attention"
-                ):
+                if attention_action is not None and classify_advance_action(attention_action) == "needs_attention":
                     recovery_attention_rows.append((owner_task, decision, attention_action))
                     continue
                 if not _is_watch_observable_recovery_skip(decision):
@@ -2926,9 +3060,7 @@ def _analyze_watch_cycle(
                 failed_task=failed,
                 recovery_task_id=decision.recovery_task_id,
             )
-            actionable_failed.append(
-                (row, failed, decision, recovery_action, worker_consuming_recovery, action_task)
-            )
+            actionable_failed.append((row, failed, decision, recovery_action, worker_consuming_recovery, action_task))
         return _WatchCycleAnalysis(
             target_branch=target_branch,
             scope_gaps=scope_gaps,
@@ -2944,7 +3076,148 @@ def _analyze_watch_cycle(
             pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
         )
 
+def _scoped_member_task_ids(owner_rows: list[LineageOwnerRow], owner_task_ids: tuple[str, ...]) -> set[str]:
+    member_ids = set(owner_task_ids)
+    for row in owner_rows:
+        member_ids.update(str(member.id) for member in row.members if member.id is not None)
+        if row.lifecycle_action_task is not None and row.lifecycle_action_task.id is not None:
+            member_ids.add(str(row.lifecycle_action_task.id))
+        if row.recovery_action_task is not None and row.recovery_action_task.id is not None:
+            member_ids.add(str(row.recovery_action_task.id))
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None:
+            member_ids.add(str(row.recovery_leaf_task.id))
+    return member_ids
 
+
+def _missing_scoped_owner_row_is_active(
+    *,
+    store: SqliteTaskStore,
+    owner_id: str,
+    running_task_ids: set[str],
+) -> bool:
+    owner_task = store.get(owner_id)
+    if owner_task is None:
+        return False
+
+    member_tasks: list[DbTask] = [owner_task]
+    member_ids = {owner_id}
+    for task in store.get_all():
+        task_id = task.id
+        if task_id is None or task_id in member_ids:
+            continue
+        if resolve_lineage_owner_task_id(store, task_id) != owner_id:
+            continue
+        member_tasks.append(task)
+        member_ids.add(task_id)
+
+    if member_ids.intersection(running_task_ids):
+        return True
+
+    for task in member_tasks:
+        if task.status == "dropped":
+            continue
+        if not task_is_complete_for_lifecycle(task, merge_state=task.merge_status):
+            return True
+    return False
+
+
+def _scoped_owner_active_count(
+    *,
+    store: SqliteTaskStore,
+    owner_rows: list[LineageOwnerRow],
+    scoped_owner_ids: tuple[str, ...],
+    running_task_ids: set[str],
+    planned_active_owner_ids: frozenset[str] = frozenset(),
+) -> int:
+    rows_by_owner_id = {row.owner_task.id: row for row in owner_rows if row.owner_task.id is not None}
+    active = 0
+    for owner_id in scoped_owner_ids:
+        row = rows_by_owner_id.get(owner_id)
+        if row is None:
+            if _missing_scoped_owner_row_is_active(
+                store=store,
+                owner_id=owner_id,
+                running_task_ids=running_task_ids,
+            ):
+                active += 1
+            continue
+        member_ids = _scoped_member_task_ids([row], (owner_id,))
+        if member_ids.intersection(running_task_ids):
+            active += 1
+            continue
+        if any(member.status in {"pending", "in_progress"} for member in row.members):
+            active += 1
+            continue
+        if owner_id in planned_active_owner_ids:
+            active += 1
+            continue
+    return active
+
+
+def _scoped_watch_active_count(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    recovery_slots: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int,
+    scoped_owner_ids: tuple[str, ...],
+) -> int:
+    plan = _build_watch_cycle_plan(
+        config=config,
+        store=store,
+        batch=batch,
+        tags=tags,
+        any_tag=any_tag,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
+        scoped_owner_ids=scoped_owner_ids,
+    )
+    planned_active_owner_ids = _collect_planned_active_owner_ids(plan.analysis)
+    return _scoped_owner_active_count(
+        store=store,
+        owner_rows=list(plan.analysis.owner_rows),
+        scoped_owner_ids=scoped_owner_ids,
+        running_task_ids=set(plan.running_task_ids),
+        planned_active_owner_ids=planned_active_owner_ids,
+    )
+
+
+def _collect_planned_active_owner_ids(analysis: _WatchCycleAnalysis) -> frozenset[str]:
+    active_owner_ids: set[str] = set()
+    for row, _task, action in analysis.action_plan:
+        owner_id = row.owner_task.id
+        if owner_id is None:
+            continue
+        if classify_advance_action(action) not in {"skip", "needs_attention"}:
+            active_owner_ids.add(str(owner_id))
+    for row, _failed, decision, _action, _worker_consuming, _action_task in analysis.actionable_failed:
+        owner_id = row.owner_task.id
+        if owner_id is None:
+            continue
+        if decision.action in {"resume", "retry", "reconcile"}:
+            active_owner_ids.add(str(owner_id))
+    return frozenset(active_owner_ids)
+
+
+def _transition_task_matches_scope(
+    store: SqliteTaskStore,
+    task_id: str,
+    scoped_owner_ids: tuple[str, ...] | None,
+) -> bool:
+    if scoped_owner_ids is None:
+        return True
+    if task_id in scoped_owner_ids:
+        return True
+    task = store.get(task_id)
+    if task is None:
+        return False
+    owner = resolve_lineage_owner_task(store, task)
+    return owner.id in set(scoped_owner_ids)
 def _build_watch_cycle_plan(
     *,
     config: Config,
@@ -2955,16 +3228,21 @@ def _build_watch_cycle_plan(
     recovery_slots: int,
     recovery_mode: DispatchSelectionMode | None,
     max_recovery_attempts: int,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> _WatchCyclePlan:
     snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
     running_task_ids = tuple(snapshot.running_task_ids)
-    pending_count = len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
-    blocked_pending_count = sum(
-        1
-        for pending_task in store.get_pending(limit=None)
-        if pending_task.task_type != "internal"
-        and task_matches_tag_filters(task_tags=pending_task.tags, tag_filters=tags, any_tag=any_tag)
-        and store.is_task_blocked(pending_task)[0]
+    pending_count = 0 if scoped_owner_ids is not None else len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
+    blocked_pending_count = (
+        0
+        if scoped_owner_ids is not None
+        else sum(
+            1
+            for pending_task in store.get_pending(limit=None)
+            if pending_task.task_type != "internal"
+            and task_matches_tag_filters(task_tags=pending_task.tags, tag_filters=tags, any_tag=any_tag)
+            and store.is_task_blocked(pending_task)[0]
+        )
     )
     running = snapshot.running
     effective_batch = min(batch, snapshot.limit)
@@ -2980,6 +3258,7 @@ def _build_watch_cycle_plan(
         recovery_slots=recovery_slots,
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
+        scoped_owner_ids=scoped_owner_ids,
     )
     return _WatchCyclePlan(
         running_task_ids=running_task_ids,
@@ -3017,6 +3296,7 @@ def _run_cycle(
     end_cycle: bool = True,
     emit_cycle_header: bool = True,
     emit_lifecycle_summary: bool = True,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> _CycleResult:
     from ._common import (
         prune_terminal_dead_workers,
@@ -3025,6 +3305,7 @@ def _run_cycle(
     )
 
     tags = normalize_tag_filters(tags)
+    scoped_mode = scoped_owner_ids is not None
     if restart_failed:
         recovery_slots = batch if restart_failed_batch is None else restart_failed_batch
         recovery_mode = "recovery_only"
@@ -3033,6 +3314,7 @@ def _run_cycle(
     recovery_mode = _normalize_watch_dispatch_selection_mode(
         dispatch_mode=recovery_mode,
         recovery_slots=recovery_slots,
+        scoped_mode=scoped_mode,
     )
 
     if begin_cycle:
@@ -3057,6 +3339,7 @@ def _run_cycle(
         recovery_slots=recovery_slots,
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
+        scoped_owner_ids=scoped_owner_ids,
     )
     running_task_ids = list(plan.running_task_ids)
     anonymous_worker_count = plan.anonymous_worker_count
@@ -3110,7 +3393,7 @@ def _run_cycle(
                 anonymous_worker_count=anonymous_worker_count,
             ),
         )
-        scope_message = _format_scope_message(tags, any_tag=any_tag)
+        scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=scoped_owner_ids)
         if scope_message is not None:
             log.emit("INFO", scope_message)
 
@@ -3279,9 +3562,7 @@ def _run_cycle(
         use_iterate_for_create_implement=True,
         use_iterate_for_needs_rebase=False,
         can_spawn_worker=lambda _kind: slots > 0,
-        no_worker_capacity_message=lambda worker_label: (
-            f"SKIP: no watch worker slots available for {worker_label}"
-        ),
+        no_worker_capacity_message=lambda worker_label: f"SKIP: no watch worker slots available for {worker_label}",
         prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
             config,
             task,
@@ -3308,13 +3589,15 @@ def _run_cycle(
         spawn_worker=_watch_spawn_worker,
         spawn_resume_worker=_watch_spawn_resume_worker,
         spawn_iterate_worker=_watch_spawn_iterate,
-        is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
-            store,
-            git,
-            t,
-            target_branch,
-            merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
-        ).already_merged,
+        is_rebase_target_already_merged=lambda t: (
+            _resolve_and_persist_post_merge_rebase_state(
+                store,
+                git,
+                t,
+                target_branch,
+                merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+            ).already_merged
+        ),
         config=config,
         git=git,
         spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_worker_with_failure_log(
@@ -3472,9 +3755,7 @@ def _run_cycle(
                         failed_task=recovery_entry.task,
                         attention_action=action,
                     )
-                    attention_key = (
-                        f"failed-recovery-attention:{display_task.id}:{recovery_entry.decision.reason_code}"
-                    )
+                    attention_key = f"failed-recovery-attention:{display_task.id}:{recovery_entry.decision.reason_code}"
                 else:
                     display_task = _resolve_watch_attention_display_task(store, row)
                     attention_key = f"advance-attention:{display_task.id}:{action_type}"
@@ -3556,8 +3837,8 @@ def _run_cycle(
                         target_branch=target_branch,
                     )
                     if merge_event is not None:
-                        merge_status_before = (
-                            (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")
+                        merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                            "merge_status"
                         )
                 merge_result = _run_with_optional_stdout_suppressed(
                     quiet,
@@ -3581,8 +3862,8 @@ def _run_cycle(
                     for warning in getattr(merge_result, "promotion_warnings", ()):
                         log.emit("WARN", warning)
                 if rc == 0 and merge_event is not None:
-                    merge_status_after = (
-                        (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")
+                    merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                        "merge_status"
                     )
                     if (
                         merge_status_before != "merged"
@@ -3780,10 +4061,7 @@ def _run_cycle(
                     if conflict_assessment is not None and conflict_assessment.reason is not None:
                         log.emit(
                             "SKIP",
-                            (
-                                f"{display_task.id}: merge failed ({conflict_assessment.reason}); "
-                                "not routing to rebase"
-                            ),
+                            (f"{display_task.id}: merge failed ({conflict_assessment.reason}); not routing to rebase"),
                             dedupe_key=f"merge-failed-non-conflict:{display_task.id}",
                         )
                         continue
@@ -4089,6 +4367,7 @@ def _run_cycle(
         any_tag=any_tag,
         max_recovery_attempts=max_recovery_attempts,
         selection_mode=dispatch_selection_mode,
+        include_pending=scoped_owner_ids is None,
     )
     dispatch_candidate_entries = _filter_watch_dispatch_preview_entries(
         dispatch_preview.runnable_entries,
@@ -4103,9 +4382,7 @@ def _run_cycle(
         step1_handled_child_task_ids=step1_handled_child_task_ids,
     )
     dispatch_recovery_task_ids = {
-        str(entry.task.id)
-        for entry in dispatch_recovery_preview_entries
-        if entry.task.id is not None
+        str(entry.task.id) for entry in dispatch_recovery_preview_entries if entry.task.id is not None
     }
     active_backoff_recovery_subject_ids: set[str] = set()
     if not dry_run:
@@ -4139,19 +4416,20 @@ def _run_cycle(
         or str(entry.task.id) not in parked_recovery_subject_ids
         and str(entry.task.id) not in active_backoff_recovery_subject_ids
     )
-    pending_tasks = [
-        entry.task
-        for entry in dispatch_launchable_entries
-        if entry.lane == "pending" and entry.task.id is not None
-    ]
+    pending_tasks = (
+        []
+        if scoped_owner_ids is not None
+        else [entry.task for entry in dispatch_launchable_entries if entry.lane == "pending" and entry.task.id is not None]
+    )
     dispatch_plan = plan_watch_dispatch_entries(
         dispatch_launchable_entries,
         slots=slots,
         recovery_slot_cap=recovery_slots,
         selection_mode=dispatch_selection_mode,
+        include_pending=scoped_owner_ids is None,
     )
     reserved_recovery_slots = dispatch_plan.recovery_worker_slots
-    pending_slots = dispatch_plan.pending_slots
+    pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
     nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids)
     recovery_started_this_cycle = False
     for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
@@ -4508,7 +4786,12 @@ def _run_cycle(
                 message=_watch_needs_attention_message(failed, no_progress_attention),
             )
 
-    if recovery_mode == "recovery_only" and pending_slots <= 0 and not recovery_started_this_cycle:
+    if (
+        scoped_owner_ids is None
+        and recovery_mode == "recovery_only"
+        and pending_slots <= 0
+        and not recovery_started_this_cycle
+    ):
         if not nonparked_recovery_subject_ids:
             pending_fallback_preview = build_dispatch_preview(
                 store,
@@ -4539,13 +4822,15 @@ def _run_cycle(
         pending_slots -= 1
         slots = max(0, slots - 1)
 
-    quiet_skip = _top_quiet_pending_task(
-        store,
-        config=config,
-        excluded_task_ids=started_task_ids | pending_recovery_task_ids | step1_handled_child_task_ids,
-        tags=tags,
-        any_tag=any_tag,
-    )
+    quiet_skip = None
+    if not scoped_mode:
+        quiet_skip = _top_quiet_pending_task(
+            store,
+            config=config,
+            excluded_task_ids=started_task_ids | pending_recovery_task_ids | step1_handled_child_task_ids,
+            tags=tags,
+            any_tag=any_tag,
+        )
     if quiet_skip is not None:
         quiet_task, quiet_available_at = quiet_skip
         quiet_available_text = format_quiet_available_at(quiet_available_at) or quiet_available_at.isoformat()
@@ -4572,7 +4857,12 @@ def _run_cycle(
             pending_action = _pending_queue_dispatch_action(task)
             if task_type == "implement":
                 if dry_run:
-                    log.emit("START", _format_start_line(task, dry_run=True))
+                    dry_run_prompt = _format_prompt_for_width(
+                        task.prompt,
+                        prefix=16 + len(f'{task.id} {task_type} "'),
+                        suffix=len('" [dry-run]'),
+                    )
+                    log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
                     started_task_ids.add(str(task.id))
                     consume_pending_slot()
                     work_done = True
@@ -4673,8 +4963,13 @@ def _run_cycle(
                 consume_pending_slot()
                 work_done = True
                 started_task_ids.add(str(task.id))
-                log.emit("START", _format_start_line(task))
                 confirmed_start_count += 1
+                started_prompt = _format_prompt_for_width(
+                    task.prompt,
+                    prefix=16 + len(f'{task.id} {task_type} "'),
+                    suffix=len('"'),
+                )
+                log.emit("START", f'{task.id} {task_type} "{started_prompt}"')
                 if no_progress_attention is not None:
                     log.emit_attention(
                         attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
@@ -4683,7 +4978,12 @@ def _run_cycle(
                 continue
 
             if dry_run:
-                log.emit("START", _format_start_line(task, dry_run=True))
+                dry_run_prompt = _format_prompt_for_width(
+                    task.prompt,
+                    prefix=16 + len(f'{task.id} {task_type} "'),
+                    suffix=len('" [dry-run]'),
+                )
+                log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
                 started_task_ids.add(str(task.id))
                 consume_pending_slot()
                 work_done = True
@@ -4759,15 +5059,35 @@ def _run_cycle(
             consume_pending_slot()
             work_done = True
             started_task_ids.add(str(task.id))
-            log.emit("START", _format_start_line(task))
             confirmed_start_count += 1
+            started_prompt = _format_prompt_for_width(
+                task.prompt,
+                prefix=16 + len(f'{task.id} {task_type} "'),
+                suffix=len('"'),
+            )
+            log.emit("START", f'{task.id} {task_type} "{started_prompt}"')
             if no_progress_attention is not None:
                 log.emit_attention(
                     attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
                     message=_watch_needs_attention_message(task, no_progress_attention),
                 )
 
-    pending_count = len(_pending_runnable_tasks(store, config=config, tags=tags, any_tag=any_tag))
+    pending_count = 0 if scoped_mode else len(_pending_runnable_tasks(store, config=config, tags=tags, any_tag=any_tag))
+    scoped_active = (
+        _scoped_watch_active_count(
+            config=config,
+            store=store,
+            batch=batch,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            scoped_owner_ids=scoped_owner_ids,
+        )
+        if scoped_mode and scoped_owner_ids is not None
+        else 0
+    )
     _check_canonical_checkout_boundary("watch-pass-end")
     _emit_cycle_attention_summary(log)
     if end_cycle:
@@ -4776,6 +5096,8 @@ def _run_cycle(
         work_done=work_done,
         running=_count_live_workers(config, store),
         pending=pending_count,
+        scoped_done=(scoped_active == 0) if scoped_mode else None,
+        scoped_active=scoped_active,
         expected_starts=expected_starts,
         confirmed_start_count=confirmed_start_count,
     )
@@ -4796,6 +5118,7 @@ def _preview_initial_watch_cycle(
     show_skipped: bool,
     auto_restart_on_drift: bool,
     installed_package_drift: _InstalledPackageDriftState | None,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> tuple[_CycleResult, _WatchCyclePlan]:
     plan = _build_watch_cycle_plan(
         config=config,
@@ -4806,6 +5129,7 @@ def _preview_initial_watch_cycle(
         recovery_slots=recovery_slots,
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
+        scoped_owner_ids=scoped_owner_ids,
     )
     log.begin_cycle()
     result = _run_cycle(
@@ -4827,6 +5151,7 @@ def _preview_initial_watch_cycle(
         precomputed_plan=plan,
         begin_cycle=False,
         end_cycle=False,
+        scoped_owner_ids=scoped_owner_ids,
     )
     return result, plan
 
@@ -4877,23 +5202,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
     batch = args.batch if args.batch is not None else config.watch.batch
     poll = args.poll if args.poll is not None else config.watch.poll
     max_idle = args.max_idle if args.max_idle is not None else config.watch.max_idle
-    max_iterations = (
-        args.max_iterations if args.max_iterations is not None else config.watch.max_iterations
-    )
+    max_iterations = args.max_iterations if args.max_iterations is not None else config.watch.max_iterations
     requested_dispatch_mode = getattr(args, "dispatch_mode", None)
     if requested_dispatch_mode is None and hasattr(args, "recovery_mode"):
         requested_dispatch_mode = getattr(args, "recovery_mode", None)
-    if requested_dispatch_mode is None and getattr(args, "restart_failed", False):
+    restart_failed = bool(getattr(args, "restart_failed", False))
+    if requested_dispatch_mode is None and restart_failed:
         requested_dispatch_mode = "recovery_only"
     auto_restart_on_drift = bool(getattr(args, "auto_restart_on_drift", True))
     recovery_slots_arg = getattr(args, "recovery_slots", None)
     if recovery_slots_arg is None:
         recovery_slots_arg = getattr(args, "restart_failed_batch", None)
     recovery_slots = recovery_slots_arg if recovery_slots_arg is not None else config.watch.recovery_slots
-    dispatch_mode = _normalize_watch_dispatch_selection_mode(
-        dispatch_mode=cast(str | None, requested_dispatch_mode),
-        recovery_slots=recovery_slots,
-    )
     max_recovery_attempts = (
         args.max_resume_attempts
         if getattr(args, "max_resume_attempts", None) is not None
@@ -4907,6 +5227,21 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
+    raw_task_ids = tuple(str(task_id) for task_id in (getattr(args, "task_ids", None) or ()))
+    raw_tag_scope = bool(getattr(args, "tags", None))
+    raw_any_tag = bool(getattr(args, "any_tag", False) or getattr(args, "all_tags", False))
+    if raw_task_ids and (raw_tag_scope or raw_any_tag):
+        print("Error: positional task IDs cannot be combined with --tag or --all-tags")
+        return 1
+    if raw_task_ids and restart_failed:
+        print("Error: positional task IDs cannot be combined with --restart-failed")
+        return 1
+    scoped_mode = bool(raw_task_ids)
+    dispatch_mode = _normalize_watch_dispatch_selection_mode(
+        dispatch_mode=cast(str | None, requested_dispatch_mode),
+        recovery_slots=recovery_slots,
+        scoped_mode=scoped_mode,
+    )
 
     if batch < 1:
         print("Error: --batch must be a positive integer")
@@ -4945,18 +5280,28 @@ def cmd_watch(args: argparse.Namespace) -> int:
         config = replace(config, max_concurrent=batch)
     elif batch > config.max_concurrent:
         source = config.source_map.get("max_concurrent")
-        startup_cap_warning = (
-            f"requested batch={batch} capped to {config.max_concurrent} by max_concurrent"
-            + (f" from {source}" if source else "")
+        startup_cap_warning = f"requested batch={batch} capped to {config.max_concurrent} by max_concurrent" + (
+            f" from {source}" if source else ""
         )
 
     store = get_store(config)
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
     if startup_cap_warning is not None:
         log.emit("WARN", startup_cap_warning)
-    installed_package_drift = _InstalledPackageDriftState(
-        startup_fingerprint=_installed_gza_package_fingerprint()
-    )
+    installed_package_drift = _InstalledPackageDriftState(startup_fingerprint=_installed_gza_package_fingerprint())
+    if raw_task_ids:
+        try:
+            scoped_owner_ids = _resolve_watch_scope_owner_ids(
+                store,
+                raw_task_ids,
+                max_recovery_attempts=max_recovery_attempts,
+                config=config,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+    else:
+        scoped_owner_ids = None
     stop_requested = False
     stop_signal: int | None = None
     sigint_count = 0
@@ -4986,7 +5331,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         git_health_hold_active = False
 
         # Preview the first watch pass and ask for confirmation before executing
-        if dispatch_mode == "recovery_only" and dry_run:
+        if dispatch_mode == "recovery_only" and dry_run and scoped_owner_ids is None:
             if _emit_git_health_hold(
                 store=store,
                 config=config,
@@ -5030,6 +5375,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 show_skipped=show_skipped,
                 auto_restart_on_drift=auto_restart_on_drift,
                 installed_package_drift=installed_package_drift,
+                scoped_owner_ids=scoped_owner_ids,
             )
             needs_initial_preview = False
             if preview_result.work_done:
@@ -5067,14 +5413,37 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     log.end_cycle()
                     preview_cycle_open = False
                     pending_first_cycle_plan = None
-                pending_count = len(_pending_runnable_tasks(store, config=config, tags=tag_filters, any_tag=any_tag))
-                log.emit(
-                    "HOLD",
-                    (
-                        "System unavailable: Docker daemon unreachable - "
-                        f"holding queue ({pending_count} pending), nothing started/failed"
-                    ),
-                )
+                if scoped_owner_ids is not None:
+                    scoped_active = _scoped_watch_active_count(
+                        config=config,
+                        store=store,
+                        batch=batch,
+                        tags=tag_filters,
+                        any_tag=any_tag,
+                        recovery_slots=recovery_slots,
+                        recovery_mode=dispatch_mode,
+                        max_recovery_attempts=max_recovery_attempts,
+                        scoped_owner_ids=scoped_owner_ids,
+                    )
+                    if scoped_active == 0:
+                        log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
+                        break
+                    log.emit(
+                        "HOLD",
+                        (
+                            "System unavailable: Docker daemon unreachable - "
+                            f"holding scoped watch ({scoped_active} active owner units), nothing started/failed"
+                        ),
+                    )
+                else:
+                    pending_count = len(_pending_runnable_tasks(store, config=config, tags=tag_filters, any_tag=any_tag))
+                    log.emit(
+                        "HOLD",
+                        (
+                            "System unavailable: Docker daemon unreachable - "
+                            f"holding queue ({pending_count} pending), nothing started/failed"
+                        ),
+                    )
                 system_hold_active = True
                 if stop_requested:
                     break
@@ -5123,6 +5492,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
+                scoped_owner_ids=scoped_owner_ids,
             )
             cycle_confirmed_start_count = _process_expected_start_boundary(
                 store=store,
@@ -5155,6 +5525,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 end_cycle=True,
                 emit_cycle_header=not preview_cycle_open,
                 emit_lifecycle_summary=not preview_cycle_open,
+                scoped_owner_ids=scoped_owner_ids,
             )
             pending_first_cycle_plan = None
             preview_cycle_open = False
@@ -5171,6 +5542,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
+                scoped_owner_ids=scoped_owner_ids,
             )
             cycle_result.confirmed_start_count += _process_expected_start_boundary(
                 store=store,
@@ -5186,6 +5558,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 tags=tag_filters,
                 any_tag=any_tag,
+                scoped_owner_ids=scoped_owner_ids,
             )
             if completed_ids and failure_streak > 0:
                 failure_streak = 0
@@ -5201,6 +5574,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 tags=tag_filters,
                 any_tag=any_tag,
+                scoped_owner_ids=scoped_owner_ids,
             )
             previous_snapshot = current_snapshot
 
@@ -5225,9 +5599,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if unhandled_failures:
                 failure_streak += len(unhandled_failures)
                 backoff_seconds = _compute_failure_backoff_seconds(config, failure_streak)
-                summary = ", ".join(
-                    f"{failure.task_id}={failure.reason}" for failure in unhandled_failures[:3]
-                )
+                summary = ", ".join(f"{failure.task_id}={failure.reason}" for failure in unhandled_failures[:3])
                 if len(unhandled_failures) > 3:
                     summary += ", ..."
                 log.emit(
@@ -5235,9 +5607,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     (
                         f"{len(unhandled_failures)} non-auto-resumable failure(s); "
                         f"sleeping {backoff_seconds}s before starting more work "
-                        f"(streak {failure_streak}"
-                        + (f"; latest: {summary}" if summary else "")
-                        + ")"
+                        f"(streak {failure_streak}" + (f"; latest: {summary}" if summary else "") + ")"
                     ),
                 )
                 halt_after = config.watch.failure_halt_after
@@ -5258,6 +5628,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             if cycle_result.work_done:
                 idle_seconds = 0
+            if scoped_owner_ids is not None and cycle_result.scoped_done:
+                log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
+                break
+            if dry_run and scoped_owner_ids is not None:
+                break
             log.emit(
                 "SLEEP",
                 _format_sleep_message(
@@ -5336,9 +5711,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     requested_dispatch_mode = getattr(args, "dispatch_mode", None)
     if requested_dispatch_mode is None and hasattr(args, "full"):
         requested_dispatch_mode = "default" if bool(getattr(args, "full", False)) else "pending_only"
-    dispatch_mode = normalize_dispatch_selection_mode(
-        cast(DispatchSelectionMode | None, requested_dispatch_mode)
-    )
+    dispatch_mode = normalize_dispatch_selection_mode(cast(DispatchSelectionMode | None, requested_dispatch_mode))
     show_recovery = dispatch_mode != "pending_only"
     show_lifecycle = dispatch_mode in {"default", "recovery_first_explicit"}
     show_pending = dispatch_mode != "recovery_only"
@@ -5495,9 +5868,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if not show_pending:
         if show_recovery:
             console.print(
-                build_queue_summary(
-                    "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
-                )
+                build_queue_summary("Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup.")
             )
             if recovery_entries:
                 for entry in recovery_entries:
@@ -5528,8 +5899,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     display_limit = None if show_all else max(1, int(limit_arg))
     visible_runnable = runnable_pending if display_limit is None else runnable_pending[:display_limit]
     rendered_rows = [
-        QueueRenderRow(task=task, position_text=str(index))
-        for index, task in enumerate(visible_runnable, 1)
+        QueueRenderRow(task=task, position_text=str(index)) for index, task in enumerate(visible_runnable, 1)
     ]
 
     def _blocked_by_text(row: TaskRow) -> str:
@@ -5551,8 +5921,10 @@ def cmd_queue(args: argparse.Namespace) -> int:
             if isinstance(target_branch, str) and target_branch:
                 detail += f" -> {target_branch}"
             return detail
-        blocking = str(blocking_id) if isinstance(blocking_id, str) and blocking_id else (
-            _precondition_blocking_dependency_id(task, config) or task.depends_on
+        blocking = (
+            str(blocking_id)
+            if isinstance(blocking_id, str) and blocking_id
+            else (_precondition_blocking_dependency_id(task, config) or task.depends_on)
         )
         return f"blocked by {blocking}" if blocking else "blocked by dependency"
 
@@ -5579,9 +5951,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
     if show_recovery:
         console.print(
-            build_queue_summary(
-                "Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup."
-            )
+            build_queue_summary("Recovery lane: `advance` / `watch` only. Evaluated ahead of pending pickup.")
         )
         if recovery_entries:
             for entry in recovery_entries:
@@ -5602,9 +5972,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             console.print("No lifecycle actions")
         console.print()
     console.print(
-        build_queue_summary(
-            "Pending lane: `gza queue` preview only. `gza work` / `watch` start from this lane."
-        )
+        build_queue_summary("Pending lane: `gza queue` preview only. `gza work` / `watch` start from this lane.")
     )
     if not runnable_pending and not quiet_rows and not blocked_pending:
         console.print("No pending tasks")
@@ -5624,9 +5992,9 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if display_limit is not None and len(runnable_pending) > display_limit:
         remaining = len(runnable_pending) - display_limit
         plural = "tasks" if remaining != 1 else "task"
-        console.print(build_queue_summary(
-            f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)"
-        ))
+        console.print(
+            build_queue_summary(f"({remaining} more runnable {plural}; use -n 0, -n -1, or --all to show everything)")
+        )
 
     if quiet_rendered_rows:
         console.print()

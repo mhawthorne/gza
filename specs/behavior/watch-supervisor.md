@@ -240,13 +240,17 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   startup warning that the requested batch was capped by the global ceiling.
 - `watch.recovery_slots` (default `1`) MUST reserve that many worker slots per cycle for
   actionable failed-task recovery before pending pickup, capped by available slots and
-  actionable in-scope worker-consuming recovery count.
+  actionable in-scope worker-consuming recovery count, when pending pickup is enabled.
 - The rule is uniform for worker-consuming recovery. There is no separate batch-1 policy:
   with batch 1 and the default `watch.recovery_slots = 1`, plain watch gives the single
   slot to worker-consuming recovery until that lane drains. `--pending-only` is the
   operator escape hatch for single-slot pending-only behavior, and `--recovery-only` is
   the `recovery_slots = batch` extreme that also suppresses pending pickup while direct
   actionable recovery remains.
+- Explicit merge-unit scope disables pending pickup entirely, so worker-consuming
+  in-scope recovery MUST be able to use all available slots in that scoped pass unless
+  the operator explicitly selected `--pending-only`; config/default
+  `watch.recovery_slots: 0` MUST NOT suppress scoped recovery on its own.
 - Eligibility remains owned by the shared recovery engine. The supervisor MUST use the
   same `decide_failed_task_recovery(...)` policy regardless of watch mode and MUST NOT
   invent a separate recovery-only eligibility predicate. Recovery-only lane gating may
@@ -397,6 +401,20 @@ When the installed `gza` package fingerprint changes while watch is running:
   scope.
 - Scope banners, wake summaries, and attention output SHOULD make the active scope
   explicit so operators can tell when watch is intentionally ignoring other work.
+- `watch <task-id>...` MUST normalize each supplied ID to the canonical lineage /
+  merge-unit owner before the loop starts, then use those owner IDs as the scope for all
+  cycle planning.
+- Explicit merge-unit scope is mutually exclusive with tag scope. The supervisor MUST
+  fail closed rather than AND-combine named owners with `--tag` / `--all-tags`.
+- Explicit merge-unit scope MUST disable global pending pickup and the global failed-task
+  recovery lane. In-scope failed members may still be recovered through their scoped owner
+  rows; unrelated failed and pending tasks MUST NOT be selected, reported as actionable
+  work, or counted as keeping the scoped watch alive.
+- `--restart-failed` is incompatible with explicit merge-unit scope because scoped mode
+  has no global recovery-priority lane. The supervisor MUST reject that combination.
+- A scoped watch MUST exit once every named owner unit is terminal or parked with no
+  automatic advance path. Ambiguous idle states may still use `--max-idle` as a backstop,
+  but unrelated global pending or failed work MUST NOT prevent scoped exit.
 
 ### 10. Stop signals stop the supervisor, not the detached workers
 

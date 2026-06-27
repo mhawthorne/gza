@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import signal
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
+from typing import cast
 
 import pytest
 
@@ -141,9 +144,9 @@ def test_install_sigterm_summary_handler_emits_summary_then_reemits(monkeypatch,
         side_effect=lambda sig, handler: recorded_reemit.append((sig, handler)),
     ):
         test_latency._install_sigterm_summary_handler(plugin, started=10.0)
-        handler = recorded_reemit[0][1]
+        handler = cast(test_latency.SignalHandler, recorded_reemit[0][1])
         assert callable(handler)
-        handler(signal.SIGTERM, None)
+        cast(Callable[[int, object | None], Any], handler)(signal.SIGTERM, None)
 
     captured = capsys.readouterr()
     assert "latency: p50=" in captured.err
@@ -227,10 +230,33 @@ def test_run_pytest_accepts_extra_plugins(monkeypatch) -> None:
 
     monkeypatch.setattr(test_latency.pytest, "main", _fake_pytest_main)
 
-    exit_code, durations, total_wall_time = test_latency.run_pytest(["tests/"], extra_plugins=[extra_plugin])
+    exit_code, durations, total_wall_time, sigterm_summary_emitted = test_latency.run_pytest(
+        ["tests/"], extra_plugins=[extra_plugin]
+    )
 
     assert exit_code == 0
     assert durations == []
     assert total_wall_time >= 0
+    assert sigterm_summary_emitted is False
     assert len(seen_plugins) == 2
     assert seen_plugins[1] is extra_plugin
+
+
+def test_main_summary_skips_duplicate_nonzero_summary_after_sigterm(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        test_latency,
+        "run_pytest",
+        lambda pytest_args, emit_sigterm_summary=False: (
+            1,
+            [MeasuredTest("tests/test_alpha.py::test_fast", 0.010)],
+            0.05,
+            True,
+        ),
+    )
+
+    exit_code = test_latency.main(["--summary", "--", "tests/"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == ""
