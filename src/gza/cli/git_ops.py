@@ -48,7 +48,7 @@ from ..db import (
 )
 from ..dependency_preconditions import task_is_merged
 from ..derived_tags import resolve_derived_task_tags
-from ..failure_reasons import mark_task_failed_from_cause
+from ..failure_reasons import is_readonly_db_failure, mark_task_failed_from_cause
 from ..git import (
     Git,
     GitError,
@@ -168,7 +168,7 @@ logger = logging.getLogger(__name__)
 
 
 def _classify_rebase_git_failure(error: BaseException) -> str:
-    if git_error_indicates_containerized_worktree_metadata_failure(error):
+    if git_error_indicates_containerized_worktree_metadata_failure(error) or is_readonly_db_failure(error):
         return "INFRASTRUCTURE_ERROR"
     return "GIT_ERROR"
 

@@ -3542,6 +3542,36 @@ class TestSnapshotTaskDbToWorktree:
             snapshot_conn.execute("CREATE TABLE blocked (id INTEGER)")
         snapshot_conn.close()
 
+    def test_creates_sqlite_snapshot_with_writable_mode_when_requested(self, tmp_path: Path) -> None:
+        db_path = tmp_path / ".gza" / "gza.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO items (name) VALUES ('alpha')")
+        conn.commit()
+        conn.close()
+
+        worktree_dir = tmp_path / "worktree"
+        worktree_dir.mkdir()
+
+        _snapshot_task_db_to_worktree(db_path, worktree_dir, read_only=False)
+
+        snapshot_path = worktree_dir / ".gza" / "gza.db"
+        assert snapshot_path.exists()
+        assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o644
+
+        snapshot_conn = sqlite3.connect(str(snapshot_path))
+        snapshot_conn.execute("CREATE TABLE writable (id INTEGER PRIMARY KEY)")
+        snapshot_conn.commit()
+        tables = {
+            row[0]
+            for row in snapshot_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        snapshot_conn.close()
+        assert "writable" in tables
+
     def test_noop_when_source_db_missing(self, tmp_path: Path):
         """Missing source DB should not create a snapshot file."""
         worktree_dir = tmp_path / "worktree"
@@ -3620,6 +3650,37 @@ class TestStageWorktreeAgentResources:
         assert installed == 1
         mock_install.assert_called_once_with(worktree_dir / ".claude" / "skills")
         assert (worktree_dir / ".gza" / "gza.db").exists()
+
+    def test_repo_root_project_can_stage_writable_snapshot(self, tmp_path: Path) -> None:
+        project_dir = tmp_path / "repo"
+        worktree_dir = tmp_path / "worktree"
+        db_path = project_dir / ".gza" / "gza.db"
+        project_dir.mkdir(parents=True)
+        worktree_dir.mkdir()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.commit()
+        conn.close()
+
+        config = Mock(spec=Config)
+        config.project_dir = project_dir
+        config.db_path = db_path
+
+        with patch("gza.skills_utils.ensure_all_skills", return_value=0):
+            _stage_worktree_agent_resources(
+                config,
+                worktree_dir,
+                boundary=ProjectBoundary(
+                    repo_root=project_dir,
+                    scope_root=Path("."),
+                    local_dependencies=(),
+                ),
+                read_only_db_snapshot=False,
+            )
+
+        snapshot_path = worktree_dir / ".gza" / "gza.db"
+        assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o644
 
 
     def test_run_non_code_task_creates_readonly_snapshot(self, tmp_path: Path):
@@ -17224,7 +17285,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
             patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
             patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
-            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0) as stage_resources,
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
             patch("gza.runner.build_prompt", return_value="prompt"),
@@ -17249,6 +17310,12 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
+        stage_resources.assert_called_once_with(
+            config,
+            isolated_path,
+            ANY,
+            read_only_db_snapshot=False,
+        )
 
         surfaced = capsys.readouterr().out
         assert "Invalid path '/gza-git'" in surfaced

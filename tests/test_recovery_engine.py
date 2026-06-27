@@ -1417,6 +1417,161 @@ def test_recovery_engine_rebase_conflict_parks_with_distinct_attention_reason(tm
     )
 
 
+def test_recovery_engine_historical_rebase_readonly_db_failure_retries(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase.log"
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "The DB file itself is mode 444, which explains the SQLite failure even though the directory is writable.\n"
+        "sqlite3.OperationalError: attempt to write a readonly database\n"
+    )
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.reason_code == "INFRASTRUCTURE_ERROR"
+    assert decision.reason_text == "INFRASTRUCTURE_ERROR restart with fresh attempt"
+    assert (
+        get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=decision,
+            max_recovery_attempts=1,
+        )
+        is None
+    )
+
+
+def test_recovery_engine_historical_rebase_success_log_records_completed_success(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase-success.log"
+    task.branch = "feature/rebase-success"
+    task.has_commits = True
+    task.output_content = "rebase output"
+    store.update(task)
+    original_completed_at = task.completed_at
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "Rebase completed successfully on feature/example onto local main\n"
+        "All checks passed!\n"
+    )
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "historical_rebase_success_reconciled"
+    assert (
+        get_failed_recovery_needs_attention_reason(
+            store,
+            task,
+            decision=decision,
+            max_recovery_attempts=1,
+        )
+        is None
+    )
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+    assert refreshed.branch == "feature/rebase-success"
+    assert refreshed.log_file == "logs/rebase-success.log"
+    assert refreshed.output_content == "rebase output"
+    assert refreshed.has_commits is True
+    assert refreshed.merge_status == "unmerged"
+    assert refreshed.completed_at == original_completed_at
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+def test_recovery_engine_historical_rebase_success_log_read_context_stays_in_sync(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase-success-read-context.log"
+    task.branch = "feature/rebase-success-read-context"
+    task.has_commits = True
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "Rebase completed successfully on feature/example onto local main\n"
+        "All checks passed!\n"
+    )
+
+    read_context = _read_context_for_store(store)
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1, read_context=read_context)
+    assert decision.action == "skip"
+    assert decision.reason_code == "historical_rebase_success_reconciled"
+    pending = store.get(task.id)
+    assert pending is not None
+    assert pending.status == "failed"
+
+    recovery_engine.apply_pending_recovery_reconciliations(store, read_context=read_context)
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+
+
+def test_recovery_engine_historical_rebase_checks_passed_only_does_not_reconcile(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase-checks-only.log"
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("All checks passed!\n")
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_failure_reason"
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
+
+
+def test_recovery_engine_historical_rebase_rebase_success_only_does_not_reconcile(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase-success-only.log"
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("Rebase completed successfully on feature/example onto local main\n")
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_failure_reason"
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
+
+
+def test_recovery_engine_historical_rebase_check_failure_after_rebase_success_does_not_reconcile(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="rebase", reason="GIT_ERROR", session_id=None)
+    task.log_file = "logs/rebase-check-failure.log"
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "Rebase completed successfully on feature/example onto local main\n"
+        "Verification failed: ./bin/tests exited 1\n"
+    )
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "manual_failure_reason"
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
+
+
 def test_classify_failure_reason_branch_unpushable_is_reconcile() -> None:
     assert classify_failure_reason("BRANCH_UNPUSHABLE") == "reconcile"
 

@@ -14,6 +14,7 @@ from .db import (
     MergeTargetResolutionError,
     SqliteTaskStore,
     Task as DbTask,
+    TaskStats,
     merge_unit_is_active,
     merge_unit_state_is_inactive_tombstone,
     task_id_numeric_key,
@@ -21,8 +22,10 @@ from .db import (
 from .dependency_preconditions import dependency_readiness, get_unmerged_dependency_precondition, task_is_merged
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
+from .failure_reasons import is_readonly_db_failure
 from .git import Git, GitError
 from .lifecycle_completion import task_is_complete_for_lifecycle
+from .log_paths import ops_log_path_for
 from .merge_state import classify_branch_merge_state_for_target, resolve_task_merge_state_for_target
 from .operator_state import (
     MOOT_EMPTY_LIFECYCLE_DETAIL,
@@ -32,6 +35,30 @@ from .operator_state import (
 from .recovery_read_context import RecoveryReadContext
 
 logger = logging.getLogger(__name__)
+
+_REBASE_COMPLETED_LOG_MARKERS = (
+    "rebase completed successfully",
+    "successfully rebased",
+)
+_REBASE_CHECKS_PASSED_LOG_MARKERS = (
+    "all checks passed",
+)
+_REBASE_CHECKS_FAILED_LOG_MARKERS = (
+    "check failed",
+    "checks failed",
+    "verification failed",
+    "verify failed",
+    "test failed",
+    "tests failed",
+    "error while running checks",
+    "error during checks",
+)
+_REBASE_INFRA_LOG_MARKERS = (
+    "git worktree list --porcelain failed",
+    "invalid path '/gza-git'",
+    "/gza-git/",
+    "worktree metadata became unavailable",
+)
 
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
 _MANUAL_ONLY_REASONS = {
@@ -816,6 +843,107 @@ def _project_dir_for_store(store: SqliteTaskStore) -> Path | None:
     return None
 
 
+def _read_failed_task_log_text(store: SqliteTaskStore, task: DbTask) -> str:
+    if not task.log_file:
+        return ""
+    project_dir = _project_dir_for_store(store)
+    stored_path = Path(task.log_file)
+    if stored_path.is_absolute():
+        conversation_path = stored_path
+    elif project_dir is None:
+        return ""
+    else:
+        conversation_path = project_dir / stored_path
+    ops_path = ops_log_path_for(conversation_path)
+    chunks: list[str] = []
+    for path in (conversation_path, ops_path):
+        if not path.exists():
+            continue
+        try:
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(chunks).casefold()
+
+
+def _persist_historical_rebase_success_reconciliation(
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> None:
+    original_completed_at = task.completed_at
+    head_sha = getattr(task, "head_sha", None)
+    base_sha = getattr(task, "base_sha", None)
+    store.mark_completed(
+        task,
+        branch=task.branch,
+        log_file=task.log_file,
+        report_file=task.report_file,
+        output_content=task.output_content,
+        has_commits=bool(task.has_commits),
+        stats=TaskStats(
+            duration_seconds=task.duration_seconds,
+            num_steps_reported=task.num_steps_reported,
+            num_steps_computed=task.num_steps_computed,
+            num_turns_reported=task.num_turns_reported,
+            num_turns_computed=task.num_turns_computed,
+            cost_usd=task.cost_usd,
+            input_tokens=task.input_tokens,
+            output_tokens=task.output_tokens,
+        ),
+        diff_files_changed=task.diff_files_changed,
+        diff_lines_added=task.diff_lines_added,
+        diff_lines_removed=task.diff_lines_removed,
+        changed_diff=task.changed_diff,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        completion_reason=task.completion_reason,
+    )
+    if original_completed_at is not None:
+        task.completed_at = original_completed_at
+        store.update(task)
+
+
+def _reconcile_historical_rebase_success(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
+    if task.status != "failed" or task.task_type != "rebase" or (task.failure_reason or "UNKNOWN") != "GIT_ERROR":
+        return False
+    log_text = _read_failed_task_log_text(store, task)
+    if not log_text:
+        return False
+    if is_readonly_db_failure(log_text):
+        return False
+    if any(marker in log_text for marker in _REBASE_INFRA_LOG_MARKERS):
+        return False
+    if not any(marker in log_text for marker in _REBASE_COMPLETED_LOG_MARKERS):
+        return False
+    if not any(marker in log_text for marker in _REBASE_CHECKS_PASSED_LOG_MARKERS):
+        return False
+    if any(marker in log_text for marker in _REBASE_CHECKS_FAILED_LOG_MARKERS):
+        return False
+    if read_context is not None and not read_context.allow_reconcile_mutation:
+        read_context.record_rebase_success_reconciliation(task)
+        return True
+    _persist_historical_rebase_success_reconciliation(store, task)
+    return True
+
+
+def _normalize_failed_rebase_reason(store: SqliteTaskStore, task: DbTask, reason: str) -> str:
+    if task.task_type != "rebase" or reason != "GIT_ERROR":
+        return reason
+    log_text = _read_failed_task_log_text(store, task)
+    if not log_text:
+        return reason
+    if is_readonly_db_failure(log_text):
+        return "INFRASTRUCTURE_ERROR"
+    if any(marker in log_text for marker in _REBASE_INFRA_LOG_MARKERS):
+        return "INFRASTRUCTURE_ERROR"
+    return reason
+
+
 def _task_lineage_branch_keys(
     store: SqliteTaskStore,
     task: DbTask,
@@ -1098,10 +1226,11 @@ def _matching_failed_terminal_descendants(
 def _expected_recovery_action(
     task: DbTask,
     *,
+    reason: str | None = None,
     chain: RecoveryChainState,
     prerequisite_reconciliation: PrerequisiteUnmergedReconciliation | None = None,
 ) -> RecoveryAction | None:
-    reason = task.failure_reason or "UNKNOWN"
+    reason = reason or task.failure_reason or "UNKNOWN"
     category = classify_failure_reason(reason)
 
     if reason == "PREREQUISITE_UNMERGED":
@@ -1181,6 +1310,10 @@ def apply_pending_recovery_reconciliations(
     read_context.pending_prerequisite_no_work_reconciliations.clear()
     for task, merge_state in pending:
         _persist_prerequisite_unmerged_no_work_reconciliation(store, task, merge_state)
+    pending_rebase_success = tuple(read_context.pending_rebase_success_reconciliations.values())
+    read_context.pending_rebase_success_reconciliations.clear()
+    for task in pending_rebase_success:
+        _persist_historical_rebase_success_reconciliation(store, task)
 
 
 def _reconcile_historical_prerequisite_unmerged_failure(
@@ -1278,6 +1411,9 @@ def _failed_task_requires_operator_recovery(
     merge_context: _MergeContext,
     read_context: RecoveryReadContext | None = None,
 ) -> bool:
+    if _reconcile_historical_rebase_success(store, task, read_context=read_context):
+        return False
+
     def _resolved_recovery_merge_state() -> str | None:
         merge_state = _task_merge_state_for_recovery(store, task, read_context=read_context)
         if (
@@ -1297,7 +1433,7 @@ def _failed_task_requires_operator_recovery(
             )
         return merge_state
 
-    reason = task.failure_reason or "UNKNOWN"
+    reason = _normalize_failed_rebase_reason(store, task, task.failure_reason or "UNKNOWN")
     if reason == "PREREQUISITE_UNMERGED":
         reconciliation = _reconcile_historical_prerequisite_unmerged_failure(
             store,
@@ -1409,7 +1545,16 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    reason = task.failure_reason or "UNKNOWN"
+    if _reconcile_historical_rebase_success(store, task, read_context=read_context):
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="historical_rebase_success_reconciled",
+            reason_text="historical rebase log proves task already completed successfully",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+
+    reason = _normalize_failed_rebase_reason(store, task, task.failure_reason or "UNKNOWN")
     prerequisite_reconciliation: PrerequisiteUnmergedReconciliation | None = None
     expected_action: RecoveryAction | None
     if reason == "PREREQUISITE_UNMERGED":
@@ -1421,11 +1566,12 @@ def decide_failed_task_recovery(
         )
         expected_action = _expected_recovery_action(
             task,
+            reason=reason,
             chain=chain,
             prerequisite_reconciliation=prerequisite_reconciliation,
         )
     else:
-        expected_action = _expected_recovery_action(task, chain=chain)
+        expected_action = _expected_recovery_action(task, reason=reason, chain=chain)
     direct_reconcile_attempts = (
         load_branch_publication_state(store, task.id).reconcile_attempts_consumed
         if expected_action == "reconcile"

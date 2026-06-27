@@ -29,6 +29,7 @@ class RecoveryReadContext:
         str,
         tuple[DbTask, Literal["empty", "redundant"]],
     ] = field(default_factory=dict)
+    pending_rebase_success_reconciliations: dict[str, DbTask] = field(default_factory=dict)
     allow_reconcile_mutation: bool = True
 
     def get_task(self, task_id: str | None) -> DbTask | None:
@@ -240,3 +241,8 @@ class RecoveryReadContext:
         if task.id is None:
             return
         self.pending_prerequisite_no_work_reconciliations[task.id] = (task, merge_state)
+
+    def record_rebase_success_reconciliation(self, task: DbTask) -> None:
+        if task.id is None:
+            return
+        self.pending_rebase_success_reconciliations[task.id] = task

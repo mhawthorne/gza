@@ -74,6 +74,7 @@ from .extractions import (
     resolve_manifest_patch_path,
 )
 from .failure_reasons import (
+    is_readonly_db_failure,
     mark_task_failed_from_cause as _mark_task_failed,
     preserves_failure_reason_over_terminal_no_work as _preserves_failure_reason_over_terminal_no_work,
     resolve_failure_reason as _resolve_failure_reason,
@@ -302,10 +303,14 @@ def _rebase_conflict_failure() -> ResolvedRunFailure:
 
 
 def _resolved_git_failure(error: BaseException) -> ResolvedRunFailure:
-    if git_error_indicates_containerized_worktree_metadata_failure(error):
+    if git_error_indicates_containerized_worktree_metadata_failure(error) or is_readonly_db_failure(error):
         return ResolvedRunFailure(
             reason="INFRASTRUCTURE_ERROR",
-            status="Failed: git worktree metadata became unavailable",
+            status=(
+                "Failed: task DB snapshot was not writable"
+                if is_readonly_db_failure(error)
+                else "Failed: git worktree metadata became unavailable"
+            ),
             outcome_message="Outcome: failed (INFRASTRUCTURE_ERROR)",
         )
     return _git_error_failure()
@@ -6767,8 +6772,13 @@ def _resolve_task_db_path(config: Config) -> Path:
     return Path(".gza") / "gza.db"
 
 
-def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
-    """Create a consistent read-only DB snapshot in the task worktree.
+def _snapshot_task_db_to_worktree(
+    db_path: Path,
+    worktree_path: Path,
+    *,
+    read_only: bool = True,
+) -> None:
+    """Create a consistent DB snapshot in the task worktree.
 
     Uses SQLite's backup API so the snapshot is transactionally consistent even
     while the live DB is being written by the host runner.
@@ -6785,17 +6795,27 @@ def _snapshot_task_db_to_worktree(db_path: Path, worktree_path: Path) -> None:
 
     _backup_sqlite_file(db_path, snapshot_path)
 
-    snapshot_path.chmod(0o444)
+    snapshot_path.chmod(0o444 if read_only else 0o644)
 
 
-def _stage_worktree_agent_resources(config: Config, worktree_path: Path, boundary: ProjectBoundary) -> int:
-    """Install bundled skills and the read-only DB snapshot at the scoped project root."""
+def _stage_worktree_agent_resources(
+    config: Config,
+    worktree_path: Path,
+    boundary: ProjectBoundary,
+    *,
+    read_only_db_snapshot: bool = True,
+) -> int:
+    """Install bundled skills and the task DB snapshot at the scoped project root."""
     from .skills_utils import ensure_all_skills
 
     scoped_worktree_root = _worktree_project_root(worktree_path, boundary)
     skills_dir = scoped_worktree_root / ".claude" / "skills"
     n_installed = ensure_all_skills(skills_dir)
-    _snapshot_task_db_to_worktree(_resolve_task_db_path(config), scoped_worktree_root)
+    _snapshot_task_db_to_worktree(
+        _resolve_task_db_path(config),
+        scoped_worktree_root,
+        read_only=read_only_db_snapshot,
+    )
     return n_installed
 
 
@@ -8597,8 +8617,13 @@ def _run_inner(
         task.num_steps_computed = count
         store.update(task)
 
-    # Ensure bundled skills and the readonly task DB snapshot are available at project scope.
-    n_installed = _stage_worktree_agent_resources(config, worktree_path, boundary)
+    # Rebase task workspaces need a writable DB snapshot for local merge-truth refreshes.
+    n_installed = _stage_worktree_agent_resources(
+        config,
+        worktree_path,
+        boundary,
+        read_only_db_snapshot=task.task_type != "rebase",
+    )
     if n_installed:
         console.print(f"Installed {n_installed} skill(s) into worktree")
 
@@ -9087,8 +9112,12 @@ def _run_non_code_task(
         else:
             prompt_report_path = worktree_report_path
 
-        # Ensure bundled skills and the readonly task DB snapshot are available at project scope.
-        n_installed = _stage_worktree_agent_resources(config, worktree_path, boundary)
+        n_installed = _stage_worktree_agent_resources(
+            config,
+            worktree_path,
+            boundary,
+            read_only_db_snapshot=task.task_type != "rebase",
+        )
         if n_installed:
             console.print(f"Installed {n_installed} skill(s) into worktree")
 

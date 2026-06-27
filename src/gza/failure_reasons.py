@@ -41,6 +41,7 @@ _RUNNER_OWNED_LOG_FALLBACK_REASONS = frozenset(
 __all__ = [
     "TERMINAL_NO_WORK_FAILURE_REASON",
     "TERMINATED_FAILURE_REASON",
+    "is_readonly_db_failure",
     "mark_task_failed_from_cause",
     "preserves_failure_reason_over_terminal_no_work",
     "resolve_failure_reason",
@@ -62,6 +63,23 @@ def _extract_log_fallback_failure_reason(log_file: Path) -> str:
     if reason in _RUNNER_OWNED_LOG_FALLBACK_REASONS:
         return "UNKNOWN"
     return reason
+
+
+def is_readonly_db_failure(error_or_message: BaseException | str | None) -> bool:
+    """Return whether text points to a read-only SQLite task DB failure."""
+    if error_or_message is None:
+        return False
+    message = str(error_or_message).lower()
+    return any(
+        marker in message
+        for marker in (
+            "attempt to write a readonly database",
+            "attempt to write a read-only database",
+            "readonly database",
+            "read-only database",
+            "mode 444",
+        )
+    )
 
 
 def terminal_no_work_failure_reason(merge_state: str | None) -> str | None:

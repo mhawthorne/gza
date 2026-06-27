@@ -111,6 +111,10 @@ Consequences:
   unavailable worktree metadata (for example `git worktree list --porcelain` or similar
   commands failing on `/gza-git/...`) MUST classify as retryable infrastructure failure,
   not as generic `GIT_ERROR` / manual-only parking.
+- A historical `rebase` row whose recorded failure reason is `GIT_ERROR` but whose log
+  proves the rebase and checks already completed successfully MUST be reconciled into
+  `status == "completed"` success, preserving its recorded task artifacts. It MUST NOT be
+  classified as retryable infrastructure failure or parked for manual recovery.
 - Provider-side transient availability failures surfaced as stream/log errors (for
   example a Codex `turn.failed` reporting that the selected model is at capacity)
   MUST classify as a retryable provider-availability failure, not `UNKNOWN`.
