@@ -20,6 +20,7 @@ from gza.sync_ops import (
     build_default_branch_cohorts,
     build_task_branch_cohort,
     build_unmerged_branch_cohorts,
+    reconcile_local_target_terminal_no_work,
     reconcile_branch_merge_truth,
     reconcile_task_branch_merge_truth,
     sync_branch_cohorts,
@@ -2019,6 +2020,111 @@ def test_reconcile_task_branch_merge_truth_persists_preserved_empty_when_ref_una
     assert refreshed_unit is not None
     assert refreshed_unit.state == "empty"
     assert refreshed_unit.merged_at is None
+
+
+def test_reconcile_local_target_terminal_no_work_persists_proven_empty_state(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Task", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/local-empty"
+    task.has_commits = False
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.ref_exists.return_value = False
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/local-empty": "shared-tree-sha" if peel == "tree" else "sha-abc123",
+        "main": "shared-tree-sha" if peel == "tree" else "sha-def456",
+    }
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/local-empty": "sha-abc123",
+        "main": "sha-def456",
+    }.get(ref)
+    git.count_commits_ahead.return_value = 0
+
+    results = reconcile_local_target_terminal_no_work(store, git, target_branch="main")
+
+    assert len(results) == 1
+    assert results[0].merge_status == "empty"
+    assert results[0].merge_status_proven is True
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "empty"
+
+
+def test_reconcile_local_target_terminal_no_work_persists_proven_redundant_state(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/local-redundant")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.ref_exists.return_value = False
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "feature/local-redundant": "shared-tree-sha" if peel == "tree" else "sha-abc123",
+        "main": "shared-tree-sha" if peel == "tree" else "sha-def456",
+    }
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/local-redundant": "sha-abc123",
+        "main": "sha-def456",
+    }.get(ref)
+    git.count_commits_ahead.return_value = 0
+
+    results = reconcile_local_target_terminal_no_work(store, git, target_branch="main")
+
+    assert len(results) == 1
+    assert results[0].merge_status == "redundant"
+    assert results[0].merge_status_proven is True
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "redundant"
+
+
+def test_reconcile_local_target_terminal_no_work_fails_closed_without_proof(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/local-no-proof")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    class _GitWithoutTreeResolveRefs:
+        def branch_exists(self, branch: str) -> bool:
+            return branch == "feature/local-no-proof"
+
+        def is_merged(self, source: str, into: str = "main") -> bool:
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                "feature/local-no-proof": "sha-abc123",
+                "main": "sha-def456",
+            }.get(ref)
+
+        def count_commits_ahead(self, source: str, target: str) -> int:
+            assert (source, target) == ("feature/local-no-proof", "main")
+            return 0
+
+    results = reconcile_local_target_terminal_no_work(
+        store,
+        _GitWithoutTreeResolveRefs(),
+        target_branch="main",
+    )
+
+    assert len(results) == 1
+    assert results[0].merge_status == "unmerged"
+    assert results[0].merge_status_proven is False
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
 
 
 def test_git_reconcile_update_drops_merge_source_for_empty_result() -> None:

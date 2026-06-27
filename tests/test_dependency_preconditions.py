@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gza import dependency_preconditions as dependency_preconditions_module
@@ -9,6 +10,7 @@ from gza.dependency_preconditions import (
 from gza.db import SqliteTaskStore
 from gza.lineage_query import _load_indexes
 from gza.recovery_read_context import RecoveryReadContext
+from gza.sync_ops import reconcile_local_target_terminal_no_work
 
 
 def _read_context_for_store(store: SqliteTaskStore) -> RecoveryReadContext:
@@ -117,6 +119,59 @@ def test_dependency_precondition_redundant_unit_uses_completed_empty_policy(tmp_
 
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
+    assert get_unmerged_dependency_precondition(store, downstream) is None
+
+
+def test_dependency_precondition_ready_after_local_target_empty_reconciliation(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dependency = store.add("Dependency", task_type="implement")
+    dependency.status = "completed"
+    dependency.completed_at = datetime.now(UTC)
+    dependency.branch = "feature/dependency-local-empty"
+    dependency.has_commits = False
+    dependency.merge_status = "unmerged"
+    store.update(dependency)
+    assert dependency.id is not None
+    unit = store.get_or_create_merge_unit_for_task(dependency)
+    assert unit is not None
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
+
+    class _EmptyProofGit:
+        def branch_exists(self, branch: str) -> bool:
+            return branch == "feature/dependency-local-empty"
+
+        def is_merged(self, source: str, into: str = "main") -> bool:
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def resolve_refs(self, refs, peel: str = "commit"):
+            return {
+                "feature/dependency-local-empty": "shared-tree-sha" if peel == "tree" else "sha-abc123",
+                "main": "shared-tree-sha" if peel == "tree" else "sha-def456",
+            }
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                "feature/dependency-local-empty": "sha-abc123",
+                "main": "sha-def456",
+            }.get(ref)
+
+        def count_commits_ahead(self, source: str, target: str) -> int:
+            assert (source, target) == ("feature/dependency-local-empty", "main")
+            return 0
+
+    reconcile_local_target_terminal_no_work(
+        store,
+        _EmptyProofGit(),
+        target_branch="main",
+    )
+
+    readiness = dependency_readiness(store, downstream)
+    assert readiness.ready is True
     assert get_unmerged_dependency_precondition(store, downstream) is None
 
 

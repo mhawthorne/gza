@@ -1153,8 +1153,11 @@ def query_lineage_owner_rows(
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    persist_terminal_no_work_merge_truth: bool = False,
     reuse_recovery_merge_context: bool = False,
 ) -> tuple[LineageOwnerRow, ...]:
+    if persist_terminal_no_work_merge_truth:
+        _maybe_persist_terminal_no_work_merge_truth(store, git=git, target_branch=target_branch)
     rows, read_context = _query_lineage_owner_rows_with_context(
         store,
         query,
@@ -1201,10 +1204,13 @@ def query_lineage_owner_rows_in_read_session(
     target_branch: str | None = None,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    persist_terminal_no_work_merge_truth: bool = False,
     reuse_recovery_merge_context: bool = False,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .recovery_engine import apply_pending_recovery_reconciliations
 
+    if persist_terminal_no_work_merge_truth:
+        _maybe_persist_terminal_no_work_merge_truth(store, git=git, target_branch=target_branch)
     with store.read_session():
         rows, read_context = _query_lineage_owner_rows_with_context(
             store,
@@ -1218,6 +1224,27 @@ def query_lineage_owner_rows_in_read_session(
         )
     apply_pending_recovery_reconciliations(store, read_context=read_context)
     return rows, read_context
+
+
+def _maybe_persist_terminal_no_work_merge_truth(
+    store: SqliteTaskStore,
+    *,
+    git: Git | None,
+    target_branch: str | None,
+) -> None:
+    if git is None or target_branch is None:
+        return
+    if getattr(store, "_open_mode", None) == "query_only":
+        return
+    if not isinstance(git, Git):
+        return
+    required_git_methods = ("branch_exists", "is_merged", "ref_exists", "rev_parse_if_exists")
+    if not all(callable(getattr(git, method_name, None)) for method_name in required_git_methods):
+        return
+    from .sync_ops import reconcile_local_target_terminal_no_work
+
+    reconcile_local_target_terminal_no_work(store, git, target_branch=target_branch)
+
 
 def _query_lineage_owner_rows_with_context(
     store: SqliteTaskStore,

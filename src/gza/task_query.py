@@ -520,6 +520,7 @@ class TaskQueryService:
 
         rows: list[LineageRow]
         if use_incomplete_rollup:
+            persist_reconciliation = getattr(self._store, "_open_mode", None) != "query_only"
             if query.task_types and len(query.task_types) > 1:
                 raise ValueError(
                     "lineages scope with lifecycle_state=incomplete supports at most one task type"
@@ -541,6 +542,9 @@ class TaskQueryService:
                 config=config,
                 git=git,
                 target_branch=target_branch,
+                persist_post_merge_rebase_state=persist_reconciliation,
+                persist_review_clearance=persist_reconciliation,
+                persist_terminal_no_work_merge_truth=persist_reconciliation,
             )
             rows = [
                 LineageRow(

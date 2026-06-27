@@ -77,6 +77,7 @@ def collect_lifecycle_action_entries(
         target_branch=target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_post_merge_rebase_state,
+        persist_terminal_no_work_merge_truth=persist_post_merge_rebase_state,
     )
 
     entries: list[LifecycleActionEntry] = []

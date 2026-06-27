@@ -92,6 +92,7 @@ class BranchSyncResult:
     fetch_attempted: bool = False
     fetch_succeeded: bool = False
     reconciled: bool = False
+    merge_status_proven: bool = False
     actions: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -349,21 +350,21 @@ def reconcile_branch_merge_truth(
     results: list[BranchSyncResult] = []
 
     for cohort in cohorts:
+        branch_tasks = tuple(task for task in cohort.tasks if task.branch == cohort.branch)
         result = BranchSyncResult(
             branch=cohort.branch,
-            task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
+            task_ids=tuple(task.id for task in branch_tasks if task.id is not None),
             reconciled=True,
         )
         results.append(result)
-        code_tasks = cohort.code_tasks
-        if not code_tasks:
-            result.skipped_reason = "no code-bearing task rows"
+        if not branch_tasks:
+            result.skipped_reason = "no branch-backed task rows"
             continue
 
         owner_tasks = cohort.merge_status_owner_tasks
-        source_owner_task = owner_tasks[0] if owner_tasks else code_tasks[0]
+        source_owner_task = owner_tasks[0] if owner_tasks else branch_tasks[0]
         source_has_commits = source_owner_task.has_commits
-        desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
+        desired_merge_status = owner_tasks[0].merge_status if owner_tasks else branch_tasks[0].merge_status
         proof_target_ref = remote_target_ref or target_branch
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
@@ -410,6 +411,7 @@ def reconcile_branch_merge_truth(
                 source_has_commits=source_has_commits,
                 on_warning=result.warnings.append,
             )
+            result.merge_status_proven = desired_merge_status in {"merged", "empty", "redundant"}
             if desired_merge_status == "merged":
                 _mark_merged(result)
                 result.merge_source = MERGE_SOURCE_EXTERNAL
@@ -446,6 +448,7 @@ def reconcile_branch_merge_truth(
                 classify_state = "unknown"
             if classify_state in {"empty", "redundant"}:
                 desired_merge_status = classify_state
+                result.merge_status_proven = True
             elif classify_state == "unknown":
                 result.warnings.append(
                     f"branch '{cohort.branch}': could not determine unique commit count "
@@ -710,16 +713,17 @@ def _persist_branch_updates(
 ) -> None:
     """Write combined branch-state updates once per error-free cohort."""
     for cohort, result, update in zip(cohorts, results, updates, strict=True):
+        branch_tasks = tuple(task for task in cohort.tasks if task.branch == cohort.branch)
         if not result.ok:
             continue
         if result.skipped_reason is not None:
             continue
-        if not cohort.code_tasks:
+        if not branch_tasks:
             continue
         try:
             _persist_branch_state(
                 store,
-                cohort.code_tasks,
+                branch_tasks,
                 target_branch,
                 merge_unit_id=cohort.merge_unit_id,
                 merge_status=update.merge_status,
@@ -845,6 +849,60 @@ def reconcile_task_branch_merge_truth(
     if persist and result.skipped_reason is None:
         _persist_branch_updates(store, [cohort], [result], [_git_reconcile_update(result)], target_branch)
     return result
+
+
+def reconcile_local_target_terminal_no_work(
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    target_branch: str,
+) -> list[BranchSyncResult]:
+    """Persist proven local-target ``empty``/``redundant`` truth for canonical unmerged work.
+
+    This is the single writable host-side boundary for terminal no-work
+    reconciliation. Query-only surfaces must not call it.
+    """
+    cohorts = build_unmerged_branch_cohorts(store)
+    results_by_index, eligible_indices, eligible_cohorts = _partition_target_mismatch_cohorts(
+        store,
+        cohorts,
+        target_branch=target_branch,
+    )
+    if not eligible_cohorts:
+        return [results_by_index[idx] for idx in range(len(cohorts))]
+
+    results = reconcile_branch_merge_truth(
+        git,
+        eligible_cohorts,
+        target_branch=target_branch,
+        include_diff_stats=False,
+        remote_target_ref=None,
+    )
+    persist_cohorts: list[BranchCohort] = []
+    persist_results: list[BranchSyncResult] = []
+    persist_updates: list[_BranchPersistenceUpdate] = []
+    for cohort, result in zip(eligible_cohorts, results, strict=True):
+        if result.skipped_reason is not None:
+            continue
+        if result.merge_status not in {"empty", "redundant"}:
+            continue
+        if not result.merge_status_proven:
+            continue
+        persist_cohorts.append(cohort)
+        persist_results.append(result)
+        persist_updates.append(_git_reconcile_update(result))
+    if persist_cohorts:
+        _persist_branch_updates(
+            store,
+            persist_cohorts,
+            persist_results,
+            persist_updates,
+            target_branch,
+        )
+
+    for idx, result in zip(eligible_indices, results, strict=True):
+        results_by_index[idx] = result
+    return [results_by_index[idx] for idx in range(len(cohorts))]
 
 
 def sync_branch_cohorts(

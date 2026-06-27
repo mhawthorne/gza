@@ -16417,6 +16417,59 @@ class TestIncompleteCommand:
         assert json.loads(result.stdout) == []
         assert result.stderr == ""
 
+    def test_incomplete_query_only_preview_does_not_persist_terminal_no_work_state(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("readonly redundant owner", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = "feature/readonly-redundant-owner"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        unit = store.get_or_create_merge_unit_for_task(impl)
+        assert unit is not None
+
+        class _PreviewRedundantGit(_FastUnmergedGit):
+            def resolve_refs(self, refs, peel: str = "commit"):
+                return {
+                    "feature/readonly-redundant-owner": "shared-tree-sha" if peel == "tree" else "sha-abc123",
+                    "main": "shared-tree-sha" if peel == "tree" else "sha-def456",
+                }
+
+            def rev_parse_if_exists(self, ref: str) -> str | None:
+                if ref == "main":
+                    return "sha-def456"
+                if ref == "feature/readonly-redundant-owner":
+                    return "sha-abc123"
+                return None
+
+            def count_commits_ahead(self, branch: str, target: str) -> int:
+                assert (branch, target) == ("feature/readonly-redundant-owner", "main")
+                return 0
+
+        with patch("gza.cli.query.Git", return_value=_PreviewRedundantGit()):
+            result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id",
+                "--project",
+                str(tmp_path),
+            )
+
+        refreshed_store = make_store(tmp_path)
+        refreshed_unit = refreshed_store.get_merge_unit(unit.id)
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [{"id": impl.id}]
+        assert "readonly" not in result.stderr.lower()
+        assert "traceback" not in result.stderr.lower()
+        assert refreshed_unit is not None
+        assert refreshed_unit.state == "unmerged"
+
     def test_incomplete_normalization_keeps_merged_owner_with_live_unresolved_descendant(
         self,
         tmp_path: Path,

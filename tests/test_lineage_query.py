@@ -19,6 +19,7 @@ from gza.lineage_query import (
     _query_lineage_owner_rows_with_context,
     collect_stale_unmerged_sweep_candidates,
     query_lineage_owner_rows,
+    query_lineage_owner_rows_in_read_session,
 )
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_engine import list_failed_tasks_for_recovery
@@ -1401,6 +1402,172 @@ def test_query_lineage_owner_rows_failed_empty_prereq_surfaces_release_valve_by_
     assert row.next_action["type"] == "awaiting_human"
     assert "empty prerequisite" in row.next_action["description"]
     assert "requires recovery or manual resolution" in row.next_action["description"]
+
+
+@pytest.mark.parametrize(
+    ("merge_state", "has_commits", "branch"),
+    [
+        ("empty", False, "feature/lineage-terminal-empty"),
+        ("redundant", True, "feature/lineage-terminal-redundant"),
+    ],
+)
+def test_query_lineage_owner_rows_in_read_session_persists_terminal_no_work_and_hides_owner(
+    tmp_path: Path,
+    merge_state: str,
+    has_commits: bool,
+    branch: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add(f"Persist {merge_state} owner", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.has_commits = has_commits
+    task.merge_status = "unmerged"
+    store.update(task)
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    class _ProofGit(Git):
+        def __init__(self) -> None:
+            self.repo_dir = Path(".")
+            self._cache = None
+
+        def branch_exists(self, branch_name: str) -> bool:
+            return branch_name == branch
+
+        def local_branch_names(self) -> frozenset[str]:
+            return frozenset({branch, "main"})
+
+        def is_merged(self, source: str, into: str = "main") -> bool:
+            assert source == branch
+            assert into == "main"
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            del ref
+            return False
+
+        def resolve_refs(self, refs, peel: str = "commit"):
+            del refs
+            return {
+                branch: "shared-tree-sha" if peel == "tree" else "sha-abc123",
+                "main": "shared-tree-sha" if peel == "tree" else "sha-def456",
+            }
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                branch: "sha-abc123",
+                "main": "sha-def456",
+            }.get(ref)
+
+        def count_commits_ahead(self, source: str, target: str) -> int:
+            assert (source, target) == (branch, "main")
+            return 0
+
+        def count_commits_ahead_checked(self, source: str, target: str) -> int | None:
+            assert (source, target) == (branch, "main")
+            return 0
+
+        def merge_base(self, ref1: str, ref2: str) -> str:
+            assert (ref1, ref2) == (branch, "main")
+            return "main"
+
+        def can_merge(self, source: str, target: str) -> bool:
+            assert (source, target) == (branch, "main")
+            return True
+
+        def get_diff_name_status(self, revision_range: str, **_kwargs) -> str:
+            assert revision_range == f"main...{branch}"
+            return ""
+
+        def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+            assert (commit, target) == (branch, "main")
+            return True
+
+        def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
+            assert (source_ref, target) == (branch, "main")
+            return False
+
+    rows, _read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=_ProofGit(),
+        target_branch="main",
+        persist_terminal_no_work_merge_truth=True,
+    )
+
+    assert rows == ()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == merge_state
+
+
+def test_query_lineage_owner_rows_in_read_session_fails_closed_when_terminal_no_work_proof_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Ambiguous no-work owner", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/lineage-no-proof"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    class _GitWithoutTreeResolveRefs:
+        def branch_exists(self, branch_name: str) -> bool:
+            return branch_name == "feature/lineage-no-proof"
+
+        def is_merged(self, source: str, into: str = "main") -> bool:
+            return False
+
+        def ref_exists(self, ref: str) -> bool:
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                "feature/lineage-no-proof": "sha-abc123",
+                "main": "sha-def456",
+            }.get(ref)
+
+        def count_commits_ahead(self, source: str, target: str) -> int:
+            assert (source, target) == ("feature/lineage-no-proof", "main")
+            return 0
+
+        def can_merge(self, source: str, target: str) -> bool:
+            assert (source, target) == ("feature/lineage-no-proof", "main")
+            return True
+
+        def get_diff_name_status(self, revision_range: str, **_kwargs) -> str:
+            assert revision_range == "main...feature/lineage-no-proof"
+            return ""
+
+    rows, _read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=_GitWithoutTreeResolveRefs(),
+        target_branch="main",
+        persist_terminal_no_work_merge_truth=True,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].owner_task.id == task.id
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
 
 
 def test_blocked_by_empty_prereq_label_uses_completed_retry_descendant_from_read_context(
