@@ -655,6 +655,82 @@ def _build_owner_tree(
     return filtered, tuple(flatten_lineage_tree(filtered))
 
 
+def _build_descendants_only_owner_tree(
+    *,
+    owner_task: DbTask,
+    based_on_children: Mapping[str, list[DbTask]],
+    depends_on_children: Mapping[str, list[DbTask]],
+) -> tuple[Any, tuple[DbTask, ...]]:
+    from .query import (
+        TaskLineageNode,
+        _classify_child_relationship,
+        _lineage_child_sort_key,
+        flatten_lineage_tree,
+    )
+
+    if owner_task.id is None:
+        tree = TaskLineageNode(task=owner_task, depth=0, relationship="root")
+        return tree, (owner_task,)
+
+    def _build_node(
+        task: DbTask,
+        *,
+        parent_task: DbTask | None,
+        depth: int,
+    ) -> TaskLineageNode:
+        relationship = (
+            "root"
+            if parent_task is None
+            else _classify_child_relationship(parent_task, task)
+        )
+        node = TaskLineageNode(task=task, depth=depth, relationship=relationship)
+        if task.id is None:
+            return node
+
+        direct_based_on_children = list(based_on_children.get(task.id, ()))
+        review_by_id = {
+            child.id: child
+            for child in depends_on_children.get(task.id, ())
+            if child.id is not None and child.task_type == "review"
+        }
+        review_attached_children: dict[str, list[DbTask]] = {
+            review_id: [] for review_id in review_by_id
+        }
+        filtered_based_on_children: list[DbTask] = []
+        for child in direct_based_on_children:
+            if child.id is not None and child.id in review_by_id:
+                continue
+            if child.depends_on is not None and child.depends_on in review_attached_children:
+                review_attached_children[child.depends_on].append(child)
+            else:
+                filtered_based_on_children.append(child)
+
+        direct_children = [*review_by_id.values(), *filtered_based_on_children]
+        direct_children.sort(key=lambda child: _lineage_child_sort_key(task, child))
+
+        for child in direct_children:
+            child_node = _build_node(child, parent_task=task, depth=depth + 1)
+            if child.task_type == "review" and child.id is not None:
+                nested_children = review_attached_children.get(child.id, ())
+                for nested_child in sorted(
+                    nested_children,
+                    key=lambda nested: _lineage_child_sort_key(child, nested),
+                ):
+                    child_node.children.append(
+                        _build_node(
+                            nested_child,
+                            parent_task=child,
+                            depth=depth + 2,
+                        )
+                    )
+            node.children.append(child_node)
+
+        return node
+
+    tree = _build_node(owner_task, parent_task=None, depth=0)
+    return tree, tuple(flatten_lineage_tree(tree))
+
+
 def _select_representative_completed_task(
     store: SqliteTaskStore,
     snapshot: LineageOwnerSnapshot,
@@ -691,6 +767,159 @@ def _select_representative_completed_task(
         if rep is not None:
             return rep
     return max(actionable, key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)))
+
+
+def _resolve_incomplete_explicit_subject_task(
+    store: SqliteTaskStore,
+    action: Mapping[str, Any],
+    row: LineageOwnerRow,
+) -> DbTask | None:
+    from .cli.advance_engine import get_action_subject_task_id
+
+    subject_task_id = get_action_subject_task_id(action)
+    if subject_task_id is None:
+        return None
+    subject_task = store.get(subject_task_id)
+    if subject_task is None or subject_task.id != subject_task_id:
+        return None
+    candidate_ids = {
+        task.id
+        for task in (
+            row.owner_task,
+            *row.members,
+            *row.unresolved_tasks,
+            row.lifecycle_action_task,
+            row.recovery_action_task,
+            row.recovery_leaf_task,
+        )
+        if isinstance(task, DbTask) and task.id is not None
+    }
+    if subject_task.id not in candidate_ids:
+        subject_root_id = _resolve_lineage_root(store, subject_task).id
+        if subject_root_id is None:
+            return None
+        if not any(
+            (candidate := store.get(candidate_id)) is not None
+            and candidate.id is not None
+            and _resolve_lineage_root(store, candidate).id == subject_root_id
+            for candidate_id in candidate_ids
+        ):
+            return None
+    return subject_task
+
+
+def _resolve_incomplete_owner_task(
+    store: SqliteTaskStore,
+    row: LineageOwnerRow,
+    *,
+    indexes: _LineageIndexes | None = None,
+) -> DbTask:
+    from .cli.advance_engine import _resolve_subject_fallback_task
+    from .query import resolve_lineage_owner_task
+
+    ordered: list[DbTask] = []
+    seen: set[str | None] = set()
+    for task in (
+        row.owner_task,
+        row.lifecycle_action_task,
+        row.recovery_action_task,
+        row.recovery_leaf_task,
+        *row.unresolved_tasks,
+        *row.members,
+    ):
+        if task is None or task.id in seen:
+            continue
+        seen.add(task.id)
+        ordered.append(task)
+
+    for candidate in ordered:
+        if blocked_by_empty_prereq_label(store, candidate) is not None:
+            return candidate
+    for candidate in ordered:
+        owner_task = resolve_lineage_owner_task(store, candidate)
+        if owner_task.task_type == "implement" and owner_task.branch:
+            return _resolve_subject_fallback_task(store, row, fallback_task=owner_task)
+    for candidate in ordered:
+        owner_task = resolve_lineage_owner_task(store, candidate)
+        if owner_task.task_type == "implement":
+            return _resolve_subject_fallback_task(store, row, fallback_task=owner_task)
+    return _resolve_subject_fallback_task(store, row, fallback_task=row.owner_task)
+
+
+def _prepare_incomplete_owner_row(
+    store: SqliteTaskStore,
+    *,
+    indexes: _LineageIndexes | None = None,
+    row: LineageOwnerRow,
+    exclude_dropped: bool,
+) -> LineageOwnerRow | None:
+    from .cli.advance_engine import classify_advance_action, resolve_subject_task
+
+    resolved_indexes = indexes or _load_indexes(store)
+    owner_task = _resolve_incomplete_owner_task(store, row, indexes=resolved_indexes)
+    action = row.next_action
+    if action is not None and classify_advance_action(action) == "needs_attention":
+        explicit_subject = _resolve_incomplete_explicit_subject_task(store, action, row)
+        owner_task = resolve_subject_task(store, action, row, fallback_task=owner_task)
+        if owner_task.id != row.owner_task.id and explicit_subject is None:
+            action = None
+
+    merge_units_by_task_id: dict[str, MergeUnit] = {}
+    for task in (owner_task, *row.members, *row.unresolved_tasks):
+        if task is None or task.id is None or task.id in merge_units_by_task_id:
+            continue
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None:
+            merge_units_by_task_id[task.id] = unit
+    unresolved_tasks = filter_display_unresolved_tasks_for_incomplete(
+        row.unresolved_tasks,
+        merge_units_by_task_id=merge_units_by_task_id,
+        exclude_dropped=exclude_dropped,
+    )
+    if (
+        not unresolved_tasks
+        and row.recovery_leaf_task is not None
+        and row.recovery_leaf_task.status == "failed"
+        and (
+            row.recovery_leaf_task in row.unresolved_tasks
+            or row.recovery_action_task is row.recovery_leaf_task
+        )
+    ):
+        unresolved_tasks = (row.recovery_leaf_task,)
+    if owner_task.status == "dropped":
+        return None
+    if (
+        not unresolved_tasks
+        and owner_task.task_type == "plan"
+        and action is not None
+        and classify_advance_action(action) == "needs_attention"
+    ):
+        unresolved_tasks = (owner_task,)
+    if not unresolved_tasks:
+        return None
+
+    tree = row.tree
+    members = row.members
+    if owner_task.task_type == "implement":
+        tree, members = _build_descendants_only_owner_tree(
+            owner_task=owner_task,
+            based_on_children=resolved_indexes.based_on_children,
+            depends_on_children=resolved_indexes.depends_on_children,
+        )
+
+    return LineageOwnerRow(
+        owner_task=owner_task,
+        members=members,
+        tree=tree,
+        lineage_status=row.lineage_status,
+        next_action=action,
+        next_action_reason=str(action.get("description", "")) if action is not None else "",
+        unresolved_tasks=unresolved_tasks,
+        unresolved_leaf_summary=row.unresolved_leaf_summary,
+        lifecycle_action_task=row.lifecycle_action_task,
+        recovery_action_task=row.recovery_action_task,
+        recovery_leaf_task=row.recovery_leaf_task,
+    )
 
 
 def _requires_impl_branch_manual_resolution(
@@ -1615,12 +1844,6 @@ def _query_lineage_owner_rows_with_context(
                 parked_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
                 if parked_attention is not None:
                     action = parked_attention
-        lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
-        if not query.include_skipped and lineage_status == "skipped":
-            continue
-        if not _owner_matches_tag_filters(owner, query, tag_matcher=task_matches_tag_filters):
-            continue
-
         tree, rendered_members = _build_owner_tree(
             root_task=root,
             owner_task=owner,
@@ -1639,6 +1862,12 @@ def _query_lineage_owner_rows_with_context(
             for task in displayed_unresolved_tasks
             if task.id is not None
         )
+        lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
+        if not query.include_skipped and lineage_status == "skipped":
+            continue
+        if not _owner_matches_tag_filters(owner, query, tag_matcher=task_matches_tag_filters):
+            continue
+
         rows.append(
             LineageOwnerRow(
                 owner_task=owner,
@@ -1699,6 +1928,12 @@ def _query_lineage_owner_rows_with_context(
     if read_context.allow_reconcile_mutation:
         apply_pending_recovery_reconciliations(store, read_context=read_context)
     return (tuple(rows), read_context)
+
+
+def _resolve_lineage_root(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    from gza.query import resolve_lineage_root
+
+    return resolve_lineage_root(store, task)
 
 
 __all__ = [

@@ -57,10 +57,8 @@ from ..lineage import resolve_lineage_root as _resolve_lineage_root_task, walk_b
 from ..lineage_query import (
     StaleUnmergedSweepCandidate,
     collect_stale_unmerged_sweep_candidates,
-    filter_display_unresolved_tasks_for_incomplete,
 )
 from ..operator_state import (
-    blocked_by_empty_prereq_label,
     blocked_dependency_label,
     effective_no_work_merge_state,
     moot_empty_lifecycle_detail,
@@ -140,14 +138,11 @@ from ._queue_render import (
 )
 from ._recovery_lane import RecoveryLaneEntry, collect_recovery_lane_entries
 from .advance_engine import (
-    _resolve_subject_fallback_task,
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
     format_needs_attention_lifecycle,
-    get_action_subject_task_id,
     resolve_advance_context,
-    resolve_subject_task,
 )
 
 _LINEAGE_REL_LABELS = _QUERY_LINEAGE_REL_LABELS
@@ -1566,15 +1561,6 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     )
     with cache_scope:
         result = service.run(query, config=config, git=git, target_branch=target_branch)
-        if not blocked_by_dropped_only:
-            result = _normalize_incomplete_result_rows(
-                result,
-                service=service,
-                store=store,
-                config=config,
-                git=git,
-                target_branch=target_branch,
-            )
     if getattr(args, "json", False):
         _render_projection_result(result, use_json=True)
         return 0
@@ -1732,183 +1718,6 @@ def _incomplete_dirty_checkout_warning(
     except GitError:
         return None
     return "merges blocked: main checkout has uncommitted changes - commit or stash them first"
-
-
-def _normalize_incomplete_result_rows(
-    result: _TaskQueryResult,
-    *,
-    service: _TaskQueryService,
-    store: SqliteTaskStore,
-    config: Config,
-    git: Git | None,
-    target_branch: str | None,
-) -> _TaskQueryResult:
-    """Re-root incomplete rows on the implementation that owns the merge unit."""
-    normalized_rows: list[_TaskRow | _LineageRow] = []
-    changed = False
-    tag_filters = result.query.tag_filters
-    any_tag = result.query.any_tag
-
-    for row in result.rows:
-        if not isinstance(row, _LineageRow):
-            normalized_rows.append(row)
-            continue
-
-        owner_task = _resolve_incomplete_owner_task(store, row)
-        action = row.next_action_data
-        stale_fallback_action = False
-        if action is not None and classify_advance_action(action) == "needs_attention":
-            explicit_subject = _resolve_incomplete_explicit_subject_task(store, action, row)
-            owner_task = resolve_subject_task(store, action, row, fallback_task=owner_task)
-            stale_fallback_action = owner_task.id != row.owner_task.id and explicit_subject is None
-        merge_units_by_task_id: dict[str, MergeUnit] = {}
-        for task in (owner_task, *row.members, *row.unresolved_tasks):
-            if task is None or task.id is None or task.id in merge_units_by_task_id:
-                continue
-            unit = store.resolve_merge_unit_for_task(task.id)
-            if unit is not None:
-                merge_units_by_task_id[task.id] = unit
-        unresolved_tasks = filter_display_unresolved_tasks_for_incomplete(
-            row.unresolved_tasks,
-            merge_units_by_task_id=merge_units_by_task_id,
-            exclude_dropped=True,
-        )
-        if owner_task.status == "dropped":
-            changed = True
-            continue
-        if (
-            not unresolved_tasks
-            and owner_task.task_type == "plan"
-            and action is not None
-            and classify_advance_action(action) == "needs_attention"
-        ):
-            unresolved_tasks = (owner_task,)
-        if not unresolved_tasks:
-            changed = True
-            continue
-        if not task_matches_tag_filters(
-            task_tags=owner_task.tags,
-            tag_filters=tag_filters,
-            any_tag=any_tag,
-        ):
-            changed = True
-            continue
-
-        tree = row.tree
-        members = row.members
-        if owner_task.task_type == "implement":
-            tree = _descendants_only_unmerged_lineage_tree(store, owner_task=owner_task)
-            members = tuple(_flatten_query_lineage_tree(tree)) if tree is not None else ()
-
-        owner_changed = owner_task.id != row.owner_task.id
-        tree_changed = tree is not row.tree
-        members_changed = tuple(task.id for task in members) != tuple(task.id for task in row.members)
-        if not owner_changed and not tree_changed and not members_changed:
-            normalized_rows.append(row)
-            continue
-
-        changed = True
-        normalized_rows.append(
-            service._project_lineage_row(  # noqa: SLF001
-                _LineageRow(
-                    owner_task=owner_task,
-                    members=members,
-                    tree=tree,
-                    unresolved_tasks=unresolved_tasks,
-                    lifecycle_action_task=row.lifecycle_action_task,
-                    recovery_action_task=row.recovery_action_task,
-                    recovery_leaf_task=row.recovery_leaf_task,
-                    lineage_status=row.lineage_status,
-                    next_action_data=None if stale_fallback_action else row.next_action_data,
-                ),
-                result.query,
-                config=config,
-                git=git,
-                target_branch=target_branch,
-            )
-        )
-
-    if not changed:
-        return result
-    return _TaskQueryResult(query=result.query, rows=tuple(normalized_rows), total_count=result.total_count)
-
-
-def _resolve_incomplete_explicit_subject_task(
-    store: SqliteTaskStore,
-    action: object,
-    row: _LineageRow,
-) -> DbTask | None:
-    """Return the action's explicit subject when it still resolves within the row lineage."""
-
-    if not isinstance(action, Mapping):
-        return None
-    action_mapping = cast("Mapping[str, object]", action)
-    subject_task_id = get_action_subject_task_id(action_mapping)
-    if subject_task_id is None:
-        return None
-    subject_task = store.get(subject_task_id)
-    if subject_task is None or subject_task.id != subject_task_id:
-        return None
-    candidate_ids: set[str] = {
-        task.id
-        for task in (
-            row.owner_task,
-            *row.members,
-            *row.unresolved_tasks,
-            row.lifecycle_action_task,
-            row.recovery_action_task,
-            row.recovery_leaf_task,
-        )
-        if isinstance(task, DbTask) and task.id is not None
-    }
-    if subject_task.id not in candidate_ids:
-        subject_root_id = _resolve_lineage_root_task(store, subject_task).id
-        if subject_root_id is None:
-            return None
-        if not any(
-            (candidate := store.get(candidate_id)) is not None
-            and candidate.id is not None
-            and _resolve_lineage_root_task(store, candidate).id == subject_root_id
-            for candidate_id in candidate_ids
-        ):
-            return None
-    return subject_task
-
-
-def _resolve_incomplete_owner_task(store: SqliteTaskStore, row: _LineageRow) -> DbTask:
-    """Return the implementation that owns an incomplete row's branch when one exists."""
-
-    def _iter_candidates() -> list[DbTask]:
-        ordered: list[DbTask] = []
-        seen: set[str | None] = set()
-        for task in (
-            row.owner_task,
-            row.lifecycle_action_task,
-            row.recovery_action_task,
-            row.recovery_leaf_task,
-            *row.unresolved_tasks,
-            *row.members,
-        ):
-            if task is None or task.id in seen:
-                continue
-            seen.add(task.id)
-            ordered.append(task)
-        return ordered
-
-    candidates = _iter_candidates()
-    for candidate in candidates:
-        if blocked_by_empty_prereq_label(store, candidate) is not None:
-            return candidate
-    for candidate in candidates:
-        owner_task = _resolve_lineage_owner_task(store, candidate)
-        if owner_task.task_type == "implement" and owner_task.branch:
-            return _resolve_subject_fallback_task(store, row, fallback_task=owner_task)
-    for candidate in candidates:
-        owner_task = _resolve_lineage_owner_task(store, candidate)
-        if owner_task.task_type == "implement":
-            return _resolve_subject_fallback_task(store, row, fallback_task=owner_task)
-    return _resolve_subject_fallback_task(store, row, fallback_task=row.owner_task)
-
 
 def _format_review_verdict_label(review_verdict: str | None) -> str | None:
     """Return the unmerged review verdict badge label."""

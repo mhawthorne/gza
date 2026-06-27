@@ -398,9 +398,6 @@ def query_incomplete(
     target_branch: str | None = None,
 ) -> list[IncompleteLineage]:
     """Return unresolved lineages grouped by canonical root for attention workflows."""
-    from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
-    from .task_query import DateFilter, normalize_tag_filters
-
     statuses: tuple[str, ...] | None = None
     merge_chain_state: tuple[str, ...] | None = None
     exclude_statuses: tuple[str, ...] | None = None
@@ -421,38 +418,41 @@ def query_incomplete(
         start=datetime.fromisoformat(f.start_date).date() if f.start_date else None,
         end=datetime.fromisoformat(f.end_date).date() if f.end_date else None,
     )
-    rows, _read_context = query_lineage_owner_rows_in_read_session(
-        store,
-        LineageOwnerQuery(
+
+    service = _TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="lineages",
             limit=f.limit,
             statuses=statuses,
             exclude_statuses=exclude_statuses,
-            merge_chain_state=merge_chain_state,
-            exclude_merge_chain_state=exclude_merge_chain_state,
             task_types=(f.task_type,) if f.task_type else None,
             exclude_task_types=(f.task_type_not,) if f.task_type_not else None,
-            tags=normalize_tag_filters(f.tags),
-            exclude_tags=normalize_tag_filters(f.tags_not),
+            lifecycle_state=("incomplete",),
+            merge_chain_state=merge_chain_state,
+            exclude_merge_chain_state=exclude_merge_chain_state,
+            tag_filters=f.tags,
+            exclude_tag_filters=f.tags_not,
             any_tag=f.any_tag,
             date_filter=date_filter,
-            include_skipped=True,
-            exclude_dropped_from_planning=True,
         ),
         target_branch=target_branch,
     )
-    lineages = [
-        IncompleteLineage(
-            root=row.tree.task if row.tree is not None else row.owner_task,
-            tree=row.tree,
-            unresolved_tasks=list(row.unresolved_tasks),
-            latest_unresolved_at=max(
-                (_normalize_lineage_time(task_time_for_lineage(task)) for task in row.unresolved_tasks),
-                default=_normalize_lineage_time(task_time_for_lineage(row.owner_task)),
-            ),
+    lineages: list[IncompleteLineage] = []
+    for row in result.rows:
+        if isinstance(row, TaskRow) or row.tree is None:
+            continue
+        lineages.append(
+            IncompleteLineage(
+                root=row.tree.task,
+                tree=row.tree,
+                unresolved_tasks=list(row.unresolved_tasks),
+                latest_unresolved_at=max(
+                    (_normalize_lineage_time(task_time_for_lineage(task)) for task in row.unresolved_tasks),
+                    default=_normalize_lineage_time(task_time_for_lineage(row.owner_task)),
+                ),
+            )
         )
-        for row in rows
-        if row.tree is not None
-    ]
     return lineages
 
 

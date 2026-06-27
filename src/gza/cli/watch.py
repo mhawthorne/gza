@@ -53,6 +53,7 @@ from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_i
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
+    _resolve_incomplete_owner_task,
     query_lineage_owner_rows_in_read_session,
     resolve_lineage_owner_task_id,
 )
@@ -180,7 +181,6 @@ from .git_ops import (
     cleanup_failed_merge_checkout,
     ensure_watch_main_checkout,
 )
-from .query import _resolve_incomplete_owner_task
 
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"

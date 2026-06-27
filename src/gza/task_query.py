@@ -10,7 +10,11 @@ from typing import Any, Literal, TypeVar
 from . import lineage
 from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 from .lifecycle_completion import task_is_complete_for_lifecycle
-from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
+from .lineage_query import (
+    LineageOwnerQuery,
+    _prepare_incomplete_owner_row,
+    query_lineage_owner_rows_in_read_session,
+)
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .pickup import effective_edit_time, is_in_quiet_period
 
@@ -528,9 +532,14 @@ class TaskQueryService:
                 self._store,
                 LineageOwnerQuery(
                     limit=None,
+                    statuses=query.statuses,
+                    exclude_statuses=query.exclude_statuses,
+                    merge_chain_state=query.merge_chain_state,
+                    exclude_merge_chain_state=query.exclude_merge_chain_state,
                     task_types=query.task_types,
                     exclude_task_types=query.exclude_task_types,
                     tags=query.tag_filters,
+                    exclude_tags=query.exclude_tag_filters,
                     any_tag=query.any_tag,
                     date_filter=query.date_filter,
                     include_skipped=True,
@@ -542,20 +551,31 @@ class TaskQueryService:
                 git=git,
                 target_branch=target_branch,
             )
-            rows = [
-                LineageRow(
-                    owner_task=row.owner_task,
-                    members=row.members,
-                    tree=row.tree,
-                    unresolved_tasks=row.unresolved_tasks,
-                    lifecycle_action_task=row.lifecycle_action_task,
-                    recovery_action_task=row.recovery_action_task,
-                    recovery_leaf_task=row.recovery_leaf_task,
-                    lineage_status=row.lineage_status,
-                    next_action_data=row.next_action,
+            prepared_rows: list[LineageRow] = []
+            for owner_row in owner_rows:
+                prepared_owner_row = _prepare_incomplete_owner_row(
+                    self._store,
+                    row=owner_row,
+                    exclude_dropped=True,
                 )
-                for row in owner_rows
-            ]
+                if prepared_owner_row is None:
+                    continue
+                if not self._matches_tag_filters(prepared_owner_row.owner_task, query):
+                    continue
+                prepared_rows.append(
+                    LineageRow(
+                        owner_task=prepared_owner_row.owner_task,
+                        members=prepared_owner_row.members,
+                        tree=prepared_owner_row.tree,
+                        unresolved_tasks=prepared_owner_row.unresolved_tasks,
+                        lifecycle_action_task=prepared_owner_row.lifecycle_action_task,
+                        recovery_action_task=prepared_owner_row.recovery_action_task,
+                        recovery_leaf_task=prepared_owner_row.recovery_leaf_task,
+                        lineage_status=prepared_owner_row.lineage_status,
+                        next_action_data=prepared_owner_row.next_action,
+                    )
+                )
+            rows = prepared_rows
         else:
             grouped: dict[str, list[DbTask]] = {}
             owner_by_id: dict[str, DbTask] = {}

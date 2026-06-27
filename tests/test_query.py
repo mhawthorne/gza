@@ -490,6 +490,36 @@ class TestQueryIncomplete:
         task.status = "failed"
         task.completed_at = datetime.now(UTC)
 
+    def _setup_merged_owner_with_live_descendant_fixture(self, store: SqliteTaskStore) -> tuple[Task, Task]:
+        plan = store.add("merged owner plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        impl = store.add("merged implementation owner", task_type="implement", based_on=plan.id)
+        store.mark_completed(impl, has_commits=True, branch="feature/query-merged-owner-live-descendant")
+        assert impl.id is not None
+
+        unit = store.resolve_merge_unit_for_task(impl.id)
+        assert unit is not None
+        store.set_merge_unit_state(unit.id, "merged")
+
+        followup = store.add(
+            "live unresolved improve descendant",
+            task_type="improve",
+            based_on=impl.id,
+        )
+        followup.status = "completed"
+        followup.completed_at = datetime.now(UTC)
+        followup.has_commits = True
+        followup.branch = "feature/query-merged-owner-live-descendant-followup"
+        followup.merge_status = "unmerged"
+        store.update(followup)
+        assert followup.id is not None
+
+        return impl, followup
+
     def test_merged_root_hides_completed_review_and_improve(self, tmp_path: Path):
         store = self._store(tmp_path)
 
@@ -719,6 +749,54 @@ class TestQueryIncomplete:
         store.update(orphan)
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
+
+    def test_query_incomplete_keeps_merged_owner_with_live_unresolved_descendant(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+        impl, followup = self._setup_merged_owner_with_live_descendant_fixture(store)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+
+        assert len(lineages) == 1
+        assert lineages[0].root.id == impl.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {followup.id}
+
+    def test_query_incomplete_applies_limit_after_preparation_prunes_hidden_rows(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+
+        impl, followup = self._setup_merged_owner_with_live_descendant_fixture(store)
+        visible_followup = store.get(followup.id)
+        assert visible_followup is not None
+        visible_followup.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+        store.update(visible_followup)
+
+        hidden_root = store.add("hidden merged implement owner", task_type="implement")
+        store.mark_completed(hidden_root, has_commits=True, branch="feature/query-hidden-merged-owner")
+        assert hidden_root.id is not None
+
+        hidden_unit = store.resolve_merge_unit_for_task(hidden_root.id)
+        assert hidden_unit is not None
+        store.set_merge_unit_state(hidden_unit.id, "merged")
+
+        hidden_orphan = store.add(
+            "hidden orphan same-branch descendant on forked branch",
+            task_type="improve",
+            based_on=hidden_root.id,
+            same_branch=True,
+        )
+        hidden_orphan.status = "completed"
+        hidden_orphan.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+        hidden_orphan.has_commits = True
+        hidden_orphan.branch = "feature/query-hidden-merged-owner-as-28"
+        hidden_orphan.merge_status = "unmerged"
+        store.update(hidden_orphan)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=1))
+
+        assert len(lineages) == 1
+        assert lineages[0].root.id == impl.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {followup.id}
 
     def test_dropped_root_task_is_hidden_from_incomplete(self, tmp_path: Path):
         store = self._store(tmp_path)

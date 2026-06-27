@@ -12,7 +12,7 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from rich.console import Console
@@ -16417,7 +16417,7 @@ class TestIncompleteCommand:
         assert json.loads(result.stdout) == []
         assert result.stderr == ""
 
-    def test_incomplete_normalization_keeps_merged_owner_with_live_unresolved_descendant(
+    def test_incomplete_query_keeps_merged_owner_with_live_unresolved_descendant(
         self,
         tmp_path: Path,
     ) -> None:
@@ -16433,17 +16433,8 @@ class TestIncompleteCommand:
             target_branch="main",
         )
 
-        normalized = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
-            result,
-            service=service,
-            store=store,
-            config=config,
-            git=None,
-            target_branch="main",
-        )
-
-        assert len(normalized.rows) == 1
-        row = normalized.rows[0]
+        assert len(result.rows) == 1
+        row = result.rows[0]
         assert row.owner_task.id == impl.id
         assert {task.id for task in row.unresolved_tasks} == {followup.id}
 
@@ -16467,7 +16458,7 @@ class TestIncompleteCommand:
             }
         ]
 
-    def test_incomplete_enters_git_cache_for_query_and_normalization(
+    def test_incomplete_enters_git_cache_for_query_only(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -16516,32 +16507,15 @@ class TestIncompleteCommand:
             phases.append("run")
             return query_cli._TaskQueryResult(query=query, rows=())
 
-        def _fake_normalize(
-            result: query_cli._TaskQueryResult,  # noqa: SLF001
-            *,
-            service: query_cli._TaskQueryService,  # noqa: SLF001
-            store: object,
-            config: Config,
-            git: object,
-            target_branch: str | None,
-        ) -> query_cli._TaskQueryResult:  # noqa: SLF001
-            del service, store, config
-            assert cache_state["active"] is True
-            assert git is not None
-            assert target_branch == "main"
-            phases.append("normalize")
-            return result
-
         with (
             patch("gza.cli.query.Git", return_value=git),
             patch.object(query_cli._TaskQueryService, "run", autospec=True, side_effect=_fake_run),
-            patch("gza.cli.query._normalize_incomplete_result_rows", side_effect=_fake_normalize),
         ):
             result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None))
 
         captured = capsys.readouterr()
         assert result == 0
-        assert phases == ["cache-enter", "run", "normalize", "cache-exit"]
+        assert phases == ["cache-enter", "run", "cache-exit"]
         assert captured.out.strip() == "No unresolved task lineages"
 
     def test_incomplete_cli_json_uses_real_next_action_when_git_context_is_available(self, tmp_path: Path):
@@ -16623,15 +16597,6 @@ class TestIncompleteCommand:
                 git=git,
                 target_branch="main",
             )
-            result = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
-                result,
-                service=service,
-                store=store,
-                config=config,
-                git=git,
-                target_branch="main",
-            )
-
         assert len(result.rows) == 1
         row = result.rows[0]
         assert row.owner_task.id == completed_retry.id
@@ -16691,15 +16656,6 @@ class TestIncompleteCommand:
                 git=git,
                 target_branch="main",
             )
-            result = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
-                result,
-                service=service,
-                store=store,
-                config=config,
-                git=git,
-                target_branch="main",
-            )
-
         assert len(result.rows) == 1
         row = result.rows[0]
         assert row.owner_task.id == completed_retry.id
@@ -16758,28 +16714,17 @@ class TestIncompleteCommand:
                 git=git,
                 target_branch="main",
             )
-            stale_action = {
-                "type": "needs_discussion",
-                "description": "SKIP: failed owner no progress",
-                "needs_attention_reason": "watch-no-progress-backstop",
-            }
-            assert isinstance(result.rows[0], query_cli._LineageRow)
-            stale_row = replace(result.rows[0], next_action_data=stale_action)
-            result = replace(result, rows=(stale_row,))
-            with patch.object(
-                service,
-                "_project_next_action",
+            with patch(
+                "gza.cli.advance_engine.determine_next_action",
                 return_value={
                     "type": "needs_discussion",
                     "description": "SKIP: recovery carrier blocked on current lifecycle gate",
                     "needs_attention_reason": "retry-limit-reached",
                     "subject_task_id": completed_retry.id,
                 },
-            ) as project_next_action:
-                result = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
-                    result,
-                    service=service,
-                    store=store,
+            ) as determine_next_action:
+                result = service.run(
+                    query_cli._TaskQueryPresets.incomplete(limit=None),
                     config=config,
                     git=git,
                     target_branch="main",
@@ -16790,11 +16735,17 @@ class TestIncompleteCommand:
         assert row.owner_task.id == completed_retry.id
         assert row.values["next_action_owner_id"] == completed_retry.id
         assert row.values["next_action_reason"] == "SKIP: recovery carrier blocked on current lifecycle gate"
-        project_next_action.assert_called_once_with(
+        determine_next_action.assert_called_once_with(
+            config,
+            store,
+            git,
             completed_retry,
-            config=config,
-            git=git,
-            target_branch="main",
+            "main",
+            impl_based_on_ids=ANY,
+            max_resume_attempts=None,
+            persist_post_merge_rebase_state=True,
+            persist_review_clearance=True,
+            read_context=ANY,
         )
 
     def test_incomplete_hides_failed_owner_after_completed_recovery_code_is_merged(
