@@ -8789,7 +8789,9 @@ class TestIterateCommand:
             "## Questions / Assumptions\n\nNone.\n\n"
             "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
         )
-        prior_review.completed_at = datetime.now(UTC)
+        review_completed_at = datetime(2026, 6, 27, 11, 55, tzinfo=UTC)
+        verify_captured_at = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+        prior_review.completed_at = review_completed_at
         prior_review.review_verify_status = "failed"
         prior_review.review_verify_branch = impl.branch
         prior_review.review_verify_head_sha = "same-head"
@@ -8880,7 +8882,9 @@ class TestIterateCommand:
             "Required tests: rerun verify_command.\n\n"
             "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
         )
-        prior_review.completed_at = datetime.now(UTC)
+        review_completed_at = datetime(2026, 6, 27, 11, 55, tzinfo=UTC)
+        verify_captured_at = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+        prior_review.completed_at = review_completed_at
         prior_review.review_verify_status = "failed"
         prior_review.review_verify_branch = impl.branch
         prior_review.review_verify_head_sha = "same-head"
@@ -8894,7 +8898,7 @@ class TestIterateCommand:
             same_branch=True,
         )
         noop_improve.status = "completed"
-        noop_improve.completed_at = datetime.now(UTC)
+        noop_improve.completed_at = review_completed_at
         noop_improve.branch = impl.branch
         noop_improve.changed_diff = False
         store.update(noop_improve)
@@ -8937,7 +8941,7 @@ class TestIterateCommand:
                     "uv run pytest tests/unit -q",
                     status="passed",
                     exit_status="0",
-                    captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                    captured_at=verify_captured_at,
                     reviewed_branch=impl.branch,
                     reviewed_head_sha="same-head",
                     reviewed_base_sha="base-sha",
