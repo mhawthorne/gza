@@ -3568,6 +3568,31 @@ def test_failed_rebase_terminal_skip_subjects_owning_implementation(tmp_path: Pa
     assert action["subject_task_id"] == impl.id
 
 
+def test_failed_fix_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/failed-fix-subject",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    failed_fix = store.add("Failed fix", task_type="fix", based_on=impl.id, same_branch=True)
+    assert failed_fix.id is not None
+    failed_fix.status = "failed"
+    failed_fix.failure_reason = "UNKNOWN"
+    failed_fix.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    failed_fix.branch = impl.branch
+    store.update(failed_fix)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), failed_fix, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["subject_task_id"] == impl.id
+    resolved = resolve_subject_task(store, action)
+    assert resolved.id == impl.id
+
+
 def test_failed_chained_improve_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

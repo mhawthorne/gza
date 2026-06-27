@@ -141,6 +141,12 @@ The intended resolution order, first match wins:
    the branch changes; that ancestor is the owner.
 5. **Self.** Else the task owns itself.
 
+For operator-facing parked/needs-attention signals produced by failed-task recovery, failed
+side-quest descendants that rescue or validate an implementation (`review`, `improve`,
+`rebase`, and `fix`) MUST name the owning implementation / merge-unit owner as the surfaced
+subject. The failed leaf remains detail within that owner's signal; it MUST NOT become a
+separate top-level stuck owner row by itself.
+
 *Implementation note: `lineage_query.py` `_load_indexes` owner-resolution cascade;
 `db.resolve_merge_unit_owner_task` (canonical `owner_task_id`). Rules 2 and 4 predate
 first-class merge units and may be partly subsumed by rule 1 — see OQ1.*

@@ -17,6 +17,7 @@ from gza.query import (
     query_incomplete,
     query_history,
     query_history_with_lineage,
+    resolve_lineage_owner_task,
 )
 
 
@@ -803,6 +804,31 @@ class TestQueryIncomplete:
         assert rebase.id is not None
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
+
+    def test_failed_fix_resolves_to_implementation_owner_row(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        root = store.add("implement root", task_type="implement")
+        self._complete(root, merge_status="unmerged")
+        root.branch = "feature/failed-fix-owner"
+        store.update(root)
+        assert root.id is not None
+
+        failed_fix = store.add("fix failed", task_type="fix", based_on=root.id, same_branch=True)
+        self._fail(failed_fix)
+        failed_fix.branch = root.branch
+        store.update(failed_fix)
+        assert failed_fix.id is not None
+
+        owner = resolve_lineage_owner_task(store, failed_fix)
+        assert owner.id == root.id
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+        assert len(lineages) == 1
+        assert lineages[0].root.id == root.id
+        assert lineages[0].tree.task.id == root.id
+        unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
+        assert unresolved_ids == {root.id, failed_fix.id}
 
     def test_completed_unmerged_root_superseded_by_merged_retry_is_hidden(self, tmp_path: Path):
         """Regression: completed-but-unmerged root should be suppressed once a

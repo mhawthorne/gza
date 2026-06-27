@@ -2499,7 +2499,7 @@ def _already_rebased_but_lineage_incomplete_action(ctx: AdvanceContext) -> dict[
 def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
     subject_task_id = ctx.task.id
-    if ctx.task.task_type in {"review", "improve", "rebase"} and ctx.task.id is not None:
+    if ctx.task.task_type in {"review", "improve", "rebase", "fix"} and ctx.task.id is not None:
         implement_task = _resolve_owning_implementation_task(ctx.store, ctx.task)
         if implement_task is not None and implement_task.id is not None:
             subject_task_id = implement_task.id
