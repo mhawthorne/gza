@@ -4685,6 +4685,7 @@ class TestFailureReasonTracking:
         assert "INFRASTRUCTURE_ERROR" in KNOWN_FAILURE_REASONS
         assert "MAX_STEPS" in KNOWN_FAILURE_REASONS
         assert "MAX_TURNS" in KNOWN_FAILURE_REASONS
+        # Legacy rows may still carry PR_REQUIRED until recovery planning reclassifies them.
         assert "PR_REQUIRED" in KNOWN_FAILURE_REASONS
         assert "PREREQUISITE_UNMERGED" in KNOWN_FAILURE_REASONS
         assert "PROVIDER_EMPTY_TURN" in KNOWN_FAILURE_REASONS

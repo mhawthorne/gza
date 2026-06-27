@@ -11,7 +11,7 @@ from gza.config import Config
 from gza.config import ConfigError
 from gza.db import MergeTargetResolutionError, SqliteTaskStore, Task
 from gza.git import Git, GitError
-from gza.lineage_query import _load_indexes
+from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows_in_read_session
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import (
@@ -1610,14 +1610,18 @@ def test_recovery_engine_branch_unpushable_direct_reconcile_attempt_reaches_retr
     assert (decision.attempt_index, decision.attempt_limit) == (2, 2)
 
 
-def test_recovery_engine_legacy_pr_required_chooses_reconcile(tmp_path: Path) -> None:
+def test_recovery_engine_legacy_pr_required_reclassifies_to_branch_unpushable(tmp_path: Path) -> None:
     store, task = _failed_task(tmp_path, reason="PR_REQUIRED", session_id=None)
     task.branch = "feature/legacy-pr-required"
     store.update(task)
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.failure_reason == "BRANCH_UNPUSHABLE"
     assert decision.action == "reconcile"
     assert decision.launch_mode == "none"
-    assert decision.reason_code == "PR_REQUIRED"
+    assert decision.reason_code == "BRANCH_UNPUSHABLE"
 
 
 def test_recovery_engine_branchless_branch_unpushable_parks_for_manual_repair(tmp_path: Path) -> None:
@@ -1644,6 +1648,10 @@ def test_recovery_engine_branchless_pr_required_parks_for_manual_repair(tmp_path
 
     decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
 
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.failure_reason == "BRANCH_UNPUSHABLE"
+
     assert decision.action == "skip"
     assert decision.reason_code == "reconcile_branch_missing"
     assert "no branch to reconcile" in decision.reason_text
@@ -1658,8 +1666,60 @@ def test_recovery_engine_branchless_pr_required_parks_for_manual_repair(tmp_path
     )
 
 
+def test_query_lineage_owner_rows_in_read_session_persists_legacy_pr_required_reclassification(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Legacy publish failure", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PR_REQUIRED"
+    failed.branch = "feature/legacy-read-session-reclassify"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    rows, _read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            include_skipped=True,
+            max_recovery_attempts=1,
+            owner_task_ids=(failed.id,),
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    assert any(row.owner_task.id == failed.id for row in rows)
+    refreshed = store.get(failed.id)
+    assert refreshed is not None
+    assert refreshed.failure_reason == "BRANCH_UNPUSHABLE"
+
+
+def test_recovery_engine_branch_unpushable_recovery_disabled_parks(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="BRANCH_UNPUSHABLE", session_id=None)
+    task.branch = "feature/recovery-disabled"
+    store.update(task)
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=0)
+
+    assert decision.action == "skip"
+    assert decision.reason_code == "automatic_recovery_disabled"
+
+
 def test_classify_failure_reason_config_error_is_manual() -> None:
     assert classify_failure_reason("CONFIG_ERROR") == "manual"
+
+
+@pytest.mark.parametrize("reason", ["CONFIG_ERROR", "TEST_FAILURE", "GIT_ERROR"])
+def test_other_manual_only_failures_remain_manual(reason: str) -> None:
+    assert classify_failure_reason(reason) == "manual"
 
 
 def test_recovery_engine_config_error_skips(tmp_path: Path) -> None:

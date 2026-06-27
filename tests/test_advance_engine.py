@@ -3656,6 +3656,28 @@ def test_branch_unpushable_failed_recovery_lowers_to_reconcile_action(tmp_path: 
     assert classify_advance_action(action) == "actionable"
 
 
+def test_legacy_pr_required_failed_recovery_normalizes_before_reconcile_action(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PR_REQUIRED"
+    failed.branch = "feature/advance-legacy-pr-required"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(failed, decision)
+    refreshed = store.get(failed.id)
+
+    assert refreshed is not None
+    assert refreshed.failure_reason == "BRANCH_UNPUSHABLE"
+    assert decision.action == "reconcile"
+    assert decision.reason_code == "BRANCH_UNPUSHABLE"
+    assert action["type"] == "reconcile_branch_divergence"
+
+
 def test_branchless_branch_unpushable_failed_recovery_lowers_to_needs_attention(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
 

@@ -30,6 +30,7 @@ class RecoveryReadContext:
         tuple[DbTask, Literal["empty", "redundant"]],
     ] = field(default_factory=dict)
     pending_rebase_success_reconciliations: dict[str, DbTask] = field(default_factory=dict)
+    pending_legacy_branch_publication_reconciliations: dict[str, DbTask] = field(default_factory=dict)
     allow_reconcile_mutation: bool = True
 
     def get_task(self, task_id: str | None) -> DbTask | None:
@@ -246,3 +247,8 @@ class RecoveryReadContext:
         if task.id is None:
             return
         self.pending_rebase_success_reconciliations[task.id] = task
+
+    def record_legacy_branch_publication_reconciliation(self, task: DbTask) -> None:
+        if task.id is None:
+            return
+        self.pending_legacy_branch_publication_reconciliations[task.id] = task

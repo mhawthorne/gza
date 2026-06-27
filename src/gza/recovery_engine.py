@@ -80,7 +80,8 @@ _RETRY_REASONS = {
     "WORKSPACE_NOT_POPULATED",
     "NO_ACTIVITY",
 }
-_RECONCILE_REASONS = frozenset({"BRANCH_UNPUSHABLE", "PR_REQUIRED"})
+_RECONCILE_REASONS = frozenset({"BRANCH_UNPUSHABLE"})
+_LEGACY_BRANCH_PUBLICATION_REASON = "PR_REQUIRED"
 _TIMEOUT_STYLE_REASONS = frozenset({"MAX_STEPS", "MAX_TURNS", "TIMEOUT", "TERMINATED", "TERMINAL_NO_WORK"})
 _UNRESOLVED_RECOVERY_TERMINAL_STATUSES = frozenset({"failed", "dropped"})
 _UNRESOLVED_RECOVERY_ATTENTION_REASON = "newer-recovery-descendant-needs-attention"
@@ -234,11 +235,44 @@ def classify_failure_reason(reason: str | None) -> FailureCategory:
         return "manual"
     if reason in _RETRY_REASONS:
         return "retryable"
+    if reason == _LEGACY_BRANCH_PUBLICATION_REASON:
+        return "reconcile"
     if reason in _RECONCILE_REASONS:
         return "reconcile"
     if reason in _TIMEOUT_STYLE_REASONS or is_resumable_failure_reason(reason):
         return "timeout"
     return "manual"
+
+
+def _normalize_legacy_branch_publication_failure_reason(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> str:
+    """Reclassify legacy ``PR_REQUIRED`` failures to ``BRANCH_UNPUSHABLE`` when possible.
+
+    Historical rows predate the publication split between "push rejected" and
+    "PR creation unavailable". Slice 2 chooses the compatibility path of lazily
+    rewriting failed ``PR_REQUIRED`` rows to ``BRANCH_UNPUSHABLE`` the first
+    time recovery planning evaluates them, so the row takes the countable
+    reconcile path without requiring a schema migration.
+    """
+    reason = task.failure_reason or "UNKNOWN"
+    if task.status != "failed" or reason != _LEGACY_BRANCH_PUBLICATION_REASON:
+        return reason
+
+    setattr(task, "failure_reason", "BRANCH_UNPUSHABLE")
+    if task.id is not None and read_context is not None:
+        indexed_task = read_context.get_task(task.id)
+        if indexed_task is not None:
+            setattr(indexed_task, "failure_reason", "BRANCH_UNPUSHABLE")
+        if not read_context.allow_reconcile_mutation:
+            read_context.record_legacy_branch_publication_reconciliation(task)
+            return "BRANCH_UNPUSHABLE"
+
+    store.update(task)
+    return "BRANCH_UNPUSHABLE"
 
 
 def _is_resume_recovery_edge(parent: DbTask, child: DbTask) -> bool:
@@ -1306,6 +1340,10 @@ def apply_pending_recovery_reconciliations(
 ) -> None:
     if read_context is None:
         return
+    pending_legacy_branch_publication = tuple(read_context.pending_legacy_branch_publication_reconciliations.values())
+    read_context.pending_legacy_branch_publication_reconciliations.clear()
+    for task in pending_legacy_branch_publication:
+        store.update(task)
     pending = tuple(read_context.pending_prerequisite_no_work_reconciliations.values())
     read_context.pending_prerequisite_no_work_reconciliations.clear()
     for task, merge_state in pending:
@@ -1554,7 +1592,12 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    reason = _normalize_failed_rebase_reason(store, task, task.failure_reason or "UNKNOWN")
+    normalized_reason = _normalize_legacy_branch_publication_failure_reason(
+        store,
+        task,
+        read_context=read_context,
+    )
+    reason = _normalize_failed_rebase_reason(store, task, normalized_reason)
     prerequisite_reconciliation: PrerequisiteUnmergedReconciliation | None = None
     expected_action: RecoveryAction | None
     if reason == "PREREQUISITE_UNMERGED":
