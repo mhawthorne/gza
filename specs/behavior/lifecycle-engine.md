@@ -310,7 +310,21 @@ When a current review exists for the implementation lineage:
   failure in the parked result instead of silently degrading to a generic no-op loop.
   When the review-time runner verify PASSED, or no runner-owned review verify exists,
   the blocker is treated as a genuine code issue and still requires a real code change
-  before merge.
+  before merge. When parallel sibling reviews exist on one implementation, lifecycle
+  MUST attribute this park to the review whose feedback actually remains unresolved. A
+  zero-diff improve for a verify-only sibling review MUST NOT be framed as the wasted
+  no-op when a different sibling review still carries unresolved CODE blockers; the
+  parked description MUST name that sibling review and its blocker IDs/titles. Existing
+  improves on that older sibling review are not sufficient to suppress the park:
+  pending or in-progress sibling improves still block merge, and completed sibling
+  improves suppress the sibling-review park only when current tracked resolution
+  evidence clears that sibling review's blocker set. A completed code-changing improve
+  for that older sibling review, followed by a newer current same-head review on the
+  implementation, counts as superseding that older sibling review for attribution even
+  if no explicit blocker-resolution artifact was recorded. This sibling-review guard also
+  applies when current same-head passing verify evidence cleared the latest verify-only
+  review: that latest review may be marked cleared per-review, but lifecycle MUST still
+  park instead of merging while the older sibling CODE review remains unresolved.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress after rule B has already been exhausted or the
   adjudication result was `NEEDS_HUMAN` → `needs_discussion` (reason

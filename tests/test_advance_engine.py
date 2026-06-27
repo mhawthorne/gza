@@ -7982,7 +7982,6 @@ def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_a
     git = _FakeGit(
         can_merge=True,
         rev_parse_errors={impl.branch: GitError("should not resolve branch tip")},
-        name_status_error_by_range={f"main...{impl.branch}": GitError("should not inspect verify availability")},
     )
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
@@ -8275,6 +8274,569 @@ def test_code_blocker_hits_threshold_one_with_single_noop_improve_and_parks(tmp_
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+
+
+def test_verify_only_noop_improve_attention_points_to_unaddressed_sibling_code_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/parallel-review-noop-attribution",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    sibling_review = store.add("Sibling code review", task_type="review", depends_on=impl.id)
+    assert sibling_review.id is not None
+    sibling_review.status = "completed"
+    sibling_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    sibling_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "### B2 Path classifier still matches substring\n"
+        "Evidence: `src/gza/git.py:20` still treats substring matches as rooted paths.\n"
+        "Open-state citation: `src/gza/git.py:20`\n"
+        "Impact: review scoping still misclassifies unrelated files.\n"
+        "Required fix: match path roots only.\n"
+        "Required tests: add a path-classifier regression.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(sibling_review)
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 11, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    store.update(verify_review)
+
+    noop_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["review_task"].id == sibling_review.id
+    assert noop_improve.id in action["description"]
+    assert verify_review.id in action["description"]
+    assert sibling_review.id in action["description"]
+    assert "B1 Missing worktree health guard" in action["description"]
+    assert "B2 Path classifier still matches substring" in action["description"]
+    assert "review feedback remains unresolved after no tracked diff change" not in action["description"]
+
+
+def test_verify_only_noop_improve_probe_failure_beats_sibling_review_attribution(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/parallel-review-probe-warning",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+    impl.tags = (CROSS_PROJECT_TAG,)
+    store.update(impl)
+
+    sibling_review = store.add("Sibling code review", task_type="review", depends_on=impl.id)
+    assert sibling_review.id is not None
+    sibling_review.status = "completed"
+    sibling_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    sibling_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(sibling_review)
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 11, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    store.update(verify_review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        rev_parse_errors={impl.branch: GitError("should not resolve branch tip")},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.noop_improve_verify_probe_warning == (
+        f"branch-head probe failed for {impl.branch}: should not resolve branch tip"
+    )
+    assert ctx.sibling_review_attention_candidate is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["probe_warning"] == ctx.noop_improve_verify_probe_warning
+    assert "branch-head probe failed" in action["description"]
+    assert "verify-only auto-clear could not be validated" in action["description"]
+    assert sibling_review.id not in action["description"]
+    assert verify_review.id not in action["description"]
+
+
+def test_same_head_green_verify_clearance_still_parks_for_unresolved_sibling_code_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/parallel-review-green-verify-reconciliation",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    sibling_review = store.add("Sibling code review", task_type="review", depends_on=impl.id)
+    assert sibling_review.id is not None
+    sibling_review.status = "completed"
+    sibling_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    sibling_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "### B2 Path classifier still matches substring\n"
+        "Evidence: `src/gza/git.py:20` still treats substring matches as rooted paths.\n"
+        "Open-state citation: `src/gza/git.py:20`\n"
+        "Impact: review scoping still misclassifies unrelated files.\n"
+        "Required fix: match path roots only.\n"
+        "Required tests: add a path-classifier regression.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(sibling_review)
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 11, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    verify_review.review_verify_status = "failed"
+    verify_review.review_verify_branch = impl.branch
+    verify_review.review_verify_head_sha = "same-head-sha"
+    store.update(verify_review)
+
+    noop_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    noop_improve.review_verify_status = "passed"
+    noop_improve.review_verify_branch = impl.branch
+    noop_improve.review_verify_head_sha = "same-head-sha"
+    noop_improve.review_verify_captured_at = verify_review.completed_at + timedelta(seconds=30)
+    store.update(noop_improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+    stored_impl = store.get(impl.id)
+
+    assert ctx.review_cleared is True
+    assert stored_impl is not None
+    assert stored_impl.review_cleared_at is not None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["review_task"].id == sibling_review.id
+    assert verify_review.id in action["description"]
+
+
+def test_same_head_green_verify_clearance_still_parks_when_sibling_completed_improve_did_not_clear_blockers(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/parallel-review-nonclearing-sibling-improve",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    sibling_review = store.add("Sibling code review", task_type="review", depends_on=impl.id)
+    assert sibling_review.id is not None
+    sibling_review.status = "completed"
+    sibling_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    sibling_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(sibling_review)
+
+    sibling_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        sibling_review,
+        when=datetime(2026, 6, 26, 10, 30, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 11, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    verify_review.review_verify_status = "failed"
+    verify_review.review_verify_branch = impl.branch
+    verify_review.review_verify_head_sha = "same-head-sha"
+    store.update(verify_review)
+
+    noop_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    noop_improve.review_verify_status = "passed"
+    noop_improve.review_verify_branch = impl.branch
+    noop_improve.review_verify_head_sha = "same-head-sha"
+    noop_improve.review_verify_captured_at = verify_review.completed_at + timedelta(seconds=30)
+    store.update(noop_improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["review_task"].id == sibling_review.id
+    assert sibling_review.id in action["description"]
+    assert sibling_improve.id in action["description"]
+    assert "Completed improve" in action["description"]
+    assert "Missing worktree health guard" in action["description"]
+    assert action["type"] not in {"merge", "merge_with_followups"}
+
+
+def test_same_head_green_verify_clearance_skips_addressed_middle_sibling_and_parks_on_oldest_unresolved_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/parallel-review-addressed-middle-sibling",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    oldest_review = store.add("Oldest code review", task_type="review", depends_on=impl.id)
+    assert oldest_review.id is not None
+    oldest_review.status = "completed"
+    oldest_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    oldest_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "### B2 Path classifier still matches substring\n"
+        "Evidence: `src/gza/git.py:20` still treats substring matches as rooted paths.\n"
+        "Open-state citation: `src/gza/git.py:20`\n"
+        "Impact: review scoping still misclassifies unrelated files.\n"
+        "Required fix: match path roots only.\n"
+        "Required tests: add a path-classifier regression.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(oldest_review)
+
+    middle_review = store.add("Addressed code review", task_type="review", depends_on=impl.id)
+    assert middle_review.id is not None
+    middle_review.status = "completed"
+    middle_review.completed_at = datetime(2026, 6, 26, 10, 30, tzinfo=UTC)
+    middle_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Tighten stale-review guard\n"
+        "Evidence: `src/gza/advance_engine.py:30` still misses the refreshed guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:30`\n"
+        "Impact: review freshness can misclassify current work.\n"
+        "Required fix: add the refreshed guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(middle_review)
+
+    middle_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        middle_review,
+        when=datetime(2026, 6, 26, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 12, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    verify_review.review_verify_status = "failed"
+    verify_review.review_verify_branch = impl.branch
+    verify_review.review_verify_head_sha = "same-head-sha"
+    store.update(verify_review)
+
+    noop_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 13, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    noop_improve.review_verify_status = "passed"
+    noop_improve.review_verify_branch = impl.branch
+    noop_improve.review_verify_head_sha = "same-head-sha"
+    noop_improve.review_verify_captured_at = verify_review.completed_at + timedelta(seconds=30)
+    store.update(noop_improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["review_task"].id == oldest_review.id
+    assert oldest_review.id in action["description"]
+    assert "B1 Missing worktree health guard" in action["description"]
+    assert "B2 Path classifier still matches substring" in action["description"]
+    assert middle_review.id not in action["description"]
+    assert middle_improve.id not in action["description"]
+
+
+def test_same_head_green_verify_clearance_does_not_park_on_only_addressed_sibling_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/parallel-review-only-addressed-sibling",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    sibling_review = store.add("Addressed code review", task_type="review", depends_on=impl.id)
+    assert sibling_review.id is not None
+    sibling_review.status = "completed"
+    sibling_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    sibling_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(sibling_review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        sibling_review,
+        when=datetime(2026, 6, 26, 10, 30, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 11, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    verify_review.review_verify_status = "failed"
+    verify_review.review_verify_branch = impl.branch
+    verify_review.review_verify_head_sha = "same-head-sha"
+    store.update(verify_review)
+
+    noop_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    noop_improve.review_verify_status = "passed"
+    noop_improve.review_verify_branch = impl.branch
+    noop_improve.review_verify_head_sha = "same-head-sha"
+    noop_improve.review_verify_captured_at = verify_review.completed_at + timedelta(seconds=30)
+    store.update(noop_improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge (previous review addressed)"
+
+
+@pytest.mark.parametrize("sibling_improve_status", ["pending", "in_progress"])
+def test_same_head_green_verify_clearance_still_parks_when_sibling_improve_is_active(
+    tmp_path: Path,
+    sibling_improve_status: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feat/parallel-review-active-sibling-improve-{sibling_improve_status}",
+        when=datetime(2026, 6, 26, 9, 0, tzinfo=UTC),
+    )
+
+    sibling_review = store.add("Sibling code review", task_type="review", depends_on=impl.id)
+    assert sibling_review.id is not None
+    sibling_review.status = "completed"
+    sibling_review.completed_at = datetime(2026, 6, 26, 10, 0, tzinfo=UTC)
+    sibling_review.output_content = (
+        "## Summary\n\n- Found product-code blockers.\n\n"
+        "## Blockers\n\n"
+        "### B1 Missing worktree health guard\n"
+        "Evidence: `src/gza/advance_engine.py:10` still skips the guard.\n"
+        "Open-state citation: `src/gza/advance_engine.py:10`\n"
+        "Impact: unhealthy worktrees still reach the runner.\n"
+        "Required fix: add the missing guard.\n"
+        "Required tests: add a targeted advance-engine regression.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(sibling_review)
+
+    sibling_improve = store.add(
+        "Sibling improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=sibling_review.id,
+        same_branch=True,
+    )
+    assert sibling_improve.id is not None
+    sibling_improve.status = sibling_improve_status
+    sibling_improve.branch = impl.branch
+    if sibling_improve_status == "in_progress":
+        sibling_improve.started_at = datetime(2026, 6, 26, 10, 30, tzinfo=UTC)
+    store.update(sibling_improve)
+
+    verify_review = store.add("Verify-only review", task_type="review", depends_on=impl.id)
+    assert verify_review.id is not None
+    verify_review.status = "completed"
+    verify_review.completed_at = datetime(2026, 6, 26, 11, 0, tzinfo=UTC)
+    verify_review.output_content = _verify_failure_only_review_report()
+    verify_review.review_verify_status = "failed"
+    verify_review.review_verify_branch = impl.branch
+    verify_review.review_verify_head_sha = "same-head-sha"
+    store.update(verify_review)
+
+    noop_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        verify_review,
+        when=datetime(2026, 6, 26, 12, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    noop_improve.review_verify_status = "passed"
+    noop_improve.review_verify_branch = impl.branch
+    noop_improve.review_verify_head_sha = "same-head-sha"
+    noop_improve.review_verify_captured_at = verify_review.completed_at + timedelta(seconds=30)
+    store.update(noop_improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["review_task"].id == sibling_review.id
+    assert sibling_review.id in action["description"]
+    assert sibling_improve.id in action["description"]
+    if sibling_improve_status == "pending":
+        assert "already queued" in action["description"]
+    else:
+        assert "already in progress" in action["description"]
+    assert "merge must still wait" in action["description"]
+    assert action["type"] not in {"merge", "merge_with_followups"}
+    assert "B1 Missing worktree health guard" in action["description"]
+    assert not action["description"].startswith("Merge")
 
 
 def test_product_code_open_state_citation_prevents_verify_noop_reverify(tmp_path: Path) -> None:
@@ -11691,11 +12253,12 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
             "stale_review_needs_manual_refresh",
             "failed_rebase_without_successful_review",
             "closing_review_invariant",
-            "fresh_comments_noop_improve_limit",
-            "review_blocker_adjudication_needed",
-            "review_verify_blocked_no_code_issues",
-            "review_noop_improve_limit",
-            "review_duplicate_blocker_no_progress",
+                "fresh_comments_noop_improve_limit",
+                "review_blocker_adjudication_needed",
+                "review_cleared_but_sibling_review_unresolved",
+                "review_verify_blocked_no_code_issues",
+                "review_noop_improve_limit",
+                "review_duplicate_blocker_no_progress",
         "review_max_cycles",
         "review_unknown_verdict",
         "implement_needs_manual_review",

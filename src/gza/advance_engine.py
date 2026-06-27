@@ -213,6 +213,15 @@ class OffTopicVerifyClearanceCandidate:
 
 
 @dataclass(frozen=True)
+class SiblingReviewAttentionCandidate:
+    """Sibling review whose unresolved code blockers should own no-op attention."""
+
+    review_task: DbTask
+    review_report: ParsedReviewReport
+    related_improve_task: DbTask | None = None
+
+
+@dataclass(frozen=True)
 class NeedsAttentionDisplayEntry:
     """Rendered needs-attention display text plus known field boundaries."""
 
@@ -300,6 +309,7 @@ class AdvanceContext:
     review_blocker_adjudication_needed_task: DbTask | None = None
     review_blocker_adjudication_candidate: ReviewBlockerAdjudicationCandidate | None = None
     active_review_blocker_adjudication: DbTask | None = None
+    sibling_review_attention_candidate: SiblingReviewAttentionCandidate | None = None
     duplicate_blocker_streak: DuplicateBlockerStreak | None = None
     has_improve_after_review: bool = False
     has_fresh_unresolved_comments_since_latest_review: bool = False
@@ -785,6 +795,17 @@ def _latest_completed_noop_improve(improve_tasks: list[DbTask]) -> DbTask | None
             improve
             for improve in improve_tasks
             if improve.status == "completed" and improve.changed_diff is False
+        ),
+        None,
+    )
+
+
+def _latest_completed_code_changing_improve(improve_tasks: list[DbTask]) -> DbTask | None:
+    return next(
+        (
+            improve
+            for improve in improve_tasks
+            if improve.status == "completed" and improve.changed_diff is True
         ),
         None,
     )
@@ -1830,6 +1851,96 @@ def _latest_review_blocker_resolution_statuses(
     return tuple(statuses)
 
 
+def _find_sibling_review_attention_candidate(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    impl_task: DbTask,
+    completed_reviews: list[DbTask],
+    latest_completed_review: DbTask | None,
+) -> SiblingReviewAttentionCandidate | None:
+    if latest_completed_review is None or latest_completed_review.id is None or impl_task.id is None:
+        return None
+
+    latest_summary = summarize_review_blockers(_get_review_output_content(config, latest_completed_review))
+    if not latest_summary.is_verify_blocked_only:
+        return None
+
+    project_dir = Path(config.project_dir)
+    branch_head = _resolve_branch_head_sha(git, impl_task.branch)
+    if branch_head.warning is not None:
+        return None
+    current_head_sha = branch_head.head_sha
+    latest_reviewed_head_sha = _normalize_review_state_head_sha(latest_completed_review.review_verify_head_sha)
+    latest_review_is_current = (
+        current_head_sha is not None
+        and latest_reviewed_head_sha is not None
+        and current_head_sha == latest_reviewed_head_sha
+    )
+    for sibling_review in completed_reviews[1:]:
+        if sibling_review.id is None:
+            continue
+        improve_tasks = store.get_improve_tasks_for(impl_task.id, sibling_review.id)
+
+        sibling_report = get_review_report(project_dir, sibling_review)
+        if sibling_report.verdict != "CHANGES_REQUESTED":
+            continue
+
+        sibling_summary = summarize_review_blockers(_get_review_output_content(config, sibling_review))
+        if sibling_summary.is_verify_blocked_only:
+            continue
+
+        latest_code_improve = _latest_completed_code_changing_improve(improve_tasks)
+        if (
+            latest_review_is_current
+            and latest_completed_review.completed_at is not None
+            and latest_code_improve is not None
+            and sibling_review.completed_at is not None
+            and _task_event_time(latest_code_improve) > _normalize_time(sibling_review.completed_at)
+            and _normalize_time(latest_completed_review.completed_at) > _task_event_time(latest_code_improve)
+            and not any(task.status in {"pending", "in_progress"} for task in improve_tasks)
+        ):
+            continue
+
+        resolution_statuses = _latest_review_blocker_resolution_statuses(
+            store,
+            git=git,
+            project_dir=project_dir,
+            review_task=sibling_review,
+            impl_task=impl_task,
+            findings=sibling_report.findings,
+            improve_tasks=improve_tasks,
+            allow_verify_clearance=True,
+        )
+        if resolution_statuses and all(
+            _review_blocker_status_clears_current_blocker(status) for status in resolution_statuses
+        ):
+            continue
+
+        active_improve = next(
+            (task for task in improve_tasks if task.status == "in_progress"),
+            None,
+        )
+        if active_improve is None:
+            active_improve = next(
+                (task for task in improve_tasks if task.status == "pending"),
+                None,
+            )
+        related_improve_task = active_improve
+        if related_improve_task is None:
+            completed_improves = [task for task in improve_tasks if task.status == "completed"]
+            if completed_improves:
+                related_improve_task = max(completed_improves, key=_task_event_time)
+
+        return SiblingReviewAttentionCandidate(
+            review_task=sibling_review,
+            review_report=sibling_report,
+            related_improve_task=related_improve_task,
+        )
+    return None
+
+
 def _resolve_review_blocker_adjudication_task(
     store: SqliteTaskStore,
     *,
@@ -2081,6 +2192,61 @@ def _review_blocker_adjudication_needed_action(ctx: AdvanceContext) -> dict[str,
     )
 
 
+def _format_blocker_titles_for_attention(report: ParsedReviewReport, *, limit: int = 2) -> str:
+    blockers = [finding for finding in report.findings if finding.severity == "BLOCKER"]
+    if not blockers:
+        return "unresolved blockers"
+    rendered = [f"{finding.id} {finding.title}" for finding in blockers[:limit]]
+    if len(blockers) > limit:
+        rendered.append(f"+{len(blockers) - limit} more")
+    return "; ".join(rendered)
+
+
+def _noop_improve_sibling_review_attention_action(ctx: AdvanceContext) -> dict[str, Any]:
+    candidate = getattr(ctx, "sibling_review_attention_candidate", None)
+    if candidate is None:
+        return _noop_improve_needs_discussion_action(ctx)
+    latest_noop_id = _task_id(ctx.latest_noop_improve)
+    blocker_summary = _format_blocker_titles_for_attention(candidate.review_report)
+    sibling_improve = candidate.related_improve_task
+    if sibling_improve is None:
+        sibling_state = "That review has no improve targeting it."
+    elif sibling_improve.status == "completed":
+        sibling_state = (
+            f"Completed improve {_task_id(sibling_improve)} did not clear that review's current blockers."
+        )
+    elif sibling_improve.status == "pending":
+        sibling_state = (
+            f"Pending improve {_task_id(sibling_improve)} is already queued for that review, "
+            "but merge must still wait for those blockers to clear."
+        )
+    else:
+        sibling_state = (
+            f"Improve {_task_id(sibling_improve)} is already in progress for that review, "
+            "but merge must still wait for those blockers to clear."
+        )
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: no-op improve {latest_noop_id} belongs to verify-only review "
+                f"{_task_id(ctx.latest_completed_review)}, but unresolved code blockers remain on "
+                f"sibling review {_task_id(candidate.review_task)}: {blocker_summary}. "
+                f"{sibling_state}"
+            ),
+            "review_task": candidate.review_task,
+        },
+        reason="improve-no-op",
+        subject_task_id=_needs_attention_subject_id(ctx),
+    )
+
+
+def _requires_sibling_review_attention(ctx: AdvanceContext) -> bool:
+    candidate = getattr(ctx, "sibling_review_attention_candidate", None)
+    summary = getattr(ctx, "latest_review_blocker_summary", None)
+    return candidate is not None and summary is not None and summary.is_verify_blocked_only
+
+
 def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
     latest_noop_id = _task_id(ctx.latest_noop_improve)
     source = "unresolved comments remain open after" if ctx.noop_improve_trigger == "comments" else "review feedback remains unresolved after"
@@ -2136,6 +2302,8 @@ def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
     """Park a no-op loop unless runner-owned verify evidence has already cleared it."""
     if ctx.noop_improve_verify_probe_warning is not None:
         return _noop_improve_verify_probe_failure_action(ctx)
+    if _requires_sibling_review_attention(ctx):
+        return _noop_improve_sibling_review_attention_action(ctx)
     if (
         ctx.review_verdict == "CHANGES_REQUESTED"
         and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
@@ -3178,6 +3346,7 @@ def _resolve_review_state(
     DbTask | None,
     dict[str, Any] | None,
     OffTopicVerifyClearanceCandidate | None,
+    SiblingReviewAttentionCandidate | None,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
     reviews = get_reviews_for_root(store, task)
@@ -3215,6 +3384,7 @@ def _resolve_review_state(
     review_blocker_adjudication_needed_task: DbTask | None = None
     review_blocker_adjudication_candidate: ReviewBlockerAdjudicationCandidate | None = None
     active_review_blocker_adjudication: DbTask | None = None
+    sibling_review_attention_candidate: SiblingReviewAttentionCandidate | None = None
     has_improve_after_review = False
     has_fresh_unresolved_comments_since_latest_review = False
     latest_completed_code_change: DbTask | None = None
@@ -3367,6 +3537,14 @@ def _resolve_review_state(
             if len(verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD:
                 break
         recent_verify_timeout_only_reviews = tuple(verify_timeout_only_reviews)
+        sibling_review_attention_candidate = _find_sibling_review_attention_candidate(
+            config=config,
+            store=store,
+            git=git,
+            impl_task=task,
+            completed_reviews=completed_reviews,
+            latest_completed_review=latest_completed_review,
+        )
 
     max_failed_closing_review_retries = int(
         getattr(config, "max_failed_closing_review_retries", 3)
@@ -3411,6 +3589,7 @@ def _resolve_review_state(
         latest_completed_code_change,
         closing_review_action,
         off_topic_verify_clearance_candidate,
+        sibling_review_attention_candidate,
     )
 
 
@@ -4058,6 +4237,7 @@ def resolve_advance_context(
         latest_completed_code_change,
         closing_review_action,
         off_topic_verify_clearance_candidate,
+        sibling_review_attention_candidate,
     ) = _resolve_review_state(
         config,
         store,
@@ -4115,6 +4295,7 @@ def resolve_advance_context(
         review_blocker_adjudication_needed_task=review_blocker_adjudication_needed_task,
         review_blocker_adjudication_candidate=review_blocker_adjudication_candidate,
         active_review_blocker_adjudication=active_review_blocker_adjudication,
+        sibling_review_attention_candidate=sibling_review_attention_candidate,
         has_improve_after_review=has_improve_after_review,
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
@@ -4998,6 +5179,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
             reason="review-verdict-needs-manual-attention",
             subject_task_id=_needs_attention_subject_id(ctx),
         ),
+    ),
+    AdvanceRule(
+        name="review_cleared_but_sibling_review_unresolved",
+        matches=lambda ctx: execution_status_allows_merge(ctx)
+        and has_valid_review_for_merge(ctx)
+        and ctx.review_cleared
+        and ctx.latest_completed_review is not None
+        and _requires_sibling_review_attention(ctx),
+        action=_noop_improve_sibling_review_attention_action,
     ),
     AdvanceRule(
         name="reviews_all_cleared",
