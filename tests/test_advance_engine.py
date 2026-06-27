@@ -3676,6 +3676,10 @@ def test_legacy_pr_required_failed_recovery_normalizes_before_reconcile_action(t
     assert decision.action == "reconcile"
     assert decision.reason_code == "BRANCH_UNPUSHABLE"
     assert action["type"] == "reconcile_branch_divergence"
+    assert action["description"] == "Reconcile branch publication (BRANCH_UNPUSHABLE)"
+    assert action["reason_code"] == "BRANCH_UNPUSHABLE"
+    assert action["attempt_index"] == decision.attempt_index
+    assert action["attempt_limit"] == decision.attempt_limit
 
 
 def test_branchless_branch_unpushable_failed_recovery_lowers_to_needs_attention(tmp_path: Path) -> None:

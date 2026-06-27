@@ -2968,7 +2968,7 @@ def failed_recovery_decision_to_action(
 ) -> dict[str, Any]:
     """Convert a shared failed-task recovery decision into an advance action dict."""
     description = f"SKIP: {decision.reason_text}"
-    failure_reason = task.failure_reason or "UNKNOWN"
+    failure_reason = decision.reason_code or task.failure_reason or "UNKNOWN"
     if decision.action == "resume":
         description = f"Resume failed task ({failure_reason})"
     elif decision.action == "retry":
@@ -2982,6 +2982,9 @@ def failed_recovery_decision_to_action(
         "recovery_task_id": decision.recovery_task_id,
         "reuse_existing": decision.reuse_existing,
         "launch_mode": decision.launch_mode,
+        "reason_code": decision.reason_code,
+        "attempt_index": decision.attempt_index,
+        "attempt_limit": decision.attempt_limit,
         "decision": decision,
     }
     if needs_attention_reason is not None:

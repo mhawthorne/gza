@@ -3571,6 +3571,9 @@ def test_watch_cycle_executes_branch_unpushable_reconcile_without_worker_slots(t
     action = execute_action.call_args.kwargs["action"]
     assert action["type"] == "reconcile_branch_divergence"
     assert action["decision"].action == "reconcile"
+    assert action["reason_code"] == "BRANCH_UNPUSHABLE"
+    assert action["attempt_index"] == action["decision"].attempt_index
+    assert action["attempt_limit"] == action["decision"].attempt_limit
     text = log_path.read_text()
     assert "RECOVR" in text
     assert "reconcile branch publication" in text
