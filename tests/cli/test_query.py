@@ -3717,6 +3717,56 @@ class TestQueueCommand:
                     )
                 )
 
+    def test_watch_pending_runnable_tasks_uses_current_pickup_signature(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        with patch.object(watch_cli, "get_runnable_pending_tasks", return_value=[]) as mocked_pickup:
+            assert watch_cli._pending_runnable_tasks(store, tags=("ops",), any_tag=True) == []  # noqa: SLF001
+
+        mocked_pickup.assert_called_once_with(store, tags=("ops",), any_tag=True)
+
+    def test_queue_ignores_quiet_period_config_when_rendering_pending_lane(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "quiet_period_seconds: 300\n")
+        store = make_store(tmp_path)
+
+        blocker = store.add("Blocking dependency")
+        runnable = store.add("Runnable queue task")
+        blocked = store.add("Blocked queue task", depends_on=blocker.id)
+        assert blocker.id is not None
+        assert runnable.id is not None
+        assert blocked.id is not None
+
+        recording_console = _RecordingConsole()
+        config = Config.load(tmp_path)
+        with (
+            patch.object(watch_cli, "console", recording_console),
+            patch.object(watch_cli.Config, "load", return_value=config),
+        ):
+            exit_code = watch_cli.cmd_queue(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    queue_action=None,
+                    limit=10,
+                    all=True,
+                    tags=None,
+                    any_tag=False,
+                    dispatch_mode="pending_only",
+                )
+            )
+
+        assert exit_code == 0
+        rendered = "\n".join(
+            output.plain if isinstance(output, Text) else str(output)
+            for output in recording_console.outputs
+        )
+        assert "Pending lane:" in rendered
+        assert "Quiet lane:" not in rendered
+        assert "Runnable queue task" in rendered
+        assert "Blocked queue task" in rendered
+
     def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
