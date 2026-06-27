@@ -445,6 +445,7 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     assert (
         "not a git repository" in broken_probe.stderr
         or "invalid commondir" in broken_probe.stderr
+        or "Invalid path '/gza-git'" in broken_probe.stderr
     )
 
     args = argparse.Namespace(
