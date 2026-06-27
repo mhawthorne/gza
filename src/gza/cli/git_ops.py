@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -356,6 +356,14 @@ class SquashBranchReconcileResult:
     manual_source_ref: str | None = None
     expected_remote_oid: str | None = None
 
+
+def _should_retry_pr_publication_after_reconcile(task: DbTask) -> bool:
+    """Return whether reconcile should rerun shared PR publication work."""
+    if not task.create_pr:
+        return False
+    return not (task.pr_state == "open" and task.pr_number is not None)
+
+
 def complete_branch_unpushable_after_reconcile(
     *,
     config: Config,
@@ -376,8 +384,9 @@ def complete_branch_unpushable_after_reconcile(
     task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_path), echo=True) if log_path is not None else None
     default_branch = git.default_branch()
     publication_state = load_branch_publication_state(store, task.id)
+    publication_retry_task = task if _should_retry_pr_publication_after_reconcile(task) else replace(task, create_pr=False)
     return _complete_failed_code_task_after_pr_publication(
-        task=task,
+        task=publication_retry_task,
         config=config,
         store=store,
         git=git,
