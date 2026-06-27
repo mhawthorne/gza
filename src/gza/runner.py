@@ -16,7 +16,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -2763,6 +2763,16 @@ class ReviewVerifyResult:
     working_directory: str | None = None
     failure: str | None = None
     output: str | None = None
+    artifact_id: int | None = None
+    artifact_path: str | None = None
+
+
+@dataclass(frozen=True)
+class _StoredReviewVerifyArtifacts:
+    """Latest content-bearing verify artifact metadata for one persisted result set."""
+
+    artifact_id: int | None = None
+    artifact_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2885,9 +2895,9 @@ def _store_review_verify_artifact_records(
     *,
     producer: str,
     metadata: dict[str, Any] | None = None,
-) -> str | None:
-    """Persist durable verify artifacts and return the latest content-bearing path."""
-    stored_paths: list[tuple[datetime, str]] = []
+) -> _StoredReviewVerifyArtifacts:
+    """Persist durable verify artifacts and return the latest content-bearing artifact metadata."""
+    latest_content_artifact: tuple[datetime, int, str] | None = None
     shared_metadata = {
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
@@ -2905,14 +2915,8 @@ def _store_review_verify_artifact_records(
     if project_results:
         for entry in project_results:
             entry_result = entry.result
-            entry_status = entry_result.status if entry_result is not None else "skipped"
-            entry_exit_status = entry_result.exit_status if entry_result is not None else "skipped"
-            entry_command = entry_result.command if entry_result is not None else None
-            entry_head_sha = entry_result.reviewed_head_sha if entry_result is not None else result.reviewed_head_sha
-            entry_branch = entry_result.reviewed_branch if entry_result is not None else result.reviewed_branch
-            entry_base_sha = entry_result.reviewed_base_sha if entry_result is not None else result.reviewed_base_sha
-            entry_created_at = entry_result.captured_at if entry_result is not None else result.captured_at
-            entry_output = entry_result.output if entry_result is not None else None
+            if entry_result is None:
+                continue
             stored = store_command_output_artifact(
                 store,
                 task,
@@ -2920,25 +2924,28 @@ def _store_review_verify_artifact_records(
                 kind="verify_command_output",
                 producer=producer,
                 label="verify_command",
-                output=entry_output,
-                command=entry_command,
-                status=entry_status,
-                exit_status=entry_exit_status,
-                head_sha=entry_head_sha,
+                output=entry_result.output,
+                command=entry_result.command,
+                status=entry_result.status,
+                exit_status=entry_result.exit_status,
+                head_sha=entry_result.reviewed_head_sha,
                 scope=entry.scope,
                 metadata={
                     "scope": entry.scope,
                     "working_directory": entry.working_directory,
                     "skip_reason": entry.skip_reason,
-                    "reviewed_branch": entry_branch,
-                    "reviewed_head_sha": entry_head_sha,
-                    "reviewed_base_sha": entry_base_sha,
+                    "reviewed_branch": entry_result.reviewed_branch,
+                    "reviewed_head_sha": entry_result.reviewed_head_sha,
+                    "reviewed_base_sha": entry_result.reviewed_base_sha,
+                    **({"cwd": entry.working_directory} if entry.working_directory is not None else {}),
                     **(metadata or {}),
                 },
-                created_at=entry_created_at,
+                created_at=entry_result.captured_at,
             )
-            if entry_output:
-                stored_paths.append((entry_created_at, stored.path))
+            if entry_result.output:
+                candidate = (entry_result.captured_at, stored.id, stored.path)
+                if latest_content_artifact is None or candidate > latest_content_artifact:
+                    latest_content_artifact = candidate
     else:
         stored = store_command_output_artifact(
             store,
@@ -2954,16 +2961,17 @@ def _store_review_verify_artifact_records(
             head_sha=result.reviewed_head_sha,
             metadata={
                 "working_directory": result.working_directory,
+                **({"cwd": result.working_directory} if result.working_directory is not None else {}),
                 **shared_metadata,
             },
             created_at=result.captured_at,
         )
         if result.output:
-            stored_paths.append((result.captured_at, stored.path))
-    if not stored_paths:
-        return None
-    stored_paths.sort(key=lambda item: item[0], reverse=True)
-    return stored_paths[0][1]
+            latest_content_artifact = (result.captured_at, stored.id, stored.path)
+    if latest_content_artifact is None:
+        return _StoredReviewVerifyArtifacts()
+    _, artifact_id, artifact_path = latest_content_artifact
+    return _StoredReviewVerifyArtifacts(artifact_id=artifact_id, artifact_path=artifact_path)
 
 
 def _persist_review_verify_result(
@@ -2998,7 +3006,7 @@ def _persist_review_verify_result(
     task.review_verify_branch = result.reviewed_branch
     task.review_verify_markdown = markdown
     task.review_verify_cwd = result.working_directory
-    task.review_verify_artifact_file = artifact_file
+    task.review_verify_artifact_file = artifact_file or result.artifact_path
 
 
 def _capture_review_verify_result(
@@ -3014,7 +3022,7 @@ def _capture_review_verify_result(
     metadata: dict[str, Any] | None = None,
 ) -> str:
     """Persist review verify provenance, artifact, and optional ops-log evidence."""
-    artifact_file = _store_review_verify_artifact_records(
+    stored_artifacts = _store_review_verify_artifact_records(
         task,
         config,
         store,
@@ -3023,30 +3031,35 @@ def _capture_review_verify_result(
         producer=producer,
         metadata=metadata,
     )
+    persisted_result = replace(
+        result,
+        artifact_id=stored_artifacts.artifact_id,
+        artifact_path=stored_artifacts.artifact_path,
+    )
     _persist_review_verify_result(
         task,
-        result,
+        persisted_result,
         markdown=markdown,
-        artifact_file=artifact_file,
+        artifact_file=stored_artifacts.artifact_path,
     )
     store.update(task)
     if task_logger is not None:
         task_logger.phase(
-            f"Captured review verify result: {result.status} ({result.exit_status})",
+            f"Captured review verify result: {persisted_result.status} ({persisted_result.exit_status})",
             extra={
                 "event": "review_verify_result",
-                "review_verify_status": result.status,
-                "review_verify_exit_status": result.exit_status,
-                "review_verify_command": result.command,
-                "review_verify_captured_at": result.captured_at.isoformat(),
-                "review_verify_branch": result.reviewed_branch,
-                "review_verify_head_sha": result.reviewed_head_sha,
-                "review_verify_base_sha": result.reviewed_base_sha,
-                "review_verify_cwd": result.working_directory,
-                "review_verify_artifact_file": artifact_file,
+                "review_verify_status": persisted_result.status,
+                "review_verify_exit_status": persisted_result.exit_status,
+                "review_verify_command": persisted_result.command,
+                "review_verify_captured_at": persisted_result.captured_at.isoformat(),
+                "review_verify_branch": persisted_result.reviewed_branch,
+                "review_verify_head_sha": persisted_result.reviewed_head_sha,
+                "review_verify_base_sha": persisted_result.reviewed_base_sha,
+                "review_verify_cwd": persisted_result.working_directory,
+                "review_verify_artifact_file": stored_artifacts.artifact_path,
             },
-    )
-    return artifact_file or ""
+        )
+    return stored_artifacts.artifact_path or ""
 
 
 def _review_blocker_resolution_artifact_key(metadata: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, str | None]:
@@ -8935,6 +8948,7 @@ def _run_non_code_task(
                         markdown=review_verify_markdown,
                         project_results=persisted_project_results if reviewed_head_sha is not None else (),
                         task_logger=task_logger,
+                        metadata={"timeout_seconds": autonomous_verify_timeout_seconds},
                     )
             prompt = build_prompt(
                 task,

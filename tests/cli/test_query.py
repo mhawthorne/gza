@@ -5697,6 +5697,7 @@ class TestShowCommand:
         assert "Review Verify Artifact:" in result.stdout
         assert "Artifacts:" in result.stdout
         assert stored.path in result.stdout
+        assert f"Review Verify Artifact: {stored.path}" in result.stdout
         assert "Review Verify Result:" in result.stdout
         assert "## verify_command result" in result.stdout
         assert "mypy failed" in result.stdout
@@ -5726,6 +5727,7 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Artifacts:" in result.stdout
         assert stored.path in result.stdout
+        assert "Review Verify Artifact:" in result.stdout
         assert "missing" in result.stdout
 
     def test_artifact_command_prints_latest_content_and_path(self, tmp_path: Path) -> None:

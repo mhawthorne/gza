@@ -18212,9 +18212,11 @@ class TestProviderPromptSanitization:
         assert artifact.exit_status == "7"
         assert artifact.path == refreshed.review_verify_artifact_file
         assert artifact.metadata == {
+            "cwd": refreshed.review_verify_cwd,
             "reviewed_base_sha": None,
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
+            "timeout_seconds": 120,
             "tree_fingerprint": failed_fingerprint,
             "working_directory": refreshed.review_verify_cwd,
         }
@@ -18301,14 +18303,16 @@ class TestProviderPromptSanitization:
         assert artifacts[0].status == "passed"
         assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == "all good"
         assert artifacts[0].metadata == {
+            "cwd": refreshed.review_verify_cwd,
             "reviewed_base_sha": None,
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
+            "timeout_seconds": 120,
             "tree_fingerprint": None,
             "working_directory": refreshed.review_verify_cwd,
         }
 
-    def test_fresh_review_truncates_inline_verify_output_and_keeps_full_artifact(self, tmp_path: Path):
+    def test_fresh_review_failing_verify_artifact_preserves_pytest_tail_beyond_prompt_trim(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -18332,9 +18336,16 @@ class TestProviderPromptSanitization:
         config.model = None
         config.max_steps = 10
         config.timeout_minutes = 10
-        large_output = ("x" * 4500) + " ENDMARK"
-        config.verify_command = f"printf '%s' '{large_output}' && exit 9"
+        config.verify_command = "./bin/tests"
         config.autonomous_verify_timeout_seconds = 120
+
+        long_output = (
+            ("collected setup noise\n" * 350)
+            + "FAILED tests/test_example.py::test_tail - AssertionError: boom\n"
+            + "=== short test summary info ===\n"
+            + "FAILED tests/test_example.py::test_tail - AssertionError: boom\n"
+            + "============================== 1 failed in 31.25s ==============================\n"
+        )
 
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
@@ -18360,7 +18371,21 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
+        verify_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha=None,
+            working_directory=str(config.worktree_path / f"{task.slug}-{task.task_type}"),
+            failure="pytest failed",
+            output=long_output,
+        )
+
         with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
+             patch("gza.runner._run_review_verify_command", return_value=verify_result), \
              patch("gza.runner.post_review_to_pr"):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
@@ -18369,13 +18394,17 @@ class TestProviderPromptSanitization:
         assert refreshed is not None
         assert refreshed.review_verify_markdown is not None
         assert "Failing output (trimmed):" in refreshed.review_verify_markdown
-        assert "```text" in refreshed.review_verify_markdown
         assert "..." in refreshed.review_verify_markdown
+        assert "FAILED tests/test_example.py::test_tail - AssertionError: boom" in refreshed.review_verify_markdown
+        assert "=== short test summary info ===" in refreshed.review_verify_markdown
+        assert "collected setup noise" not in refreshed.review_verify_markdown
         assert refreshed.review_verify_artifact_file is not None
         artifacts = store.list_artifacts(task.id, kind="verify_command_output")
         assert len(artifacts) == 1
-        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == large_output
-        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8").endswith("ENDMARK")
+        artifact_output = (tmp_path / artifacts[0].path).read_text(encoding="utf-8")
+        assert artifact_output == long_output
+        assert "FAILED tests/test_example.py::test_tail - AssertionError: boom" in artifact_output
+        assert "=== short test summary info ===" in artifact_output
 
     def test_cross_project_review_persists_failed_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -18641,11 +18670,13 @@ class TestProviderPromptSanitization:
         assert set(artifacts_by_scope) == {"services/foo", "libs/bar"}
         assert artifacts_by_scope["services/foo"].status == "passed"
         assert artifacts_by_scope["services/foo"].metadata == {
+            "cwd": "services/foo",
             "reviewed_base_sha": "cafebabe",
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
             "scope": "services/foo",
             "skip_reason": None,
+            "timeout_seconds": 120,
             "working_directory": "services/foo",
         }
         assert (tmp_path / artifacts_by_scope["services/foo"].path).read_text(encoding="utf-8") == (
@@ -18658,11 +18689,13 @@ class TestProviderPromptSanitization:
         )
         assert artifacts_by_scope["libs/bar"].status == "failed"
         assert artifacts_by_scope["libs/bar"].metadata == {
+            "cwd": "libs/bar",
             "reviewed_base_sha": "cafebabe",
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
             "scope": "libs/bar",
             "skip_reason": None,
+            "timeout_seconds": 120,
             "working_directory": "libs/bar",
         }
         assert (tmp_path / artifacts_by_scope["libs/bar"].path).read_text(encoding="utf-8") == (
@@ -19025,21 +19058,10 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
         assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
         artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 2
+        assert len(artifacts) == 1
         artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
-        assert set(artifacts_by_scope) == {"services/foo", "apps/baz"}
+        assert set(artifacts_by_scope) == {"services/foo"}
         assert artifacts_by_scope["services/foo"].status == "passed"
-        assert artifacts_by_scope["apps/baz"].status == "skipped"
-        assert artifacts_by_scope["apps/baz"].byte_size == 0
-        assert artifacts_by_scope["apps/baz"].metadata == {
-            "reviewed_base_sha": "cafebabe",
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "deadbeef",
-            "scope": "apps/baz",
-            "skip_reason": "no verify_command configured for this affected project",
-            "working_directory": "apps/baz",
-        }
-        assert (tmp_path / artifacts_by_scope["apps/baz"].path).exists() is False
 
     def test_cross_project_review_persists_unavailable_aggregate_when_unknown_paths_are_skipped(
         self, tmp_path: Path
@@ -19165,20 +19187,9 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
         assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
         artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 2
+        assert len(artifacts) == 1
         artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
-        assert set(artifacts_by_scope) == {"services/foo", "unknown paths"}
-        assert artifacts_by_scope["unknown paths"].status == "skipped"
-        assert artifacts_by_scope["unknown paths"].byte_size == 0
-        assert artifacts_by_scope["unknown paths"].metadata == {
-            "reviewed_base_sha": "cafebabe",
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "deadbeef",
-            "scope": "unknown paths",
-            "skip_reason": "affected paths fell outside all discovered project roots",
-            "working_directory": "unknown paths",
-        }
-        assert (tmp_path / artifacts_by_scope["unknown paths"].path).exists() is False
+        assert set(artifacts_by_scope) == {"services/foo"}
 
     def test_fresh_review_prompt_still_runs_provider_after_verify_timeout(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
