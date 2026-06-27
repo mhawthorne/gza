@@ -117,6 +117,13 @@ def test_classify_transient_recovery_terminal_worker_died_before_commits_is_tran
     assert transient.failure_reason == "WORKER_DIED"
 
 
+def test_classify_transient_recovery_terminal_workspace_not_populated_is_transient() -> None:
+    transient = classify_transient_recovery_terminal(_task(failure_reason="WORKSPACE_NOT_POPULATED"))
+
+    assert transient is not None
+    assert transient.failure_reason == "WORKSPACE_NOT_POPULATED"
+
+
 def test_classify_transient_recovery_terminal_completed_noop_improve_is_not_transient() -> None:
     transient = classify_transient_recovery_terminal(
         _task(status="completed", task_type="improve", failure_reason=None, changed_diff=False)

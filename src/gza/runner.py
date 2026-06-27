@@ -302,6 +302,99 @@ def _resolved_git_failure(error: BaseException) -> ResolvedRunFailure:
             outcome_message="Outcome: failed (INFRASTRUCTURE_ERROR)",
         )
     return _git_error_failure()
+
+
+def _workspace_population_markers(project_dir: Path) -> tuple[str, ...]:
+    """Return stable project-root file markers for population probing.
+
+    The probe is intentionally conservative: it should fail only when startup can
+    prove the prepared workspace is unpopulated. Root files like ``pyproject.toml``
+    and ``package.json`` are stable evidence that survives normal worktree setup;
+    untracked or ignored directories do not meet that bar.
+    """
+    markers: list[str] = []
+    for candidate in ("pyproject.toml", "uv.lock", "package.json", "go.mod", "Cargo.toml"):
+        if (project_dir / candidate).is_file():
+            markers.append(candidate)
+    return tuple(markers)
+
+
+def _probe_workspace_population(
+    *,
+    config: Config,
+    worktree_path: Path,
+    provider_cwd: Path,
+) -> str | None:
+    """Return a setup-failure message when the prepared workspace is unpopulated."""
+    project_markers = _workspace_population_markers(config.project_dir)
+    if not project_markers:
+        return None
+
+    repo_marker_path = worktree_path / ".git"
+    present_project_markers = tuple(marker for marker in project_markers if (provider_cwd / marker).is_file())
+    if repo_marker_path.exists() and present_project_markers:
+        return None
+
+    missing: list[str] = []
+    if not repo_marker_path.exists():
+        missing.append(str(repo_marker_path))
+    if not present_project_markers:
+        expected_paths = ", ".join(str(provider_cwd / marker) for marker in project_markers)
+        missing.append(f"at least one stable project-root marker ({expected_paths})")
+
+    expected = ".git plus at least one stable project-root marker"
+    found = ", ".join(present_project_markers) if present_project_markers else "none"
+    missing_text = "; ".join(missing)
+    return (
+        "Workspace is not populated; aborting before provider run. "
+        f"Missing required workspace evidence: {missing_text}. "
+        f"Present stable project-root markers in provider cwd: {found}. "
+        f"Expected task workspace root {worktree_path} and project workspace {provider_cwd} "
+        f"to contain {expected}."
+    )
+
+
+def _fail_if_workspace_not_populated(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: Provider | str,
+    invocation: RunInvocationContext | None,
+    interaction_mode: str,
+    resume: bool,
+    worktree_path: Path,
+    provider_cwd: Path,
+    branch: str | None = None,
+    prelude_written: bool = False,
+) -> bool:
+    """Mark a setup failure and return True when the prepared workspace is unpopulated."""
+    workspace_population_error = _probe_workspace_population(
+        config=config,
+        worktree_path=worktree_path,
+        provider_cwd=provider_cwd,
+    )
+    if workspace_population_error is None:
+        return False
+
+    error_message(f"Error: {workspace_population_error}")
+    _mark_workspace_setup_failure(
+        task=task,
+        config=config,
+        store=store,
+        provider=provider,
+        invocation=invocation,
+        interaction_mode=interaction_mode,
+        resume=resume,
+        message=workspace_population_error,
+        failure_reason="WORKSPACE_NOT_POPULATED",
+        phase="workspace_population_probe",
+        branch=branch,
+        prelude_written=prelude_written,
+    )
+    return True
+
+
 def _task_is_cross_project(task: Task) -> bool:
     """Return whether a task carries the reserved cross-project scope tag."""
     return CROSS_PROJECT_TAG in task.tags
@@ -8383,13 +8476,29 @@ def _run_inner(
         _park_task_pending_after_blocked_precondition(task, store)
         return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
 
+    # Validate the prepared workspace before any provider turn starts.
+    boundary = _project_boundary(config)
+    provider_cwd = _worktree_execution_dir(worktree_path, boundary)
+    if _fail_if_workspace_not_populated(
+        task=task,
+        config=config,
+        store=store,
+        provider=provider,
+        invocation=invocation,
+        interaction_mode=interaction_mode,
+        resume=resume,
+        worktree_path=worktree_path,
+        provider_cwd=provider_cwd,
+        branch=branch_name,
+        prelude_written=True,
+    ):
+        return 1
+
     # Setup summary directory and path for task/implement types
     _, summary_path = get_task_output_paths(task, config.project_dir)
     assert summary_path is not None, f"Code task type '{task.task_type}' must have a summary path"
     summary_dir = summary_path.parent
     summary_dir.mkdir(parents=True, exist_ok=True)
-    boundary = _project_boundary(config)
-    provider_cwd = _worktree_execution_dir(worktree_path, boundary)
 
     # Create summary directory structure in worktree
     worktree_summary_dir = _worktree_path_for_project_path(config, worktree_path, summary_dir)
@@ -8861,6 +8970,7 @@ def _run_non_code_task(
     # Create worktree in /tmp for Docker compatibility on macOS
     assert task.slug is not None
     worktree_path = config.worktree_path / f"{task.slug}-{task.task_type}"
+    boundary = _project_boundary(config)
 
     try:
         # Get default branch to base worktree on
@@ -8880,9 +8990,22 @@ def _run_non_code_task(
         _create_detached_review_worktree(git, worktree_path, base_ref)
         worktree_git = Git(worktree_path)
 
-    # Create report directory structure in worktree
-        boundary = _project_boundary(config)
         provider_cwd = _worktree_execution_dir(worktree_path, boundary)
+        if _fail_if_workspace_not_populated(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation,
+            interaction_mode=interaction_mode,
+            resume=resume,
+            worktree_path=worktree_path,
+            provider_cwd=provider_cwd,
+            prelude_written=True,
+        ):
+            return 1
+
+        # Create report directory structure in worktree
         worktree_report_dir = _worktree_path_for_project_path(config, worktree_path, report_path.parent)
         worktree_report_dir.mkdir(parents=True, exist_ok=True)
         worktree_report_path = _worktree_path_for_project_path(config, worktree_path, report_path)

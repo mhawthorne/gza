@@ -1495,6 +1495,17 @@ def test_recovery_engine_provider_empty_turn_is_retryable(tmp_path: Path) -> Non
     assert decision.reason_code == "PROVIDER_EMPTY_TURN"
 
 
+def test_recovery_engine_workspace_not_populated_is_retryable(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, task_type="plan", reason="WORKSPACE_NOT_POPULATED", session_id=None)
+
+    assert classify_failure_reason("WORKSPACE_NOT_POPULATED") == "retryable"
+
+    decision = decide_failed_task_recovery(store, task, max_recovery_attempts=1)
+    assert decision.action == "retry"
+    assert decision.launch_mode == "worker"
+    assert decision.reason_code == "WORKSPACE_NOT_POPULATED"
+
+
 def test_recovery_engine_retryable_provider_error_chooses_fresh_retry_even_with_session(tmp_path: Path) -> None:
     store, task = _failed_task(
         tmp_path,

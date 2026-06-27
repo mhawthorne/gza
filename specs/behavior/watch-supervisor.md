@@ -347,6 +347,7 @@ When the installed `gza` package fingerprint changes while watch is running:
   slot idle.
 - When the latest relevant failed recovery or improve attempt for that selected
   subject/action is a **transient terminal** (for example provider-capacity,
+  infrastructure/setup failure before durable work such as `WORKSPACE_NOT_POPULATED`,
   infrastructure/worker death before durable work, or timeout before meaningful execution),
   watch MUST NOT increment the no-progress streak for that cycle. Instead it MUST preserve
   the last real no-progress streak unchanged, clear any deferred launch marker for the

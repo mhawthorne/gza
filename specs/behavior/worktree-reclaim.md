@@ -147,6 +147,13 @@ failure reason, and setup-phase metadata so operators can distinguish "claimed b
 acquired a workspace" from "provider ran and failed." A direct manual run and a supervisor
 run MUST use the same logging path.
 
+If task startup can prove the prepared workspace is unpopulated before provider execution
+starts — for example the mounted worktree lacks its repo marker and any stable tracked
+project-root marker —
+the runner MUST fail fast with a distinct setup reason rather than starting the provider and
+later inferring `WORKER_DIED`. That outcome remains a bounded retryable infrastructure/setup
+failure under the shared recovery policy, but it is still classified as "provider never ran."
+
 ## Policy knob
 
 - **`worktree_auto_reclaim_clean`** (default: **on**).

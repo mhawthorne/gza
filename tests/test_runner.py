@@ -17483,6 +17483,256 @@ class TestExceptionHandlerMarkFailed:
         assert outcome["branch"] == "feature/setup-logging"
         assert any(entry.get("subtype") == "execution" for entry in ops_entries)
 
+    def test_code_task_empty_workspace_fails_before_provider_run_and_is_retryable_infra(self, tmp_path: Path) -> None:
+        """An unpopulated prepared workspace must abort before any provider turn."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "tests").mkdir()
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement setup logging", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260627-empty-workspace"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+
+        empty_worktree = config.worktree_path / task.slug
+        empty_worktree.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/empty-workspace"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch(
+                "gza.runner._project_boundary",
+                return_value=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
+            ),
+            patch("gza.runner._stage_worktree_agent_resources", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
+        ):
+            rc = _run_inner(task, config, config, store, provider, git, resume=False)
+
+        assert rc == 1
+        assert provider.run.call_count == 0
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKSPACE_NOT_POPULATED"
+        assert refreshed.num_turns_reported is None
+        assert refreshed.num_turns_computed is None
+        assert refreshed.output_tokens is None
+        assert refreshed.session_id is None
+
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "retry"
+        assert decision.reason_code == "WORKSPACE_NOT_POPULATED"
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["failure_reason"] == "WORKSPACE_NOT_POPULATED"
+        assert outcome["phase"] == "workspace_setup"
+        assert outcome["setup_phase"] == "workspace_population_probe"
+        assert "before provider run" in outcome["message"]
+        assert not any(entry.get("subtype") == "stats" for entry in ops_entries)
+
+    def test_code_task_workspace_probe_ignores_extra_source_marker_candidates(self, tmp_path: Path) -> None:
+        """Extra marker-looking files in the source checkout must not fail a populated worktree."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "package.json").write_text('{"name":"local-only"}\n', encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement setup logging", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260627-populated-workspace"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+
+        populated_worktree = config.worktree_path / task.slug
+        populated_worktree.mkdir(parents=True, exist_ok=True)
+        (populated_worktree / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+        (populated_worktree / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (populated_worktree / "src").mkdir(exist_ok=True)
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/populated-workspace"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch(
+                "gza.runner._project_boundary",
+                return_value=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
+            ),
+            patch(
+                "gza.runner._stage_worktree_agent_resources",
+                side_effect=RuntimeError("stage reached"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="stage reached"):
+                _run_inner(task, config, config, store, provider, git, resume=False)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "in_progress"
+        assert refreshed.failure_reason is None
+
+    def test_non_code_empty_workspace_fails_before_provider_run_and_is_retryable_infra(self, tmp_path: Path) -> None:
+        """A non-code detached worktree must abort before prompt staging or provider execution."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "tests").mkdir()
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Plan setup logging", task_type="plan")
+        assert task.id is not None
+        task.slug = "20260627-empty-non-code-workspace"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+
+        empty_worktree = config.worktree_path / f"{task.slug}-{task.task_type}"
+        empty_worktree.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch("gza.runner._create_detached_review_worktree", return_value=None),
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch(
+                "gza.runner._project_boundary",
+                return_value=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
+            ),
+            patch("gza.runner._stage_worktree_agent_resources", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner._copy_learnings_to_worktree", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner.build_prompt", side_effect=AssertionError("provider should not run")),
+            patch("gza.runner._prepare_validated_docker_worktree_git_metadata", side_effect=AssertionError("provider prep should not run")),
+            patch("gza.runner._call_provider_run", side_effect=AssertionError("provider should not run")),
+        ):
+            rc = _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        assert rc == 1
+        assert provider.run.call_count == 0
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKSPACE_NOT_POPULATED"
+        assert refreshed.num_turns_reported is None
+        assert refreshed.num_turns_computed is None
+        assert refreshed.output_tokens is None
+        assert refreshed.session_id is None
+
+        decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
+        assert decision.action == "retry"
+        assert decision.reason_code == "WORKSPACE_NOT_POPULATED"
+
+        assert refreshed.log_file is not None
+        log_file = config.project_dir / refreshed.log_file
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["failure_reason"] == "WORKSPACE_NOT_POPULATED"
+        assert outcome["phase"] == "workspace_setup"
+        assert outcome["setup_phase"] == "workspace_population_probe"
+        assert "before provider run" in outcome["message"]
+        assert not any(entry.get("subtype") == "stats" for entry in ops_entries)
+
+    def test_non_code_workspace_probe_ignores_extra_source_marker_candidates(self, tmp_path: Path) -> None:
+        """Detached worktrees should continue when stable root markers prove population."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "package.json").write_text('{"name":"local-only"}\n', encoding="utf-8")
+        (tmp_path / "tests").mkdir()
+
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Plan setup logging", task_type="plan")
+        assert task.id is not None
+        task.slug = "20260627-populated-non-code-workspace"
+        store.mark_in_progress(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+
+        populated_worktree = config.worktree_path / f"{task.slug}-{task.task_type}"
+        populated_worktree.mkdir(parents=True, exist_ok=True)
+        (populated_worktree / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+        (populated_worktree / "pyproject.toml").write_text("[project]\nname='testproject'\n", encoding="utf-8")
+        (populated_worktree / "src").mkdir(exist_ok=True)
+
+        with (
+            patch("gza.runner._create_detached_review_worktree", return_value=None),
+            patch("gza.runner.Git", return_value=Mock(spec=Git)),
+            patch(
+                "gza.runner._project_boundary",
+                return_value=ProjectBoundary(repo_root=tmp_path, scope_root=Path("."), local_dependencies=()),
+            ),
+            patch(
+                "gza.runner._stage_worktree_agent_resources",
+                side_effect=RuntimeError("stage reached"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="stage reached"):
+                _run_non_code_task(task, config, store, provider, git, resume=False)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "in_progress"
+        assert refreshed.failure_reason is None
+
     def test_non_code_detached_worktree_git_error_writes_ops_outcome(self, tmp_path: Path):
         """Non-code setup GitError should be persisted before the task is marked failed."""
         (tmp_path / "gza.yaml").write_text(
