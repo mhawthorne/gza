@@ -1642,8 +1642,15 @@ def ensure_task_log_paths(config: Config, store: SqliteTaskStore, task: Task) ->
     return paths
 
 
-def prepare_task_startup_phase(config: Config, store: SqliteTaskStore, task: Task) -> Task:
+def prepare_task_startup_phase(
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    resume_mode: bool = False,
+) -> Task:
     """Synchronously materialize task startup metadata before execution detaches."""
+    _ensure_task_dispatchable_for_startup(task, store, resume_mode=resume_mode)
     if task.slug is None:
         git = Git(config.project_dir)
         slug_override = _compute_slug_override(task, store)
@@ -1667,6 +1674,54 @@ def prepare_task_startup_phase(config: Config, store: SqliteTaskStore, task: Tas
     if task.id is None:
         return task
     return store.get(task.id) or task
+
+
+class TaskDispatchBlockedError(RuntimeError):
+    """Raised when a pending task is not dispatchable."""
+
+
+def _is_code_task(task: Task) -> bool:
+    """Return whether the task uses the code-task runner path."""
+    return task.task_type not in {
+        "explore",
+        "plan",
+        "plan_review",
+        "plan_improve",
+        "review",
+        "internal",
+        "learn",
+    }
+
+
+def _ensure_code_task_dependency_dispatchable(task: Task, store: SqliteTaskStore) -> None:
+    """Refuse dispatch for dependency-blocked code tasks before startup begins."""
+    if not _is_code_task(task):
+        return
+    readiness = store.get_dependency_readiness(task)
+    if readiness.ready:
+        return
+    raise TaskDispatchBlockedError(blocked_dependency_error_message(store, task))
+
+
+def _ensure_pending_task_dispatchable(task: Task, store: SqliteTaskStore) -> None:
+    """Refuse dispatch for dependency-blocked pending tasks before startup begins."""
+    if task.status != "pending":
+        return
+    _ensure_code_task_dependency_dispatchable(task, store)
+
+
+def _ensure_task_dispatchable_for_startup(
+    task: Task,
+    store: SqliteTaskStore,
+    *,
+    resume_mode: bool,
+) -> None:
+    """Refuse startup for dependency-blocked tasks on dispatchable execution paths."""
+    if task.status == "pending":
+        _ensure_pending_task_dispatchable(task, store)
+        return
+    if resume_mode and task.status == "failed":
+        _ensure_code_task_dependency_dispatchable(task, store)
 
 
 def remove_task_startup_artifacts(config: Config, task: Task) -> None:
@@ -6652,7 +6707,8 @@ def run(
         task_id: Optional specific task ID to run. If None, runs next pending task.
         resume: If True, resume from previous session using stored session_id.
         open_after: If True, open the report file in $EDITOR after completion (for review tasks).
-        skip_precondition_check: If True, skip dependency merge precondition checks.
+        skip_precondition_check: Compatibility flag retained for callers; dependency
+            readiness is still enforced before dispatch.
         on_task_claimed: Optional callback invoked after task ownership is established.
         create_pr: If True, create/reuse a PR after successful code-task completion.
         invocation: Optional execution invocation context for UX/provenance.
@@ -6703,6 +6759,11 @@ def run(
                 assert task.id is not None
                 store.set_execution_mode(task.id, task_execution_mode)
             else:
+                try:
+                    _ensure_code_task_dependency_dispatchable(task, store)
+                except TaskDispatchBlockedError as exc:
+                    error_message(f"Error: {exc}")
+                    return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
@@ -6712,18 +6773,12 @@ def run(
                 task.execution_mode = task_execution_mode
                 store.update(task)
         else:
-            # Check if task is blocked by dependencies
-            is_blocked, blocking_id, blocking_status = store.is_task_blocked(task)
-            merge_precondition_blocked = (
-                skip_precondition_check
-                and task.depends_on
-                and not task.same_branch
-                and get_unmerged_dependency_precondition(store, task) is not None
-            )
-            if is_blocked and not merge_precondition_blocked:
-                del blocking_id, blocking_status
-                error_message(f"Error: {blocked_dependency_error_message(store, task)}")
-                return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+            if task.status == "pending":
+                try:
+                    _ensure_pending_task_dispatchable(task, store)
+                except TaskDispatchBlockedError as exc:
+                    error_message(f"Error: {exc}")
+                    return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
             requested_create_pr = bool(create_pr or task.create_pr)
             allow_pr_retry = (
                 requested_create_pr
@@ -6736,6 +6791,11 @@ def run(
                 task.execution_mode = task_execution_mode
                 store.update(task)
             elif allow_pr_retry:
+                try:
+                    _ensure_code_task_dependency_dispatchable(task, store)
+                except TaskDispatchBlockedError as exc:
+                    error_message(f"Error: {exc}")
+                    return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
                 task.status = "in_progress"
                 task.started_at = datetime.now(UTC)
                 task.completed_at = None
@@ -6748,27 +6808,17 @@ def run(
                 return 1
             else:
                 assert task.id is not None
-                if skip_precondition_check and merge_precondition_blocked:
-                    task.status = "in_progress"
-                    task.started_at = datetime.now(UTC)
-                    task.completed_at = None
-                    task.failure_reason = None
-                    task.completion_reason = None
-                    task.running_pid = os.getpid()
-                    task.execution_mode = task_execution_mode
-                    store.update(task)
-                else:
-                    claim = store.try_mark_in_progress(task.id, os.getpid())
-                    claimed = claim.task if claim is not None else None
-                    if claimed is None:
-                        refreshed = store.get(task.id)
-                        status = refreshed.status if refreshed else "unknown"
-                        if claim is not None and claim.refusal_reason == "blocked":
-                            error_message(f"Error: {blocked_dependency_error_message(store, task)}")
-                            return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
-                        error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
-                        return 1
-                    task = claimed
+                claim = store.try_mark_in_progress(task.id, os.getpid())
+                claimed = claim.task if claim is not None else None
+                if claimed is None:
+                    refreshed = store.get(task.id)
+                    status = refreshed.status if refreshed else "unknown"
+                    if claim is not None and claim.refusal_reason == "blocked":
+                        error_message(f"Error: {blocked_dependency_error_message(store, task)}")
+                        return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+                    error_message(f"Error: Task {task_id} is no longer pending (status: {status})")
+                    return 1
+                task = claimed
                 task.execution_mode = task_execution_mode
                 assert task.id is not None
                 store.set_execution_mode(task.id, task_execution_mode)
@@ -8125,15 +8175,7 @@ def _run_inner(
     """Inner task execution logic, split out to allow foreground worker cleanup."""
     # For branchless task types, run without creating a branch.
     # Keep temporary "learn" compatibility for pre-migration rows.
-    if task.task_type in (
-        "explore",
-        "plan",
-        "plan_review",
-        "plan_improve",
-        "review",
-        "internal",
-        "learn",
-    ):
+    if not _is_code_task(task):
         return _run_non_code_task(
             task,
             task_config,
@@ -8289,70 +8331,57 @@ def _run_inner(
         resumed=resume,
     )
 
-    if skip_precondition_check and task.depends_on and not task.same_branch:
+    blocking_dep, target_branch, precondition_error = _check_dependency_merge_precondition(
+        task,
+        store,
+        git,
+        default_branch=default_branch,
+    )
+    if precondition_error is not None:
+        error_message(f"Git error: {precondition_error}")
         write_log_entry(
             log_file,
             {
                 "type": "gza",
-                "subtype": "info",
-                "message": (
-                    f"Skipped dependency merge precondition check (--force) "
-                    f"for depends_on task {task.depends_on}"
-                ),
+                "subtype": "outcome",
+                "message": precondition_error,
+                "failure_reason": "GIT_ERROR",
             },
         )
-    else:
-        blocking_dep, target_branch, precondition_error = _check_dependency_merge_precondition(
-            task,
-            store,
-            git,
-            default_branch=default_branch,
+        _mark_task_failed(
+            task=task,
+            config=config,
+            store=store,
+            log_file=log_file,
+            branch=branch_name,
+            explicit_reason="GIT_ERROR",
+            error_type=None,
+            exit_code=1,
         )
-        if precondition_error is not None:
-            error_message(f"Git error: {precondition_error}")
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "outcome",
-                    "message": precondition_error,
-                    "failure_reason": "GIT_ERROR",
-                },
-            )
-            _mark_task_failed(
-                task=task,
-                config=config,
-                store=store,
-                log_file=log_file,
-                branch=branch_name,
-                explicit_reason="GIT_ERROR",
-                error_type=None,
-                exit_code=1,
-            )
-            return 1
-        if blocking_dep is not None:
-            assert blocking_dep.id is not None
-            dep_branch = blocking_dep.branch or "<none>"
-            failure_message = (
-                f"Dependency {blocking_dep.id} on branch '{dep_branch}' is not merged into "
-                f"'{target_branch}'. Leaving task pending without provider run."
-            )
-            error_message(f"Error: {failure_message}")
-            write_log_entry(
-                log_file,
-                {
-                    "type": "gza",
-                    "subtype": "blocked",
-                    "message": failure_message,
-                    "reason": "dependency_merge_precondition",
-                    "dependency_task_id": blocking_dep.id,
-                    "dependency_branch": dep_branch,
-                    "target_branch": target_branch,
-                    "task_status": "pending",
-                },
-            )
-            _park_task_pending_after_blocked_precondition(task, store)
-            return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        return 1
+    if blocking_dep is not None:
+        assert blocking_dep.id is not None
+        dep_branch = blocking_dep.branch or "<none>"
+        failure_message = (
+            f"Dependency {blocking_dep.id} on branch '{dep_branch}' is not merged into "
+            f"'{target_branch}'. Leaving task pending without provider run."
+        )
+        error_message(f"Error: {failure_message}")
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "blocked",
+                "message": failure_message,
+                "reason": "dependency_merge_precondition",
+                "dependency_task_id": blocking_dep.id,
+                "dependency_branch": dep_branch,
+                "target_branch": target_branch,
+                "task_status": "pending",
+            },
+        )
+        _park_task_pending_after_blocked_precondition(task, store)
+        return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
 
     # Setup summary directory and path for task/implement types
     _, summary_path = get_task_output_paths(task, config.project_dir)

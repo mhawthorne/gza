@@ -632,20 +632,23 @@ def test_configuration_docs_cover_force_execution_flags_and_prerequisite_unmerge
     config_content = (docs_root / "configuration.md").read_text()
 
     required_snippets = [
-        "| `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |",
-        "| `--force` | Skip dependency merge precondition checks when starting the resumed task |",
-        "| `--force` | Skip dependency merge precondition checks when starting the retry task |",
-        "| `--force` | Skip dependency merge precondition checks when running the improve task |",
-        "| `--force` | Skip dependency merge precondition checks when running the plan review task |",
-        "| `--force` | Skip dependency merge precondition checks when running the plan improve task |",
-        "| `--force` | Skip dependency merge precondition checks when running the implement task |",
-        "| `--force` | Skip dependency merge precondition checks when advance starts workers |",
-        "| `--force` | Skip dependency merge precondition checks when iterate starts workers |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Compatibility flag; dependency-blocked tasks still will not run |",
+        "| `--force` | Bypass numeric retry/review caps only; dependency-blocked tasks still will not run |",
+        "| `--force` | Bypass numeric retry/review caps only; dependency-blocked tasks still will not run |",
         "`PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged",
     ]
 
     for snippet in required_snippets:
         assert snippet in config_content
+
+    assert "Use `--force` only when you intentionally want to bypass this guard." not in config_content
+    assert "`--force` does not bypass dependency merge/readiness guards." in config_content
 
 
 def test_retry_docs_and_examples_describe_same_branch_retry_split() -> None:

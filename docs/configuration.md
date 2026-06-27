@@ -619,7 +619,7 @@ gza work [task_id...] [options]
 | `--count N`, `-c N` | Number of tasks to run before stopping |
 | `--background`, `-b` | Run worker in background |
 | `--max-turns N` | Override max_turns setting for this run |
-| `--force` | Skip dependency merge precondition checks (run even if depends_on output is not yet merged) |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 | `--pr` | Request auto-create/reuse of a GitHub PR after successful code-task completion; evaluated at completion time and skipped without failing when PRs are unavailable |
 | `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
@@ -1108,7 +1108,7 @@ gza run-inline <task_id> [options]
 | `--resume` | Resume from the stored provider session instead of starting fresh |
 | `--no-docker` | Run provider directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
-| `--force` | Skip dependency merge precondition checks when starting the run |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 `run-inline` uses provider capabilities: Claude runs in terminal-attached interactive foreground mode, while providers without interactive foreground support run in observe-only mode.
 
@@ -1128,7 +1128,7 @@ gza resume <task_id> [options]
 | `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--max-turns N` | Override max_turns setting for this run |
-| `--force` | Skip dependency merge precondition checks when starting the resumed task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 Bare `gza resume <task_id>` creates the resumed task and leaves it pending. Use `--run` for immediate foreground execution or `--background` for detached execution.
 
@@ -1148,7 +1148,7 @@ gza retry <task_id> [options]
 | `--run`, `-r` | Run the task immediately in the foreground |
 | `--background`, `-b` | Run worker in background |
 | `--max-turns N` | Override max_turns setting for this run |
-| `--force` | Skip dependency merge precondition checks when starting the retry task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 Bare `gza retry <task_id>` creates the retry task and leaves it pending. Use `--run` for immediate foreground execution or `--background` for detached execution.
 
@@ -1516,7 +1516,7 @@ gza improve <impl_task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
-| `--force` | Skip dependency merge precondition checks when running the improve task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 The improve command finds the most recent review for the implementation task and creates a new task that continues on the same branch to address the review feedback.
 When no completed review exists, improve can use unresolved task comments as feedback context.
@@ -1542,7 +1542,7 @@ gza fix <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
-| `--force` | Skip dependency precondition checks when running the fix task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 `gza fix` only applies to a resolved implementation that already reached `completed`. If
 the implementation never completed and is currently `failed`, `dropped`, or otherwise
@@ -1678,7 +1678,7 @@ gza implement <plan_task_id> [prompt] [options]
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
-| `--force` | Skip dependency merge precondition checks when running the implement task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
 Using `uv run gza edit <plan-id> --no-hold-for-review` also clears the hold, but that path releases the completed plan back into the automated `plan_review` lifecycle rather than directly creating implementation work.
@@ -1705,7 +1705,7 @@ gza plan-review <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
-| `--force` | Skip dependency merge precondition checks when running the plan review task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 `--edit-slices` and `--materialize` operate on a completed `plan_review` task ID rather than a plan source ID. `--edit-slices` persists a validated override artifact tied to that review, and `--materialize` reuses an existing non-dropped slice set for the same review/manifest instead of creating duplicates. If a stored override artifact is malformed or no longer validates, both commands exit non-zero with an invalid override-manifest error and create no implementation tasks.
 The primary unattended path is still `plan -> plan_review -> materialized implement slices`; this command is the direct manual surface for reruns, slice overrides, and explicit materialization.
@@ -1729,7 +1729,7 @@ gza plan-improve <task_id> [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--model MODEL` | Override model for this task |
 | `--provider PROVIDER` | Override provider for this task |
-| `--force` | Skip dependency merge precondition checks when running the plan improve task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 `gza plan-improve` rejects pending, in-progress, approved, or discussion-only plan
 reviews and creates no revised-plan task in those states.
@@ -1768,7 +1768,7 @@ gza extract SOURCE --files-from FILE [options]
 | `--background`, `-b` | Run worker in background |
 | `--no-docker` | Run Claude directly instead of in Docker |
 | `--max-turns N` | Override max_turns setting for this run |
-| `--force` | Skip dependency merge precondition checks when running the extracted implement task |
+| `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
 `gza extract` accepts exactly one source selector: `SOURCE`, `--branch BRANCH`, or one or more `--commit REV` flags. When multiple commits are provided, extraction applies them in the exact order given on the command line. Without `--per-commit`, that ordered commit set becomes one extraction bundle and one implement task. With `--per-commit`, `gza extract` creates one extracted implement task per selected commit, still preserving the provided order for task creation and extraction manifests. If `--background` is also set, those extracted tasks are then handed to the generic background worker spawner, so execution starts in parallel rather than as a serialized commit-by-commit run.
 
@@ -1790,7 +1790,7 @@ uv run gza advance [task_id] [options]
 | `--dry-run` | Preview actions without executing them |
 | `--max N` | Limit the number of tasks to advance |
 | `--no-docker` | Run workers directly instead of in Docker |
-| `--force` | Skip dependency merge precondition checks when advance starts workers |
+| `--force` | Bypass numeric retry/review caps only; dependency-blocked tasks still will not run |
 | `--unimplemented` | List completed plan/explore source rows that still need an implementation path |
 | `--create` | With `--unimplemented`: queue implement tasks for the listed source rows |
 | `--auto`, `-y` | Skip confirmation and execute immediately |
@@ -1847,7 +1847,7 @@ uv run gza iterate <impl_task_id> [options]
 | `--max-iterations N` | Maximum iterate iterations (1 iteration = code-change task [implement/improve] + review; default: `iterate_max_iterations` or `3`) |
 | `--dry-run` | Preview what would happen without executing |
 | `--no-docker` | Run Claude directly instead of in Docker |
-| `--force` | Skip dependency merge precondition checks when iterate starts workers |
+| `--force` | Bypass numeric retry/review caps only; dependency-blocked tasks still will not run |
 
 If `impl_task_id` names a failed implementation whose recovery-only lineage already ends in a completed retry/resume descendant, iterate plans from that completed descendant instead of surfacing a stale `recovery child already completed` skip. If that descendant is already merged or has no remaining commits to land (`empty` merge state) or only has commits already present on target (`redundant` merge state), iterate reports that no remaining lifecycle action is needed. Directly iterating an implementation whose current-target merge state is already terminal also exits early with the same no-op outcome instead of resurfacing historical failed review/improve/rebase side-quests.
 
@@ -2143,7 +2143,7 @@ Any state can be manually set to `dropped` via `gza set-status`.
 
 - Use `uv run gza resume <task_id>` to continue from where the task left off (preserves conversation context)
 - Use `uv run gza retry <task_id>` to create a new retry attempt (`implement` retries fork fresh; same-branch follow-ups stay on the shared branch)
-- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`uv run gza merge <dependency_task_id>`); after that, `uv run gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `uv run gza retry <task_id>`. Use `--force` only when you intentionally want to bypass this guard.
+- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`uv run gza merge <dependency_task_id>`) or otherwise mark its merge unit complete first; after that, `uv run gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `uv run gza retry <task_id>`. `--force` does not bypass dependency merge/readiness guards.
 
 **Dependencies:**
 

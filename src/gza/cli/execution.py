@@ -87,7 +87,12 @@ from ..recovery_engine import (
 )
 from ..review_tasks import build_review_blocker_dispute_metadata
 from ..review_verdict import get_review_report
-from ..runner import RunInvocationContext, generate_slug, remove_task_startup_artifacts
+from ..runner import (
+    DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
+    RunInvocationContext,
+    generate_slug,
+    remove_task_startup_artifacts,
+)
 from ..status_ops import apply_manual_task_status
 from ..task_types import CLI_ADD_TASK_TYPES
 from ..workers import WorkerRegistry
@@ -4770,6 +4775,10 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
 
     # If the task is pending, run it first before entering the loop.
     if impl_task.status == "pending":
+        is_blocked, _blocking_id, _blocking_status = store.is_task_blocked(impl_task)
+        if is_blocked:
+            print(blocked_dependency_error_message(store, impl_task))
+            return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
         if dry_run:
             print(f"[dry-run] Would run pending implementation {impl_task.id} then iterate (max {max_iterations} iterations)")
             return 0

@@ -228,8 +228,8 @@ def test_iterate_foreground_held_plan_block_surfaces_release_guidance(tmp_path) 
 
 
 @pytest.mark.functional
-def test_iterate_background_held_plan_block_writes_discoverable_startup_reason(tmp_path) -> None:
-    """Background iterate should log pre-claim held-plan blocks to the task startup log."""
+def test_iterate_background_held_plan_block_does_not_spawn_worker(tmp_path) -> None:
+    """Background iterate should refuse held-plan blocks before worker startup."""
 
     setup_config(tmp_path)
     _init_basic_repo(tmp_path)
@@ -252,38 +252,20 @@ def test_iterate_background_held_plan_block_writes_discoverable_startup_reason(t
         str(tmp_path),
     )
 
-    assert result.returncode == 0
-    assert f"Started task {impl.id} in background" in result.stdout
+    assert result.returncode == 1
+    normalized = " ".join((result.stdout + result.stderr).split())
+    assert f"Task {impl.id} is blocked: awaiting plan review for {plan.id}" in normalized
 
     config = Config.load(tmp_path)
     registry = WorkerRegistry(config.workers_path)
-    deadline = time.monotonic() + 10
-    worker = None
-    while time.monotonic() < deadline:
-        workers = [w for w in registry.list_all(include_completed=True) if w.task_id == impl.id]
-        if workers and workers[0].status == "failed":
-            worker = workers[0]
-            break
-        time.sleep(0.1)
+    workers = [w for w in registry.list_all(include_completed=True) if w.task_id == impl.id]
+    assert workers == []
 
-    assert worker is not None
-    assert worker.status == "failed"
-    assert worker.exit_code == 3
-
-    assert worker.startup_log_file is not None
-    startup_log = tmp_path / worker.startup_log_file
-    assert startup_log.exists()
-    startup_text = startup_log.read_text()
-    normalized_startup = " ".join(startup_text.split())
-    assert f"Task {impl.id} is blocked: awaiting plan review for {plan.id}" in normalized_startup
-    assert f"uv run gza implement {plan.id}" in normalized_startup
-    assert f"uv run gza edit {plan.id} --no-hold-for-review" in normalized_startup
-
-    log_result = invoke_gza("log", str(impl.id), "--project", str(tmp_path))
-    assert log_result.returncode == 0
-    normalized_log = " ".join(log_result.stdout.split())
-    assert f"Task {impl.id}" in normalized_log
-    assert f"awaiting plan review for {plan.id}" in normalized_log
+    refreshed = store.get(impl.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    assert refreshed.slug is None
+    assert refreshed.log_file is None
 
 
 @pytest.mark.functional

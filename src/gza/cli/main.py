@@ -295,7 +295,7 @@ def main() -> int:
     work_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks (allows running with unmerged depends_on tasks)",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     work_parser.add_argument(
         "--pr",
@@ -346,7 +346,7 @@ def main() -> int:
     run_inline_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when starting the inline run",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(run_inline_parser)
 
@@ -838,7 +838,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when advance starts workers",
+        help="Bypass numeric retry/review caps only; dependency-blocked tasks still will not run",
     )
     advance_parser.add_argument(
         "--unimplemented",
@@ -2096,7 +2096,7 @@ def main() -> int:
     retry_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the retry task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(retry_parser)
 
@@ -2122,7 +2122,7 @@ def main() -> int:
     resume_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the resumed task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(resume_parser)
 
@@ -2178,7 +2178,7 @@ def main() -> int:
     improve_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the improve task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(improve_parser)
 
@@ -2222,7 +2222,7 @@ def main() -> int:
     fix_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the fix task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(fix_parser)
 
@@ -2302,7 +2302,7 @@ def main() -> int:
         iterate_parser.add_argument(
             "--force",
             action="store_true",
-            help="Skip dependency precondition checks when iterate starts workers",
+            help="Bypass numeric retry/review caps only; dependency-blocked tasks still will not run",
         )
         add_common_args(iterate_parser)
 
@@ -2398,7 +2398,7 @@ def main() -> int:
     implement_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the implement task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(implement_parser)
 
@@ -2453,7 +2453,7 @@ def main() -> int:
     plan_review_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the plan review task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(plan_review_parser)
 
@@ -2492,7 +2492,7 @@ def main() -> int:
     plan_improve_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the plan improve task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(plan_improve_parser)
 
@@ -2609,7 +2609,7 @@ def main() -> int:
     extract_parser.add_argument(
         "--force",
         action="store_true",
-        help="Skip dependency precondition checks when running the extracted implement task",
+        help="Compatibility flag; dependency-blocked tasks still will not run",
     )
     add_common_args(extract_parser)
 

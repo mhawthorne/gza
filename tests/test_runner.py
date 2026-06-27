@@ -35,6 +35,7 @@ from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
+    PR_REQUIRED_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
     REVIEW_IMPROVE_LINEAGE_LIMIT,
     REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
@@ -17997,6 +17998,8 @@ class TestDependencyMergePrecondition:
         assert refreshed.started_at is None
         assert store.is_task_blocked(refreshed) == (True, refreshed.depends_on, "completed")
         assert all(task.status != "failed" for task in store.get_all())
+        log_file = tmp_path / "logs" / f"{downstream.slug}.log"
+        assert not log_file.exists()
 
     def test_missing_dependency_holds_task_before_provider_run(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
@@ -18157,21 +18160,107 @@ class TestDependencyMergePrecondition:
         assert refreshed is not None
         assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
 
-    def test_force_flag_skips_unmerged_dependency_check(self, tmp_path: Path):
+    def test_force_flag_does_not_bypass_unmerged_dependency_dispatch_gate(self, tmp_path: Path):
         result, mock_provider, store, downstream = self._run_with_dependency_state(
             tmp_path,
             skip_precondition_check=True,
         )
 
-        assert result == 0
-        assert mock_provider.run.call_count == 1
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        assert mock_provider.run.call_count == 0
         refreshed = store.get(downstream.id)
         assert refreshed is not None
-        assert refreshed.failure_reason != "PREREQUISITE_UNMERGED"
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+        assert refreshed.started_at is None
+        assert refreshed.completed_at is None
 
         log_file = tmp_path / "logs" / f"{downstream.slug}.log"
-        assert log_file.exists()
-        assert "Skipped dependency merge precondition check (--force)" in ops_log_path_for(log_file).read_text()
+        assert not log_file.exists()
+
+    def test_failed_resume_dependency_block_stops_before_startup_side_effects(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        dependency, downstream = self._setup_dep_and_downstream(store)
+        assert dependency.id is not None
+        failed_at = datetime.now(UTC)
+        downstream.status = "failed"
+        downstream.failure_reason = "TIMEOUT"
+        downstream.started_at = failed_at
+        downstream.completed_at = failed_at
+        downstream.session_id = "resume-session"
+        downstream.log_file = "logs/existing-resume.log"
+        store.update(downstream)
+        config = self._make_config(tmp_path, db_path)
+
+        original = store.get(downstream.id)
+        assert original is not None
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", side_effect=AssertionError("provider should not start")),
+            patch("gza.runner.Git", side_effect=AssertionError("git should not be consulted")),
+        ):
+            result = run(config, task_id=downstream.id, resume=True)
+
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == original.failure_reason
+        assert refreshed.started_at == original.started_at
+        assert refreshed.completed_at == original.completed_at
+        assert refreshed.running_pid == original.running_pid
+        assert refreshed.execution_mode == original.execution_mode
+        assert refreshed.log_file == original.log_file
+
+        assert not (config.project_dir / refreshed.log_file).exists()
+        assert not (config.worktree_path / downstream.slug).exists()
+
+    def test_failed_pr_required_retry_dependency_block_stops_before_startup_side_effects(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        dependency, downstream = self._setup_dep_and_downstream(store)
+        failed_at = datetime.now(UTC)
+        downstream.status = "failed"
+        downstream.failure_reason = PR_REQUIRED_FAILURE_REASON
+        downstream.started_at = failed_at
+        downstream.completed_at = failed_at
+        downstream.branch = "feature/retry-pr-required"
+        downstream.create_pr = True
+        downstream.log_file = "logs/existing-pr-retry.log"
+        store.update(downstream)
+        config = self._make_config(tmp_path, db_path)
+
+        original = store.get(downstream.id)
+        assert original is not None
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", side_effect=AssertionError("provider should not start")),
+            patch("gza.runner.Git", side_effect=AssertionError("git should not be consulted")),
+        ):
+            result = run(config, task_id=downstream.id, create_pr=True)
+
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+
+        refreshed = store.get(downstream.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == PR_REQUIRED_FAILURE_REASON
+        assert refreshed.started_at == original.started_at
+        assert refreshed.completed_at == original.completed_at
+        assert refreshed.running_pid == original.running_pid
+        assert refreshed.execution_mode == original.execution_mode
+        assert refreshed.log_file == original.log_file
+
+        assert not (config.project_dir / refreshed.log_file).exists()
+        assert not (config.worktree_path / downstream.slug).exists()
 
     def test_followup_task_dependency_is_merge_gated_by_reviewed_implementation(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

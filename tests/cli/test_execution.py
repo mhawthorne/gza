@@ -26,6 +26,7 @@ from gza.db import SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
 from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
+from gza.runner import DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
 from gza.workers import WorkerMetadata, WorkerRegistry
 
 from .conftest import (
@@ -4225,6 +4226,78 @@ class TestBackgroundWorkerCommand:
         workers_dir = tmp_path / ".gza" / "workers"
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
+
+    def test_work_background_resume_dependency_block_preserves_failed_task_state_before_spawn(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Explicit background resume must refuse blocked failed code tasks before startup side effects."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        dependency = store.add("Dependency", task_type="implement")
+        dependency.status = "completed"
+        dependency.branch = "feature/dependency-background-resume"
+        dependency.has_commits = True
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        task = store.add("Blocked background resume", task_type="implement", depends_on=dependency.id)
+        failed_at = datetime.now(UTC)
+        task.status = "failed"
+        task.failure_reason = "TIMEOUT"
+        task.started_at = failed_at
+        task.completed_at = failed_at
+        task.slug = "20260627-blocked-background-resume"
+        task.session_id = "resume-session"
+        task.log_file = "logs/existing-background-resume.log"
+        store.update(task)
+        assert task.id is not None
+
+        with (
+            patch(
+                "gza.cli._spawn_detached_worker_process",
+                side_effect=AssertionError("worker process should not spawn"),
+            ),
+            patch(
+                "gza.cli._common.get_effective_config_for_task",
+                side_effect=AssertionError("background resume should fail before provider routing"),
+            ),
+        ):
+            result = invoke_gza(
+                "work",
+                str(task.id),
+                "--background",
+                "--resume",
+                "--no-docker",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "blocked by task" in result.stderr
+        output = result.stdout + result.stderr
+        assert "Started task" not in output
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TIMEOUT"
+        assert refreshed.started_at == failed_at
+        assert refreshed.completed_at == failed_at
+        assert refreshed.slug == "20260627-blocked-background-resume"
+        assert refreshed.session_id == "resume-session"
+        assert refreshed.log_file == "logs/existing-background-resume.log"
+        assert refreshed.execution_mode is None
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+        assert not (config.worktree_path / refreshed.slug).exists()
 
     def test_background_worker_tag_selection_prepares_selected_task_and_hands_off_that_task_id(
         self,
@@ -16235,6 +16308,130 @@ class TestIterateCommand:
         assert spawn_background.call_args.kwargs.get("prepared_task_id") is None
         assert [task for task in store.get_all() if task.task_type == "rebase"] == []
 
+    def test_iterate_background_does_not_prepare_or_spawn_blocked_pending_implementation(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dependency = store.add("Dependency", task_type="implement")
+        dependency.status = "completed"
+        dependency.branch = "feature/dependency"
+        dependency.has_commits = True
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        impl = store.add("Blocked impl", task_type="implement", depends_on=dependency.id)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+            force=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli._common.get_store", return_value=store),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate worker should not spawn"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        combined_output = captured.out + captured.err
+        assert result == 1
+        assert "blocked by task" in combined_output
+
+        refreshed = store.get(impl.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+        assert refreshed.started_at is None
+        assert refreshed.slug is None
+        assert refreshed.log_file is None
+
+    def test_iterate_foreground_reports_blocked_pending_implementation_before_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.runner import DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        dependency = store.add("Dependency", task_type="implement")
+        dependency.status = "completed"
+        dependency.branch = "feature/dependency"
+        dependency.has_commits = True
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        impl = store.add("Blocked impl", task_type="implement", depends_on=dependency.id)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git") as git_cls,
+            patch("gza.cli._run_foreground", side_effect=AssertionError("foreground run should not start")),
+        ):
+            git_cls.return_value.current_branch.return_value = "main"
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        assert "blocked by task" in output
+        assert "Running pending implementation" not in output
+
+        refreshed = store.get(impl.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+        assert refreshed.started_at is None
+
     def test_iterate_needs_rebase_skips_merged_target_before_create(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
@@ -17443,6 +17640,66 @@ class TestRunForeground:
         assert workers[0].status == "failed"
         assert workers[0].exit_code == 1
 
+    def test_run_foreground_resume_dependency_block_refuses_before_dispatch_side_effects(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Blocked failed resumes must stop before rebase, permits, startup prep, or worker registration."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        dependency = store.add("Dependency", task_type="implement")
+        dependency.status = "completed"
+        dependency.branch = "feature/dependency-foreground-resume"
+        dependency.has_commits = True
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        task = store.add("Blocked foreground resume", task_type="implement", depends_on=dependency.id)
+        failed_at = datetime.now(UTC)
+        task.status = "failed"
+        task.failure_reason = "TIMEOUT"
+        task.started_at = failed_at
+        task.completed_at = failed_at
+        task.slug = "20260627-blocked-foreground-resume"
+        task.session_id = "resume-session"
+        task.log_file = "logs/existing-foreground-resume.log"
+        store.update(task)
+        assert task.id is not None
+
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli._auto_rebase_before_resume", side_effect=AssertionError("rebase should not run")),
+            patch("gza.cli.launch_permit", side_effect=AssertionError("launch permit should not be acquired")),
+            patch("gza.cli._prepare_task_for_launch", side_effect=AssertionError("startup prep should not run")),
+            patch("gza.cli.run", side_effect=AssertionError("runner should not start")),
+            patch("gza.workers.WorkerRegistry.register", side_effect=AssertionError("worker should not register")),
+        ):
+            rc = _run_foreground(config, task_id=task.id, resume=True)
+
+        assert rc == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        assert "blocked by task" in capsys.readouterr().err
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TIMEOUT"
+        assert refreshed.started_at == failed_at
+        assert refreshed.completed_at == failed_at
+        assert refreshed.execution_mode is None
+        assert refreshed.slug == "20260627-blocked-foreground-resume"
+        assert refreshed.log_file == "logs/existing-foreground-resume.log"
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+        assert not (config.worktree_path / refreshed.slug).exists()
+
     def test_auto_rebase_before_resume_creates_completed_rebase_child(self, tmp_path: Path):
         """Resume preflight creates a completed rebase child task on success."""
         from gza.cli import _auto_rebase_before_resume
@@ -17871,6 +18128,79 @@ class TestRunInlineCommand:
         assert invocation.command == "run-inline"
         assert invocation.execution_mode == "foreground_inline"
         assert invocation.interaction_mode == "auto"
+
+    def test_cmd_run_inline_resume_dependency_block_preserves_failed_task_state(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        dependency = store.add("Dependency", task_type="implement")
+        dependency.status = "completed"
+        dependency.branch = "feature/dependency"
+        dependency.has_commits = True
+        dependency.completed_at = datetime.now(UTC)
+        store.update(dependency)
+
+        task = store.add("Blocked resume", task_type="implement", depends_on=dependency.id)
+        failed_at = datetime.now(UTC)
+        task.status = "failed"
+        task.failure_reason = "TIMEOUT"
+        task.started_at = failed_at
+        task.completed_at = failed_at
+        task.slug = "20260627-blocked-run-inline-resume"
+        task.session_id = "resume-session"
+        task.log_file = "logs/existing-run-inline-resume.log"
+        store.update(task)
+        assert task.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            task_id=task.id,
+            resume=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.resolve_id", return_value=task.id),
+            patch("gza.cli._auto_rebase_before_resume", side_effect=AssertionError("rebase should not run")) as mock_rebase,
+            patch("gza.cli.launch_permit", side_effect=AssertionError("launch permit should not be acquired")),
+            patch("gza.cli._prepare_task_for_launch", side_effect=AssertionError("startup prep should not run")),
+            patch("gza.workers.WorkerRegistry.register", side_effect=AssertionError("worker should not register")),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.get_provider", side_effect=AssertionError("provider should not start")),
+            patch("gza.runner.Git", side_effect=AssertionError("git should not be consulted")),
+        ):
+            rc = cmd_run_inline(args)
+
+        assert rc == DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        mock_rebase.assert_not_called()
+        captured = capsys.readouterr()
+        assert "blocked by task" in captured.err
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "TIMEOUT"
+        assert refreshed.started_at == failed_at
+        assert refreshed.completed_at == failed_at
+        assert refreshed.execution_mode is None
+        assert refreshed.slug == "20260627-blocked-run-inline-resume"
+        assert refreshed.log_file == "logs/existing-run-inline-resume.log"
+
+        logs_dir = tmp_path / ".gza" / "logs"
+        if logs_dir.exists():
+            assert not any(path.is_file() for path in logs_dir.rglob("*"))
+        workers_dir = tmp_path / ".gza" / "workers"
+        if workers_dir.exists():
+            assert list(workers_dir.iterdir()) == []
+        assert not (config.worktree_path / task.slug).exists()
 
 
 class TestForegroundInvocationContextWiring:

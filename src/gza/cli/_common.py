@@ -88,7 +88,10 @@ from ..review_verdict import (
     parse_review_verdict,
 )
 from ..runner import (
+    DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     RunInvocationContext,
+    TaskDispatchBlockedError,
+    _ensure_task_dispatchable_for_startup,
     get_effective_config_for_task,
     prepare_task_startup_phase,
     remove_task_startup_artifacts,
@@ -104,6 +107,19 @@ _REUSE_WORKER_OWNER_OUTER = "outer"
 _REUSE_WORKER_REENTRY_ENV = "GZA_REUSE_WORKER_REENTRY"
 _REUSE_WORKER_SESSION_ENV = "GZA_REUSE_WORKER_SESSION"
 _PLAN_REVIEW_OVERRIDE_ARTIFACT_KIND = "plan_review_manifest_override"
+
+
+def _prepare_startup_phase(
+    config: Config,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    resume_mode: bool = False,
+) -> DbTask:
+    """Call startup preparation without widening the default monkeypatch signature."""
+    if resume_mode:
+        return prepare_task_startup_phase(config, store, task, resume_mode=True)
+    return prepare_task_startup_phase(config, store, task)
 
 
 @dataclass(frozen=True)
@@ -932,6 +948,7 @@ def _prepare_task_for_immediate_execution(
     task: DbTask,
     *,
     rollback_on_failure: bool,
+    resume_mode: bool = False,
     rollback_cleanup: Callable[[], None] | None = None,
 ) -> DbTask | None:
     """Run the synchronous creator phase on the caller's stdout/stderr."""
@@ -939,7 +956,7 @@ def _prepare_task_for_immediate_execution(
     original_slug = task.slug
     original_log_file = task.log_file
     try:
-        prepared = prepare_task_startup_phase(config, store, task)
+        prepared = _prepare_startup_phase(config, store, task, resume_mode=resume_mode)
     except Exception as exc:
         if rollback_on_failure and task.id is not None:
             remove_task_startup_artifacts(config, task)
@@ -975,12 +992,14 @@ def _prepare_task_for_reserved_launch(
     *,
     permit: LaunchPermit,
     rollback_on_failure: bool,
+    resume_mode: bool = False,
     rollback_cleanup: Callable[[], None] | None = None,
 ) -> DbTask | None:
     prepared = _prepare_task_for_immediate_execution(
         config,
         task,
         rollback_on_failure=rollback_on_failure,
+        resume_mode=resume_mode,
         rollback_cleanup=rollback_cleanup,
     )
     if prepared is None:
@@ -994,6 +1013,7 @@ def _prepare_task_for_launch(
     task: DbTask,
     *,
     rollback_on_failure: bool,
+    resume_mode: bool = False,
     rollback_cleanup: Callable[[], None] | None = None,
     allow_same_pid_reentry: bool = False,
     permit: LaunchPermit | None = None,
@@ -1009,7 +1029,7 @@ def _prepare_task_for_launch(
                 store,
                 current_pid=os.getpid() if allow_same_pid_reentry else None,
             )
-        prepared = prepare_task_startup_phase(config, store, task)
+        prepared = _prepare_startup_phase(config, store, task, resume_mode=resume_mode)
     except Exception as exc:
         if acquired_permit is not None:
             acquired_permit.release()
@@ -1128,6 +1148,21 @@ def _run_foreground(
     permit: LaunchPermit | None = None
     try:
         if resume and task_id is not None:
+            task = store.get(task_id)
+            if task is None:
+                if phase1_args is not None:
+                    return phase1_error(phase1_args, f"Task {task_id} not found")
+                print(f"Error: Task {task_id} not found", file=sys.stderr)
+                return 1
+            try:
+                _ensure_task_dispatchable_for_startup(task, store, resume_mode=True)
+            except TaskDispatchBlockedError as exc:
+                if phase1_args is not None:
+                    print_phase1_message(phase1_args, f"Error: {exc}")
+                else:
+                    print(f"Error: {exc}", file=sys.stderr)
+                return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
+        if resume and task_id is not None:
             rebase_exit_code = _auto_rebase_before_resume(config, task_id)
             if rebase_exit_code != 0:
                 if not worker_registered and not reuse_existing_worker:
@@ -1160,6 +1195,7 @@ def _run_foreground(
                     config,
                     task,
                     rollback_on_failure=False,
+                    resume_mode=resume,
                     allow_same_pid_reentry=allow_registered_worker_reentry,
                 )
                 if prepared_launch is None:
@@ -1279,6 +1315,11 @@ def _spawn_background_worker(
                     f"Task {explicit_task_id} has no session ID (cannot resume)"
                 )
                 return 1
+            try:
+                _ensure_task_dispatchable_for_startup(task, store, resume_mode=True)
+            except TaskDispatchBlockedError as exc:
+                _print_background_phase1_error(str(exc))
+                return 1
         else:
             allow_pr_retry = _allow_pr_required_retry(args, task)
             if task.status != "pending" and not allow_pr_retry:
@@ -1326,6 +1367,7 @@ def _spawn_background_worker(
             config,
             selected_task,
             rollback_on_failure=False,
+            resume_mode=resume_mode,
             permit=permit,
         )
         if prepared_launch is None:
@@ -1755,6 +1797,7 @@ def _spawn_background_resume_worker(
             config,
             task,
             rollback_on_failure=False,
+            resume_mode=True,
         )
         if prepared_launch is None:
             return 1

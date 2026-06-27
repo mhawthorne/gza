@@ -4381,18 +4381,25 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
                 ]
                 assert improved_children == []
     else:
-        assert spawn_worker.call_count == 1
         if action_type == "needs_rebase":
+            assert spawn_worker.call_count == 0
             assert create_rebase.call_count == 1
             assert rebase_task is not None
             child_id = str(rebase_task.id)
         else:
+            assert spawn_worker.call_count == 1
             assert review_task is not None
             child_id = str(review_task.id)
 
     log_lines = log_path.read_text().splitlines()
-    assert any("START_FAILED" in line and child_id in line for line in log_lines)
-    assert not any(line.split(maxsplit=2)[1] == "START" and f"{child_id} {child_type}" in line for line in log_lines)
+    if action_type == "needs_rebase":
+        assert any("startup preparation failed" in line and child_id in line for line in log_lines)
+    else:
+        assert any("START_FAILED" in line and child_id in line for line in log_lines)
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and f"{child_id} {child_type}" in line
+        for line in log_lines
+    )
 
 
 def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_path: Path) -> None:
