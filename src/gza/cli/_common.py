@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -13,10 +14,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -425,6 +426,24 @@ def _running_workers_by_task_id(registry: WorkerRegistry) -> dict[str, WorkerMet
     return workers_by_task_id
 
 
+def _latest_workers_by_task_id(registry: WorkerRegistry) -> dict[str, WorkerMetadata]:
+    """Index the latest worker entry per task ID, including completed/failed rows."""
+    workers_by_task_id: dict[str, WorkerMetadata] = {}
+    for worker in registry.list_all(include_completed=True):
+        if worker.task_id is None:
+            continue
+        key = str(worker.task_id)
+        existing = workers_by_task_id.get(key)
+        if existing is None:
+            workers_by_task_id[key] = worker
+            continue
+        existing_time = _normalize_timestamp(existing.completed_at or existing.started_at)
+        worker_time = _normalize_timestamp(worker.completed_at or worker.started_at)
+        if worker_time is not None and (existing_time is None or worker_time >= existing_time):
+            workers_by_task_id[key] = worker
+    return workers_by_task_id
+
+
 def _task_worker_is_dead(task: DbTask, worker: WorkerMetadata | None, registry: WorkerRegistry | None) -> bool:
     """Return whether the claimed worker for a task is dead/stale."""
     if worker is not None and registry is not None:
@@ -455,6 +474,544 @@ def _mark_worker_reconciled(
         status="failed",
         completion_reason=completion_reason,
     )
+
+
+def _signal_name_from_exit_code(exit_code: int | None) -> str | None:
+    """Return the terminating signal name for a negative subprocess exit code."""
+    if exit_code is None or exit_code >= 0:
+        return None
+    signum = -exit_code
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"SIG{signum}"
+
+
+def _signal_number_from_name(signal_name: str | None) -> int | None:
+    """Resolve a signal name like ``SIGKILL`` to its platform signal number."""
+    if not signal_name:
+        return None
+    try:
+        return int(getattr(signal, signal_name))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _load_jsonl_entries(path: Path) -> list[dict[str, Any]]:
+    """Best-effort JSONL reader for task conversation or ops logs."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if not content.strip():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
+    return entries
+
+
+def _worker_log_candidates(
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+) -> tuple[Path, ...]:
+    """Return candidate task/startup logs that may contain worker lifecycle evidence."""
+    candidates: list[Path] = []
+
+    def _append(path_value: str | Path | None) -> None:
+        if path_value is None:
+            return
+        path = Path(path_value)
+        if not path.is_absolute():
+            path = config.project_dir / path
+        if path not in candidates:
+            candidates.append(path)
+
+    _append(task.log_file)
+    if worker is not None:
+        _append(worker.startup_log_file)
+    _append(startup_log_path_for_task(config, task))
+    return tuple(candidates)
+
+
+def _sort_entries_by_timestamp(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort structured log entries by timestamp when available while preserving source order."""
+    indexed = list(enumerate(entries))
+    indexed.sort(key=lambda item: (str(item[1].get("timestamp", "")), item[0]))
+    return [entry for _, entry in indexed]
+
+
+def _load_worker_log_entries(
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+) -> list[dict[str, Any]]:
+    """Load merged task/startup structured entries for worker diagnostics."""
+    merged: list[dict[str, Any]] = []
+    for log_path in _worker_log_candidates(config, task, worker):
+        ops_path = ops_log_path_for(log_path)
+        source_path = ops_path if ops_path.exists() else log_path
+        merged.extend(_load_jsonl_entries(source_path))
+    return _sort_entries_by_timestamp(merged)
+
+
+@dataclass(frozen=True)
+class WorkerDeathDiagnostics:
+    """Best-effort diagnostics explaining why a worker disappeared."""
+
+    stage: str | None = None
+    exit_code: int | None = None
+    signal_name: str | None = None
+    signal_number: int | None = None
+    output_tail: tuple[str, ...] = ()
+    os_hint: str | None = None
+    source_event: str | None = None
+    worker_status: str | None = None
+    completion_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkerDeathCaptureResult:
+    """Best-effort reconciliation payload for WORKER_DIED terminalization."""
+
+    log_path: Path | None = None
+    failure_log_file: str | None = None
+    diagnostics: WorkerDeathDiagnostics = WorkerDeathDiagnostics()
+
+
+def _classify_worker_death_stage(entries: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """Infer the furthest worker lifecycle stage reached before death."""
+    saw_preflight = False
+    saw_worker_start = False
+    saw_provider_exec = False
+    saw_execution_provenance = False
+    saw_task_claim = False
+
+    for entry in entries:
+        if entry.get("type") != "gza":
+            continue
+        subtype = entry.get("subtype")
+        event = entry.get("event")
+        if event == "verify_credentials_docker":
+            saw_preflight = True
+        if subtype == "worker_lifecycle" and event == "start":
+            saw_worker_start = True
+        if subtype == "command" and event == "provider_exec_start":
+            saw_provider_exec = True
+        if subtype == "execution":
+            saw_execution_provenance = True
+        if subtype == "info":
+            message = entry.get("message")
+            if isinstance(message, str) and message.startswith("Task: "):
+                saw_task_claim = True
+
+    if saw_provider_exec:
+        return "provider_exec", "provider_exec_start"
+    if saw_worker_start or saw_execution_provenance or saw_task_claim:
+        return "after_worker_start_before_provider_exec", "worker_lifecycle/start"
+    if saw_preflight:
+        return "after_preflight_before_worker_start", "verify_credentials_docker"
+    return "before_preflight_or_no_logs", None
+
+
+def _collect_output_tail_from_entries(entries: list[dict[str, Any]], *, limit: int = 8) -> tuple[str, ...]:
+    """Collect a short output tail from structured provider/process entries."""
+    tail: list[str] = []
+    for entry in reversed(entries):
+        message: str | None = None
+        subtype = entry.get("subtype")
+        if subtype == "process_output":
+            raw = entry.get("provider_output") or entry.get("message")
+            if isinstance(raw, str) and raw.strip():
+                message = raw.strip()
+        elif entry.get("type") == "result":
+            raw = entry.get("result")
+            if isinstance(raw, str) and raw.strip():
+                message = raw.strip()
+        elif entry.get("type") == "gza" and subtype in {"info", "branch", "outcome", "blocked"}:
+            raw = entry.get("message")
+            if isinstance(raw, str) and raw.strip():
+                message = raw.strip()
+        if message:
+            tail.append(message)
+        if len(tail) >= limit:
+            break
+    return tuple(reversed(tail))
+
+
+def _collect_output_tail_from_text(path: Path, *, limit: int = 8) -> tuple[str, ...]:
+    """Collect a short raw-text tail from a startup capture file."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ()
+    non_empty = [line.strip() for line in lines if line.strip()]
+    return tuple(non_empty[-limit:])
+
+
+def _resolve_worker_log_path(config: Config, task: DbTask, worker: WorkerMetadata | None) -> Path | None:
+    """Pick the best log path to inspect or annotate for worker death diagnostics."""
+    if task.log_file:
+        task_log = Path(task.log_file)
+        return task_log if task_log.is_absolute() else config.project_dir / task_log
+    if worker and worker.startup_log_file:
+        startup_log = Path(worker.startup_log_file)
+        return startup_log if startup_log.is_absolute() else config.project_dir / startup_log
+    return startup_log_path_for_task(config, task)
+
+
+def _darwin_worker_death_hint(
+    *,
+    pid: int | None,
+    reference_time: datetime | None,
+) -> str | None:
+    """Return a best-effort macOS log hint for worker death root cause."""
+    if platform.system() != "Darwin":
+        return None
+    end = reference_time or datetime.now(UTC)
+    start = end - timedelta(minutes=3)
+    predicate = (
+        'process == "kernel" OR process == "powerd" OR process == "launchd" '
+        'OR eventMessage CONTAINS[c] "jetsam" '
+        'OR eventMessage CONTAINS[c] "memorystatus" '
+        'OR eventMessage CONTAINS[c] "sleep" '
+        'OR eventMessage CONTAINS[c] "wake" '
+        'OR eventMessage CONTAINS[c] "out of memory"'
+    )
+    try:
+        result = subprocess.run(
+            [
+                "log",
+                "show",
+                "--style",
+                "compact",
+                "--start",
+                start.isoformat(),
+                "--end",
+                end.isoformat(),
+                "--predicate",
+                predicate,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if pid is not None:
+        pid_token = f"[{pid}]"
+        pid_lines = [line for line in lines if pid_token in line or f" pid {pid} " in line or f"pid {pid}" in line]
+        if pid_lines:
+            return f"darwin log hint (best effort): {truncate(pid_lines[-1], 220)}"
+
+    for line in reversed(lines):
+        lowered = line.lower()
+        if any(token in lowered for token in ("jetsam", "memorystatus", "out of memory", "sleep", "wake")):
+            return f"darwin log hint (best effort): {truncate(line, 220)}"
+    return None
+
+
+def _collect_worker_death_diagnostics(
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+) -> WorkerDeathDiagnostics:
+    """Collect best-effort diagnostics for a dead worker without raising."""
+    log_path = _resolve_worker_log_path(config, task, worker)
+    ops_entries = _load_worker_log_entries(config, task, worker)
+
+    stage, source_event = _classify_worker_death_stage(ops_entries)
+    output_tail = _collect_output_tail_from_entries(ops_entries)
+    if not output_tail and log_path is not None:
+        output_tail = _collect_output_tail_from_text(log_path)
+    if not output_tail:
+        for candidate in reversed(_worker_log_candidates(config, task, worker)):
+            output_tail = _collect_output_tail_from_text(candidate)
+            if output_tail:
+                break
+
+    event_exit_code: int | None = None
+    event_signal_name: str | None = None
+    event_signal_number: int | None = None
+    event_worker_status: str | None = None
+    event_completion_reason: str | None = None
+    for entry in reversed(ops_entries):
+        if entry.get("type") != "gza" or entry.get("subtype") != "worker_lifecycle":
+            continue
+        if entry.get("event") not in {
+            "death_detected",
+            "startup_abort_detected",
+            "detached_exit",
+            "start_failed",
+            "handoff_failed",
+        }:
+            continue
+        exit_code_raw = entry.get("exit_code")
+        event_exit_code = exit_code_raw if isinstance(exit_code_raw, int) else None
+        event_signal_name = entry.get("signal") if isinstance(entry.get("signal"), str) else None
+        signal_number_raw = entry.get("signal_number")
+        event_signal_number = (
+            signal_number_raw
+            if isinstance(signal_number_raw, int)
+            else _signal_number_from_name(event_signal_name)
+        )
+        event_worker_status = entry.get("worker_status") if isinstance(entry.get("worker_status"), str) else None
+        event_completion_reason = (
+            entry.get("completion_reason") if isinstance(entry.get("completion_reason"), str) else None
+        )
+        break
+
+    exit_code = worker.exit_code if worker is not None else None
+    if exit_code is None:
+        exit_code = event_exit_code
+    signal_name = _signal_name_from_exit_code(exit_code) if exit_code is not None else None
+    if signal_name is None:
+        signal_name = event_signal_name
+    signal_number = _signal_number_from_name(signal_name)
+    if signal_number is None:
+        signal_number = event_signal_number
+
+    reference_time = None
+    if worker is not None and worker.completed_at:
+        reference_time = _normalize_timestamp(worker.completed_at)
+    if reference_time is None and task.completed_at:
+        reference_time = _normalize_timestamp(task.completed_at)
+
+    os_hint = _darwin_worker_death_hint(
+        pid=worker.pid if worker is not None else task.running_pid,
+        reference_time=reference_time,
+    )
+
+    return WorkerDeathDiagnostics(
+        stage=stage,
+        exit_code=exit_code,
+        signal_name=signal_name,
+        signal_number=signal_number,
+        output_tail=output_tail,
+        os_hint=os_hint,
+        source_event=source_event,
+        worker_status=(worker.status if worker is not None else None) or event_worker_status,
+        completion_reason=(worker.completion_reason if worker is not None else None) or event_completion_reason,
+    )
+
+
+def _worker_death_failure_log_file(
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+    log_path: Path | None,
+) -> str | None:
+    """Choose the log file path that should remain visible on the failed task."""
+    if task.log_file:
+        return task.log_file
+    if worker is not None and worker.startup_log_file:
+        return worker.startup_log_file
+    if log_path is None:
+        return None
+    try:
+        return str(log_path.relative_to(config.project_dir))
+    except ValueError:
+        return str(log_path)
+
+
+def _fallback_worker_death_diagnostics(worker: WorkerMetadata | None) -> WorkerDeathDiagnostics:
+    """Minimal diagnostics used when best-effort capture fails."""
+    exit_code = worker.exit_code if worker is not None else None
+    signal_name = _signal_name_from_exit_code(exit_code)
+    return WorkerDeathDiagnostics(
+        exit_code=exit_code,
+        signal_name=signal_name,
+        signal_number=_signal_number_from_name(signal_name),
+        worker_status=worker.status if worker is not None else None,
+        completion_reason=worker.completion_reason if worker is not None else None,
+    )
+
+
+def _capture_worker_death_best_effort(
+    *,
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+    event: str,
+    warning_context: str,
+) -> WorkerDeathCaptureResult:
+    """Capture worker-death diagnostics without letting capture failure block terminalization."""
+    log_path: Path | None = None
+    diagnostics = _fallback_worker_death_diagnostics(worker)
+
+    try:
+        log_path = _resolve_worker_log_path(config, task, worker)
+    except Exception as exc:
+        print(
+            f"Warning: Failed to resolve worker-death log path for {warning_context}: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        diagnostics = _collect_worker_death_diagnostics(config, task, worker)
+    except Exception as exc:
+        print(
+            f"Warning: Failed to collect worker-death diagnostics for {warning_context}: {exc}",
+            file=sys.stderr,
+        )
+
+    if log_path is not None:
+        try:
+            _write_worker_death_ops_event(log_path, task=task, worker=worker, diagnostics=diagnostics, event=event)
+        except Exception as exc:
+            print(
+                f"Warning: Failed to write worker-death diagnostics for {warning_context}: {exc}",
+                file=sys.stderr,
+            )
+
+    return WorkerDeathCaptureResult(
+        log_path=log_path,
+        failure_log_file=_worker_death_failure_log_file(config, task, worker, log_path),
+        diagnostics=diagnostics,
+    )
+
+
+def _worker_lifecycle_entry_indicates_death(entry: Mapping[str, object]) -> bool:
+    """Return whether a worker_lifecycle entry records concrete worker-death evidence."""
+    if entry.get("type") != "gza" or entry.get("subtype") != "worker_lifecycle":
+        return False
+
+    event = entry.get("event")
+    if event in {"death_detected", "startup_abort_detected", "start_failed", "handoff_failed"}:
+        return True
+    if event != "detached_exit":
+        return False
+
+    if entry.get("reason") == "WORKER_DIED":
+        return True
+
+    exit_code = entry.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True
+
+    if isinstance(entry.get("signal"), str) and entry["signal"]:
+        return True
+
+    if entry.get("worker_status") == "failed":
+        return True
+
+    return entry.get("completion_reason") == "startup failure before task claim"
+
+
+def _worker_has_death_exit_evidence(
+    *,
+    config: Config,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+    warning_context: str,
+) -> bool:
+    """Return whether a dead pending worker has concrete exit/startup-abort evidence."""
+    if worker is None:
+        return False
+    if worker.exit_code not in (None, 0):
+        return True
+    if worker.completion_reason == "startup failure before task claim":
+        return True
+
+    try:
+        for entry in reversed(_load_worker_log_entries(config, task, worker)):
+            if _worker_lifecycle_entry_indicates_death(entry):
+                return True
+    except Exception as exc:
+        print(
+            f"Warning: Failed to inspect worker-death evidence for {warning_context}: {exc}",
+            file=sys.stderr,
+        )
+    return False
+
+
+def _mark_pending_worker_failed(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    registry: WorkerRegistry,
+    task: DbTask,
+    worker: WorkerMetadata,
+    explicit_reason: str,
+    log_file: str | None,
+    exit_code: int | None,
+    completion_reason: str,
+) -> None:
+    """Terminalize a pending task and retire its registered worker."""
+    has_commits = _branch_has_commits(config, task.branch)
+    mark_task_failed_from_cause(
+        task=task,
+        config=config,
+        store=store,
+        log_file=log_file,
+        branch=task.branch,
+        explicit_reason=explicit_reason,
+        has_commits=has_commits,
+        error_type=None,
+        exit_code=exit_code,
+    )
+    registry.mark_completed(
+        worker.worker_id,
+        exit_code=exit_code if exit_code is not None else 1,
+        status="failed",
+        completion_reason=completion_reason,
+    )
+
+
+def _write_worker_death_ops_event(
+    log_path: Path,
+    *,
+    task: DbTask,
+    worker: WorkerMetadata | None,
+    diagnostics: WorkerDeathDiagnostics,
+    event: str = "death_detected",
+) -> None:
+    """Persist a structured worker-death breadcrumb for later diagnostics."""
+    payload: dict[str, Any] = {
+        "subtype": "worker_lifecycle",
+        "event": event,
+        "reason": "WORKER_DIED",
+        "task_id": task.id,
+        "worker_id": worker.worker_id if worker is not None else None,
+        "worker_status": diagnostics.worker_status,
+        "completion_reason": diagnostics.completion_reason,
+        "exit_code": diagnostics.exit_code,
+        "signal": diagnostics.signal_name,
+        "signal_number": diagnostics.signal_number,
+        "stage": diagnostics.stage,
+        "stage_source_event": diagnostics.source_event,
+        "output_tail": list(diagnostics.output_tail),
+        "os_hint": diagnostics.os_hint,
+    }
+    if diagnostics.signal_name:
+        payload["message"] = (
+            f"Worker died with signal {diagnostics.signal_name}"
+            + (f" during {diagnostics.stage}" if diagnostics.stage else "")
+        )
+    elif diagnostics.exit_code is not None:
+        payload["message"] = (
+            f"Worker exited with code {diagnostics.exit_code}"
+            + (f" during {diagnostics.stage}" if diagnostics.stage else "")
+        )
+    else:
+        payload["message"] = (
+            "Worker died without an observed exit code"
+            + (f" during {diagnostics.stage}" if diagnostics.stage else "")
+        )
+    write_ops_entry(ops_log_path_for(log_path), payload, raise_on_error=True)
 
 
 def _normalize_timestamp(value: datetime | str | None) -> datetime | None:
@@ -507,28 +1064,37 @@ def reconcile_in_progress_tasks(config: Config) -> None:
         print(f"Warning: Skipping task reconciliation due to unexpected error: {exc}", file=sys.stderr)
         return
 
-    workers_by_task_id = _running_workers_by_task_id(registry)
+    running_workers_by_task_id = _running_workers_by_task_id(registry)
+    latest_workers_by_task_id = _latest_workers_by_task_id(registry)
 
     for task in store.get_in_progress():
         task_label = f"{task.id}" if task.id is not None else "<unknown>"
         try:
-            worker = workers_by_task_id.get(str(task.id)) if task.id is not None else None
-            if _task_worker_is_dead(task, worker, registry):
+            running_worker = running_workers_by_task_id.get(str(task.id)) if task.id is not None else None
+            worker = latest_workers_by_task_id.get(str(task.id)) if task.id is not None else None
+            if _task_worker_is_dead(task, running_worker, registry):
                 has_commits = _branch_has_commits(config, task.branch)
+                capture = _capture_worker_death_best_effort(
+                    config=config,
+                    task=task,
+                    worker=worker,
+                    event="death_detected",
+                    warning_context=f"task {task_label}",
+                )
                 mark_task_failed_from_cause(
                     task=task,
                     config=config,
                     store=store,
-                    log_file=task.log_file,
+                    log_file=capture.failure_log_file,
                     branch=task.branch,
                     explicit_reason="WORKER_DIED",
                     has_commits=has_commits,
                     error_type=None,
-                    exit_code=None,
+                    exit_code=capture.diagnostics.exit_code,
                 )
                 _mark_worker_reconciled(
                     registry,
-                    worker,
+                    running_worker,
                     completion_reason="watch reconciliation detected dead in-progress worker",
                 )
                 continue
@@ -564,7 +1130,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 )
                 _mark_worker_reconciled(
                     registry,
-                    worker,
+                    running_worker,
                     completion_reason="watch reconciliation marked in-progress worker NO_ACTIVITY",
                 )
         except (sqlite3.Error, OSError, ValueError) as exc:
@@ -572,7 +1138,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
         except Exception as exc:
             print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
 
-    for task_id, worker in workers_by_task_id.items():
+    for task_id, worker in latest_workers_by_task_id.items():
         task_label = task_id
         try:
             pending_task = store.get(task_id)
@@ -580,23 +1146,44 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 continue
             if registry.is_running(worker.worker_id):
                 continue
+
+            if _worker_has_death_exit_evidence(
+                config=config,
+                task=pending_task,
+                worker=worker,
+                warning_context=f"pending task {task_label}",
+            ):
+                capture = _capture_worker_death_best_effort(
+                    config=config,
+                    task=pending_task,
+                    worker=worker,
+                    event="startup_abort_detected",
+                    warning_context=f"pending task {task_label}",
+                )
+                _mark_pending_worker_failed(
+                    config=config,
+                    store=store,
+                    registry=registry,
+                    task=pending_task,
+                    worker=worker,
+                    explicit_reason="WORKER_DIED",
+                    log_file=capture.failure_log_file,
+                    exit_code=capture.diagnostics.exit_code,
+                    completion_reason="startup failure before task claim",
+                )
+                continue
+
             if not _task_is_silent_past_timeout(config, pending_task, worker):
                 continue
-            has_commits = _branch_has_commits(config, pending_task.branch)
-            mark_task_failed_from_cause(
-                task=pending_task,
+            _mark_pending_worker_failed(
                 config=config,
                 store=store,
-                log_file=pending_task.log_file or worker.startup_log_file,
-                branch=pending_task.branch,
+                registry=registry,
+                task=pending_task,
+                worker=worker,
                 explicit_reason="NO_ACTIVITY",
-                has_commits=has_commits,
-                error_type=None,
+                log_file=pending_task.log_file or worker.startup_log_file,
                 exit_code=worker.exit_code,
-            )
-            _mark_worker_reconciled(
-                registry,
-                worker,
                 completion_reason="watch reconciliation detected dead pending worker with no activity",
             )
         except (sqlite3.Error, OSError, ValueError) as exc:
@@ -633,22 +1220,22 @@ def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
             if classify_recovery_row(store, task) not in {"resume", "retry"}:
                 continue
 
-            has_commits = _branch_has_commits(config, task.branch)
-            mark_task_failed_from_cause(
+            capture = _capture_worker_death_best_effort(
+                config=config,
                 task=task,
+                worker=worker,
+                event="startup_abort_detected",
+                warning_context=f"pending recovery task {task_label}",
+            )
+            _mark_pending_worker_failed(
                 config=config,
                 store=store,
-                log_file=task.log_file or worker.startup_log_file,
-                branch=task.branch,
+                registry=registry,
+                task=task,
+                worker=worker,
                 explicit_reason="WORKER_DIED",
-                has_commits=has_commits,
-                error_type=None,
-                exit_code=worker.exit_code,
-            )
-            registry.mark_completed(
-                worker.worker_id,
-                exit_code=worker.exit_code if worker.exit_code is not None else 1,
-                status="failed",
+                log_file=capture.failure_log_file,
+                exit_code=capture.diagnostics.exit_code,
                 completion_reason="startup failure before task claim",
             )
         except (sqlite3.Error, OSError, ValueError) as exc:
@@ -881,16 +1468,79 @@ def _spawn_detached_worker_process(
             start_new_session=True,
             cwd=config.project_dir,
         )
-    _start_detached_process_reaper(proc)
-    return proc, str(startup_log_path.relative_to(config.project_dir))
+    startup_log_rel = str(startup_log_path.relative_to(config.project_dir))
+    return proc, startup_log_rel
 
 
-def _start_detached_process_reaper(proc: subprocess.Popen) -> None:
+def _start_detached_process_reaper(
+    proc: subprocess.Popen,
+    *,
+    config: Config,
+    worker_id: str,
+    startup_log_rel: str,
+) -> None:
     """Reap short-lived detached children so the parent does not leave zombies behind."""
 
+    def _warn_reaper_failure(action: str, exc: Exception) -> None:
+        print(
+            f"Warning: Detached worker reaper failed to {action} for worker {worker_id}: {exc}",
+            file=sys.stderr,
+        )
+
     def _wait_for_exit() -> None:
-        with contextlib.suppress(Exception):
-            proc.wait()
+        try:
+            returncode = proc.wait()
+            startup_log = config.project_dir / startup_log_rel
+            signal_name = _signal_name_from_exit_code(returncode)
+        except Exception as exc:
+            _warn_reaper_failure("wait for process exit", exc)
+            return
+
+        try:
+            write_ops_entry(
+                ops_log_path_for(startup_log),
+                {
+                    "subtype": "worker_lifecycle",
+                    "event": "detached_exit",
+                    "reason": "WORKER_DIED" if returncode != 0 else None,
+                    "worker_id": worker_id,
+                    "pid": proc.pid,
+                    "exit_code": returncode,
+                    "signal": signal_name,
+                    "message": (
+                        f"Detached worker {worker_id} exited via {signal_name}"
+                        if signal_name
+                        else f"Detached worker {worker_id} exited with code {returncode}"
+                    ),
+                },
+                raise_on_error=True,
+            )
+        except Exception as exc:
+            _warn_reaper_failure("record detached exit diagnostics", exc)
+
+        try:
+            registry = WorkerRegistry(config.workers_path)
+            worker = registry.get(worker_id)
+        except Exception as exc:
+            _warn_reaper_failure("load worker registry state", exc)
+            return
+
+        if worker is None or worker.status != "running":
+            return
+
+        try:
+            registry.mark_completed(
+                worker_id,
+                exit_code=returncode if returncode is not None else 1,
+                status="completed" if returncode == 0 else "failed",
+                completion_reason=(
+                    f"detached worker exited with signal {signal_name}"
+                    if signal_name
+                    else None
+                ),
+            )
+        except Exception as exc:
+            _warn_reaper_failure("mark the worker completed", exc)
 
     threading.Thread(
         target=_wait_for_exit,
@@ -1526,6 +2176,13 @@ def _spawn_background_worker(
             tmux_session=tmux_session,
         )
         registry.ensure_running(worker_metadata)
+        if proc is not None and startup_log_rel is not None:
+            _start_detached_process_reaper(
+                proc,
+                config=config,
+                worker_id=worker_id,
+                startup_log_rel=startup_log_rel,
+            )
         if permit is not None:
             permit.release()
 
@@ -1846,6 +2503,12 @@ def _spawn_background_resume_worker(
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
+        _start_detached_process_reaper(
+            proc,
+            config=config,
+            worker_id=worker_id,
+            startup_log_rel=startup_log_rel,
+        )
         if permit is not None:
             permit.release()
 
@@ -1951,6 +2614,12 @@ def _spawn_background_iterate_worker(
             startup_log_file=startup_log_rel,
         )
         registry.ensure_running(worker)
+        _start_detached_process_reaper(
+            proc,
+            config=config,
+            worker_id=worker_id,
+            startup_log_rel=startup_log_rel,
+        )
         permit.release()
         _print_background_worker_started(
             display_task,
@@ -3259,7 +3928,7 @@ def _resolve_task_log_path(config: Config, task: DbTask) -> Path | None:
     if not candidates:
         return None
     for candidate in candidates:
-        if candidate.exists():
+        if _existing_log_source_path(candidate) is not None:
             return candidate
     return candidates[0]
 
@@ -3519,6 +4188,11 @@ class FailureDiagnostics:
     marker_reason: str | None
     summary: str
     interrupt_source: str | None
+    worker_stage: str | None
+    worker_exit_code: int | None
+    worker_signal: str | None
+    worker_output_tail: tuple[str, ...]
+    worker_os_hint: str | None
     explanation: str | None
     verify_context: str | None
     result_context: str | None
@@ -3528,8 +4202,11 @@ def _extract_interrupt_source(log_path: Path) -> str | None:
     """Extract the latest structured interrupt source label from the task log."""
     from .log import _load_log_file_entries
 
+    source_path = _existing_log_source_path(log_path)
+    if source_path is None:
+        return None
     try:
-        entries = _load_log_file_entries(ops_log_path_for(log_path) if ops_log_path_for(log_path).exists() else log_path)[1]
+        entries = _load_log_file_entries(source_path)[1]
     except OSError:
         return None
 
@@ -3545,6 +4222,65 @@ def _extract_interrupt_source(log_path: Path) -> str | None:
     return None
 
 
+def _extract_worker_death_diagnostics(log_path: Path) -> WorkerDeathDiagnostics:
+    """Extract the latest structured worker-death details from a task log."""
+    from .log import _load_log_file_entries
+
+    source_path = _existing_log_source_path(log_path)
+    if source_path is None:
+        return WorkerDeathDiagnostics()
+    try:
+        entries = _load_log_file_entries(source_path)[1]
+    except OSError:
+        return WorkerDeathDiagnostics()
+
+    for entry in reversed(entries):
+        if entry.get("type") != "gza" or entry.get("subtype") != "worker_lifecycle":
+            continue
+        if entry.get("event") not in {
+            "death_detected",
+            "startup_abort_detected",
+            "detached_exit",
+            "start_failed",
+            "handoff_failed",
+        }:
+            continue
+        exit_code_raw = entry.get("exit_code")
+        exit_code = exit_code_raw if isinstance(exit_code_raw, int) else None
+        signal_name = entry.get("signal") if isinstance(entry.get("signal"), str) else None
+        signal_number_raw = entry.get("signal_number")
+        signal_number = signal_number_raw if isinstance(signal_number_raw, int) else _signal_number_from_name(signal_name)
+        output_tail_raw = entry.get("output_tail")
+        output_tail = tuple(
+            str(line).strip() for line in output_tail_raw
+            if isinstance(line, str) and line.strip()
+        ) if isinstance(output_tail_raw, list) else ()
+        return WorkerDeathDiagnostics(
+            stage=entry.get("stage") if isinstance(entry.get("stage"), str) else None,
+            exit_code=exit_code,
+            signal_name=signal_name or _signal_name_from_exit_code(exit_code),
+            signal_number=signal_number,
+            output_tail=output_tail,
+            os_hint=entry.get("os_hint") if isinstance(entry.get("os_hint"), str) else None,
+            source_event=entry.get("stage_source_event") if isinstance(entry.get("stage_source_event"), str) else None,
+            worker_status=entry.get("worker_status") if isinstance(entry.get("worker_status"), str) else None,
+            completion_reason=entry.get("completion_reason") if isinstance(entry.get("completion_reason"), str) else None,
+        )
+    return WorkerDeathDiagnostics()
+
+
+def _existing_log_source_path(log_path: Path | None) -> Path | None:
+    """Return an existing task log source, preferring structured ops siblings."""
+    if log_path is None:
+        return None
+    ops_path = ops_log_path_for(log_path)
+    if ops_path.exists():
+        return ops_path
+    if log_path.exists():
+        return log_path
+    return None
+
+
 def _build_failure_diagnostics(
     task: DbTask,
     log_path: Path | None,
@@ -3556,21 +4292,29 @@ def _build_failure_diagnostics(
     reason = task.failure_reason or "UNKNOWN"
     marker_reason: str | None = None
     interrupt_source: str | None = None
+    worker_diagnostics = WorkerDeathDiagnostics()
     explanation: str | None = None
     verify_context: str | None = None
     result_context: str | None = None
 
-    if log_path and log_path.exists():
+    if log_path is not None and _existing_log_source_path(log_path) is not None:
         marker_reason = _extract_agent_failure_marker_reason(log_path)
         interrupt_source = _extract_interrupt_source(log_path)
         explanation = _extract_last_agent_message_for_failure(log_path)
         verify_context, result_context = _extract_failure_log_context(log_path, verify_command)
+        if reason == "WORKER_DIED":
+            worker_diagnostics = _extract_worker_death_diagnostics(log_path)
 
     return FailureDiagnostics(
         reason=reason,
         marker_reason=marker_reason,
         summary=_failure_summary(task, reason, store=store),
         interrupt_source=interrupt_source,
+        worker_stage=worker_diagnostics.stage,
+        worker_exit_code=worker_diagnostics.exit_code,
+        worker_signal=worker_diagnostics.signal_name,
+        worker_output_tail=worker_diagnostics.output_tail,
+        worker_os_hint=worker_diagnostics.os_hint,
         explanation=explanation,
         verify_context=verify_context,
         result_context=result_context,
@@ -3609,6 +4353,39 @@ def _render_failure_diagnostics(
             f"[{value_color}]{rich_escape(diagnostics.interrupt_source)}[/{value_color}]",
             soft_wrap=soft_wrap,
         )
+    if diagnostics.worker_signal or diagnostics.worker_exit_code is not None:
+        exit_parts: list[str] = []
+        if diagnostics.worker_signal:
+            exit_parts.append(diagnostics.worker_signal)
+        if diagnostics.worker_exit_code is not None:
+            exit_parts.append(f"exit code {diagnostics.worker_exit_code}")
+        console.print(
+            f"[{label_color}]Worker Exit:[/{label_color}] "
+            f"[{value_color}]{rich_escape(', '.join(exit_parts))}[/{value_color}]",
+            soft_wrap=soft_wrap,
+        )
+    if diagnostics.worker_stage:
+        console.print(
+            f"[{label_color}]Worker Death Stage:[/{label_color}] "
+            f"[{value_color}]{rich_escape(diagnostics.worker_stage)}[/{value_color}]",
+            soft_wrap=soft_wrap,
+        )
+    if diagnostics.worker_output_tail:
+        console.print(f"[{label_color}]Worker Output Tail:[/{label_color}]", soft_wrap=soft_wrap)
+        console.print(
+            Panel(
+                "\n".join(rich_escape(line) for line in diagnostics.worker_output_tail),
+                border_style=status_failed_color,
+                padding=(0, 1),
+                expand=False,
+            )
+        )
+    if diagnostics.worker_os_hint:
+        console.print(
+            f"[{label_color}]Worker OS Hint:[/{label_color}] "
+            f"[{value_color}]{rich_escape(diagnostics.worker_os_hint)}[/{value_color}]",
+            soft_wrap=soft_wrap,
+        )
 
     if include_explanation:
         console.print(f"[{label_color}]Agent Explanation:[/{label_color}]", soft_wrap=soft_wrap)
@@ -3645,8 +4422,8 @@ def _precondition_blocking_dependency_id(task: DbTask, config: Config | None) ->
     from .log import _load_log_file_entries
 
     log_path = config.project_dir / task.log_file
-    source_path = ops_log_path_for(log_path) if ops_log_path_for(log_path).exists() else log_path
-    if not source_path.exists():
+    source_path = _existing_log_source_path(log_path)
+    if source_path is None:
         return None
     try:
         entries = _load_log_file_entries(source_path)[1]

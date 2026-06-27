@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import UTC, datetime
+from pathlib import Path
 import time
 from unittest.mock import MagicMock, patch
 
@@ -106,6 +107,80 @@ def test_reconciliation_no_commits_on_worker_died(tmp_path) -> None:
     assert refreshed.status == "failed"
     assert refreshed.failure_reason == "WORKER_DIED"
     assert refreshed.has_commits is not True
+
+
+def test_reconciliation_worker_died_records_signal_and_output_tail(tmp_path: Path) -> None:
+    """Reconciliation should persist signal and output-tail breadcrumbs for WORKER_DIED."""
+    import json
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _init_basic_repo(tmp_path)
+
+    task = store.add("Killed worker task")
+    store.mark_in_progress(task)
+    task = store.get(task.id)
+    assert task is not None
+    task.running_pid = -1
+    task.log_file = ".gza/logs/killed-worker.log"
+    store.update(task)
+
+    log_dir = tmp_path / ".gza" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "killed-worker.log").write_text("")
+    (log_dir / "killed-worker.ops.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "gza",
+                "subtype": "command",
+                "event": "verify_credentials_docker",
+                "message": "preflight ok",
+            }
+        )
+        + "\n"
+    )
+
+    workers_dir = tmp_path / ".gza" / "workers"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    startup_log = tmp_path / ".gza" / "workers" / "w-killed-startup.log"
+    startup_log.write_text("stderr tail line\nstdout tail line\n")
+
+    config = Config.load(tmp_path)
+    registry = WorkerRegistry(config.workers_path)
+    registry.register(
+        WorkerMetadata(
+            worker_id="w-killed",
+            task_id=task.id,
+            pid=999999,
+            status="failed",
+            exit_code=-9,
+            startup_log_file=".gza/workers/w-killed-startup.log",
+            completed_at=datetime.now(UTC).isoformat(),
+        )
+    )
+
+    reconcile_in_progress_tasks(config)
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "WORKER_DIED"
+
+    ops_entries = [
+        json.loads(line)
+        for line in (log_dir / "killed-worker.ops.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    death_entry = next(entry for entry in reversed(ops_entries) if entry.get("event") == "death_detected")
+    assert death_entry["signal"] == "SIGKILL"
+    assert death_entry["exit_code"] == -9
+    assert death_entry["stage"] == "after_preflight_before_worker_start"
+    assert death_entry["output_tail"] == ["stderr tail line", "stdout tail line"]
+
+    result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+    assert result.returncode == 0
+    assert "Worker Exit: SIGKILL, exit code -9" in result.stdout
+    assert "Worker Output Tail:" in result.stdout
 
 
 def test_dry_run_changes_requested_completed_improve_without_review_clear_creates_closing_review(tmp_path) -> None:

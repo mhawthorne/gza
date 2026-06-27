@@ -228,6 +228,12 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   explicitly associated with a registered running-status worker entry. A plain pending
   queue item with no registered worker remains runnable and MUST NOT be reaped just
   because it has no process metadata.
+- When reconciliation classifies a task as `WORKER_DIED`, it MUST persist a structured
+  worker-death breadcrumb on the task's ops stream before or with terminalization. That
+  breadcrumb MUST capture the best available exit evidence (`exit_code`, terminating
+  signal when derivable, worker stage, and a short stdout/stderr tail), and MAY add a
+  clearly-labelled platform hint (for example, Darwin sleep/jetsam context) when
+  available. This capture is best-effort and MUST NOT itself crash reconciliation.
 - Query and triage surfaces that render runtime state from that reconciliation (including
   `gza ps`) MUST treat a `pending` task with a registered `running` worker as live
   in-flight work even when the task row has not yet stamped `running_pid` for the main
@@ -271,10 +277,18 @@ This is the process-level expression of overview invariant 1.
   MUST wait/adopt that work rather than create another child for the same step.
 - While such a `pending` task is backed by a reconciled live registered worker, operator
   runtime surfaces MUST present it as waiting/live startup work rather than `stale`.
-- A `pending` task with a registered worker that is dead/stale and silent past
-  `watch.no_activity_timeout` is not live existing work. Watch MUST reconcile it to a
-  terminal failure (`NO_ACTIVITY`) before treating the lineage as something to wait on
-  or adopt.
+- A `pending` task with a registered worker that is dead/stale and also carries concrete
+  exit/startup-abort evidence (for example a detached-exit lifecycle event or nonzero
+  exit code) is not live existing work. Watch MUST reconcile it to `WORKER_DIED`,
+  persist the task-visible worker-death breadcrumb, and surface the captured startup/exit
+  evidence before treating the lineage as something to wait on or adopt.
+- A `pending` task with a registered worker that is dead/stale but has no worker-death
+  exit evidence and is silent past `watch.no_activity_timeout` is not live existing work.
+  Watch MUST reconcile that residue to a terminal failure (`NO_ACTIVITY`) before
+  treating the lineage as something to wait on or adopt.
+- A worker that dies after provider preflight but before the normal `worker_lifecycle/start`
+  registration breadcrumb MUST still leave a `worker_lifecycle` abort/death event on the
+  task-visible ops stream identifying that earlier stage.
 - If a worker is already live for the lineage an iterate start would own, watch MUST NOT
   start a second iterate worker for that same lineage, whether the detached chain is an
   implementation chain or a plan chain.

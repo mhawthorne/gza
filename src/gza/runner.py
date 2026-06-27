@@ -1684,25 +1684,35 @@ __all__ = [
 ]
 
 
-def write_log_entry(log_file: "Path", entry: dict) -> None:
+def _handle_log_write_failure(target: "Path", exc: Exception, *, raise_on_error: bool) -> bool:
+    logger.warning("Failed to write log entry to %s", target, exc_info=True)
+    if raise_on_error:
+        raise exc
+    return False
+
+
+def write_log_entry(log_file: "Path", entry: dict, *, raise_on_error: bool = False) -> bool:
     """Append a JSONL entry to the task log file."""
     target = log_file
     payload = dict(entry)
-    if payload.get("type") == "gza" and log_file.suffix == ".log":
-        target = ops_log_path_for(log_file)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        if not log_file.exists():
-            log_file.touch()
-        payload.setdefault("stream", "ops")
-        payload.setdefault("source", "gza")
-        payload.setdefault("timestamp", _ops_timestamp())
     try:
-        with open(target, "a") as f:
+        if payload.get("type") == "gza" and log_file.suffix == ".log":
+            target = ops_log_path_for(log_file)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            if not log_file.exists():
+                log_file.touch()
+            payload.setdefault("stream", "ops")
+            payload.setdefault("source", "gza")
+            payload.setdefault("timestamp", _ops_timestamp())
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload) + "\n")
             f.flush()
-    except Exception:
-        logger.warning("Failed to write log entry to %s", target, exc_info=True)
+    except Exception as exc:
+        return _handle_log_write_failure(target, exc, raise_on_error=raise_on_error)
+    return True
 
 
 def _ops_timestamp() -> str:
@@ -1710,14 +1720,14 @@ def _ops_timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def write_ops_entry(ops_log_file: "Path", entry: dict) -> None:
+def write_ops_entry(ops_log_file: "Path", entry: dict, *, raise_on_error: bool = False) -> bool:
     """Append a structured JSONL entry to the task ops log file."""
     payload = dict(entry)
     payload.setdefault("type", "gza")
     payload.setdefault("stream", "ops")
     payload.setdefault("source", "gza")
     payload.setdefault("timestamp", _ops_timestamp())
-    write_log_entry(ops_log_file, payload)
+    return write_log_entry(ops_log_file, payload, raise_on_error=raise_on_error)
 
 
 def task_log_storage_path(config: Config, path: Path) -> str:

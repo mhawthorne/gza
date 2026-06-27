@@ -99,6 +99,7 @@ from gza.runner import (
     run,
     write_execution_provenance_event,
     write_log_entry,
+    write_ops_entry,
     write_worker_start_event,
 )
 from gza.worktree_roots import managed_worktree_root_paths
@@ -17636,6 +17637,17 @@ class TestWriteLogEntry:
             write_log_entry(bad_path, {"type": "gza", "message": "x"})
 
         assert "Failed to write log entry" in caplog.text
+
+    def test_write_ops_entry_can_raise_for_strict_persistence_callers(self, tmp_path: Path) -> None:
+        """Strict callers can detect real ops-write failures instead of silently swallowing them."""
+        ops_path = tmp_path / "logs" / "task.ops.jsonl"
+        with patch("gza.runner.open", side_effect=OSError("boom")):
+            with pytest.raises(OSError, match="boom"):
+                write_ops_entry(
+                    ops_path,
+                    {"type": "gza", "subtype": "worker_lifecycle", "event": "death_detected"},
+                    raise_on_error=True,
+                )
 
 
 class TestExtractReviewVerdict:

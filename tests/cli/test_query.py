@@ -8109,6 +8109,52 @@ class TestShowCommand:
         assert "Termination Source:" in result.stdout
         assert "watch_reconcile_no_activity" in result.stdout
 
+    def test_show_failed_worker_died_renders_worker_death_diagnostics(self, tmp_path: Path):
+        """WORKER_DIED tasks should render signal, stage, and output-tail diagnostics."""
+        import json
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Killed worker task")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "WORKER_DIED"
+        task.log_file = ".gza/logs/killed-worker.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "killed-worker.log").write_text("")
+        (log_dir / "killed-worker.ops.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "worker_lifecycle",
+                            "event": "death_detected",
+                            "reason": "WORKER_DIED",
+                            "exit_code": -9,
+                            "signal": "SIGKILL",
+                            "signal_number": 9,
+                            "stage": "after_preflight_before_worker_start",
+                            "output_tail": ["stderr tail line", "stdout tail line"],
+                        }
+                    )
+                ]
+            )
+        )
+
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: WORKER_DIED" in result.stdout
+        assert "Worker Exit: SIGKILL, exit code -9" in result.stdout
+        assert "Worker Death Stage: after_preflight_before_worker_start" in result.stdout
+        assert "Worker Output Tail:" in result.stdout
+        assert "stderr tail line" in result.stdout
+        assert "stdout tail line" in result.stdout
+
     def test_show_failed_task_extracts_verify_failure_from_tool_error_entries(self, tmp_path: Path):
         """Failed-task diagnostics should detect verify failures in non-Claude tool_* entry shapes."""
         import json

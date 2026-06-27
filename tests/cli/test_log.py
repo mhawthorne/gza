@@ -395,6 +395,52 @@ class TestLogCommand:
         assert "uv run pytest tests/ -q" in result.stdout
         assert "Last Result Context: error_max_turns" in result.stdout
 
+    def test_log_failure_renders_worker_death_diagnostics(self, tmp_path: Path):
+        """`gza log --failure` should surface structured WORKER_DIED diagnostics."""
+        import json
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Killed worker task")
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "WORKER_DIED"
+        task.log_file = ".gza/logs/killed-worker.log"
+        store.update(task)
+
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "killed-worker.log").write_text("")
+        (log_dir / "killed-worker.ops.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "worker_lifecycle",
+                            "event": "death_detected",
+                            "reason": "WORKER_DIED",
+                            "exit_code": -9,
+                            "signal": "SIGKILL",
+                            "signal_number": 9,
+                            "stage": "provider_exec",
+                            "output_tail": ["fatal stderr", "final stdout"],
+                        }
+                    )
+                ]
+            )
+        )
+
+        result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Failure Reason: WORKER_DIED" in result.stdout
+        assert "Worker Exit: SIGKILL, exit code -9" in result.stdout
+        assert "Worker Death Stage: provider_exec" in result.stdout
+        assert "Worker Output Tail:" in result.stdout
+        assert "fatal stderr" in result.stdout
+        assert "final stdout" in result.stdout
+
     def test_failure_diagnostics_parity_between_show_and_log_failure(self, tmp_path: Path):
         """Show and log --failure should render the same core failure diagnostics."""
         import json

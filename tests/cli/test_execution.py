@@ -3552,8 +3552,22 @@ class TestWorkCommandMultiTask:
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
 
-    def test_spawn_detached_worker_process_starts_background_reaper(self, tmp_path: Path):
-        """Detached bare worker launches should start a background waiter to reap the child."""
+    @staticmethod
+    def _inline_thread_factory(*, target=None, name=None, daemon=None):
+        class _InlineThread:
+            def __init__(self, thread_target, thread_name, thread_daemon):
+                self._target = thread_target
+                self.name = thread_name
+                self.daemon = thread_daemon
+
+            def start(self):
+                assert self._target is not None
+                self._target()
+
+        return _InlineThread(target, name, daemon)
+
+    def test_spawn_detached_worker_process_defers_background_reaper_until_registration(self, tmp_path: Path):
+        """Detached spawn should return proc/log details without arming the reaper yet."""
         from gza.cli._common import _spawn_detached_worker_process
 
         setup_config(tmp_path)
@@ -3571,14 +3585,263 @@ class TestBackgroundWorkerCommand:
 
         assert proc is mock_proc
         assert startup_log == ".gza/workers/w-reap-test-startup.log"
-        thread_cls.assert_called_once()
-        kwargs = thread_cls.call_args.kwargs
-        assert callable(kwargs["target"])
-        kwargs["target"]()
-        mock_proc.wait.assert_called_once_with()
-        assert kwargs["name"] == "gza-worker-reaper-4321"
-        assert kwargs["daemon"] is True
-        mock_thread.start.assert_called_once_with()
+        thread_cls.assert_not_called()
+        mock_thread.start.assert_not_called()
+
+    def test_background_worker_arms_reaper_after_registry_registration(self, tmp_path: Path) -> None:
+        """Shared background launch must register worker metadata before starting the reaper."""
+        from gza.cli import _spawn_background_worker
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending candidate")
+
+        config = Config.load(tmp_path)
+        config.tmux.enabled = False
+
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(tmp_path),
+            create_pr=False,
+            resume=False,
+            force=False,
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        events: list[str] = []
+        original_ensure_running = WorkerRegistry.ensure_running
+
+        def capture_spawn(_cmd, _config, worker_id):
+            return mock_proc, f".gza/workers/{worker_id}-startup.log"
+
+        def capture_ensure_running(self, worker):
+            events.append("ensure_running")
+            return original_ensure_running(self, worker)
+
+        def capture_start_reaper(*_args, **_kwargs):
+            events.append("start_reaper")
+
+        with (
+            patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn),
+            patch("gza.cli._start_detached_process_reaper", side_effect=capture_start_reaper),
+            patch.object(WorkerRegistry, "ensure_running", autospec=True, side_effect=capture_ensure_running),
+        ):
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 0
+        assert events[:2] == ["ensure_running", "start_reaper"]
+
+    def test_detached_process_reaper_warns_on_ops_write_failure_and_still_marks_worker_completed(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Reaper must preserve registry completion when detached-exit diagnostics fail to persist."""
+        from gza.cli._common import _start_detached_process_reaper
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-reaper-write-fail",
+                task_id="gza-1",
+                pid=4321,
+                status="running",
+                startup_log_file=".gza/workers/w-reaper-write-fail-startup.log",
+            )
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.wait.return_value = -15
+
+        with (
+            patch(
+                "gza.cli._common.threading.Thread",
+                side_effect=self._inline_thread_factory,
+            ),
+            patch("gza.cli._common.write_ops_entry", side_effect=RuntimeError("write-boom")),
+        ):
+            _start_detached_process_reaper(
+                mock_proc,
+                config=config,
+                worker_id="w-reaper-write-fail",
+                startup_log_rel=".gza/workers/w-reaper-write-fail-startup.log",
+            )
+
+        worker = registry.get("w-reaper-write-fail")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == -15
+        assert worker.completion_reason == "detached worker exited with signal SIGTERM"
+
+        captured = capsys.readouterr()
+        assert "Warning: Detached worker reaper failed to record detached exit diagnostics" in captured.err
+        assert "write-boom" in captured.err
+
+    def test_detached_process_reaper_warns_on_registry_completion_failure_after_writing_ops_event(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A registry failure must not erase the detached-exit breadcrumb the reaper already observed."""
+        from gza.cli._common import _start_detached_process_reaper
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        startup_rel = ".gza/workers/w-reaper-registry-fail-startup.log"
+        startup_log = tmp_path / startup_rel
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("")
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-reaper-registry-fail",
+                task_id="gza-1",
+                pid=4321,
+                status="running",
+                startup_log_file=startup_rel,
+            )
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.wait.return_value = 7
+
+        with (
+            patch(
+                "gza.cli._common.threading.Thread",
+                side_effect=self._inline_thread_factory,
+            ),
+            patch.object(WorkerRegistry, "mark_completed", autospec=True, side_effect=RuntimeError("registry-boom")),
+        ):
+            _start_detached_process_reaper(
+                mock_proc,
+                config=config,
+                worker_id="w-reaper-registry-fail",
+                startup_log_rel=startup_rel,
+            )
+
+        ops_text = ops_log_path_for(startup_log).read_text()
+        assert '"event": "detached_exit"' in ops_text
+        assert '"exit_code": 7' in ops_text
+        assert '"message": "Detached worker w-reaper-registry-fail exited with code 7"' in ops_text
+
+        worker = registry.get("w-reaper-registry-fail")
+        assert worker is not None
+        assert worker.status == "running"
+
+        captured = capsys.readouterr()
+        assert "Warning: Detached worker reaper failed to mark the worker completed" in captured.err
+        assert "registry-boom" in captured.err
+
+    def test_detached_process_reaper_warns_on_actual_ops_write_failure(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Actual detached-exit persistence failures must still warn and complete the registry row."""
+        from gza.cli._common import _start_detached_process_reaper
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        startup_rel = ".gza/workers/w-reaper-write-strict-startup.log"
+        startup_log = tmp_path / startup_rel
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("")
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-reaper-write-strict",
+                task_id="gza-1",
+                pid=4321,
+                status="running",
+                startup_log_file=startup_rel,
+            )
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.wait.return_value = -15
+
+        with (
+            patch(
+                "gza.cli._common.threading.Thread",
+                side_effect=self._inline_thread_factory,
+            ),
+            patch("gza.runner.open", side_effect=OSError("disk-full")),
+        ):
+            _start_detached_process_reaper(
+                mock_proc,
+                config=config,
+                worker_id="w-reaper-write-strict",
+                startup_log_rel=startup_rel,
+            )
+
+        worker = registry.get("w-reaper-write-strict")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == -15
+        assert worker.completion_reason == "detached worker exited with signal SIGTERM"
+
+        captured = capsys.readouterr()
+        assert "Warning: Detached worker reaper failed to record detached exit diagnostics" in captured.err
+        assert "disk-full" in captured.err
+
+    def test_detached_process_reaper_records_nonzero_exit_signal_before_reconciliation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Early detached exits must persist signal/exit evidence on the startup ops stream immediately."""
+        from gza.cli._common import _start_detached_process_reaper
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        startup_rel = ".gza/workers/w-reaper-early-exit-startup.log"
+        startup_log = tmp_path / startup_rel
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("")
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-reaper-early-exit",
+                task_id="gza-1",
+                pid=4321,
+                status="running",
+                startup_log_file=startup_rel,
+            )
+        )
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.wait.return_value = -15
+
+        with patch(
+            "gza.cli._common.threading.Thread",
+            side_effect=self._inline_thread_factory,
+        ):
+            _start_detached_process_reaper(
+                mock_proc,
+                config=config,
+                worker_id="w-reaper-early-exit",
+                startup_log_rel=startup_rel,
+            )
+
+        ops_text = ops_log_path_for(startup_log).read_text()
+        assert '"event": "detached_exit"' in ops_text
+        assert '"reason": "WORKER_DIED"' in ops_text
+        assert '"exit_code": -15' in ops_text
+        assert '"signal": "SIGTERM"' in ops_text
+
+        worker = registry.get("w-reaper-early-exit")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == -15
 
     def test_background_worker_command_uses_project_flag(self, tmp_path: Path):
         """Background worker subprocess must pass project dir with --project flag, not as positional arg.
@@ -4679,6 +4942,165 @@ class TestReconciliation:
         assert request["signal"] == "SIGTERM"
         assert request["source"] == "watch_reconcile_no_activity"
 
+    def test_reconciliation_worker_death_capture_failure_still_terminalizes_in_progress_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Best-effort worker-death capture failures must not block WORKER_DIED terminalization."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Detached worker died")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = 999999
+        task.slug = "20260627-gza-fallback-startup"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-in-progress",
+                task_id=task.id,
+                pid=999999,
+                status="running",
+                startup_log_file=".gza/workers/dead-in-progress.startup.log",
+            )
+        )
+
+        with patch("gza.cli._common._collect_worker_death_diagnostics", side_effect=RuntimeError("capture-boom")):
+            reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/workers/dead-in-progress.startup.log"
+
+        worker = registry.get("w-dead-in-progress")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "watch reconciliation detected dead in-progress worker"
+
+        captured = capsys.readouterr()
+        assert "Warning: Failed to collect worker-death diagnostics for task" in captured.err
+        assert "capture-boom" in captured.err
+
+    def test_reconciliation_worker_death_event_write_failure_still_terminalizes_in_progress_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Ops-event write failures must not block WORKER_DIED terminalization for in-progress tasks."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Detached worker died after startup")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = 999999
+        task.log_file = ".gza/logs/dead-in-progress.log"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        task_log = tmp_path / ".gza" / "logs" / "dead-in-progress.log"
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        task_log.write_text("")
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-in-progress-write",
+                task_id=task.id,
+                pid=999999,
+                status="running",
+            )
+        )
+
+        with patch("gza.cli._common._write_worker_death_ops_event", side_effect=RuntimeError("write-boom")):
+            reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/logs/dead-in-progress.log"
+
+        worker = registry.get("w-dead-in-progress-write")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "watch reconciliation detected dead in-progress worker"
+
+        captured = capsys.readouterr()
+        assert "Warning: Failed to write worker-death diagnostics for task" in captured.err
+        assert "write-boom" in captured.err
+
+    def test_reconciliation_actual_ops_write_failure_still_terminalizes_in_progress_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Actual ops persistence failures must still warn and terminalize in-progress WORKER_DIED rows."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Detached worker died with disk error")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = 999999
+        task.log_file = ".gza/logs/dead-in-progress-strict.log"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        task_log = tmp_path / ".gza" / "logs" / "dead-in-progress-strict.log"
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        task_log.write_text("")
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-in-progress-strict",
+                task_id=task.id,
+                pid=999999,
+                status="running",
+            )
+        )
+
+        with patch("gza.runner.open", side_effect=OSError("disk-full")):
+            reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/logs/dead-in-progress-strict.log"
+
+        worker = registry.get("w-dead-in-progress-strict")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "watch reconciliation detected dead in-progress worker"
+
+        captured = capsys.readouterr()
+        assert "Warning: Failed to write worker-death diagnostics for task" in captured.err
+        assert "disk-full" in captured.err
+
     def test_reconciliation_skips_recent_live_task(self, tmp_path: Path):
         """A live task under the threshold should NOT be marked NO_ACTIVITY."""
         from datetime import UTC, datetime, timedelta
@@ -4865,6 +5287,603 @@ class TestReconciliation:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.completion_reason == "startup failure before task claim"
+
+    def test_reconciliation_worker_death_capture_failure_still_terminalizes_pending_recovery_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Pending recovery startup failures must still terminalize when capture fails."""
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.status = "pending"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-failed-recovery-capture",
+                task_id=retry_child.id,
+                pid=999999,
+                status="failed",
+                startup_log_file=".gza/workers/retry-child-capture.startup.log",
+            )
+        )
+
+        with patch("gza.cli._common._collect_worker_death_diagnostics", side_effect=RuntimeError("capture-boom")):
+            reconcile_dead_pending_recovery_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/workers/retry-child-capture.startup.log"
+
+        worker = registry.get("w-failed-recovery-capture")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "startup failure before task claim"
+
+        captured = capsys.readouterr()
+        assert "Warning: Failed to collect worker-death diagnostics for pending recovery task" in captured.err
+        assert "capture-boom" in captured.err
+
+    def test_reconciliation_worker_death_event_write_failure_still_terminalizes_pending_recovery_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Pending recovery startup failures must still terminalize when ops-event writing fails."""
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.status = "pending"
+        retry_child.log_file = ".gza/logs/retry-child-write.log"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        task_log = tmp_path / ".gza" / "logs" / "retry-child-write.log"
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        task_log.write_text("")
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-failed-recovery-write",
+                task_id=retry_child.id,
+                pid=999999,
+                status="failed",
+            )
+        )
+
+        with patch("gza.cli._common._write_worker_death_ops_event", side_effect=RuntimeError("write-boom")):
+            reconcile_dead_pending_recovery_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/logs/retry-child-write.log"
+
+        worker = registry.get("w-failed-recovery-write")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "startup failure before task claim"
+
+        captured = capsys.readouterr()
+        assert "Warning: Failed to write worker-death diagnostics for pending recovery task" in captured.err
+        assert "write-boom" in captured.err
+
+    def test_reconciliation_actual_ops_write_failure_still_terminalizes_pending_recovery_task(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Actual ops persistence failures must still warn and terminalize startup-abort recovery rows."""
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.status = "pending"
+        retry_child.log_file = ".gza/logs/retry-child-strict.log"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        task_log = tmp_path / ".gza" / "logs" / "retry-child-strict.log"
+        task_log.parent.mkdir(parents=True, exist_ok=True)
+        task_log.write_text("")
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-failed-recovery-strict",
+                task_id=retry_child.id,
+                pid=999999,
+                status="failed",
+            )
+        )
+
+        with patch("gza.runner.open", side_effect=OSError("disk-full")):
+            reconcile_dead_pending_recovery_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/logs/retry-child-strict.log"
+
+        worker = registry.get("w-failed-recovery-strict")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "startup failure before task claim"
+
+        captured = capsys.readouterr()
+        assert "Warning: Failed to write worker-death diagnostics for pending recovery task" in captured.err
+        assert "disk-full" in captured.err
+
+    def test_reconciliation_pending_recovery_merges_startup_detached_exit_into_task_visible_diagnostics(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Startup detached-exit evidence must survive even when task.log_file already exists."""
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.status = "pending"
+        retry_child.log_file = ".gza/logs/retry-child.log"
+        store.update(retry_child)
+
+        config = Config.load(tmp_path)
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "retry-child.log").write_text("")
+
+        startup_rel = ".gza/workers/retry-child.startup.log"
+        startup_log = tmp_path / startup_rel
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("fatal: worker vanished before claim\n")
+        ops_log_path_for(startup_log).write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "command",
+                            "event": "verify_credentials_docker",
+                            "timestamp": "2026-06-27T00:00:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "worker_lifecycle",
+                            "event": "detached_exit",
+                            "reason": "WORKER_DIED",
+                            "worker_id": "w-raced-startup-exit",
+                            "pid": 999999,
+                            "exit_code": -15,
+                            "signal": "SIGTERM",
+                            "message": "Detached worker w-raced-startup-exit exited via SIGTERM",
+                            "timestamp": "2026-06-27T00:00:01Z",
+                        }
+                    ),
+                ]
+            )
+        )
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-raced-startup-exit",
+                task_id=retry_child.id,
+                pid=999999,
+                status="failed",
+                startup_log_file=startup_rel,
+            )
+        )
+
+        reconcile_dead_pending_recovery_tasks(config)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+
+        task_ops = (log_dir / "retry-child.ops.jsonl").read_text()
+        assert '"event": "startup_abort_detected"' in task_ops
+        assert '"exit_code": -15' in task_ops
+        assert '"signal": "SIGTERM"' in task_ops
+        assert '"stage": "after_preflight_before_worker_start"' in task_ops
+
+        result = invoke_gza("show", str(retry_child.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Failure Reason: WORKER_DIED" in result.stdout
+        assert "Worker Exit: SIGTERM, exit code -15" in result.stdout
+        assert "Worker Death Stage: after_preflight_before_worker_start" in result.stdout
+
+    def test_reconciliation_terminalizes_failed_pending_worker_with_startup_exit_diagnostics(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Ordinary pending rows with failed pre-claim workers should surface WORKER_DIED diagnostics."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Pending task with detached startup death")
+        assert task.id is not None
+        task.log_file = ".gza/logs/pending-startup-death.log"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "pending-startup-death.log").write_text("")
+
+        startup_rel = ".gza/workers/pending-startup-death.startup.log"
+        startup_log = tmp_path / startup_rel
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("fatal: worker vanished before claim\n")
+        ops_log_path_for(startup_log).write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "command",
+                            "event": "verify_credentials_docker",
+                            "timestamp": "2026-06-27T00:00:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "worker_lifecycle",
+                            "event": "detached_exit",
+                            "reason": "WORKER_DIED",
+                            "worker_id": "w-pending-startup-death",
+                            "pid": 999999,
+                            "exit_code": -9,
+                            "signal": "SIGKILL",
+                            "message": "Detached worker w-pending-startup-death exited via SIGKILL",
+                            "timestamp": "2026-06-27T00:00:01Z",
+                        }
+                    ),
+                ]
+            )
+        )
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-pending-startup-death",
+                task_id=task.id,
+                pid=999999,
+                status="failed",
+                exit_code=-9,
+                startup_log_file=startup_rel,
+            )
+        )
+
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == ".gza/logs/pending-startup-death.log"
+
+        task_ops = (log_dir / "pending-startup-death.ops.jsonl").read_text()
+        assert '"event": "startup_abort_detected"' in task_ops
+        assert '"exit_code": -9' in task_ops
+        assert '"signal": "SIGKILL"' in task_ops
+        assert '"stage": "after_preflight_before_worker_start"' in task_ops
+        assert '"fatal: worker vanished before claim"' in task_ops
+
+        worker = registry.get("w-pending-startup-death")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.completion_reason == "startup failure before task claim"
+
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+        assert result.returncode == 0
+        assert "Failure Reason: WORKER_DIED" in result.stdout
+        assert "Worker Exit: SIGKILL, exit code -9" in result.stdout
+        assert "Worker Death Stage: after_preflight_before_worker_start" in result.stdout
+        assert "fatal: worker vanished before claim" in result.stdout
+
+    def test_reconciliation_fallback_startup_ops_without_base_log_are_visible_to_show_and_log_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Fallback startup ops breadcrumbs should stay task-visible without a base startup log file."""
+        from gza.cli._common import reconcile_in_progress_tasks, startup_log_path_for_task
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("In-progress task with fallback startup diagnostics")
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        task.running_pid = 999999
+        task.slug = "20260627-gza-fallback-startup"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        fallback_log = startup_log_path_for_task(config, task)
+        assert fallback_log is not None
+        fallback_ops = ops_log_path_for(fallback_log)
+        fallback_ops.parent.mkdir(parents=True, exist_ok=True)
+        fallback_ops.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "command",
+                            "event": "verify_credentials_docker",
+                            "timestamp": "2026-06-27T00:00:00Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "info",
+                            "message": "fatal: worker vanished before claim",
+                            "timestamp": "2026-06-27T00:00:01Z",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "gza",
+                            "subtype": "worker_lifecycle",
+                            "event": "detached_exit",
+                            "reason": "WORKER_DIED",
+                            "worker_id": "w-fallback-startup",
+                            "pid": 999999,
+                            "exit_code": -9,
+                            "signal": "SIGKILL",
+                            "message": "Detached worker w-fallback-startup exited via SIGKILL",
+                            "timestamp": "2026-06-27T00:00:02Z",
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-fallback-startup",
+                task_id=task.id,
+                pid=999999,
+                status="running",
+            )
+        )
+
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.log_file == str(fallback_log.relative_to(tmp_path))
+        assert not fallback_log.exists()
+
+        task_ops = fallback_ops.read_text()
+        assert '"event": "death_detected"' in task_ops
+        assert '"exit_code": -9' in task_ops
+        assert '"stage": "after_preflight_before_worker_start"' in task_ops
+        assert '"fatal: worker vanished before claim"' in task_ops
+
+        show_result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+        assert show_result.returncode == 0
+        assert "Failure Reason: WORKER_DIED" in show_result.stdout
+        assert "Worker Exit: SIGKILL, exit code -9" in show_result.stdout
+        assert "Worker Death Stage: after_preflight_before_worker_start" in show_result.stdout
+        assert "fatal: worker vanished before claim" in show_result.stdout
+
+        log_result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
+        assert log_result.returncode == 0
+        assert "Failure Reason: WORKER_DIED" in log_result.stdout
+        assert "Worker Exit: SIGKILL, exit code -9" in log_result.stdout
+        assert "Worker Death Stage: after_preflight_before_worker_start" in log_result.stdout
+        assert "fatal: worker vanished before claim" in log_result.stdout
+
+    def test_reconciliation_leaves_pending_task_with_clean_completed_worker_pending(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Clean completed workers must not be treated as WORKER_DIED evidence."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Pending task with clean completed worker")
+        assert task.id is not None
+        task.log_file = ".gza/logs/pending-clean-exit.log"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "pending-clean-exit.log").write_text("")
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-pending-clean-exit",
+                task_id=task.id,
+                pid=999999,
+                status="completed",
+                exit_code=0,
+            )
+        )
+
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+
+        task_ops_path = log_dir / "pending-clean-exit.ops.jsonl"
+        assert not task_ops_path.exists()
+
+        worker = registry.get("w-pending-clean-exit")
+        assert worker is not None
+        assert worker.status == "completed"
+        assert worker.completion_reason is None
+
+    def test_reconciliation_ignores_clean_detached_exit_for_pending_worker(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A clean detached_exit breadcrumb must not by itself imply WORKER_DIED."""
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Pending task with clean detached exit")
+        assert task.id is not None
+        task.log_file = ".gza/logs/pending-clean-detached.log"
+        store.update(task)
+
+        config = Config.load(tmp_path)
+        log_dir = tmp_path / ".gza" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "pending-clean-detached.log").write_text("")
+
+        startup_rel = ".gza/workers/pending-clean-detached.startup.log"
+        startup_log = tmp_path / startup_rel
+        startup_log.parent.mkdir(parents=True, exist_ok=True)
+        startup_log.write_text("worker exited cleanly before claim\n")
+        ops_log_path_for(startup_log).write_text(
+            json.dumps(
+                {
+                    "type": "gza",
+                    "subtype": "worker_lifecycle",
+                    "event": "detached_exit",
+                    "worker_id": "w-pending-clean-detached",
+                    "pid": 999999,
+                    "exit_code": 0,
+                    "message": "Detached worker w-pending-clean-detached exited with code 0",
+                    "timestamp": "2026-06-27T00:00:01Z",
+                }
+            )
+        )
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-pending-clean-detached",
+                task_id=task.id,
+                pid=999999,
+                status="completed",
+                startup_log_file=startup_rel,
+            )
+        )
+
+        reconcile_in_progress_tasks(config)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "pending"
+        assert refreshed.failure_reason is None
+
+        task_ops_path = log_dir / "pending-clean-detached.ops.jsonl"
+        assert not task_ops_path.exists()
+
+        worker = registry.get("w-pending-clean-detached")
+        assert worker is not None
+        assert worker.status == "completed"
+        assert worker.completion_reason is None
 
     def test_reconciliation_fails_silent_pending_task_with_dead_registered_worker(self, tmp_path: Path):
         """Pending tasks with dead registered workers past the silence timeout should fail NO_ACTIVITY."""

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -199,6 +200,67 @@ class TestRunWithResume:
             task,
             run_task=_run_task,
             max_resume_attempts=0,
+        )
+
+        assert rc == 1
+        assert final_task.status == "failed"
+        assert len(store.get_all()) == 1
+
+    def test_does_not_resume_on_test_failure(self, tmp_path):
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.session_id = "sess-123"
+        store.update(task)
+
+        seen_resume_flags: list[bool] = []
+
+        def _run_task(run_task, resume: bool) -> int:
+            seen_resume_flags.append(resume)
+            run_task.status = "failed"
+            run_task.failure_reason = "TEST_FAILURE"
+            run_task.session_id = "sess-123"
+            store.update(run_task)
+            return 1
+
+        final_task, rc = run_with_resume(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=3,
+        )
+
+        assert rc == 1
+        assert final_task.status == "failed"
+        assert seen_resume_flags == [False]
+        assert len(store.get_all()) == 1
+
+    def test_returns_nonzero_for_handled_failed_outcome_with_zero_exit(self, tmp_path):
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+        task = store.add("Implement feature", task_type="implement")
+        task.session_id = "sess-123"
+        store.update(task)
+
+        def _run_task(run_task, resume: bool) -> int:
+            del resume
+            run_task.status = "failed"
+            run_task.failure_reason = "TEST_FAILURE"
+            run_task.session_id = "sess-123"
+            store.update(run_task)
+            return 0
+
+        final_task, rc = run_with_resume(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=3,
         )
 
         assert rc == 1
@@ -411,66 +473,86 @@ def test_build_failure_diagnostics_extracts_interrupt_source(tmp_path):
         "watch_reconcile_no_activity (watch reconciliation detected no recent task log activity)"
     )
 
-    def test_does_not_resume_on_test_failure(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 
-        task = store.add("Implement feature", task_type="implement")
-        task.session_id = "sess-123"
-        store.update(task)
-
-        seen_resume_flags: list[bool] = []
-
-        def _run_task(run_task, resume: bool) -> int:
-            seen_resume_flags.append(resume)
-            run_task.status = "failed"
-            run_task.failure_reason = "TEST_FAILURE"
-            run_task.session_id = "sess-123"
-            store.update(run_task)
-            return 1
-
-        final_task, rc = run_with_resume(
-            config,
-            store,
-            task,
-            run_task=_run_task,
-            max_resume_attempts=3,
+def test_build_failure_diagnostics_extracts_worker_death_details(tmp_path: Path) -> None:
+    """Structured worker-death ops entries should surface exit, stage, and tail details."""
+    log_path = tmp_path / "worker-died.log"
+    log_path.write_text("")
+    ops_path = tmp_path / "worker-died.ops.jsonl"
+    ops_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "gza",
+                        "subtype": "worker_lifecycle",
+                        "event": "death_detected",
+                        "reason": "WORKER_DIED",
+                        "exit_code": -9,
+                        "signal": "SIGKILL",
+                        "signal_number": 9,
+                        "stage": "after_preflight_before_worker_start",
+                        "output_tail": ["fatal: worker vanished", "last stdout line"],
+                        "os_hint": "darwin log hint (best effort): jetsam around death window",
+                    }
+                )
+            ]
         )
+    )
 
-        assert rc == 1
-        assert final_task.status == "failed"
-        assert seen_resume_flags == [False]
-        assert len(store.get_all()) == 1
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Dead worker task")
+    task.status = "failed"
+    task.failure_reason = "WORKER_DIED"
+    store.update(task)
 
-    def test_returns_nonzero_for_handled_failed_outcome_with_zero_exit(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
-        config = Config.load(tmp_path)
-        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    diagnostics = _build_failure_diagnostics(task, log_path, verify_command=None)
 
-        task = store.add("Implement feature", task_type="implement")
-        task.session_id = "sess-123"
-        store.update(task)
+    assert diagnostics.reason == "WORKER_DIED"
+    assert diagnostics.worker_signal == "SIGKILL"
+    assert diagnostics.worker_exit_code == -9
+    assert diagnostics.worker_stage == "after_preflight_before_worker_start"
+    assert diagnostics.worker_output_tail == ("fatal: worker vanished", "last stdout line")
+    assert diagnostics.worker_os_hint == "darwin log hint (best effort): jetsam around death window"
 
-        def _run_task(run_task, resume: bool) -> int:
-            del resume
-            run_task.status = "failed"
-            run_task.failure_reason = "TEST_FAILURE"
-            run_task.session_id = "sess-123"
-            store.update(run_task)
-            return 0
 
-        final_task, rc = run_with_resume(
-            config,
-            store,
-            task,
-            run_task=_run_task,
-            max_resume_attempts=3,
+def test_build_failure_diagnostics_extracts_worker_death_details_from_ops_without_base_log(tmp_path: Path) -> None:
+    """Ops-only worker-death breadcrumbs should render even when the base log file is absent."""
+    log_path = tmp_path / "worker-died.startup.log"
+    ops_path = tmp_path / "worker-died.startup.ops.jsonl"
+    ops_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "gza",
+                        "subtype": "worker_lifecycle",
+                        "event": "death_detected",
+                        "reason": "WORKER_DIED",
+                        "exit_code": -15,
+                        "signal": "SIGTERM",
+                        "signal_number": 15,
+                        "stage": "after_preflight_before_worker_start",
+                        "output_tail": ["fatal: startup abort"],
+                    }
+                )
+            ]
         )
+    )
 
-        assert rc == 1
-        assert final_task.status == "failed"
-        assert len(store.get_all()) == 1
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Dead worker task without transcript")
+    task.status = "failed"
+    task.failure_reason = "WORKER_DIED"
+    store.update(task)
+
+    diagnostics = _build_failure_diagnostics(task, log_path, verify_command=None)
+
+    assert diagnostics.reason == "WORKER_DIED"
+    assert diagnostics.worker_signal == "SIGTERM"
+    assert diagnostics.worker_exit_code == -15
+    assert diagnostics.worker_stage == "after_preflight_before_worker_start"
+    assert diagnostics.worker_output_tail == ("fatal: startup abort",)
 
 
 class TestExtractLastAgentMessageForFailure:
