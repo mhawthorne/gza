@@ -45,7 +45,7 @@ def lifecycle_action_execution_sort_key(action_task: DbTask, action: Mapping[str
     action_type = str(action.get("type", ""))
     worker_consuming_rank = 1 if is_worker_consuming_advance_action(action_type) else 0
     direct_action_rank = ADVANCE_ACTION_ORDER.get(action_type, 1) if worker_consuming_rank == 0 else 0
-    plan_explore_rank = 1 if action_task.task_type in {"plan", "explore"} else 0
+    plan_explore_rank = 1 if action_task.task_type in {"plan", "plan_improve", "explore"} else 0
     return (worker_consuming_rank, direct_action_rank, plan_explore_rank)
 
 

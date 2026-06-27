@@ -20,6 +20,7 @@ from .merge_state import classify_branch_merge_state_for_target
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
+    IMPLEMENTATION_SOURCE_TASK_TYPES,
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
     held_plan_has_blocked_awaiting_review_dependents,
@@ -614,7 +615,7 @@ def _select_representative_completed_task(
     include_dropped: bool,
 ) -> DbTask | None:
     owner = snapshot.owner_task
-    if owner.task_type in {"plan", "explore"} and owner.status == "completed" and owner in unresolved_tasks:
+    if owner.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES and owner.status == "completed" and owner in unresolved_tasks:
         return owner
     actionable = _actionable_lifecycle_tasks(unresolved_tasks, include_dropped=include_dropped)
     if not actionable:
@@ -1249,7 +1250,7 @@ def _query_lineage_owner_rows_with_context(
                 include_tag_filters=False,
                 merge_unit=merge_unit,
             )
-            if task.task_type in {"plan", "explore"} and task.status == "completed":
+            if task.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES and task.status == "completed":
                 followup_state = _source_followup_state(indexes, task, source_followup_cache)
                 needs_followup = source_task_needs_implementation_followup(
                     task,
@@ -1364,7 +1365,7 @@ def _query_lineage_owner_rows_with_context(
         resolution = is_lineage_resolved(snapshot)
         has_unimplemented_source = (
             owner.id is not None
-            and owner.task_type in {"plan", "explore"}
+            and owner.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES
             and owner.status == "completed"
             and (
                 source_task_needs_implementation_followup(

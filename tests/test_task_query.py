@@ -117,6 +117,53 @@ def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_
     assert row.values["next_action_reason"] == "Create and start plan review task"
 
 
+def test_incomplete_preset_projects_revised_plan_followup_when_context_available(tmp_path: Path) -> None:
+    from tests.cli.conftest import setup_config
+
+    setup_config(tmp_path)
+    store = _store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("completed plan", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+    store.update(plan)
+
+    review = store.add("review plan", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    revised_plan = store.add(
+        "revised plan",
+        task_type="plan_improve",
+        based_on=plan.id,
+        depends_on=review.id,
+    )
+    assert revised_plan.id is not None
+    revised_plan.status = "completed"
+    revised_plan.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    store.update(revised_plan)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=SimpleNamespace(can_merge=lambda *_args, **_kwargs: True),
+        target_branch="main",
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert hasattr(row, "owner_task")
+    assert row.values["next_action"] == "create_plan_review"
+    assert row.values["next_action_reason"] == "Create and start plan review task"
+    assert row.values["unresolved_ids"] == [revised_plan.id]
+
+
 def test_incomplete_query_uses_one_read_session_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
     failed = store.add("failed impl", task_type="implement")

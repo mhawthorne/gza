@@ -1,6 +1,7 @@
 """Tests for auto-advancing completed plans via `gza advance`."""
 
 import argparse
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,12 +115,6 @@ def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) 
     plan.slug = "20260305-design-auth-system-2"
     store.update(plan)
 
-    spawn_calls: list[str | None] = []
-
-    def fake_spawn(_worker_args, _config, task_id=None, **_kw):
-        spawn_calls.append(task_id)
-        return 0
-
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
         patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
@@ -127,7 +122,7 @@ def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) 
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
-        patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
+        patch("gza.cli.git_ops._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         rc = cmd_advance(_advance_args(tmp_path))
 
@@ -137,7 +132,7 @@ def test_advance_creates_plan_review_for_completed_plan(tmp_path: Path, capsys) 
     assert len(plan_review_tasks) == 1
     assert plan_review_tasks[0].depends_on == plan.id
     assert plan_review_tasks[0].based_on is None
-    assert spawn_calls == [plan_review_tasks[0].id]
+    assert spawn_worker.call_args.kwargs["task_id"] == plan_review_tasks[0].id
 
 
 def test_advance_create_plan_review_inherits_tags_from_completed_plan(tmp_path: Path, capsys) -> None:
@@ -225,6 +220,96 @@ def test_advance_create_plan_review_startup_failure_rolls_back_child_and_skips_s
     workers_dir = tmp_path / ".gza" / "workers"
     if workers_dir.exists():
         assert list(workers_dir.iterdir()) == []
+
+
+def test_advance_materializes_approved_revised_plan_into_implement_tasks(tmp_path: Path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = _create_completed_plan(store, "Design auth system")
+    assert plan.id is not None
+
+    first_review = store.add("Review original auth plan", task_type="plan_review", depends_on=plan.id)
+    assert first_review.id is not None
+    first_review.status = "completed"
+    first_review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    first_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(first_review)
+
+    revised_plan = store.add(
+        "Revise auth plan",
+        task_type="plan_improve",
+        based_on=plan.id,
+        depends_on=first_review.id,
+    )
+    assert revised_plan.id is not None
+    revised_plan.status = "completed"
+    revised_plan.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+    store.update(revised_plan)
+
+    manifest = {
+        "schema_version": 1,
+        "source_task_id": revised_plan.id,
+        "source_task_type": "plan_improve",
+        "verdict": "APPROVED",
+        "slice_quality": {
+            "fits_single_task_budget": True,
+            "timeout_budget_minutes": 30,
+            "max_expected_files_changed_per_slice": 8,
+            "rationale": "Bounded slices.",
+        },
+        "slices": [
+            {
+                "slice_id": "S1",
+                "title": "Foundation",
+                "prompt": "Implement revised auth foundation.",
+                "scope": ["Planner"],
+                "out_of_scope": [],
+                "acceptance_criteria": ["Foundation exists"],
+                "depends_on_slices": [],
+                "based_on_slice": None,
+                "review_scope": "Foundation only.",
+                "estimated_complexity": "small",
+                "expected_timeout_minutes": 30,
+                "requires_code_review": True,
+                "tags": ["planner"],
+            }
+        ],
+    }
+    revised_review = store.add("Review revised auth plan", task_type="plan_review", depends_on=revised_plan.id)
+    assert revised_review.id is not None
+    revised_review.status = "completed"
+    revised_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+    revised_review.output_content = (
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+        + json.dumps(manifest)
+        + "\n```\n"
+    )
+    store.update(revised_review)
+
+    spawn_calls: list[str | None] = []
+
+    def fake_spawn(_worker_args, _config, task_id=None, **_kw):
+        spawn_calls.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.recovery_engine.list_failed_tasks_for_recovery", return_value=[]),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.git_ops._spawn_background_worker", side_effect=fake_spawn),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path))
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Materialized implementation slices" in output
+    implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+    assert len(implement_tasks) == 1
+    assert implement_tasks[0].based_on == revised_plan.id
 
 
 def test_advance_skips_plan_with_existing_implement(tmp_path: Path, capsys) -> None:

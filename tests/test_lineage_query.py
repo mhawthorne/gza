@@ -1233,13 +1233,64 @@ def test_query_lineage_owner_rows_surfaces_held_completed_plan_as_awaiting_human
     )
 
     assert len(rows) == 1
+
+
+def test_query_lineage_owner_rows_uses_completed_revised_plan_as_action_frontier(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan background jobs", task_type="plan")
+    assert plan.id is not None
+    _set_completed(
+        plan,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(plan)
+
+    initial_review = store.add("Review the original plan", task_type="plan_review", depends_on=plan.id)
+    assert initial_review.id is not None
+    initial_review.status = "completed"
+    initial_review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+    initial_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(initial_review)
+
+    revised_plan = store.add(
+        "Revise the plan",
+        task_type="plan_improve",
+        based_on=plan.id,
+        depends_on=initial_review.id,
+    )
+    assert revised_plan.id is not None
+    _set_completed(
+        revised_plan,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        branch=None,
+        has_commits=False,
+    )
+    store.update(revised_plan)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
     row = rows[0]
-    assert row.owner_task.id == plan.id
+    assert row.owner_task.id == revised_plan.id
+    assert row.lifecycle_action_task is not None
+    assert row.lifecycle_action_task.id == revised_plan.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "awaiting_human"
-    assert row.next_action["needs_attention_reason"] == "awaiting-human-review"
-    assert row.next_action["subject_task_id"] == plan.id
-    assert f"uv run gza implement {plan.id}" in row.next_action["description"]
+    assert row.next_action["type"] == "create_plan_review"
+    assert [task.id for task in row.unresolved_tasks if task.id is not None] == [revised_plan.id]
 
 
 def test_query_lineage_owner_rows_completed_empty_prereq_is_not_awaiting_human(tmp_path: Path) -> None:

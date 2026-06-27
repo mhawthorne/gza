@@ -20,6 +20,10 @@ class SourceFollowupState:
     has_non_dropped_implement_descendant: bool
 
 
+PLAN_LIKE_SOURCE_TASK_TYPES = frozenset({"plan", "plan_improve"})
+IMPLEMENTATION_SOURCE_TASK_TYPES = frozenset({"explore", "plan", "plan_improve"})
+
+
 def _task_event_time(task: DbTask) -> datetime:
     value = task.completed_at or task.created_at
     if value is None:
@@ -70,7 +74,7 @@ def resolve_source_followup_state(
         seen.add(child.id)
         queue.extend(get_children(child.id))
 
-        if child.task_type not in {"plan", "implement"}:
+        if child.task_type not in {*PLAN_LIKE_SOURCE_TASK_TYPES, "implement"}:
             continue
         if child.status == "dropped":
             continue
@@ -114,19 +118,20 @@ def source_task_needs_implementation_followup(
 ) -> bool:
     """Return whether a completed plan/explore task still lacks real follow-up."""
 
-    if task.status != "completed" or task.task_type not in {"plan", "explore"}:
+    if task.status != "completed" or task.task_type not in IMPLEMENTATION_SOURCE_TASK_TYPES:
         return False
     has_direct_implement_followup = (
         task.id is not None
         and non_dropped_implement_source_ids is not None
         and task.id in non_dropped_implement_source_ids
     )
-    if task.task_type == "plan":
-        return not (has_direct_implement_followup or followup_state.has_non_dropped_implement_descendant)
-    return not (
-        has_direct_implement_followup
-        or followup_state.has_non_dropped_plan_or_implement_descendant
-    )
+    if task.task_type in PLAN_LIKE_SOURCE_TASK_TYPES:
+        return not (
+            has_direct_implement_followup
+            or followup_state.has_non_dropped_implement_descendant
+            or followup_state.has_non_dropped_plan_or_implement_descendant
+        )
+    return not (has_direct_implement_followup or followup_state.has_non_dropped_plan_or_implement_descendant)
 
 
 def source_task_has_implementation_followup(
@@ -157,7 +162,7 @@ def held_plan_has_blocked_awaiting_review_dependents(
 ) -> bool:
     """Return whether a completed held plan still blocks pending dependents awaiting review."""
 
-    if task.id is None or task.task_type != "plan" or task.status != "completed" or task.auto_implement is not False:
+    if task.id is None or task.task_type not in PLAN_LIKE_SOURCE_TASK_TYPES or task.status != "completed" or task.auto_implement is not False:
         return False
 
     for dependent in get_dependents(task.id):
