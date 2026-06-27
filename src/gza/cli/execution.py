@@ -144,7 +144,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
-    needs_attention_recommends_fix,
+    needs_attention_recommended_next_step,
     resolve_closing_review_action,
     resolve_subject_task,
 )
@@ -3451,6 +3451,13 @@ def cmd_fix(args: argparse.Namespace) -> int:
             f"Task {impl_task.id} is {impl_task.status}. "
             "Run/finish the implementation first, then run fix for stuck review/improve churn.",
         )
+    if impl_task.status != "completed":
+        return phase1_error(
+            args,
+            f"Task {impl_task.id} never completed (status={impl_task.status}). "
+            "fix is for review/improve churn on a completed implementation; "
+            "retry or re-implement instead.",
+        )
     reserved_launch = _reserve_immediate_execution_permit(args=args, config=config, store=store)
     if reserved_launch is False:
         return 1
@@ -4171,8 +4178,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     f"{NEEDS_ATTENTION_LABEL}: "
                     f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
                 )
-                if needs_attention_recommends_fix(attention.action):
-                    print(f"Recommended next step: uv run gza fix {iterate_task.id}")
+                next_step = needs_attention_recommended_next_step(store, attention.task, attention.action)
+                if next_step is not None:
+                    print(next_step)
             else:
                 print(f"Iterate blocked: {attention_result.message.removeprefix('SKIP: ')}")
             return 3
@@ -4206,7 +4214,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 f"max_review_cycles={engine_config.max_review_cycles}, "
                 "consumed_this_invocation=0"
             )
-            print(f"Recommended next step: uv run gza fix {iterate_task.id}")
+            next_step = needs_attention_recommended_next_step(store, subject_task, initial_action)
+            if next_step is not None:
+                print(next_step)
             return 3
         if classify_advance_action(initial_action) == "needs_attention":
             subject_task = resolve_subject_task(store, initial_action, fallback_task=iterate_task)
@@ -4214,8 +4224,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 f"{NEEDS_ATTENTION_LABEL}: "
                 f"{format_needs_attention_entry_for_display(subject_task, action=initial_action, prefix=len(subject_task.id or '') + 4)}"
             )
-            if needs_attention_recommends_fix(initial_action):
-                print(f"Recommended next step: uv run gza fix {iterate_task.id}")
+            next_step = needs_attention_recommended_next_step(store, subject_task, initial_action)
+            if next_step is not None:
+                print(next_step)
             return 3
         print(f"Iterate blocked: {_iterate_action_description(initial_action)}")
         return 3
@@ -4223,8 +4234,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     def _print_failed_recovery_attention_and_return(
         failed_task: DbTask,
         decision: FailedRecoveryDecision,
-        *,
-        fix_task_id: str,
     ) -> int | None:
         attention_result = build_failed_recovery_needs_attention_result(
             store=store,
@@ -4241,8 +4250,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             f"{NEEDS_ATTENTION_LABEL}: "
             f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
         )
-        if needs_attention_recommends_fix(attention.action):
-            print(f"Recommended next step: uv run gza fix {fix_task_id}")
+        next_step = needs_attention_recommended_next_step(store, attention.task, attention.action)
+        if next_step is not None:
+            print(next_step)
         return 3
 
     def _resolve_prepared_iterate_start() -> tuple[_PreparedIterateStart | None, int | None]:
@@ -4608,7 +4618,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     exit_code = _print_failed_recovery_attention_and_return(
                         blocked_task,
                         resume_blocked_decision,
-                        fix_task_id=impl_task_id,
                     )
                     if exit_code is not None:
                         return None, exit_code
@@ -4780,7 +4789,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 exit_code = _print_failed_recovery_attention_and_return(
                     impl_task,
                     terminal_skip_decision,
-                    fix_task_id=impl_task_id,
                 )
                 if exit_code is not None:
                     return exit_code
@@ -4819,7 +4827,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     exit_code = _print_failed_recovery_attention_and_return(
                         blocked_task,
                         resume_blocked_decision,
-                        fix_task_id=impl_task_id,
                     )
                     if exit_code is not None:
                         return exit_code
@@ -4906,7 +4913,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 exit_code = _print_failed_recovery_attention_and_return(
                     impl_task,
                     terminal_skip_decision,
-                    fix_task_id=impl_task_id,
                 )
                 if exit_code is not None:
                     return exit_code
@@ -5935,15 +5941,19 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             f"max_review_cycles={engine_config.max_review_cycles}, "
             f"consumed_this_invocation={consumed_this_invocation}"
         )
-        print(f"Recommended next step: uv run gza fix {impl_task_key}")
+        if final_attention_action is not None and final_attention_task is not None:
+            next_step = needs_attention_recommended_next_step(store, final_attention_task, final_attention_action)
+            if next_step is not None:
+                print(next_step)
         return 3
     if final_attention_action is not None and final_attention_task is not None:
         print(
             f"{NEEDS_ATTENTION_LABEL}: "
             f"{format_needs_attention_entry_for_display(final_attention_task, action=final_attention_action, prefix=len(final_attention_task.id or '') + 4)}"
         )
-        if needs_attention_recommends_fix(final_attention_action):
-            print(f"Recommended next step: uv run gza fix {impl_task_key}")
+        next_step = needs_attention_recommended_next_step(store, final_attention_task, final_attention_action)
+        if next_step is not None:
+            print(next_step)
         return 3
     if final_non_attention_stop_message is not None:
         print(f"Iterate blocked: {final_non_attention_stop_message}")

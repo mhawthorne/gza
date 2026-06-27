@@ -28,7 +28,7 @@ from gza.flaky_investigations import (
 )
 from gza.git import ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
-from gza.lineage import walk_ancestors, walk_based_on_descendants
+from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
 from gza.off_topic_verify import (
     classify_failure_diff_scope,
@@ -102,6 +102,17 @@ FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
         "retry-limit-reached",
         "retryable-provider-error",
     }
+)
+FAILED_RECOVERY_FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
+    {
+        "automatic-recovery-disabled",
+        "retry-limit-reached",
+        "retryable-provider-error",
+    }
+)
+FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP = (
+    "Recommended next step: retry or re-implement instead. "
+    "`uv run gza fix` only applies after a completed implementation."
 )
 DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
 REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS = 3
@@ -2764,6 +2775,27 @@ def needs_attention_recommends_fix(action: Mapping[str, Any]) -> bool:
     """Return True when the operator handoff for this attention state is `gza fix`."""
     reason = get_needs_attention_reason(action)
     return reason in FIX_HANDOFF_NEEDS_ATTENTION_REASONS
+
+
+def needs_attention_recommended_next_step(
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: Mapping[str, Any],
+) -> str | None:
+    """Return the operator next-step line for a needs-attention action, if any."""
+    reason = get_needs_attention_reason(action)
+    if reason is None or task.id is None:
+        return None
+    impl_task, resolve_error = resolve_impl_task(store, task.id)
+    resolved_impl = impl_task if resolve_error is None and impl_task is not None else None
+    if reason == "review-max-cycles-reached":
+        fix_task_id = resolved_impl.id if resolved_impl is not None and resolved_impl.id is not None else task.id
+        return f"Recommended next step: uv run gza fix {fix_task_id}"
+    if reason not in FAILED_RECOVERY_FIX_HANDOFF_NEEDS_ATTENTION_REASONS:
+        return None
+    if resolved_impl is not None and resolved_impl.status == "completed" and resolved_impl.id is not None:
+        return f"Recommended next step: uv run gza fix {resolved_impl.id}"
+    return FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP
 
 
 def is_diverged_merge_source_warning(warning: str | None) -> bool:

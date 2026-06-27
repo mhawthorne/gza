@@ -14,6 +14,7 @@ import pytest
 from gza.artifacts import store_command_output_artifact
 from gza.advance_engine import (
     ADVANCE_RULES,
+    FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP,
     REVIEW_CLEARANCE_ARTIFACT_KIND,
     WORKER_CONSUMING_ACTIONS,
     _count_consecutive_plan_review_cycles,
@@ -23,6 +24,7 @@ from gza.advance_engine import (
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
     get_action_subject_task_id,
+    needs_attention_recommended_next_step,
     require_needs_attention_subject,
     resolve_advance_context,
     resolve_closing_review_action,
@@ -3460,6 +3462,65 @@ def test_retry_limit_reached_failed_recovery_action_defaults_subject_to_failed_t
     assert decision.reason_code == "retry_limit_reached"
     assert classify_advance_action(action) == "needs_attention"
     assert action["subject_task_id"] == failed.id
+
+
+def test_failed_recovery_next_step_requires_completed_implementation(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    failed = store.add("Implement feature", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_STEPS"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    action = failed_recovery_decision_to_action(
+        failed,
+        decision,
+        needs_attention_reason="retry-limit-reached",
+        subject_task_id=failed.id,
+    )
+
+    assert needs_attention_recommended_next_step(store, failed, action) == FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP
+
+
+def test_failed_improve_recovery_next_step_keeps_fix_for_completed_impl(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/completed-fix-handoff",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_STEPS"
+    failed_improve.completed_at = datetime(2026, 5, 15, 11, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    action = {
+        "type": "needs_discussion",
+        "description": "Improve automatic recovery is disabled",
+        "needs_attention_reason": "automatic-recovery-disabled",
+        "subject_task_id": impl.id,
+    }
+
+    assert needs_attention_recommended_next_step(store, failed_improve, action) == (
+        f"Recommended next step: uv run gza fix {impl.id}"
+    )
 
 
 def test_failed_review_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:

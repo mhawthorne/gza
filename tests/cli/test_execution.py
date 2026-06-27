@@ -7572,6 +7572,60 @@ class TestFixCommand:
         assert result.returncode == 1
         assert f"Task {impl_task.id} is in_progress" in result.stdout
 
+    def test_fix_rejects_failed_implementation_that_never_completed(self, tmp_path: Path):
+        """Fix command rejects never-completed implementations and points callers to retry/re-implement."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement cache", task_type="implement")
+        impl_task.status = "failed"
+        impl_task.failure_reason = "WORKER_DIED"
+        store.update(impl_task)
+
+        result = invoke_gza("fix", str(impl_task.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert (
+            f"Task {impl_task.id} never completed (status=failed). fix is for review/improve churn "
+            "on a completed implementation; retry or re-implement instead."
+        ) in result.stdout
+
+    def test_fix_still_creates_task_for_completed_implementation_via_cmd_fix(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Completed implementations remain eligible for fix through the command entrypoint."""
+        from gza.cli.execution import cmd_fix
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Implement cache", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(impl_task.id),
+            queue=True,
+            background=False,
+            no_docker=True,
+            max_turns=None,
+            model=None,
+            provider=None,
+            force=False,
+        )
+
+        assert cmd_fix(args) == 0
+
+        fix_tasks = [task for task in store.get_all() if task.task_type == "fix"]
+        assert len(fix_tasks) == 1
+        assert fix_tasks[0].based_on == impl_task.id
+        output = capsys.readouterr().out
+        assert f"Implementation: {impl_task.id}" in output
+
     def test_fix_defers_follow_up_handoff_to_runner(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Fix command should not run local git probing or create reviews directly."""
         from gza.cli.execution import cmd_fix
@@ -13657,7 +13711,7 @@ class TestIterateCommand:
         )
         assert attention_result is None
 
-    def test_iterate_pending_implementation_recovery_exhaustion_uses_shared_attention(
+    def test_iterate_pending_implementation_recovery_exhaustion_recommends_retry_or_reimplement(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -13736,9 +13790,10 @@ class TestIterateCommand:
         assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert f"Implementation {failed_resume.id} failed (exit code 1)" not in output
-        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" not in output
+        assert "Recommended next step: retry or re-implement instead." in output
 
-    def test_iterate_pending_retryable_provider_error_exhaustion_uses_shared_attention(
+    def test_iterate_pending_retryable_provider_error_recommends_retry_or_reimplement(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -13815,7 +13870,8 @@ class TestIterateCommand:
         assert expected_line in output
         assert "reason=retryable-provider-error" in output
         assert output.count("Needs attention:") == 1
-        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" not in output
+        assert "Recommended next step: retry or re-implement instead." in output
 
     def test_iterate_resume_start_recovery_exhaustion_auto_iterate_uses_shared_attention(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -13901,7 +13957,8 @@ class TestIterateCommand:
         assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert f"Resume of {impl.id} failed" not in output
-        assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" not in output
+        assert "Recommended next step: retry or re-implement instead." in output
         assert "max auto-resume attempts" not in captured.err
 
     def test_failed_task_resume_descendant_manual_iterate_bypasses_auto_resume_cap(

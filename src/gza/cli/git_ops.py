@@ -154,7 +154,7 @@ from .advance_engine import (
     classify_advance_action,
     determine_next_action,
     format_needs_attention_entry_for_display,
-    needs_attention_recommends_fix,
+    needs_attention_recommended_next_step,
     resolve_subject_task,
 )
 from .advance_executor import (
@@ -3215,8 +3215,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         for atask, aaction in items:
             _color = _advance_action_color(aaction["type"])
             console.print(f"  [{_color}]{_format_needs_attention_line(atask, aaction)}[/{_color}]")
-            if needs_attention_recommends_fix(aaction):
-                console.print(f"  [{_color}]Recommended next step: uv run gza fix {atask.id}[/{_color}]")
+            next_step = needs_attention_recommended_next_step(store, atask, aaction)
+            if next_step is not None:
+                console.print(f"  [{_color}]{next_step}[/{_color}]")
 
     def _append_attention_once(
         items: list[tuple[DbTask, dict[str, Any]]],

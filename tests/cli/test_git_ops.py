@@ -4675,7 +4675,7 @@ def test_cmd_advance_all_tasks_persists_deferred_prerequisite_reconciliation(
     assert merge_unit.state == "redundant"
 
 
-def test_advance_retryable_provider_attention_recommends_fix_even_without_actionable_work(
+def test_advance_retryable_provider_attention_recommends_retry_or_reimplement_for_failed_impl(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -4724,7 +4724,8 @@ def test_advance_retryable_provider_attention_recommends_fix_even_without_action
     assert rc == 0
     assert "No eligible tasks to advance" in output
     assert "reason=retryable-provider-error" in output
-    assert f"Recommended next step: uv run gza fix {task.id}" in output
+    assert f"Recommended next step: uv run gza fix {task.id}" not in output
+    assert "Recommended next step: retry or re-implement instead." in output
 
 
 def test_cmd_advance_merge_renders_off_topic_investigation_ids(
