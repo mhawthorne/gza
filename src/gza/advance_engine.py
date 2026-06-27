@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from gza.artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from gza.branch_resolution import resolve_rebase_target_task
 from gza.config import DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK, DEFAULT_MAX_NOOP_IMPROVE_CYCLES
 from gza.console import prompt_available_width, shorten_prompt
@@ -851,16 +852,31 @@ def _matching_review_verify_artifact(store: SqliteTaskStore, task: DbTask) -> Ta
     return artifacts[0]
 
 
+def _resolve_review_verify_artifact_path(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> Path | None:
+    artifact = _matching_review_verify_artifact(store, task)
+    stored_path = artifact.path if artifact is not None and artifact.path else task.review_verify_artifact_file
+    if not stored_path:
+        return None
+    try:
+        return resolve_artifact_path(Path(config.project_dir), stored_path)
+    except InvalidArtifactPathError:
+        return None
+
+
 def _read_review_verify_output(
     *,
     config: Any,
     store: SqliteTaskStore,
     task: DbTask,
 ) -> str | None:
-    artifact = _matching_review_verify_artifact(store, task)
-    if artifact is None or not artifact.path:
+    artifact_path = _resolve_review_verify_artifact_path(config=config, store=store, task=task)
+    if artifact_path is None:
         return None
-    artifact_path = (Path(config.project_dir) / artifact.path).resolve()
     try:
         return artifact_path.read_text(encoding="utf-8", errors="replace")
     except OSError:

@@ -12833,8 +12833,11 @@ class TestExtractedRunInnerHelpers:
         config.autonomous_verify_timeout_seconds = 120
         config.review_verify_timeout_grace_seconds = 9.0
 
+        detached_worktree = config.worktree_path / "noop-reverify-temp"
+        detached_worktree.mkdir(parents=True, exist_ok=True)
+
         worktree_git = Mock(spec=Git)
-        worktree_git.repo_dir = tmp_path
+        worktree_git.repo_dir = detached_worktree
         worktree_git.default_branch.return_value = "main"
         worktree_git.rev_parse_if_exists.return_value = "abc1234"
 
@@ -12858,6 +12861,7 @@ class TestExtractedRunInnerHelpers:
                     reviewed_branch=impl.branch,
                     reviewed_head_sha="abc1234",
                     reviewed_base_sha="cafebabe",
+                    output="all good\n",
                 ),
             ) as mock_review_verify,
             patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
@@ -12891,19 +12895,25 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_improve.review_verify_branch == impl.branch
         assert refreshed_improve.review_verify_head_sha == "abc1234"
         assert refreshed_improve.review_verify_captured_at == captured_at
-        assert refreshed_improve.review_verify_artifact_file is None
-        artifacts = store.list_artifacts(improve.id, kind="verify_command_output")
+        assert refreshed_improve.review_verify_artifact_file is not None
+        artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
         assert len(artifacts) == 1
-        assert artifacts[0].producer == "review_verify"
+        assert store.list_artifacts(improve.id, kind="verify_command_output") == []
+        assert artifacts[0].producer == "noop_review_verify"
         assert artifacts[0].status == "passed"
+        assert artifacts[0].path == refreshed_improve.review_verify_artifact_file
         assert artifacts[0].metadata == {
+            "review_task_id": review.id,
             "reviewed_base_sha": "cafebabe",
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "abc1234",
+            "timeout_seconds": 120,
             "tree_fingerprint": None,
             "working_directory": None,
         }
-        assert (tmp_path / artifacts[0].path).exists() is False
+        assert artifacts[0].path.startswith(f".gza/artifacts/{impl.id}/")
+        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == "all good\n"
+        assert not str((tmp_path / artifacts[0].path).resolve()).startswith(str(detached_worktree.resolve()))
         reviews = [task for task in store.get_all() if task.task_type == "review" and task.depends_on == impl.id]
         assert len(reviews) == 1
 
@@ -12924,6 +12934,142 @@ class TestExtractedRunInnerHelpers:
 
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+
+    def test_post_complete_noop_improve_chain_persists_verify_artifact_on_root_implementation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with verify-only review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-verify-chain"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before chained no-op improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
+        review.output_content = (
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: mypy error\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        review.review_verify_status = "failed"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "abc1234"
+        store.update(review)
+
+        previous_improve = store.add(
+            prompt="Previous no-op improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        previous_improve.status = "completed"
+        previous_improve.branch = impl.branch
+        store.update(previous_improve)
+        assert previous_improve.id is not None
+
+        improve = store.add(
+            prompt="Retried no-op improve",
+            task_type="improve",
+            based_on=previous_improve.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        improve.slug = "20260605-noop-improve-chain-verify"
+        store.update(improve)
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "verify_command: uv run pytest tests/ -q\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.verify_command = "uv run pytest tests/ -q"
+        config.autonomous_verify_timeout_seconds = 120
+
+        detached_worktree = config.worktree_path / "noop-reverify-chain-temp"
+        detached_worktree.mkdir(parents=True, exist_ok=True)
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = detached_worktree
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.rev_parse_if_exists.return_value = "abc1234"
+
+        captured_at = datetime(2026, 6, 1, 19, 0, tzinfo=UTC)
+        with (
+            patch(
+                "gza.runner.compute_improve_changed_diff",
+                return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
+            ),
+            patch(
+                "gza.runner._capture_noop_improve_review_verify_result",
+                wraps=_capture_noop_improve_review_verify_result,
+            ) as capture_verify,
+            patch(
+                "gza.runner._run_review_verify_command",
+                return_value=ReviewVerifyResult(
+                    command=config.verify_command,
+                    status="passed",
+                    exit_status="0",
+                    captured_at=captured_at,
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="abc1234",
+                    reviewed_base_sha="cafebabe",
+                    output="all good from chained improve\n",
+                ),
+            ),
+            patch("gza.runner._resolve_review_verify_base_sha", return_value="cafebabe"),
+            patch("gza.runner.sync_task_branch_if_live_pr"),
+            patch("gza.runner._create_and_run_review_task"),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
+
+        assert rc == 0
+        capture_verify.assert_called_once()
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status == "passed"
+        assert refreshed_improve.review_verify_artifact_file is not None
+
+        impl_artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
+        assert len(impl_artifacts) == 1
+        assert store.list_artifacts(previous_improve.id, kind="verify_command_output") == []
+        assert store.list_artifacts(improve.id, kind="verify_command_output") == []
+        assert impl_artifacts[0].producer == "noop_review_verify"
+        assert impl_artifacts[0].path == refreshed_improve.review_verify_artifact_file
+        assert impl_artifacts[0].path.startswith(f".gza/artifacts/{impl.id}/")
+        assert (tmp_path / impl_artifacts[0].path).read_text(encoding="utf-8") == "all good from chained improve\n"
 
     def test_post_complete_noop_improve_persists_fresh_failed_verify_evidence_without_clearing_review(
         self,
@@ -13040,8 +13186,93 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_improve.review_verify_branch == impl.branch
         assert refreshed_improve.review_verify_head_sha == "abc1234"
         assert refreshed_improve.review_verify_captured_at == captured_at
+        artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
+        assert len(artifacts) == 0
+        assert store.list_artifacts(improve.id, kind="verify_command_output") == []
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
+
+    def test_capture_noop_improve_review_verify_setup_failure_does_not_create_empty_artifact(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement with verify-only review blocker", task_type="implement")
+        impl.status = "completed"
+        impl.branch = "feature/noop-verify-setup-failure"
+        store.update(impl)
+        assert impl.id is not None
+
+        review = store.add(
+            prompt="Review before no-op improve",
+            task_type="review",
+            depends_on=impl.id,
+        )
+        review.status = "completed"
+        review.completed_at = datetime(2026, 6, 1, 18, 0, tzinfo=UTC)
+        review.output_content = _runner_verify_failure_only_review_report()
+        review.review_verify_status = "failed"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "abc1234"
+        store.update(review)
+
+        improve = store.add(
+            prompt="No-op improve after verify-only review",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+            create_review=True,
+        )
+        improve.status = "completed"
+        improve.branch = impl.branch
+        store.update(improve)
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "verify_command: uv run pytest tests/ -q\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        config.log_path.mkdir(parents=True, exist_ok=True)
+
+        detached_worktree = config.worktree_path / "noop-reverify-temp"
+        detached_worktree.mkdir(parents=True, exist_ok=True)
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = detached_worktree
+        worktree_git.default_branch.return_value = "main"
+        branch_ref = impl.branch
+        branch_values = iter(["abc1234", None])
+
+        def _rev_parse_if_exists(ref: str) -> str | None:
+            if ref == "origin/main":
+                return "cafebabe"
+            if ref == branch_ref:
+                return next(branch_values)
+            return None
+
+        worktree_git.rev_parse_if_exists.side_effect = _rev_parse_if_exists
+
+        result = _capture_noop_improve_review_verify_result(
+            config=config,
+            store=store,
+            task=improve,
+            worktree_git=worktree_git,
+            branch_name=impl.branch,
+        )
+
+        assert result is not None
+        assert result.status == "unavailable"
+        assert result.exit_status == "unresolved head"
+        assert store.list_artifacts(impl.id, kind="verify_command_output") == []
+        assert store.list_artifacts(improve.id, kind="verify_command_output") == []
+
+        refreshed_improve = store.get(improve.id)
+        assert refreshed_improve is not None
+        assert refreshed_improve.review_verify_status == "unavailable"
+        assert refreshed_improve.review_verify_artifact_file is None
 
     @pytest.mark.parametrize(
         ("label", "seed_evidence"),

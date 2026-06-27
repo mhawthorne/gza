@@ -2894,9 +2894,12 @@ def _store_review_verify_artifact_records(
     project_results: tuple[ProjectReviewVerifyResult, ...] = (),
     *,
     producer: str,
+    artifact_task: Task | None = None,
+    allow_metadata_only_artifacts: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> _StoredReviewVerifyArtifacts:
     """Persist durable verify artifacts and return the latest content-bearing artifact metadata."""
+    artifact_owner = artifact_task or task
     latest_content_artifact: tuple[datetime, int, str] | None = None
     shared_metadata = {
         "reviewed_branch": result.reviewed_branch,
@@ -2917,9 +2920,11 @@ def _store_review_verify_artifact_records(
             entry_result = entry.result
             if entry_result is None:
                 continue
+            if not entry_result.output and not allow_metadata_only_artifacts:
+                continue
             stored = store_command_output_artifact(
                 store,
-                task,
+                artifact_owner,
                 config,
                 kind="verify_command_output",
                 producer=producer,
@@ -2947,9 +2952,11 @@ def _store_review_verify_artifact_records(
                 if latest_content_artifact is None or candidate > latest_content_artifact:
                     latest_content_artifact = candidate
     else:
+        if not result.output and not allow_metadata_only_artifacts:
+            return _StoredReviewVerifyArtifacts()
         stored = store_command_output_artifact(
             store,
-            task,
+            artifact_owner,
             config,
             kind="verify_command_output",
             producer=producer,
@@ -3019,6 +3026,8 @@ def _capture_review_verify_result(
     project_results: tuple[ProjectReviewVerifyResult, ...] = (),
     task_logger: TaskExecutionLogger | None = None,
     producer: str = "review_verify",
+    artifact_task: Task | None = None,
+    allow_metadata_only_artifacts: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> str:
     """Persist review verify provenance, artifact, and optional ops-log evidence."""
@@ -3029,6 +3038,8 @@ def _capture_review_verify_result(
         result=result,
         project_results=project_results,
         producer=producer,
+        artifact_task=artifact_task,
+        allow_metadata_only_artifacts=allow_metadata_only_artifacts,
         metadata=metadata,
     )
     persisted_result = replace(
@@ -4849,6 +4860,9 @@ def _capture_noop_improve_review_verify_result(
     """Persist fresh verify evidence for a no-op improve blocked only by review verify."""
     if task.task_type != "improve" or task.depends_on is None:
         return None
+    impl_task = _resolve_impl_ancestor(store, task)
+    if impl_task is None or impl_task.id is None:
+        return None
 
     review_task = store.get(task.depends_on)
     if review_task is None or review_task.task_type != "review" or review_task.status != "completed":
@@ -4942,6 +4956,13 @@ def _capture_noop_improve_review_verify_result(
         markdown=markdown,
         project_results=project_results,
         task_logger=task_logger,
+        producer="noop_review_verify",
+        artifact_task=impl_task,
+        allow_metadata_only_artifacts=False,
+        metadata={
+            "review_task_id": review_task.id,
+            "timeout_seconds": timeout_seconds,
+        },
     )
     return result
 

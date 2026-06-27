@@ -6752,6 +6752,142 @@ def test_off_topic_verify_unblock_clears_review_and_persists_audit_artifact(
     assert investigation_artifacts[0].metadata["implementation_task_id"] == impl.id
 
 
+def test_off_topic_verify_unblock_reads_failed_noop_reverify_from_improve_artifact_pointer(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_off_topic_verify_unblock = True
+    tree_fingerprint = "e" * 64
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-4416-noop-reverify-pointer-fallback",
+        when=datetime(2026, 6, 23, 9, 0, tzinfo=UTC),
+    )
+
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 23, 10, 0, tzinfo=UTC))
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    review.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    review.review_verify_exit_status = "1"
+    review.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(review)
+
+    green_improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 23, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    green_improve.review_verify_status = "passed"
+    green_improve.review_verify_branch = impl.branch
+    green_improve.review_verify_head_sha = "same-head-sha"
+    green_improve.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    green_improve.review_verify_exit_status = "0"
+    green_improve.review_verify_captured_at = review.completed_at + timedelta(seconds=30)
+    store.update(green_improve)
+    _persist_review_verify_artifact(
+        config=config,
+        store=store,
+        task=green_improve,
+        output=_passing_verify_output(tree_fingerprint=tree_fingerprint),
+        status="passed",
+        exit_status="0",
+        tree_fingerprint=tree_fingerprint,
+    )
+
+    red_improve = store.add(
+        "Improve retry",
+        task_type="improve",
+        based_on=green_improve.id,
+        depends_on=review.id,
+        same_branch=True,
+    )
+    assert red_improve.id is not None
+    red_improve.status = "completed"
+    red_improve.completed_at = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    red_improve.branch = impl.branch
+    red_improve.changed_diff = False
+    red_improve.review_verify_status = "failed"
+    red_improve.review_verify_branch = impl.branch
+    red_improve.review_verify_head_sha = "same-head-sha"
+    red_improve.review_verify_command = "uv run pytest tests/ -q --maxfail=0"
+    red_improve.review_verify_exit_status = "1"
+    red_improve.review_verify_captured_at = review.completed_at + timedelta(minutes=3)
+    stored_red = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="noop_review_verify",
+        label="verify_command",
+        output=_off_topic_failed_verify_output(tree_fingerprint=tree_fingerprint),
+        status="failed",
+        exit_status="1",
+        head_sha=red_improve.review_verify_head_sha,
+        metadata={
+            "review_task_id": review.id,
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": red_improve.review_verify_head_sha,
+            "tree_fingerprint": tree_fingerprint,
+        },
+        created_at=red_improve.review_verify_captured_at,
+    )
+    red_improve.review_verify_artifact_file = stored_red.path
+    store.update(red_improve)
+
+    assert store.list_artifacts(red_improve.id, kind="verify_command_output") == []
+    assert [artifact.path for artifact in store.list_artifacts(impl.id, kind="verify_command_output")] == [
+        stored_red.path,
+    ]
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch, "main"},
+        ref_shas={impl.branch: "same-head-sha", "main": "main-head-sha"},
+        default_branch_name="main",
+        resolved_tree_shas={"main": "f" * 64},
+        name_status_by_range={
+            f"main...{impl.branch}": "M\tsrc/gza/git.py\nM\tsrc/gza/cli/git_ops.py"
+        },
+    )
+
+    with patch(
+        "gza.off_topic_verify.run_local_target_baseline_plan",
+        return_value=SimpleNamespace(
+            results=(
+                ReviewVerifyResult(
+                    command="uv run pytest tests/cli/test_query.py::test_worker_registry -q --maxfail=0",
+                    status="failed",
+                    exit_status="1",
+                    captured_at=datetime(2026, 6, 23, 12, 5, tzinfo=UTC),
+                    output=(
+                        "=========================== short test summary info ============================\n"
+                        "FAILED tests/cli/test_query.py::test_worker_registry - AssertionError: assert 'running' == 'completed'\n"
+                        "============================== 1 failed in 0.20s =============================="
+                    ),
+                ),
+            )
+        ),
+    ):
+        action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    stored_impl = store.get(impl.id)
+    artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
+
+    assert action["type"] == "merge"
+    assert stored_impl is not None
+    assert stored_impl.review_cleared_at is not None
+    assert len(artifacts) == 1
+    assert artifacts[0].metadata["reason"] == "off_topic_verify_failure"
+    assert artifacts[0].metadata["tree_fingerprint"] == tree_fingerprint
+    assert artifacts[0].metadata["red_task_id"] == red_improve.id
+
+
 def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fails(
     tmp_path: Path,
 ) -> None:
