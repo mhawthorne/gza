@@ -337,12 +337,19 @@ def _build_alert_message(
     probe: GitWorktreeHealthProbe,
     compact_failure: str,
     remediation_message: str,
+    metadata_findings: tuple[GitWorktreeHealthFinding, ...],
     metadata_scan_error: str | None,
 ) -> str:
     if metadata_scan_error is not None and not probe.failed:
         return (
             "git worktree health RED - dispatch halted; "
             f"host worktree metadata scan failed: {metadata_scan_error}. "
+            f"{remediation_message} No tasks were started or marked failed by this halt."
+        )
+    if metadata_findings and not probe.failed:
+        return (
+            "git worktree health RED - dispatch halted; "
+            f"host worktree metadata validation found container-only paths: {compact_failure}. "
             f"{remediation_message} No tasks were started or marked failed by this halt."
         )
     return (
@@ -466,8 +473,20 @@ def check_git_worktree_health(
         validation.suspected_container_path_marker if validation is not None else None
     )
 
-    if probe.failed or metadata_scan_error is not None:
-        raw_failure_text = _combine_probe_failure_text(probe) if probe.failed else metadata_scan_error
+    if probe.failed or metadata_scan_error is not None or findings:
+        if probe.failed:
+            raw_failure_text = _combine_probe_failure_text(probe)
+        elif metadata_scan_error is not None:
+            raw_failure_text = metadata_scan_error
+        else:
+            raw_failure_text = "; ".join(
+                (
+                    f"{finding.admin_path} contains container-only value {finding.value} in "
+                    f"{finding.admin_file}"
+                    f"{'; expected ' + finding.expected_value if finding.expected_value is not None else ''}"
+                )
+                for finding in findings
+            )
         assert raw_failure_text is not None
         compact_failure = _compact_failure_text(raw_failure_text)
         remediation_message = _build_remediation_message(
@@ -479,6 +498,7 @@ def check_git_worktree_health(
             probe=probe,
             compact_failure=compact_failure,
             remediation_message=remediation_message,
+            metadata_findings=findings,
             metadata_scan_error=metadata_scan_error,
         )
         if persist:

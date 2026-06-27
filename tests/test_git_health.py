@@ -267,6 +267,138 @@ def test_check_git_worktree_health_metadata_scanner_failure_is_durable_alert(tmp
     assert payload["dispatch_halted"] is True
 
 
+def test_check_git_worktree_health_green_probe_with_metadata_findings_is_durable_alert(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = SimpleNamespace(repo_dir=tmp_path)
+    probe = GitWorktreeHealthProbe(
+        command="git worktree list --porcelain",
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+    issue = WorktreeAdminMetadataIssue(
+        registration_name="broken",
+        admin_file="commondir",
+        admin_path=tmp_path / ".git" / "worktrees" / "broken" / "commondir",
+        value="/gza-git/common",
+        problem="containerized-commondir",
+        details="container path leak",
+        expected_value="../..",
+        suspected_container_path_marker="/gza-git",
+    )
+
+    with (
+        patch("gza.git_health.datetime") as mocked_datetime,
+        patch("gza.git_health._probe_git_worktree_health", return_value=probe),
+        patch("gza.git_health.validate_host_worktree_admin_metadata", return_value=_validation(tmp_path, issue)),
+    ):
+        mocked_datetime.now.return_value = datetime(2026, 6, 26, tzinfo=UTC)
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        check = check_git_worktree_health(None, store, git)
+
+    assert check.dispatch_halted is True
+    state = check.state
+    assert state.task is not None
+    assert state.probe_returncode == 0
+    assert state.metadata_scan_error is None
+    assert len(state.metadata_findings) == 1
+    assert state.metadata_findings[0].admin_path == str(issue.admin_path)
+    assert state.suspected_container_path_marker == "/gza-git"
+    assert state.raw_failure_text is not None
+    assert str(issue.admin_path) in state.raw_failure_text
+    assert "/gza-git/common" in state.raw_failure_text
+    assert state.alert_message is not None
+    assert "host worktree metadata validation found container-only paths" in state.alert_message
+    assert current_git_health_alert(store) == state
+
+    persisted_task = ensure_git_worktree_health_task(store)
+    matching = [task for task in store.get_all() if task.prompt == GIT_WORKTREE_HEALTH_PROMPT]
+    assert len(matching) == 1
+    payload = json.loads(persisted_task.output_content or "{}")
+    assert payload["dispatch_halted"] is True
+    assert payload["metadata_findings"] == [
+        {
+            "admin_file": "commondir",
+            "admin_path": str(issue.admin_path),
+            "details": "container path leak",
+            "expected_value": "../..",
+            "problem": "containerized-commondir",
+            "registration_name": "broken",
+            "suspected_container_path_marker": "/gza-git",
+            "value": "/gza-git/common",
+        }
+    ]
+    assert payload["suspected_container_path_marker"] == "/gza-git"
+
+
+def test_check_git_worktree_health_clears_existing_alert_only_when_probe_green_and_findings_empty(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = SimpleNamespace(repo_dir=tmp_path)
+
+    failed_probe = GitWorktreeHealthProbe(
+        command="git worktree list --porcelain",
+        returncode=128,
+        stdout="",
+        stderr="fatal: invalid commondir /gza-git/common",
+    )
+    green_probe = GitWorktreeHealthProbe(
+        command="git worktree list --porcelain",
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+    issue = WorktreeAdminMetadataIssue(
+        registration_name="broken",
+        admin_file="commondir",
+        admin_path=tmp_path / ".git" / "worktrees" / "broken" / "commondir",
+        value="/gza-git/common",
+        problem="containerized-commondir",
+        details="container path leak",
+        expected_value="../..",
+        suspected_container_path_marker="/gza-git",
+    )
+
+    with (
+        patch("gza.git_health.datetime") as mocked_datetime,
+        patch("gza.git_health._probe_git_worktree_health", side_effect=[failed_probe, green_probe, green_probe]),
+        patch(
+            "gza.git_health.validate_host_worktree_admin_metadata",
+            side_effect=[_validation(tmp_path, issue), _validation(tmp_path, issue), _validation(tmp_path)],
+        ),
+    ):
+        mocked_datetime.now.side_effect = [
+            datetime(2026, 6, 26, 0, 0, tzinfo=UTC),
+            datetime(2026, 6, 26, 0, 0, tzinfo=UTC),
+            datetime(2026, 6, 26, 0, 1, tzinfo=UTC),
+            datetime(2026, 6, 26, 0, 2, tzinfo=UTC),
+        ]
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+
+        initial = check_git_worktree_health(None, store, git)
+        still_red = check_git_worktree_health(None, store, git)
+        persisted_red = current_git_health_alert(store)
+        recovered = check_git_worktree_health(None, store, git)
+
+    assert initial.dispatch_halted is True
+    assert still_red.dispatch_halted is True
+    assert persisted_red is not None
+
+    still_red_state = still_red.state
+    assert still_red_state.dispatch_halted is True
+    assert len(still_red_state.metadata_findings) == 1
+    assert still_red_state.probe_returncode == 0
+    assert persisted_red == still_red_state
+
+    recovered_state = recovered.state
+    assert recovered.dispatch_halted is False
+    assert recovered_state.dispatch_halted is False
+    assert recovered_state.metadata_findings == ()
+    assert recovered_state.suspected_container_path_marker is None
+    assert current_git_health_alert(store) is None
+
+
 @pytest.mark.parametrize("control_flow_error", [KeyboardInterrupt(), SystemExit(2)])
 def test_probe_worktree_list_control_flow_exceptions_propagate(tmp_path, control_flow_error) -> None:
     setup_config(tmp_path)
