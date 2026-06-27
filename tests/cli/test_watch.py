@@ -21,7 +21,11 @@ from rich.console import Console
 import gza.cli.watch as watch_module
 import gza.colors as colors
 import gza.recovery_engine as recovery_engine
-from gza.advance_engine import classify_advance_action, failed_recovery_decision_to_action
+from gza.advance_engine import (
+    NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    classify_advance_action,
+    failed_recovery_decision_to_action,
+)
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
@@ -75,6 +79,14 @@ from gza.cli.watch import (
     cmd_watch,
 )
 from gza.concurrency import MaxConcurrentTasksError
+from gza.cli.advance_engine import (
+    PARK_REASON_IMPROVE_NO_OP,
+    PARK_REASON_RETRY_LIMIT_REACHED,
+    PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
+    PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
+    PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
+    WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS,
+)
 from gza.config import Config
 from gza.db import Task, Task as DbTask, WatchProgressObservation, WatchRecoveryBackoff
 from gza.dispatch_preview import (
@@ -1757,7 +1769,7 @@ def test_watch_cycle_default_watch_emits_owner_attention_for_manual_failed_recov
     assert emitted_owner_ids == expected_owner_ids == {owner.id}
     assert f"{owner.id} implement" in text
     assert f"failed leaf {failed_rebase.id}" in text
-    assert "Needs attention (1 task):" in text
+    assert "Needs attention (2 tasks):" in text
 
 
 def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_descendant(
@@ -1798,10 +1810,8 @@ def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_de
     assert result.work_done is False
     attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
     assert len(attention_lines) == 2
-    assert any("reason=owner-needs-attention" in line and impl.id in line for line in attention_lines)
-    assert any(
-        "reason=manual-failure-reason" in line and f"failed leaf {failed_rebase.id}" in line for line in attention_lines
-    )
+    assert any("reason=rebase-failed-needs-manual-resolution" in line and impl.id in line for line in attention_lines)
+    assert any("reason=manual-failure-reason" in line and f"failed leaf {failed_rebase.id}" in line for line in attention_lines)
 
 
 def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(tmp_path: Path) -> None:
@@ -4313,6 +4323,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         assert review_task.id is not None
         review_task.status = "completed"
         review_task.completed_at = datetime.now(UTC)
+        review_task.output_content = "**Verdict: CHANGES_REQUESTED**"
         store.update(review_task)
 
     rebase_task = None
@@ -5627,6 +5638,8 @@ def test_watch_cycle_dry_run_logs_only_merge_unit_owner(tmp_path: Path) -> None:
         task.branch = "feature/watch-dry-run-merge-unit"
         task.has_commits = True
         store.update(task)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
 
     unit = store.create_merge_unit(
         source_branch="feature/watch-dry-run-merge-unit",
@@ -10099,8 +10112,8 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert spawn_iterate.call_args.args[2].id == impl.id
 
 
-def test_watch_cycle_improve_action_with_disabled_auto_recovery_routes_to_iterate(tmp_path: Path) -> None:
-    """Watch should hand failed-improve recovery state to iterate instead of stopping locally."""
+def test_watch_cycle_improve_action_with_disabled_auto_recovery_parks_once(tmp_path: Path) -> None:
+    """Watch should surface terminal improve recovery state instead of respawning iterate."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -10161,12 +10174,11 @@ def test_watch_cycle_improve_action_with_disabled_auto_recovery_routes_to_iterat
             log=log,
             max_recovery_attempts=0,
         )
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
     log_text = log_path.read_text()
-    assert "ATTENTION" not in log_text
-    assert f"{impl.id} iterate" in log_text
+    assert "ATTENTION" in log_text
+    assert "reason=automatic-recovery-disabled" in log_text
 
 
 def test_watch_cycle_failed_improve_dry_run_routes_through_iterate(
@@ -10270,6 +10282,7 @@ def test_watch_cycle_improve_action_routes_to_iterate_without_creating_local_chi
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -10321,6 +10334,7 @@ def test_watch_cycle_improve_action_routes_failed_chain_to_iterate(tmp_path: Pat
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(
@@ -10389,6 +10403,7 @@ def test_watch_cycle_improve_action_with_manual_review_failure_routes_to_iterate
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(
@@ -10457,6 +10472,7 @@ def test_watch_cycle_attempt_capped_improve_chain_stays_parked_without_iterate_r
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -10532,6 +10548,7 @@ def test_watch_cycle_runs_pending_improve_even_when_failed_chain_is_parked(tmp_p
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -11607,6 +11624,223 @@ def test_watch_cycle_skips_parked_retry_limit_lineage_without_recomputing_or_spa
     assert not any(line.split(maxsplit=2)[1] == "START" for line in log_text.splitlines())
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        PARK_REASON_IMPROVE_NO_OP,
+        PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
+        PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
+        PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
+        PARK_REASON_RETRY_LIMIT_REACHED,
+    ],
+)
+def test_watch_parked_lineage_action_uses_shared_taxonomy(reason: str) -> None:
+    owner = Task(id="testproject-1", prompt="Owner", task_type="implement")
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={
+            "type": "needs_discussion",
+            "description": "SKIP: parked",
+            "needs_attention_reason": reason,
+        },
+        next_action_reason="test",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner,
+    )
+
+    assert watch_module._watch_parked_lineage_action(row) == row.next_action
+
+
+def test_watch_shared_parked_reason_taxonomy_covers_noop_and_recovery_parks() -> None:
+    assert PARK_REASON_IMPROVE_NO_OP in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+    assert PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+    assert PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+    assert PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+    assert PARK_REASON_RETRY_LIMIT_REACHED in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+
+
+def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_respawning_iterate(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/verify-noop-branch-tip-attention"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, review),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test",
+        unresolved_tasks=(review,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=review,
+    )
+    attention_action = {
+        "type": "needs_discussion",
+        "description": "SKIP: verify-only no-op improve could not resolve current branch tip; needs manual discussion",
+        "needs_attention_reason": PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
+        "subject_task_id": impl.id,
+    }
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.determine_next_action", return_value=attention_action),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("parked verify-noop lineage should not spawn iterate"),
+        ) as spawn_iterate,
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert first.work_done is False
+    assert second.work_done is False
+    assert spawn_iterate.call_count == 0
+
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert text.count("Needs attention (1 task):") == 1
+    assert text.count("1 task still need attention (unchanged)") == 1
+    assert f"reason={PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE}" in text
+    assert str(impl.id) in text
+    assert "START" not in text
+
+
+def test_watch_cycle_does_not_rerun_verify_only_noop_recovery_after_parked_attention(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/verify-noop-recovery-loop-stop"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, review),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test",
+        unresolved_tasks=(review,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+    )
+    recover_action = {
+        "type": "recover_verify_only_noop_review",
+        "description": "Fresh verify on current tip for verify-only no-op improve recovery",
+        "review_task": review,
+        "latest_noop_improve_task": review,
+        "current_branch_head_sha": "same-head",
+        "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    }
+    parked_action = {
+        "type": "needs_discussion",
+        "description": (
+            "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
+            "manual attention is required."
+        ),
+        "needs_attention_reason": PARK_REASON_IMPROVE_NO_OP,
+        "subject_task_id": impl.id,
+        "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    }
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            side_effect=[recover_action, parked_action, parked_action],
+        ),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="recover_verify_only_noop_review",
+                status="skip",
+                message=parked_action["description"],
+                attention_type="needs_discussion",
+                attention_reason=PARK_REASON_IMPROVE_NO_OP,
+                noop_improve_kind=NOOP_IMPROVE_KIND_VERIFY_ONLY,
+            ),
+        ) as execute_action,
+    ):
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+        _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
+
+    assert execute_action.call_count == 1
+    text = log_path.read_text()
+    assert text.count("ATTENTION") == 1
+    assert "1 task still need attention (unchanged)" in text
+
+
 def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spawning_rebase(
     tmp_path: Path,
 ) -> None:
@@ -12163,6 +12397,7 @@ def test_watch_cycle_materialize_plan_slices_success_does_not_wait_for_dispatch_
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     row = LineageOwnerRow(
@@ -12595,6 +12830,7 @@ def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -12654,6 +12890,7 @@ def test_watch_cycle_failed_iterate_launch_does_not_park_without_execution(tmp_p
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -12715,6 +12952,7 @@ def test_clear_watch_progress_subject_clears_persisted_observation_for_subject(t
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     candidate = build_watch_progress_candidate(
@@ -16068,6 +16306,7 @@ def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_pat
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     config = Config.load(tmp_path)
@@ -16276,6 +16515,7 @@ def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     action = {"type": "improve", "review_task": review}
@@ -23163,6 +23403,7 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     improve = store.add(
@@ -23229,6 +23470,7 @@ def test_watch_cycle_run_improve_routes_retry_chain_through_root_impl_iterate(tm
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
     store.update(review)
 
     failed_improve = store.add(

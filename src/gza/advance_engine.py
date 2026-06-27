@@ -56,6 +56,12 @@ from gza.recovery_engine import (
 )
 from gza.recovery_read_context import RecoveryReadContext
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
+from gza.review_clearance import (
+    REVIEW_CLEARANCE_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+    is_verify_only_noop_review_clearance_status,
+)
 from gza.review_tasks import (
     build_review_blocker_dispute_metadata,
     find_existing_review_blocker_adjudication_task,
@@ -95,12 +101,60 @@ from gza.source_followup import (
 )
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
+PARK_REASON_IMPROVE_NO_OP = "improve-no-op"
+PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE = "verify-noop-improve-branch-tip-unavailable"
+PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE = "verify-noop-improve-diff-probe-unavailable"
+PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES = "verify-blocked-no-code-issues"
+PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED = "review-blocker-adjudication-needed"
+PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS = "duplicate-blocker-no-progress"
+PARK_REASON_REVIEW_MAX_CYCLES_REACHED = "review-max-cycles-reached"
+PARK_REASON_RETRY_LIMIT_REACHED = "retry-limit-reached"
+PARK_REASON_RETRYABLE_PROVIDER_ERROR = "retryable-provider-error"
+
+WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
+    {
+        "automatic-recovery-disabled",
+        "branch-already-rebased-lineage-incomplete",
+        "closing-review-failed-max-retries",
+        "closing-review-needs-manual-refresh",
+        PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS,
+        "explore-needs-follow-up-decision",
+        PARK_REASON_IMPROVE_NO_OP,
+        "merge-source-needs-manual-resolution",
+        "plan-review-invalid-slices",
+        "plan-review-materialization-repair-needed",
+        "plan-review-max-cycles-reached",
+        "plan-review-needs-manual-creation",
+        "plan-review-repeatedly-failed",
+        "project-scope-unverified",
+        "project-scope-violation",
+        "rebase-failed-needs-manual-resolution",
+        "rebase-failure-circuit-breaker",
+        "rebase-target-missing-merge-unit",
+        "rebase-did-not-unblock-merge",
+        "recovery-ambiguous",
+        PARK_REASON_RETRYABLE_PROVIDER_ERROR,
+        PARK_REASON_RETRY_LIMIT_REACHED,
+        PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED,
+        PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
+        "review-freshness-unverified",
+        "review-needs-manual-creation",
+        "review-verdict-needs-manual-attention",
+        "stale-review-needs-manual-refresh",
+        PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
+        PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
+        PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
+    }
+)
+
+NOOP_IMPROVE_KIND_VERIFY_ONLY = "verify_only"
+NOOP_IMPROVE_KIND_REAL_BLOCKER = "real_blocker"
 FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
     {
-        "review-max-cycles-reached",
+        PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
         "automatic-recovery-disabled",
-        "retry-limit-reached",
-        "retryable-provider-error",
+        PARK_REASON_RETRY_LIMIT_REACHED,
+        PARK_REASON_RETRYABLE_PROVIDER_ERROR,
     }
 )
 FAILED_RECOVERY_FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
@@ -138,8 +192,9 @@ WORKER_CONSUMING_ACTIONS = frozenset(
 MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
 VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
 _LOG = logging.getLogger(__name__)
-REVIEW_CLEARANCE_ARTIFACT_KIND = "review_clearance"
 VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND = "verify_command_output"
+VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND = "verify_only_noop_recovery_attention"
+VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS = "parked"
 
 
 @dataclass(frozen=True)
@@ -313,6 +368,7 @@ class AdvanceContext:
     consecutive_noop_improves: int = 0
     noop_improve_trigger: str | None = None
     noop_improve_verify_probe_warning: str | None = None
+    noop_improve_verify_recovery_attention_message: str | None = None
     review_blocker_resolution_statuses: tuple[ReviewBlockerResolutionStatus, ...] = ()
     review_blockers_invalidated: bool = False
     review_blockers_revalidated: bool = False
@@ -831,6 +887,12 @@ def _latest_review_is_verify_blocked_only(ctx: AdvanceContext) -> bool:
     )
 
 
+def _noop_improve_kind(ctx: AdvanceContext) -> str:
+    if _latest_review_is_verify_blocked_only(ctx):
+        return NOOP_IMPROVE_KIND_VERIFY_ONLY
+    return NOOP_IMPROVE_KIND_REAL_BLOCKER
+
+
 def _resolve_branch_head_sha(git: Any, branch: str | None) -> BranchHeadResolution:
     if not branch:
         return BranchHeadResolution(head_sha=None)
@@ -858,7 +920,7 @@ def _task_has_current_failed_review_verify_evidence(
     current_branch: str | None,
     current_head_sha: str | None,
 ) -> bool:
-    if task.review_verify_status != "failed":
+    if task.review_verify_status not in {"failed", "unavailable"}:
         return False
     if task.review_verify_captured_at is None:
         return False
@@ -1287,20 +1349,22 @@ def _resolve_noop_improve_verify_clearance(
         current_branch=task.branch,
         current_head_sha=current_head_sha,
     ):
-        clearance_time = (
-            latest_completed_noop_improve.review_verify_captured_at
-            or latest_completed_noop_improve.completed_at
-            or latest_completed_noop_improve.started_at
+        matching_clearance = _latest_matching_verify_only_noop_review_clearance(
+            store=store,
+            task=task,
+            latest_completed_review=latest_completed_review,
+            current_head_sha=current_head_sha,
         )
-        if not persist:
-            return True, clearance_time, None, (), ()
-
-        store.clear_review_state(task.id)
-        persisted_task = store.get(task.id)
-        if persisted_task is None or persisted_task.review_cleared_at is None:
+        if matching_clearance is not None:
+            return True, matching_clearance.created_at, None, (), ()
+        if _latest_matching_verify_only_noop_recovery_attention(
+            store=store,
+            noop_improve_task=latest_completed_noop_improve,
+            latest_completed_review=latest_completed_review,
+            current_head_sha=current_head_sha,
+        ) is not None:
             return False, None, None, (), ()
-        task.review_cleared_at = persisted_task.review_cleared_at
-        return True, persisted_task.review_cleared_at, None, (), ()
+        return False, None, None, (), ()
 
     (
         cleared_off_topic,
@@ -1329,6 +1393,154 @@ def _resolve_noop_improve_verify_clearance(
             reused_investigation_task_ids,
         )
     return False, None, clearance_warning, (), ()
+
+
+def _latest_matching_verify_only_noop_review_clearance(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    latest_completed_review: DbTask | None,
+    current_head_sha: str | None,
+) -> TaskArtifact | None:
+    """Return the latest structured verify-only clearance for this review/head."""
+    if task.id is None or latest_completed_review is None or latest_completed_review.id is None:
+        return None
+    if not current_head_sha:
+        return None
+    for artifact in store.list_artifacts(task.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if not is_verify_only_noop_review_clearance_status(artifact.status):
+            continue
+        if artifact.head_sha != current_head_sha:
+            continue
+        if metadata is None:
+            continue
+        if metadata.get("review_task_id") != latest_completed_review.id:
+            continue
+        is_verify_only_noop_clearance = (
+            metadata.get("clearance_kind") == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND
+            and metadata.get("clearance_status") == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
+            and metadata.get("reviewed_head_sha") == current_head_sha
+        )
+        is_off_topic_verify_clearance = metadata.get("reason") == "off_topic_verify_failure"
+        if not is_verify_only_noop_clearance and not is_off_topic_verify_clearance:
+            continue
+        if (
+            latest_completed_review.completed_at is not None
+            and artifact.created_at < latest_completed_review.completed_at
+        ):
+            continue
+        return artifact
+    return None
+
+
+def _latest_matching_verify_only_noop_recovery_attention(
+    *,
+    store: SqliteTaskStore,
+    noop_improve_task: DbTask | None,
+    latest_completed_review: DbTask | None,
+    current_head_sha: str | None,
+) -> TaskArtifact | None:
+    """Return the latest persisted verify-only recovery park for this review/head."""
+    if (
+        noop_improve_task is None
+        or noop_improve_task.id is None
+        or latest_completed_review is None
+        or latest_completed_review.id is None
+        or not current_head_sha
+    ):
+        return None
+    for artifact in store.list_artifacts(
+        noop_improve_task.id,
+        kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
+    ):
+        metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+        if artifact.status != VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS:
+            continue
+        if artifact.head_sha != current_head_sha or metadata is None:
+            continue
+        if metadata.get("review_task_id") != latest_completed_review.id:
+            continue
+        if metadata.get("noop_improve_kind") != NOOP_IMPROVE_KIND_VERIFY_ONLY:
+            continue
+        if metadata.get("reviewed_head_sha") != current_head_sha:
+            continue
+        if metadata.get("attention_reason") != PARK_REASON_IMPROVE_NO_OP:
+            continue
+        if (
+            latest_completed_review.completed_at is not None
+            and artifact.created_at < latest_completed_review.completed_at
+        ):
+            continue
+        return artifact
+    return None
+
+
+def _resolve_noop_improve_verify_recovery_attention_message(
+    *,
+    store: SqliteTaskStore,
+    project_dir: Path,
+    task: DbTask,
+    latest_completed_review: DbTask | None,
+    latest_completed_noop_improve: DbTask | None,
+    current_head_sha: str | None,
+) -> str | None:
+    """Return durable parked messaging for failed verify-only no-op recovery attempts."""
+    if (
+        latest_completed_review is None
+        or latest_completed_noop_improve is None
+        or task.branch is None
+        or not current_head_sha
+        or not _review_is_verify_only_blocked_at_head(
+            project_dir=project_dir,
+            review_task=latest_completed_review,
+            current_branch=task.branch,
+            current_head_sha=current_head_sha,
+        )
+    ):
+        return None
+    persisted_attention = _latest_matching_verify_only_noop_recovery_attention(
+        store=store,
+        noop_improve_task=latest_completed_noop_improve,
+        latest_completed_review=latest_completed_review,
+        current_head_sha=current_head_sha,
+    )
+    if persisted_attention is not None:
+        metadata = persisted_attention.metadata if isinstance(persisted_attention.metadata, dict) else None
+        message = metadata.get("message") if metadata is not None else None
+        if isinstance(message, str) and message.strip():
+            return message
+        return (
+            "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
+            "manual attention is required."
+        )
+    if _task_has_current_failed_review_verify_evidence(
+        task=latest_completed_noop_improve,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha,
+    ):
+        return (
+            "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
+            "manual attention is required."
+        )
+    if _task_has_current_passing_review_verify_evidence(
+        task=latest_completed_noop_improve,
+        review_task=latest_completed_review,
+        current_branch=task.branch,
+        current_head_sha=current_head_sha,
+    ) and _latest_matching_verify_only_noop_review_clearance(
+        store=store,
+        task=task,
+        latest_completed_review=latest_completed_review,
+        current_head_sha=current_head_sha,
+    ) is None:
+        return (
+            "SKIP: verify-only no-op recovery has current passing verify evidence for this tip, "
+            "but the required structured review_clearance is missing. "
+            "Manual attention is required before merge."
+        )
+    return None
 
 
 def _load_persisted_review_verify_result(
@@ -1499,13 +1711,14 @@ def _resolve_off_topic_verify_clearance_candidate(
 
 def _review_has_current_verify_blocker_clearance(
     *,
+    store: SqliteTaskStore,
+    impl_task: DbTask,
     project_dir: Path,
     review_task: DbTask,
     current_branch: str | None,
     current_head_sha: str | None,
-    improve_tasks: list[DbTask],
 ) -> bool:
-    """Return whether runner-owned same-head evidence clears current verify blockers."""
+    """Return whether structured same-head clearance clears current verify blockers."""
     if review_task.review_verify_status != "failed":
         return False
     if not current_branch or review_task.review_verify_branch != current_branch:
@@ -1515,15 +1728,14 @@ def _review_has_current_verify_blocker_clearance(
     blocker_summary = summarize_review_blockers(get_review_content(project_dir, review_task))
     if blocker_summary.verify_failure_count + blocker_summary.verify_timeout_count == 0:
         return False
-    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
     return (
-        latest_completed_noop_improve is not None
-        and _task_has_current_passing_review_verify_evidence(
-            task=latest_completed_noop_improve,
-            review_task=review_task,
-            current_branch=current_branch,
+        _latest_matching_verify_only_noop_review_clearance(
+            store=store,
+            task=impl_task,
+            latest_completed_review=review_task,
             current_head_sha=current_head_sha,
         )
+        is not None
     )
 
 
@@ -1755,11 +1967,12 @@ def _latest_review_blocker_resolution_statuses(
         allow_verify_clearance
         and (
             _review_has_current_verify_blocker_clearance(
+                store=store,
+                impl_task=impl_task,
                 project_dir=project_dir,
                 review_task=review_task,
                 current_branch=impl_task.branch,
                 current_head_sha=current_head_sha,
-                improve_tasks=improve_tasks,
             )
             if current_head_sha is not None
             else False
@@ -2148,6 +2361,28 @@ def _clear_off_topic_verify_blocker_action(ctx: AdvanceContext) -> dict[str, Any
     }
 
 
+def _recover_verify_only_noop_review_description(ctx: AdvanceContext) -> str:
+    latest_noop_id = _task_id(ctx.latest_noop_improve)
+    return (
+        "Fresh verify on current tip for verify-only no-op improve recovery "
+        f"(latest {latest_noop_id})"
+    )
+
+
+def _recover_verify_only_noop_review_action(ctx: AdvanceContext) -> dict[str, Any]:
+    current_branch_head_sha = ctx.current_review_head_sha
+    if current_branch_head_sha is None:
+        current_branch_head_sha = ctx.latest_reviewed_head_sha
+    return {
+        "type": "recover_verify_only_noop_review",
+        "description": _recover_verify_only_noop_review_description(ctx),
+        "review_task": ctx.latest_completed_review,
+        "latest_noop_improve_task": ctx.latest_noop_improve,
+        "current_branch_head_sha": current_branch_head_sha,
+        "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    }
+
+
 def _noop_improve_followup_suffix(ctx: AdvanceContext) -> str:
     if ctx.latest_noop_improve is None or ctx.consecutive_noop_improves <= 0:
         return ""
@@ -2197,8 +2432,9 @@ def _review_blocker_adjudication_needed_action(ctx: AdvanceContext) -> dict[str,
                 f"{task_id} {detail}. Review the dispute evidence and resolve the blocker manually."
             ),
             "review_adjudication_task": adjudication_task,
+            "noop_improve_kind": _noop_improve_kind(ctx),
         },
-        reason="review-blocker-adjudication-needed",
+        reason=PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED,
         subject_task_id=_needs_attention_subject_id(ctx),
     )
 
@@ -2268,8 +2504,9 @@ def _noop_improve_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]
                 f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
                 f"(latest {latest_noop_id}); {source} no tracked diff change."
             ),
+            "noop_improve_kind": _noop_improve_kind(ctx),
         },
-        reason="improve-no-op",
+        reason=PARK_REASON_IMPROVE_NO_OP,
         subject_task_id=_needs_attention_subject_id(ctx),
     )
 
@@ -2283,12 +2520,26 @@ def _noop_improve_verify_probe_failure_action(ctx: AdvanceContext) -> dict[str, 
             "description": (
                 f"SKIP: {ctx.consecutive_noop_improves} consecutive no-op improves reached "
                 f"(latest {latest_noop_id}), but verify-only auto-clear could not be validated "
-                f"because {ctx.noop_improve_verify_probe_warning}. Review remains uncleared until "
-                "lifecycle can revalidate the same-head clearance evidence."
+                f"because {ctx.noop_improve_verify_probe_warning}. manual attention is required. "
+                "Review remains uncleared until lifecycle can revalidate the same-head clearance evidence."
             ),
             "probe_warning": ctx.noop_improve_verify_probe_warning,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
         },
-        reason="improve-no-op",
+        reason=PARK_REASON_IMPROVE_NO_OP,
+        subject_task_id=_needs_attention_subject_id(ctx),
+    )
+
+
+def _noop_improve_verify_recovery_attention_action(ctx: AdvanceContext) -> dict[str, Any]:
+    assert ctx.noop_improve_verify_recovery_attention_message is not None
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": ctx.noop_improve_verify_recovery_attention_message,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+        },
+        reason=PARK_REASON_IMPROVE_NO_OP,
         subject_task_id=_needs_attention_subject_id(ctx),
     )
 
@@ -2303,18 +2554,40 @@ def _verify_blocked_no_code_issues_action(ctx: AdvanceContext) -> dict[str, Any]
                 "Investigate test performance or verify_timeout config."
             ),
             "review_task": ctx.latest_completed_review,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
         },
-        reason="verify-blocked-no-code-issues",
+        reason=PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
         subject_task_id=_needs_attention_subject_id(ctx),
     )
 
 
 def _noop_improve_limit_action(ctx: AdvanceContext) -> dict[str, Any]:
-    """Park a no-op loop unless runner-owned verify evidence has already cleared it."""
+    """Resolve a no-op improve limit using persisted clearance, probe failures, or refresh review."""
     if ctx.noop_improve_verify_probe_warning is not None:
         return _noop_improve_verify_probe_failure_action(ctx)
     if _requires_sibling_review_attention(ctx):
         return _noop_improve_sibling_review_attention_action(ctx)
+    if getattr(ctx, "noop_improve_verify_recovery_attention_message", None) is not None:
+        return _noop_improve_verify_recovery_attention_action(ctx)
+    if (
+        ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.latest_completed_review is not None
+        and ctx.latest_noop_improve is not None
+        and ctx.latest_reviewed_head_sha is not None
+        and ctx.current_review_head_sha is not None
+        and ctx.current_review_head_sha == ctx.latest_reviewed_head_sha
+        and _latest_review_is_verify_blocked_only(ctx)
+        and _task_has_current_passing_review_verify_evidence(
+            task=ctx.latest_noop_improve,
+            review_task=ctx.latest_completed_review,
+            current_branch=ctx.task.branch,
+            current_head_sha=ctx.current_review_head_sha,
+        )
+    ):
+        return {
+            "type": "create_review",
+            "description": "Create review (required before merge)",
+        }
     if (
         ctx.review_verdict == "CHANGES_REQUESTED"
         and len(ctx.recent_verify_timeout_only_reviews) >= VERIFY_BLOCKED_REVIEW_THRESHOLD
@@ -2342,7 +2615,7 @@ def _duplicate_blocker_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
                 "review_task_ids": streak.review_task_ids,
             },
         },
-        reason="duplicate-blocker-no-progress",
+        reason=PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS,
         subject_task_id=ctx.task.id,
     )
 
@@ -3366,6 +3639,7 @@ def _resolve_review_state(
     int,
     str | None,
     str | None,
+    str | None,
     tuple[ReviewBlockerResolutionStatus, ...],
     bool,
     bool,
@@ -3409,6 +3683,7 @@ def _resolve_review_state(
     consecutive_noop_improves = 0
     noop_improve_trigger: str | None = None
     noop_improve_verify_probe_warning: str | None = None
+    noop_improve_verify_recovery_attention_message: str | None = None
     review_blocker_resolution_statuses: tuple[ReviewBlockerResolutionStatus, ...] = ()
     review_blockers_invalidated = False
     review_blockers_revalidated = False
@@ -3459,6 +3734,23 @@ def _resolve_review_state(
             getattr(config, "advance_off_topic_verify_unblock", False)
             and latest_completed_review.review_verify_status == "failed"
         )
+        if review_cleared and review_verdict == "CHANGES_REQUESTED" and latest_review_blocker_summary is not None:
+            current_head_sha: str | None = None
+            if task.branch is not None:
+                current_head_sha = _resolve_branch_head_sha(git, task.branch).head_sha
+            has_matching_verify_clearance = (
+                latest_review_blocker_summary.is_verify_blocked_only
+                and _latest_matching_verify_only_noop_review_clearance(
+                    store=store,
+                    task=task,
+                    latest_completed_review=latest_completed_review,
+                    current_head_sha=current_head_sha,
+                )
+                is not None
+            )
+            if latest_review_blocker_summary.is_verify_blocked_only and not has_matching_verify_clearance:
+                review_cleared = False
+                effective_review_cleared_at = None
         if not review_cleared:
             (
                 review_cleared,
@@ -3476,6 +3768,19 @@ def _resolve_review_state(
                 latest_completed_review=latest_completed_review,
                 improve_tasks=improve_tasks,
                 persist=persist_review_clearance,
+            )
+            branch_head = _resolve_branch_head_sha(git, task.branch)
+            noop_improve_verify_recovery_attention_message = (
+                _resolve_noop_improve_verify_recovery_attention_message(
+                    store=store,
+                    project_dir=Path(config.project_dir),
+                    task=task,
+                    latest_completed_review=latest_completed_review,
+                    latest_completed_noop_improve=_latest_completed_noop_improve(improve_tasks),
+                    current_head_sha=branch_head.head_sha,
+                )
+                if branch_head.warning is None
+                else None
             )
         if not review_cleared and allow_off_topic_lane:
             off_topic_verify_clearance_candidate = _resolve_off_topic_verify_clearance_candidate(
@@ -3609,6 +3914,7 @@ def _resolve_review_state(
         consecutive_noop_improves,
         noop_improve_trigger,
         noop_improve_verify_probe_warning,
+        noop_improve_verify_recovery_attention_message,
         review_blocker_resolution_statuses,
         review_blockers_invalidated,
         review_blockers_revalidated,
@@ -3652,6 +3958,26 @@ def execution_status_allows_merge(ctx: AdvanceContext) -> bool:
     return ctx.task.status in MERGEABLE_EXECUTION_STATUSES
 
 
+def _review_cleared_is_merge_ready(ctx: AdvanceContext) -> bool:
+    if not ctx.review_cleared:
+        return False
+    if getattr(ctx, "review_blockers_invalidated", False):
+        return True
+    if _latest_review_is_verify_blocked_only(ctx):
+        current_head_sha = ctx.current_review_head_sha or ctx.latest_reviewed_head_sha
+        if _latest_matching_verify_only_noop_review_clearance(
+            store=ctx.store,
+            task=ctx.task,
+            latest_completed_review=ctx.latest_completed_review,
+            current_head_sha=current_head_sha,
+        ) is not None:
+            return True
+        return False
+    if ctx.effective_review_cleared_at is not None:
+        return True
+    return False
+
+
 def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     """Return whether current review evidence is fresh enough to allow auto-merge."""
     if not _is_implementation_owned_lineage(ctx):
@@ -3667,7 +3993,7 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     if ctx.current_review_head_probe_warning is not None and ctx.latest_reviewed_head_sha is not None:
         return False
     if ctx.review_cleared:
-        return True
+        return _review_cleared_is_merge_ready(ctx)
     return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
@@ -4257,6 +4583,7 @@ def resolve_advance_context(
         consecutive_noop_improves,
         noop_improve_trigger,
         noop_improve_verify_probe_warning,
+        noop_improve_verify_recovery_attention_message,
         review_blocker_resolution_statuses,
         review_blockers_invalidated,
         review_blockers_revalidated,
@@ -4320,6 +4647,7 @@ def resolve_advance_context(
         consecutive_noop_improves=consecutive_noop_improves,
         noop_improve_trigger=noop_improve_trigger,
         noop_improve_verify_probe_warning=noop_improve_verify_probe_warning,
+        noop_improve_verify_recovery_attention_message=noop_improve_verify_recovery_attention_message,
         review_blocker_resolution_statuses=review_blocker_resolution_statuses,
         review_blockers_invalidated=review_blockers_invalidated,
         review_blockers_revalidated=review_blockers_revalidated,
@@ -5148,6 +5476,31 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="review_recover_verify_only_noop_review",
+        matches=lambda ctx: (not ctx.review_cleared)
+        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles
+        and ctx.active_improve_running is None
+        and ctx.active_improve_pending is None
+        and ctx.latest_completed_review is not None
+        and ctx.latest_completed_review.review_verify_status == "failed"
+        and ctx.latest_noop_improve is not None
+        and ctx.latest_reviewed_head_sha is not None
+        and ctx.current_review_head_sha is not None
+        and ctx.current_review_head_sha == ctx.latest_reviewed_head_sha
+        and _latest_review_is_verify_blocked_only(ctx)
+        and not _task_has_current_passing_review_verify_evidence(
+            task=ctx.latest_noop_improve,
+            review_task=ctx.latest_completed_review,
+            current_branch=ctx.task.branch,
+            current_head_sha=ctx.current_review_head_sha,
+        )
+        and ctx.current_review_head_probe_warning is None
+        and ctx.noop_improve_verify_recovery_attention_message is None
+        and ctx.noop_improve_verify_probe_warning is None,
+        action=_recover_verify_only_noop_review_action,
+    ),
+    AdvanceRule(
         name="review_noop_improve_limit",
         matches=lambda ctx: (not ctx.review_cleared)
         and ctx.review_verdict == "CHANGES_REQUESTED"
@@ -5186,7 +5539,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                     f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
                 ),
             },
-            reason="review-max-cycles-reached",
+            reason=PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
             subject_task_id=ctx.task.id,
         ),
     ),

@@ -2,6 +2,7 @@
 
 import json
 import re
+import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -76,6 +77,13 @@ class OffTopicVerifyClearancePersistenceResult:
 
     created_tasks: tuple[Task, ...]
     reused_tasks: tuple[Task, ...]
+    review_cleared_at: datetime
+
+
+@dataclass(frozen=True)
+class ReviewClearancePersistenceResult:
+    """Persisted structured review-clearance details."""
+
     review_cleared_at: datetime
 
 
@@ -587,6 +595,80 @@ def persist_off_topic_verify_clearance(
         reused_tasks=tuple(reused),
         review_cleared_at=cleared_at,
     )
+
+
+def persist_review_clearance_artifact(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    impl_task: Task,
+    clearance_payload: Mapping[str, Any],
+    created_at: datetime,
+    review_clearance_artifact_kind: str,
+    review_clearance_artifact_label: str,
+    review_clearance_artifact_producer: str,
+    status: str,
+    head_sha: str | None,
+    metadata: dict[str, Any] | None,
+) -> ReviewClearancePersistenceResult:
+    """Persist a structured review-clearance artifact and bind it to the impl row."""
+    if impl_task.id is None:
+        raise OffTopicVerifyPersistenceError("review clearance persistence requires an implementation task id")
+
+    conn = store._connect()
+    prepared_paths: list[Path] = []
+    try:
+        write_conn = cast(sqlite3.Connection, conn)
+        prepared_clearance = prepare_command_output_artifact(
+            Path(config.project_dir),
+            impl_task.id,
+            label=review_clearance_artifact_label,
+            output=json.dumps(clearance_payload, indent=2, sort_keys=True),
+            created_at=created_at,
+        )
+        prepared_paths.append(prepared_clearance.absolute_path)
+        store._set_review_cleared_at_conn(write_conn, impl_task.id, created_at)
+        store._add_artifact_conn(
+            write_conn,
+            impl_task.id,
+            kind=review_clearance_artifact_kind,
+            producer=review_clearance_artifact_producer,
+            label=review_clearance_artifact_label,
+            path=prepared_clearance.path,
+            content_type="application/json; charset=utf-8",
+            byte_size=prepared_clearance.bytes,
+            sha256=prepared_clearance.digest,
+            created_at=created_at,
+            status=status,
+            head_sha=head_sha,
+            metadata=metadata,
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        for prepared_path in reversed(prepared_paths):
+            try:
+                if prepared_path.exists():
+                    prepared_path.unlink()
+                parent = prepared_path.parent
+                while parent.name and parent.exists() and parent != Path(config.project_dir):
+                    if any(parent.iterdir()):
+                        break
+                    parent.rmdir()
+                    parent = parent.parent
+            except Exception:
+                continue
+        raise OffTopicVerifyPersistenceError(
+            f"review clearance persistence failed: {exc}"
+        ) from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    impl_task.review_cleared_at = created_at
+    return ReviewClearancePersistenceResult(review_cleared_at=created_at)
 
 
 def build_followup_prompt(

@@ -255,11 +255,26 @@ When a current review exists for the implementation lineage:
   blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when
   the current review row already carries runner-owned review-time failure evidence for
   the same branch/head. A preserved rebase MAY carry that key forward to the new head
-  only when the diff-preservation proof succeeds. Reviewer wording MAY corroborate the
+  only when the diff-preservation proof succeeds. When lifecycle records the resulting
+  clear, the durable clearance metadata MUST be bound to that exact reviewed head SHA;
+  a generic review-cleared timestamp alone MUST NOT authorize merge of a later tip.
+  Reviewer wording MAY corroborate the
   situation, but lifecycle MUST first conservatively classify the blocker set as
   verify-only before same-head runner-owned evidence can clear it; prose alone MUST NOT
-  decide stale/non-stale provenance. The engine MUST NOT run a separate isolated
-  detached-worktree verify solely to clear this condition.
+  decide stale/non-stale provenance. When no current same-head green verify evidence is
+  already recorded, lifecycle MAY run one bounded fresh verify in an isolated worktree
+  for the current evaluated head; that execution path MUST fail closed on head drift,
+  MUST persist the resulting verify evidence on the no-op improve task, and MUST record
+  SHA-bound clearance metadata before the next merge decision can treat the review as
+  cleared. If same-head passing verify evidence exists for the current tip but the
+  matching structured `review_clearance` record is missing, lifecycle MUST fail closed
+  and park the lineage as `needs_discussion` with reason `improve-no-op`; it MUST NOT
+  fall back to creating another review from that residue state. If that bounded fresh
+  verify instead fails, is unavailable, or ends in any other fail-closed
+  manual-attention outcome for that same reviewed head, lifecycle MUST persist a durable
+  parked marker and, on the next evaluation, MUST park the lineage as
+  `needs_discussion` with reason `improve-no-op` instead of selecting the same recovery
+  verify action again.
 - **A2. Off-topic verify unblock contract.** When rule A does not clear a verify-only
   review blocker because the later no-op-improve-side verify is still red, lifecycle MAY
   consult [off-topic-verify-failures.md](off-topic-verify-failures.md) only if the latest
@@ -303,9 +318,10 @@ When a current review exists for the implementation lineage:
   no-op park applies only after ruling out rule B adjudication-eligible disputed
   non-verify CODE blockers. If current passing in-improve evidence has already cleared
   the review, normal merge rules apply before the no-op limit can park. Otherwise, if
-  `verify_command` still fails, the evidence is absent, stale, or recorded at a
-  different branch/head, or the blocker is not verify-only, the no-op improve limit
-  MUST park rather than auto-clear. If lifecycle cannot resolve the current branch head
+  `verify_command` still fails, the evidence is absent, stale, lacks the required
+  structured `review_clearance`, or is recorded at a different branch/head, or the
+  blocker is not verify-only, the no-op improve limit MUST park rather than auto-clear.
+  If lifecycle cannot resolve the current branch head
   while checking that provenance, it MUST still fail closed but surface that probe
   failure in the parked result instead of silently degrading to a generic no-op loop.
   When the review-time runner verify PASSED, or no runner-owned review verify exists,

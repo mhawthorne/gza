@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,20 +11,27 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.cli._common import _create_retry_task, _materialize_plan_review_slices, resolve_improve_action
+from gza.advance_engine import (
+    NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    REVIEW_CLEARANCE_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+)
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
+from gza.cli._common import _create_retry_task, _materialize_plan_review_slices, resolve_improve_action
 from gza.cli.advance_executor import (
+    _WORKER_ACTIONS,
+    ITERATE_ROUTABLE_ACTIONS,
     AdvanceActionExecutionContext,
     AdvanceActionExecutionResult,
     BranchDivergenceReconcileResult,
-    ITERATE_ROUTABLE_ACTIONS,
-    _WORKER_ACTIONS,
     build_improve_needs_attention_result,
     execute_advance_action,
     resolve_execution_needs_attention,
 )
-from gza.config import Config
 from gza.concurrency import launch_permit
+from gza.config import Config
 from gza.db import Task as DbTask
 from gza.flaky_investigations import (
     FlakyInvestigationEvidence,
@@ -33,15 +39,17 @@ from gza.flaky_investigations import (
     normalize_flaky_investigation_dedup_key,
 )
 from gza.off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
+from gza.pickup import count_worker_consuming_actions, is_worker_consuming_advance_action
 from gza.plan_review_materialization import (
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
     build_plan_review_slice_task_specs,
     plan_review_manifest_digest,
 )
-from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.plan_review_verdict import validate_plan_review_manifest
-from gza.pickup import count_worker_consuming_actions, is_worker_consuming_advance_action
+from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
+from gza.review_tasks import OffTopicVerifyPersistenceError
 from gza.review_verdict import ReviewFinding
+from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
 
 from .conftest import make_store, setup_config
 
@@ -345,6 +353,28 @@ def _off_topic_clearance_candidate(review: DbTask, impl: DbTask, *, working_dire
     )
 
 
+class _VerifyOnlyNoopGit:
+    def __init__(self, branch: str, head_sha: str):
+        self.branch = branch
+        self.head_sha = head_sha
+        self.worktree_add_calls: list[tuple[Path, str, bool]] = []
+        self.worktree_remove_calls: list[tuple[Path, bool]] = []
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref in {self.branch, "HEAD"}:
+            return self.head_sha
+        return None
+
+    def worktree_add_existing(self, path: Path, ref: str, *, detach: bool = False) -> Path:
+        self.worktree_add_calls.append((path, ref, detach))
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def worktree_remove(self, path: Path, force: bool = False):
+        self.worktree_remove_calls.append((path, force))
+        return SimpleNamespace(returncode=0)
+
+
 def test_clear_off_topic_verify_blocker_creates_investigation_and_clears_review(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -555,6 +585,634 @@ def test_clear_off_topic_verify_blocker_fails_closed_when_evidence_cannot_build_
     assert "cannot produce a bounded targeted pytest command" in result.message
     assert refreshed is not None
     assert refreshed.review_cleared_at is None
+
+
+def test_recover_verify_only_noop_review_persists_clearance_without_creating_review(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-recovery")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = (
+        "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure\n"
+        "Evidence: verify_command failed.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify.\n"
+        "Required tests: rerun verify.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("prepare_create_review should not run"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=lambda path: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.cli.advance_executor._run_review_verify_command",
+            return_value=_make_review_verify_result(
+                "uv run pytest tests/unit -q",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-sha",
+                working_directory=str(tmp_path),
+            ),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    refreshed_impl = store.get(impl.id)
+    refreshed_improve = store.get(improve.id)
+    artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
+
+    assert result.status == "success"
+    assert result.success_message.startswith("Fresh verify passed")
+    assert refreshed_impl is not None
+    assert refreshed_impl.review_cleared_at is not None
+    assert refreshed_improve is not None
+    assert refreshed_improve.review_verify_status == "passed"
+    assert artifacts
+    assert artifacts[0].metadata is not None
+    assert artifacts[0].metadata["clearance_kind"] == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND
+    assert artifacts[0].metadata["review_task_id"] == review.id
+
+
+def test_recover_verify_only_noop_review_failed_verify_returns_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-red")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=lambda path: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.cli.advance_executor._run_review_verify_command",
+            return_value=_make_review_verify_result(
+                "uv run pytest tests/unit -q",
+                status="failed",
+                exit_status="1",
+                captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-sha",
+                working_directory=str(tmp_path),
+                failure="tests failed",
+            ),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "improve-no-op"
+    assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert store.get(impl.id).review_cleared_at is None
+    parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
+    assert len(parked) == 1
+    assert parked[0].status == VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS
+    assert parked[0].metadata["review_task_id"] == review.id
+
+
+def test_recover_verify_only_noop_review_head_mismatch_fails_closed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-head-mismatch")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "new-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={
+            "type": "recover_verify_only_noop_review",
+            "review_task": review,
+            "latest_noop_improve_task": improve,
+            "current_branch_head_sha": "same-head",
+        },
+        context=context,
+    )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "improve-no-op"
+    assert store.get(impl.id).review_cleared_at is None
+    parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
+    assert len(parked) == 1
+    assert parked[0].metadata["outcome_kind"] == "head_drift_before_verify"
+
+
+def test_recover_verify_only_noop_review_setup_failure_returns_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-setup-failure")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with patch.object(git, "worktree_add_existing", side_effect=RuntimeError("boom during add")):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "improve-no-op"
+    assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "Setup failure: boom during add" in result.message
+    assert store.get(impl.id).review_cleared_at is None
+    parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
+    assert len(parked) == 1
+    assert parked[0].metadata["outcome_kind"] == "setup_failure"
+
+
+def test_recover_verify_only_noop_review_cleanup_failure_returns_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-cleanup-failure")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=lambda path: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.cli.advance_executor._run_review_verify_command",
+            return_value=_make_review_verify_result(
+                "uv run pytest tests/unit -q",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-sha",
+                working_directory=str(tmp_path),
+            ),
+        ),
+        patch.object(git, "worktree_remove", side_effect=RuntimeError("cleanup exploded")),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    refreshed_improve = store.get(improve.id)
+    artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
+
+    assert result.status == "skip"
+    assert result.attention_reason == "improve-no-op"
+    assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "Cleanup failure: worktree removal failed: cleanup exploded" in result.message
+    assert store.get(impl.id).review_cleared_at is None
+    assert refreshed_improve is not None
+    assert refreshed_improve.review_verify_status == "passed"
+    assert artifacts == []
+    parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
+    assert len(parked) == 1
+    assert parked[0].metadata["outcome_kind"] == "cleanup_failure"
+
+
+def test_recover_verify_only_noop_review_cross_project_cleanup_failure_returns_attention(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-cross-project-cleanup-failure")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    improve.tags = (CROSS_PROJECT_TAG,)
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch(
+            "gza.cli.advance_executor.Git",
+            side_effect=lambda path: SimpleNamespace(
+                repo_dir=Path(path),
+                default_branch=lambda: "main",
+                rev_parse_if_exists=lambda ref: "same-head",
+            ),
+        ),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch("gza.cli.advance_executor._run_review_verify_commands_for_projects", return_value=None),
+        patch.object(git, "worktree_remove", side_effect=RuntimeError("cleanup exploded")),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "improve-no-op"
+    assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "Cleanup failure: worktree removal failed: cleanup exploded" in result.message
+    parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
+    assert len(parked) == 1
+    assert parked[0].metadata["outcome_kind"] == "cleanup_failure"
+
+
+def test_recover_verify_only_noop_review_clearance_persistence_failure_returns_structured_error(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-clearance-failure")
+    store.update(impl)
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+
+    improve = store.add(
+        "Improve attempt",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="advance",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch(
+            "gza.cli.advance_executor.Git",
+            side_effect=lambda path: SimpleNamespace(
+                repo_dir=Path(path),
+                default_branch=lambda: "main",
+                rev_parse_if_exists=lambda ref: "same-head",
+            ),
+        ),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.cli.advance_executor._run_review_verify_command",
+            return_value=_make_review_verify_result(
+                "uv run pytest tests/unit -q",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-sha",
+                working_directory=str(tmp_path),
+            ),
+        ),
+        patch(
+            "gza.cli.advance_executor._persist_verify_only_noop_clearance",
+            side_effect=OffTopicVerifyPersistenceError("review clearance persistence failed: disk full"),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    refreshed_impl = store.get(impl.id)
+    refreshed_improve = store.get(improve.id)
+    clearance_artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
+    verify_artifacts = store.list_artifacts(improve.id, kind="verify_command_output")
+
+    assert result.status == "error"
+    assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert result.message == (
+        "failed to persist verify-only no-op clearance: "
+        "review clearance persistence failed: disk full"
+    )
+    assert refreshed_impl is not None
+    assert refreshed_impl.review_cleared_at is None
+    assert refreshed_improve is not None
+    assert refreshed_improve.review_verify_status == "passed"
+    assert clearance_artifacts == []
+    assert len(verify_artifacts) == 1
+    parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
+    assert len(parked) == 1
+    assert parked[0].metadata["outcome_kind"] == "clearance_persistence_failure"
+    assert "structured review_clearance could not be persisted" in parked[0].metadata["message"]
 
 
 def test_materialize_plan_review_slices_includes_slice_prompt_and_provenance(tmp_path: Path) -> None:

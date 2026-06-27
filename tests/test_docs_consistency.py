@@ -401,8 +401,8 @@ def test_practices_document_verify_timeout_diagnostics_recipe() -> None:
         assert snippet in practices_content
 
 
-def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() -> None:
-    """Tracked lifecycle docs/spec should not describe the removed detached no-op reverify path."""
+def test_noop_verify_docs_and_spec_describe_bounded_isolated_reverify_contract() -> None:
+    """Tracked lifecycle docs/spec should describe the current bounded isolated reverify contract."""
     repo_root = Path(__file__).resolve().parents[1]
     tracked_docs = {
         "advance_workflow": (repo_root / "docs" / "internal" / "advance-workflow.md").read_text(),
@@ -415,9 +415,9 @@ def test_noop_verify_removal_docs_and_spec_do_not_advertise_detached_reverify() 
     }
 
     required_snippets = [
-        "lifecycle no longer launches a detached fallback verify pass",
-        "The engine MUST NOT run a separate isolated detached-worktree verify solely to clear",
-        "runner-owned passing verify evidence has already cleared the review",
+        "lifecycle MAY run one bounded fresh verify in an isolated worktree for the current evaluated head",
+        "that execution path MUST fail closed on head drift",
+        "MUST record SHA-bound clearance metadata before the next merge decision can treat the review as cleared",
     ]
     for snippet in required_snippets:
         assert any(snippet in content for content in normalized_docs.values())

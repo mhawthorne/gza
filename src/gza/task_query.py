@@ -201,6 +201,7 @@ _TASK_DEFAULT_FIELDS: tuple[str, ...] = (
 
 _LINEAGE_DEFAULT_FIELDS: tuple[str, ...] = (
     *_TASK_DEFAULT_FIELDS,
+    "next_action_noop_improve_kind",
     "member_ids",
     "unresolved_ids",
 )
@@ -860,6 +861,7 @@ class TaskQueryService:
             "next_action": None,
             "next_action_reason": None,
             "next_action_owner_id": None,
+            "next_action_noop_improve_kind": None,
             "trigger_source": task.trigger_source,
             "blocked": blocked,
             "blocking_id": blocking_id,
@@ -891,6 +893,7 @@ class TaskQueryService:
         next_action_type: str | None = None
         next_action_reason: str | None = None
         next_action_owner_id: str | None = None
+        next_action_noop_improve_kind: str | None = None
 
         if query.projection.preset == TaskProjectionPreset.INCOMPLETE_SUMMARY:
             empty_prereq_reason = blocked_by_empty_prereq_label(self._store, owner)
@@ -914,6 +917,10 @@ class TaskQueryService:
                 next_action_type = str(action_type_value) if action_type_value is not None else None
                 next_action_reason = str(action_reason_value) if action_reason_value is not None else None
                 next_action_owner_id = owner.id
+                noop_kind_value = action.get("noop_improve_kind") if action else None
+                next_action_noop_improve_kind = (
+                    str(noop_kind_value) if isinstance(noop_kind_value, str) and noop_kind_value else None
+                )
                 if action and _action_is_needs_attention(action):
                     from gza.advance_engine import resolve_subject_task
 
@@ -944,6 +951,7 @@ class TaskQueryService:
             "next_action": next_action_type,
             "next_action_reason": next_action_reason,
             "next_action_owner_id": next_action_owner_id,
+            "next_action_noop_improve_kind": next_action_noop_improve_kind,
             "trigger_source": owner.trigger_source,
             "blocked": not owner_readiness.ready,
             "blocking_id": owner_readiness.blocking_task_id,

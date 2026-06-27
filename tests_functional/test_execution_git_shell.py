@@ -338,7 +338,7 @@ def test_failed_task_retry_runs_then_iterates(tmp_path, capsys: pytest.CaptureFi
     assert retry_task.same_branch is False
     assert retry_task.base_branch == "feature/existing-impl-branch"
     assert "Retrying failed implementation" in output
-    assert "Iterate complete: APPROVED" in output
+    assert "Iterate complete: MERGE_READY" in output
 
 
 @pytest.mark.functional
@@ -402,7 +402,7 @@ def test_failed_task_resume_runs_then_iterates(tmp_path, capsys: pytest.CaptureF
     first_task_id = run_fg.call_args_list[0][1]["task_id"]
     assert first_task_id != impl.id
     assert "Resuming failed implementation" in output
-    assert "Iterate complete: APPROVED" in output
+    assert "Iterate complete: MERGE_READY" in output
 
 
 @pytest.mark.functional

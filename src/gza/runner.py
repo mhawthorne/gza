@@ -124,6 +124,11 @@ from .rebase_diff import (
     compute_rebase_changed_diff,
 )
 from .rebase_publish import publish_rebased_branch
+from .review_clearance import (
+    REVIEW_CLEARANCE_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+)
 from .review_scope import resolve_review_scope_for_impl
 from .review_tasks import (
     DuplicateReviewError,
@@ -132,6 +137,7 @@ from .review_tasks import (
     extract_review_blocker_adjudication_dispute_metadata,
     extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_prompt_parts,
+    persist_review_clearance_artifact,
 )
 from .review_verdict import (
     ReviewFinding,
@@ -161,6 +167,7 @@ logger = logging.getLogger(__name__)
 
 REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND = "review_blocker_resolution"
 REVIEW_BLOCKER_RESOLUTION_ARTIFACT_SCHEMA_VERSION = 1
+NOOP_IMPROVE_KIND_VERIFY_ONLY = "verify_only"
 
 # Keep the legacy patch target available for extraction tests that stub the
 # fallback parser on ``gza.runner``.
@@ -4991,9 +4998,71 @@ def _noop_improve_resolves_verify_only_review(
         current_head_sha=current_head_sha,
     ):
         return False
+    if current_head_sha is None:
+        return False
 
-    store.clear_review_state(impl_ancestor.id)
-    return True
+    cleared_at = task.review_verify_captured_at or task.completed_at or task.started_at
+    if cleared_at is None:
+        return False
+
+    persisted_clearance = _persist_verify_only_noop_review_clearance(
+        config=config,
+        store=store,
+        impl_task=impl_ancestor,
+        review_task=review_task,
+        source_task=task,
+        current_head_sha=current_head_sha,
+        cleared_at=cleared_at,
+    )
+    return persisted_clearance is not None
+
+
+def _persist_verify_only_noop_review_clearance(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    impl_task: Task,
+    review_task: Task,
+    source_task: Task,
+    current_head_sha: str,
+    cleared_at: datetime,
+) -> datetime | None:
+    """Persist SHA-bound verify-only no-op clearance for the current review/head."""
+    if impl_task.id is None or review_task.id is None or source_task.id is None:
+        return None
+
+    clearance_payload = {
+        "schema_version": 1,
+        "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+        "clearance_status": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+        "implementation_task_id": impl_task.id,
+        "review_task_id": review_task.id,
+        "source_task_id": source_task.id,
+        "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+        "reviewed_head_sha": current_head_sha,
+        "captured_at": cleared_at.isoformat(),
+    }
+    persisted = persist_review_clearance_artifact(
+        store,
+        config=config,
+        impl_task=impl_task,
+        clearance_payload=clearance_payload,
+        created_at=cleared_at,
+        review_clearance_artifact_kind=REVIEW_CLEARANCE_ARTIFACT_KIND,
+        review_clearance_artifact_label="review_clearance",
+        review_clearance_artifact_producer="advance_verify_only_noop_recovered",
+        status=VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+        head_sha=current_head_sha,
+        metadata={
+            "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+            "clearance_status": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+            "review_task_id": review_task.id,
+            "source_task_id": source_task.id,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+            "reviewed_head_sha": current_head_sha,
+        },
+    )
+    return persisted.review_cleared_at
 
 
 def _capture_noop_improve_review_verify_result(

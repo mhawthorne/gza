@@ -15,7 +15,13 @@ from gza.artifacts import store_command_output_artifact
 from gza.advance_engine import (
     ADVANCE_RULES,
     FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP,
+    NOOP_IMPROVE_KIND_REAL_BLOCKER,
+    NOOP_IMPROVE_KIND_VERIFY_ONLY,
     REVIEW_CLEARANCE_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
     WORKER_CONSUMING_ACTIONS,
     _count_consecutive_plan_review_cycles,
     _empty_merge_state_description,
@@ -401,6 +407,77 @@ def _persist_review_verify_artifact(
     )
     task.review_verify_artifact_file = stored.path
     store.update(task)
+
+
+def _add_verify_only_noop_review_clearance_artifact(
+    store: SqliteTaskStore,
+    *,
+    impl: DbTask,
+    review: DbTask,
+    source_task: DbTask,
+    reviewed_head_sha: str,
+    created_at: datetime,
+    clearance_status: str = VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+) -> None:
+    assert impl.id is not None
+    assert review.id is not None
+    assert source_task.id is not None
+    store.add_artifact(
+        impl.id,
+        kind=REVIEW_CLEARANCE_ARTIFACT_KIND,
+        producer="test",
+        label="review_clearance",
+        path=f".gza/artifacts/{impl.id}/review_clearance.json",
+        content_type="application/json; charset=utf-8",
+        byte_size=2,
+        sha256="0" * 64,
+        created_at=created_at,
+        status=clearance_status,
+        head_sha=reviewed_head_sha,
+        metadata={
+            "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+            "clearance_status": clearance_status,
+            "review_task_id": review.id,
+            "source_task_id": source_task.id,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+            "reviewed_head_sha": reviewed_head_sha,
+        },
+    )
+
+
+def _add_verify_only_noop_recovery_attention_artifact(
+    store: SqliteTaskStore,
+    *,
+    review: DbTask,
+    source_task: DbTask,
+    reviewed_head_sha: str,
+    created_at: datetime,
+    message: str,
+) -> None:
+    assert review.id is not None
+    assert source_task.id is not None
+    store.add_artifact(
+        source_task.id,
+        kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
+        producer="test",
+        label="verify_only_noop_recovery_attention",
+        path=f".gza/artifacts/{source_task.id}/verify_only_noop_recovery_attention.txt",
+        content_type="text/plain; charset=utf-8",
+        byte_size=len(message.encode("utf-8")),
+        sha256="1" * 64,
+        created_at=created_at,
+        status=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
+        head_sha=reviewed_head_sha,
+        metadata={
+            "schema_version": 1,
+            "attention_reason": "improve-no-op",
+            "review_task_id": review.id,
+            "source_task_id": source_task.id,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+            "reviewed_head_sha": reviewed_head_sha,
+            "message": message,
+        },
+    )
 
 
 def _add_review_blocker_resolution_artifact(
@@ -2733,7 +2810,78 @@ def test_review_freshness_probe_failure_parks_cleared_review_instead_of_merging(
     assert action["needs_attention_reason"] == "review-freshness-unverified"
     assert action["probe_warning"] == ctx.current_review_head_probe_warning
     assert "branch-head probe failed" in action["description"]
-    assert action["type"] != "merge"
+
+
+def test_verify_only_blocker_resolution_statuses_require_structured_clearance_artifact(
+    tmp_path: Path,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-resolution-statuses",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "### B2 verify_command timeout: functional lane\n"
+        "Evidence: verify_command timed out while running functional tests.\n"
+        "Impact: autonomous verify lacks a complete result.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "current-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(improve)
+
+    report = advance_engine_module.get_review_report(Path(config.project_dir), review)
+    statuses = advance_engine_module._latest_review_blocker_resolution_statuses(  # noqa: SLF001
+        store,
+        git=_FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha"},
+        ),
+        project_dir=Path(config.project_dir),
+        review_task=review,
+        impl_task=impl,
+        findings=report.findings,
+        improve_tasks=[improve],
+        allow_verify_clearance=True,
+    )
+
+    assert [status.state for status in statuses] == [None, None]
 
 
 @pytest.mark.parametrize(
@@ -3688,6 +3836,67 @@ def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: P
     assert action["type"] == "create_review", action
 
 
+def test_persisted_review_clearance_for_real_blocker_remains_mergeable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/persisted-review-clearance-mergeable",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    store.clear_review_state(impl.id)
+    impl = store.get(impl.id)
+    assert impl is not None
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(
+                ReviewFinding(
+                    id="B1",
+                    severity="BLOCKER",
+                    title="Missing API guard",
+                    body="Canonical blocker context.",
+                    evidence="The current code still accepts empty IDs.",
+                    impact="Invalid requests can crash the handler.",
+                    fix_or_followup="Reject empty IDs before calling the service.",
+                    tests="Add a regression for empty IDs.",
+                    open_state_citation="src/api.py:12-18",
+                ),
+            ),
+            format_version="legacy",
+        ),
+    )
+
+    ctx = resolve_advance_context(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert improve.changed_diff is False
+    assert ctx.review_cleared is True
+    assert ctx.review_blockers_invalidated is False
+    assert ctx.review_invalidated_by_progress is False
+    assert ctx.closing_review_action is None
+    assert ctx.current_review_head_probe_warning is None
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge (previous review addressed)"
+
+
 def test_completed_improve_without_review_clear_creates_closing_review(
     tmp_path: Path,
     monkeypatch,
@@ -4604,7 +4813,6 @@ def test_invalid_code_adjudication_does_not_clear_mixed_review_without_current_v
         },
         created_at=adjudication.completed_at,
     )
-
     git = _FakeGit(
         can_merge=True,
         existing_branches={impl.branch},
@@ -4769,6 +4977,14 @@ def test_invalid_code_adjudication_clears_mixed_review_once_current_verify_prove
             },
         },
         created_at=adjudication.completed_at,
+    )
+    _add_verify_only_noop_review_clearance_artifact(
+        store,
+        impl=impl,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="current-sha",
+        created_at=improve.review_verify_captured_at or improve.completed_at,
     )
 
     git = _FakeGit(
@@ -5933,6 +6149,7 @@ def test_verify_blocked_subject_is_implement_when_evaluated_from_improve_leaf(tm
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "verify-blocked-no-code-issues"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
     # Subject must be the implement owner, not the improve leaf.
     assert get_action_subject_task_id(action) == impl.id
     assert get_action_subject_task_id(action) != improve_leaf.id
@@ -5941,7 +6158,7 @@ def test_verify_blocked_subject_is_implement_when_evaluated_from_improve_leaf(tm
     assert resolved.id == impl.id
 
 
-def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path: Path) -> None:
+def test_verify_only_noop_improve_timestamp_only_clearance_does_not_merge(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -5955,18 +6172,7 @@ def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
-    review.output_content = (
-        "## Summary\n\n- The code still looks risky.\n\n"
-        "## Blockers\n\n"
-        "### B1 Missing provider-result normalization\n"
-        "Evidence: src/gza/foo.py:10 still appears to surface raw provider failures.\n"
-        "Impact: callers may still see inconsistent error behavior.\n"
-        "Required fix: normalize the failure path, then rerun verify_command.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "## Follow-Ups\n\nNone.\n\n"
-        "## Questions / Assumptions\n\nNone.\n\n"
-        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    )
+    review.output_content = _verify_failure_only_review_report()
     review.review_verify_status = "failed"
     review.review_verify_branch = impl.branch
     review.review_verify_head_sha = "current-sha"
@@ -5982,13 +6188,133 @@ def test_verify_only_noop_improve_with_cleared_review_becomes_mergeable(tmp_path
     impl.review_cleared_at = improve.completed_at
     store.update(impl)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] != "merge"
+
+
+def test_verify_only_noop_improve_with_matching_structured_clearance_becomes_mergeable(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-mergeable",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+    _add_verify_only_noop_review_clearance_artifact(
+        store,
+        impl=impl,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="current-sha",
+        created_at=datetime(2026, 5, 14, 11, 1, tzinfo=UTC),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha"},
+        ),
+        impl,
+        "main",
+    )
 
     assert action["type"] == "merge"
     assert "improve-no-op" not in action["description"]
 
 
-def test_verify_only_noop_improve_with_persisted_green_verify_evidence_becomes_mergeable(
+def test_verify_only_noop_improve_with_stale_structured_clearance_does_not_merge(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-stale-clearance",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    impl.review_cleared_at = improve.completed_at
+    store.update(impl)
+    _add_verify_only_noop_review_clearance_artifact(
+        store,
+        impl=impl,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="old-sha",
+        created_at=datetime(2026, 5, 14, 11, 1, tzinfo=UTC),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] != "merge"
+
+
+def test_verify_only_noop_improve_with_persisted_green_verify_evidence_without_structured_clearance_parks(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -6040,12 +6366,96 @@ def test_verify_only_noop_improve_with_persisted_green_verify_evidence_becomes_m
         ref_shas={impl.branch: "current-sha"},
     )
 
-    ctx = resolve_advance_context(config, store, git, impl, "main")
-    action = evaluate_advance_rules(config, store, git, improve, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        git,
+        improve,
+        "main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+    )
 
-    assert ctx.review_cleared is True
-    assert action["type"] == "merge"
-    assert "improve-no-op" not in action["description"]
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    assert refreshed_impl.review_cleared_at is None
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "structured review_clearance is missing" in action["description"]
+
+
+def test_verify_only_blocker_resolution_statuses_require_structured_clearance_artifact(
+    tmp_path: Path,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-resolution-statuses",
+        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "### B2 verify_command timeout: functional lane\n"
+        "Evidence: verify_command timed out while running functional tests.\n"
+        "Impact: autonomous verify lacks a complete result.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "current-sha"
+    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
+    store.update(improve)
+
+    report = advance_engine_module.get_review_report(Path(config.project_dir), review)
+    statuses = advance_engine_module._latest_review_blocker_resolution_statuses(  # noqa: SLF001
+        store,
+        git=_FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "current-sha"},
+        ),
+        project_dir=Path(config.project_dir),
+        review_task=review,
+        impl_task=impl,
+        findings=report.findings,
+        improve_tasks=[improve],
+        allow_verify_clearance=True,
+    )
+
+    assert [status.state for status in statuses] == [None, None]
 
 
 def test_verify_only_noop_improve_does_not_enter_code_adjudication_lane(tmp_path: Path) -> None:
@@ -6128,11 +6538,11 @@ def test_verify_only_noop_improve_does_not_enter_code_adjudication_lane(tmp_path
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.review_blocker_adjudication_candidate is None
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["type"] != "merge"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
 
 
-def test_verify_failure_only_noop_improve_with_same_head_green_evidence_merges(
+def test_verify_failure_only_noop_improve_with_same_head_green_evidence_parks_until_review_clearance_exists(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -6177,16 +6587,89 @@ def test_verify_failure_only_noop_improve_with_same_head_green_evidence_merges(
     action = evaluate_advance_rules(config, store, git, impl, "main")
     stored_impl = store.get(impl.id)
 
-    assert ctx.review_cleared is True
+    assert ctx.review_cleared is False
     assert stored_impl is not None
-    assert stored_impl.review_cleared_at is not None
-    assert action["type"] == "merge"
-    assert action["type"] != "needs_discussion"
-    assert action["description"].startswith("Merge")
-    assert "improve-no-op" not in action["description"]
+    assert stored_impl.review_cleared_at is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "structured review_clearance is missing" in action["description"]
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
 
-def test_off_topic_verify_policy_preserves_same_head_green_clearance_before_fallback(
+def test_verify_failure_only_noop_recovery_clearance_persistence_residue_parks_instead_of_creating_review(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-6519-clearance-residue-park",
+        when=datetime(2026, 6, 27, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 27, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = datetime(2026, 6, 27, 11, 10, tzinfo=UTC)
+    store.update(improve)
+    _add_verify_only_noop_recovery_attention_artifact(
+        store,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="same-head-sha",
+        created_at=improve.review_verify_captured_at,
+        message=(
+            "SKIP: verify-only no-op recovery captured a passing verify result for the current tip, "
+            "but the required structured review_clearance could not be persisted. "
+            "Manual attention is required before merge. Persistence failure: disk full"
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    action = determine_next_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=True,
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "could not be persisted" in action["description"]
+    assert "Create review (required before merge)" not in action["description"]
+
+
+def test_off_topic_verify_policy_preserves_same_head_green_review_refresh_before_fallback(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -6265,11 +6748,12 @@ def test_off_topic_verify_policy_preserves_same_head_green_clearance_before_fall
     action = evaluate_advance_rules(config, store, git, impl, "main")
     stored_impl = store.get(impl.id)
 
-    assert ctx.review_cleared is True
-    assert ctx.off_topic_verify_clearance_candidate is None
-    assert action["type"] == "merge"
+    assert ctx.review_cleared is False
+    assert ctx.off_topic_verify_clearance_candidate is not None
+    assert action["type"] == "clear_off_topic_verify_blocker"
     assert stored_impl is not None
-    assert stored_impl.review_cleared_at is not None
+    assert stored_impl.review_cleared_at is None
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
 
 def test_off_topic_verify_policy_still_fails_closed_without_current_same_head_green_evidence(
@@ -6353,8 +6837,8 @@ def test_off_topic_verify_policy_still_fails_closed_without_current_same_head_gr
 
     assert ctx.review_cleared is False
     assert ctx.off_topic_verify_clearance_candidate is None
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["type"] == "recover_verify_only_noop_review"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
 
@@ -6463,9 +6947,275 @@ def test_verify_failure_only_noop_improve_does_not_clear_from_older_pass_when_ne
     if label == "review_head_mismatch":
         assert action["type"] == "create_review", label
         assert action.get("needs_attention_reason") is None, label
-    else:
+    elif label == "newer_failed_evidence":
         assert action["type"] == "needs_discussion", label
         assert action["needs_attention_reason"] == "improve-no-op", label
+        assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY, label
+    else:
+        assert action["type"] == "recover_verify_only_noop_review", label
+        assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY, label
+
+
+@pytest.mark.parametrize("verify_status", ["failed", "unavailable"])
+def test_verify_failure_only_noop_recovery_evidence_parks_instead_of_rerunning_recovery(
+    tmp_path: Path,
+    verify_status: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feat/gza-6519-{verify_status}-park",
+        when=datetime(2026, 6, 24, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 24, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = verify_status
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = datetime(2026, 6, 24, 11, 30, tzinfo=UTC)
+    store.update(improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        git,
+        improve,
+        "main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "manual attention is required" in action["description"]
+
+
+def test_verify_failure_only_noop_recovery_attention_artifact_parks_setup_failure(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-6519-setup-failure-park",
+        when=datetime(2026, 6, 24, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 24, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    _add_verify_only_noop_recovery_attention_artifact(
+        store,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="same-head-sha",
+        created_at=datetime(2026, 6, 24, 11, 15, tzinfo=UTC),
+        message=(
+            "SKIP: verify-only no-op recovery could not prepare its isolated worktree; "
+            "manual attention is required. Setup failure: boom during add"
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        git,
+        improve,
+        "main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "Setup failure: boom during add" in action["description"]
+
+
+def test_verify_failure_only_noop_recovery_attention_blocks_cleanup_failure_merge_clearance(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-6519-cleanup-failure-park",
+        when=datetime(2026, 6, 24, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 24, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = datetime(2026, 6, 24, 11, 10, tzinfo=UTC)
+    store.update(improve)
+    _add_verify_only_noop_recovery_attention_artifact(
+        store,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="same-head-sha",
+        created_at=datetime(2026, 6, 24, 11, 15, tzinfo=UTC),
+        message=(
+            "SKIP: verify-only no-op recovery could not clean up its isolated worktree; "
+            "manual attention is required. Cleanup failure: worktree removal failed: cleanup exploded"
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    action = determine_next_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=True,
+    )
+
+    refreshed_impl = store.get(impl.id)
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "Cleanup failure: worktree removal failed: cleanup exploded" in action["description"]
+    assert refreshed_impl is not None
+    assert refreshed_impl.review_cleared_at is None
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
+
+
+def test_verify_failure_only_noop_recovery_clearance_artifact_keeps_merge_ready(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.advance_engine import determine_next_action
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/gza-6519-cleanup-success-merge-ready",
+        when=datetime(2026, 6, 24, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 24, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+    improve.review_verify_status = "passed"
+    improve.review_verify_branch = impl.branch
+    improve.review_verify_head_sha = "same-head-sha"
+    improve.review_verify_captured_at = datetime(2026, 6, 24, 11, 10, tzinfo=UTC)
+    store.update(improve)
+    _add_verify_only_noop_review_clearance_artifact(
+        store,
+        impl=impl,
+        review=review,
+        source_task=improve,
+        reviewed_head_sha="same-head-sha",
+        created_at=improve.review_verify_captured_at,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "same-head-sha"},
+    )
+
+    action = determine_next_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=True,
+    )
+
+    assert action["type"] == "merge"
+    assert "improve-no-op" not in action["description"]
 
 
 def test_verify_failure_only_noop_improve_uses_newest_candidate_when_created_at_ties(
@@ -6593,9 +7343,10 @@ def test_read_only_verify_failure_only_noop_improve_merge_does_not_persist_revie
     )
     stored_impl = store.get(impl.id)
 
-    assert action["type"] == "merge"
+    assert action["type"] != "merge"
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
 
 def test_off_topic_verify_unblock_disabled_keeps_existing_noop_red_behavior(
@@ -6694,6 +7445,7 @@ def test_off_topic_verify_unblock_disabled_keeps_existing_noop_red_behavior(
     stored_impl = store.get(impl.id)
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
     assert store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND) == []
@@ -7099,8 +7851,7 @@ def test_off_topic_verify_unblock_fails_closed_when_investigation_persistence_fa
     )
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
-    assert "probe_warning" in action
-    assert "off-topic verify clearance persistence failed" in action["probe_warning"]
+    assert "manual attention is required" in action["description"]
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
     assert store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND) == []
@@ -7211,11 +7962,7 @@ def test_off_topic_verify_unblock_baseline_exception_parks_with_warning_and_no_a
     stored_impl = store.get(impl.id)
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
-    assert action["probe_warning"] == (
-        "off-topic local-target baseline failed for main: "
-        "local-target baseline cwd does not exist: /tmp/missing"
-    )
-    assert "off-topic local-target baseline failed for main" in action["description"]
+    assert "manual attention is required" in action["description"]
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
     assert store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND) == []
@@ -7458,6 +8205,7 @@ def test_read_only_off_topic_verify_candidate_skips_baseline_and_keeps_review_bl
     stored_impl = store.get(impl.id)
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
     assert store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND) == []
@@ -7557,6 +8305,7 @@ def test_off_topic_verify_unblock_blocks_branch_introduced_failures(
     stored_impl = store.get(impl.id)
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
 
@@ -7657,6 +8406,7 @@ def test_off_topic_verify_unblock_fails_closed_when_classifier_is_unavailable(
     stored_impl = store.get(impl.id)
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None
 
@@ -7828,6 +8578,18 @@ def test_verify_failure_only_noop_improve_mismatches_do_not_auto_clear(
     if label == "review_head_mismatch":
         assert action["type"] == "create_review", label
         assert action.get("needs_attention_reason") is None, label
+    elif label in {
+        "missing_passing_improve_evidence",
+        "improve_captured_before_review_completed",
+        "improve_captured_at_review_completed",
+        "improve_branch_mismatch",
+        "improve_head_mismatch",
+    }:
+        assert action["type"] == "recover_verify_only_noop_review", label
+        assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY, label
+    elif label in {"review_branch_mismatch", "review_verify_was_passed"}:
+        assert action["type"] == "create_review", label
+        assert action["description"] == "Create review (required before merge)", label
     else:
         assert action["type"] == "needs_discussion", label
         assert action["needs_attention_reason"] == "improve-no-op", label
@@ -7884,6 +8646,7 @@ def test_verify_only_noop_improves_without_green_resolution_do_not_auto_clear(tm
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_REAL_BLOCKER
     assert action["type"] != "merge"
 
 
@@ -7946,6 +8709,7 @@ def test_verify_only_noop_improve_with_persisted_failing_verify_evidence_stays_b
     assert ctx.review_cleared is False
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
 
 
 def test_verify_only_noop_improve_stays_mergeable_after_review_preserved_rebase(tmp_path: Path) -> None:
@@ -8016,9 +8780,13 @@ def test_verify_only_noop_improve_stays_mergeable_after_review_preserved_rebase(
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert ctx.review_cleared is True
+    assert ctx.review_cleared is False
     assert ctx.review_preserved_by_rebase is not None
-    assert action["type"] == "merge"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "structured review_clearance is missing" in action["description"]
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
 
 def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_availability_probe(
@@ -8082,6 +8850,54 @@ def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_a
     assert "branch-head probe failed" in action["description"]
     assert "verify-only auto-clear could not be validated" in action["description"]
     assert git.name_status_calls == []
+
+
+def test_verify_only_noop_recovery_requires_successful_current_head_probe(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_noop_improve_cycles = 1
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/noop-verify-only-head-probe-required",
+        when=datetime(2026, 6, 27, 9, 0, tzinfo=UTC),
+    )
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    review.output_content = _verify_failure_only_review_report()
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head-sha"
+    store.update(review)
+
+    _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 6, 27, 11, 0, tzinfo=UTC),
+        changed_diff=False,
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        rev_parse_errors={impl.branch: GitError("probe blew up")},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.current_review_head_sha is None
+    assert ctx.current_review_head_probe_warning == (
+        f"branch-head probe failed for {impl.branch}: probe blew up"
+    )
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action["probe_warning"] == ctx.current_review_head_probe_warning
+    assert "latest review freshness could not be verified" in action["description"]
+    assert action["type"] != "recover_verify_only_noop_review"
 
 
 def test_substantive_noop_improves_still_park_without_auto_clear(tmp_path: Path) -> None:
@@ -8574,13 +9390,14 @@ def test_same_head_green_verify_clearance_still_parks_for_unresolved_sibling_cod
     action = evaluate_advance_rules(config, store, git, impl, "main")
     stored_impl = store.get(impl.id)
 
-    assert ctx.review_cleared is True
+    assert ctx.review_cleared is False
     assert stored_impl is not None
-    assert stored_impl.review_cleared_at is not None
+    assert stored_impl.review_cleared_at is None
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "improve-no-op"
     assert action["review_task"].id == sibling_review.id
     assert verify_review.id in action["description"]
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
 
 def test_same_head_green_verify_clearance_still_parks_when_sibling_completed_improve_did_not_clear_blockers(
@@ -8830,8 +9647,11 @@ def test_same_head_green_verify_clearance_does_not_park_on_only_addressed_siblin
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (previous review addressed)"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == NOOP_IMPROVE_KIND_VERIFY_ONLY
+    assert "structured review_clearance is missing" in action["description"]
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
 
 @pytest.mark.parametrize("sibling_improve_status", ["pending", "in_progress"])

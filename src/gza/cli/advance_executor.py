@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from ..advance_engine import (
+    NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    PARK_REASON_IMPROVE_NO_OP,
+    REVIEW_CLEARANCE_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
+    VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+    VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+)
+from ..artifacts import store_command_output_artifact
 from ..concurrency import (
     LaunchPermit,
     MaxConcurrentTasksError,
@@ -15,9 +29,27 @@ from ..concurrency import (
 )
 from ..db import SqliteTaskStore, Task as DbTask
 from ..flaky_investigations import create_or_reuse_flaky_investigations
+from ..git import Git, GitError
 from ..plan_review_verdict import PlanReviewManifest
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
-from ..review_tasks import build_review_blocker_dispute_metadata
+from ..review_tasks import (
+    OffTopicVerifyPersistenceError,
+    build_review_blocker_dispute_metadata,
+    persist_review_clearance_artifact,
+)
+from ..runner import (
+    ProjectReviewVerifyResult,
+    _capture_review_verify_result,
+    _format_review_verify_result,
+    _make_review_verify_result,
+    _project_boundary,
+    _resolve_review_verify_base_sha,
+    _resolve_review_verify_timeout_settings,
+    _run_review_verify_command,
+    _run_review_verify_commands_for_projects,
+    _task_is_cross_project,
+    _worktree_execution_dir,
+)
 from ._common import (
     PlanReviewMaterializationResult,
     _create_improve_task,
@@ -114,6 +146,7 @@ class AdvanceActionExecutionResult:
     attention_reason: str | None = None
     worker_label: str | None = None
     guarded_pending_task_id: str | None = None
+    noop_improve_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +165,7 @@ _WORKER_ACTIONS = frozenset(
         "run_plan_improve",
         "materialize_plan_slices",
         "clear_off_topic_verify_blocker",
+        "recover_verify_only_noop_review",
         "create_review",
         "run_review",
         "create_review_adjudication",
@@ -263,6 +297,8 @@ def resolve_execution_needs_attention(
         "description": result.message,
         "needs_attention_reason": result.attention_reason,
     }
+    if result.noop_improve_kind is not None:
+        action["noop_improve_kind"] = result.noop_improve_kind
     subject_task = result.failed_improve or task
     if result.action_type == "improve" and result.attention_type in {"automatic_recovery_disabled", "manual_review_required"}:
         subject_task = task
@@ -462,6 +498,461 @@ def _maybe_route_action_through_iterate(
     result.guarded_pending_task_id = guarded_pending_task_id
     result.success_message = f"Started iterate for {preferred.id}"
     return result
+
+
+def _persist_verify_only_noop_clearance(
+    *,
+    context: AdvanceActionExecutionContext,
+    task: DbTask,
+    review_task: DbTask,
+    noop_improve_task: DbTask,
+    reviewed_head_sha: str,
+    captured_at: datetime,
+) -> datetime | None:
+    if context.config is None or task.id is None or review_task.id is None or noop_improve_task.id is None:
+        return None
+    clearance_payload = {
+        "schema_version": 1,
+        "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+        "clearance_status": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+        "implementation_task_id": task.id,
+        "review_task_id": review_task.id,
+        "source_task_id": noop_improve_task.id,
+        "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+        "reviewed_head_sha": reviewed_head_sha,
+        "captured_at": captured_at.isoformat(),
+    }
+    persisted = persist_review_clearance_artifact(
+        context.store,
+        config=context.config,
+        impl_task=task,
+        clearance_payload=clearance_payload,
+        created_at=captured_at,
+        review_clearance_artifact_kind=REVIEW_CLEARANCE_ARTIFACT_KIND,
+        review_clearance_artifact_label="review_clearance",
+        review_clearance_artifact_producer="advance_verify_only_noop_recovered",
+        status=VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+        head_sha=reviewed_head_sha,
+        metadata={
+            "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
+            "clearance_status": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+            "review_task_id": review_task.id,
+            "source_task_id": noop_improve_task.id,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+            "reviewed_head_sha": reviewed_head_sha,
+        },
+    )
+    return persisted.review_cleared_at
+
+
+def _verify_only_noop_attention_result(
+    *,
+    action_type: str,
+    message: str,
+) -> AdvanceActionExecutionResult:
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        message=message,
+        attention_type="needs_discussion",
+        attention_reason=PARK_REASON_IMPROVE_NO_OP,
+        noop_improve_kind=NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    )
+
+
+def _persist_verify_only_noop_attention(
+    *,
+    context: AdvanceActionExecutionContext,
+    task: DbTask,
+    review_task: DbTask,
+    noop_improve_task: DbTask,
+    reviewed_head_sha: str,
+    message: str,
+    outcome_kind: str,
+    verify_status: str | None = None,
+    captured_at: datetime | None = None,
+) -> None:
+    if context.config is None:
+        raise ValueError("config is required to persist verify-only no-op recovery attention")
+    store_command_output_artifact(
+        context.store,
+        noop_improve_task,
+        context.config,
+        kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
+        producer="advance_verify_only_noop_recovery",
+        label="verify_only_noop_recovery_attention",
+        output=message,
+        status=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
+        head_sha=reviewed_head_sha,
+        metadata={
+            "schema_version": 1,
+            "attention_reason": PARK_REASON_IMPROVE_NO_OP,
+            "implementation_task_id": task.id,
+            "review_task_id": review_task.id,
+            "source_task_id": noop_improve_task.id,
+            "noop_improve_kind": NOOP_IMPROVE_KIND_VERIFY_ONLY,
+            "reviewed_head_sha": reviewed_head_sha,
+            "message": message,
+            "outcome_kind": outcome_kind,
+            "verify_status": verify_status,
+        },
+        created_at=captured_at,
+    )
+
+
+def _verify_only_noop_error_result(
+    *,
+    action_type: str,
+    message: str,
+) -> AdvanceActionExecutionResult:
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="error",
+        message=message,
+        noop_improve_kind=NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    )
+
+
+def _cleanup_verify_only_noop_worktree(
+    *,
+    context: AdvanceActionExecutionContext,
+    worktree_path: Path | None,
+    added_worktree: bool,
+) -> str | None:
+    if worktree_path is None:
+        return None
+    if context.git is None:
+        return "missing git context for isolated worktree cleanup"
+
+    cleanup_failures: list[str] = []
+    if added_worktree:
+        try:
+            context.git.worktree_remove(worktree_path, force=True)
+        except (GitError, OSError, RuntimeError, ValueError) as exc:
+            cleanup_failures.append(f"worktree removal failed: {exc}")
+    try:
+        shutil.rmtree(worktree_path)
+    except OSError as exc:
+        if worktree_path.exists():
+            cleanup_failures.append(f"temporary directory cleanup failed: {exc}")
+    if cleanup_failures:
+        return "; ".join(cleanup_failures)
+    return None
+
+
+def _execute_recover_verify_only_noop_review(
+    *,
+    task: DbTask,
+    action_type: str,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult:
+    review_task = action.get("review_task")
+    noop_improve_task = action.get("latest_noop_improve_task")
+    current_branch_head_sha = action.get("current_branch_head_sha")
+    if (
+        not isinstance(review_task, DbTask)
+        or review_task.id is None
+        or not isinstance(noop_improve_task, DbTask)
+        or noop_improve_task.id is None
+        or task.id is None
+        or context.config is None
+        or context.git is None
+        or task.branch is None
+        or not isinstance(current_branch_head_sha, str)
+        or not current_branch_head_sha
+    ):
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message="missing verify-only no-op recovery inputs",
+        )
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Fresh verify on current tip"),
+            work_done=True,
+            handled_task_id=task.id,
+        )
+
+    def _persist_attention(
+        message: str,
+        *,
+        outcome_kind: str,
+        verify_status: str | None = None,
+        captured_at: datetime | None = None,
+    ) -> AdvanceActionExecutionResult:
+        try:
+            _persist_verify_only_noop_attention(
+                context=context,
+                task=task,
+                review_task=review_task,
+                noop_improve_task=noop_improve_task,
+                reviewed_head_sha=current_branch_head_sha,
+                message=message,
+                outcome_kind=outcome_kind,
+                verify_status=verify_status,
+                captured_at=captured_at,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            return _verify_only_noop_error_result(
+                action_type=action_type,
+                message=f"failed to persist verify-only no-op recovery attention: {exc}",
+            )
+        return _verify_only_noop_attention_result(
+            action_type=action_type,
+            message=message,
+        )
+
+    live_head_before = context.git.rev_parse_if_exists(task.branch)
+    if live_head_before != current_branch_head_sha:
+        return _persist_attention(
+            "SKIP: verify-only no-op recovery no longer matches the evaluated branch tip; "
+            "rerun lifecycle on the current head.",
+            outcome_kind="head_drift_before_verify",
+        )
+
+    worktree_path: Path | None = None
+    added_worktree = False
+    try:
+        tmp_root = Path(context.config.project_dir) / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        worktree_path = Path(
+            tempfile.mkdtemp(
+                prefix=f"verify-only-noop-{task.id or 'task'}-",
+                dir=tmp_root,
+            )
+        )
+        context.git.worktree_add_existing(worktree_path, current_branch_head_sha, detach=True)
+        added_worktree = True
+        worktree_git = Git(worktree_path)
+    except (GitError, OSError, RuntimeError, ValueError) as exc:
+        cleanup_failure = _cleanup_verify_only_noop_worktree(
+            context=context,
+            worktree_path=worktree_path,
+            added_worktree=added_worktree,
+        )
+        message = (
+            "SKIP: verify-only no-op recovery could not prepare its isolated worktree; "
+            f"manual attention is required. Setup failure: {exc}"
+        )
+        if cleanup_failure:
+            message = f"{message}. Cleanup failure: {cleanup_failure}"
+        return _persist_attention(message, outcome_kind="setup_failure")
+
+    try:
+        timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
+        provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
+        verify_command = (
+            str(context.config.verify_command).strip()
+            if isinstance(getattr(context.config, "verify_command", None), str)
+            else ""
+        )
+        reviewed_base_sha: str | None = None
+        reviewed_head_sha: str | None = None
+        project_results: tuple[ProjectReviewVerifyResult, ...] = ()
+        deferred_attention_message: str | None = None
+        deferred_attention_outcome_kind: str | None = None
+        deferred_attention_verify_status: str | None = None
+        deferred_attention_captured_at: datetime | None = None
+        command_label = verify_command or "(review verify unavailable)"
+        result = None
+        try:
+            default_branch = worktree_git.default_branch()
+            reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, default_branch)
+            reviewed_head_sha = worktree_git.rev_parse_if_exists("HEAD")
+            if reviewed_head_sha is None:
+                result = _make_review_verify_result(
+                    command_label,
+                    status="unavailable",
+                    exit_status="unresolved head",
+                    captured_at=datetime.now(UTC),
+                    reviewed_branch=task.branch,
+                    reviewed_head_sha=None,
+                    reviewed_base_sha=reviewed_base_sha,
+                    working_directory=str(provider_cwd),
+                    failure="unable to resolve detached review-verify HEAD",
+                )
+            elif _task_is_cross_project(noop_improve_task):
+                cross_project_verify = _run_review_verify_commands_for_projects(
+                    config=context.config,
+                    task=noop_improve_task,
+                    worktree_git=worktree_git,
+                    worktree_path=worktree_git.repo_dir,
+                    timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
+                    reviewed_branch=task.branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                )
+                if cross_project_verify is None:
+                    deferred_attention_message = (
+                        "SKIP: verify-only no-op recovery could not run cross-project verify."
+                    )
+                    deferred_attention_outcome_kind = "cross_project_verify_unavailable"
+                else:
+                    result = cross_project_verify.aggregate_result
+                    project_results = cross_project_verify.project_results
+            elif not verify_command:
+                result = _make_review_verify_result(
+                    command_label,
+                    status="unavailable",
+                    exit_status="not configured",
+                    captured_at=datetime.now(UTC),
+                    reviewed_branch=task.branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    working_directory=str(provider_cwd),
+                    failure="verify_command is not configured for verify-only no-op recovery",
+                )
+            else:
+                result = _run_review_verify_command(
+                    verify_command,
+                    cwd=provider_cwd,
+                    reviewed_branch=task.branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    timeout_seconds=timeout_seconds,
+                    timeout_grace_seconds=timeout_grace_seconds,
+                )
+        except (GitError, OSError, RuntimeError, ValueError) as exc:
+            result = _make_review_verify_result(
+                command_label,
+                status="unavailable",
+                exit_status="launch failed",
+                captured_at=datetime.now(UTC),
+                reviewed_branch=task.branch,
+                reviewed_head_sha=reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(provider_cwd),
+                failure=f"unable to prepare or run verify_command for verify-only no-op recovery: {exc}",
+            )
+
+        if result is not None:
+            markdown = _format_review_verify_result(result)
+            _capture_review_verify_result(
+                context.config,
+                context.store,
+                noop_improve_task,
+                result,
+                markdown=markdown,
+                project_results=project_results,
+                producer="advance_verify_only_noop_recovery",
+            )
+
+        live_head_after = context.git.rev_parse_if_exists(task.branch)
+        cleanup_failure = _cleanup_verify_only_noop_worktree(
+            context=context,
+            worktree_path=worktree_path,
+            added_worktree=added_worktree,
+        )
+        added_worktree = False
+        worktree_path = None
+        if cleanup_failure:
+            return _persist_attention(
+                "SKIP: verify-only no-op recovery could not clean up its isolated worktree; "
+                f"manual attention is required. Cleanup failure: {cleanup_failure}",
+                outcome_kind="cleanup_failure",
+                verify_status=None if result is None else result.status,
+                captured_at=None if result is None else result.captured_at,
+            )
+        if deferred_attention_message is not None:
+            assert deferred_attention_outcome_kind is not None
+            return _persist_attention(
+                deferred_attention_message,
+                outcome_kind=deferred_attention_outcome_kind,
+                verify_status=deferred_attention_verify_status,
+                captured_at=deferred_attention_captured_at,
+            )
+        assert result is not None
+        if reviewed_head_sha != current_branch_head_sha or live_head_after != current_branch_head_sha:
+            return _persist_attention(
+                "SKIP: verify-only no-op recovery finished on a stale tip; "
+                "the implementation branch moved during verification.",
+                outcome_kind="head_drift_after_verify",
+                verify_status=result.status,
+                captured_at=result.captured_at,
+            )
+        if result.status != "passed":
+            return _persist_attention(
+                "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
+                "manual attention is required.",
+                outcome_kind="verify_not_cleared",
+                verify_status=result.status,
+                captured_at=result.captured_at,
+            )
+
+        try:
+            persisted_clearance = _persist_verify_only_noop_clearance(
+                context=context,
+                task=task,
+                review_task=review_task,
+                noop_improve_task=noop_improve_task,
+                reviewed_head_sha=current_branch_head_sha,
+                captured_at=result.captured_at,
+            )
+        except OffTopicVerifyPersistenceError as exc:
+            message = (
+                "failed to persist verify-only no-op clearance: "
+                f"{exc}"
+            )
+            _persist_verify_only_noop_attention(
+                context=context,
+                task=task,
+                review_task=review_task,
+                noop_improve_task=noop_improve_task,
+                reviewed_head_sha=current_branch_head_sha,
+                message=(
+                    "SKIP: verify-only no-op recovery captured a passing verify result for the current tip, "
+                    "but the required structured review_clearance could not be persisted. "
+                    "Manual attention is required before merge. "
+                    f"Persistence failure: {exc}"
+                ),
+                outcome_kind="clearance_persistence_failure",
+                verify_status=result.status,
+                captured_at=result.captured_at,
+            )
+            return _verify_only_noop_error_result(
+                action_type=action_type,
+                message=message,
+            )
+        if persisted_clearance is None:
+            _persist_verify_only_noop_attention(
+                context=context,
+                task=task,
+                review_task=review_task,
+                noop_improve_task=noop_improve_task,
+                reviewed_head_sha=current_branch_head_sha,
+                message=(
+                    "SKIP: verify-only no-op recovery captured a passing verify result for the current tip, "
+                    "but the required structured review_clearance could not be persisted. "
+                    "Manual attention is required before merge."
+                ),
+                outcome_kind="clearance_persistence_missing",
+                verify_status=result.status,
+                captured_at=result.captured_at,
+            )
+            return _verify_only_noop_error_result(
+                action_type=action_type,
+                message="failed to persist verify-only no-op clearance",
+            )
+        refreshed_task = context.store.get(task.id) or task
+        refreshed_task.review_cleared_at = persisted_clearance
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            success_message="Fresh verify passed; verify-only no-op review blocker cleared for the current tip.",
+            work_done=True,
+            handled_task_id=task.id,
+            created_task=refreshed_task,
+        )
+    finally:
+        _cleanup_verify_only_noop_worktree(
+            context=context,
+            worktree_path=worktree_path,
+            added_worktree=added_worktree,
+        )
 
 
 def execute_advance_action(
@@ -947,6 +1438,14 @@ def execute_advance_action(
             handled_task_id=prepared_adjudication_task.id,
             worker_label="review_adjudication",
             created_task=prepared_adjudication_task,
+        )
+
+    if action_type == "recover_verify_only_noop_review":
+        return _execute_recover_verify_only_noop_review(
+            task=task,
+            action_type=action_type,
+            action=action,
+            context=context,
         )
 
     if action_type == "clear_off_topic_verify_blocker":

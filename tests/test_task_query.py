@@ -164,6 +164,142 @@ def test_incomplete_preset_projects_revised_plan_followup_when_context_available
     assert row.values["unresolved_ids"] == [revised_plan.id]
 
 
+def test_incomplete_preset_projects_verify_only_noop_recovery_without_persisting_clearance(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / "test.db", prefix=config.project_prefix)
+
+    impl = store.add("completed impl", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feat/task-query-verify-only-noop"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    review.output_content = (
+        "## Summary\n\n- Verify failed.\n\n"
+        "## Blockers\n\n"
+        "### B1 verify_command failure: flaky unit lane\n"
+        "Evidence: verify_command failed with exit status 1.\n"
+        "Impact: autonomous verify fails.\n"
+        "Required fix: rerun verify_command on the current tip.\n"
+        "Required tests: rerun verify_command.\n\n"
+        "## Follow-Ups\n\nNone.\n\n"
+        "## Questions / Assumptions\n\nNone.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "current-sha"
+    store.update(review)
+
+    for minute in (11, 12):
+        improve = store.add(
+            "noop improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert improve.id is not None
+        improve.status = "completed"
+        improve.completed_at = datetime(2026, 5, 14, minute, 0, tzinfo=UTC)
+        improve.branch = impl.branch
+        improve.changed_diff = False
+        improve.review_verify_status = "passed"
+        improve.review_verify_branch = impl.branch
+        improve.review_verify_head_sha = "current-sha"
+        improve.review_verify_captured_at = datetime(2026, 5, 14, minute, 0, 1, tzinfo=UTC)
+        store.update(improve)
+
+    class _Git:
+        def can_merge(self, source_branch: str, target_branch: str) -> bool:
+            del source_branch, target_branch
+            return True
+
+        def is_merged(self, source_branch: str, target_branch: str) -> bool:
+            del source_branch, target_branch
+            return False
+
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def ref_exists(self, ref: str) -> bool:
+            del ref
+            return False
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref == impl.branch:
+                return "current-sha"
+            if ref == "main":
+                return "main-sha"
+            return None
+
+        def count_commits_behind(self, source_ref: str, target_ref: str) -> int | None:
+            del source_ref, target_ref
+            return 0
+
+        def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:
+            del source_ref, target_ref
+            return 1
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def get_diff_name_status(
+            self,
+            revision_range: str,
+            paths: tuple[str, ...] | list[str] = (),
+            *,
+            check: bool = False,
+        ) -> str:
+            del revision_range, paths, check
+            return ""
+
+    service = TaskQueryService(store)
+    git = _Git()
+    action = service._project_next_action(  # noqa: SLF001
+        impl,
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
+    assert action["noop_improve_kind"] == "verify_only"
+
+    row = service._collect_lineages_unlimited(  # noqa: SLF001
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=git,
+        target_branch="main",
+    )[0]
+    projected = service._project_lineage_row(  # noqa: SLF001
+        replace(row, next_action_data=action),
+        TaskQueryPresets.incomplete(limit=None),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert projected.values["next_action"] == "needs_discussion"
+    assert projected.values["next_action_noop_improve_kind"] == "verify_only"
+
+
 def test_incomplete_query_uses_one_read_session_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
     failed = store.add("failed impl", task_type="implement")
@@ -712,6 +848,7 @@ def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_p
             "description": "SKIP: manual intervention required",
             "needs_attention_reason": "retry-limit-reached",
             "subject_task_id": "gza-999999",
+            "noop_improve_kind": "verify_only",
         },
     )
 
@@ -724,6 +861,7 @@ def test_incomplete_preset_falls_back_to_owner_for_unknown_subject_task_id(tmp_p
     )
 
     assert projected.values["next_action_owner_id"] == impl.id
+    assert projected.values["next_action_noop_improve_kind"] == "verify_only"
 
 
 def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_task_id(

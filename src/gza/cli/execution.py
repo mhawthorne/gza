@@ -154,8 +154,10 @@ from .advance_engine import (
     resolve_subject_task,
 )
 from .advance_executor import (
+    AdvanceActionExecutionContext,
     build_failed_recovery_needs_attention_result,
     build_improve_needs_attention_result,
+    execute_advance_action,
     resolve_execution_needs_attention,
 )
 from .log import _latest_worker_for_task, _running_worker_id_for_task
@@ -5138,6 +5140,17 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         closing_action = _resolve_forced_closing_review_action()
         if closing_action is None:
             return False
+        current_impl_task = _current_impl_task()
+        current_action = determine_next_action(
+            engine_config,
+            store,
+            git_runtime,
+            current_impl_task,
+            target_branch,
+            max_resume_attempts=max_resume_attempts,
+        )
+        if current_action.get("type") in {"merge", "merge_with_followups"}:
+            return False
 
         action_type = closing_action["type"]
         if action_type == "wait_review":
@@ -5167,7 +5180,6 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return False
 
         print("\nClosing review required before termination.")
-        current_impl_task = _current_impl_task()
         action_task: DbTask | None = None
         if action_type == "create_review":
             try:
@@ -5406,6 +5418,80 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                 _append_summary_row(summary_rows, iteration_index=iteration, task_type="improve", task=None, status="in_progress")
             break
 
+        if action_type == "recover_verify_only_noop_review":
+            exec_result = execute_advance_action(
+                task=impl_task,
+                action=action,
+                context=AdvanceActionExecutionContext(
+                    store=store,
+                    trigger_source="manual",
+                    dry_run=False,
+                    max_resume_attempts=effective_max_resume_attempts,
+                    use_iterate_for_create_implement=False,
+                    use_iterate_for_needs_rebase=False,
+                    prepare_task_for_background_start=lambda task, _rollback: task,
+                    prepare_create_review=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("prepare_create_review should not run for verify-only noop recovery")
+                    ),
+                    create_resume_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_resume_task should not run for verify-only noop recovery")
+                    ),
+                    create_rebase_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_rebase_task should not run for verify-only noop recovery")
+                    ),
+                    create_implement_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_implement_task should not run for verify-only noop recovery")
+                    ),
+                    spawn_worker=lambda _task, _kind: (_ for _ in ()).throw(
+                        AssertionError("spawn_worker should not run for verify-only noop recovery")
+                    ),
+                    spawn_resume_worker=lambda _task, _kind: (_ for _ in ()).throw(
+                        AssertionError("spawn_resume_worker should not run for verify-only noop recovery")
+                    ),
+                    spawn_iterate_worker=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        AssertionError("spawn_iterate_worker should not run for verify-only noop recovery")
+                    ),
+                    config=config,
+                    git=git_runtime,
+                ),
+            )
+            if exec_result.success_message:
+                print(f"  {exec_result.success_message}")
+            elif exec_result.message:
+                print(f"  {exec_result.message.removeprefix('SKIP: ')}")
+            if exec_result.status == "success":
+                impl_task = store.get(impl_task.id) or impl_task
+                continue
+            if exec_result.status == "skip":
+                attention = resolve_execution_needs_attention(impl_task, exec_result)
+                if attention is not None:
+                    final_attention_action = attention.action
+                    final_attention_task = attention.task
+                    final_stop_reason = exec_result.attention_reason or action_type
+                else:
+                    final_stop_reason = action_type
+                final_status = "blocked"
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type=action_type,
+                    task=impl_task,
+                    status="failed",
+                    failure_reason=exec_result.message,
+                )
+                break
+            final_status = "blocked"
+            final_stop_reason = action_type
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type=action_type,
+                task=impl_task,
+                status="failed",
+                failure_reason=exec_result.message or exec_result.error_message,
+            )
+            break
+
         action_task: DbTask | None = None
         verdict: str | None = None
         initial_resume = False
@@ -5445,6 +5531,11 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
                     final_stop_reason = "needs_rebase"
                     break
                 permit_for_rebase: LaunchPermit | None = permit_candidate
+                if impl_task.id is None or impl_task.branch is None:
+                    final_status = "blocked"
+                    final_stop_reason = "needs_rebase"
+                    _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
+                    break
                 created_rebase_task = _create_rebase_task(
                     store,
                     impl_task.id,
@@ -5897,7 +5988,8 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         if action_type in {"create_review", "run_review"}:
             # Count full change+review cycles by completed review actions.
             iteration += 1
-        impl_task = store.get(impl_task.id) or impl_task
+        if impl_task.id is not None:
+            impl_task = store.get(impl_task.id) or impl_task
 
     if final_status in {"approved", "merge_ready", "maxed_out"}:
         _run_forced_closing_review(iteration)

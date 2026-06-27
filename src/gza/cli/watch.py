@@ -147,6 +147,7 @@ from ._queue_render import (
 from ._recovery_lane import RecoveryLaneEntry, collect_recovery_lane_entries
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
+    WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS,
     build_needs_attention_entry_for_display,
     classify_advance_action,
     determine_next_action,
@@ -184,7 +185,7 @@ _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
 _WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON = "transient-recovery-backoff"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset(
-    {"retry-limit-reached", "retryable-provider-error", WATCH_NO_PROGRESS_BACKSTOP_REASON}
+    {*WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS, WATCH_NO_PROGRESS_BACKSTOP_REASON}
 )
 _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
@@ -599,11 +600,16 @@ def _watch_parked_iterate_result(
 def _resolve_watch_attention_display_task(store: SqliteTaskStore, row: LineageOwnerRow) -> DbTask:
     """Resolve the declared attention subject, falling back to incomplete-owner behavior."""
     action = row.next_action or {}
+    fallback_task = (
+        _resolve_watch_iterate_impl_for_task(store, row.lifecycle_action_task)
+        if row.lifecycle_action_task is not None
+        else None
+    ) or row.owner_task or _resolve_incomplete_owner_task(store, cast(Any, row))
     return resolve_subject_task(
         store,
         action,
         row,
-        fallback_task=_resolve_incomplete_owner_task(store, cast(Any, row)),
+        fallback_task=fallback_task,
     )
 
 
@@ -3742,12 +3748,10 @@ def _run_cycle(
             if classify_advance_action(action) == "needs_attention":
                 attention_key: str
                 recovery_entry = (
-                    recovery_lane_entry_by_failed_id.get(row.recovery_leaf_task.id)
-                    if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+                    recovery_lane_entry_by_failed_id.get(get_action_subject_task_id(action) or "")
+                    if classify_advance_action(action) == "needs_attention"
                     else None
                 )
-                if recovery_entry is None:
-                    recovery_entry = recovery_lane_entry_by_failed_id.get(get_action_subject_task_id(action) or "")
                 if recovery_entry is not None and recovery_entry.attention_action is not None:
                     display_task = recovery_entry.owner_task
                     action = _reroot_failed_recovery_attention_action(
