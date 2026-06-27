@@ -1443,35 +1443,36 @@ def _complete_failed_code_task_after_pr_publication(
     record_reconcile_attempt: bool = False,
 ) -> int:
     """Retry PR publication for a previously failed completed code task."""
-    pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
-    if pr_outcome.kind == "nonfatal_missing_pr":
-        _record_pr_publication_note(
-            task=task,
-            log_file=log_file,
-            branch_name=branch_name,
-            status=pr_outcome.status,
-            error=pr_outcome.error,
-        )
-    elif pr_outcome.kind == "branch_unpushable":
-        return _persist_branch_unpushable_failure(
-            task=task,
-            config=config,
-            store=store,
-            log_file=log_file if log_file is not None else task.log_file,
-            stats=stats,
-            branch_name=branch_name,
-            output_content=output_content,
-            diff_files=diff_files,
-            diff_added=diff_added,
-            diff_removed=diff_removed,
-            head_sha=head_sha,
-            base_sha=base_sha,
-            message=pr_outcome.message,
-            fix_commits_ahead_before_run=fix_commits_ahead_before_run,
-            fix_default_branch=fix_default_branch,
-            fix_was_merged_before_run=fix_was_merged_before_run,
-            record_reconcile_attempt=record_reconcile_attempt,
-        )
+    if task.create_pr:
+        pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+        if pr_outcome.kind == "nonfatal_missing_pr":
+            _record_pr_publication_note(
+                task=task,
+                log_file=log_file,
+                branch_name=branch_name,
+                status=pr_outcome.status,
+                error=pr_outcome.error,
+            )
+        elif pr_outcome.kind == "branch_unpushable":
+            return _persist_branch_unpushable_failure(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file if log_file is not None else task.log_file,
+                stats=stats,
+                branch_name=branch_name,
+                output_content=output_content,
+                diff_files=diff_files,
+                diff_added=diff_added,
+                diff_removed=diff_removed,
+                head_sha=head_sha,
+                base_sha=base_sha,
+                message=pr_outcome.message,
+                fix_commits_ahead_before_run=fix_commits_ahead_before_run,
+                fix_default_branch=fix_default_branch,
+                fix_was_merged_before_run=fix_was_merged_before_run,
+                record_reconcile_attempt=record_reconcile_attempt,
+            )
 
     if log_file is not None:
         _finalize_completed_code_task(
@@ -8319,7 +8320,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
 
     publication_state = load_branch_publication_state(store, task.id)
     return _complete_failed_code_task_after_pr_publication(
-        task=task,
+        task=replace(task, create_pr=True),
         config=config,
         store=store,
         git=git,

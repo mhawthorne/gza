@@ -3932,7 +3932,7 @@ def test_watch_cycle_reconcile_completes_failed_branch_unpushable_task(tmp_path:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    failed = store.add("Failed publish", task_type="implement")
+    failed = store.add("Failed publish", task_type="implement", create_pr=True)
     assert failed.id is not None
     failed.status = "failed"
     failed.failure_reason = "BRANCH_UNPUSHABLE"
@@ -3956,7 +3956,7 @@ def test_watch_cycle_reconcile_completes_failed_branch_unpushable_task(tmp_path:
         count_commits_ahead=lambda *_args: 1,
         rev_parse_if_exists=lambda ref: {"feature/watch-reconcile-complete": "head123", "main": "base456"}.get(ref),
         can_merge=lambda *_args: True,
-        get_diff_name_status=lambda *_args: "",
+        get_diff_name_status=lambda *_args, **_kwargs: "",
     )
 
     def _execute_with_mocked_git(*, task, action, context):

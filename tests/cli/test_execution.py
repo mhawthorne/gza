@@ -8,7 +8,7 @@ import os
 import re
 import signal as signal_mod
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -424,6 +424,77 @@ def test_run_with_recovery_executes_reconcile_instead_of_terminal_skip(tmp_path:
     complete_after_reconcile.assert_called_once()
     assert terminal_skip_calls == []
     assert final_task.status == "completed"
+
+
+def test_run_with_recovery_reconcile_push_failure_does_not_spawn_retry(tmp_path: Path) -> None:
+    from gza.cli._common import run_with_recovery
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Failed publish", task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/run-with-recovery-still-failing"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    run_calls: list[str] = []
+
+    def _run_task(current_task, _resume):
+        run_calls.append(current_task.id or "")
+        refreshed = store.get(current_task.id)
+        assert refreshed is not None
+        return 1
+
+    def _completion_fails(*, config, store, git, task):
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        refreshed.status = "failed"
+        refreshed.failure_reason = "BRANCH_UNPUSHABLE"
+        refreshed.completed_at = datetime.now(UTC)
+        store.update(refreshed)
+        return 1
+
+    decision = _recovery_engine_module.FailedRecoveryDecision(
+        task_id=task.id,
+        action="reconcile",
+        reason_code="branch_unpushable_retryable",
+        reason_text="reconcile diverged branch before completion retry",
+        launch_mode="none",
+        attempt_index=0,
+        attempt_limit=1,
+    )
+
+    with (
+        patch("gza.cli._common.decide_failed_task_recovery", return_value=decision),
+        patch(
+            "gza.cli.git_ops._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(status="reconciled", message="reconciled"),
+        ),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.git.Git.branch_exists", return_value=True),
+        patch("gza.git.Git.ref_exists", return_value=False),
+        patch(
+            "gza.cli.git_ops.complete_branch_unpushable_after_reconcile",
+            side_effect=_completion_fails,
+        ) as complete_after_reconcile,
+    ):
+        final_task, rc = run_with_recovery(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=1,
+        )
+
+    assert rc == 1
+    complete_after_reconcile.assert_called_once()
+    assert run_calls == [task.id]
+    assert final_task.status == "failed"
+    assert final_task.failure_reason == "BRANCH_UNPUSHABLE"
 
 
 class TestAddCommand:
@@ -8937,7 +9008,7 @@ class TestIterateCommand:
                     "uv run pytest tests/unit -q",
                     status="passed",
                     exit_status="0",
-                    captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                    captured_at=(prior_review.completed_at or datetime.now(UTC)) + timedelta(seconds=1),
                     reviewed_branch=impl.branch,
                     reviewed_head_sha="same-head",
                     reviewed_base_sha="base-sha",
