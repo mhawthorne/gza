@@ -5171,6 +5171,7 @@ class TestRunNonCodeTaskDockerGitMetadata:
                     "'/gza-git/common' (containerized-commondir). expected '../..'. "
                     "container metadata leaked into canonical commondir"
                 ),
+                None,
             ],
         ):
             exit_code = _run_non_code_task(review_task, config, store, provider, mock_git, resume=False)
@@ -5180,6 +5181,88 @@ class TestRunNonCodeTaskDockerGitMetadata:
         assert refreshed is not None
         assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
         assert provider.run.call_count == 0
+        assert config.docker_volumes == []
+        assert config.docker_env == []
+
+    def test_run_inner_docker_code_task_restores_git_metadata_after_post_setup_validation_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(prompt="Implement feature", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260627-docker-git-metadata-post-setup-validation-failure"
+        store.update(task)
+
+        worktree_path = config.worktree_path / task.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        host_worktree_gitdir = tmp_path / "repo.git" / "worktrees" / task.slug
+        host_worktree_gitdir.mkdir(parents=True, exist_ok=True)
+        host_common_gitdir = tmp_path / "repo.git"
+        original_commondir_text = f"{host_common_gitdir}\n"
+        (host_worktree_gitdir / "commondir").write_text(original_commondir_text)
+        original_git_text = f"gitdir: {host_worktree_gitdir}\n"
+        (worktree_path / ".git").write_text(original_git_text)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = worktree_path
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value="feature/docker-git-metadata"),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner._call_provider_run", side_effect=AssertionError("provider should not run")),
+            patch(
+                "gza.runner._assert_host_worktree_admin_metadata_healthy",
+                side_effect=[
+                    None,
+                    GitError(
+                        "Canonical worktree admin metadata became invalid during "
+                        "provider docker metadata preparation post-setup: "
+                        f"{tmp_path / 'repo.git' / 'worktrees' / 'broken' / 'commondir'} contains "
+                        "'/gza-git/common' (containerized-commondir). expected '../..'. "
+                        "container metadata leaked into canonical commondir"
+                    ),
+                    None,
+                ],
+            ),
+            patch(
+                "gza.runner.check_canonical_checkout_invariant",
+                return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+            ),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.failure_reason == "INFRASTRUCTURE_ERROR"
+        assert mock_provider.run.call_count == 0
+        assert (worktree_path / ".git").read_text() == original_git_text
+        assert (host_worktree_gitdir / "commondir").read_text() == original_commondir_text
+        assert getattr(config, "docker_env", []) == []
+        assert f"{host_worktree_gitdir}:/gza-git/worktree" not in config.docker_volumes
 
 
 class TestRunNonCodeTaskWorktreeReportDir:

@@ -703,7 +703,15 @@ def _prepare_validated_docker_worktree_git_metadata(
         target_config=target_config,
         worktree_path=worktree_path,
     )
-    _assert_host_worktree_admin_metadata_healthy(canonical_git, phase=f"{phase} post-setup")
+    try:
+        _assert_host_worktree_admin_metadata_healthy(canonical_git, phase=f"{phase} post-setup")
+    except Exception:
+        _restore_validated_docker_worktree_git_metadata(
+            docker_git_metadata,
+            canonical_git=canonical_git,
+            phase=phase,
+        )
+        raise
     return docker_git_metadata
 
 
@@ -9106,6 +9114,7 @@ def _run_inner(
         except GitError:
             fix_commits_ahead_before_run = None
 
+    stats = TaskStats()
     try:
         docker_git_metadata = _prepare_validated_docker_worktree_git_metadata(
             config=config,
