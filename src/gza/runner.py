@@ -398,7 +398,7 @@ def _fail_if_workspace_not_populated(
         return False
 
     error_message(f"Error: {workspace_population_error}")
-    _mark_workspace_setup_failure(
+    _record_startup_failure(
         task=task,
         config=config,
         store=store,
@@ -406,10 +406,13 @@ def _fail_if_workspace_not_populated(
         invocation=invocation,
         interaction_mode=interaction_mode,
         resume=resume,
-        message=workspace_population_error,
-        failure_reason="WORKSPACE_NOT_POPULATED",
-        phase="workspace_population_probe",
-        branch=branch,
+        failure=_build_startup_failure_record(
+            phase="workspace_setup",
+            setup_phase="workspace_population_probe",
+            message=workspace_population_error,
+            branch=branch,
+            failure_reason="WORKSPACE_NOT_POPULATED",
+        ),
         prelude_written=prelude_written,
     )
     return True

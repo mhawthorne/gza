@@ -18203,15 +18203,27 @@ class TestExceptionHandlerMarkFailed:
 
         assert refreshed.log_file is not None
         log_file = config.project_dir / refreshed.log_file
+        log_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
         ops_entries = [
             json.loads(line)
             for line in ops_log_path_for(log_file).read_text().splitlines()
             if line.strip()
         ]
+        startup_failure = next(entry for entry in log_entries if entry.get("subtype") == "startup_failure")
+        assert startup_failure["failure_reason"] == "WORKSPACE_NOT_POPULATED"
+        assert startup_failure["phase"] == "workspace_setup"
+        assert startup_failure["setup_phase"] == "workspace_population_probe"
+        assert startup_failure["branch"] == "feature/empty-workspace"
+        assert "before provider run" in startup_failure["message"]
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["failure_reason"] == "WORKSPACE_NOT_POPULATED"
         assert outcome["phase"] == "workspace_setup"
         assert outcome["setup_phase"] == "workspace_population_probe"
+        assert outcome["branch"] == "feature/empty-workspace"
         assert "before provider run" in outcome["message"]
         assert not any(entry.get("subtype") == "stats" for entry in ops_entries)
 
@@ -18382,11 +18394,21 @@ class TestExceptionHandlerMarkFailed:
 
         assert refreshed.log_file is not None
         log_file = config.project_dir / refreshed.log_file
+        log_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
         ops_entries = [
             json.loads(line)
             for line in ops_log_path_for(log_file).read_text().splitlines()
             if line.strip()
         ]
+        startup_failure = next(entry for entry in log_entries if entry.get("subtype") == "startup_failure")
+        assert startup_failure["failure_reason"] == "WORKSPACE_NOT_POPULATED"
+        assert startup_failure["phase"] == "workspace_setup"
+        assert startup_failure["setup_phase"] == "workspace_population_probe"
+        assert "before provider run" in startup_failure["message"]
         outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
         assert outcome["failure_reason"] == "WORKSPACE_NOT_POPULATED"
         assert outcome["phase"] == "workspace_setup"
