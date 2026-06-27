@@ -2577,16 +2577,24 @@ def _format_lineage(
 
     lines: list[str] = [_node_label(lineage_tree.task)]
 
-    def _walk(node: _TaskLineageNode, prefix: str) -> None:
+    def _walk(node: _TaskLineageNode, ancestors_last: tuple[bool, ...] = ()) -> None:
         for index, child in enumerate(node.children):
             is_last = index == (len(node.children) - 1)
-            branch = "└── " if is_last else "├── "
-            lines.append(f"{prefix}{branch}{_node_label(child.task, child.relationship)}")
-            next_prefix = f"{prefix}{'    ' if is_last else '│   '}"
-            _walk(child, next_prefix)
+            prefix = _lineage_tree_prefix((*ancestors_last, is_last))
+            lines.append(f"{prefix}{_node_label(child.task, child.relationship)}")
+            _walk(child, (*ancestors_last, is_last))
 
-    _walk(lineage_tree, "")
+    _walk(lineage_tree)
     return "\n".join(lines)
+
+
+def _lineage_tree_prefix(ancestors_last: tuple[bool, ...]) -> str:
+    """Render a tree connector with guide widths that match child connectors."""
+    if not ancestors_last:
+        return ""
+    prefix = "".join("    " if flag else "│   " for flag in ancestors_last[:-1])
+    prefix += "└── " if ancestors_last[-1] else "├── "
+    return prefix
 
 
 def _resolved_review_scope_metadata(task: DbTask) -> str | None:

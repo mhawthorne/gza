@@ -110,6 +110,7 @@ from ._common import (
     _build_failure_diagnostics,
     _failure_next_steps,
     _format_lineage,
+    _lineage_tree_prefix,
     _parse_iso,
     _render_failure_diagnostics,
     _resolve_task_log_path,
@@ -4026,12 +4027,7 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         ancestors_last: tuple[bool, ...] = (),
     ) -> list[tuple[TaskLineageNode, str]]:
         rows: list[tuple[TaskLineageNode, str]] = []
-        if ancestors_last:
-            prefix = "".join(" " if flag else "│" for flag in ancestors_last[:-1])
-            prefix += "└── " if ancestors_last[-1] else "├── "
-        else:
-            prefix = ""
-        rows.append((node, prefix))
+        rows.append((node, _lineage_tree_prefix(ancestors_last)))
 
         for idx, child in enumerate(node.children):
             rows.extend(

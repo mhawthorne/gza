@@ -15364,7 +15364,7 @@ class TestLineageCommand:
         assert len(prompt_positions) == 1
 
     def test_lineage_prefix_depth_increments_one_column_per_level(self, tmp_path: Path):
-        """Ancestor indentation grows by exactly one column per depth level."""
+        """Ancestor indentation grows by exactly one connector width per depth level."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -15407,8 +15407,79 @@ class TestLineageCommand:
         grandchild_connector_col = grandchild_line.index("└── ")
         great_grandchild_connector_col = great_grandchild_line.index("└── ")
 
-        assert grandchild_connector_col - child_connector_col == 1
-        assert great_grandchild_connector_col - grandchild_connector_col == 1
+        assert grandchild_connector_col - child_connector_col == 4
+        assert great_grandchild_connector_col - grandchild_connector_col == 4
+
+    def test_lineage_tree_guides_match_show_lineage_alignment(self, tmp_path: Path):
+        """Standalone lineage tree uses the same 4-column guide alignment as show."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+
+        root = store.add("Root implement", task_type="implement")
+        assert root.id is not None
+        root.status = "completed"
+        root.completed_at = now
+        store.update(root)
+
+        child = store.add("Child improve", task_type="improve", based_on=root.id)
+        assert child.id is not None
+        child.status = "completed"
+        child.completed_at = now
+        store.update(child)
+
+        grandchild = store.add("Grandchild improve", task_type="improve", based_on=child.id)
+        assert grandchild.id is not None
+        grandchild.status = "completed"
+        grandchild.completed_at = now
+        store.update(grandchild)
+
+        sibling = store.add("Sibling improve", task_type="improve", based_on=child.id)
+        assert sibling.id is not None
+        sibling.status = "completed"
+        sibling.completed_at = now
+        store.update(sibling)
+
+        deep_child = store.add("Deep child", task_type="fix", based_on=grandchild.id)
+        assert deep_child.id is not None
+        deep_child.status = "completed"
+        deep_child.completed_at = now
+        store.update(deep_child)
+
+        root_sibling = store.add("Root sibling review", task_type="review", depends_on=root.id)
+        assert root_sibling.id is not None
+        root_sibling.status = "completed"
+        root_sibling.completed_at = now
+        store.update(root_sibling)
+
+        lineage_result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
+        show_result = invoke_gza("show", str(root.id), "--project", str(tmp_path))
+
+        assert lineage_result.returncode == 0
+        assert show_result.returncode == 0
+
+        lineage_lines = {
+            match.group(1): line
+            for line in lineage_result.stdout.splitlines()
+            for match in [re.search(r"(testproject-\d+)", line)]
+            if match
+        }
+        show_lines = {
+            match.group(1): line
+            for line in show_result.stdout.splitlines()
+            for match in [re.search(r"(testproject-\d+)", line)]
+            if match
+        }
+
+        branched_task_id = next(
+            task_id for task_id, line in lineage_lines.items() if "│   ├── " in line
+        )
+
+        assert "│   ├── " in lineage_lines[branched_task_id]
+        assert "│   │   └── " in lineage_lines[deep_child.id]
+        assert lineage_lines[branched_task_id].index("├── ") == show_lines[branched_task_id].index("├── ")
+        assert lineage_lines[deep_child.id].index("└── ") == show_lines[deep_child.id].index("└── ")
 
 
 class TestPsSortKey:
