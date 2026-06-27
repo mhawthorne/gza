@@ -229,15 +229,45 @@ def task_owns_merge_status(task: "Task") -> bool:
     return not (task.task_type in {"improve", "fix", "rebase"} and task.based_on is not None)
 
 
+MERGE_UNIT_ACTIONABLE_STATES: frozenset[str] = frozenset({"unmerged", "blocked", "stale"})
+MERGE_UNIT_LANDED_OR_NO_WORK_STATES: frozenset[str] = frozenset({"merged", "empty", "redundant"})
+MERGE_UNIT_INACTIVE_TOMBSTONE_STATES: frozenset[str] = frozenset({"dropped", "superseded"})
+MERGE_UNIT_ACTIVE_STATES: frozenset[str] = (
+    MERGE_UNIT_ACTIONABLE_STATES | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
+)
+
+
+def merge_unit_state_is_inactive_tombstone(state: str | None) -> bool:
+    """Return whether a merge-unit state is a manual inactive tombstone."""
+    return state in MERGE_UNIT_INACTIVE_TOMBSTONE_STATES
+
+
+def merge_unit_is_active(unit: "MergeUnit | None") -> bool:
+    """Return whether a merge unit should participate in shared active-unit reads."""
+    return (
+        unit is not None
+        and unit.superseded_by_unit_id is None
+        and not merge_unit_state_is_inactive_tombstone(unit.state)
+    )
+
+
+def active_merge_unit_where_sql(alias: str) -> str:
+    """Return the shared SQL predicate for active merge-unit reads."""
+    return (
+        f"{alias}.superseded_by_unit_id IS NULL "
+        f"AND {alias}.state NOT IN ('dropped', 'superseded')"
+    )
+
+
 def merge_unit_legacy_state(state: str | None) -> str | None:
     """Map merge-unit state to the legacy task-row merge_status field."""
     if state is None:
         return None
     if state == "merged":
         return "merged"
-    if state in {"unmerged", "blocked"}:
+    if state in MERGE_UNIT_ACTIONABLE_STATES:
         return "unmerged"
-    if state in {"stale", "empty", "redundant"}:
+    if state in (MERGE_UNIT_LANDED_OR_NO_WORK_STATES | MERGE_UNIT_INACTIVE_TOMBSTONE_STATES):
         return None
     return None
 
@@ -5903,13 +5933,29 @@ class SqliteTaskStore:
     def resolve_merge_unit_for_task(self, task_id: str) -> MergeUnit | None:
         """Resolve the active merge unit attached to a task row.
 
-        Each task has at most one active (non-superseded) merge unit.
+        Each task has at most one active merge unit.
+        """
+        units = self.list_merge_units_for_task(task_id, active_only=True)
+        return units[0] if units else None
+
+    def list_merge_units_for_task(
+        self,
+        task_id: str,
+        *,
+        active_only: bool = False,
+    ) -> list[MergeUnit]:
+        """Return merge units attached to a task, newest first.
+
+        Recovery and audit paths sometimes need historical membership, not only the
+        shared active-unit view. ``active_only=True`` preserves the existing active
+        resolution contract for callers that should ignore tombstoned units.
         """
         if not self.supports_merge_units():
-            return None
+            return []
+        where_active = f" AND {active_merge_unit_where_sql('mu')}" if active_only else ""
         with self._connect() as conn:
-            row = conn.execute(
-                """
+            rows = conn.execute(
+                f"""
                 SELECT mu.*
                 FROM merge_unit_tasks mut
                 JOIN merge_units mu
@@ -5917,15 +5963,12 @@ class SqliteTaskStore:
                  AND mu.id = mut.merge_unit_id
                 WHERE mut.project_id = ?
                   AND mut.task_id = ?
-                  AND mu.superseded_by_unit_id IS NULL
+                  {where_active}
                 ORDER BY mu.updated_at DESC, mu.id DESC
-                LIMIT 1
                 """,
                 (self._project_id, task_id),
-            ).fetchone()
-        return self._row_to_merge_unit(row)
-
-        return row is not None
+            ).fetchall()
+        return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 
     def task_is_attached_to_merge_unit_ids(self, task_id: str, merge_unit_ids: tuple[str, ...]) -> bool:
         """Return whether a task is attached to any active merge unit in ``merge_unit_ids``."""
@@ -5943,7 +5986,7 @@ class SqliteTaskStore:
                  AND mu.id = mut.merge_unit_id
                 WHERE mut.project_id = ?
                   AND mut.task_id = ?
-                  AND mu.superseded_by_unit_id IS NULL
+                  AND {active_merge_unit_where_sql("mu")}
                   AND mu.id IN ({placeholders})
                 LIMIT 1
                 """,
@@ -5995,7 +6038,7 @@ class SqliteTaskStore:
             if branch_task.id is None:
                 continue
             active_unit = self.resolve_merge_unit_for_task(branch_task.id)
-            if active_unit is not None and active_unit.superseded_by_unit_id is None:
+            if merge_unit_is_active(active_unit):
                 return active_unit
         return None
 
@@ -6093,7 +6136,7 @@ class SqliteTaskStore:
         self,
         states: tuple[str, ...] | None = None,
     ) -> list[MergeUnit]:
-        """List active (non-superseded) merge units, optionally filtered by state."""
+        """List active merge units, optionally filtered by state."""
         if not self.supports_merge_units():
             return []
         params: list[object] = [self._project_id]
@@ -6107,7 +6150,7 @@ class SqliteTaskStore:
                 SELECT *
                 FROM merge_units
                 WHERE project_id = ?
-                  AND superseded_by_unit_id IS NULL
+                  AND {active_merge_unit_where_sql("merge_units")}
                   {where_state}
                 ORDER BY updated_at DESC, id DESC
                 """,
@@ -6144,7 +6187,7 @@ class SqliteTaskStore:
         if not tasks:
             return
         owner = self._legacy_merge_status_owner_for_unit(unit)
-        legacy_status = merge_unit_legacy_state(unit.state)
+        legacy_status = merge_unit_legacy_state(unit.state) if merge_unit_is_active(unit) else None
         with self._connect() as conn:
             for task in tasks:
                 if task.id is None:
@@ -6366,7 +6409,7 @@ class SqliteTaskStore:
 
     def get_unmerged_merge_units(self) -> list[MergeUnit]:
         """Return actionable merge units."""
-        return self.list_active_merge_units(states=("unmerged", "blocked", "stale"))
+        return self.list_active_merge_units(states=tuple(sorted(MERGE_UNIT_ACTIONABLE_STATES)))
 
     def list_merged_units(
         self,
@@ -6416,7 +6459,7 @@ class SqliteTaskStore:
             if task.id is None or not task.branch:
                 continue
             unit = self.get_or_create_merge_unit_for_task(task)
-            if unit is None or unit.state not in {"unmerged", "blocked", "stale"}:
+            if unit is None or unit.state not in MERGE_UNIT_ACTIONABLE_STATES:
                 continue
             units_by_id.setdefault(unit.id, unit)
         return sorted(

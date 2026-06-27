@@ -19,6 +19,7 @@ class RecoveryReadContext:
     depends_on_children: Mapping[str, Sequence[DbTask]] = field(default_factory=dict)
     root_by_task_id: Mapping[str, DbTask] = field(default_factory=dict)
     merge_units_by_task_id: Mapping[str, MergeUnit] = field(default_factory=dict)
+    historical_merge_units_by_task_id: Mapping[str, Sequence[MergeUnit]] = field(default_factory=dict)
     merge_context: object | None = None
     recovery_snapshots: dict[str, object] = field(default_factory=dict)
     lineage_tree_by_root_task_id: dict[str, object] = field(default_factory=dict)
@@ -44,6 +45,11 @@ class RecoveryReadContext:
         if task_id is None:
             return None
         return self.merge_units_by_task_id.get(task_id)
+
+    def list_merge_units_for_task(self, task_id: str | None) -> tuple[MergeUnit, ...]:
+        if task_id is None:
+            return ()
+        return tuple(self.historical_merge_units_by_task_id.get(task_id, ()))
 
     def resolve_merge_unit_owner_task(self, merge_unit: MergeUnit | None) -> DbTask | None:
         if merge_unit is None:

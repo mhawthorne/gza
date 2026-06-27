@@ -20,6 +20,7 @@ def _read_context_for_store(store: SqliteTaskStore) -> RecoveryReadContext:
         depends_on_children=indexes.depends_on_children,
         root_by_task_id=indexes.root_by_task_id,
         merge_units_by_task_id=indexes.merge_units_by_task_id,
+        historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=False,
     )
 

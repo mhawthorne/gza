@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from .db import MergeUnit, SqliteTaskStore, Task as DbTask, merge_unit_is_active, task_id_numeric_key
 from .git import Git, prime_advance_planning_refs
 from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
@@ -123,6 +123,7 @@ class _LineageIndexes:
     members_by_owner_id: dict[str, list[DbTask]]
     skipped_same_branch_members_by_root_id: dict[str, list[DbTask]]
     merge_units_by_task_id: dict[str, MergeUnit]
+    historical_merge_units_by_task_id: dict[str, tuple[MergeUnit, ...]]
     impl_based_on_ids: set[str]
     non_dropped_impl_source_ids: set[str]
 
@@ -396,19 +397,18 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         children.sort(key=_indexed_child_created_order_key)
 
     merge_units_by_task_id: dict[str, MergeUnit] = {}
+    historical_merge_units_by_task_id: dict[str, tuple[MergeUnit, ...]] = {}
     if store.supports_merge_units():
-        for unit in store.list_active_merge_units():
-            for member in store.list_tasks_for_merge_unit(unit.id):
-                if member.id is not None:
-                    existing = merge_units_by_task_id.get(member.id)
-                    unit_key = (_normalize_dt(unit.updated_at), unit.id)
-                    existing_key = (
-                        (_normalize_dt(existing.updated_at), existing.id)
-                        if existing is not None
-                        else None
-                    )
-                    if existing_key is None or unit_key > existing_key:
-                        merge_units_by_task_id[member.id] = unit
+        for task in tasks:
+            if task.id is None:
+                continue
+            units = tuple(store.list_merge_units_for_task(task.id))
+            if not units:
+                continue
+            historical_merge_units_by_task_id[task.id] = units
+            active_unit = next((unit for unit in units if merge_unit_is_active(unit)), None)
+            if active_unit is not None:
+                merge_units_by_task_id[task.id] = active_unit
 
     recovery_read_context = RecoveryReadContext(
         tasks=tasks,
@@ -416,6 +416,7 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         based_on_children=based_on_children,
         depends_on_children=depends_on_children,
         merge_units_by_task_id=merge_units_by_task_id,
+        historical_merge_units_by_task_id=historical_merge_units_by_task_id,
         allow_reconcile_mutation=False,
     )
 
@@ -518,6 +519,7 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         members_by_owner_id=members_by_owner_id,
         skipped_same_branch_members_by_root_id=skipped_same_branch_members_by_root_id,
         merge_units_by_task_id=merge_units_by_task_id,
+        historical_merge_units_by_task_id=historical_merge_units_by_task_id,
         impl_based_on_ids=store.get_impl_based_on_ids(),
         non_dropped_impl_source_ids=collect_non_dropped_implement_source_ids(tasks),
     )
@@ -1180,6 +1182,7 @@ def _query_lineage_owner_rows_with_context(
         depends_on_children=indexes.depends_on_children,
         root_by_task_id=indexes.root_by_task_id,
         merge_units_by_task_id=indexes.merge_units_by_task_id,
+        historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=store._read_session_depth == 0,
     )
     if isinstance(git, Git) and target_branch is not None:

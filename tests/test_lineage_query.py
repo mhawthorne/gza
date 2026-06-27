@@ -64,6 +64,7 @@ def _read_context_for_store(store: SqliteTaskStore) -> RecoveryReadContext:
         depends_on_children=indexes.depends_on_children,
         root_by_task_id=indexes.root_by_task_id,
         merge_units_by_task_id=indexes.merge_units_by_task_id,
+        historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=False,
     )
 
@@ -3023,6 +3024,47 @@ def test_load_indexes_matches_merge_unit_updated_at_then_id_tie_break(tmp_path: 
     assert resolved is not None
     assert indexes.merge_units_by_task_id[task.id].id == resolved.id
     assert resolved.id == max(first.id, second.id)
+
+
+def test_load_indexes_excludes_inactive_manual_tombstone_merge_units(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    dropped = store.add("Dropped implementation", task_type="implement")
+    superseded = store.add("Superseded implementation", task_type="implement")
+    winner = store.add("Winning implementation", task_type="implement")
+    assert dropped.id is not None
+    assert superseded.id is not None
+    assert winner.id is not None
+
+    store.mark_completed(dropped, has_commits=True, branch="feature/indexes-dropped")
+    store.mark_completed(superseded, has_commits=True, branch="feature/indexes-superseded")
+    store.mark_completed(winner, has_commits=True, branch="feature/indexes-winner")
+
+    dropped_unit = store.resolve_merge_unit_for_task(dropped.id)
+    superseded_unit = store.resolve_merge_unit_for_task(superseded.id)
+    winner_unit = store.resolve_merge_unit_for_task(winner.id)
+    assert dropped_unit is not None
+    assert superseded_unit is not None
+    assert winner_unit is not None
+
+    store.set_merge_unit_state(dropped_unit.id, "dropped")
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET superseded_by_unit_id = ?, updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (winner_unit.id, "2026-06-27 12:00:00", store._project_id, superseded_unit.id),
+        )
+    store.dual_write_legacy_merge_status(superseded_unit.id)
+
+    indexes = _load_indexes(store)
+
+    assert dropped.id not in indexes.merge_units_by_task_id
+    assert superseded.id not in indexes.merge_units_by_task_id
+    assert indexes.merge_units_by_task_id[winner.id].id == winner_unit.id
 
 
 def test_query_lineage_owner_rows_hides_branchless_moot_prerequisite_unmerged_failed_owner_from_recovery_lane(

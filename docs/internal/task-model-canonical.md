@@ -33,6 +33,18 @@ The expected squash-merge shape is therefore: `merge_unit.state == "merged"`, br
 
 An `empty` merge-unit state is the other terminal lifecycle outcome for code-bearing branches. It is neither DB lifecycle `merged` nor active `unmerged`: the branch has no remaining net commits to land against its target, so lifecycle queries should treat it as moot/complete and exclude it from `needs_merge`, while merge provenance fields such as `merged_at` stay unset.
 
+Merge units also have an **inactive manual tombstone axis**: `dropped` and `superseded`.
+These states preserve historical membership and auditability, but they are not active
+owner-row work and they are not landed/no-work dependency proof. Shared active-unit reads
+must treat both `state in {"dropped", "superseded"}` and `superseded_by_unit_id != NULL`
+as inactive. Historical direct lookup (`get_merge_unit(unit_id)`) still returns those rows.
+
+That yields three distinct merge-unit buckets:
+
+- Actionable active work: `unmerged`, `blocked`, `stale`
+- Active terminal landed/no-work: `merged`, `empty`, `redundant`
+- Inactive historical tombstones: `dropped`, `superseded`, plus any row hidden by `superseded_by_unit_id`
+
 An `empty` prerequisite also has a distinct dependency-policy answer. It **does** satisfy a downstream merge-required `depends_on` edge, because the upstream merge unit is terminal and moot. That decision must stay routed through the single shared `empty_prereq_satisfies_dependency()` policy hook in `src/gza/dependency_preconditions.py`; its default return is `True`, and any future policy flip should only require changing that one hook instead of reworking multiple lifecycle call sites.
 
 A prerequisite with authoritative merge-unit state `merged` is stronger still: once the dependency's work is already landed on target, downstream merge-required `depends_on` edges are satisfied even if the direct task row later ends in `failed`. That is a dependency-readiness rule, not a failed-task recovery suppression rule; the same failed task must still follow the shared recovery policy for its own operator-facing recovery row decisions.

@@ -46,6 +46,7 @@ def _read_context_for_store(store) -> RecoveryReadContext:
         depends_on_children=indexes.depends_on_children,
         root_by_task_id=indexes.root_by_task_id,
         merge_units_by_task_id=indexes.merge_units_by_task_id,
+        historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=False,
     )
 
@@ -94,6 +95,35 @@ def _attach_redundant_merge_unit(store, task) -> None:
         state="redundant",
     )
     store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+
+def _attach_historical_merge_unit(
+    store,
+    task,
+    *,
+    state: str = "unmerged",
+    superseded_by_unit_id: str | None = None,
+):
+    assert task.id is not None
+    unit = store.create_merge_unit(
+        source_branch=task.branch or f"feature/{task.id}",
+        target_branch="main",
+        owner_task_id=task.id,
+        state=state,
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+    if superseded_by_unit_id is not None:
+        with store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET superseded_by_unit_id = ?, updated_at = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (superseded_by_unit_id, "2026-06-27 12:00:00", store._project_id, unit.id),
+            )
+        store.dual_write_legacy_merge_status(unit.id)
+    return unit
 
 
 class _StubMergeGit:
@@ -2579,6 +2609,150 @@ def test_recovery_engine_prerequisite_unmerged_stored_redundant_row_is_moot_afte
     assert unit.state == "redundant"
 
 
+@pytest.mark.parametrize(
+    ("historical_state", "uses_superseded_by"),
+    [
+        ("dropped", False),
+        ("superseded", False),
+        ("unmerged", True),
+    ],
+)
+def test_recovery_engine_hides_failed_tasks_attached_to_tombstoned_merge_units(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    historical_state: str,
+    uses_superseded_by: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = f"feature/{historical_state}-loser"
+    failed.has_commits = True
+    failed.completed_at = datetime(2026, 6, 27, 11, 0, tzinfo=UTC)
+    store.update(failed)
+
+    superseded_by_unit_id: str | None = None
+    if uses_superseded_by:
+        winner = store.add("Winner", task_type="implement")
+        assert winner.id is not None
+        store.mark_completed(winner, has_commits=True, branch="feature/winner")
+        winner_unit = store.resolve_merge_unit_for_task(winner.id)
+        assert winner_unit is not None
+        superseded_by_unit_id = winner_unit.id
+
+    historical_unit = _attach_historical_merge_unit(
+        store,
+        failed,
+        state=historical_state,
+        superseded_by_unit_id=superseded_by_unit_id,
+    )
+
+    assert store.resolve_merge_unit_for_task(failed.id) is None
+
+    store_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert store_decision.action == "skip"
+    assert store_decision.reason_code == "merge_unit_tombstoned"
+    assert should_hide_failed_recovery_decision(store_decision) is True
+    assert list_failed_tasks_for_recovery(store) == []
+
+    read_context = _read_context_for_store(store)
+    assert read_context.resolve_merge_unit_for_task(failed.id) is None
+    assert [unit.id for unit in read_context.list_merge_units_for_task(failed.id)] == [historical_unit.id]
+
+    def _unexpected_store_history_read(*_args, **_kwargs):
+        raise AssertionError("indexed tombstone recovery checks should use RecoveryReadContext history")
+
+    monkeypatch.setattr(store, "list_merge_units_for_task", _unexpected_store_history_read)
+
+    indexed_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, read_context=read_context)
+    assert indexed_decision.action == "skip"
+    assert indexed_decision.reason_code == "merge_unit_tombstoned"
+    assert should_hide_failed_recovery_decision(indexed_decision) is True
+    assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
+
+
+@pytest.mark.parametrize(
+    ("historical_state", "uses_superseded_by"),
+    [
+        ("dropped", False),
+        ("superseded", False),
+        ("unmerged", True),
+    ],
+)
+def test_recovery_engine_keeps_failed_tasks_with_active_merge_unit_despite_historical_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    historical_state: str,
+    uses_superseded_by: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = f"feature/mixed-{historical_state}"
+    failed.has_commits = True
+    failed.completed_at = datetime(2026, 6, 27, 11, 0, tzinfo=UTC)
+    store.update(failed)
+
+    superseded_by_unit_id: str | None = None
+    if uses_superseded_by:
+        winner = store.add("Winner", task_type="implement")
+        assert winner.id is not None
+        store.mark_completed(winner, has_commits=True, branch=f"feature/winner-{historical_state}")
+        winner_unit = store.resolve_merge_unit_for_task(winner.id)
+        assert winner_unit is not None
+        superseded_by_unit_id = winner_unit.id
+
+    historical_unit = _attach_historical_merge_unit(
+        store,
+        failed,
+        state=historical_state,
+        superseded_by_unit_id=superseded_by_unit_id,
+    )
+    active_unit = store.create_merge_unit(
+        source_branch=f"{failed.branch}-active",
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, active_unit.id, "owner")
+
+    resolved = store.resolve_merge_unit_for_task(failed.id)
+    assert resolved is not None
+    assert resolved.id == active_unit.id
+    assert [unit.id for unit in store.list_merge_units_for_task(failed.id)] == [active_unit.id, historical_unit.id]
+
+    store_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert store_decision.action == "retry"
+    assert store_decision.reason_code != "merge_unit_tombstoned"
+    assert should_hide_failed_recovery_decision(store_decision) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    read_context = _read_context_for_store(store)
+    resolved_from_context = read_context.resolve_merge_unit_for_task(failed.id)
+    assert resolved_from_context is not None
+    assert resolved_from_context.id == active_unit.id
+    assert [unit.id for unit in read_context.list_merge_units_for_task(failed.id)] == [active_unit.id, historical_unit.id]
+
+    def _unexpected_store_history_read(*_args, **_kwargs):
+        raise AssertionError("indexed mixed-attachment recovery checks should use RecoveryReadContext history")
+
+    monkeypatch.setattr(store, "list_merge_units_for_task", _unexpected_store_history_read)
+
+    indexed_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, read_context=read_context)
+    assert indexed_decision.action == "retry"
+    assert indexed_decision.reason_code != "merge_unit_tombstoned"
+    assert should_hide_failed_recovery_decision(indexed_decision) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store, read_context=read_context)] == [failed.id]
+
+
 def test_recovery_engine_legacy_empty_with_task_commits_uses_redundant_reason_text(
     tmp_path: Path,
 ) -> None:
@@ -3665,6 +3839,7 @@ def test_decide_failed_task_recovery_uses_read_context_merge_context_not_load(
         depends_on_children=indexes.depends_on_children,
         root_by_task_id=indexes.root_by_task_id,
         merge_units_by_task_id=indexes.merge_units_by_task_id,
+        historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=False,
     )
     read_context.merge_context = pre_loaded_mc  # pre-populate as a batch caller would

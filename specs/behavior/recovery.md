@@ -43,6 +43,13 @@ surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by comma
   the target) never satisfies R5 — it is governed by the no-work recovery predicate (§1),
   not by landed suppression. This rule and `lifecycle-engine.md` §7 ("already landed")
   MUST stay in lockstep.
+- **R7 — Tombstoned merge units are intentionally inactive, not recoverable winners.**
+  A merge unit in state `dropped` or `superseded`, or one hidden behind
+  `superseded_by_unit_id != NULL`, is an operator-declared losing unit. Shared active-unit
+  reads MUST stop resolving it as active work, and failed-task recovery queues/dry-run
+  surfaces MUST omit its attached failed members. This suppression is abandonment, not
+  dependency satisfaction: the tombstoned unit still does not count as landed/no-work for
+  `lineage.md` L1.
 - **R6 — A recovery row carries its action.** A task created to carry recovery
   (`recovery_origin = resume` or `recovery_origin = retry`) MUST be executed with that
   action whenever it runs, by **any** launch path (pending-queue worker pickup, `iterate`,
@@ -139,6 +146,10 @@ resolution. A branch that is merely reachable from the target but has **no uniqu
 is terminal no-work, not a landed representative, and MUST NOT count as proof of
 resolution either (see R5 and `lifecycle-engine.md` §7).
 
+Failed members of a dropped/superseded merge unit are a separate suppression case: they
+MUST disappear from shared recovery queues because the unit is intentionally inactive, even
+though that abandonment does not satisfy dependencies or create a landed representative.
+
 ### 4. Executing a pending recovery row
 
 Sections 1–3 decide whether to **create** a resume/retry for a failed task. This section
@@ -198,6 +209,9 @@ its stored action.
   with a continuable session (see §4).
 - Failed-task recovery queues and dry-run reports MUST omit moot empty/redundant tasks and
   retain recoverable empty/redundant tasks.
+- Failed-task recovery queues and dry-run reports MUST also omit failed tasks whose only
+  attached merge unit is inactive via `superseded_by_unit_id != NULL` or
+  `state in {dropped, superseded}`.
 - `watch`, `advance`, `iterate`, and query/recovery-lane surfaces MUST agree on the same
   recovery decision for the same task.
 

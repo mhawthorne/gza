@@ -110,6 +110,10 @@ A task `T` with `depends_on = D` MUST NOT run until `D`'s work is **satisfied**.
   with `empty`/`redundant` merge evidence MUST remain blocked unless L1 resolves a valid
   completed representative through the `based_on` recovery chain. Recoverable failed
   empty work MUST NOT silently satisfy downstream merge-required dependencies on its own.
+- **Manual tombstone units are never dependency-satisfying.** A merge unit in state
+  `dropped` or `superseded` is historical abandonment, not landed or moot completion.
+  It MUST NOT satisfy a dependency, stand in for a completed representative, or remain
+  selectable from shared active-unit reads.
 - **Retry-chain satisfaction.** If `D` itself is `failed` or `dropped`, satisfaction MUST
   follow the `based_on` recovery chain rooted at `D`: the **first `status == "completed"`
   descendant** (whose merge unit is then `merged`/`empty`/`redundant`) satisfies the dependency.
@@ -217,19 +221,25 @@ It is the object L1/L2 ultimately resolve against.
 
 - A merge unit is identified by a **(source branch, target branch)** pair within a
   project and carries a **canonical owner task** for provenance.
-- Its **state** is `merged`, `unmerged`, `empty`, or `redundant`. `empty` means the
-  task/branch carried no commits of its own. `redundant` means the task carried commits,
-  but branch inspection proved the target already contains equivalent work and no unique
-  commits remain to land. Both `empty` and `redundant` are terminal for lifecycle and
-  dependency-readiness policy: there is nothing left to merge, so they MUST NOT be
-  re-reported as `unmerged`/blocking once proven. `empty`, `redundant`, and `merged` are
-  **distinct**: a branch that is merely reachable from the target with no unique commits
-  is never automatically `merged`/landed, and MUST NOT be treated as a landed
-  representative for failed-task recovery suppression (see `recovery.md` R5 /
+- Its **state** is one of:
+  `unmerged`, `blocked`, `stale`, `merged`, `empty`, `redundant`, `dropped`, or `superseded`.
+  `empty` means the task/branch carried no commits of its own. `redundant` means the task
+  carried commits, but branch inspection proved the target already contains equivalent work
+  and no unique commits remain to land. Both `empty` and `redundant` are terminal for
+  lifecycle and dependency-readiness policy: there is nothing left to merge, so they MUST
+  NOT be re-reported as `unmerged`/blocking once proven. `empty`, `redundant`, and
+  `merged` are **distinct**: a branch that is merely reachable from the target with no
+  unique commits is never automatically `merged`/landed, and MUST NOT be treated as a
+  landed representative for failed-task recovery suppression (see `recovery.md` R5 /
   `lifecycle-engine.md` §7). "Reachable from target" alone does not prove work landed —
   only contributed commits do.
-- A unit MAY be **superseded** (e.g. on re-sync); resolution MUST consider only the active
-  (non-superseded) unit.
+- `dropped` and `superseded` are **inactive manual tombstones**. They preserve history for
+  an abandoned losing unit, but they are not dependency-satisfying, not actionable, and
+  not eligible for shared active-unit resolution by task id or unit listing.
+- A unit MAY also be inactive via `superseded_by_unit_id != NULL` even if its literal
+  `state` is not itself `superseded`. Shared active-unit readers MUST treat both
+  mechanisms the same way: only units with `superseded_by_unit_id == NULL` and
+  `state` not in `{dropped, superseded}` are active.
 - Tasks attach many-to-one to a merge unit. The unit, not any single task, is the "needs
   attention" row operators act on (P1).
 - Proven-merged truth for any member of a merge unit, including a non-owner same-branch
@@ -237,6 +247,10 @@ It is the object L1/L2 ultimately resolve against.
   state. When that proof lands the unit as `merged`, merge provenance MUST stay
   attributed to the canonical owner task rather than the follow-up row that observed the
   merge.
+- When an operator abandons a whole unit, the abandonment applies to the merge unit and
+  all of its attached member rows as one historical work record. That cascade preserves
+  history, but the tombstoned unit still MUST NOT satisfy dependencies or recovery
+  suppression rules that require a landed/no-work representative.
 
 *Implementation note: `MergeUnit` (db.py), `merge_unit_tasks` junction, `resolve_merge_unit_for_task`,
 `list_active_merge_units`. The first-class `empty` state is being introduced by plan

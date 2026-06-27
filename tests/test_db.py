@@ -28,6 +28,7 @@ from gza.db import (
     _is_readonly_snapshot_operational_error,
     check_migration_status,
     import_legacy_local_db,
+    merge_unit_legacy_state,
     preview_v25_migration,
     preview_v26_migration,
     resolve_task_id,
@@ -99,6 +100,85 @@ def test_set_task_changed_diff_persists_and_rebase_wrapper_still_works(tmp_path:
     refreshed_rebase = store.get(rebase.id)
     assert refreshed_rebase is not None
     assert refreshed_rebase.changed_diff is True
+
+
+def test_merge_unit_legacy_state_treats_manual_tombstones_as_inactive() -> None:
+    assert merge_unit_legacy_state("merged") == "merged"
+    assert merge_unit_legacy_state("unmerged") == "unmerged"
+    assert merge_unit_legacy_state("blocked") == "unmerged"
+    assert merge_unit_legacy_state("stale") == "unmerged"
+    assert merge_unit_legacy_state("empty") is None
+    assert merge_unit_legacy_state("redundant") is None
+    assert merge_unit_legacy_state("dropped") is None
+    assert merge_unit_legacy_state("superseded") is None
+
+
+def test_active_merge_unit_readers_exclude_manual_tombstones_and_historical_access_still_works(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    dropped = store.add("Dropped loser", task_type="implement")
+    superseded = store.add("Superseded loser", task_type="implement")
+    displaced = store.add("Displaced loser", task_type="implement")
+    winner = store.add("Winner", task_type="implement")
+    assert dropped.id is not None
+    assert superseded.id is not None
+    assert displaced.id is not None
+    assert winner.id is not None
+
+    store.mark_completed(dropped, has_commits=True, branch="feature/dropped")
+    store.mark_completed(superseded, has_commits=True, branch="feature/superseded")
+    store.mark_completed(displaced, has_commits=True, branch="feature/displaced")
+    store.mark_completed(winner, has_commits=True, branch="feature/winner")
+
+    dropped_unit = store.resolve_merge_unit_for_task(dropped.id)
+    superseded_unit = store.resolve_merge_unit_for_task(superseded.id)
+    displaced_unit = store.resolve_merge_unit_for_task(displaced.id)
+    winner_unit = store.resolve_merge_unit_for_task(winner.id)
+    assert dropped_unit is not None
+    assert superseded_unit is not None
+    assert displaced_unit is not None
+    assert winner_unit is not None
+
+    store.set_merge_unit_state(dropped_unit.id, "dropped")
+    store.set_merge_unit_state(superseded_unit.id, "superseded")
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET superseded_by_unit_id = ?, updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (winner_unit.id, "2026-06-27 12:00:00", store._project_id, displaced_unit.id),
+        )
+    store.dual_write_legacy_merge_status(displaced_unit.id)
+
+    assert store.resolve_merge_unit_for_task(dropped.id) is None
+    assert store.resolve_merge_unit_for_task(superseded.id) is None
+    assert store.resolve_merge_unit_for_task(displaced.id) is None
+    assert store.resolve_merge_unit_for_task(winner.id).id == winner_unit.id
+
+    active_ids = {unit.id for unit in store.list_active_merge_units()}
+    assert winner_unit.id in active_ids
+    assert dropped_unit.id not in active_ids
+    assert superseded_unit.id not in active_ids
+    assert displaced_unit.id not in active_ids
+
+    assert store.task_is_attached_to_merge_unit_ids(dropped.id, (dropped_unit.id,)) is False
+    assert store.task_is_attached_to_merge_unit_ids(superseded.id, (superseded_unit.id,)) is False
+    assert store.task_is_attached_to_merge_unit_ids(displaced.id, (displaced_unit.id,)) is False
+    assert store.task_is_attached_to_merge_unit_ids(winner.id, (winner_unit.id,)) is True
+
+    assert store.get_merge_unit(dropped_unit.id).state == "dropped"
+    assert store.get_merge_unit(superseded_unit.id).state == "superseded"
+    displaced_historical = store.get_merge_unit(displaced_unit.id)
+    assert displaced_historical is not None
+    assert displaced_historical.superseded_by_unit_id == winner_unit.id
+
+    assert store.get(dropped.id).merge_status is None
+    assert store.get(superseded.id).merge_status is None
+    assert store.get(displaced.id).merge_status is None
 
 
 def test_add_tasks_with_artifact_atomic_rollback_does_not_delete_reused_ids(tmp_path: Path) -> None:

@@ -10,7 +10,14 @@ from typing import Literal
 
 from .branch_publication import load_branch_publication_state
 from .config import Config, ConfigError
-from .db import MergeTargetResolutionError, SqliteTaskStore, Task as DbTask, task_id_numeric_key
+from .db import (
+    MergeTargetResolutionError,
+    SqliteTaskStore,
+    Task as DbTask,
+    merge_unit_is_active,
+    merge_unit_state_is_inactive_tombstone,
+    task_id_numeric_key,
+)
 from .dependency_preconditions import dependency_readiness, get_unmerged_dependency_precondition, task_is_merged
 from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
@@ -93,6 +100,7 @@ class FailedRecoveryDecision:
 def should_hide_failed_recovery_decision(decision: FailedRecoveryDecision) -> bool:
     """Return whether the decision should stay off operator recovery surfaces."""
     return decision.action == "skip" and decision.reason_code in {
+        "merge_unit_tombstoned",
         "resolved_by_merged_target",
         "merge_unit_empty",
         "merge_unit_redundant",
@@ -290,6 +298,29 @@ def _task_merge_state_for_recovery(
     )
     raw_state = unit.state if unit is not None else task.merge_status
     return effective_no_work_merge_state(task, raw_state)
+
+
+def _is_attached_to_tombstoned_merge_unit(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
+    """Return whether only historical inactive merge-unit attachments tombstone recovery."""
+    if task.id is None:
+        return False
+    units = (
+        read_context.list_merge_units_for_task(task.id)
+        if read_context is not None
+        else tuple(store.list_merge_units_for_task(task.id))
+    )
+    has_inactive_historical_attachment = False
+    for unit in units:
+        if merge_unit_is_active(unit):
+            return False
+        if unit.superseded_by_unit_id is not None or merge_unit_state_is_inactive_tombstone(unit.state):
+            has_inactive_historical_attachment = True
+    return has_inactive_historical_attachment
 
 
 def _task_has_executed_resumable_session(task: DbTask) -> bool:
@@ -996,6 +1027,7 @@ def list_failed_tasks_for_recovery(
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
         ]
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task, read_context=read_context)]
+    failed = [task for task in failed if not _is_attached_to_tombstoned_merge_unit(store, task, read_context=read_context)]
     failed = [task for task in failed if not is_resolved_by_merged_target(store, task, read_context=read_context)]
     failed = [
         task
@@ -1364,6 +1396,15 @@ def decide_failed_task_recovery(
             task_id=task_id,
             reason_code="task_type_out_of_scope",
             reason_text=f"task type {task.task_type} is out of scope",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+        )
+
+    if _is_attached_to_tombstoned_merge_unit(store, task, read_context=read_context):
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="merge_unit_tombstoned",
+            reason_text="failed task belongs to a dropped or superseded merge unit",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
         )
