@@ -604,6 +604,7 @@ def persist_review_clearance_artifact(
     impl_task: Task,
     clearance_payload: Mapping[str, Any],
     created_at: datetime,
+    recorded_at: datetime | None = None,
     review_clearance_artifact_kind: str,
     review_clearance_artifact_label: str,
     review_clearance_artifact_producer: str,
@@ -614,6 +615,8 @@ def persist_review_clearance_artifact(
     """Persist a structured review-clearance artifact and bind it to the impl row."""
     if impl_task.id is None:
         raise OffTopicVerifyPersistenceError("review clearance persistence requires an implementation task id")
+    if recorded_at is None:
+        recorded_at = created_at
 
     conn = store._connect()
     prepared_paths: list[Path] = []
@@ -624,10 +627,10 @@ def persist_review_clearance_artifact(
             impl_task.id,
             label=review_clearance_artifact_label,
             output=json.dumps(clearance_payload, indent=2, sort_keys=True),
-            created_at=created_at,
+            created_at=recorded_at,
         )
         prepared_paths.append(prepared_clearance.absolute_path)
-        store._set_review_cleared_at_conn(write_conn, impl_task.id, created_at)
+        store._set_review_cleared_at_conn(write_conn, impl_task.id, recorded_at)
         store._add_artifact_conn(
             write_conn,
             impl_task.id,
@@ -638,7 +641,7 @@ def persist_review_clearance_artifact(
             content_type="application/json; charset=utf-8",
             byte_size=prepared_clearance.bytes,
             sha256=prepared_clearance.digest,
-            created_at=created_at,
+            created_at=recorded_at,
             status=status,
             head_sha=head_sha,
             metadata=metadata,
@@ -667,8 +670,8 @@ def persist_review_clearance_artifact(
         except Exception:
             pass
 
-    impl_task.review_cleared_at = created_at
-    return ReviewClearancePersistenceResult(review_cleared_at=created_at)
+    impl_task.review_cleared_at = recorded_at
+    return ReviewClearancePersistenceResult(review_cleared_at=recorded_at)
 
 
 def build_followup_prompt(

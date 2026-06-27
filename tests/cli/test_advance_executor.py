@@ -603,6 +603,7 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     review = store.add("Review feature", task_type="review", depends_on=impl.id)
     assert review.id is not None
     _mark_completed(review)
+    review.completed_at = datetime(2026, 6, 27, 20, 0, tzinfo=UTC)
     review.output_content = (
         "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
         "## Blockers\n\n"
@@ -668,7 +669,9 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
                 working_directory=str(tmp_path),
             ),
         ),
+        patch("gza.cli.advance_executor.datetime") as mocked_datetime,
     ):
+        mocked_datetime.now.return_value = datetime(2026, 6, 27, 20, 1, tzinfo=UTC)
         result = execute_advance_action(
             task=impl,
             action={
@@ -687,10 +690,11 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     assert result.status == "success"
     assert result.success_message.startswith("Fresh verify passed")
     assert refreshed_impl is not None
-    assert refreshed_impl.review_cleared_at is not None
+    assert refreshed_impl.review_cleared_at == datetime(2026, 6, 27, 20, 1, tzinfo=UTC)
     assert refreshed_improve is not None
     assert refreshed_improve.review_verify_status == "passed"
     assert artifacts
+    assert artifacts[0].created_at == datetime(2026, 6, 27, 20, 1, tzinfo=UTC)
     assert artifacts[0].metadata is not None
     assert artifacts[0].metadata["clearance_kind"] == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND
     assert artifacts[0].metadata["review_task_id"] == review.id
