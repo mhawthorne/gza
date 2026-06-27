@@ -5036,6 +5036,7 @@ def _persist_verify_only_noop_review_clearance(
     if impl_task.id is None or review_task.id is None or source_task.id is None:
         return None
 
+    persisted_at = datetime.now(UTC)
     clearance_payload = {
         "schema_version": 1,
         "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
@@ -5052,7 +5053,7 @@ def _persist_verify_only_noop_review_clearance(
         config=config,
         impl_task=impl_task,
         clearance_payload=clearance_payload,
-        created_at=cleared_at,
+        created_at=persisted_at,
         review_clearance_artifact_kind=REVIEW_CLEARANCE_ARTIFACT_KIND,
         review_clearance_artifact_label="review_clearance",
         review_clearance_artifact_producer="advance_verify_only_noop_recovered",

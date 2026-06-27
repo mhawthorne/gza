@@ -8956,6 +8956,128 @@ class TestIterateCommand:
         assert "Next action: merge" in output
         assert "Iterate complete: MERGE_READY" in output
 
+    def test_iterate_verify_only_noop_recovery_clears_even_when_verify_evidence_predates_review_completion(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.runner import _make_review_verify_result
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/iterate-verify-only-stale-evidence"
+        store.update(impl)
+
+        prior_review = store.add("Review", task_type="review", depends_on=impl.id)
+        assert prior_review.id is not None
+        prior_review.status = "completed"
+        prior_review.output_content = (
+            "## Summary\n\n- Implementation is aligned; verify failed.\n\n"
+            "## Blockers\n\n"
+            "### B1 verify_command failure: flaky unit lane\n"
+            "Evidence: verify_command failed with exit status 1.\n"
+            "Impact: autonomous verify fails.\n"
+            "Required fix: rerun verify_command on the current tip.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        prior_review.completed_at = datetime(2026, 6, 27, 18, 30, tzinfo=UTC)
+        prior_review.review_verify_status = "failed"
+        prior_review.review_verify_branch = impl.branch
+        prior_review.review_verify_head_sha = "same-head"
+        store.update(prior_review)
+
+        noop_improve = store.add(
+            "Improve attempt",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=prior_review.id,
+            same_branch=True,
+        )
+        assert noop_improve.id is not None
+        noop_improve.status = "completed"
+        noop_improve.completed_at = datetime(2026, 6, 27, 18, 35, tzinfo=UTC)
+        noop_improve.branch = impl.branch
+        noop_improve.changed_diff = False
+        store.update(noop_improve)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            verify_command="uv run pytest tests/unit -q",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref in {impl.branch, "HEAD"} else None
+        mock_git.worktree_add_existing.side_effect = (
+            lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
+        )
+        mock_git.worktree_remove.side_effect = lambda path, force=False: SimpleNamespace(returncode=0)
+
+        def _git_for_path(path):
+            worktree_git = MagicMock()
+            worktree_git.repo_dir = Path(path)
+            worktree_git.default_branch.return_value = "main"
+            worktree_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == "HEAD" else None
+            return worktree_git
+
+        verify_captured_at = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.advance_executor.Git", side_effect=_git_for_path),
+            patch("gza.db.Git", return_value=mock_git, create=True),
+            patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+            patch(
+                "gza.cli.advance_executor._run_review_verify_command",
+                return_value=_make_review_verify_result(
+                    "uv run pytest tests/unit -q",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=verify_captured_at,
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="same-head",
+                    reviewed_base_sha="base-sha",
+                    working_directory=str(tmp_path),
+                ),
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert result == 0
+        assert refreshed_impl.review_cleared_at is not None
+        assert refreshed_impl.review_cleared_at > prior_review.completed_at
+        assert "Next action: merge" in output
+        assert "Iterate complete: MERGE_READY" in output
+
+        clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
+        assert len(clearance_artifacts) == 1
+        assert clearance_artifacts[0].created_at == refreshed_impl.review_cleared_at
+        assert clearance_artifacts[0].metadata["reviewed_head_sha"] == "same-head"
+
+        payload_path = tmp_path / clearance_artifacts[0].path
+        assert payload_path.exists()
+        assert '"captured_at": "2026-06-27T12:00:00+00:00"' in payload_path.read_text()
+
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
         """gza iterate rejects tasks that are not implement type."""
 
