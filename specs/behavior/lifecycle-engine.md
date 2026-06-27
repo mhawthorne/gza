@@ -89,6 +89,10 @@ and default to **off**.
   with no implementation follow-up MUST enter automated `plan_review` first when
   `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
   then materialize bounded implementation slices only after an approved valid manifest.
+  `gza iterate <plan>` MUST reuse this same intake path for completed plan sources, and
+  `gza iterate <failed-plan> --resume|--retry` MUST re-enter the same plan loop only
+  after the failed plan source itself has been restarted through the shared failed-task
+  recovery policy.
   Repeated failed automated `plan_review` attempts for the same plan source MUST be bounded by
   a circuit breaker; once the failed-attempt cap is reached, the engine MUST park with
   `plan-review-repeatedly-failed` instead of spawning another review.
@@ -96,8 +100,15 @@ and default to **off**.
   record is missing or incomplete, the engine MUST park with
   `plan-review-materialization-repair-needed`; it MUST NOT silently treat a partial
   prefix as a complete materialization.
+  If a completed plan already has a non-dropped implement descendant but no recorded
+  approved-slice materialization, `iterate` MAY still exit 0, but it MUST report a
+  neutral skip such as `already_has_implement`; it MUST NOT claim the plan is already
+  materialized unless the durable materialization state proves that approved slices
+  were fully materialized.
   The legacy single-implement path is allowed only when
   `require_plan_review_before_implement` is off.
+  Once iterate materializes approved slices, it MUST stop at that materialization result;
+  it MUST NOT continue by iterating the newly created implement children in the same run.
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
   `awaiting_human` with parked reason `awaiting-human-review`.
   Operators MUST NOT pre-create `implement` dependents for that held plan via

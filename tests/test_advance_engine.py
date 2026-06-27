@@ -1627,11 +1627,132 @@ def test_completed_plan_with_partial_unrecorded_plan_materialization_needs_repai
         + "\n```\n"
     )
     store.update(review)
-
-    partial = store.add("Implement slice S1.", task_type="implement", based_on=plan.id, trigger_source="plan-review")
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+    assert action["type"] == "materialize_plan_slices"
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=action["manifest"],
+        trigger_source="manual",
+        require_review_before_merge=True,
+    )
+    partial = store.add(
+        task_specs[0].prompt,
+        task_type="implement",
+        based_on=plan.id,
+        trigger_source="manual",
+        tags=task_specs[0].tags,
+        review_scope=task_specs[0].review_scope,
+        create_review=task_specs[0].create_review,
+    )
     assert partial.id is not None
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "plan-review-materialization-repair-needed"
+
+
+def test_completed_plan_improve_with_existing_implement_child_skips_without_materializing(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    initial_review = store.add("Initial review", task_type="plan_review", depends_on=plan.id)
+    assert initial_review.id is not None
+    initial_review.status = "completed"
+    initial_review.completed_at = datetime.now(UTC)
+    initial_review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+    store.update(initial_review)
+
+    revised_plan = store.add("Revise plan", task_type="plan_improve", depends_on=initial_review.id, based_on=plan.id)
+    assert revised_plan.id is not None
+    revised_plan.status = "completed"
+    revised_plan.completed_at = datetime.now(UTC)
+    store.update(revised_plan)
+
+    revised_review = store.add("Revised review", task_type="plan_review", depends_on=revised_plan.id)
+    assert revised_review.id is not None
+    revised_review.status = "completed"
+    revised_review.completed_at = datetime.now(UTC)
+    revised_review.output_content = _approved_plan_review_report(
+        {
+            **_approved_plan_review_manifest(revised_plan.id),
+            "source_task_type": "plan_improve",
+        }
+    )
+    store.update(revised_review)
+
+    existing_impl = store.add("Existing implement child", task_type="implement", based_on=revised_plan.id)
+    assert existing_impl.id is not None
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), revised_plan, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "already_has_implement"
+
+
+def test_completed_plan_improve_with_partial_unrecorded_materialization_needs_repair(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    initial_review = store.add("Initial review", task_type="plan_review", depends_on=plan.id)
+    assert initial_review.id is not None
+    initial_review.status = "completed"
+    initial_review.completed_at = datetime.now(UTC)
+    initial_review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+    store.update(initial_review)
+
+    revised_plan = store.add("Revise plan", task_type="plan_improve", depends_on=initial_review.id, based_on=plan.id)
+    assert revised_plan.id is not None
+    revised_plan.status = "completed"
+    revised_plan.completed_at = datetime.now(UTC)
+    store.update(revised_plan)
+
+    revised_review = store.add("Revised review", task_type="plan_review", depends_on=revised_plan.id)
+    assert revised_review.id is not None
+    revised_review.status = "completed"
+    revised_review.completed_at = datetime.now(UTC)
+    revised_review.output_content = _approved_plan_review_report(
+        {
+            **_approved_plan_review_manifest(revised_plan.id),
+            "source_task_type": "plan_improve",
+        }
+    )
+    store.update(revised_review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), revised_plan, "main")
+    assert action["type"] == "materialize_plan_slices"
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=revised_plan,
+        review_task=revised_review,
+        manifest=action["manifest"],
+        trigger_source="manual",
+        require_review_before_merge=True,
+    )
+    partial = store.add(
+        task_specs[0].prompt,
+        task_type="implement",
+        based_on=revised_plan.id,
+        trigger_source="manual",
+        tags=task_specs[0].tags,
+        review_scope=task_specs[0].review_scope,
+        create_review=task_specs[0].create_review,
+    )
+    assert partial.id is not None
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), revised_plan, "main")
 
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "plan-review-materialization-repair-needed"
@@ -1784,25 +1905,19 @@ def test_completed_plan_with_incomplete_recorded_plan_materialization_needs_repa
         + "\n```\n"
     )
     store.update(review)
-    manifest_digest = plan_review_manifest_digest(
-        evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")["manifest"]
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+    assert action["type"] == "materialize_plan_slices"
+    manifest_digest = plan_review_manifest_digest(action["manifest"])
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=action["manifest"],
+        trigger_source="manual",
+        require_review_before_merge=True,
     )
 
     partial_materialized_tasks = store.add_tasks_with_artifact_atomic(
-        tasks=[
-            NewTaskParams(
-                prompt="Implement slice S1.",
-                task_type="implement",
-                based_on=plan.id,
-                trigger_source="plan-review",
-            ),
-            NewTaskParams(
-                prompt="Implement slice S2.",
-                task_type="implement",
-                based_on=plan.id,
-                trigger_source="plan-review",
-            ),
-        ],
+        tasks=task_specs,
         artifact_task_id=review.id,
         artifact_kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
         artifact_label="plan_review_materialization",

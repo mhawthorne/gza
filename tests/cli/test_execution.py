@@ -8457,6 +8457,28 @@ class TestIterateCommand:
         store.update(impl)
         return impl
 
+    def _approved_plan_review_output(self, source_task_id: str, *, source_task_type: str = "plan") -> str:
+        return (
+            "## Verdict\n"
+            "Verdict: APPROVED\n\n"
+            "## Slice Manifest\n"
+            "```json\n"
+            "{"
+            f"\"schema_version\":1,\"source_task_id\":\"{source_task_id}\","
+            f"\"source_task_type\":\"{source_task_type}\","
+            "\"verdict\":\"APPROVED\","
+            "\"slice_quality\":{\"fits_single_task_budget\":true,\"timeout_budget_minutes\":30,"
+            "\"max_expected_files_changed_per_slice\":8,\"rationale\":\"Bounded.\"},"
+            "\"slices\":["
+            "{\"slice_id\":\"S1\",\"title\":\"Foundation\",\"prompt\":\"Implement foundation slice.\","
+            "\"scope\":[\"Add parser\"],\"out_of_scope\":[],\"acceptance_criteria\":[\"Parser works\"],"
+            "\"depends_on_slices\":[],\"based_on_slice\":null,\"review_scope\":\"Foundation only.\","
+            "\"estimated_complexity\":\"small\",\"expected_timeout_minutes\":30,"
+            "\"requires_code_review\":true,\"tags\":[\"slice-a\"]}"
+            "]}\n"
+            "```\n"
+        )
+
     def _format_expected_attention_line(self, task, action: dict[str, object]) -> str:
         from gza.advance_engine import format_needs_attention_entry_for_display
 
@@ -8937,15 +8959,1159 @@ class TestIterateCommand:
     def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
         """gza iterate rejects tasks that are not implement type."""
 
+    def test_cmd_iterate_routes_plan_tasks_and_rejects_unsupported_types(self, tmp_path: Path) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
         plan_task = store.add("A plan", task_type="plan")
+        explore_task = store.add("An explore", task_type="explore")
 
-        result = invoke_gza("iterate", str(plan_task.id), "--project", str(tmp_path))
+        plan_args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+        explore_args = argparse.Namespace(**{**vars(plan_args), "impl_task_id": explore_task.id})
 
-        assert result.returncode != 0
-        assert "implement" in result.stdout.lower() or "implement" in result.stderr.lower()
+        with patch("gza.cli.execution._cmd_iterate_plan", return_value=0) as plan_iterate:
+            assert cmd_iterate(plan_args) == 0
+
+        plan_iterate.assert_called_once()
+
+        result = cmd_iterate(explore_args)
+        assert result == 1
+
+    def test_completed_plan_iterate_materializes_slices_without_running_child_implements(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        run_calls: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            run_calls.append(task_id)
+            task = store.get(task_id)
+            assert task is not None
+            if task.task_type == "plan_review":
+                task.status = "completed"
+                task.completed_at = datetime.now(UTC)
+                task.output_content = self._approved_plan_review_output(plan_task.id)
+                store.update(task)
+                return 0
+            pytest.fail(f"unexpected iterate child task type: {task.task_type}")
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert rc == 0
+        assert run_calls and len(run_calls) == 1
+        assert len(implement_tasks) == 1
+        assert implement_tasks[0].status == "pending"
+        assert implement_tasks[0].depends_on is None
+        assert "Created plan review task" in output
+        assert "Created implement task" in output
+        assert "Iterate complete: MATERIALIZED (materialized)" in output
+
+    def test_pending_plan_iterate_runs_source_then_materializes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Pending plan", task_type="plan")
+        assert plan_task.id is not None
+
+        run_calls: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            run_calls.append(task_id)
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            if task.task_type == "plan_review":
+                task.output_content = self._approved_plan_review_output(plan_task.id)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+
+        assert rc == 0
+        assert run_calls[0] == plan_task.id
+        assert "Running pending plan source" in output
+        assert "Created implement task" in output
+
+    def test_failed_plan_iterate_requires_restart_flag(self, tmp_path: Path) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_plan = store.add("Failed plan", task_type="plan")
+        assert failed_plan.id is not None
+        failed_plan.status = "failed"
+        failed_plan.failure_reason = "TIMEOUT"
+        failed_plan.session_id = "plan-session-1"
+        store.update(failed_plan)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 1
+
+    def test_plan_iterate_rejects_resume_for_non_failed_plan(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Completed plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 1
+        assert "only valid for failed tasks" in capsys.readouterr().out
+
+    def test_failed_plan_iterate_resume_runs_recovery_then_materializes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_plan = store.add("Failed plan", task_type="plan")
+        assert failed_plan.id is not None
+        failed_plan.status = "failed"
+        failed_plan.failure_reason = "TIMEOUT"
+        failed_plan.session_id = "plan-session-1"
+        store.update(failed_plan)
+
+        run_calls: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            run_calls.append(task_id)
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            if task.task_type == "plan_review":
+                assert task.depends_on is not None
+                task.output_content = self._approved_plan_review_output(task.depends_on)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=failed_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        resume_children = [
+            task for task in store.get_all() if task.task_type == "plan" and task.based_on == failed_plan.id
+        ]
+
+        assert rc == 0
+        assert len(resume_children) == 1
+        assert run_calls[0] == resume_children[0].id
+        assert "Resuming failed plan source" in output
+        assert "Created implement task" in output
+
+    def test_failed_plan_iterate_resume_recovery_exhaustion_uses_shared_attention(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.recovery_engine import decide_failed_task_recovery
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_plan = store.add("Failed plan", task_type="plan")
+        assert failed_plan.id is not None
+        failed_plan.status = "failed"
+        failed_plan.failure_reason = "MAX_STEPS"
+        failed_plan.session_id = "plan-session-1"
+        store.update(failed_plan)
+
+        args = argparse.Namespace(
+            impl_task_id=failed_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        def fake_run_foreground(_config, task_id, resume=False, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "failed"
+            task.failure_reason = "MAX_STEPS"
+            task.session_id = "plan-session-1"
+            store.update(task)
+            return 1
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground:
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        recovery_children = store.get_based_on_children(failed_plan.id)
+        assert len(recovery_children) == 1
+        failed_resume = recovery_children[0]
+        terminal_decision = decide_failed_task_recovery(
+            store,
+            failed_resume,
+            max_recovery_attempts=1,
+        )
+        expected_line = self._expected_failed_recovery_attention_line(
+            store=store,
+            failed_task=failed_resume,
+            decision=terminal_decision,
+            max_resume_attempts=1,
+        )
+
+        assert result == 3
+        assert run_foreground.call_count == 1
+        assert run_foreground.call_args.kwargs.get("resume") is True
+        assert terminal_decision.reason_code == "retry_limit_reached"
+        assert expected_line in output
+        assert "reason=retry-limit-reached" in output
+        assert output.count("Needs attention:") == 1
+        assert f"Resume of {failed_plan.id} failed" not in output
+        assert f"Recommended next step: uv run gza fix {failed_plan.id}" in output
+
+    def test_failed_held_plan_iterate_resume_preserves_hold_and_stops_for_human(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_plan = store.add("Held failed plan", task_type="plan", auto_implement=False)
+        assert failed_plan.id is not None
+        failed_plan.status = "failed"
+        failed_plan.failure_reason = "TIMEOUT"
+        failed_plan.session_id = "plan-session-1"
+        store.update(failed_plan)
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=failed_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        resume_children = [
+            task for task in store.get_all() if task.task_type == "plan" and task.based_on == failed_plan.id
+        ]
+        plan_reviews = [task for task in store.get_all() if task.task_type == "plan_review"]
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert rc == 3
+        assert len(resume_children) == 1
+        assert resume_children[0].auto_implement is False
+        assert len(plan_reviews) == 0
+        assert len(implement_tasks) == 0
+        assert "Resuming failed plan source" in output
+        assert f"use uv run gza implement {resume_children[0].id}".lower() in output.lower()
+
+    def test_failed_plan_improve_iterate_retry_runs_new_attempt_then_materializes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_plan = store.add("Root plan", task_type="plan")
+        assert root_plan.id is not None
+        root_plan.status = "completed"
+        root_plan.completed_at = datetime.now(UTC)
+        store.update(root_plan)
+
+        review = store.add("Review", task_type="plan_review", depends_on=root_plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        failed_improve = store.add("Failed improve", task_type="plan_improve", based_on=root_plan.id, depends_on=review.id)
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+        store.update(failed_improve)
+
+        run_calls: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            run_calls.append(task_id)
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            if task.task_type == "plan_review":
+                task.output_content = self._approved_plan_review_output(
+                    task.depends_on,
+                    source_task_type="plan_improve",
+                )
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=failed_improve.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        retry_children = [
+            task for task in store.get_all() if task.task_type == "plan_improve" and task.based_on == failed_improve.id
+        ]
+
+        assert rc == 0
+        assert len(retry_children) == 1
+        assert run_calls[0] == retry_children[0].id
+        assert "Retrying failed plan source" in output
+        assert "Created implement task" in output
+
+    def test_failed_held_plan_iterate_retry_preserves_hold_and_stops_for_human(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed_plan = store.add("Held failed plan", task_type="plan", auto_implement=False)
+        assert failed_plan.id is not None
+        failed_plan.status = "failed"
+        failed_plan.failure_reason = "TIMEOUT"
+        store.update(failed_plan)
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=failed_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        retry_children = [
+            task for task in store.get_all() if task.task_type == "plan" and task.based_on == failed_plan.id
+        ]
+        plan_reviews = [task for task in store.get_all() if task.task_type == "plan_review"]
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert rc == 3
+        assert len(retry_children) == 1
+        assert retry_children[0].auto_implement is False
+        assert len(plan_reviews) == 0
+        assert len(implement_tasks) == 0
+        assert "Retrying failed plan source" in output
+        assert f"use uv run gza implement {retry_children[0].id}".lower() in output.lower()
+
+    def test_plan_iterate_changes_requested_runs_plan_improve_then_materializes(
+        self, tmp_path: Path
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review_runs = 0
+        plan_improve_runs = 0
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            nonlocal review_runs, plan_improve_runs
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            if task.task_type == "plan_review":
+                review_runs += 1
+                if review_runs == 1:
+                    task.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+                else:
+                    assert task.depends_on is not None
+                    task.output_content = self._approved_plan_review_output(
+                        task.depends_on,
+                        source_task_type="plan_improve",
+                    )
+            elif task.task_type == "plan_improve":
+                plan_improve_runs += 1
+            else:
+                pytest.fail(f"unexpected iterate child task type: {task.task_type}")
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+            rc = cmd_iterate(args)
+
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        latest_source = max(
+            [task for task in store.get_all() if task.task_type in {"plan", "plan_improve"}],
+            key=lambda task: task_id_numeric_key(task.id),
+        )
+
+        assert rc == 0
+        assert review_runs == 2
+        assert plan_improve_runs == 1
+        assert len(implement_tasks) == 1
+        assert implement_tasks[0].based_on == latest_source.id
+
+    def test_plan_iterate_blocks_when_post_improve_review_requests_more_changes_after_budget(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review_runs = 0
+        plan_improve_runs = 0
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            nonlocal review_runs, plan_improve_runs
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.completed_at = datetime.now(UTC)
+            if task.task_type == "plan_review":
+                review_runs += 1
+                task.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+            elif task.task_type == "plan_improve":
+                plan_improve_runs += 1
+            else:
+                pytest.fail(f"unexpected iterate child task type: {task.task_type}")
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        config = Config.load(tmp_path)
+        config.max_plan_review_cycles = 3
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        plan_improves = [task for task in store.get_all() if task.task_type == "plan_improve"]
+        reviews = [task for task in store.get_all() if task.task_type == "plan_review"]
+
+        assert rc == 3
+        assert review_runs == 2
+        assert plan_improve_runs == 1
+        assert len(implement_tasks) == 0
+        assert len(plan_improves) == 1
+        assert len(reviews) == 2
+        assert "max improve iterations (1) reached before plan approval" in output.lower()
+
+    def test_plan_iterate_reports_blocked_states(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        held_plan = store.add("Held plan", task_type="plan", auto_implement=False)
+        held_plan.status = "completed"
+        held_plan.completed_at = datetime.now(UTC)
+        store.update(held_plan)
+
+        wait_plan = store.add("Plan with running review", task_type="plan")
+        wait_plan.status = "completed"
+        wait_plan.completed_at = datetime.now(UTC)
+        store.update(wait_plan)
+        running_review = store.add("Review", task_type="plan_review", depends_on=wait_plan.id)
+        running_review.status = "in_progress"
+        store.update(running_review)
+
+        disabled_plan = store.add("Disabled plan", task_type="plan")
+        disabled_plan.status = "completed"
+        disabled_plan.completed_at = datetime.now(UTC)
+        store.update(disabled_plan)
+
+        held_args = argparse.Namespace(
+            impl_task_id=held_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+        wait_args = argparse.Namespace(**{**vars(held_args), "impl_task_id": wait_plan.id})
+        disabled_args = argparse.Namespace(**{**vars(held_args), "impl_task_id": disabled_plan.id})
+
+        assert cmd_iterate(held_args) == 3
+        held_output = capsys.readouterr().out
+        assert f"use uv run gza implement {held_plan.id}".lower() in held_output.lower()
+
+        assert cmd_iterate(wait_args) == 3
+        wait_output = capsys.readouterr().out
+        assert "already in progress" in wait_output.lower()
+
+        config = Config.load(tmp_path)
+        config.require_plan_review_before_implement = False
+        with patch("gza.cli.execution.Config.load", return_value=config):
+            assert cmd_iterate(disabled_args) == 1
+        disabled_output = capsys.readouterr().out
+        assert "no plan-review loop is configured" in disabled_output.lower()
+
+    def test_plan_iterate_invalid_approved_manifest_blocks_with_detail(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Invalid manifest plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Plan review", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: APPROVED\n"
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 3
+        output = capsys.readouterr().out
+        assert "invalid slice manifest" in output
+
+    def test_plan_iterate_materialize_action_falls_back_to_latest_review_inputs(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Fallback manifest plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Plan review", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch(
+            "gza.cli.execution.determine_next_action",
+            return_value={"type": "materialize_plan_slices", "description": "materialize"},
+        ):
+            assert cmd_iterate(args) == 0
+
+        output = capsys.readouterr().out
+        assert "Created implement task" in output
+
+    def test_plan_iterate_partial_materialization_requires_repair(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+        from gza.cli.advance_engine import determine_next_action
+        from gza.plan_review_materialization import build_plan_review_slice_task_specs
+        from tests.test_advance_engine import _FakeGit
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Partially materialized plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Plan review", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        action = determine_next_action(Config.load(tmp_path), store, _FakeGit(can_merge=True), plan_task, "main")
+        assert action["type"] == "materialize_plan_slices"
+        task_specs = build_plan_review_slice_task_specs(
+            plan_source_task=plan_task,
+            review_task=review,
+            manifest=action["manifest"],
+            trigger_source="manual",
+            require_review_before_merge=True,
+        )
+        partial_impl = store.add(
+            task_specs[0].prompt,
+            task_type="implement",
+            based_on=plan_task.id,
+            trigger_source="manual",
+            tags=task_specs[0].tags,
+            review_scope=task_specs[0].review_scope,
+            create_review=task_specs[0].create_review,
+        )
+        partial_impl.status = "pending"
+        store.update(partial_impl)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 3
+        output = capsys.readouterr().out
+        assert "repair or drop the partial slice set" in output
+
+    def test_plan_improve_iterate_existing_implement_skips_without_duplicates(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_plan = store.add("Plan", task_type="plan")
+        assert root_plan.id is not None
+        root_plan.status = "completed"
+        root_plan.completed_at = datetime.now(UTC)
+        store.update(root_plan)
+
+        review = store.add("Initial review", task_type="plan_review", depends_on=root_plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        revised_plan = store.add("Revised plan", task_type="plan_improve", depends_on=review.id, based_on=root_plan.id)
+        assert revised_plan.id is not None
+        revised_plan.status = "completed"
+        revised_plan.completed_at = datetime.now(UTC)
+        store.update(revised_plan)
+
+        revised_review = store.add("Revised review", task_type="plan_review", depends_on=revised_plan.id)
+        revised_review.status = "completed"
+        revised_review.completed_at = datetime.now(UTC)
+        revised_review.output_content = self._approved_plan_review_output(
+            revised_plan.id, source_task_type="plan_improve"
+        )
+        store.update(revised_review)
+
+        existing_impl = store.add("Existing implement child", task_type="implement", based_on=revised_plan.id)
+        assert existing_impl.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=revised_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 0
+        output = capsys.readouterr().out
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert len(implement_tasks) == 1
+        assert "Iterate complete: SKIPPED (already_has_implement)" in output
+        assert "implement task already exists for this plan" in output
+
+    def test_plan_improve_iterate_partial_materialization_requires_repair(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.advance_engine import determine_next_action
+        from gza.cli.execution import cmd_iterate
+        from gza.plan_review_materialization import build_plan_review_slice_task_specs
+        from tests.test_advance_engine import _FakeGit
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        root_plan = store.add("Plan", task_type="plan")
+        assert root_plan.id is not None
+        root_plan.status = "completed"
+        root_plan.completed_at = datetime.now(UTC)
+        store.update(root_plan)
+
+        review = store.add("Initial review", task_type="plan_review", depends_on=root_plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        revised_plan = store.add("Revised plan", task_type="plan_improve", depends_on=review.id, based_on=root_plan.id)
+        assert revised_plan.id is not None
+        revised_plan.status = "completed"
+        revised_plan.completed_at = datetime.now(UTC)
+        store.update(revised_plan)
+
+        revised_review = store.add("Revised review", task_type="plan_review", depends_on=revised_plan.id)
+        revised_review.status = "completed"
+        revised_review.completed_at = datetime.now(UTC)
+        revised_review.output_content = self._approved_plan_review_output(
+            revised_plan.id, source_task_type="plan_improve"
+        )
+        store.update(revised_review)
+
+        action = determine_next_action(Config.load(tmp_path), store, _FakeGit(can_merge=True), revised_plan, "main")
+        assert action["type"] == "materialize_plan_slices"
+        task_specs = build_plan_review_slice_task_specs(
+            plan_source_task=revised_plan,
+            review_task=revised_review,
+            manifest=action["manifest"],
+            trigger_source="manual",
+            require_review_before_merge=True,
+        )
+        partial_impl = store.add(
+            task_specs[0].prompt,
+            task_type="implement",
+            based_on=revised_plan.id,
+            trigger_source="manual",
+            tags=task_specs[0].tags,
+            review_scope=task_specs[0].review_scope,
+            create_review=task_specs[0].create_review,
+        )
+        partial_impl.status = "pending"
+        store.update(partial_impl)
+
+        args = argparse.Namespace(
+            impl_task_id=revised_plan.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 3
+        output = capsys.readouterr().out
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert len(implement_tasks) == 1
+        assert "repair or drop the partial slice set" in output
+
+    def test_plan_iterate_background_bypasses_impl_preflight(
+        self, tmp_path: Path
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Background plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=True,
+            force=False,
+            worker_id=None,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", side_effect=AssertionError("implementation preflight should not run")),
+            patch("gza.cli.execution._spawn_background_iterate_worker", return_value=0) as spawn_background,
+        ):
+            assert cmd_iterate(args) == 0
+
+        spawn_background.assert_called_once()
+
+    def test_plan_iterate_dry_run_and_already_materialized_skip(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+        from gza.cli._common import _materialize_plan_review_slices
+        from gza.plan_review_verdict import get_plan_review_outcome
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Materialized plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Review materialized plan", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        review_outcome = get_plan_review_outcome(
+            tmp_path,
+            review,
+            source_task_id=plan_task.id,
+            source_task_type="plan",
+            max_slice_timeout_minutes=30,
+            max_plan_slices=None,
+        )
+        assert review_outcome.manifest is not None
+
+        materialization = _materialize_plan_review_slices(
+            Config.load(tmp_path),
+            store,
+            plan_task,
+            review,
+            review_outcome.manifest,
+            trigger_source="manual",
+            require_review_before_merge=True,
+        )
+        assert materialization.tasks
+
+        dry_run_args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+        run_args = argparse.Namespace(**{**vars(dry_run_args), "dry_run": False})
+
+        assert cmd_iterate(dry_run_args) == 0
+        dry_run_output = capsys.readouterr().out
+        assert "[dry-run] Would iterate plan" in dry_run_output
+
+        assert cmd_iterate(run_args) == 0
+        output = capsys.readouterr().out
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert len(implement_tasks) == len(materialization.tasks)
+        assert "already materialized" in output.lower()
+
+    def test_plan_iterate_existing_implement_skip_is_not_reported_as_materialized(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan with existing implement", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        implement_task = store.add(
+            "Existing implement child",
+            task_type="implement",
+            based_on=plan_task.id,
+        )
+        assert implement_task.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 0
+        output = capsys.readouterr().out
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert len(implement_tasks) == 1
+        assert "implement task already exists for this plan" in output
+        assert "Iterate complete: SKIPPED (already_has_implement)" in output
+        assert "MATERIALIZED" not in output
+        assert "already_materialized" not in output
 
     def test_cycle_rejects_in_progress_task(self, tmp_path: Path):
         """gza iterate rejects implementation tasks that are in_progress."""
@@ -20455,6 +21621,41 @@ class TestRecoveryTaskScopeCloning:
         retried = _create_retry_task(store, original, trigger_source="manual")
 
         assert retried.tags == original.tags
+
+    def test_resume_task_preserves_held_plan_auto_implement(self, tmp_path: Path):
+        from gza.cli._common import _create_resume_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Held plan source",
+            task_type="plan",
+            auto_implement=False,
+        )
+        original.status = "failed"
+        original.session_id = "session-123"
+        store.update(original)
+
+        resumed = _create_resume_task(store, original, trigger_source="manual")
+
+        assert resumed.auto_implement is False
+
+    def test_retry_task_preserves_held_plan_auto_implement(self, tmp_path: Path):
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add(
+            "Held plan source",
+            task_type="plan",
+            auto_implement=False,
+        )
+        original.status = "failed"
+        store.update(original)
+
+        retried = _create_retry_task(store, original, trigger_source="manual")
+
+        assert retried.auto_implement is False
 
 
 class TestAddCommandWithNoLearnings:

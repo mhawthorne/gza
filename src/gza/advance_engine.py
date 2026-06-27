@@ -35,7 +35,10 @@ from gza.off_topic_verify import (
     parse_review_verify_failure_set,
 )
 from gza.operator_state import terminal_no_work_lifecycle_detail
-from gza.plan_review_materialization import load_materialized_plan_slice_set
+from gza.plan_review_materialization import (
+    build_plan_review_slice_task_specs,
+    load_materialized_plan_slice_set,
+)
 from gza.plan_review_verdict import (
     PlanReviewManifest,
     get_plan_review_outcome,
@@ -248,6 +251,7 @@ class PlanMaterializationState:
 
     materialized: bool
     task_ids: tuple[str, ...] = ()
+    partial_slice_descendants_detected: bool = False
 
 
 @dataclass(frozen=True)
@@ -3389,11 +3393,73 @@ def _resolve_plan_materialization_state(
         manifest=manifest,
     )
     if materialized_tasks is None:
-        return PlanMaterializationState(materialized=False)
+        return PlanMaterializationState(
+            materialized=False,
+            partial_slice_descendants_detected=_has_unrecorded_plan_review_slice_descendants(
+                config=config,
+                store=store,
+                latest_plan_source=latest_plan_source,
+                latest_completed_plan_review=latest_completed_plan_review,
+                manifest=manifest,
+            ),
+        )
     return PlanMaterializationState(
         materialized=True,
         task_ids=tuple(task.id for task in materialized_tasks if task.id is not None),
     )
+
+
+def _has_unrecorded_plan_review_slice_descendants(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    latest_plan_source: DbTask,
+    latest_completed_plan_review: DbTask,
+    manifest: PlanReviewManifest,
+) -> bool:
+    """Return whether approved slice tasks exist without a durable materialization record."""
+    if latest_plan_source.id is None or latest_completed_plan_review.id is None:
+        return False
+
+    expected_prompts = {
+        spec.prompt
+        for spec in build_plan_review_slice_task_specs(
+            plan_source_task=latest_plan_source,
+            review_task=latest_completed_plan_review,
+            manifest=manifest,
+            trigger_source="manual",
+            require_review_before_merge=getattr(config, "require_review_before_merge", True),
+        )
+    }
+    if not expected_prompts:
+        return False
+
+    for task in store.get_all():
+        if (
+            task.task_type == "implement"
+            and task.status != "dropped"
+            and task.prompt in expected_prompts
+            and _is_based_on_descendant_of_source(store, task, latest_plan_source.id)
+        ):
+            return True
+    return False
+
+
+def _is_based_on_descendant_of_source(store: SqliteTaskStore, task: DbTask, source_task_id: str) -> bool:
+    """Return whether a task belongs to a source task's based_on chain."""
+    current: DbTask | None = task
+    seen: set[str] = set()
+
+    while current is not None and current.based_on is not None:
+        parent_id = current.based_on
+        if parent_id == source_task_id:
+            return True
+        if parent_id in seen:
+            return False
+        seen.add(parent_id)
+        current = store.get(parent_id)
+
+    return False
 
 
 def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
@@ -4748,10 +4814,21 @@ ADVANCE_RULES: list[AdvanceRule] = [
                     ctx.plan_materialization_state is not None
                     and ctx.plan_materialization_state.materialized
                 )
+                or (
+                    ctx.plan_review_verdict == "APPROVED"
+                    and ctx.validated_plan_review_manifest is not None
+                    and ctx.plan_materialization_state is not None
+                    and not ctx.plan_materialization_state.partial_slice_descendants_detected
+                )
             )
         ),
         action=lambda ctx: {
             "type": "skip",
+            "reason": (
+                "already_materialized"
+                if ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized
+                else "already_has_implement"
+            ),
             "description": (
                 "SKIP: approved plan-review slices are already materialized"
                 if ctx.plan_materialization_state is not None and ctx.plan_materialization_state.materialized
@@ -4769,6 +4846,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.require_plan_review_before_implement
             and ctx.plan_review_verdict == "APPROVED"
             and ctx.validated_plan_review_manifest is not None
+            and ctx.plan_materialization_state is not None
+            and ctx.plan_materialization_state.partial_slice_descendants_detected
             and not (
                 ctx.plan_materialization_state is not None
                 and ctx.plan_materialization_state.materialized

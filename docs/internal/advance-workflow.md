@@ -85,7 +85,13 @@ Manual `implement` follow-up for a held plan is intentionally explicit. `uv run 
 | Completed non-held plan whose plan-review loop hit `max_plan_review_cycles` | `needs_discussion` — stop repeated plan churn (`reason=plan-review-max-cycles-reached`) |
 | Completed non-held plan with approved plan review slices partially present but no durable materialization record | `needs_discussion` — repair or drop the partial slice set before retrying (`reason=plan-review-materialization-repair-needed`) |
 | Completed non-held plan with `require_plan_review_before_implement=false` | `create_implement` — legacy compatibility path |
-| Plan with existing implement child | `skip` |
+| Plan with existing implement child | `skip` — either approved slices are already materialized, or a legacy/direct implement child already exists |
+
+Foreground `gza iterate <plan>` now drives this same action table directly for `plan`
+and `plan_improve` sources. In that mode, iterate may run/recover the plan source
+itself, then create/run `plan_review` or `plan_improve`, and finally materialize the
+approved slice set. It stops at materialization; it does not continue into the new
+implement children.
 
 ### 2. Explore source follow-up
 

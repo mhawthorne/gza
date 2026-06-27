@@ -191,8 +191,9 @@ state to win over already-mergeable fresh code.
 - `watch.max_idle` / `--max-idle` bound consecutive idle supervisor time. When reached,
   watch MUST exit cleanly rather than spin forever doing no work.
 - `watch.max_iterations` / `--max-iterations` are **not** a supervisor loop bound. They
-  bound iterate workers launched for implementation chains. Watch MUST pass that budget to
-  those workers, but MUST NOT treat it as "run only N watch cycles."
+  bound iterate workers launched for detached iterate chains. Watch MUST pass that budget
+  to those workers, whether the chain is driving implementation review/improve work or
+  plan-review/plan-improve work, but MUST NOT treat it as "run only N watch cycles."
 
 ### 2A. Per-cycle human-required parity belongs to phase 5
 
@@ -274,8 +275,9 @@ This is the process-level expression of overview invariant 1.
   `watch.no_activity_timeout` is not live existing work. Watch MUST reconcile it to a
   terminal failure (`NO_ACTIVITY`) before treating the lineage as something to wait on
   or adopt.
-- If a worker is already live for the implementation lineage an iterate start would own,
-  watch MUST NOT start a second iterate worker for that lineage.
+- If a worker is already live for the lineage an iterate start would own, watch MUST NOT
+  start a second iterate worker for that same lineage, whether the detached chain is an
+  implementation chain or a plan chain.
 - Re-running watch after a crash, operator restart, or code re-exec MUST NOT treat
   detached workers as lost merely because the old parent process exited.
 

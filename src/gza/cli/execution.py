@@ -69,7 +69,7 @@ from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_error_message
-from ..plan_review_verdict import get_plan_review_outcome, validate_plan_review_manifest
+from ..plan_review_verdict import PlanReviewManifest, get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
 from ..query import (
     get_base_task_slug as _get_base_task_slug,
@@ -150,6 +150,7 @@ from .advance_engine import (
     determine_next_action,
     format_needs_attention_entry_for_display,
     needs_attention_recommended_next_step,
+    needs_attention_recommends_fix,
     resolve_closing_review_action,
     resolve_subject_task,
 )
@@ -360,6 +361,116 @@ def _run_iterate_task_with_recovery(
         on_terminal_skip=_capture_terminal_skip,
     )
     return final_task, rc, terminal_skip_decision
+
+
+def _print_iterate_failed_recovery_attention(
+    *,
+    store: SqliteTaskStore,
+    failed_task: DbTask,
+    decision: FailedRecoveryDecision,
+    fix_task_id: str,
+    max_resume_attempts: int,
+) -> int | None:
+    attention_result = build_failed_recovery_needs_attention_result(
+        store=store,
+        failed_task=failed_task,
+        recovery_decision=decision,
+        max_resume_attempts=max_resume_attempts,
+    )
+    if attention_result is None:
+        return None
+    attention = resolve_execution_needs_attention(failed_task, attention_result)
+    if attention is None:
+        return None
+    print(
+        f"{NEEDS_ATTENTION_LABEL}: "
+        f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
+    )
+    if needs_attention_recommends_fix(attention.action):
+        print(f"Recommended next step: uv run gza fix {fix_task_id}")
+    return 3
+
+
+def _resolve_failed_iterate_resume_start(
+    *,
+    args: argparse.Namespace,
+    store: SqliteTaskStore,
+    failed_task: DbTask,
+    max_resume_attempts: int,
+) -> tuple[tuple[DbTask, FailedRecoveryDecision] | None, tuple[DbTask, FailedRecoveryDecision] | None]:
+    decision = decide_failed_task_recovery(
+        store,
+        failed_task,
+        max_recovery_attempts=max(1, max_resume_attempts),
+    )
+    if decision.action != "resume":
+        return None, (failed_task, decision)
+    if decision.reuse_existing and decision.recovery_task_id is not None:
+        existing_resume = store.get(decision.recovery_task_id)
+        if existing_resume is None:
+            print_phase1_message(
+                args,
+                f"Error: pending resume child {decision.recovery_task_id} "
+                "selected by recovery policy was not found.",
+            )
+            return None, None
+        return (existing_resume, decision), None
+    return (_create_resume_task(store, failed_task, trigger_source="manual"), decision), None
+
+
+def _resolve_plan_materialization_action_inputs(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    action: dict[str, Any],
+    fallback_source_task: DbTask,
+) -> tuple[DbTask | None, DbTask | None, PlanReviewManifest | None, str | None]:
+    action_source = action.get("plan_source_task")
+    if not isinstance(action_source, DbTask):
+        action_source = fallback_source_task
+
+    review_task = action.get("plan_review_task")
+    if not isinstance(review_task, DbTask):
+        review_task = _latest_completed_non_dropped_plan_review_for_source(store, action_source)
+    if review_task is None or review_task.id is None:
+        return (
+            action_source,
+            None,
+            None,
+            f"Approved plan review for {action_source.id} could not be resolved; rerun plan review or inspect lifecycle state.",
+        )
+
+    manifest = action.get("validated_plan_review_manifest")
+    if manifest is None:
+        manifest = action.get("manifest")
+    if isinstance(manifest, PlanReviewManifest):
+        return action_source, review_task, manifest, None
+
+    outcome = get_plan_review_outcome(
+        Path(config.project_dir),
+        review_task,
+        source_task_id=action_source.id or "",
+        source_task_type=action_source.task_type,
+        max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+    )
+    if outcome.manifest is not None:
+        return action_source, review_task, outcome.manifest, None
+    if outcome.verdict == "APPROVED":
+        detail = outcome.validation_error or "missing approved slice manifest"
+        return (
+            action_source,
+            review_task,
+            None,
+            f"Plan review {review_task.id} is APPROVED but its slice manifest is invalid: {detail}",
+        )
+    detail = outcome.validation_error or "missing verdict"
+    return (
+        action_source,
+        review_task,
+        None,
+        f"Plan review {review_task.id} does not have a valid approved slice manifest to materialize ({detail}).",
+    )
 
 
 @dataclass(frozen=True)
@@ -3708,6 +3819,10 @@ class _AdvanceEngineConfigAdapter:
     advance_create_reviews: bool
     max_review_cycles: int
     max_resume_attempts: int
+    advance_create_plan_reviews: bool = True
+    require_plan_review_before_implement: bool = True
+    max_plan_review_cycles: int = 2
+    max_failed_plan_review_retries: int = 3
     max_noop_improve_cycles: int = 1
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
 
@@ -3729,7 +3844,78 @@ class _PreparedIterateStart:
     review_task_id: str | None = None
 
 
-def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
+def _build_iterate_engine_config(config: Config, *, max_resume_attempts: int) -> _AdvanceEngineConfigAdapter:
+    def _int_config(value: object, default: int) -> int:
+        return value if isinstance(value, int) else default
+
+    return _AdvanceEngineConfigAdapter(
+        project_dir=config.project_dir,
+        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
+        advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
+        max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
+        max_resume_attempts=max_resume_attempts,
+        advance_create_plan_reviews=bool(getattr(config, "advance_create_plan_reviews", True)),
+        require_plan_review_before_implement=bool(
+            getattr(config, "require_plan_review_before_implement", True)
+        ),
+        max_plan_review_cycles=_int_config(getattr(config, "max_plan_review_cycles", None), 2),
+        max_failed_plan_review_retries=_int_config(
+            getattr(config, "max_failed_plan_review_retries", None),
+            3,
+        ),
+        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
+        max_failed_closing_review_retries=_int_config(
+            getattr(config, "max_failed_closing_review_retries", None),
+            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
+        ),
+    )
+
+
+def _print_iterate_summary(
+    *,
+    final_status: str,
+    final_stop_reason: str,
+    summary_rows: list[IterateSummaryRow],
+    iterate_wall_seconds: float,
+) -> None:
+    total_steps = sum(row.steps or 0 for row in summary_rows)
+    total_cost = sum(row.cost_usd or 0.0 for row in summary_rows)
+
+    print(f"\n{'=' * 60}")
+    print(f"Iterate complete: {final_status.upper()} ({final_stop_reason})")
+    print(f"{'=' * 60}")
+    print(f"{'Iter':<5} {'Type':<8} {'Task':<10} {'Verdict':<18} {'Duration':>8} {'Steps':>5} {'Cost':>8} Status")
+    print(f"{'-' * 5} {'-' * 8} {'-' * 10} {'-' * 18} {'-' * 8} {'-' * 5} {'-' * 8} {'-' * 12}")
+    for row in summary_rows:
+        iter_str = str(row.iteration_index + 1)
+        verdict_str = row.verdict or "-"
+        duration_str = _format_compact_duration(row.duration_seconds)
+        steps_str = str(row.steps) if row.steps is not None else "-"
+        cost_str = f"${row.cost_usd:.2f}" if row.cost_usd is not None else "-"
+        status_str = _format_summary_status(row)
+        task_str = row.task_id or "-"
+        print(
+            f"{iter_str:<5} {row.task_type:<8} {task_str:<10} {verdict_str:<18} "
+            f"{duration_str:>8} {steps_str:>5} {cost_str:>8} {status_str}"
+        )
+    print(f"Totals: {_format_compact_duration(iterate_wall_seconds)} wall | {total_steps} steps | ${total_cost:.2f}")
+    print()
+
+
+def _classify_plan_iterate_skip(action: dict[str, Any]) -> tuple[str, str]:
+    reason = action.get("reason")
+    if reason == "already_materialized":
+        return "materialized", "already_materialized"
+    if isinstance(reason, str) and reason:
+        return "skipped", reason
+    return "skipped", "skip"
+
+
+def _cmd_iterate_impl(
+    args: argparse.Namespace,
+    config: Config,
+    impl_task: DbTask | None = None,
+) -> int:
     """Run an automated lifecycle loop for an implementation task."""
     store = get_store(config)
     def _int_config(value: object, default: int) -> int:
@@ -3747,7 +3933,8 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
     # it manages the full review/improve iteration lifecycle and requires the root impl task.
     impl_task_id = resolve_id(config, args.impl_task_id)
-    impl_task = store.get(impl_task_id)
+    if impl_task is None:
+        impl_task = store.get(impl_task_id)
     if not impl_task:
         return phase1_error(args, f"Task {impl_task_id} not found")
     if impl_task.task_type != "implement":
@@ -4005,17 +4192,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
             return (existing_resume, decision), None
         return (_create_resume_task(store, failed_task, trigger_source="manual"), decision), None
 
-    engine_config = _AdvanceEngineConfigAdapter(
-        project_dir=config.project_dir,
-        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
-        advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
-        max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
+    engine_config = _build_iterate_engine_config(
+        config,
         max_resume_attempts=effective_max_resume_attempts,
-        max_failed_closing_review_retries=_int_config(
-            getattr(config, "max_failed_closing_review_retries", None),
-            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
-        ),
     )
 
     def _prepare_iterate_background_preflight_context(
@@ -4945,17 +5124,9 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,
     )
-    engine_config = _AdvanceEngineConfigAdapter(
-        project_dir=config.project_dir,
-        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
-        advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
-        max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
+    engine_config = _build_iterate_engine_config(
+        config,
         max_resume_attempts=max_resume_attempts,
-        max_failed_closing_review_retries=_int_config(
-            getattr(config, "max_failed_closing_review_retries", None),
-            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
-        ),
     )
     if prepared_iteration_start is not None:
         initial_action = {"type": prepared_iteration_start.action_type or "iteration"}
@@ -5995,28 +6166,12 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
         _run_forced_closing_review(iteration)
 
     iterate_wall_seconds = time.monotonic() - iterate_started_at
-    total_steps = sum(row.steps or 0 for row in summary_rows)
-    total_cost = sum(row.cost_usd or 0.0 for row in summary_rows)
-
-    print(f"\n{'=' * 60}")
-    print(f"Iterate complete: {final_status.upper()} ({final_stop_reason})")
-    print(f"{'=' * 60}")
-    print(f"{'Iter':<5} {'Type':<8} {'Task':<10} {'Verdict':<18} {'Duration':>8} {'Steps':>5} {'Cost':>8} Status")
-    print(f"{'-' * 5} {'-' * 8} {'-' * 10} {'-' * 18} {'-' * 8} {'-' * 5} {'-' * 8} {'-' * 12}")
-    for row in summary_rows:
-        iter_str = str(row.iteration_index + 1)
-        verdict_str = row.verdict or "-"
-        duration_str = _format_compact_duration(row.duration_seconds)
-        steps_str = str(row.steps) if row.steps is not None else "-"
-        cost_str = f"${row.cost_usd:.2f}" if row.cost_usd is not None else "-"
-        status_str = _format_summary_status(row)
-        task_str = row.task_id or "-"
-        print(
-            f"{iter_str:<5} {row.task_type:<8} {task_str:<10} {verdict_str:<18} "
-            f"{duration_str:>8} {steps_str:>5} {cost_str:>8} {status_str}"
-        )
-    print(f"Totals: {_format_compact_duration(iterate_wall_seconds)} wall | {total_steps} steps | ${total_cost:.2f}")
-    print()
+    _print_iterate_summary(
+        final_status=final_status,
+        final_stop_reason=final_stop_reason,
+        summary_rows=summary_rows,
+        iterate_wall_seconds=iterate_wall_seconds,
+    )
 
     if final_status in {"approved", "merge_ready"}:
         return 0
@@ -6063,16 +6218,516 @@ def _cmd_iterate_impl(args: argparse.Namespace, config: Config) -> int:
     return 3
 
 
+def _cmd_iterate_plan(
+    args: argparse.Namespace,
+    config: Config,
+    plan_task: DbTask | None = None,
+) -> int:
+    """Run an automated plan lifecycle loop without entering implementation iteration."""
+    store = get_store(config)
+    max_iterations_arg = getattr(args, "max_iterations", None)
+    max_iterations = max_iterations_arg if max_iterations_arg is not None else config.iterate_max_iterations
+    if max_iterations <= 0:
+        return phase1_error(args, "--max-iterations must be a positive integer.")
+
+    dry_run: bool = getattr(args, "dry_run", False)
+    use_resume: bool = getattr(args, "resume", False)
+    use_retry: bool = getattr(args, "retry", False)
+    background: bool = getattr(args, "background", False)
+
+    plan_task_id = resolve_id(config, args.impl_task_id)
+    if plan_task is None:
+        plan_task = store.get(plan_task_id)
+    if not plan_task:
+        return phase1_error(args, f"Task {plan_task_id} not found")
+    if plan_task.task_type not in {"plan", "plan_improve"}:
+        return phase1_error(
+            args,
+            f"Task {plan_task.id} is a {plan_task.task_type} task. Expected an implementation or plan task.",
+        )
+
+    allowed_statuses = {"completed", "pending", "failed"}
+    if plan_task.status not in allowed_statuses:
+        return phase1_error(
+            args,
+            f"Task {plan_task.id} is {plan_task.status}. Can only iterate completed, pending, or failed tasks.",
+        )
+    if plan_task.status == "failed" and not use_resume and not use_retry:
+        return phase1_error(
+            args,
+            f"Task {plan_task.id} is failed. Use --resume or --retry to specify how to restart it.",
+        )
+    if (use_resume or use_retry) and plan_task.status != "failed":
+        flag = "--resume" if use_resume else "--retry"
+        return phase1_error(
+            args,
+            f"{flag} is only valid for failed tasks (task {plan_task.id} is {plan_task.status}).",
+        )
+
+    effective_max_resume_attempts = int(
+        getattr(config, "max_resume_attempts", DEFAULT_MAX_RESUME_ATTEMPTS)
+    )
+    engine_config = _build_iterate_engine_config(
+        config,
+        max_resume_attempts=effective_max_resume_attempts,
+    )
+
+    if background:
+        return _spawn_background_iterate_worker(
+            args,
+            config,
+            plan_task,
+            max_iterations=max_iterations,
+            resume=use_resume,
+            retry=use_retry,
+            dry_run=dry_run,
+        )
+
+    if plan_task.status == "pending":
+        if dry_run:
+            print(f"[dry-run] Would run pending plan source {plan_task.id} then iterate (max {max_iterations} improve cycles)")
+            return 0
+        print(f"Running pending plan source {plan_task.id}...")
+        plan_task, rc, _terminal_skip_decision = _run_iterate_task_with_recovery(
+            args=args,
+            config=config,
+            store=store,
+            task_to_run=plan_task,
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        if rc != 0 or plan_task.status == "failed":
+            print(f"Plan source {plan_task.id} failed (exit code {rc})")
+            return 1
+        if plan_task.id is not None:
+            plan_task = store.get(plan_task.id) or plan_task
+
+    if plan_task.status == "failed":
+        if use_resume:
+            if dry_run:
+                print(
+                    f"[dry-run] Would resume failed plan source {plan_task.id} "
+                    f"then iterate (max {max_iterations} improve cycles)"
+                )
+                return 0
+            resume_start, resume_blocked = _resolve_failed_iterate_resume_start(
+                args=args,
+                store=store,
+                failed_task=plan_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+            if resume_start is None:
+                if resume_blocked is not None:
+                    blocked_task, resume_blocked_decision = resume_blocked
+                    exit_code = _print_iterate_failed_recovery_attention(
+                        store=store,
+                        failed_task=blocked_task,
+                        decision=resume_blocked_decision,
+                        fix_task_id=plan_task_id,
+                        max_resume_attempts=effective_max_resume_attempts,
+                    )
+                    if exit_code is not None:
+                        return exit_code
+                    print(
+                        f"Error: Cannot resume failed plan source {plan_task.id}: "
+                        f"{resume_blocked_decision.reason_text}."
+                    )
+                return 1
+            run_start_task, _decision = resume_start
+            print(f"Resuming failed plan source {plan_task.id} as {run_start_task.id}...")
+            plan_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=run_start_task,
+                max_resume_attempts=effective_max_resume_attempts,
+                initial_resume=True,
+            )
+            if rc != 0:
+                if terminal_skip_decision is not None:
+                    exit_code = _print_iterate_failed_recovery_attention(
+                        store=store,
+                        failed_task=plan_task,
+                        decision=terminal_skip_decision,
+                        fix_task_id=plan_task_id,
+                        max_resume_attempts=effective_max_resume_attempts,
+                    )
+                    if exit_code is not None:
+                        return exit_code
+                print(f"Resume of {plan_task_id} failed (exit code {rc})")
+                return 1
+        else:
+            if dry_run:
+                print(
+                    f"[dry-run] Would retry failed plan source {plan_task.id} "
+                    f"then iterate (max {max_iterations} improve cycles)"
+                )
+                return 0
+            run_start_task = _create_retry_task(store, plan_task, trigger_source="manual")
+            print(f"Retrying failed plan source {plan_task.id} as {run_start_task.id}...")
+            plan_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=run_start_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+            if rc != 0:
+                if terminal_skip_decision is not None:
+                    exit_code = _print_iterate_failed_recovery_attention(
+                        store=store,
+                        failed_task=plan_task,
+                        decision=terminal_skip_decision,
+                        fix_task_id=plan_task_id,
+                        max_resume_attempts=effective_max_resume_attempts,
+                    )
+                    if exit_code is not None:
+                        return exit_code
+                print(f"Retry of {plan_task_id} failed (exit code {rc})")
+                return 1
+
+        if plan_task.status == "failed":
+            action_label = "Resume" if use_resume else "Retry"
+            print(f"{action_label} of {plan_task_id} failed, cannot continue iteration.")
+            return 1
+        if plan_task.id is not None:
+            plan_task = store.get(plan_task.id) or plan_task
+
+    source_task = _resolve_latest_plan_source(store, plan_task)
+    initial_action = determine_next_action(
+        engine_config,
+        store,
+        object(),
+        source_task,
+        "",
+        max_resume_attempts=effective_max_resume_attempts,
+    )
+    initial_action_type = initial_action["type"]
+    initial_action_description = _iterate_action_description(initial_action)
+
+    if dry_run:
+        print(f"[dry-run] Would iterate plan {source_task.id} (max {max_iterations} improve cycles)")
+        if initial_action_type == "materialize_plan_slices":
+            plan_review_task = initial_action.get("plan_review_task")
+            review_label = (
+                plan_review_task.id
+                if isinstance(plan_review_task, DbTask) and plan_review_task.id is not None
+                else "approved plan review"
+            )
+            print(f"[dry-run] Would materialize approved plan-review slices from {review_label}")
+        else:
+            print(f"[dry-run] First next action: {initial_action_type} - {initial_action_description}")
+        return 0
+
+    print(f"Iterating plan {source_task.id} (max {max_iterations} improve cycles)...")
+    summary_rows: list[IterateSummaryRow] = []
+    iterate_started_at = time.monotonic()
+    improve_iteration = 0
+    final_status = "blocked"
+    final_stop_reason = "incomplete"
+    final_message: str | None = None
+    final_exit_code = 3
+
+    while True:
+        if plan_task.id is not None:
+            plan_task = store.get(plan_task.id) or plan_task
+        source_task = _resolve_latest_plan_source(store, plan_task)
+        action = determine_next_action(
+            engine_config,
+            store,
+            object(),
+            source_task,
+            "",
+            max_resume_attempts=effective_max_resume_attempts,
+        )
+        action_type = action["type"]
+
+        if action_type in {"create_plan_improve", "run_plan_improve"} and improve_iteration >= max_iterations:
+            final_status = "blocked"
+            final_stop_reason = "max_iterations_reached"
+            final_message = f"Max improve iterations ({max_iterations}) reached before plan approval."
+            final_exit_code = 3
+            break
+
+        if action_type == "create_plan_review":
+            plan_review_task = _create_plan_review_task(store, source_task, trigger_source="manual")
+            print(f"  Created plan review task {plan_review_task.id}")
+            print(f"  Running plan review {plan_review_task.id}...")
+            plan_review_task, rc, _terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=plan_review_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+            if plan_review_task.id is not None:
+                plan_review_task = store.get(plan_review_task.id) or plan_review_task
+            verdict = None
+            if source_task.id is not None:
+                verdict = get_plan_review_outcome(
+                    Path(config.project_dir),
+                    plan_review_task,
+                    source_task_id=source_task.id,
+                    source_task_type=source_task.task_type,
+                    max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+                    max_plan_slices=getattr(config, "max_plan_slices", None),
+                ).verdict
+            _append_iterate_summary_row(
+                store,
+                summary_rows,
+                iteration_index=improve_iteration,
+                task_type="plan_review",
+                task=plan_review_task,
+                verdict=verdict,
+            )
+            if rc != 0 or plan_review_task.status == "failed":
+                final_status = "blocked"
+                final_stop_reason = "plan_review_failed"
+                final_exit_code = 1
+                break
+            continue
+
+        if action_type == "run_plan_review":
+            plan_review_task = action.get("plan_review_task")
+            assert isinstance(plan_review_task, DbTask)
+            print(f"  Running pending plan review {plan_review_task.id}...")
+            plan_review_task, rc, _terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=plan_review_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+            if plan_review_task.id is not None:
+                plan_review_task = store.get(plan_review_task.id) or plan_review_task
+            verdict = None
+            if source_task.id is not None:
+                verdict = get_plan_review_outcome(
+                    Path(config.project_dir),
+                    plan_review_task,
+                    source_task_id=source_task.id,
+                    source_task_type=source_task.task_type,
+                    max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+                    max_plan_slices=getattr(config, "max_plan_slices", None),
+                ).verdict
+            _append_iterate_summary_row(
+                store,
+                summary_rows,
+                iteration_index=improve_iteration,
+                task_type="plan_review",
+                task=plan_review_task,
+                verdict=verdict,
+            )
+            if rc != 0 or plan_review_task.status == "failed":
+                final_status = "blocked"
+                final_stop_reason = "plan_review_failed"
+                final_exit_code = 1
+                break
+            continue
+
+        if action_type == "create_plan_improve":
+            review_task = action.get("plan_review_task")
+            assert isinstance(review_task, DbTask)
+            plan_improve_task = _create_plan_improve_task(
+                store,
+                source_task,
+                review_task,
+                trigger_source="manual",
+            )
+            print(f"  Created plan improve task {plan_improve_task.id}")
+            print(f"  Running plan improve {plan_improve_task.id}...")
+            plan_improve_task, rc, _terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=plan_improve_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+            if plan_improve_task.id is not None:
+                plan_improve_task = store.get(plan_improve_task.id) or plan_improve_task
+            _append_iterate_summary_row(
+                store,
+                summary_rows,
+                iteration_index=improve_iteration,
+                task_type="plan_improve",
+                task=plan_improve_task,
+            )
+            improve_iteration += 1
+            if rc != 0 or plan_improve_task.status == "failed":
+                final_status = "blocked"
+                final_stop_reason = "plan_improve_failed"
+                final_exit_code = 1
+                break
+            continue
+
+        if action_type == "run_plan_improve":
+            maybe_plan_improve_task = action.get("plan_improve_task")
+            assert isinstance(maybe_plan_improve_task, DbTask)
+            plan_improve_task = maybe_plan_improve_task
+            print(f"  Running pending plan improve {plan_improve_task.id}...")
+            plan_improve_task, rc, _terminal_skip_decision = _run_iterate_task_with_recovery(
+                args=args,
+                config=config,
+                store=store,
+                task_to_run=plan_improve_task,
+                max_resume_attempts=effective_max_resume_attempts,
+            )
+            if plan_improve_task.id is not None:
+                plan_improve_task = store.get(plan_improve_task.id) or plan_improve_task
+            _append_iterate_summary_row(
+                store,
+                summary_rows,
+                iteration_index=improve_iteration,
+                task_type="plan_improve",
+                task=plan_improve_task,
+            )
+            improve_iteration += 1
+            if rc != 0 or plan_improve_task.status == "failed":
+                final_status = "blocked"
+                final_stop_reason = "plan_improve_failed"
+                final_exit_code = 1
+                break
+            continue
+
+        if action_type == "materialize_plan_slices":
+            action_source, review_task, manifest, manifest_error = _resolve_plan_materialization_action_inputs(
+                config=config,
+                store=store,
+                action=action,
+                fallback_source_task=source_task,
+            )
+            if action_source is None or review_task is None or manifest is None:
+                final_status = "blocked"
+                final_stop_reason = "invalid_manifest"
+                final_message = manifest_error or "approved plan review is missing materialization inputs"
+                final_exit_code = 3
+                break
+            materialization = _materialize_plan_review_slices(
+                config,
+                store,
+                action_source,
+                review_task,
+                manifest,
+                trigger_source="manual",
+                require_review_before_merge=getattr(config, "require_review_before_merge", True),
+            )
+            action_source.auto_implement = True
+            store.update(action_source)
+            if plan_task.id != action_source.id:
+                plan_task.auto_implement = True
+                store.update(plan_task)
+            _emit_plan_slice_materialization(
+                materialization,
+                plan_source_id=action_source.id or "unknown",
+                plan_review_id=review_task.id or "unknown",
+            )
+            for task in materialization.tasks:
+                _append_iterate_summary_row(
+                    store,
+                    summary_rows,
+                    iteration_index=improve_iteration,
+                    task_type="implement",
+                    task=task,
+                )
+            final_status = "materialized"
+            final_stop_reason = "materialized" if materialization.created else "already_materialized"
+            final_exit_code = 0
+            break
+
+        if action_type in {"wait_plan_review", "wait_plan_improve"}:
+            wait_task = action.get("plan_review_task") if action_type == "wait_plan_review" else action.get("plan_improve_task")
+            assert isinstance(wait_task, DbTask)
+            wait_task_type = "plan_review" if action_type == "wait_plan_review" else "plan_improve"
+            _append_iterate_summary_row(
+                store,
+                summary_rows,
+                iteration_index=improve_iteration,
+                task_type=wait_task_type,
+                task=wait_task,
+                status="in_progress",
+            )
+            final_status = "blocked"
+            final_stop_reason = action_type
+            final_message = "Existing task is already in progress."
+            final_exit_code = 3
+            break
+
+        if action_type == "awaiting_human":
+            final_status = "blocked"
+            final_stop_reason = "awaiting_human"
+            final_message = f"Plan {source_task.id} is held for human review. Use uv run gza implement {source_task.id} when ready."
+            final_exit_code = 3
+            break
+
+        if action_type in {"needs_discussion", "plan_max_cycles_reached"}:
+            final_status = "blocked"
+            final_stop_reason = action.get("reason") or action_type
+            final_message = _iterate_action_description(action)
+            final_exit_code = 3
+            break
+
+        if action_type == "create_implement":
+            final_status = "blocked"
+            final_stop_reason = "create_implement"
+            final_message = f"No plan-review loop is configured; use uv run gza implement {source_task.id}."
+            final_exit_code = 1
+            break
+
+        if action_type == "skip":
+            final_status, final_stop_reason = _classify_plan_iterate_skip(action)
+            final_message = _iterate_action_description(action)
+            final_exit_code = 0
+            break
+
+        final_status = "blocked"
+        final_stop_reason = f"unsupported_action:{action_type}"
+        final_message = _iterate_action_description(action)
+        final_exit_code = 3
+        break
+
+    iterate_wall_seconds = time.monotonic() - iterate_started_at
+    _print_iterate_summary(
+        final_status=final_status,
+        final_stop_reason=final_stop_reason,
+        summary_rows=summary_rows,
+        iterate_wall_seconds=iterate_wall_seconds,
+    )
+    if final_message:
+        if final_exit_code == 0:
+            print(final_message)
+        else:
+            print(f"Iterate blocked: {final_message}")
+    return final_exit_code
+
+
 def cmd_iterate(args: argparse.Namespace) -> int:
-    """Run an automated lifecycle loop for an implementation task."""
+    """Run an automated lifecycle loop for an implementation or plan task."""
     config = Config.load(args.project_dir)
     if hasattr(args, 'no_docker') and args.no_docker:
         config.use_docker = False
+    max_iterations_arg = getattr(args, "max_iterations", None)
+    max_iterations = max_iterations_arg if max_iterations_arg is not None else config.iterate_max_iterations
+    if max_iterations <= 0:
+        return phase1_error(args, "--max-iterations must be a positive integer.")
+
+    def _run_iterate() -> int:
+        store = get_store(config)
+        task_id = resolve_id(config, args.impl_task_id)
+        task = store.get(task_id)
+        if task is None:
+            return phase1_error(args, f"Task {task_id} not found")
+        if task.task_type in {"plan", "plan_improve"}:
+            return _cmd_iterate_plan(args, config, task)
+        if task.task_type == "implement":
+            return _cmd_iterate_impl(args, config, task)
+        return phase1_error(
+            args,
+            f"Task {task.id} is a {task.task_type} task. Expected an implementation or plan task.",
+        )
 
     return _run_with_registered_worker(
         config=config,
         worker_id=getattr(args, "worker_id", None),
-        run_command=lambda: _cmd_iterate_impl(args, config),
+        run_command=_run_iterate,
     )
 
 

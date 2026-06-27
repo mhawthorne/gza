@@ -2230,7 +2230,7 @@ def main() -> int:
         iterate_parser.add_argument(
             "impl_task_id",
             type=str,
-            help="Full prefixed implementation task ID to iterate (e.g. 'gza-1234')",
+            help="Full prefixed implementation task ID to iterate, or a plan task ID (e.g. 'gza-1234')",
         )
         iterate_parser.add_argument(
             "-i", "--max-iterations",
@@ -2238,7 +2238,10 @@ def main() -> int:
             default=None,
             dest="max_iterations",
             metavar="N",
-            help="Maximum iterate iterations (each is a code-change task [implement/improve] plus its review) (default: iterate_max_iterations or 3)",
+            help=(
+                "Maximum iterate iterations (each is a code-change task [implement/improve] plus its review); "
+                "for plan iteration, counts plan-improve cycles (default: iterate_max_iterations or 3)"
+            ),
         )
         iterate_parser.add_argument(
             "--dry-run",
@@ -2309,8 +2312,12 @@ def main() -> int:
     # iterate command
     iterate_parser = subparsers.add_parser(
         "iterate",
-        help="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for an implementation task",
-        description="Run an automated implementation lifecycle loop (review/improve/resume/rebase) for an implementation task",
+        help="Run an automated lifecycle loop for an implementation or plan task",
+        description=(
+            "Run an automated implementation lifecycle loop for an implementation task or a plan task. "
+            "Implementation mode drives review/improve/resume/rebase to merge-ready state; "
+            "plan mode drives plan-review/plan-improve to approved slice materialization."
+        ),
     )
     _add_iterate_args(iterate_parser)
 
