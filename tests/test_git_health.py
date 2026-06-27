@@ -63,6 +63,38 @@ def test_check_git_worktree_health_pass_without_existing_alert_keeps_state_ephem
     assert current_git_health_alert(store) is None
 
 
+def test_check_git_worktree_health_green_probe_ignores_host_valid_gza_git_substrings(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = SimpleNamespace(repo_dir=tmp_path)
+    probe = GitWorktreeHealthProbe(
+        command="git worktree list --porcelain",
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+
+    registration_dir = tmp_path / ".git" / "worktrees" / "healthy"
+    registration_dir.mkdir(parents=True)
+    (registration_dir / "commondir").write_text("/tmp/gza-git/common\n")
+    (registration_dir / "gitdir").write_text("/Users/dev/gza-git-worktrees/repo/.git\n")
+
+    with (
+        patch("gza.git_health.datetime") as mocked_datetime,
+        patch("gza.git_health._probe_git_worktree_health", return_value=probe),
+        patch("gza.git._git_common_dir", return_value=tmp_path / ".git"),
+    ):
+        mocked_datetime.now.return_value = datetime(2026, 6, 26, tzinfo=UTC)
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        check = check_git_worktree_health(None, store, git)
+
+    assert check.dispatch_halted is False
+    assert check.state.task is None
+    assert check.state.metadata_findings == ()
+    assert check.state.suspected_container_path_marker is None
+    assert current_git_health_alert(store) is None
+
+
 def test_check_git_worktree_health_failure_persists_payload_and_alert(tmp_path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

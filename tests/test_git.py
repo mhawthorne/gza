@@ -382,6 +382,22 @@ class TestGitWorktreeHealth:
         assert validation.is_healthy is True
         assert validation.issues == ()
 
+    def test_validate_host_worktree_admin_metadata_ignores_host_paths_with_gza_git_substrings(self, tmp_path: Path):
+        repo_dir = tmp_path / "repo"
+        common_dir = repo_dir / ".git"
+        registration_dir = common_dir / "worktrees" / "healthy"
+        registration_dir.mkdir(parents=True)
+        (registration_dir / "commondir").write_text("/tmp/gza-git/common\n")
+        (registration_dir / "gitdir").write_text("/Users/dev/gza-git-worktrees/repo/.git\n")
+        git = Git(repo_dir)
+
+        with patch("gza.git._git_common_dir", return_value=common_dir):
+            validation = validate_host_worktree_admin_metadata(git)
+
+        assert validation.is_healthy is True
+        assert validation.suspected_container_path_marker is None
+        assert validation.issues == ()
+
     def test_validate_host_worktree_admin_metadata_detects_linked_worktree_admin_leak(self, tmp_path: Path):
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

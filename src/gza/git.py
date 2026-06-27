@@ -8,7 +8,7 @@ import subprocess
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -1813,7 +1813,14 @@ def _read_worktree_admin_file(path: Path) -> str | None:
 
 def _known_container_git_root_marker(value: str) -> str | None:
     """Return the known container-only git root marker embedded in ``value``."""
-    return "/gza-git" if "/gza-git" in value else None
+    normalized = PurePosixPath(value)
+    if not normalized.is_absolute():
+        return None
+    if normalized == PurePosixPath("/gza-git"):
+        return "/gza-git"
+    if normalized.parts[:2] == ("/", "gza-git"):
+        return "/gza-git"
+    return None
 
 
 def _current_worktree_admin_dir(git: "Git") -> Path | None:
