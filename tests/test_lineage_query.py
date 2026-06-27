@@ -1867,6 +1867,109 @@ def test_query_lineage_owner_rows_planning_skips_dropped_only_descendants(tmp_pa
     assert rows == ()
 
 
+def test_query_lineage_owner_rows_repeated_planning_omits_superseded_loser_root_and_keeps_winner_rows(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    loser = store.add("Superseded loser", task_type="implement")
+    winner = store.add("Winning implement", task_type="implement", based_on=loser.id)
+    unrelated = store.add("Unrelated actionable implement", task_type="implement")
+    loser_review = store.add("Loser review", task_type="review", based_on=loser.id, depends_on=loser.id)
+    assert loser.id is not None
+    assert winner.id is not None
+    assert unrelated.id is not None
+    assert loser_review.id is not None
+
+    loser.branch = "feature/superseded-loser"
+    loser.status = "failed"
+    loser.failure_reason = "INFRASTRUCTURE_ERROR"
+    loser.has_commits = True
+    loser.completed_at = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+    store.update(loser)
+
+    winner.branch = "feature/superseded-winner"
+    winner.status = "completed"
+    winner.has_commits = True
+    winner.merge_status = "unmerged"
+    winner.completed_at = datetime(2026, 6, 27, 9, 5, tzinfo=UTC)
+    store.update(winner)
+
+    unrelated.branch = "feature/unrelated-root"
+    unrelated.status = "completed"
+    unrelated.has_commits = True
+    unrelated.merge_status = "unmerged"
+    unrelated.completed_at = datetime(2026, 6, 27, 9, 10, tzinfo=UTC)
+    store.update(unrelated)
+
+    loser_review.status = "pending"
+    store.update(loser_review)
+
+    loser_unit = store.create_merge_unit(
+        source_branch=loser.branch,
+        target_branch="main",
+        owner_task_id=loser.id,
+        state="unmerged",
+    )
+    winner_unit = store.create_merge_unit(
+        source_branch=winner.branch,
+        target_branch="main",
+        owner_task_id=winner.id,
+        state="unmerged",
+    )
+    unrelated_unit = store.create_merge_unit(
+        source_branch=unrelated.branch,
+        target_branch="main",
+        owner_task_id=unrelated.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(loser.id, loser_unit.id, "owner")
+    store.attach_task_to_merge_unit(loser_review.id, loser_unit.id, "review")
+    store.attach_task_to_merge_unit(winner.id, winner_unit.id, "owner")
+    store.attach_task_to_merge_unit(unrelated.id, unrelated_unit.id, "owner")
+
+    store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+
+    git = MagicMock()
+    git.can_merge.return_value = True
+
+    first_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    second_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    for rows in (first_rows, second_rows):
+        rows_by_owner = {row.owner_task.id: row for row in rows if row.owner_task.id is not None}
+        assert set(rows_by_owner) == {winner.id, unrelated.id}
+        assert rows_by_owner[winner.id].tree is not None
+        assert rows_by_owner[winner.id].tree.task.id == winner.id
+        rendered_ids = {task.id for task in rows_by_owner[winner.id].members if task.id is not None}
+        assert loser.id not in rendered_ids
+        assert loser_review.id not in rendered_ids
+
+
 def test_query_lineage_owner_rows_hides_failed_root_resolved_by_completed_recovery_descendant(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

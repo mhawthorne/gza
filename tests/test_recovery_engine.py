@@ -2870,7 +2870,7 @@ def test_recovery_engine_hides_failed_tasks_attached_to_tombstoned_merge_units(
 
     store_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert store_decision.action == "skip"
-    assert store_decision.reason_code == "merge_unit_tombstoned"
+    assert store_decision.reason_code == "merge_unit_superseded"
     assert should_hide_failed_recovery_decision(store_decision) is True
     assert list_failed_tasks_for_recovery(store) == []
 
@@ -2885,9 +2885,60 @@ def test_recovery_engine_hides_failed_tasks_attached_to_tombstoned_merge_units(
 
     indexed_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, read_context=read_context)
     assert indexed_decision.action == "skip"
-    assert indexed_decision.reason_code == "merge_unit_tombstoned"
+    assert indexed_decision.reason_code == "merge_unit_superseded"
     assert should_hide_failed_recovery_decision(indexed_decision) is True
     assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
+
+
+def test_recovery_engine_hides_failed_tasks_after_store_supersede_mutation(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    winner = store.add("Winning implementation", task_type="implement")
+    assert failed.id is not None
+    assert winner.id is not None
+
+    failed.branch = "feature/store-supersede-loser"
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.has_commits = True
+    failed.completed_at = datetime(2026, 6, 27, 11, 0, tzinfo=UTC)
+    store.update(failed)
+
+    winner.branch = "feature/store-supersede-winner"
+    winner.status = "completed"
+    winner.has_commits = True
+    winner.completed_at = datetime(2026, 6, 27, 11, 5, tzinfo=UTC)
+    store.update(winner)
+
+    loser_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    winner_unit = store.create_merge_unit(
+        source_branch=winner.branch,
+        target_branch="main",
+        owner_task_id=winner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, loser_unit.id, "owner")
+    store.attach_task_to_merge_unit(winner.id, winner_unit.id, "owner")
+
+    store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+
+    refreshed_failed = store.get(failed.id)
+    assert refreshed_failed is not None
+    assert refreshed_failed.status == "dropped"
+    assert refreshed_failed.failure_reason is None
+    assert refreshed_failed.completion_reason == f"merge unit {loser_unit.id} superseded by {winner_unit.id}"
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "merge_unit_superseded"
+    assert list_failed_tasks_for_recovery(store) == []
 
 
 @pytest.mark.parametrize(
@@ -2946,7 +2997,7 @@ def test_recovery_engine_keeps_failed_tasks_with_active_merge_unit_despite_histo
 
     store_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
     assert store_decision.action == "retry"
-    assert store_decision.reason_code != "merge_unit_tombstoned"
+    assert store_decision.reason_code != "merge_unit_superseded"
     assert should_hide_failed_recovery_decision(store_decision) is False
     assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
 
@@ -2963,7 +3014,7 @@ def test_recovery_engine_keeps_failed_tasks_with_active_merge_unit_despite_histo
 
     indexed_decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, read_context=read_context)
     assert indexed_decision.action == "retry"
-    assert indexed_decision.reason_code != "merge_unit_tombstoned"
+    assert indexed_decision.reason_code != "merge_unit_superseded"
     assert should_hide_failed_recovery_decision(indexed_decision) is False
     assert [task.id for task in list_failed_tasks_for_recovery(store, read_context=read_context)] == [failed.id]
 

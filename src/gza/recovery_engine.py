@@ -128,7 +128,7 @@ class FailedRecoveryDecision:
 def should_hide_failed_recovery_decision(decision: FailedRecoveryDecision) -> bool:
     """Return whether the decision should stay off operator recovery surfaces."""
     return decision.action == "skip" and decision.reason_code in {
-        "merge_unit_tombstoned",
+        "merge_unit_superseded",
         "resolved_by_merged_target",
         "merge_unit_empty",
         "merge_unit_redundant",
@@ -361,13 +361,13 @@ def _task_merge_state_for_recovery(
     return effective_no_work_merge_state(task, raw_state)
 
 
-def _is_attached_to_tombstoned_merge_unit(
+def is_recovery_suppressed_by_inactive_merge_unit(
     store: SqliteTaskStore,
     task: DbTask,
     *,
     read_context: RecoveryReadContext | None = None,
 ) -> bool:
-    """Return whether only historical inactive merge-unit attachments tombstone recovery."""
+    """Return whether recovery should hide a task attached only to inactive historical units."""
     if task.id is None:
         return False
     units = (
@@ -1189,7 +1189,11 @@ def list_failed_tasks_for_recovery(
             if task_matches_tag_filters(task_tags=task.tags, tag_filters=normalized, any_tag=any_tag)
         ]
     failed = [task for task in failed if not is_chain_resolved_by_recovery(store, task, read_context=read_context)]
-    failed = [task for task in failed if not _is_attached_to_tombstoned_merge_unit(store, task, read_context=read_context)]
+    failed = [
+        task
+        for task in failed
+        if not is_recovery_suppressed_by_inactive_merge_unit(store, task, read_context=read_context)
+    ]
     failed = [task for task in failed if not is_resolved_by_merged_target(store, task, read_context=read_context)]
     failed = [
         task
@@ -1574,10 +1578,10 @@ def decide_failed_task_recovery(
             attempt_limit=attempt_limit,
         )
 
-    if _is_attached_to_tombstoned_merge_unit(store, task, read_context=read_context):
+    if is_recovery_suppressed_by_inactive_merge_unit(store, task, read_context=read_context):
         return _skip_decision(
             task_id=task_id,
-            reason_code="merge_unit_tombstoned",
+            reason_code="merge_unit_superseded",
             reason_text="failed task belongs to a dropped or superseded merge unit",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,

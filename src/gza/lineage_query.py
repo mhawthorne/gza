@@ -183,6 +183,40 @@ def _actionable_lifecycle_tasks(
     return [task for task in unresolved_tasks if task.status in allowed_statuses]
 
 
+def _task_has_only_inactive_historical_merge_units(
+    task: DbTask,
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+    historical_merge_units_by_task_id: Mapping[str, Sequence[MergeUnit]],
+) -> bool:
+    if task.id is None or task.id in merge_units_by_task_id:
+        return False
+    units = historical_merge_units_by_task_id.get(task.id, ())
+    if not units:
+        return False
+    has_inactive_historical_attachment = False
+    for unit in units:
+        if merge_unit_is_active(unit):
+            return False
+        has_inactive_historical_attachment = True
+    return has_inactive_historical_attachment
+
+
+def _task_is_excluded_from_dropped_planning(
+    task: DbTask,
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+    historical_merge_units_by_task_id: Mapping[str, Sequence[MergeUnit]],
+) -> bool:
+    if task.status == "dropped":
+        return True
+    return _task_has_only_inactive_historical_merge_units(
+        task,
+        merge_units_by_task_id=merge_units_by_task_id,
+        historical_merge_units_by_task_id=historical_merge_units_by_task_id,
+    )
+
+
 def _task_is_terminal_for_incomplete_display(
     task: DbTask,
     *,
@@ -571,6 +605,7 @@ def _build_owner_tree(
     unresolved_tasks: Sequence[DbTask],
     based_on_children: Mapping[str, list[DbTask]],
     depends_on_children: Mapping[str, list[DbTask]],
+    drop_excluded_task_ids: frozenset[str] = frozenset(),
 ) -> tuple[Any, tuple[DbTask, ...]]:
     from .query import build_lineage_tree_from_index, flatten_lineage_tree
 
@@ -583,7 +618,7 @@ def _build_owner_tree(
     keep_ids = {task.id for task in unresolved_tasks if task.id is not None}
     if owner_task.id is not None:
         keep_ids.add(owner_task.id)
-    if root_task.id is not None:
+    if root_task.id is not None and root_task.id not in drop_excluded_task_ids:
         keep_ids.add(root_task.id)
 
     def _filter(node: Any, is_root: bool) -> Any | None:
@@ -593,7 +628,11 @@ def _build_owner_tree(
             if filtered is not None:
                 kept_children.append(filtered)
         task_id = node.task.id
-        should_keep = is_root or (task_id is not None and task_id in keep_ids) or bool(kept_children)
+        should_keep = (task_id is not None and task_id in keep_ids) or bool(kept_children)
+        if task_id is not None and task_id in drop_excluded_task_ids and task_id not in keep_ids:
+            should_keep = bool(kept_children)
+        elif is_root:
+            should_keep = True
         if not should_keep:
             return None
         node_type = type(node)
@@ -606,6 +645,13 @@ def _build_owner_tree(
 
     filtered = _filter(root_tree, True)
     assert filtered is not None
+    while (
+        filtered.task.id is not None
+        and filtered.task.id in drop_excluded_task_ids
+        and filtered.task.id not in keep_ids
+        and len(filtered.children) == 1
+    ):
+        filtered = filtered.children[0]
     return filtered, tuple(flatten_lineage_tree(filtered))
 
 
@@ -1051,16 +1097,38 @@ def _candidate_owner_rows(
         owner = indexes.task_by_id.get(owner_id)
         if owner is None:
             continue
-        if query.exclude_dropped_from_planning and owner.status == "dropped":
+        if query.exclude_dropped_from_planning and _task_is_excluded_from_dropped_planning(
+            owner,
+            merge_units_by_task_id=indexes.merge_units_by_task_id,
+            historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+        ):
             continue
         member_matches_task_filter = False
         if task_ids_filter is not None:
             member_matches_task_filter = any(
-                task.id in task_ids_filter for task in owner_members if task.id is not None
+                task.id in task_ids_filter
+                and not (
+                    query.exclude_dropped_from_planning
+                    and _task_is_excluded_from_dropped_planning(
+                        task,
+                        merge_units_by_task_id=indexes.merge_units_by_task_id,
+                        historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+                    )
+                )
+                for task in owner_members
+                if task.id is not None
             )
             if not member_matches_task_filter:
                 member_matches_task_filter = any(
                     task.id in task_ids_filter
+                    and not (
+                        query.exclude_dropped_from_planning
+                        and _task_is_excluded_from_dropped_planning(
+                            task,
+                            merge_units_by_task_id=indexes.merge_units_by_task_id,
+                            historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+                        )
+                    )
                     for task in indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
                     if task.id is not None
                 )
@@ -1195,6 +1263,17 @@ def _query_lineage_owner_rows_with_context(
         owner_ids_filter=owner_ids_filter,
         task_ids_filter=task_ids_filter,
     )
+    drop_excluded_task_ids = frozenset(
+        task.id
+        for task in indexes.tasks
+        if task.id is not None
+        and query.exclude_dropped_from_planning
+        and _task_is_excluded_from_dropped_planning(
+            task,
+            merge_units_by_task_id=indexes.merge_units_by_task_id,
+            historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+        )
+    )
     visible_failed_tasks = [
         task for task in list_failed_tasks_for_recovery(store, read_context=read_context) if task.id is not None
     ]
@@ -1243,7 +1322,11 @@ def _query_lineage_owner_rows_with_context(
             empty_prereq_block = blocked_by_empty_prereq_label(store, task, read_context=read_context)
             if task.status not in {"failed", "completed", "unmerged", "dropped"} and empty_prereq_block is None:
                 continue
-            if query.exclude_dropped_from_planning and task.status == "dropped":
+            if query.exclude_dropped_from_planning and _task_is_excluded_from_dropped_planning(
+                task,
+                merge_units_by_task_id=indexes.merge_units_by_task_id,
+                historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+            ):
                 continue
             merge_unit = merge_units_by_member.get(task.id)
             matches = _matches_task_filters(
@@ -1544,6 +1627,7 @@ def _query_lineage_owner_rows_with_context(
             unresolved_tasks=tuple(unresolved_tasks),
             based_on_children=indexes.based_on_children,
             depends_on_children=indexes.depends_on_children,
+            drop_excluded_task_ids=drop_excluded_task_ids,
         )
         summaries = tuple(
             UnresolvedLeafSummary(

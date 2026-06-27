@@ -181,6 +181,265 @@ def test_active_merge_unit_readers_exclude_manual_tombstones_and_historical_acce
     assert store.get(displaced.id).merge_status is None
 
 
+def test_resolve_merge_unit_subject_supports_direct_historical_unit_lookup_only_by_unit_id(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    loser = store.add("Losing implementation", task_type="implement")
+    winner = store.add("Winning implementation", task_type="implement")
+    assert loser.id is not None
+    assert winner.id is not None
+
+    loser.branch = "feature/loser"
+    loser.status = "failed"
+    loser.has_commits = True
+    loser.failure_reason = "INFRASTRUCTURE_ERROR"
+    loser.completed_at = datetime(2026, 6, 27, 11, 0, tzinfo=UTC)
+    store.update(loser)
+
+    winner.branch = "feature/winner"
+    winner.status = "completed"
+    winner.has_commits = True
+    winner.completed_at = datetime(2026, 6, 27, 11, 5, tzinfo=UTC)
+    store.update(winner)
+
+    loser_unit = store.create_merge_unit(
+        source_branch=loser.branch,
+        target_branch="main",
+        owner_task_id=loser.id,
+        state="unmerged",
+    )
+    winner_unit = store.create_merge_unit(
+        source_branch=winner.branch,
+        target_branch="main",
+        owner_task_id=winner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(loser.id, loser_unit.id, "owner")
+    store.attach_task_to_merge_unit(winner.id, winner_unit.id, "owner")
+
+    assert store.resolve_merge_unit_subject(loser.id).id == loser_unit.id
+    assert store.resolve_merge_unit_subject(loser_unit.id).id == loser_unit.id
+
+    store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+
+    historical = store.resolve_merge_unit_subject(loser_unit.id)
+    assert historical is not None
+    assert historical.state == "superseded"
+    assert historical.superseded_by_unit_id == winner_unit.id
+    assert store.resolve_merge_unit_subject(loser.id) is None
+
+
+def test_supersede_merge_unit_cascades_members_preserves_history_and_is_idempotent(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    owner = store.add("Owner implementation", task_type="implement")
+    improve = store.add("Failed improve", task_type="improve", based_on=owner.id)
+    review = store.add("Pending review", task_type="review", based_on=owner.id, depends_on=owner.id)
+    winner = store.add("Winning implementation", task_type="implement")
+    alternate_winner = store.add("Alternate winner", task_type="implement")
+    assert owner.id is not None
+    assert improve.id is not None
+    assert review.id is not None
+    assert winner.id is not None
+    assert alternate_winner.id is not None
+
+    owner.branch = "feature/loser"
+    owner.status = "completed"
+    owner.has_commits = True
+    owner.log_file = ".gza/logs/owner.log"
+    owner.report_file = ".gza/reports/owner.md"
+    owner.completed_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    store.update(owner)
+
+    improve.branch = owner.branch
+    improve.status = "failed"
+    improve.has_commits = True
+    improve.failure_reason = "TEST_FAILURE"
+    improve.log_file = ".gza/logs/improve.log"
+    improve.report_file = ".gza/reports/improve.md"
+    improve.completed_at = datetime(2026, 6, 27, 10, 5, tzinfo=UTC)
+    store.update(improve)
+
+    review.status = "pending"
+    review.output_content = "review payload"
+    store.update(review)
+
+    winner.branch = "feature/winner"
+    winner.status = "completed"
+    winner.has_commits = True
+    winner.completed_at = datetime(2026, 6, 27, 10, 10, tzinfo=UTC)
+    store.update(winner)
+
+    alternate_winner.branch = "feature/alternate-winner"
+    alternate_winner.status = "completed"
+    alternate_winner.has_commits = True
+    alternate_winner.completed_at = datetime(2026, 6, 27, 10, 15, tzinfo=UTC)
+    store.update(alternate_winner)
+
+    loser_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    winner_unit = store.create_merge_unit(
+        source_branch=winner.branch,
+        target_branch="main",
+        owner_task_id=winner.id,
+        state="unmerged",
+    )
+    alternate_winner_unit = store.create_merge_unit(
+        source_branch=alternate_winner.branch,
+        target_branch="main",
+        owner_task_id=alternate_winner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, loser_unit.id, "owner")
+    store.attach_task_to_merge_unit(improve.id, loser_unit.id, "contributor")
+    store.attach_task_to_merge_unit(review.id, loser_unit.id, "review")
+    store.attach_task_to_merge_unit(winner.id, winner_unit.id, "owner")
+    store.attach_task_to_merge_unit(alternate_winner.id, alternate_winner_unit.id, "owner")
+
+    result = store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+
+    assert result.changed is True
+    assert result.unit_id == loser_unit.id
+    assert result.state == "superseded"
+    assert result.superseded_by_unit_id == winner_unit.id
+    assert result.completion_reason == f"merge unit {loser_unit.id} superseded by {winner_unit.id}"
+    assert result.affected_task_ids == (owner.id, improve.id, review.id)
+
+    tombstoned_unit = store.get_merge_unit(loser_unit.id)
+    assert tombstoned_unit is not None
+    assert tombstoned_unit.state == "superseded"
+    assert tombstoned_unit.superseded_by_unit_id == winner_unit.id
+    assert store.resolve_merge_unit_for_task(owner.id) is None
+    assert store.resolve_merge_unit_for_task(improve.id) is None
+    assert store.resolve_merge_unit_for_task(review.id) is None
+    assert {task.id for task in store.list_tasks_for_merge_unit(loser_unit.id)} == {owner.id, improve.id, review.id}
+
+    refreshed_owner = store.get(owner.id)
+    refreshed_improve = store.get(improve.id)
+    refreshed_review = store.get(review.id)
+    refreshed_winner = store.get(winner.id)
+    assert refreshed_owner is not None
+    assert refreshed_improve is not None
+    assert refreshed_review is not None
+    assert refreshed_winner is not None
+
+    for task in (refreshed_owner, refreshed_improve, refreshed_review):
+        assert task.status == "dropped"
+        assert task.failure_reason is None
+        assert task.completion_reason == result.completion_reason
+        assert task.merge_status is None
+
+    assert refreshed_owner.branch == owner.branch
+    assert refreshed_improve.branch == improve.branch
+    assert refreshed_review.branch is None
+    assert refreshed_owner.log_file == ".gza/logs/owner.log"
+    assert refreshed_improve.report_file == ".gza/reports/improve.md"
+    assert refreshed_review.output_content == "review payload"
+    assert refreshed_review.completed_at is not None
+    assert refreshed_winner.status == "completed"
+
+    noop = store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+    assert noop.changed is False
+    assert noop.state == "superseded"
+    assert noop.superseded_by_unit_id == winner_unit.id
+    assert noop.affected_task_ids == result.affected_task_ids
+
+    with pytest.raises(ValueError, match="already resolved"):
+        store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=alternate_winner_unit.id)
+
+
+@pytest.mark.parametrize("state", ["merged", "empty", "redundant"])
+def test_supersede_merge_unit_rejects_landed_or_no_work_losers(tmp_path: Path, state: str) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    loser = store.add("Losing implementation", task_type="implement")
+    assert loser.id is not None
+    loser.branch = "feature/guard-loser"
+    loser.status = "completed"
+    loser.has_commits = True
+    loser.completed_at = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+    store.update(loser)
+
+    loser_unit = store.create_merge_unit(
+        source_branch=loser.branch,
+        target_branch="main",
+        owner_task_id=loser.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(loser.id, loser_unit.id, "owner")
+    store.set_merge_unit_state(loser_unit.id, state)
+
+    with pytest.raises(ValueError, match="cannot be dropped or superseded"):
+        store.supersede_merge_unit(loser_unit.id)
+
+
+def test_supersede_merge_unit_rejects_in_progress_members_and_invalid_winners(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    loser = store.add("Losing implementation", task_type="implement")
+    running = store.add("Running improve", task_type="improve", based_on=loser.id)
+    wrong_target = store.add("Wrong target winner", task_type="implement")
+    assert loser.id is not None
+    assert running.id is not None
+    assert wrong_target.id is not None
+
+    loser.branch = "feature/running-loser"
+    loser.status = "completed"
+    loser.has_commits = True
+    loser.completed_at = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+    store.update(loser)
+
+    running.branch = loser.branch
+    running.status = "in_progress"
+    running.has_commits = True
+    running.running_pid = 12345
+    running.started_at = datetime(2026, 6, 27, 9, 5, tzinfo=UTC)
+    store.update(running)
+
+    wrong_target.branch = "feature/wrong-target"
+    wrong_target.status = "completed"
+    wrong_target.has_commits = True
+    wrong_target.completed_at = datetime(2026, 6, 27, 9, 10, tzinfo=UTC)
+    store.update(wrong_target)
+
+    loser_unit = store.create_merge_unit(
+        source_branch=loser.branch,
+        target_branch="main",
+        owner_task_id=loser.id,
+        state="unmerged",
+    )
+    wrong_target_unit = store.create_merge_unit(
+        source_branch=wrong_target.branch,
+        target_branch="release",
+        owner_task_id=wrong_target.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(loser.id, loser_unit.id, "owner")
+    store.attach_task_to_merge_unit(running.id, loser_unit.id, "contributor")
+    store.attach_task_to_merge_unit(wrong_target.id, wrong_target_unit.id, "owner")
+
+    with pytest.raises(ValueError, match="in-progress members"):
+        store.supersede_merge_unit(loser_unit.id)
+
+    running.status = "failed"
+    running.failure_reason = "TIMEOUT"
+    running.completed_at = datetime(2026, 6, 27, 9, 20, tzinfo=UTC)
+    running.running_pid = None
+    store.update(running)
+
+    with pytest.raises(ValueError, match="cannot supersede itself"):
+        store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=loser_unit.id)
+
+    with pytest.raises(ValueError, match="expected 'main'"):
+        store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=wrong_target_unit.id)
+
+
 def test_add_tasks_with_artifact_atomic_rollback_does_not_delete_reused_ids(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path)

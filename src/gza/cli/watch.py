@@ -37,6 +37,7 @@ from ..db import (
     Task as DbTask,
     WatchProgressObservation,
     WatchRecoveryBackoff,
+    active_merge_unit_where_sql,
     task_id_numeric_key,
 )
 from ..dispatch_preview import (
@@ -1888,7 +1889,9 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
                          AND mu.id = mut.merge_unit_id
                         WHERE mut.project_id = tasks.project_id
                           AND mut.task_id = tasks.id
-                          AND mu.superseded_by_unit_id IS NULL
+                          AND """
+            + active_merge_unit_where_sql("mu")
+            + """
                         ORDER BY mu.updated_at DESC, mu.id DESC
                         LIMIT 1
                     ),
@@ -1902,7 +1905,9 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
                      AND mu.id = mut.merge_unit_id
                     WHERE mut.project_id = tasks.project_id
                       AND mut.task_id = tasks.id
-                      AND mu.superseded_by_unit_id IS NULL
+                      AND """
+            + active_merge_unit_where_sql("mu")
+            + """
                     ORDER BY mu.updated_at DESC, mu.id DESC
                     LIMIT 1
                 ) AS merge_target_branch

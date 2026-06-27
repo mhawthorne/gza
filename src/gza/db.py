@@ -283,6 +283,17 @@ def merge_unit_membership_role(task: "Task") -> str:
     return "context"
 
 
+def merge_unit_supersede_completion_reason(
+    unit_id: str,
+    *,
+    superseded_by_unit_id: str | None,
+) -> str:
+    """Return the canonical completion reason for manual unit abandonment."""
+    if superseded_by_unit_id:
+        return f"merge unit {unit_id} superseded by {superseded_by_unit_id}"
+    return f"merge unit {unit_id} dropped"
+
+
 def _backfill_task_tags_from_group(conn: sqlite3.Connection) -> None:
     """Backfill legacy tasks.group values into task_tags."""
     if not _table_exists(conn, "task_tags"):
@@ -543,6 +554,18 @@ class MergeUnit:
     diff_lines_added: int | None = None
     diff_lines_removed: int | None = None
     superseded_by_unit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeUnitSupersedeResult:
+    """Outcome of a manual merge-unit supersede/drop mutation."""
+
+    unit_id: str
+    state: str
+    superseded_by_unit_id: str | None
+    completion_reason: str
+    affected_task_ids: tuple[str, ...]
+    changed: bool
 
 
 def _task_is_actionable_merge_unit_member(task: "Task", unit: MergeUnit) -> bool:
@@ -5840,6 +5863,177 @@ class SqliteTaskStore:
                 (self._project_id, unit_id),
             ).fetchone()
         return self._row_to_merge_unit(row)
+
+    def resolve_merge_unit_subject(self, subject_id: str) -> MergeUnit | None:
+        """Resolve a merge-unit subject from a merge-unit id or attached task id."""
+        if not self.supports_merge_units():
+            return None
+        direct_unit = self.get_merge_unit(subject_id)
+        if direct_unit is not None:
+            return direct_unit
+        try:
+            resolved_task_id = resolve_task_id(subject_id, self._prefix)
+        except InvalidTaskIdError:
+            return None
+        return self.resolve_merge_unit_for_task(resolved_task_id)
+
+    def supersede_merge_unit(
+        self,
+        unit_id: str,
+        *,
+        superseded_by_unit_id: str | None = None,
+    ) -> MergeUnitSupersedeResult:
+        """Tombstone one active merge unit and cascade attached tasks to dropped."""
+        if not self.supports_merge_units():
+            raise RuntimeError("merge units are not available on this database")
+
+        requested_state = "superseded" if superseded_by_unit_id is not None else "dropped"
+        completion_reason = merge_unit_supersede_completion_reason(
+            unit_id,
+            superseded_by_unit_id=superseded_by_unit_id,
+        )
+
+        loser = self.get_merge_unit(unit_id)
+        if loser is None:
+            raise ValueError(f"Merge unit {unit_id} not found")
+
+        if merge_unit_state_is_inactive_tombstone(loser.state) or loser.superseded_by_unit_id is not None:
+            if loser.state == requested_state and loser.superseded_by_unit_id == superseded_by_unit_id:
+                affected_task_ids = tuple(
+                    task.id
+                    for task in self.list_tasks_for_merge_unit(loser.id)
+                    if task.id is not None
+                )
+                return MergeUnitSupersedeResult(
+                    unit_id=loser.id,
+                    state=loser.state,
+                    superseded_by_unit_id=loser.superseded_by_unit_id,
+                    completion_reason=completion_reason,
+                    affected_task_ids=affected_task_ids,
+                    changed=False,
+                )
+            raise ValueError(
+                f"Merge unit {loser.id} already resolved as {loser.state}"
+                + (
+                    f" by {loser.superseded_by_unit_id}"
+                    if loser.superseded_by_unit_id is not None
+                    else ""
+                )
+            )
+
+        if loser.state in MERGE_UNIT_LANDED_OR_NO_WORK_STATES:
+            raise ValueError(f"Merge unit {loser.id} in state {loser.state!r} cannot be dropped or superseded")
+
+        winner: MergeUnit | None = None
+        if superseded_by_unit_id is not None:
+            winner = self.get_merge_unit(superseded_by_unit_id)
+            if winner is None:
+                raise ValueError(f"Winner merge unit {superseded_by_unit_id} not found")
+            if winner.id == loser.id:
+                raise ValueError("Merge unit cannot supersede itself")
+            if not merge_unit_is_active(winner):
+                raise ValueError(f"Winner merge unit {winner.id} is not active")
+            if winner.target_branch != loser.target_branch:
+                raise ValueError(
+                    f"Winner merge unit {winner.id} targets {winner.target_branch!r}, "
+                    f"expected {loser.target_branch!r}"
+                )
+            if winner.superseded_by_unit_id == loser.id:
+                raise ValueError(f"Winner merge unit {winner.id} already points at loser {loser.id}")
+
+        now_dt = datetime.now(UTC)
+        now = _format_db_timestamp(now_dt)
+        assert now is not None
+
+        with self._connect() as conn:
+            attached_rows = conn.execute(
+                """
+                SELECT t.*
+                FROM merge_unit_tasks mut
+                JOIN tasks t
+                  ON t.project_id = mut.project_id
+                 AND t.id = mut.task_id
+                WHERE mut.project_id = ?
+                  AND mut.merge_unit_id = ?
+                ORDER BY t.created_at ASC, t.id ASC
+                """,
+                (self._project_id, loser.id),
+            ).fetchall()
+            attached_tasks = self._rows_to_tasks(conn, attached_rows)
+            attached_task_ids = tuple(task.id for task in attached_tasks if task.id is not None)
+
+            if any(task.status == "in_progress" for task in attached_tasks):
+                raise ValueError(f"Merge unit {loser.id} has in-progress members")
+
+            updated_unit = conn.execute(
+                """
+                UPDATE merge_units
+                SET state = ?,
+                    superseded_by_unit_id = ?,
+                    merged_at = NULL,
+                    merged_by_task_id = NULL,
+                    merge_source = NULL,
+                    updated_at = ?
+                WHERE project_id = ?
+                  AND id = ?
+                  AND state = ?
+                  AND superseded_by_unit_id IS NULL
+                """,
+                (
+                    requested_state,
+                    superseded_by_unit_id,
+                    now,
+                    self._project_id,
+                    loser.id,
+                    loser.state,
+                ),
+            )
+            if updated_unit.rowcount != 1:
+                refreshed_row = conn.execute(
+                    "SELECT state FROM merge_units WHERE project_id = ? AND id = ?",
+                    (self._project_id, loser.id),
+                ).fetchone()
+                raise RuntimeError(
+                    f"Failed to supersede merge unit {loser.id}; current state is "
+                    f"{str(refreshed_row['state']) if refreshed_row is not None else 'missing'}"
+                )
+
+            for task in attached_tasks:
+                if task.id is None:
+                    continue
+                completed_at = task.completed_at
+                if completed_at is None or task.status in {"pending", "in_progress"}:
+                    completed_at = now_dt
+                conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = ?,
+                        completed_at = ?,
+                        running_pid = NULL,
+                        failure_reason = NULL,
+                        completion_reason = ?,
+                        merge_status = NULL,
+                        merged_at = NULL
+                    WHERE project_id = ?
+                      AND id = ?
+                    """,
+                    (
+                        "dropped",
+                        _format_db_timestamp(completed_at),
+                        completion_reason,
+                        self._project_id,
+                        task.id,
+                    ),
+                )
+
+        return MergeUnitSupersedeResult(
+            unit_id=loser.id,
+            state=requested_state,
+            superseded_by_unit_id=superseded_by_unit_id,
+            completion_reason=completion_reason,
+            affected_task_ids=attached_task_ids,
+            changed=True,
+        )
 
     def _legacy_merge_status_owner_for_unit(self, unit: MergeUnit) -> Task | None:
         owner_task: Task | None = self.get(unit.owner_task_id) if unit.owner_task_id is not None else None

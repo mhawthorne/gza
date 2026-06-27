@@ -732,6 +732,76 @@ class TestQueryIncomplete:
 
         assert query_incomplete(store, HistoryFilter(limit=None)) == []
 
+    def test_incomplete_omits_superseded_loser_root_and_members_but_keeps_winner_and_unrelated_rows(
+        self,
+        tmp_path: Path,
+    ):
+        store = self._store(tmp_path)
+
+        loser = store.add("losing implement", task_type="implement")
+        winner = store.add("winning implement", task_type="implement", based_on=loser.id)
+        unrelated = store.add("unrelated implement", task_type="implement")
+        loser_review = store.add("loser review", task_type="review", based_on=loser.id, depends_on=loser.id)
+        assert loser.id is not None
+        assert winner.id is not None
+        assert unrelated.id is not None
+        assert loser_review.id is not None
+
+        loser.branch = "feature/incomplete-loser"
+        loser.status = "failed"
+        loser.failure_reason = "INFRASTRUCTURE_ERROR"
+        loser.has_commits = True
+        loser.completed_at = datetime.now(UTC)
+        store.update(loser)
+
+        winner.branch = "feature/incomplete-winner"
+        self._complete(winner, merge_status="unmerged")
+        store.update(winner)
+
+        unrelated.branch = "feature/incomplete-unrelated"
+        self._complete(unrelated, merge_status="unmerged")
+        store.update(unrelated)
+
+        loser_review.status = "pending"
+        store.update(loser_review)
+
+        loser_unit = store.create_merge_unit(
+            source_branch=loser.branch,
+            target_branch="main",
+            owner_task_id=loser.id,
+            state="unmerged",
+        )
+        winner_unit = store.create_merge_unit(
+            source_branch=winner.branch,
+            target_branch="main",
+            owner_task_id=winner.id,
+            state="unmerged",
+        )
+        unrelated_unit = store.create_merge_unit(
+            source_branch=unrelated.branch,
+            target_branch="main",
+            owner_task_id=unrelated.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(loser.id, loser_unit.id, "owner")
+        store.attach_task_to_merge_unit(loser_review.id, loser_unit.id, "review")
+        store.attach_task_to_merge_unit(winner.id, winner_unit.id, "owner")
+        store.attach_task_to_merge_unit(unrelated.id, unrelated_unit.id, "owner")
+
+        store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+
+        lineages = query_incomplete(store, HistoryFilter(limit=None))
+
+        roots = {lineage.root.id for lineage in lineages}
+        assert roots == {winner.id, unrelated.id}
+        winner_lineage = next(lineage for lineage in lineages if lineage.root.id == winner.id)
+        rendered_ids = {task.id for task in winner_lineage.unresolved_tasks}
+        tree_ids = {winner_lineage.tree.task.id, *(child.task.id for child in winner_lineage.tree.children)}
+        assert loser.id not in rendered_ids
+        assert loser_review.id not in rendered_ids
+        assert loser.id not in tree_ids
+        assert loser_review.id not in tree_ids
+
     def test_branching_retry_lineage_keeps_all_unresolved_siblings_under_root(self, tmp_path: Path):
         store = self._store(tmp_path)
 
@@ -1207,6 +1277,50 @@ class TestQueryIncomplete:
         assert lineages[0].root.id == root.id
         unresolved_ids = {task.id for task in lineages[0].unresolved_tasks}
         assert unresolved_ids == {root.id}
+
+    def test_query_incomplete_omits_superseded_merge_unit_members_after_store_mutation(self, tmp_path: Path):
+        store = self._store(tmp_path)
+
+        loser = store.add("losing implement", task_type="implement")
+        winner = store.add("winning implement", task_type="implement")
+        assert loser.id is not None
+        assert winner.id is not None
+
+        loser.status = "failed"
+        loser.failure_reason = "INFRASTRUCTURE_ERROR"
+        loser.branch = "feature/query-superseded-loser"
+        loser.has_commits = True
+        loser.completed_at = datetime.now(UTC)
+        store.update(loser)
+
+        winner.status = "completed"
+        winner.branch = "feature/query-superseded-winner"
+        winner.has_commits = True
+        winner.completed_at = datetime.now(UTC)
+        store.update(winner)
+
+        loser_unit = store.create_merge_unit(
+            source_branch=loser.branch,
+            target_branch="main",
+            owner_task_id=loser.id,
+            state="unmerged",
+        )
+        winner_unit = store.create_merge_unit(
+            source_branch=winner.branch,
+            target_branch="main",
+            owner_task_id=winner.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(loser.id, loser_unit.id, "owner")
+        store.attach_task_to_merge_unit(winner.id, winner_unit.id, "owner")
+
+        before = query_incomplete(store, HistoryFilter(limit=None))
+        assert {lineage.root.id for lineage in before} == {loser.id, winner.id}
+
+        store.supersede_merge_unit(loser_unit.id, superseded_by_unit_id=winner_unit.id)
+
+        after = query_incomplete(store, HistoryFilter(limit=None))
+        assert [lineage.root.id for lineage in after] == [winner.id]
 
 
 class TestIsLineageResolved:
