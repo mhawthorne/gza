@@ -1135,6 +1135,42 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["watch"]["dispatch_start_timeout"] == 7
         assert payload["sources"]["watch.dispatch_start_timeout"] == "local"
 
+    def test_config_command_includes_parked_auto_rearm_judge_json_and_sources(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """gza config --json should expose parked auto-rearm judge settings and sources."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  parked_auto_rearm:\n"
+            "    judge_enabled: true\n"
+            "    judge_cooldown_hours: 6\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  parked_auto_rearm:\n"
+            "    judge_max_parked_tasks: 17\n"
+        )
+
+        result = invoke_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        parked_auto_rearm = payload["effective"]["watch"]["parked_auto_rearm"]
+        assert parked_auto_rearm["judge_enabled"] is True
+        assert parked_auto_rearm["judge_cooldown_hours"] == 6
+        assert parked_auto_rearm["judge_max_parked_tasks"] == 17
+        assert payload["sources"]["watch.parked_auto_rearm.judge_enabled"] == "base"
+        assert payload["sources"]["watch.parked_auto_rearm.judge_cooldown_hours"] == "base"
+        assert payload["sources"]["watch.parked_auto_rearm.judge_max_parked_tasks"] == "local"
+
     def test_config_command_includes_quiet_period_seconds_json_and_source(self, tmp_path: Path):
         """gza config --json should expose quiet_period_seconds with source attribution."""
 

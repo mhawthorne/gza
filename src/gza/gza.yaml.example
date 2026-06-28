@@ -372,14 +372,14 @@ project_name: my-project
 #   Default: 3
 #   no_progress_cycles: 3
 #   parked_auto_rearm:
-#     Maximum blind auto-rearm attempts `gza watch` may spend per parked subject/reason pair before
+#     Maximum parked auto-rearm attempts `gza watch` may spend per parked subject/reason pair before
 #     leaving it parked.
 #     Default: 2
 #     budget: 2
-#     Cooldown window between blind parked auto-rearm attempts for the same subject/reason pair.
+#     Cooldown window between parked auto-rearm attempts for the same subject/reason pair.
 #     Default: 12
 #     cooldown_hours: 12
-#     Enable the watch-owned blind parked auto-rearm phase for eligible parked owner/reason pairs.
+#     Enable the watch-owned parked auto-rearm phase for eligible parked owner/reason pairs.
 #     Default: false
 #     enabled: false
 #     Minimum cooldown between batched parked auto-rearm judge passes.
@@ -392,7 +392,7 @@ project_name: my-project
 #     Maximum parked candidates included in one batched judge prompt.
 #     Default: 50
 #     judge_max_parked_tasks: 50
-#     Require the target branch SHA to advance since the last blind auto-rearm attempt before watch
+#     Require the target branch SHA to advance since the last parked auto-rearm attempt before watch
 #     spends another attempt for the same parked subject/reason pair.
 #     Default: true
 #     require_target_advanced: true
