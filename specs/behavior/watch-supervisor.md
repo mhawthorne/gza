@@ -122,7 +122,8 @@ Each watch cycle MUST execute these phases in order:
    purpose match the current classification before queue-bumping it.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
-4. **Parked auto-rearm phase.** **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
+4. **Parked auto-rearm phase.** **Blind parked auto-rearm phase.** is the judge-disabled
+   branch within this phase. After the direct non-worker lifecycle phase has
    reconciled the freshest target state for this cycle, watch MAY run one conservative
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay
    supervisor-owned and MUST reuse the shared parked clear service plus the shared

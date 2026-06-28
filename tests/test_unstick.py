@@ -392,6 +392,31 @@ def test_select_and_clear_parked_tasks_clears_backstop_and_is_idempotent(tmp_pat
     assert [(outcome.status, outcome.detail) for outcome in second.outcomes] == [("skipped", "not currently parked")]
 
 
+def test_select_and_clear_parked_tasks_reports_reason_mismatch_for_explicit_parked_id(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+
+    impl, owner_row = _make_backstop_owner(store, prompt="Backstop reason mismatch", branch="feature/backstop-mismatch")
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(impl.id,),
+            reason_classes=("retry-limit",),
+        )
+
+    assert [(outcome.status, outcome.detail) for outcome in result.outcomes] == [
+        ("skipped", "does not match requested reason"),
+    ]
+    merge_unit = store.get_or_create_merge_unit_for_task(impl)
+    observations = store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=str(merge_unit.id))
+    assert len(observations) == 1
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
 def test_select_and_clear_parked_tasks_finds_and_rearms_real_retry_limit_owner_row(tmp_path: Path) -> None:
     setup_config(tmp_path)
     (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 1\n")

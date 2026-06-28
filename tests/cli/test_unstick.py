@@ -151,6 +151,36 @@ def test_unstick_help_mentions_reason_and_all_tags(tmp_path):
     assert "--limit N" in result.stdout
 
 
+def test_unstick_reports_reason_mismatch_for_explicit_parked_id(tmp_path, monkeypatch):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner = store.add("Reason mismatch owner", task_type="implement")
+    assert owner.id is not None
+    monkeypatch.setattr("gza.cli.unstick.Git", _UnstickGitDouble)
+    outcomes = (
+        UnstickOutcome(owner_task=owner, reason_class=None, status="skipped", detail="does not match requested reason"),
+    )
+
+    with patch(
+        "gza.cli.unstick.select_and_clear_parked_tasks",
+        return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+    ):
+        result = invoke_gza(
+            "unstick",
+            str(owner.id),
+            "--reason",
+            "retry-limit",
+            "--project",
+            str(tmp_path),
+        )
+
+    assert result.returncode == 0
+    assert "Selected 1 parked owner(s)" in result.stdout
+    assert "Skipped:" in result.stdout
+    assert f"{owner.id} does not match requested reason: Reason mismatch owner" in result.stdout
+    assert "not currently parked" not in result.stdout
+
+
 def test_unstick_run_reports_started_cleared_only_and_capacity_blocked(tmp_path, monkeypatch):
     setup_config(tmp_path)
     store = make_store(tmp_path)

@@ -52,6 +52,7 @@ class SelectedParkedTask:
 
     owner_task: DbTask
     current_candidate: ParkedTaskCandidate | None
+    selection_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -257,7 +258,12 @@ def _select_targets(
             return True
         return task_matches_tag_filters(task_tags=owner_task.tags, tag_filters=tags, any_tag=any_tag)
 
-    def _append(owner_task: DbTask, candidate: ParkedTaskCandidate | None) -> None:
+    def _append(
+        owner_task: DbTask,
+        candidate: ParkedTaskCandidate | None,
+        *,
+        selection_detail: str | None = None,
+    ) -> None:
         owner_id = owner_task.id
         if owner_id is None:
             return
@@ -266,7 +272,13 @@ def _select_targets(
         if dedupe_key in seen_owner_reason:
             return
         seen_owner_reason.add(dedupe_key)
-        selected.append(SelectedParkedTask(owner_task=owner_task, current_candidate=candidate))
+        selected.append(
+            SelectedParkedTask(
+                owner_task=owner_task,
+                current_candidate=candidate,
+                selection_detail=selection_detail,
+            )
+        )
 
     if task_ids:
         for task_id in task_ids:
@@ -277,6 +289,9 @@ def _select_targets(
             if matching_candidates:
                 for candidate in matching_candidates:
                     _append(owner_task, candidate)
+                continue
+            if reason_filter and by_owner_id.get(owner_task.id):
+                _append(owner_task, None, selection_detail="does not match requested reason")
                 continue
             if _matches_tag_only(owner_task):
                 _append(owner_task, None)
@@ -338,7 +353,7 @@ def _apply_selected_target(
             owner_task=owner_task,
             reason_class=None,
             status="skipped",
-            detail="not currently parked",
+            detail=selected.selection_detail or "not currently parked",
         )
     clear_parked_candidate_state(store, parked, record_manual_retry_limit_rearm=True)
     return UnstickOutcome(
