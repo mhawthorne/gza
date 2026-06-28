@@ -5454,14 +5454,11 @@ def test_rebase_run_uses_foreground_task_backed_path(tmp_path: Path) -> None:
     run_rebase.assert_called_once()
 
 
-def test_rebase_background_duplicate_active_rebase_returns_phase1_error_and_releases_capacity(
+def test_rebase_background_duplicate_active_rebase_returns_phase1_error_and_releases_permit_once(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     setup_config(tmp_path)
-    config_path = tmp_path / "gza.yaml"
-    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
-    config = Config.load(tmp_path)
     store = make_store(tmp_path)
 
     impl_task = store.add("Implement feature", task_type="implement")
@@ -5471,7 +5468,7 @@ def test_rebase_background_duplicate_active_rebase_returns_phase1_error_and_rele
     impl_task.completed_at = datetime.now(UTC)
     store.update(impl_task)
 
-    active_rebase = store.add("Rebase", task_type="rebase", based_on=impl_task.id, same_branch=True)
+    active_rebase = store.add("Existing rebase", task_type="rebase", based_on=impl_task.id, same_branch=True)
     assert active_rebase.id is not None
 
     git = SimpleNamespace(
@@ -5491,30 +5488,51 @@ def test_rebase_background_duplicate_active_rebase_returns_phase1_error_and_rele
         background=True,
         no_docker=True,
     )
+    permit = MagicMock()
 
     with (
         patch("gza.cli.git_ops.Git", return_value=git),
         patch("gza.cli.git_ops._require_default_branch", return_value=True),
+        patch("gza.cli.git_ops.launch_permit", return_value=permit),
         patch(
             "gza.cli.git_ops._create_rebase_task",
             side_effect=DuplicateActiveChildError(active_rebase),
         ),
-        patch("gza.cli.git_ops._prepare_task_for_immediate_execution", side_effect=AssertionError("unused")),
-        patch("gza.cli.git_ops._spawn_background_worker", side_effect=AssertionError("unused")),
+        patch(
+            "gza.cli.git_ops._prepare_task_for_immediate_execution",
+            side_effect=AssertionError("should not prepare duplicate rebase"),
+        ),
+        patch(
+            "gza.cli.git_ops._spawn_background_worker",
+            side_effect=AssertionError("should not spawn duplicate rebase"),
+        ),
+        patch(
+            "gza.cli.git_ops.reserve_task_launch_permit",
+            side_effect=AssertionError("should not reserve permit for duplicate rebase"),
+        ),
     ):
         rc = cmd_rebase(args)
 
     assert rc == 1
+    permit.release.assert_called_once_with()
     captured = capsys.readouterr()
-    combined_output = captured.out + captured.err
-    assert f"Error: rebase already pending/in progress for {impl_task.id}: {active_rebase.id}" in combined_output
-    permit = launch_permit(config, store)
-    permit.release()
+    assert captured.out == "On branch main\n"
+    assert f"rebase already pending/in progress for {impl_task.id}" in captured.err
+    assert active_rebase.id in captured.err
 
 
-def test_rebase_foreground_duplicate_active_rebase_returns_phase1_error(
+@pytest.mark.parametrize(
+    ("run_flag", "background_flag"),
+    [
+        (False, False),
+        (True, False),
+    ],
+)
+def test_rebase_duplicate_active_rebase_returns_phase1_error_without_running_rebase(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    run_flag: bool,
+    background_flag: bool,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -5526,7 +5544,7 @@ def test_rebase_foreground_duplicate_active_rebase_returns_phase1_error(
     impl_task.completed_at = datetime.now(UTC)
     store.update(impl_task)
 
-    active_rebase = store.add("Rebase", task_type="rebase", based_on=impl_task.id, same_branch=True)
+    active_rebase = store.add("Existing rebase", task_type="rebase", based_on=impl_task.id, same_branch=True)
     assert active_rebase.id is not None
 
     git = SimpleNamespace(
@@ -5541,9 +5559,9 @@ def test_rebase_foreground_duplicate_active_rebase_returns_phase1_error(
         remote=False,
         force=False,
         resolve=False,
-        run=True,
+        run=run_flag,
         queue=False,
-        background=False,
+        background=background_flag,
         no_docker=True,
     )
 
@@ -5554,14 +5572,19 @@ def test_rebase_foreground_duplicate_active_rebase_returns_phase1_error(
             "gza.cli.git_ops._create_rebase_task",
             side_effect=DuplicateActiveChildError(active_rebase),
         ),
-        patch("gza.cli.git_ops._run_task_backed_rebase", side_effect=AssertionError("unused")),
+        patch(
+            "gza.cli.git_ops._run_task_backed_rebase",
+            side_effect=AssertionError("should not run duplicate rebase"),
+        ),
     ):
         rc = cmd_rebase(args)
 
     assert rc == 1
     captured = capsys.readouterr()
-    combined_output = captured.out + captured.err
-    assert f"Error: rebase already pending/in progress for {impl_task.id}: {active_rebase.id}" in combined_output
+    assert captured.err == ""
+    assert captured.out.startswith("On branch main\n")
+    assert f"rebase already pending/in progress for {impl_task.id}" in captured.out
+    assert active_rebase.id in captured.out
 
 
 def test_reconcile_squash_merge_skips_when_no_remote_tracking_ref() -> None:
