@@ -4661,6 +4661,10 @@ def _build_context_from_chain(
 
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":
+        unresolved_comments: list[Any] = []
+        current_review_task: Task | None = None
+        current_review_content: str | None = None
+
         impl_ancestor = _resolve_impl_ancestor(store, task)
         if impl_ancestor is not None and impl_ancestor.id is not None:
             unresolved_comments = store.get_comments(
@@ -4669,58 +4673,71 @@ def _build_context_from_chain(
                 created_on_or_before=task.created_at,
                 kinds=(TASK_COMMENT_KIND_FEEDBACK,),
             )
-            if unresolved_comments:
-                context_parts.append("## Comments:\n")
-                for comment in unresolved_comments:
-                    source_author = f"source={comment.source}"
-                    if comment.author:
-                        source_author += f", author={comment.author}"
-                    context_parts.append(
-                        f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
-                    )
-                    context_parts.append(comment.content)
 
         # Get the review we're addressing
         if task.depends_on:
-            review_task = store.get(task.depends_on)
-            if review_task and review_task.task_type == "review":
-                review_content = _get_task_output(review_task, project_dir)
-                if review_content:
-                    context_parts.append("## Review feedback to address:\n")
-                    context_parts.append(review_content)
-                    if is_verify_timeout_only_review(review_content):
-                        context_parts.append("\n## Verify Timeout Guidance\n")
-                        context_parts.append(
-                            "The inbound review's only Blocker is a `verify_command` timeout. "
-                            "Treat this as a test-performance investigation first, not a generic "
-                            "code-correctness fix.\n"
-                        )
-                        context_parts.append(
-                            "- Inspect the captured `## verify_command result`, trimmed output, and any referenced `verify_command_output` artifact before rerunning the full command. Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps."
-                        )
-                        context_parts.append(
-                            "- Re-run the exact configured `verify_command` once from the current branch tip to confirm the timeout is still current."
-                        )
-                        context_parts.append(
-                            "- If it still times out, run a narrower configured subset or harness-specific diagnostic mode so you can isolate the slow phase before rerunning the full suite."
-                        )
-                        context_parts.append(
-                            "- Use diagnostics that fit the configured harness for this project; keep framework-specific probes in project docs or harness scripts rather than assuming any one test framework."
-                        )
-                        context_parts.append(
-                            "- Compare against the baseline branch when practical to determine whether this branch introduced the slowdown."
-                        )
-                        context_parts.append(
-                            "- If this branch introduced the slowdown, fix or narrow the offending test."
-                        )
-                        context_parts.append(
-                            "- If the slowdown is pre-existing or environmental, report that explicitly and escalate; do not silently relax suite-wide guardrails or change `verify_timeout`."
-                        )
-                else:
+            current_review_task = store.get(task.depends_on)
+            if current_review_task and current_review_task.task_type == "review":
+                current_review_content = _get_task_output(current_review_task, project_dir)
+
+        if current_review_task is not None or unresolved_comments:
+            context_parts.append(
+                _build_current_improve_closure_checklist(
+                    impl_ancestor=impl_ancestor,
+                    review_task=current_review_task,
+                    review_content=current_review_content,
+                    unresolved_comments=unresolved_comments,
+                )
+            )
+
+        if current_review_task and current_review_task.task_type == "review":
+            if current_review_content:
+                context_parts.append("## Review feedback to address:\n")
+                context_parts.append(current_review_content)
+                if is_verify_timeout_only_review(current_review_content):
+                    context_parts.append("\n## Verify Timeout Guidance\n")
                     context_parts.append(
-                        "## Review feedback to address:\n"
-                        f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
+                        "The inbound review's only Blocker is a `verify_command` timeout. "
+                        "Treat this as a test-performance investigation first, not a generic "
+                        "code-correctness fix.\n"
                     )
+                    context_parts.append(
+                        "- Inspect the captured `## verify_command result`, trimmed output, and any referenced `verify_command_output` artifact before rerunning the full command. Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps."
+                    )
+                    context_parts.append(
+                        "- Re-run the exact configured `verify_command` once from the current branch tip to confirm the timeout is still current."
+                    )
+                    context_parts.append(
+                        "- If it still times out, run a narrower configured subset or harness-specific diagnostic mode so you can isolate the slow phase before rerunning the full suite."
+                    )
+                    context_parts.append(
+                        "- Use diagnostics that fit the configured harness for this project; keep framework-specific probes in project docs or harness scripts rather than assuming any one test framework."
+                    )
+                    context_parts.append(
+                        "- Compare against the baseline branch when practical to determine whether this branch introduced the slowdown."
+                    )
+                    context_parts.append(
+                        "- If this branch introduced the slowdown, fix or narrow the offending test."
+                    )
+                    context_parts.append(
+                        "- If the slowdown is pre-existing or environmental, report that explicitly and escalate; do not silently relax suite-wide guardrails or change `verify_timeout`."
+                    )
+            else:
+                context_parts.append(
+                    "## Review feedback to address:\n"
+                    f"(review task {current_review_task.id} exists but content unavailable on this machine - flag as blocker)"
+                )
+
+        if unresolved_comments:
+            context_parts.append("## Comments:\n")
+            for comment in unresolved_comments:
+                source_author = f"source={comment.source}"
+                if comment.author:
+                    source_author += f", author={comment.author}"
+                context_parts.append(
+                    f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
+                )
+                context_parts.append(comment.content)
 
         if impl_ancestor is not None:
             plan_task = get_plan_for_task(store, impl_ancestor)
@@ -5417,6 +5434,91 @@ def _extract_failure_context(task: Task, project_dir: Path) -> str:
                 lines.extend(tail[-20:])
     if not lines:
         return "(no failed-attempt context available)"
+    return "\n".join(lines)
+
+
+def _summarize_improve_comment(comment: Any) -> str:
+    """Return a compact one-line summary for an unresolved improve comment."""
+    collapsed = " ".join((comment.content or "").split()).strip()
+    if not collapsed:
+        collapsed = "(comment content unavailable)"
+    if len(collapsed) > 140:
+        collapsed = f"{collapsed[:137].rstrip()}..."
+    return collapsed
+
+
+def _build_current_improve_closure_checklist(
+    *,
+    impl_ancestor: Task | None,
+    review_task: Task | None,
+    review_content: str | None,
+    unresolved_comments: list[Any],
+) -> str:
+    """Render a conservative closure checklist for the current improve pass."""
+    lines = ["## Current Improve Closure Checklist", ""]
+    if impl_ancestor is not None and impl_ancestor.id is not None:
+        lines.append(f"- Implementation task: {impl_ancestor.id}")
+    if review_task is not None and review_task.id is not None:
+        lines.append(f"- Current review task: {review_task.id}")
+
+    parsed_blockers: list[ReviewFinding] | None = None
+    parser_degraded = False
+    if review_content:
+        try:
+            parsed_review = parse_review_report(review_content)
+        except Exception:
+            parser_degraded = True
+        else:
+            parsed_blockers = [
+                finding for finding in parsed_review.findings if finding.severity == "BLOCKER"
+            ]
+            if (
+                not parsed_blockers
+                and parsed_review.verdict == "CHANGES_REQUESTED"
+                and ("## Blockers" in review_content or "## Must-Fix" in review_content)
+            ):
+                parser_degraded = True
+
+    if review_task is not None:
+        if not review_content:
+            lines.append(
+                "- [ ] Current review content is unavailable on this machine; use the authoritative review task below and flag the missing content as a blocker."
+            )
+        elif parsed_blockers:
+            for finding in parsed_blockers:
+                blocker_kind = classify_review_blocker_finding(finding)
+                lines.append(
+                    f"- [ ] Review blocker {finding.id} [{blocker_kind}]: {finding.title}"
+                )
+                if finding.open_state_citation:
+                    lines.append(f"  Open-state citation: {finding.open_state_citation}")
+                if finding.fix_or_followup:
+                    lines.append(f"  Required fix: {finding.fix_or_followup}")
+                if finding.tests:
+                    lines.append(f"  Required tests: {finding.tests}")
+        elif parser_degraded:
+            lines.append(
+                "- [ ] Structured review blockers are unavailable or incomplete for the current review; use the raw review text below as authoritative and do not assume unstated blocker claims."
+            )
+        else:
+            lines.append("- No structured review blockers are currently listed in the current review.")
+    else:
+        lines.append("- No current review is attached to this improve pass.")
+
+    if unresolved_comments:
+        for comment in unresolved_comments:
+            source_author = f"source={comment.source}"
+            if comment.author:
+                source_author += f", author={comment.author}"
+            lines.append(
+                f"- [ ] Unresolved comment #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author}): {_summarize_improve_comment(comment)}"
+            )
+    else:
+        lines.append("- No unresolved improve comments are currently in scope.")
+
+    lines.append(
+        "- [ ] Closure rule: close every listed blocker/comment together, preserve the raw review and comment evidence below, and do not complete this improve until the full final verify passes."
+    )
     return "\n".join(lines)
 
 

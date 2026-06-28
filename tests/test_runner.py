@@ -32,7 +32,7 @@ from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_clearance import VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
-from gza.review_verdict import ReviewFinding, parse_review_report
+from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
@@ -2862,8 +2862,146 @@ class TestReviewContextFromChain:
             context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
         assert "## Review feedback to address:" in context
+        assert "## Current Improve Closure Checklist" in context
         assert f"review task {review_task.id} exists but content unavailable" in context
         assert "flag as blocker" in context
+
+    def test_improve_context_closure_checklist_lists_all_current_review_blockers(self, tmp_path: Path):
+        """Improve context should inventory the full current blocker set beside the raw review."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Also tighten the follow-up validation path.", source="direct")
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Two blockers remain open.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing stale-review guard\n"
+            "Evidence: `src/gza/advance_engine.py:1994` still allows the stale path to surface.\n"
+            "Open-state citation: `src/gza/advance_engine.py:1994`\n"
+            "Impact: the merge path can still park or merge from the wrong state.\n"
+            "Required fix: guard the stale branch before merge.\n"
+            "Required tests: add a targeted advance-engine regression.\n\n"
+            "### B2 verify_command failure: resume review regression\n"
+            "Evidence: `tests/test_runner.py::test_runner_resume_guard` still fails at the current tip.\n"
+            "Impact: autonomous verify is still red.\n"
+            "Required fix: rerun verify_command after correcting the guard behavior.\n"
+            "Required tests: rerun verify_command.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        checklist_start = context.index("## Current Improve Closure Checklist")
+        review_start = context.index("## Review feedback to address:")
+        assert checklist_start < review_start
+        assert "Review blocker B1 [code]: Missing stale-review guard" in context
+        assert "Open-state citation: `src/gza/advance_engine.py:1994`" in context
+        assert "Review blocker B2 [verify_failure]: verify_command failure: resume review regression" in context
+        assert "Required tests: rerun verify_command." in context
+        assert "Unresolved comment #" in context
+        assert "Also tighten the follow-up validation path." in context
+        assert "Closure rule: close every listed blocker/comment together" in context
+
+    def test_improve_context_closure_checklist_supports_comments_only_improve(self, tmp_path: Path):
+        """Comments-only improve context should still render a checklist without inventing review blockers."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Rename helper for clarity.", source="direct", author="alice")
+        store.add_comment(
+            impl_task.id,
+            "Add a guard for missing input before normalization.",
+            source="github",
+        )
+
+        improve_task = store.add(
+            prompt="Improve feature from comments",
+            task_type="improve",
+            based_on=impl_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Current Improve Closure Checklist" in context
+        assert "- No current review is attached to this improve pass." in context
+        assert "Unresolved comment #" in context
+        assert "Rename helper for clarity." in context
+        assert "Add a guard for missing input before normalization." in context
+        assert "## Review feedback to address:" not in context
+        assert "Review blocker B" not in context
+
+    def test_improve_context_closure_checklist_stays_conservative_when_review_parser_degrades(
+        self, tmp_path: Path
+    ):
+        """Parser degradation should preserve raw review text and avoid invented blocker claims."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Must-Fix\n\n"
+            "- Something is still wrong here, but this legacy report is not parseable into structured findings.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        degraded_report = ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        )
+        with patch("gza.runner.parse_review_report", return_value=degraded_report):
+            context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Current Improve Closure Checklist" in context
+        assert "Structured review blockers are unavailable or incomplete for the current review" in context
+        assert "do not assume unstated blocker claims" in context
+        assert "## Review feedback to address:" in context
+        assert "legacy report is not parseable into structured findings" in context
+        assert "Review blocker B1" not in context
 
     def test_improve_context_includes_verify_timeout_guidance_for_timeout_only_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
