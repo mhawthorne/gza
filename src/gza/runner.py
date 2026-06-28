@@ -57,6 +57,7 @@ from .db import (
     SqliteTaskStore,
     Task,
     TaskArtifact,
+    TaskComment,
     TaskStats,
     extract_failure_reason as _extract_failure_reason,
     task_id_numeric_key,
@@ -4598,6 +4599,64 @@ def _build_resolution_review_delta_context(
     return "\n".join(parts)
 
 
+def _summarize_atomic_context_text(text: str | None, *, max_chars: int = 120) -> str:
+    """Return a stable one-line summary for atomic improve context entries."""
+    if not text:
+        return "not specified"
+    compact = _compact_output_summary(text, max_chars=max_chars)
+    if compact:
+        return compact
+    return "not specified"
+
+
+def _render_atomic_blocker_set(
+    *,
+    impl_task: Task,
+    review_task: Task,
+    review_content: str,
+    unresolved_comments: list[TaskComment],
+) -> str | None:
+    """Render the compact improve blocker set when structured review blockers exist."""
+    parsed_review = parse_review_report(review_content)
+    blockers = [finding for finding in parsed_review.findings if finding.severity == "BLOCKER"]
+    if not blockers:
+        return None
+
+    lines = [
+        "## Atomic Blocker Set",
+        "",
+        f"Implementation task: {impl_task.id or 'unknown'}",
+        f"Review task: {review_task.id or 'unknown'}",
+        (
+            "Closure rule: treat every listed review blocker and unresolved feedback comment as one set. "
+            "Do not mark this pass complete until the full set is closed or explicitly disputed, and final "
+            "completion still requires the full verify gate."
+        ),
+        "",
+    ]
+
+    for ordinal, finding in enumerate(blockers, start=1):
+        blocker_id = finding.id.strip() if finding.id and finding.id.strip() else f"#{ordinal}"
+        classification = classify_review_blocker_finding(finding)
+        summary = _summarize_atomic_context_text(finding.fix_or_followup or finding.title)
+        line = f"- review {blocker_id}: class={classification}; summary={summary}"
+        tests = _summarize_atomic_context_text(finding.tests) if finding.tests else None
+        if tests is not None:
+            line += f"; tests={tests}"
+        lines.append(line)
+
+    for comment in unresolved_comments:
+        comment_summary = _summarize_atomic_context_text(comment.content)
+        metadata = [f"source={comment.source}", f"created_at={comment.created_at.isoformat()}"]
+        if comment.author:
+            metadata.append(f"author={comment.author}")
+        lines.append(
+            f"- feedback #{comment.id}: {'; '.join(metadata)}; summary={comment_summary}"
+        )
+
+    return "\n".join(lines)
+
+
 def _build_context_from_chain(
     task: Task,
     store: SqliteTaskStore,
@@ -4662,6 +4721,7 @@ def _build_context_from_chain(
     # For improve tasks, include review feedback and original plan
     if task.task_type == "improve":
         impl_ancestor = _resolve_impl_ancestor(store, task)
+        unresolved_comments: list[TaskComment] = []
         if impl_ancestor is not None and impl_ancestor.id is not None:
             unresolved_comments = store.get_comments(
                 impl_ancestor.id,
@@ -4669,22 +4729,37 @@ def _build_context_from_chain(
                 created_on_or_before=task.created_at,
                 kinds=(TASK_COMMENT_KIND_FEEDBACK,),
             )
-            if unresolved_comments:
-                context_parts.append("## Comments:\n")
-                for comment in unresolved_comments:
-                    source_author = f"source={comment.source}"
-                    if comment.author:
-                        source_author += f", author={comment.author}"
-                    context_parts.append(
-                        f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
-                    )
-                    context_parts.append(comment.content)
+
+        rendered_atomic_blocker_set = False
 
         # Get the review we're addressing
         if task.depends_on:
             review_task = store.get(task.depends_on)
             if review_task and review_task.task_type == "review":
                 review_content = _get_task_output(review_task, project_dir)
+                if review_content and impl_ancestor is not None:
+                    atomic_blocker_set = _render_atomic_blocker_set(
+                        impl_task=impl_ancestor,
+                        review_task=review_task,
+                        review_content=review_content,
+                        unresolved_comments=unresolved_comments,
+                    )
+                    if atomic_blocker_set:
+                        context_parts.append(atomic_blocker_set)
+                        context_parts.append("")
+                        rendered_atomic_blocker_set = True
+
+                if unresolved_comments and not rendered_atomic_blocker_set:
+                    context_parts.append("## Comments:\n")
+                    for comment in unresolved_comments:
+                        source_author = f"source={comment.source}"
+                        if comment.author:
+                            source_author += f", author={comment.author}"
+                        context_parts.append(
+                            f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
+                        )
+                        context_parts.append(comment.content)
+
                 if review_content:
                     context_parts.append("## Review feedback to address:\n")
                     context_parts.append(review_content)
@@ -4721,6 +4796,26 @@ def _build_context_from_chain(
                         "## Review feedback to address:\n"
                         f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
                     )
+            elif unresolved_comments:
+                context_parts.append("## Comments:\n")
+                for comment in unresolved_comments:
+                    source_author = f"source={comment.source}"
+                    if comment.author:
+                        source_author += f", author={comment.author}"
+                    context_parts.append(
+                        f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
+                    )
+                    context_parts.append(comment.content)
+        elif unresolved_comments:
+            context_parts.append("## Comments:\n")
+            for comment in unresolved_comments:
+                source_author = f"source={comment.source}"
+                if comment.author:
+                    source_author += f", author={comment.author}"
+                context_parts.append(
+                    f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
+                )
+                context_parts.append(comment.content)
 
         if impl_ancestor is not None:
             plan_task = get_plan_for_task(store, impl_ancestor)

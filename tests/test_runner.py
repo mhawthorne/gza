@@ -2861,9 +2861,62 @@ class TestReviewContextFromChain:
         with patch("gza.runner._get_task_output", return_value=None):
             context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
+        assert "## Atomic Blocker Set" not in context
         assert "## Review feedback to address:" in context
         assert f"review task {review_task.id} exists but content unavailable" in context
         assert "flag as blocker" in context
+
+    def test_improve_context_renders_atomic_blocker_set_before_raw_review_feedback(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = _runner_verify_failure_plus_code_blocker_review_report()
+        store.update(review_task)
+        assert review_task.id is not None
+
+        store.add_comment(
+            impl_task.id,
+            "Please keep the stale-review guard covered by a targeted regression.",
+            source="github",
+            author="alice",
+        )
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        atomic_index = context.index("## Atomic Blocker Set")
+        raw_review_index = context.index("## Review feedback to address:")
+
+        assert atomic_index < raw_review_index
+        assert f"Implementation task: {impl_task.id}" in context
+        assert f"Review task: {review_task.id}" in context
+        assert "Closure rule: treat every listed review blocker and unresolved feedback comment as one set." in context
+        assert "review B1: class=verify_failure; summary=rerun verify_command at the same head.; tests=rerun verify_command." in context
+        assert "review B2: class=code; summary=guard the stale branch before merge.; tests=add a targeted advance-engine regression." in context
+        assert "feedback #" in context
+        assert "source=github; created_at=" in context
+        assert "author=alice" in context
+        assert "summary=Please keep the stale-review guard covered by a targeted regression." in context
+        assert "## Comments:" not in context
+        assert "### B1 verify_command failure: failed root resume attention regression" in context
+        assert "### B2 Missing stale-review guard" in context
 
     def test_improve_context_includes_verify_timeout_guidance_for_timeout_only_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -3084,7 +3137,7 @@ class TestReviewContextFromChain:
         assert "## Verify Timeout Guidance" not in context
 
     def test_improve_context_includes_unresolved_comments(self, tmp_path: Path):
-        """Improve context should include unresolved feedback comments for the implementation task."""
+        """Unstructured review content keeps the fail-closed comments fallback."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3115,6 +3168,7 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
+        assert "## Atomic Blocker Set" not in context
         assert "## Comments:" in context
         assert "source=direct, author=alice" in context
         assert "Please harden input validation." in context
