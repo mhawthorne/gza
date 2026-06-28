@@ -48,8 +48,7 @@ from ..dispatch_preview import (
     normalize_dispatch_selection_mode,
     plan_watch_dispatch_entries,
 )
-from ..git import Git, GitError
-from ..git import resolve_ref_if_possible
+from ..git import Git, GitError, resolve_ref_if_possible
 from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
 from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_is_complete_for_lifecycle
 from ..lineage_query import (
@@ -4769,16 +4768,18 @@ def _run_cycle(
             any_tag=any_tag,
             scoped_owner_ids=scoped_owner_ids,
         )
-        for decision in auto_rearm_result.decisions:
-            owner_id = decision.candidate.owner_task.id
-            if decision.status == "rearmed" and owner_id is not None:
+        for auto_rearm_decision in auto_rearm_result.decisions:
+            owner_id = auto_rearm_decision.candidate.owner_task.id
+            if auto_rearm_decision.status == "rearmed" and owner_id is not None:
                 log.emit(
                     "REARM",
                     (
                         f"{owner_id}: blind auto-rearm cleared "
-                        f"{decision.candidate.attention_reason}"
+                        f"{auto_rearm_decision.candidate.attention_reason}"
                     ),
-                    dedupe_key=f"blind-auto-rearm:{owner_id}:{decision.candidate.attention_reason}",
+                    dedupe_key=(
+                        f"blind-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}"
+                    ),
                 )
                 work_done = True
         if auto_rearm_result.rearmed_owner_ids:
