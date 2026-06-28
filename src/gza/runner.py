@@ -4619,10 +4619,16 @@ def _render_atomic_blocker_set(
     """Render the compact improve blocker set when structured feedback is available."""
     parsed_review = parse_review_report(review_content)
     blockers = [finding for finding in parsed_review.findings if finding.severity == "BLOCKER"]
-    has_structured_review = parsed_review.format_version != "unknown"
+    has_parseable_blocker_section = (
+        parsed_review.blockers_section_present and not parsed_review.blockers_section_malformed
+    )
     if not blockers and not unresolved_comments:
         return None
-    if not blockers and unresolved_comments and not has_structured_review:
+    if parsed_review.blockers_section_malformed:
+        return None
+    if not blockers and unresolved_comments and not parsed_review.blockers_section_explicit_none:
+        return None
+    if not blockers and unresolved_comments and not has_parseable_blocker_section:
         return None
 
     lines = [

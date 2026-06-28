@@ -3242,6 +3242,57 @@ class TestReviewContextFromChain:
         assert "## Blockers\n\nNone." in context
         assert context.index("## Atomic Blocker Set") < context.index("## Review feedback to address:")
 
+    def test_improve_context_fails_closed_for_malformed_blocker_prose_with_comments(
+        self, tmp_path: Path
+    ):
+        """Malformed structured blocker prose must not present comments as a complete atomic set."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Validation still missing.\n\n"
+            "## Blockers\n\n"
+            "- Missing validation still crashes malformed IDs.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        store.add_comment(
+            impl_task.id,
+            "Please keep the malformed-ID regression targeted.",
+            source="github",
+            author="alice",
+        )
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Atomic Blocker Set" not in context
+        assert "## Structured Review Parse Warning" in context
+        assert "## Comments:" in context
+        assert "Please keep the malformed-ID regression targeted." in context
+        assert "## Review feedback to address:" in context
+        assert "- Missing validation still crashes malformed IDs." in context
+
     def test_improve_context_excludes_comments_added_after_improve_creation(self, tmp_path: Path):
         """Improve context should include only unresolved comments present at improve creation time."""
         db_path = tmp_path / "test.db"

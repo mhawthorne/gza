@@ -125,6 +125,9 @@ class ParsedReviewReport:
     verdict: str | None
     findings: tuple[ReviewFinding, ...]
     format_version: Literal["legacy", "v2", "unknown"]
+    blockers_section_present: bool = False
+    blockers_section_explicit_none: bool = False
+    blockers_section_malformed: bool = False
 
 
 @dataclass(frozen=True)
@@ -590,6 +593,21 @@ def parse_review_report(content: str | None) -> ParsedReviewReport:
     elif has_legacy_headings:
         format_version = "legacy"
 
+    blockers_section_present = "blockers" in sections or "mustfix" in sections
+    blockers_section_body = sections.get("blockers")
+    if blockers_section_body is None:
+        blockers_section_body = sections.get("mustfix", "")
+    blockers_section_explicit_none = False
+    blockers_section_malformed = False
+    if blockers_section_present:
+        blockers_section_explicit_none = _section_is_none_literal(blockers_section_body)
+        blockers_section_entries = _split_h3_entries(blockers_section_body)
+        blockers_section_malformed = bool(
+            blockers_section_body.strip()
+            and not blockers_section_entries
+            and not blockers_section_explicit_none
+        )
+
     findings: list[ReviewFinding] = []
     if "blockers" in sections:
         findings.extend(
@@ -624,6 +642,9 @@ def parse_review_report(content: str | None) -> ParsedReviewReport:
         verdict=verdict,
         findings=tuple(findings),
         format_version=format_version,
+        blockers_section_present=blockers_section_present,
+        blockers_section_explicit_none=blockers_section_explicit_none,
+        blockers_section_malformed=blockers_section_malformed,
     )
 
 

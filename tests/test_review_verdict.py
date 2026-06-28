@@ -262,6 +262,36 @@ class TestParseReviewReport:
         report = parse_review_report(content)
         assert report.verdict == "CHANGES_REQUESTED"
 
+    def test_marks_explicit_zero_blocker_section_as_parseable_none(self) -> None:
+        content = (
+            "## Summary\n\n- No blockers.\n\n"
+            "## Blockers\n\nNone.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        report = parse_review_report(content)
+
+        assert report.blockers_section_present is True
+        assert report.blockers_section_explicit_none is True
+        assert report.blockers_section_malformed is False
+
+    def test_marks_nonempty_non_h3_blocker_section_as_malformed(self) -> None:
+        content = (
+            "## Summary\n\n- Found a blocker.\n\n"
+            "## Blockers\n\n"
+            "- Missing validation still crashes malformed IDs.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+
+        report = parse_review_report(content)
+
+        assert report.blockers_section_present is True
+        assert report.blockers_section_explicit_none is False
+        assert report.blockers_section_malformed is True
+        assert report.findings == ()
+
 
 class TestDisputedBlockers:
     def test_parses_valid_disputed_blockers(self) -> None:
