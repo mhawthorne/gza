@@ -2182,7 +2182,9 @@ class Config:
         )
         if watch_dispatch_start_timeout is None:
             raise ConfigError("watch.dispatch_start_timeout must be a positive integer")
-        watch_parked_auto_rearm_data = watch_data.get("parked_auto_rearm") or {}
+        watch_parked_auto_rearm_data = (
+            watch_data["parked_auto_rearm"] if "parked_auto_rearm" in watch_data else {}
+        )
         if not isinstance(watch_parked_auto_rearm_data, dict):
             raise ConfigError("'watch.parked_auto_rearm' must be a dictionary")
         auto_rearm_enabled = watch_parked_auto_rearm_data.get(

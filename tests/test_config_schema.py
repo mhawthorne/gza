@@ -218,6 +218,22 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
     assert config.watch.parked_auto_rearm.require_target_advanced is False
 
 
+@pytest.mark.parametrize("value", ["false", "null"])
+def test_config_load_rejects_invalid_watch_parked_auto_rearm_shape(tmp_path, value: str) -> None:
+    """watch.parked_auto_rearm should reject present non-dictionary top-level values."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        f"  parked_auto_rearm: {value}\n"
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=re.escape("'watch.parked_auto_rearm' must be a dictionary"),
+    ):
+        Config.load(tmp_path)
+
+
 def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should default when omitted."""
     (tmp_path / "gza.yaml").write_text("project_name: demo\n")
@@ -377,4 +393,29 @@ def test_config_validation_rejects_invalid_watch_parked_auto_rearm(
     assert warnings == []
 
     with pytest.raises(ConfigError, match=re.escape(expected)):
+        Config.load(tmp_path)
+
+
+@pytest.mark.parametrize("value", ["false", "null"])
+def test_config_validation_rejects_invalid_watch_parked_auto_rearm_shape(
+    tmp_path,
+    value: str,
+) -> None:
+    """Load and validate should reject present non-dictionary parked_auto_rearm values."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        f"  parked_auto_rearm: {value}\n"
+    )
+
+    is_valid, errors, warnings = Config.validate(tmp_path)
+
+    assert not is_valid
+    assert "'watch.parked_auto_rearm' must be a dictionary" in errors
+    assert warnings == []
+
+    with pytest.raises(
+        ConfigError,
+        match=re.escape("'watch.parked_auto_rearm' must be a dictionary"),
+    ):
         Config.load(tmp_path)
