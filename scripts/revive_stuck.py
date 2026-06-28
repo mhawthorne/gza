@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Overnight unattended reviver for parked gza tasks.
 
-YOU launch this (it runs ``gza fix`` / ``gza advance``) — the "automated tool the
-user runs" pattern, like ``gza watch -y``. It dispatches on the ``next_action``
-field that ``gza incomplete --json`` already computes:
+YOU launch this (it runs ``gza advance``) — the "automated tool the user runs"
+pattern, like ``gza watch -y``. It dispatches on the ``next_action`` field that
+``gza incomplete --json`` already computes, and acts ONLY on mechanical steps:
 
-  * review/improve no-progress backstop or retry-limit (``next_action=skip`` with
-    the matching reason) → ``gza fix -b`` (a fresh attempt; advance is a no-op there)
-  * lifecycle steps (``resume`` / ``create_review`` / ``improve``) → ``gza advance <id> -y``
-    (one lifecycle step; watch finishes it)
-  * everything else (GIT_ERROR / needs_rebase / awaiting_human / merge) → leave parked
+  * lifecycle / recovery steps that ``advance`` owns (``resume`` / ``create_review``
+    / ``improve`` / ``create_improve`` / ``retry`` / ``reconcile_branch_divergence``)
+    → ``gza advance <id> -y`` (one step; watch finishes it)
+  * everything else → leave parked
 
-Don't-fix-twice-in-a-row guard: a ``fix`` only advances a unit when it makes a
-real code change. If the unit's most recent task is *already* a fix, re-fixing
-just burns cost — so it is skipped. The check is read straight from gza state
-(the newest ``member_ids`` task's type), so there is no external state file. This
-mirrors what ``watch`` itself would enforce when this logic moves in-tree.
+Judgment parks are deliberately NOT touched here: the system itself flags them as
+needing judgment (``needs_discussion`` no-op-improve / review-max-cycles /
+circuit-breaker, ``skip`` retry-limit-reached / GIT_ERROR, ``needs_rebase``,
+``awaiting_human``), and a deterministic force past the guardrail is a blind
+override, not a decision. Those are the job of the separate budget-capped
+LLM-judge gate (specs/features/stuck-unit-resolution-judge.md). Moot units are
+left to auto-resolve to ``redundant`` — never dropped here.
 
 Usage:
     scripts/revive_stuck.py                       # 15-min cycles, 1 task/cycle
@@ -34,7 +35,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import re
 import subprocess
 import sys
 import time
@@ -42,7 +42,6 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _gza(args: list[str], project: Path) -> tuple[int, str, str]:
@@ -77,47 +76,33 @@ def _parse_tags(raw_tags: list[str] | None) -> set[str] | None:
     return tags or None
 
 
-def _seq(task_id: str) -> int:
-    """Numeric suffix of a gza-NNNN id (newest task in a unit = highest)."""
-    tail = task_id.rsplit("-", 1)[-1]
-    return int(tail) if tail.isdigit() else -1
-
-
-def _latest_task_is_fix(row: dict, project: Path) -> bool:
-    """True if the unit's most recent task (highest member id) is a ``fix``."""
-    members = row.get("member_ids") or []
-    if not members:
-        return False
-    latest = max(members, key=_seq)
-    _rc, out, err = _gza(["show", latest], project)
-    for raw in (out + err).splitlines():
-        line = _ANSI.sub("", raw).strip()
-        if line.lower().startswith("type:"):
-            return line.split(":", 1)[1].strip().lower() == "fix"
-    return False
-
-
-def _classify(row: dict, project: Path) -> tuple[list[str] | None, str]:
+def _classify(row: dict) -> tuple[list[str] | None, str]:
     """Return (gza CLI args or None, a short decision label for the log)."""
     task_id = row.get("id")
     if not task_id:
         return None, "no id"
     action = row.get("next_action") or ""
-    reason = (row.get("next_action_reason") or "").lower()
 
-    # Parked review/improve loop (3-cycle backstop) or retry-cap → `fix`.
-    if action == "skip" and (
-        "durable progress" in reason
-        or "no-op improve" in reason
-        or "retry limit reached" in reason
+    # Mechanical lifecycle / recovery steps that `advance` owns: one transition,
+    # then watch carries it. `retry` re-arms an infra death (e.g. WORKER_DIED);
+    # `reconcile_branch_divergence` realigns diverged local/origin refs.
+    if action in (
+        "resume",
+        "create_review",
+        "improve",
+        "create_improve",
+        "retry",
+        "reconcile_branch_divergence",
     ):
-        if _latest_task_is_fix(row, project):
-            return None, "leave (latest task is already a fix — won't fix twice in a row)"
-        return ["fix", "-b", task_id], "fix"
-    # Lifecycle steps advance can drive (one transition, then watch carries it).
-    if action in ("resume", "create_review", "improve", "create_improve"):
         return ["advance", task_id, "-y"], f"advance ({action})"
-    # GIT_ERROR / needs_rebase / supersedes / awaiting_human / merge → leave it.
+
+    # Everything else is left parked. The judgment buckets in particular
+    # (needs_discussion no-op-improve / review-max-cycles / circuit-breaker,
+    # skip retry-limit-reached / GIT_ERROR, needs_rebase, awaiting_human, moot)
+    # are deliberately NOT force-advanced here — the system flags them as needing
+    # judgment, which is the LLM-judge gate's job (see
+    # specs/features/stuck-unit-resolution-judge.md). Moot is left to auto-resolve
+    # to `redundant`, never dropped here.
     return None, f"leave ({action or 'unknown'})"
 
 
@@ -159,7 +144,7 @@ def _classified_rows(
         total += 1
         if not _row_matches_tags(row, tag_filters):
             continue
-        cmd, label = _classify(row, project)
+        cmd, label = _classify(row)
         result.append((row.get("id") or "?", cmd, label, row.get("next_action_reason") or ""))
     return result, total
 
