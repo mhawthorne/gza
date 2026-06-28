@@ -107,7 +107,7 @@ from gza.git_health import (
 )
 from gza.lineage_query import LineageOwnerRow
 from gza.plan_review_verdict import validate_plan_review_manifest
-from gza.recovery_engine import decide_failed_task_recovery
+from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verdict import ParsedReviewReport
 from gza.watch_progress import (
@@ -3857,6 +3857,195 @@ def test_watch_cycle_recovery_only_direct_reconcile_blocks_pending_pickup(
     assert "RECOVR" in log_text
     assert "START" not in log_text
     assert str(pending_plan.id) not in log_text
+
+
+def test_watch_cycle_reuses_recovery_slot_when_needs_rebase_result_is_non_consuming(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    failed_rebase = store.add("Failed task needing rebase", task_type="implement")
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "REBASE_REQUIRED"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = "feature/recovery-needs-rebase"
+    store.update(failed_rebase)
+
+    failed_retry = store.add("Failed task needing retry", task_type="implement")
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "PROVIDER_ERROR"
+    failed_retry.completed_at = datetime.now(UTC)
+    failed_retry.branch = "feature/recovery-retry"
+    store.update(failed_retry)
+
+    retry_child = store.add(
+        failed_retry.prompt,
+        task_type="implement",
+        based_on=failed_retry.id,
+        recovery_origin="retry",
+    )
+    assert retry_child.id is not None
+
+    def _recovery_row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=None,
+            recovery_action_task=task,
+            recovery_leaf_task=task,
+        )
+
+    rebase_row = _recovery_row(failed_rebase)
+    retry_row = _recovery_row(failed_retry)
+    needs_rebase_decision = FailedRecoveryDecision(
+        task_id=failed_rebase.id,
+        action="reconcile",
+        reason_code="recovery_preflight_rebase",
+        reason_text="Needs rebase before retry",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    retry_decision = FailedRecoveryDecision(
+        task_id=failed_retry.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=retry_child.id,
+        reuse_existing=True,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(rebase_row, retry_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(rebase_row, retry_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    rebase_row,
+                    failed_rebase,
+                    needs_rebase_decision,
+                    {"type": "needs_rebase", "description": "Queue rebase before retry", "reason": "recovery-preflight-rebase"},
+                    True,
+                    failed_rebase,
+                ),
+                (
+                    retry_row,
+                    failed_retry,
+                    retry_decision,
+                    {"type": "retry", "description": "Retry failed task"},
+                    True,
+                    failed_retry,
+                ),
+            ),
+        ),
+    )
+
+    started_task_ids: list[str] = []
+
+    def _fake_execute_advance_action(*, task, action, context):
+        del context
+        assert task.id == failed_rebase.id
+        assert action["type"] == "needs_rebase"
+        return AdvanceActionExecutionResult(
+            action_type="needs_rebase",
+            status="success",
+            message="Existing rebase already covers this retry path",
+            success_message="Existing rebase already covers this retry path",
+            worker_label="rebase",
+            worker_consuming=False,
+            work_done=True,
+        )
+
+    def _fake_spawn_background_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(
+            DispatchPreviewEntry(
+                lane="recovery",
+                task=failed_rebase,
+                owner_task=failed_rebase,
+                runnable=True,
+                worker_consuming=True,
+                decision=needs_rebase_decision,
+                advance_action={"type": "needs_rebase"},
+                lineage_row=rebase_row,
+            ),
+            DispatchPreviewEntry(
+                lane="recovery",
+                task=failed_retry,
+                owner_task=failed_retry,
+                runnable=True,
+                worker_consuming=True,
+                decision=retry_decision,
+                advance_action={"type": "retry"},
+                lineage_row=retry_row,
+            ),
+        ))),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=_fake_spawn_background_worker),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=1,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    assert started_task_ids == [retry_child.id]
 
 
 def test_watch_cycle_parks_branch_unpushable_after_direct_reconcile_budget_is_consumed(
@@ -17592,6 +17781,126 @@ def test_watch_cycle_executes_direct_lifecycle_actions_before_worker_consuming_a
     assert stdout.index("MERGE") < stdout.index("(new) review for")
 
 
+def test_watch_cycle_reuses_lifecycle_slot_when_non_consuming_result_leaves_capacity(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    first_owner = store.add("First lifecycle action", task_type="implement")
+    assert first_owner.id is not None
+    first_owner.status = "completed"
+    first_owner.completed_at = datetime.now(UTC)
+    first_owner.branch = "feature/watch-reuse-slot-first"
+    first_owner.has_commits = True
+    first_owner.merge_status = "unmerged"
+    store.update(first_owner)
+
+    second_owner = store.add("Second lifecycle action", task_type="implement")
+    assert second_owner.id is not None
+    second_owner.status = "completed"
+    second_owner.completed_at = datetime.now(UTC)
+    second_owner.branch = "feature/watch-reuse-slot-second"
+    second_owner.has_commits = True
+    second_owner.merge_status = "unmerged"
+    store.update(second_owner)
+
+    def _row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        )
+
+    first_row = _row(first_owner)
+    second_row = _row(second_owner)
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(first_row, second_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(first_row, second_row),
+            recovery_rows=(),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(
+                (first_row, first_owner, {"type": "needs_rebase", "description": "Queue rebase"}),
+                (second_row, second_owner, {"type": "create_review", "description": "Create review"}),
+            ),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+        ),
+    )
+
+    executed_action_types: list[str] = []
+
+    def _fake_execute_advance_action(*, task, action, context):
+        del context
+        executed_action_types.append(str(action["type"]))
+        if task.id == first_owner.id:
+            return AdvanceActionExecutionResult(
+                action_type="needs_rebase",
+                status="success",
+                message="Existing rebase already satisfies the action",
+                success_message="Existing rebase already satisfies the action",
+                worker_label="rebase",
+                worker_consuming=False,
+                work_done=True,
+            )
+        return AdvanceActionExecutionResult(
+            action_type="create_review",
+            status="dry_run",
+            message="Would create_review",
+            worker_label="worker",
+            worker_consuming=True,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    assert executed_action_types == ["needs_rebase", "create_review"]
+    assert "no watch worker slots available for create_review" not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
 def test_watch_cycle_executes_non_worker_lifecycle_actions_with_zero_slots_and_skips_moot_rows(
     tmp_path: Path,
 ) -> None:
@@ -18620,7 +18929,10 @@ def test_cmd_watch_scoped_dry_run_runs_one_cycle(tmp_path: Path) -> None:
 
     with (
         patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(task.id,)),
-        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0, scoped_done=False)) as run_cycle,
+        patch(
+            "gza.cli.watch._dispatch_scoped_watch_once",
+            return_value=_CycleResult(False, 0, 0, scoped_done=False),
+        ) as dispatch_once,
         patch("gza.cli.watch._emit_recovery_dry_run_report") as recovery_report,
         patch("gza.cli.watch._sleep_interruptibly") as sleep,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
@@ -18628,9 +18940,9 @@ def test_cmd_watch_scoped_dry_run_runs_one_cycle(tmp_path: Path) -> None:
         rc = cmd_watch(args)
 
     assert rc == 0
-    assert run_cycle.call_count == 1
-    assert run_cycle.call_args.kwargs["dry_run"] is True
-    assert run_cycle.call_args.kwargs["scoped_owner_ids"] == (task.id,)
+    assert dispatch_once.call_count == 1
+    assert dispatch_once.call_args.kwargs["dry_run"] is True
+    assert dispatch_once.call_args.kwargs["scoped_owner_ids"] == (task.id,)
     recovery_report.assert_not_called()
     sleep.assert_not_called()
 
@@ -18664,7 +18976,10 @@ def test_cmd_watch_scoped_recovery_only_dry_run_runs_one_scoped_cycle(tmp_path: 
 
     with (
         patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(task.id,)),
-        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0, scoped_done=False)) as run_cycle,
+        patch(
+            "gza.cli.watch._dispatch_scoped_watch_once",
+            return_value=_CycleResult(False, 0, 0, scoped_done=False),
+        ) as dispatch_once,
         patch("gza.cli.watch._emit_recovery_dry_run_report") as recovery_report,
         patch("gza.cli.watch._sleep_interruptibly") as sleep,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
@@ -18672,10 +18987,10 @@ def test_cmd_watch_scoped_recovery_only_dry_run_runs_one_scoped_cycle(tmp_path: 
         rc = cmd_watch(args)
 
     assert rc == 0
-    assert run_cycle.call_count == 1
-    assert run_cycle.call_args.kwargs["dry_run"] is True
-    assert run_cycle.call_args.kwargs["scoped_owner_ids"] == (task.id,)
-    assert run_cycle.call_args.kwargs["recovery_mode"] == "recovery_only"
+    assert dispatch_once.call_count == 1
+    assert dispatch_once.call_args.kwargs["dry_run"] is True
+    assert dispatch_once.call_args.kwargs["scoped_owner_ids"] == (task.id,)
+    assert dispatch_once.call_args.kwargs["recovery_mode"] == "recovery_only"
     recovery_report.assert_not_called()
     sleep.assert_not_called()
 

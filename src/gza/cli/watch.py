@@ -107,6 +107,7 @@ from ..watch_progress import (
     record_background_watch_execution_start,
 )
 from ..workers import WorkerRegistry
+from . import _lifecycle_actions as _shared_lifecycle_actions
 from ._common import (
     _TASK_ID_RE,
     _create_implementation_task_from_source,
@@ -3445,6 +3446,56 @@ def _build_watch_cycle_plan(
     )
 
 
+def _dispatch_scoped_watch_once(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    max_iterations: int,
+    dry_run: bool,
+    log: _WatchLog,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = False,
+    quiet: bool = False,
+    recovery_slots: int = 1,
+    recovery_mode: DispatchSelectionMode | None = None,
+    max_recovery_attempts: int = 1,
+    show_skipped: bool = False,
+    auto_restart_on_drift: bool = True,
+    installed_package_drift: _InstalledPackageDriftState | None = None,
+    precomputed_plan: _WatchCyclePlan | None = None,
+    begin_cycle: bool = True,
+    end_cycle: bool = True,
+    emit_cycle_header: bool = True,
+    emit_lifecycle_summary: bool = True,
+    scoped_owner_ids: tuple[str, ...],
+) -> _CycleResult:
+    """Run one scoped watch dispatch pass through the shared watch execution path."""
+    return _run_cycle(
+        config=config,
+        store=store,
+        batch=batch,
+        max_iterations=max_iterations,
+        dry_run=dry_run,
+        log=log,
+        tags=tags,
+        any_tag=any_tag,
+        quiet=quiet,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
+        show_skipped=show_skipped,
+        auto_restart_on_drift=auto_restart_on_drift,
+        installed_package_drift=installed_package_drift,
+        precomputed_plan=precomputed_plan,
+        begin_cycle=begin_cycle,
+        end_cycle=end_cycle,
+        emit_cycle_header=emit_cycle_header,
+        emit_lifecycle_summary=emit_lifecycle_summary,
+        scoped_owner_ids=scoped_owner_ids,
+    )
+
+
 def _run_cycle(
     *,
     config: Config,
@@ -3526,6 +3577,7 @@ def _run_cycle(
     started_task_ids: set[str] = set()
     expected_starts: dict[str, _ExpectedStart] = {}
     step1_handled_child_task_ids: set[str] = set()
+    reserved_recovery_slots = 0
 
     def _check_canonical_checkout_boundary(action: str) -> None:
         if dry_run:
@@ -3601,6 +3653,18 @@ def _run_cycle(
 
     def _release_watch_reserved_task(task_id: str | None) -> None:
         release_task_launch_permit(task_id)
+
+    def _consume_worker_slot_if_needed(
+        result: AdvanceActionExecutionResult,
+        *,
+        reserve_recovery_slot: bool = False,
+    ) -> None:
+        nonlocal slots, reserved_recovery_slots
+        if not result.worker_consuming:
+            return
+        slots = max(0, slots - 1)
+        if reserve_recovery_slot:
+            reserved_recovery_slots = max(0, reserved_recovery_slots - 1)
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
@@ -3971,7 +4035,7 @@ def _run_cycle(
                 )
                 continue
 
-            if not execution_decision.selected:
+            if not _shared_lifecycle_actions.should_execute_lifecycle_action(action, free_worker_slots=slots):
                 log.emit(
                     "SKIP",
                     f"{display_task.id}: no watch worker slots available for {action_type}",
@@ -4400,8 +4464,7 @@ def _run_cycle(
                         started_task_ids.add(str(child_id))
                     else:
                         log.emit("START", f"{display_task.id} reconcile divergence [dry-run]")
-                if exec_result.worker_consuming:
-                    slots -= 1
+                _consume_worker_slot_if_needed(exec_result)
                 work_done = True
                 continue
 
@@ -4472,8 +4535,7 @@ def _run_cycle(
                     no_progress_cycles=config.watch.no_progress_cycles,
                 )
                 started_task_ids.add(str(child_id))
-                if exec_result.worker_consuming:
-                    slots -= 1
+                _consume_worker_slot_if_needed(exec_result)
                 work_done = True
                 if no_progress_attention is not None:
                     log.emit_attention(
@@ -4761,6 +4823,7 @@ def _run_cycle(
                         message=_watch_needs_attention_message(failed, no_progress_attention),
                     )
                 work_done = True
+                _consume_worker_slot_if_needed(exec_result, reserve_recovery_slot=True)
                 continue
             continue
         if recovery_action_type == "needs_rebase":
@@ -4774,8 +4837,15 @@ def _run_cycle(
                         f"({recovery_action.get('reason', 'recovery-preflight-rebase')}{deferred_text}) [dry-run]"
                     ),
                 )
-                slots -= 1
-                reserved_recovery_slots -= 1
+                _consume_worker_slot_if_needed(
+                    AdvanceActionExecutionResult(
+                        action_type="needs_rebase",
+                        status="dry_run",
+                        message="Would create rebase task",
+                        worker_consuming=True,
+                    ),
+                    reserve_recovery_slot=True,
+                )
                 work_done = True
                 continue
             exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
@@ -4821,8 +4891,7 @@ def _run_cycle(
                 parent_failed_id=str(failed.id),
                 launch_mode="worker",
             )
-            slots -= 1
-            reserved_recovery_slots -= 1
+            _consume_worker_slot_if_needed(exec_result, reserve_recovery_slot=True)
             work_done = True
             if no_progress_attention is not None:
                 log.emit_attention(
@@ -5431,27 +5500,50 @@ def _preview_initial_watch_cycle(
         scoped_owner_ids=scoped_owner_ids,
     )
     log.begin_cycle()
-    result = _run_cycle(
-        config=config,
-        store=store,
-        batch=batch,
-        max_iterations=max_iterations,
-        dry_run=True,
-        quiet=False,
-        log=log,
-        tags=tags,
-        any_tag=any_tag,
-        recovery_slots=recovery_slots,
-        recovery_mode=recovery_mode,
-        max_recovery_attempts=max_recovery_attempts,
-        show_skipped=show_skipped,
-        auto_restart_on_drift=auto_restart_on_drift,
-        installed_package_drift=installed_package_drift,
-        precomputed_plan=plan,
-        begin_cycle=False,
-        end_cycle=False,
-        scoped_owner_ids=scoped_owner_ids,
-    )
+    if scoped_owner_ids is not None:
+        result = _dispatch_scoped_watch_once(
+            config=config,
+            store=store,
+            batch=batch,
+            max_iterations=max_iterations,
+            dry_run=True,
+            quiet=False,
+            log=log,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            show_skipped=show_skipped,
+            auto_restart_on_drift=auto_restart_on_drift,
+            installed_package_drift=installed_package_drift,
+            precomputed_plan=plan,
+            begin_cycle=False,
+            end_cycle=False,
+            scoped_owner_ids=scoped_owner_ids,
+        )
+    else:
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=batch,
+            max_iterations=max_iterations,
+            dry_run=True,
+            quiet=False,
+            log=log,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            show_skipped=show_skipped,
+            auto_restart_on_drift=auto_restart_on_drift,
+            installed_package_drift=installed_package_drift,
+            precomputed_plan=plan,
+            begin_cycle=False,
+            end_cycle=False,
+            scoped_owner_ids=scoped_owner_ids,
+        )
     return result, plan
 
 
@@ -5803,29 +5895,54 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
             previous_snapshot = pre_cycle_snapshot
 
-            cycle_result = _run_cycle(
-                config=config,
-                store=store,
-                batch=batch,
-                max_iterations=max_iterations,
-                dry_run=dry_run,
-                quiet=quiet,
-                log=log,
-                tags=tag_filters,
-                any_tag=any_tag,
-                recovery_slots=recovery_slots,
-                recovery_mode=dispatch_mode,
-                max_recovery_attempts=max_recovery_attempts,
-                show_skipped=show_skipped,
-                auto_restart_on_drift=auto_restart_on_drift,
-                installed_package_drift=installed_package_drift,
-                precomputed_plan=pending_first_cycle_plan,
-                begin_cycle=not preview_cycle_open,
-                end_cycle=True,
-                emit_cycle_header=not preview_cycle_open,
-                emit_lifecycle_summary=not preview_cycle_open,
-                scoped_owner_ids=scoped_owner_ids,
-            )
+            if scoped_owner_ids is not None:
+                cycle_result = _dispatch_scoped_watch_once(
+                    config=config,
+                    store=store,
+                    batch=batch,
+                    max_iterations=max_iterations,
+                    dry_run=dry_run,
+                    quiet=quiet,
+                    log=log,
+                    tags=tag_filters,
+                    any_tag=any_tag,
+                    recovery_slots=recovery_slots,
+                    recovery_mode=dispatch_mode,
+                    max_recovery_attempts=max_recovery_attempts,
+                    show_skipped=show_skipped,
+                    auto_restart_on_drift=auto_restart_on_drift,
+                    installed_package_drift=installed_package_drift,
+                    precomputed_plan=pending_first_cycle_plan,
+                    begin_cycle=not preview_cycle_open,
+                    end_cycle=True,
+                    emit_cycle_header=not preview_cycle_open,
+                    emit_lifecycle_summary=not preview_cycle_open,
+                    scoped_owner_ids=scoped_owner_ids,
+                )
+            else:
+                cycle_result = _run_cycle(
+                    config=config,
+                    store=store,
+                    batch=batch,
+                    max_iterations=max_iterations,
+                    dry_run=dry_run,
+                    quiet=quiet,
+                    log=log,
+                    tags=tag_filters,
+                    any_tag=any_tag,
+                    recovery_slots=recovery_slots,
+                    recovery_mode=dispatch_mode,
+                    max_recovery_attempts=max_recovery_attempts,
+                    show_skipped=show_skipped,
+                    auto_restart_on_drift=auto_restart_on_drift,
+                    installed_package_drift=installed_package_drift,
+                    precomputed_plan=pending_first_cycle_plan,
+                    begin_cycle=not preview_cycle_open,
+                    end_cycle=True,
+                    emit_cycle_header=not preview_cycle_open,
+                    emit_lifecycle_summary=not preview_cycle_open,
+                    scoped_owner_ids=scoped_owner_ids,
+                )
             pending_first_cycle_plan = None
             preview_cycle_open = False
             cycle_result.confirmed_start_count += cycle_confirmed_start_count
