@@ -275,18 +275,27 @@ When a current review exists for the implementation lineage:
   - An improve is `in_progress` → `wait_improve`; `pending` → `run_improve`. (See
     [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
   - No improve yet, and no bound is tripped → create an `improve` task.
-  - Improve work is atomic over the full current blocker/comment set for that pass. The
-    improve worker MUST inventory every current review blocker and unresolved feedback
-    comment before editing, plan one shared fix set, re-check the full set after the last
-    edit, and run the configured final full verify gate after any targeted inner-loop
-    checks before reporting closure.
+  - Improve work is atomic over the full current blocker/comment set for that pass. This
+    specification file is the behavior owner for that observable contract. The improve
+    worker MUST re-read all current feedback before editing, inventory every current
+    review blocker and unresolved feedback comment, treat grouped blocker classes as
+    grouped work, plan one shared fix set, re-check the full initial inventory after
+    meaningful edit batches and again after the last edit, and run the configured final
+    full verify gate after any targeted inner-loop checks before reporting closure.
   - Improve reports MUST include a machine-readable `## Blocker Closure Ledger (Machine
     Readable)` section covering every in-scope blocker/comment, including disputed no-op
-    entries, so operators can audit closure evidence separately from free-form narrative.
+    entries. They MUST also include an explicit closure matrix for every current
+    blocker/comment plus a short anti-regression statement covering the full initial
+    inventory, so operators can audit closure evidence separately from free-form
+    narrative.
   - A completed no-op improve MAY dispute a non-verify CODE blocker only by supplying
     structured current-state evidence that the blocker is unreproducible, stale, already
     satisfied, out of scope, or otherwise invalid. Prior review text or task history
     alone is not enough; the dispute MUST cite the current still-open-or-cleared state.
+  - Improve-lineage context in later reviews MAY be used only as a pointer to inspect
+    current code/diff for repeated blocker shapes the latest improve was expected to
+    close. It is never standalone blocker evidence; renewed blockers still require
+    current-source proof on the reviewed diff or code.
 - Unresolved `feedback` comments newer than the latest completed review MUST be addressed
   via the improve flow **before** any merge, even on an approved verdict.
 - Unresolved comments of other kinds (for example `review_scope`) MUST remain visible to

@@ -98,7 +98,7 @@ Blocking discipline:
 - Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.
 - Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.
 - Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.
-- Improve-lineage context may justify a narrow current-source anti-regression check, but it is not independent blocker evidence and must not substitute for current proof on this diff.
+- Improve-lineage context may justify a narrow current-source anti-regression check for repeated blocker shapes the latest improve was expected to close, but it is only a pointer to inspect the current code/diff. It is not independent blocker evidence and must not substitute for current proof on this diff.
 - `Open-state citation:` must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.
 - Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:` explaining why the item is a `BLOCKER` or a `FOLLOWUP`.
 - Calibration examples:

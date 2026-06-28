@@ -28,6 +28,7 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.",
     "Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.",
     "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
+    "Improve-lineage context may justify a narrow current-source anti-regression check for repeated blocker shapes the latest improve was expected to close, but it is only a pointer to inspect the current code/diff.",
     "If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`;",
     "If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.",
     "Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.",
@@ -47,15 +48,19 @@ IMPROVE_DISPUTE_CONTRACT_CLAUSES = [
 ]
 
 IMPROVE_ATOMIC_CLOSURE_CONTRACT_CLAUSES = [
-    "Before you edit, inventory the entire current blocker/comment set and treat it as one atomic closure unit for this pass.",
+    "Before you edit, re-read all current feedback, inventory the entire current blocker/comment set, and treat it as one atomic closure unit for this pass.",
+    "Treat grouped blocker classes as grouped work:",
     "First list every in-scope review Blocker and every unresolved comment you must close in this pass.",
     "Add or update targeted tests that cover the specific failure mode called out in the feedback. Treat these targeted tests as inner-loop checks only, not final closure proof.",
+    "After each meaningful edit batch, re-check the full initial blocker/comment inventory for regressions or still-open grouped work before continuing.",
     "After the last edit, re-check every listed blocker/comment again, including items you believe were already addressed earlier in the pass.",
     "After the last edit, run the configured full final verify command required elsewhere in this prompt.",
     "Passing targeted tests alone is insufficient; the blocker/comment set is not closed until the full final verify gate is green",
     "## Blocker Closure Ledger (Machine Readable)",
     "improve_result: addressed | disputed_noop | blocked_external | needs_user",
     "source_id: <B1/comment id>",
+    "explicit closure matrix",
+    "anti-regression statement",
 ]
 
 REVIEW_SUMMARY_CHECKLIST_COUNT = 6
@@ -699,7 +704,7 @@ class TestPromptBuilderBuild:
         assert "same depth-3 path under `src/`" in result
         assert "do not expand isolated one-off defects" in result
         assert (
-            "Improve-lineage context may justify a narrow current-source anti-regression check, but it is not independent blocker evidence"
+            "Improve-lineage context may justify a narrow current-source anti-regression check for repeated blocker shapes the latest improve was expected to close, but it is only a pointer to inspect the current code/diff."
             in result
         )
         _assert_summary_checklist_contract(result)
@@ -1165,6 +1170,21 @@ class TestPromptBuilderImproveTask:
         assert "inspect that captured stdout/stderr before rerunning the full command" in template
         assert "SIGTERM-triggered stack dumps" in template
 
+    def test_improve_template_requires_explicit_closure_matrix_and_anti_regression_statement(self):
+        """Improve template should require explicit completion reporting for the full inventory."""
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "improve.txt"
+        ).read_text(encoding="utf-8")
+
+        assert "explicit closure matrix" in template
+        assert "anti-regression statement" in template
+        assert "After each meaningful edit batch, re-check the full initial blocker/comment inventory" in template
+
 
 class TestPromptBuilderReviewTask:
     """Tests for PromptBuilder.review_task_prompt()."""
@@ -1182,6 +1202,20 @@ class TestPromptBuilderReviewTask:
         )
         assert "15" in result
         assert "Add user authentication with JWT tokens" not in result
+
+    def test_review_template_uses_improve_lineage_only_as_current_source_pointer(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "review.txt"
+        ).read_text(encoding="utf-8")
+
+        assert "repeated blocker shapes the latest improve was expected to close" in template
+        assert "only a pointer to inspect the current code/diff" in template
+        assert "must not substitute for current proof on this diff" in template
 
     def test_review_task_prompt_does_not_include_long_impl_prompt(self):
         """Test that review task prompt does not embed long implementation prompts."""

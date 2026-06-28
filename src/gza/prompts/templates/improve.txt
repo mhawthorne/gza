@@ -10,7 +10,11 @@ Your job is to address every blocking feedback item presented:
 - Address every unresolved entry in the Comments section, when it is present.
 - Treat review **Suggestions**/**Follow-Ups** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
 
-Before you edit, inventory the entire current blocker/comment set and treat it as one atomic closure unit for this pass. Do not pick off only the newest item. Plan the edits against the full set collectively so you do not fix one blocker while regressing another or silently leaving an older comment open.
+Before you edit, re-read all current feedback, inventory the entire current blocker/comment set, and treat it as one atomic closure unit for this pass. Do not pick off only the newest item. Plan the edits against the full set collectively so you do not fix one blocker while regressing another or silently leaving an older comment open.
+
+Treat grouped blocker classes as grouped work:
+- If the review groups analogous sites into one Blocker or calls out a repeated blocker class, handle that grouped class as one closure unit and fix every cited/current analogous instance in this pass.
+- Do not report a grouped blocker closed because one example path is fixed while sibling instances in the same grouped class remain open.
 
 Work through the full blocking set systematically:
 - First list every in-scope review Blocker and every unresolved comment you must close in this pass.
@@ -19,15 +23,18 @@ Work through the full blocking set systematically:
 - Add or update targeted tests that cover the specific failure mode called out in the feedback. Treat these targeted tests as inner-loop checks only, not final closure proof.
 - If the feedback concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
 - If the context includes a failed or timed-out `## verify_command result`, inspect its captured stdout/stderr, `Failing output (trimmed)`, and any referenced `verify_command_output` artifacts before rerunning the full verify command.
+- After each meaningful edit batch, re-check the full initial blocker/comment inventory for regressions or still-open grouped work before continuing.
 - After the last edit, re-check every listed blocker/comment again, including items you believe were already addressed earlier in the pass.
 - After the last edit, run the configured full final verify command required elsewhere in this prompt. Passing targeted tests alone is insufficient; the blocker/comment set is not closed until the full final verify gate is green unless the existing no-op dispute or verify-only clearance contract explicitly applies.
 
-Before finishing, verify that every blocking item has an explicit closure condition in your final report:
+Before finishing, verify that your final report contains an explicit closure matrix for every blocking item in the initial inventory:
 - The review item you addressed
 - The comment you addressed (when comments are present)
+- The grouped blocker class you closed collectively, when applicable
 - The code change you made
 - The targeted test you added or updated
 - Any docs/help/operator-facing text you updated, if applicable
+- An anti-regression statement confirming you re-checked the full initial inventory after the meaningful edit batches and again after the last edit
 
 If a Blocker (review Must-Fix item) or comment no longer applies because the code already satisfies it or the feedback was stale, say that explicitly and cite the current code/tests that prove it instead of making unnecessary changes.
 When a non-verify CODE Blocker is invalid and the correct outcome is a no-op improve, you
@@ -78,3 +85,5 @@ final_verify:
   status: passed | failed | unavailable
 ```
 ````
+
+After the machine-readable ledger, include a short explicit closure matrix in prose or table form that lists every initial blocker/comment, its final status, and the evidence that closed it. Then add a one-sentence anti-regression statement covering the full initial inventory.

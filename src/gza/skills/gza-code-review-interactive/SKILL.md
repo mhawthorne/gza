@@ -107,6 +107,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.>
 <Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
+<Improve-lineage context may justify a narrow current-source anti-regression check for repeated blocker shapes the latest improve was expected to close, but it is only a pointer to inspect the current code/diff. It is not independent blocker evidence and must not substitute for current proof on this diff.>
 <If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
 <If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.>
 <Severity shorthand: `BLOCKER` means merge-blocking; `FOLLOWUP` means non-gating but task-worthy; `NIT` is omitted from canonical output.>

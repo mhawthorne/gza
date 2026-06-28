@@ -192,12 +192,23 @@ Severity semantics for `BLOCKER`, `FOLLOWUP`, and `NIT` live in [docs/merge-poli
 When a review blocker is one instance of a repeated same-module pattern, reviewers should consolidate the affected-file gaps plus any analogous gaps in diff-touched same-module siblings into one blocker so improve can close the whole class in one pass. `BLOCKER` remains merge-blocking; `FOLLOWUP` remains non-gating but task-worthy.
 
 Tracked review/improve report contracts are stricter than the current lifecycle action
-table alone:
+table alone. `specs/behavior/lifecycle-engine.md` is the behavior owner for this
+observable contract; this document mirrors that operator-facing rule and must stay in
+sync with it rather than redefining it elsewhere:
 
 - Every `BLOCKER` must be falsifiable. The review report must carry current-state
   `Evidence:`, at least one current-source `Open-state citation:`, and a concrete
   `Required fix:` that would close the blocker if implemented. Prior review prose or task
   history is not enough on its own.
+- A `CHANGES_REQUESTED` improve pass owns the full current blocker/comment set
+  atomically. The worker must re-read all current feedback before editing, build one
+  inventory covering every current blocker and unresolved comment, treat grouped blocker
+  classes as grouped work, re-check that full initial inventory after meaningful edit
+  batches and again after the last edit, and run the configured full final verify gate
+  before reporting completion.
+- Improve completion reporting must be atomic too: the report must include the machine-
+  readable ledger plus an explicit closure matrix for every current blocker/comment and a
+  short anti-regression statement covering the full initial inventory.
 - If an improve completes as a no-op because a non-verify CODE blocker is stale,
   unreproducible, already satisfied, out of scope, or otherwise invalid, the improve
   report may include a structured `## Disputed Blockers` section instead of fabricating a
@@ -280,12 +291,15 @@ that mismatch is an implementation gap against the spec, not operator-facing no-
 guidance.
 
 More generally, the improve worker contract is atomic over the full current blocker set,
-not one finding at a time. Improve prompts must require the worker to inventory every
-current review blocker and unresolved feedback comment before editing, plan one shared fix
-set, re-check that same full set after the last edit, and run the configured final full
-verify gate after any targeted inner-loop checks. The report must also include a machine-
-readable `## Blocker Closure Ledger (Machine Readable)` section so humans and later tasks
-can audit exactly which blockers/comments were addressed, disputed, or left unresolved.
+not one finding at a time. Improve prompts must require the worker to re-read all current
+feedback, inventory every current review blocker and unresolved feedback comment before
+editing, plan one shared fix set, treat grouped blocker classes as grouped work, re-check
+that same full initial inventory after meaningful edit batches and again after the last
+edit, and run the configured final full verify gate after any targeted inner-loop checks.
+The report must also include a machine-readable `## Blocker Closure Ledger (Machine
+Readable)` section plus an explicit closure matrix and anti-regression statement so
+humans and later tasks can audit exactly which blockers/comments were addressed,
+disputed, or left unresolved.
 
 Advance also computes a duplicate-blocker streak from completed review reports only. When the latest completed `CHANGES_REQUESTED` review and the two immediately preceding completed review cycles all carry the same primary blocker fingerprint (normalized blocker title plus the first open-state citation, or the normalized required-fix text when no citation exists), the engine first routes that repeated blocker through review-blocker adjudication using synthesized dispute metadata bound to the current reviewed branch state. Only if adjudication later returns `NEEDS_HUMAN` (or the adjudication path is otherwise exhausted) does lifecycle surface `needs_discussion` with reason `duplicate-blocker-no-progress`. The streak resets across any completed same-lineage rebase between the compared reviews, on any non-`CHANGES_REQUESTED` review, on missing blocker fingerprints, or when the primary blocker changes.
 
