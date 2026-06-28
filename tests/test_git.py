@@ -1,5 +1,6 @@
 """Comprehensive tests for Git operations."""
 
+import importlib
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -212,6 +213,12 @@ class TestCleanupWorktreeForBranch:
 class TestGitRun:
     """Tests for the _run helper method."""
 
+    @staticmethod
+    def _reset_metrics_state(metrics_module) -> None:
+        with metrics_module._STATE.lock:  # noqa: SLF001
+            metrics_module._STATE.counters.clear()  # noqa: SLF001
+            metrics_module._STATE.latencies.clear()  # noqa: SLF001
+
     def test_run_successful_command(self, tmp_path: Path):
         """Test _run with a successful command."""
         repo_dir = tmp_path / "repo"
@@ -264,6 +271,60 @@ class TestGitRun:
 
             call_args = mock_run.call_args
             assert call_args.kwargs.get('input') == "test content"
+
+    def test_run_emits_one_git_metric_observation_per_invocation(self, monkeypatch, tmp_path: Path):
+        """Each _run invocation should emit one aggregate git count and latency sample."""
+        monkeypatch.setenv("GZA_PROFILE", "1")
+        metrics_module = importlib.reload(importlib.import_module("gza.metrics"))
+        self._reset_metrics_state(metrics_module)
+
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch("gza.git.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+
+            git._run("status")
+            git._run("rev-parse", "HEAD", check=False)
+
+        snapshot = metrics_module.snapshot()
+        count_key = metrics_module.MetricKey(
+            "gza_git_run_total",
+            (("operation", "run"),),
+        )
+        latency_key = metrics_module.MetricKey(
+            "gza_git_run_latency_seconds",
+            (("operation", "run"),),
+        )
+
+        assert snapshot.counters[count_key] == 2
+        assert snapshot.latencies[latency_key].count == 2
+
+    def test_run_metrics_use_only_bounded_operation_label(self, monkeypatch, tmp_path: Path):
+        """Git metrics must not introduce subcommand or argument-derived labels."""
+        monkeypatch.setenv("GZA_PROFILE", "1")
+        metrics_module = importlib.reload(importlib.import_module("gza.metrics"))
+        self._reset_metrics_state(metrics_module)
+
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch("gza.git.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+
+            git._run("status")
+            git._run("checkout", "feature/bounded-labels", check=False)
+
+        snapshot = metrics_module.snapshot()
+
+        assert set(snapshot.counters) == {
+            metrics_module.MetricKey("gza_git_run_total", (("operation", "run"),)),
+        }
+        assert set(snapshot.latencies) == {
+            metrics_module.MetricKey("gza_git_run_latency_seconds", (("operation", "run"),)),
+        }
 
 
 class TestGitStashPopIfClean:

@@ -11,6 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import gza.metrics as metrics
+
+_GIT_RUN_COUNT_METRIC = "gza_git_run_total"
+_GIT_RUN_LATENCY_METRIC = "gza_git_run_latency_seconds"
+_GIT_RUN_LABELS = {"operation": "run"}
+
 
 class GitError(Exception):
     """Git operation failed."""
@@ -443,13 +449,25 @@ class Git:
         Returns:
             CompletedProcess result
         """
-        result = subprocess.run(
-            [self._git_executable(), *args],
-            cwd=self.repo_dir,
-            capture_output=True,
-            text=True,
-            input=stdin.decode() if stdin else None,
-        )
+        git_input = stdin.decode() if stdin else None
+        if metrics.enabled():
+            metrics.incr(_GIT_RUN_COUNT_METRIC, labels=_GIT_RUN_LABELS)
+            with metrics.timer(_GIT_RUN_LATENCY_METRIC, labels=_GIT_RUN_LABELS):
+                result = subprocess.run(
+                    [self._git_executable(), *args],
+                    cwd=self.repo_dir,
+                    capture_output=True,
+                    text=True,
+                    input=git_input,
+                )
+        else:
+            result = subprocess.run(
+                [self._git_executable(), *args],
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                input=git_input,
+            )
         if check and result.returncode != 0:
             error_output = result.stderr or result.stdout
             raise GitError(f"git {' '.join(args)} failed:\n{error_output}")
