@@ -3348,21 +3348,14 @@ def _evaluate_blind_parked_auto_rearm(
             decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", gate.skip_detail))
             continue
 
-        clear_parked_candidate_state(
-            store,
-            candidate,
-            record_manual_retry_limit_rearm=False,
+        decisions.append(
+            _record_parked_auto_rearm_attempt(
+                store=store,
+                candidate=candidate,
+                target_sha=target_sha,
+                detail="blind auto-rearm",
+            )
         )
-        subject_id = candidate.subject_task.id
-        assert subject_id is not None
-        store.record_parked_task_auto_rearm_attempt(
-            subject_kind="task",
-            subject_id=subject_id,
-            attention_reason=candidate.attention_reason,
-            subject_task_id=subject_id,
-            target_sha=target_sha,
-        )
-        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "blind auto-rearm"))
 
     return _BlindParkedAutoRearmResult(decisions=tuple(decisions))
 
@@ -3466,6 +3459,31 @@ def _evaluate_parked_auto_rearm_gate(
             )
 
     return _ParkedAutoRearmGateDecision(candidate=candidate, rearm_state=rearm_state, skip_detail=None)
+
+
+def _record_parked_auto_rearm_attempt(
+    *,
+    store: SqliteTaskStore,
+    candidate: ParkedTaskCandidate,
+    target_sha: str | None,
+    detail: str,
+) -> _BlindParkedAutoRearmDecision:
+    """Rearm one gate-cleared parked candidate through the shared clear/accounting path."""
+    clear_parked_candidate_state(
+        store,
+        candidate,
+        record_manual_retry_limit_rearm=False,
+    )
+    subject_id = candidate.subject_task.id
+    assert subject_id is not None
+    store.record_parked_task_auto_rearm_attempt(
+        subject_kind="task",
+        subject_id=subject_id,
+        attention_reason=candidate.attention_reason,
+        subject_task_id=subject_id,
+        target_sha=target_sha,
+    )
+    return _BlindParkedAutoRearmDecision(candidate, "rearmed", detail)
 
 
 def _latest_parked_auto_rearm_judge_task(store: SqliteTaskStore) -> DbTask | None:
@@ -3742,19 +3760,14 @@ def _evaluate_judged_parked_auto_rearm(
         if subject_id is None or subject_id not in selected_id_set:
             decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "judge not selected"))
             continue
-        clear_parked_candidate_state(
-            store,
-            candidate,
-            record_manual_retry_limit_rearm=False,
+        decisions.append(
+            _record_parked_auto_rearm_attempt(
+                store=store,
+                candidate=candidate,
+                target_sha=target_sha,
+                detail="judge-selected auto-rearm",
+            )
         )
-        store.record_parked_task_auto_rearm_attempt(
-            subject_kind="task",
-            subject_id=subject_id,
-            attention_reason=candidate.attention_reason,
-            subject_task_id=subject_id,
-            target_sha=target_sha,
-        )
-        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "judge-selected auto-rearm"))
     return _BlindParkedAutoRearmResult(decisions=tuple(decisions)), None
 
 def _scoped_member_task_ids(owner_rows: list[LineageOwnerRow], owner_task_ids: tuple[str, ...]) -> set[str]:

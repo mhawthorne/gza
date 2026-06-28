@@ -238,6 +238,9 @@ its stored action.
   [watch-supervisor.md](watch-supervisor.md). It MUST additionally persist its own attempt
   count plus last-attempt target SHA/timestamp so unchanged-target and cooldown skips do
   not spend more recovery budget.
+- When the parked judge path is enabled, validated judge selections MUST reuse that exact
+  same bounded auto-rearm accounting and effective epoch behavior; the judge chooses a
+  subset, but it does not get a separate retry budget or a separate clear/accounting path.
 - Shared recovery policy MUST evaluate bounded retry/resume budget relative to the latest
   applicable retry-limit rearm epoch for that recovery chain, whether that epoch came from
   a manual unstick or a bounded watch-owned blind auto-rearm, not relative to lifetime

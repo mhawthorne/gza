@@ -12502,6 +12502,14 @@ def test_judged_parked_auto_rearm_batches_candidates_into_one_internal_task(tmp_
         (subject_a.id, "rearmed", "judge-selected auto-rearm"),
         (candidate_b.subject_task.id, "skipped", "judge not selected"),
     ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=str(subject_a.id),
+        attention_reason="retry-limit-reached",
+    )
+    assert rearm is not None
+    assert rearm.auto_attempt_count == 1
+    assert rearm.last_auto_attempt_target_sha == "main-sha-1"
     judge_tasks = [
         task for task in store.get_all()
         if task.task_type == "internal" and task.trigger_source == "watch-unstick-judge"
@@ -12614,6 +12622,85 @@ def test_judged_parked_auto_rearm_ignores_unknown_selected_ids(tmp_path: Path) -
         subject_id=subject.id,
         attention_reason="retry-limit-reached",
     ) is None
+
+
+def test_judged_parked_auto_rearm_reuses_shared_budget_gate_for_selected_subset(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.judge_enabled = True
+    config.watch.parked_auto_rearm.budget = 1
+
+    git = _make_watch_git()
+    owner_a, subject_a, candidate_a = _make_simple_retry_limit_candidate(
+        store,
+        prompt="Retry candidate exhausted",
+        branch="feature/judge-budget-a",
+    )
+    owner_b, subject_b, candidate_b = _make_simple_retry_limit_candidate(
+        store,
+        prompt="Retry candidate eligible",
+        branch="feature/judge-budget-b",
+    )
+    assert subject_a.id is not None
+    store.record_parked_task_auto_rearm_attempt(
+        subject_kind="task",
+        subject_id=subject_a.id,
+        attention_reason="retry-limit-reached",
+        subject_task_id=subject_a.id,
+        target_sha="main-sha-old",
+    )
+
+    def _fake_runner_run(_config, task_id=None, on_task_claimed=None, **_kwargs):
+        assert task_id is not None
+        task = store.get(task_id)
+        assert task is not None
+        if on_task_claimed is not None:
+            on_task_claimed(task)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.output_content = json.dumps({"rearm_task_ids": [subject_a.id, subject_b.id]})
+        store.update(task)
+        return 0
+
+    with (
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate_a, candidate_b), 0)),
+        patch("gza.cli.watch.skip_reason_for_landed_or_moot", return_value=None),
+        patch("gza.runner.run", side_effect=_fake_runner_run),
+    ):
+        result, error = _evaluate_judged_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-1",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+            merge_window_owner_ids=(owner_a.id, owner_b.id),
+        )
+
+    assert error is None
+    assert result is not None
+    assert [(decision.candidate.subject_task.id, decision.status, decision.detail) for decision in result.decisions] == [
+        (subject_a.id, "skipped", "budget exhausted"),
+        (subject_b.id, "rearmed", "judge-selected auto-rearm"),
+    ]
+    exhausted_rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=subject_a.id,
+        attention_reason="retry-limit-reached",
+    )
+    assert exhausted_rearm is not None
+    assert exhausted_rearm.auto_attempt_count == 1
+    eligible_rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=str(subject_b.id),
+        attention_reason="retry-limit-reached",
+    )
+    assert eligible_rearm is not None
+    assert eligible_rearm.auto_attempt_count == 1
 
 
 def test_watch_cycle_falls_back_to_blind_auto_rearm_when_judge_fails(tmp_path: Path) -> None:

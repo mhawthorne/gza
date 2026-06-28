@@ -132,7 +132,9 @@ Each watch cycle MUST execute these phases in order:
    branch advanced when `watch.parked_auto_rearm.require_target_advanced` is true. A
    failed gate MUST leave the parked row untouched and MUST NOT spend an attempt. In
    particular, an unchanged target SHA under `require_target_advanced` spends no attempt
-   and performs no clear.
+   and performs no clear. These same budget/cooldown/target-advance gates are shared by
+   the blind path and the judged path; the judge cannot nominate a parked candidate past
+   them.
 
    When `watch.parked_auto_rearm.judge_enabled` is false, watch MAY use the existing blind
    pass directly. When that judge flag is true and the current cycle has crossed one
@@ -140,13 +142,16 @@ Each watch cycle MUST execute these phases in order:
    for the whole merge window through the standard runner path. That judge prompt MUST
    batch the merge-window context and a bounded parked-candidate set, MUST require strict
    machine-readable output, and MUST validate returned task IDs against the supplied
-   candidate set before clearing anything. Unknown IDs from otherwise valid output MUST be
-   ignored safely. Malformed output, task failure, or other judge execution failure MUST
-   fall back to the configured blind behavior for that pass or leave work parked if blind
-   auto-rearm is not configured. A successful judged or blind auto-rearm MUST clear only
-   the shared parked exclusion state, persist the current target SHA plus attempt
-   timestamp, increment the shared per-subject/per-reason auto-attempt count, and then
-   return the owner to the same cycle's ordinary watch planning. Slot use is unchanged:
+   candidate set before clearing anything. Only the validated subset may be considered for
+   rearm, and each validated selection MUST still pass the same shared gate evaluation the
+   blind path uses before watch clears anything. Unknown IDs from otherwise valid output
+   MUST be ignored safely. Malformed output, task failure, or other judge execution
+   failure MUST fall back to the configured blind behavior for that pass or leave work
+   parked if blind auto-rearm is not configured. A successful judged or blind auto-rearm
+   MUST clear only the shared parked exclusion state, persist the current target SHA plus
+   attempt timestamp, increment the shared per-subject/per-reason auto-attempt count, and
+   then return the owner to the same cycle's ordinary watch planning. Slot use is
+   unchanged:
    the rearm phase itself consumes no worker slot, and any follow-on recovery or lifecycle
    work spawned because of that clear MUST reuse the same remaining worker-slot accounting
    as every other same-cycle dispatch. Cooldown identity is subject plus parked reason, so
