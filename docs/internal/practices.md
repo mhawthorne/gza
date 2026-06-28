@@ -139,6 +139,10 @@ on the unit and functional pytest phases, the unit and functional pytest
 suite conftests call the shared `register_sigterm_faulthandler()` helper at
 import time, and `python -m gza.test_latency --summary` emits its current
 summary before re-raising termination.
+The wrapper also defaults its xdist worker count to the same fixed `-n 2`
+that CI uses under `--dist loadscope`, so local `./bin/tests` reproduces the
+same worker grouping on high-core developer machines unless an operator
+explicitly overrides `PYTEST_XDIST_WORKERS`.
 
 The unit lane also uses a guarded serial-rerun bridge in
 `python -m gza.test_serial_rerun` as an interim arbiter for bounded
