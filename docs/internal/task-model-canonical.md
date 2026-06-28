@@ -20,6 +20,18 @@
 - Point lookups that are immediately followed by a mutation (`store.get(task_id)` before update/delete) are still fine outside the query layer.
 - New CLI/API task-list features should add a query preset before adding another custom store read path.
 
+## Raw SQLite Connect Allowlist
+
+`sqlite3.connect` call sites are intentionally restricted to a small allowlist.
+
+- `src/gza/db.py` is allowed to open raw SQLite connections. This is the canonical storage module, so store internals, migrations, migration previews, import/maintenance helpers, and the instrumented store connection helper may still call `sqlite3.connect` directly there.
+- `src/gza/runner.py:_backup_sqlite_file()` is the only allowed non-storage exception. It uses SQLite's backup API directly so backups remain safe against concurrent access.
+
+Everything else should treat new `sqlite3.connect` usage as architectural drift away from the canonical store/query boundary.
+
+- Modules such as `src/gza/cli/query.py`, `src/gza/cli/_common.py`, `src/gza/operator_state.py`, `src/gza/review_tasks.py`, and `src/gza/sync_ops.py` may still import `sqlite3` for exception types or other non-`connect` references; those imports are out of scope for this guard.
+- The guard for this policy intentionally scans `sqlite3.connect` call sites only. It does not try to police unrelated `sqlite3` imports or non-connect APIs.
+
 ## Merge-State Axes
 
 gza tracks branch merge state across four different axes. They answer different questions and are not expected to agree in every case.
