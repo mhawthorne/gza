@@ -100,6 +100,7 @@ from .query import (
     cmd_unmerged,
 )
 from .tv import cmd_tv
+from .unstick import cmd_unstick
 from .watch import cmd_main_verify, cmd_queue, cmd_watch
 
 
@@ -518,6 +519,49 @@ def main() -> int:
         action="store_true",
         help="List valid --fields values for this command and exit",
     )
+
+    # unstick command
+    unstick_parser = subparsers.add_parser(
+        "unstick",
+        help="Manually clear eligible parked backstop/reconcile owner state without starting work",
+        description=(
+            "Manually clear eligible parked backstop/reconcile owner state without starting work. "
+            "Requires at least one explicit selector."
+        ),
+    )
+    unstick_parser.add_argument(
+        "task_ids",
+        nargs="*",
+        metavar="task_id",
+        help="Specific task ID(s) to inspect for current parked owner state",
+    )
+    unstick_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only select parked owners matching tag filters (repeatable)",
+    )
+    unstick_parser.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    unstick_parser.add_argument(
+        "--reason",
+        action="append",
+        dest="reasons",
+        choices=["backstop", "reconcile"],
+        metavar="{backstop,reconcile}",
+        help="Only select the named parked reason class (repeatable)",
+    )
+    unstick_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Select all currently parked owners within the requested tag/reason scope",
+    )
+    add_common_args(unstick_parser)
 
     # search command
     search_parser = subparsers.add_parser(
@@ -2985,7 +3029,7 @@ def main() -> int:
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
         "work", "kill", "advance", "retry",
-        "mark-completed", "run-inline", "set-status",
+        "mark-completed", "run-inline", "set-status", "unstick",
     }
 
     try:
@@ -3021,6 +3065,8 @@ def main() -> int:
             return cmd_history(args)
         elif args.command == "incomplete":
             return cmd_incomplete(args)
+        elif args.command == "unstick":
+            return cmd_unstick(args)
         elif args.command == "search":
             return cmd_search(args)
         elif args.command == "unmerged":

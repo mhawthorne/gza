@@ -228,6 +228,11 @@ its stored action.
   `state in {dropped, superseded}`.
 - `watch`, `advance`, `iterate`, and query/recovery-lane surfaces MUST agree on the same
   recovery decision for the same task.
+- The clear-only manual `uv run gza unstick` slice does **not** alter failed-task recovery
+  budget state, retry-limit state, or recovery-attempt accounting. In this slice it is
+  limited to clearing watch-owned exclusion state for selected `watch-no-progress-backstop`
+  or `reconcile-needs-manual-resolution` owners, leaving `retry-limit-reached` and the
+  rest of the recovery budget contract unchanged.
 
 ## Policy knobs
 

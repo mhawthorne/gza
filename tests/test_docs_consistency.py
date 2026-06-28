@@ -1203,11 +1203,13 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     config_content = (docs_root / "configuration.md").read_text()
     failed_tasks_content = (docs_root / "examples" / "failed-tasks.md").read_text()
 
-    advance_section = config_content.split("### advance", 1)[1].split("### iterate", 1)[0]
+    advance_section = config_content.split("### advance", 1)[1].split("### unstick", 1)[0]
+    unstick_section = config_content.split("### unstick", 1)[1].split("### main-verify", 1)[0]
     iterate_section = config_content.split("### iterate", 1)[1].split("### watch", 1)[0]
     watch_section = config_content.split("### watch", 1)[1].split("### learnings", 1)[0]
 
     assert "uv run gza advance [task_id] [options]" in advance_section
+    assert "uv run gza unstick [task_id ...] [options]" in unstick_section
     assert "uv run gza iterate <impl_task_id> [options]" in iterate_section
     assert "uv run gza watch [options]" in watch_section
     assert "If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant" in iterate_section
@@ -1217,11 +1219,18 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
     assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
+    assert "requires at least one explicit selector" in unstick_section
+    assert "--reason backstop\\|reconcile" in unstick_section
+    assert "clear-only / no-worker operator command" in unstick_section
+    assert "does not spawn `watch`, dispatch an iterate worker, or reset any separate recovery budget" in unstick_section
+    assert "not currently parked" in unstick_section
+    assert "missing branch cannot prove unresolved" in unstick_section
     assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in config_content
     assert "Only list pending tasks matching tag filters by default" in config_content
     assert "Only list recovery, lifecycle, and pending lanes matching tag filters" not in config_content
 
     assert "\ngza advance [task_id] [options]\n" not in advance_section
+    assert "\ngza unstick [task_id ...] [options]\n" not in unstick_section
     assert "\ngza iterate <impl_task_id> [options]\n" not in iterate_section
     assert "\ngza watch [options]\n" not in watch_section
     assert "`gza watch --restart-failed --dry-run` is the recovery inspection surface" not in watch_section

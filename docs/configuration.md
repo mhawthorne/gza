@@ -1815,6 +1815,35 @@ for listed explore rows.
 When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
 Held completed plans use `next_action = awaiting_human` with `reason=awaiting-human-review`, plus guidance to review the plan and then either run `uv run gza implement <plan-id>` for a one-off approval or `uv run gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
 
+### unstick
+
+Manually clear currently parked owner state for eligible backstop or reconcile rows without starting any worker.
+
+```bash
+uv run gza unstick [task_id ...] [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Specific full prefixed task ID(s) to inspect for current parked owner state |
+| `--tag TAG` | Only select parked owners matching tag filters (repeatable) |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
+| `--reason backstop\|reconcile` | Only select the named parked reason class (repeatable) |
+| `--all` | Select all currently parked owners within the requested tag/reason scope |
+
+`uv run gza unstick` requires at least one explicit selector: one or more `task_id` arguments, `--tag`, `--reason backstop|reconcile`, or `--all`. Combinations narrow the selected parked-owner set: explicit IDs define the starting set, then tag and reason filters further restrict it.
+
+This is a clear-only / no-worker operator command. It clears the shared parked-state exclusion for the selected owner and exits; it does not spawn `watch`, dispatch an iterate worker, or reset any separate recovery budget. Once cleared, the next normal `uv run gza advance` or `uv run gza watch` pass re-evaluates the owner through the same shared lifecycle planning.
+
+`backstop` maps to `watch-no-progress-backstop`. `reconcile` maps to `reconcile-needs-manual-resolution`. For both supported reason classes, `unstick` reuses the same landed/moot guardrails before clearing. Rows already proved `merged`, or already terminal as `empty` / `redundant`, are reported as skips instead of being re-armed.
+
+`unstick` also reports selector-visible skips when an owner is not currently parked or when merge proof cannot show the branch is still unresolved. Current operator-visible skip reasons include:
+- `already merged`
+- `terminal empty`
+- `terminal redundant`
+- `missing branch cannot prove unresolved`
+- `not currently parked`
+
 ### main-verify
 
 Inspect the current local main integration verify gate, or force a fresh rerun of it.
