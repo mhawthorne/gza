@@ -4616,10 +4616,10 @@ def _render_atomic_blocker_set(
     review_content: str,
     unresolved_comments: list[TaskComment],
 ) -> str | None:
-    """Render the compact improve blocker set when structured review blockers exist."""
+    """Render the compact improve blocker set when structured feedback is available."""
     parsed_review = parse_review_report(review_content)
     blockers = [finding for finding in parsed_review.findings if finding.severity == "BLOCKER"]
-    if not blockers:
+    if not blockers and not unresolved_comments:
         return None
 
     lines = [
@@ -4640,6 +4640,10 @@ def _render_atomic_blocker_set(
         classification = classify_review_blocker_finding(finding)
         summary = _summarize_atomic_context_text(finding.fix_or_followup or finding.title)
         line = f"- review {blocker_id}: class={classification}; summary={summary}"
+        title = _summarize_atomic_context_text(finding.title)
+        line += f"; title={title}"
+        if finding.open_state_citation:
+            line += f"; open_state_citation={finding.open_state_citation}"
         tests = _summarize_atomic_context_text(finding.tests) if finding.tests else None
         if tests is not None:
             line += f"; tests={tests}"
