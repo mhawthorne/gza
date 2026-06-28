@@ -40,6 +40,7 @@ from ..db import (
     DB_UNSET,
     MERGE_SOURCE_ADVANCE,
     MERGE_SOURCE_MANUAL,
+    DuplicateActiveChildError,
     MergeTargetResolutionError,
     SqliteTaskStore,
     Task as DbTask,
@@ -138,6 +139,7 @@ from ._common import (
     _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
+    format_duplicate_rebase_message,
     get_review_verdict,  # noqa: F401  # re-exported for test patching
     get_store,
     phase1_error,
@@ -2263,13 +2265,17 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             permit = launch_permit(config, store)
         except MaxConcurrentTasksError as exc:
             return phase1_error(args, str(exc))
-        rebase_task = _create_rebase_task(
-            store,
-            task_id,
-            task.branch,
-            task_target,
-            trigger_source="manual",
-        )
+        try:
+            rebase_task = _create_rebase_task(
+                store,
+                task_id,
+                task.branch,
+                task_target,
+                trigger_source="manual",
+            )
+        except DuplicateActiveChildError as exc:
+            permit.release()
+            return phase1_error(args, format_duplicate_rebase_message(exc, parent_task_id=task_id))
         prepared_rebase_task = _prepare_task_for_immediate_execution(
             config,
             rebase_task,
@@ -2292,13 +2298,16 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             prepared_task=prepared_rebase_task,
         )
 
-    rebase_task = _create_rebase_task(
-        store,
-        task_id,
-        task.branch,
-        task_target,
-        trigger_source="manual",
-    )
+    try:
+        rebase_task = _create_rebase_task(
+            store,
+            task_id,
+            task.branch,
+            task_target,
+            trigger_source="manual",
+        )
+    except DuplicateActiveChildError as exc:
+        return phase1_error(args, format_duplicate_rebase_message(exc, parent_task_id=task_id))
     assert rebase_task.id is not None
     rebase_task.branch = task.branch
     store.update(rebase_task)

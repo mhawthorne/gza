@@ -194,6 +194,7 @@ def create_review_task(
         depends_on=impl_task.id,
         tags=resolve_derived_task_tags(impl_task),
         based_on=impl_task.id,
+        enforce_single_active_sibling=True,
         review_scope=resolved_scope.summary if resolved_scope is not None else None,
         model=model,
         provider=provider,

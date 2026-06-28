@@ -122,6 +122,12 @@ These hold across the whole machine; the detailed rules in
 
 1. **Idempotent & interruptible.** Re-running the engine never duplicates in-flight work
    and never double-merges. In-progress tasks cause a wait, not a respawn.
+   Singleton derived-child creation applies to `review`, `rebase`, and review-backed
+   `improve` tasks: each parent MUST have at most one active direct `based_on` child of
+   that kind at a time, where active means `pending` or `in_progress`. This invariant
+   does not apply to non-singleton derived fan-out such as follow-up `implement` tasks,
+   and it does not block comments-only `improve` refreshes when newer unresolved
+   feedback needs a fresh pass.
 2. **Bounded loops, always.** Every cycle (review→improve, rebase, recovery, no-op
    improve) MUST have a hard bound. When the bound is hit, the unit goes to a human
    state — it MUST NOT loop forever and MUST NOT silently give up. The *existence and

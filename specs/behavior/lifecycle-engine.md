@@ -161,6 +161,12 @@ Conflict is decided against the canonical local target (see
 - A selected-for-merge branch that cannot merge AND already has a rebase child
   `pending`/`in_progress` → `skip` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1).
+- Singleton derived-child creation applies to `review`, `rebase`, and review-backed
+  `improve` tasks: each parent MUST have at most one active direct `based_on` child of
+  that kind at a time. Lifecycle planning MUST honor that invariant by not emitting
+  `needs_rebase` when an active rebase child already exists, while non-singleton fan-out
+  such as follow-up `implement` children and comments-only `improve` refreshes remains
+  allowed.
 - A selected-for-merge branch that cannot merge, has no rebase child, and does not
   already contain the local target tip → create a `rebase` task (`needs_rebase`). The
   action's machine-readable reason slug MUST distinguish this merge-lane path from the

@@ -46,6 +46,7 @@ from ..console import (
 )
 from ..db import (
     TASK_COMMENT_KIND_FEEDBACK,
+    DuplicateActiveChildError,
     ManualMigrationRequired,
     SqliteTaskStore,
     StoreOpenMode,
@@ -2668,6 +2669,7 @@ def _create_rebase_task(
         ),
         task_type="rebase",
         based_on=parent_task_id,
+        enforce_single_active_sibling=True,
         same_branch=True,
         base_branch=target_branch,
         review_scope=(
@@ -2678,6 +2680,15 @@ def _create_rebase_task(
         tags=resolve_derived_task_tags(parent_task) if parent_task is not None else (),
         skip_learnings=True,
         trigger_source=trigger_source,
+    )
+
+
+def format_duplicate_rebase_message(exc: DuplicateActiveChildError, *, parent_task_id: str | None = None) -> str:
+    """Render a stable operator-facing message for duplicate active rebase children."""
+    return format_duplicate_active_child_message(
+        exc,
+        parent_task_id=parent_task_id,
+        task=exc.active_child,
     )
 
 
@@ -3125,6 +3136,8 @@ def _create_improve_task(
         task_type="improve",
         depends_on=review_task.id if review_task is not None else None,
         based_on=based_on_id,
+        enforce_single_active_sibling=review_task is not None,
+        single_active_sibling_scope="review_backed_improve" if review_task is not None else None,
         same_branch=True,
         tags=resolve_derived_task_tags(impl_task),
         review_scope=_resolved_review_scope_metadata(impl_task),
@@ -3609,6 +3622,7 @@ def _create_resume_task(
         provider_is_explicit=preserve_provider,
         recovery_origin="resume",
         trigger_source=trigger_source,
+        enforce_single_active_sibling=_recovery_task_requires_singleton_guard(original_task),
     )
     # Copy session_id and branch from original task so the resumed run
     # continues the Claude Code session and uses the same branch.
@@ -3666,6 +3680,7 @@ def _create_retry_task(
         base_branch=retry_base_branch,
         recovery_origin="retry",
         trigger_source=trigger_source,
+        enforce_single_active_sibling=_recovery_task_requires_singleton_guard(original_task),
     )
     updates_needed = False
     if retry_task.same_branch and original_task.branch and retry_task.branch != original_task.branch:
@@ -3692,6 +3707,37 @@ def _create_retry_task(
     if updates_needed:
         store.update(retry_task)
     return retry_task
+
+
+def _recovery_task_requires_singleton_guard(task: DbTask) -> bool:
+    """Return whether retry/resume cloning should enforce singleton derived-child rules."""
+    if task.task_type in {"review", "rebase"}:
+        return True
+    return task.task_type == "improve" and task.depends_on is not None
+
+
+def _duplicate_active_child_label(task: DbTask) -> str:
+    if task.task_type == "improve" and task.depends_on is not None:
+        return "review-backed improve"
+    return task.task_type or "task"
+
+
+def format_duplicate_active_child_message(
+    exc: DuplicateActiveChildError,
+    *,
+    parent_task_id: str | None = None,
+    task: DbTask | None = None,
+) -> str:
+    """Render a stable operator-facing message for duplicate active singleton children."""
+    active_child = exc.active_child
+    display_task = task or active_child
+    parent_id = parent_task_id or active_child.based_on
+    label = _duplicate_active_child_label(display_task)
+    if parent_id and active_child.id:
+        return f"{label} already pending/in progress for {parent_id}: {active_child.id}"
+    if active_child.id:
+        return f"{label} already pending/in progress: {active_child.id}"
+    return f"{label} already pending/in progress"
 
 
 def _resolve_retry_merge_unit(store: SqliteTaskStore, original_task: DbTask):
@@ -3744,13 +3790,17 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
     target_branch = (
         merge_unit.target_branch if merge_unit is not None else store.default_merge_target(strict=True)
     )
-    rebase_task = _create_rebase_task(
-        store,
-        task.id or task_id,
-        task.branch,
-        target_branch,
-        trigger_source="manual",
-    )
+    try:
+        rebase_task = _create_rebase_task(
+            store,
+            task.id or task_id,
+            task.branch,
+            target_branch,
+            trigger_source="manual",
+        )
+    except DuplicateActiveChildError as exc:
+        print(format_duplicate_rebase_message(exc, parent_task_id=task.id or task_id), file=sys.stderr)
+        return 1
     assert rebase_task.id is not None
     rebase_task.branch = task.branch
     store.update(rebase_task)

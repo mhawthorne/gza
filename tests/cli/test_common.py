@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,7 +20,7 @@ from gza.cli._common import (
     run_with_resume,
 )
 from gza.config import Config
-from gza.db import SqliteTaskStore
+from gza.db import DuplicateActiveChildError, SqliteTaskStore
 
 
 class TestLooksLikeTaskId:
@@ -373,6 +374,114 @@ class TestDerivedTaskReviewScopePropagation:
 
         assert improve_task.tags == impl_task.tags
 
+    def test_create_improve_task_opts_into_singleton_guard(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        review_task = store.add(
+            "Review scoped slice",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+
+        with patch.object(store, "add", wraps=store.add) as add_task:
+            improve_task = _create_improve_task(
+                store,
+                impl_task,
+                review_task,
+                trigger_source="manual",
+            )
+
+        assert improve_task.id is not None
+        assert add_task.call_args.kwargs["enforce_single_active_sibling"] is True
+        assert add_task.call_args.kwargs["single_active_sibling_scope"] == "review_backed_improve"
+
+    def test_create_comments_only_improve_does_not_opt_into_singleton_guard(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        assert impl_task.id is not None
+        store.add_comment(impl_task.id, "Unresolved feedback comment.")
+
+        with patch.object(store, "add", wraps=store.add) as add_task:
+            improve_task = _create_improve_task(
+                store,
+                impl_task,
+                None,
+                trigger_source="manual",
+            )
+
+        assert improve_task.id is not None
+        assert add_task.call_args.kwargs["enforce_single_active_sibling"] is False
+        assert add_task.call_args.kwargs["single_active_sibling_scope"] is None
+
+    def test_create_review_backed_improve_ignores_active_comments_only_improve(
+        self, tmp_path: Path
+    ):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        assert impl_task.id is not None
+        store.add_comment(impl_task.id, "Unresolved feedback comment.")
+        comments_only = _create_improve_task(
+            store,
+            impl_task,
+            None,
+            trigger_source="manual",
+        )
+        assert comments_only.id is not None
+
+        review_task = store.add(
+            "Review scoped slice",
+            task_type="review",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+        )
+        store.mark_completed(review_task, has_commits=False)
+
+        review_backed = _create_improve_task(
+            store,
+            impl_task,
+            review_task,
+            trigger_source="manual",
+        )
+
+        assert review_backed.id is not None
+        assert review_backed.depends_on == review_task.id
+
+    def test_create_review_backed_improve_rejects_active_review_backed_sibling(
+        self, tmp_path: Path
+    ):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        assert impl_task.id is not None
+        first_review = store.add(
+            "First review",
+            task_type="review",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+        )
+        second_review = store.add(
+            "Second review",
+            task_type="review",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+        )
+        first_improve = _create_improve_task(
+            store,
+            impl_task,
+            first_review,
+            trigger_source="manual",
+        )
+        assert first_improve.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            _create_improve_task(
+                store,
+                impl_task,
+                second_review,
+                trigger_source="manual",
+            )
+
+        assert exc_info.value.active_child.id == first_improve.id
+
     def test_create_improve_task_inherits_resolved_scope_from_legacy_impl_prompt(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add(
@@ -448,6 +557,43 @@ class TestDerivedTaskReviewScopePropagation:
         )
 
         assert rebase_task.tags == impl_task.tags
+
+    def test_create_rebase_task_rejects_duplicate_active_sibling(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement scoped slice", task_type="implement")
+        assert impl_task.id is not None
+
+        first_rebase = _create_rebase_task(
+            store,
+            impl_task.id,
+            "feature/test-slice",
+            "main",
+            trigger_source="manual",
+        )
+        assert first_rebase.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            _create_rebase_task(
+                store,
+                impl_task.id,
+                "feature/test-slice",
+                "main",
+                trigger_source="manual",
+            )
+
+        assert exc_info.value.active_child.id == first_rebase.id
+
+        store.mark_completed(first_rebase, has_commits=False)
+        second_rebase = _create_rebase_task(
+            store,
+            impl_task.id,
+            "feature/test-slice",
+            "main",
+            trigger_source="manual",
+        )
+
+        assert second_rebase.id is not None
+        assert second_rebase.id != first_rebase.id
 
 
 def test_build_failure_diagnostics_extracts_interrupt_source(tmp_path):

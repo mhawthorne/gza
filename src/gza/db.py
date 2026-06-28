@@ -665,6 +665,7 @@ class NewTaskParams:
     recovery_origin: str | None = None
     trigger_source: str | None = None
     enforce_single_active_sibling: bool = False
+    single_active_sibling_scope: Literal["review_backed_improve"] | None = None
     urgent: bool = False
     skip_learnings: bool = False
 
@@ -4146,6 +4147,7 @@ class SqliteTaskStore:
         recovery_origin: str | None = None,
         trigger_source: str | None = None,
         enforce_single_active_sibling: bool = False,
+        single_active_sibling_scope: Literal["review_backed_improve"] | None = None,
         urgent: bool = False,
         skip_learnings: bool = False,
     ) -> Task:
@@ -4172,6 +4174,7 @@ class SqliteTaskStore:
             recovery_origin=recovery_origin,
             trigger_source=trigger_source,
             enforce_single_active_sibling=enforce_single_active_sibling,
+            single_active_sibling_scope=single_active_sibling_scope,
             urgent=urgent,
             skip_learnings=skip_learnings,
         )
@@ -4208,6 +4211,7 @@ class SqliteTaskStore:
             active_children = self.get_active_children_of_type(
                 params.based_on,
                 params.task_type,
+                scope=params.single_active_sibling_scope,
                 conn=conn,
             )
             if active_children:
@@ -5006,32 +5010,32 @@ class SqliteTaskStore:
         task_id: str,
         task_type: str,
         *,
+        scope: Literal["review_backed_improve"] | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> list[Task]:
         """Return active direct based_on children of one task type."""
-        if conn is not None:
-            cur = conn.execute(
-                """
+        if scope == "review_backed_improve":
+            scope_clause = "AND depends_on IS NOT NULL"
+        else:
+            scope_clause = ""
+        query = f"""
                 SELECT * FROM tasks
                 WHERE project_id = ?
                   AND based_on = ?
                   AND task_type = ?
                   AND status IN ('pending', 'in_progress')
+                  {scope_clause}
                 ORDER BY created_at ASC
-                """,
+                """
+        if conn is not None:
+            cur = conn.execute(
+                query,
                 (self._project_id, task_id, task_type),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
         with self._connect() as owned_conn:
             cur = owned_conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE project_id = ?
-                  AND based_on = ?
-                  AND task_type = ?
-                  AND status IN ('pending', 'in_progress')
-                ORDER BY created_at ASC
-                """,
+                query,
                 (self._project_id, task_id, task_type),
             )
             return self._rows_to_tasks(owned_conn, cur.fetchall())
@@ -5483,6 +5487,7 @@ class SqliteTaskStore:
                         recovery_origin=params.recovery_origin,
                         trigger_source=params.trigger_source,
                         enforce_single_active_sibling=params.enforce_single_active_sibling,
+                        single_active_sibling_scope=params.single_active_sibling_scope,
                         urgent=params.urgent,
                         skip_learnings=params.skip_learnings,
                     )

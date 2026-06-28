@@ -5496,7 +5496,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="conflict_needs_rebase",
-        matches=lambda ctx: ctx.selected_for_merge and not ctx.can_merge and not _branch_contains_target_tip(ctx),
+        matches=lambda ctx: (
+            ctx.selected_for_merge
+            and not ctx.can_merge
+            and ctx.rebase_pending_or_running is None
+            and not _branch_contains_target_tip(ctx)
+        ),
         action=lambda ctx: {
             "type": "needs_rebase",
             "description": "rebase --resolve (conflicts detected)",

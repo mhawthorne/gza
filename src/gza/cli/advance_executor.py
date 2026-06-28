@@ -27,7 +27,7 @@ from ..concurrency import (
     release_task_launch_permit,
     reserve_task_launch_permit,
 )
-from ..db import SqliteTaskStore, Task as DbTask
+from ..db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
 from ..flaky_investigations import create_or_reuse_flaky_investigations
 from ..git import Git, GitError
 from ..plan_review_verdict import PlanReviewManifest
@@ -57,6 +57,8 @@ from ._common import (
     _create_improve_task,
     _create_retry_task,
     _prepare_task_for_reserved_launch,
+    format_duplicate_active_child_message,
+    format_duplicate_rebase_message,
     resolve_improve_action,
 )
 from .advance_engine import (
@@ -471,6 +473,42 @@ def _reserve_background_launch(
 def _release_reserved_launch_if_left(task: DbTask | None) -> None:
     if task is not None and task.id is not None:
         release_task_launch_permit(str(task.id))
+
+
+def _skip_duplicate_rebase_creation(
+    *,
+    action_type: str,
+    permit: LaunchPermit | None,
+    exc: DuplicateActiveChildError,
+    parent_task_id: str | None,
+) -> AdvanceActionExecutionResult:
+    if permit is not None:
+        permit.release()
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        message=f"SKIP: {format_duplicate_rebase_message(exc, parent_task_id=parent_task_id)}",
+        worker_consuming=False,
+        work_done=False,
+    )
+
+
+def _skip_duplicate_recovery_creation(
+    *,
+    action_type: str,
+    permit: LaunchPermit | None,
+    exc: DuplicateActiveChildError,
+    task: DbTask,
+) -> AdvanceActionExecutionResult:
+    if permit is not None:
+        permit.release()
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        message=f"SKIP: {format_duplicate_active_child_message(exc, parent_task_id=task.id, task=task)}",
+        worker_consuming=False,
+        work_done=False,
+    )
 
 
 def _worker_capacity_blocked_result(
@@ -1658,16 +1696,32 @@ def execute_advance_action(
             return blocked
         if improve_mode == "resume" and failed_improve is not None:
             assert failed_improve.id is not None
-            improve_task = context.create_resume_task(failed_improve)
+            try:
+                improve_task = context.create_resume_task(failed_improve)
+            except DuplicateActiveChildError as exc:
+                return _skip_duplicate_recovery_creation(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                    task=failed_improve,
+                )
         elif improve_mode == "retry" and failed_improve is not None:
             assert failed_improve.id is not None
-            if context.create_retry_task is not None:
-                improve_task = context.create_retry_task(failed_improve)
-            else:
-                improve_task = _create_retry_task(
-                    context.store,
-                    failed_improve,
-                    trigger_source=context.trigger_source,
+            try:
+                if context.create_retry_task is not None:
+                    improve_task = context.create_retry_task(failed_improve)
+                else:
+                    improve_task = _create_retry_task(
+                        context.store,
+                        failed_improve,
+                        trigger_source=context.trigger_source,
+                    )
+            except DuplicateActiveChildError as exc:
+                return _skip_duplicate_recovery_creation(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                    task=failed_improve,
                 )
         else:
             try:
@@ -1804,7 +1858,15 @@ def execute_advance_action(
                         message=f"missing existing resume task {resume_task_id}",
                     )
             else:
-                resume_task = context.create_resume_task(task)
+                try:
+                    resume_task = context.create_resume_task(task)
+                except DuplicateActiveChildError as exc:
+                    return _skip_duplicate_recovery_creation(
+                        action_type=action_type,
+                        permit=permit,
+                        exc=exc,
+                        task=task,
+                    )
             prepared_resume_task, prepare_error = _prepare_background_start(
                 context=context,
                 action_type=action_type,
@@ -1851,7 +1913,15 @@ def execute_advance_action(
                     message=f"missing existing resume task {resume_task_id}",
                 )
         else:
-            resume_task = context.create_resume_task(task)
+            try:
+                resume_task = context.create_resume_task(task)
+            except DuplicateActiveChildError as exc:
+                return _skip_duplicate_recovery_creation(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                    task=task,
+                )
         prepared_resume_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -1921,7 +1991,15 @@ def execute_advance_action(
                     status="error",
                     message="missing retry task factory",
                 )
-            retry_task = context.create_retry_task(task)
+            try:
+                retry_task = context.create_retry_task(task)
+            except DuplicateActiveChildError as exc:
+                return _skip_duplicate_recovery_creation(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                    task=task,
+                )
         if launch_mode == "iterate":
             if context.spawn_iterate_recovery is None:
                 if permit is not None:
@@ -2081,7 +2159,15 @@ def execute_advance_action(
                     ),
                 )
             rebase_parent_task = resolved_parent_task
-        rebase_task = context.create_rebase_task(rebase_parent_task)
+        try:
+            rebase_task = context.create_rebase_task(rebase_parent_task)
+        except DuplicateActiveChildError as exc:
+            return _skip_duplicate_rebase_creation(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
+                parent_task_id=rebase_parent_task.id,
+            )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -2213,11 +2299,19 @@ def execute_advance_action(
         if blocked is not None:
             return blocked
         create_rebase_task = context.create_targeted_rebase_task
-        rebase_task = (
-            create_rebase_task(task, rebase_target)
-            if create_rebase_task is not None
-            else context.create_rebase_task(task)
-        )
+        try:
+            rebase_task = (
+                create_rebase_task(task, rebase_target)
+                if create_rebase_task is not None
+                else context.create_rebase_task(task)
+            )
+        except DuplicateActiveChildError as exc:
+            return _skip_duplicate_rebase_creation(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
+                parent_task_id=task.id,
+            )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,

@@ -33,6 +33,7 @@ from ..config import Config
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
+    DuplicateActiveChildError,
     SqliteTaskStore,
     Task as DbTask,
     WatchProgressObservation,
@@ -121,6 +122,8 @@ from ._common import (
     _spawn_background_resume_worker,
     _spawn_background_worker,
     clear_task_queue_position_scoped,
+    format_duplicate_active_child_message,
+    format_duplicate_rebase_message,
     format_review_outcome,
     get_store,
     parse_cli_tag_filters,
@@ -4153,11 +4156,21 @@ def _run_cycle(
                                     ),
                                 )
                                 _rebuild_isolated_checkout()
+                            reserved_launch: LaunchPermit | None = None
                             try:
                                 reserved_launch = _reserve_watch_launch("rebase", str(display_task.id))
                                 if reserved_launch is None:
                                     continue
                                 rebase_task = _create_rebase_from_task(task)
+                            except DuplicateActiveChildError as rebase_error:
+                                if reserved_launch is not None:
+                                    reserved_launch.release()
+                                log.emit(
+                                    "SKIP",
+                                    f"{display_task.id}: {format_duplicate_rebase_message(rebase_error, parent_task_id=str(display_task.id))}",
+                                    dedupe_key=f"watch-duplicate-rebase:{display_task.id}",
+                                )
+                                continue
                             except Exception as rebase_error:
                                 if reserved_launch is not None:
                                     reserved_launch.release()
@@ -4844,6 +4857,17 @@ def _run_cycle(
                 else:
                     try:
                         recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                    except DuplicateActiveChildError as exc:
+                        reserved_launch.release()
+                        log.emit(
+                            "SKIP",
+                            (
+                                f"{failed.id}: "
+                                f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
+                            ),
+                            dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}",
+                        )
+                        continue
                     except Exception:
                         reserved_launch.release()
                         raise
@@ -4883,6 +4907,17 @@ def _run_cycle(
                 else:
                     try:
                         recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                    except DuplicateActiveChildError as exc:
+                        reserved_launch.release()
+                        log.emit(
+                            "SKIP",
+                            (
+                                f"{failed.id}: "
+                                f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
+                            ),
+                            dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}:iterate",
+                        )
+                        continue
                     except Exception:
                         reserved_launch.release()
                         raise
@@ -4953,6 +4988,17 @@ def _run_cycle(
                         trigger_source="watch",
                         automatic_recovery=True,
                     )
+                except DuplicateActiveChildError as exc:
+                    reserved_launch.release()
+                    log.emit(
+                        "SKIP",
+                        (
+                            f"{failed.id}: "
+                            f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
+                        ),
+                        dedupe_key=f"recovery-retry-duplicate:{failed.id}:{exc.active_child.id}",
+                    )
+                    continue
                 except Exception:
                     reserved_launch.release()
                     raise

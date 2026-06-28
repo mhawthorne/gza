@@ -21,8 +21,9 @@ from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
 from gza.cli import query as query_cli_module
 import gza.cli.execution as _execution_module
 from gza.cli.execution import _format_iterate_terminal_merge_state_message
+from gza.concurrency import launch_permit
 from gza.config import Config
-from gza.db import SqliteTaskStore, task_id_numeric_key
+from gza.db import DuplicateActiveChildError, SqliteTaskStore, task_id_numeric_key
 from gza.git import Git
 from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
@@ -13300,6 +13301,123 @@ class TestIterateCommand:
         assert "Resuming failed implementation" in output
         assert "Iterate complete: MERGE_READY" in output
 
+    def test_failed_task_resume_duplicate_active_review_backed_improve_returns_phase1_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.recovery_engine import FailedRecoveryDecision
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = self._make_completed_impl(store)
+        impl.status = "failed"
+        impl.failure_reason = "MAX_STEPS"
+        impl.session_id = "impl-session"
+        store.update(impl)
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Failed improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_STEPS"
+        failed_improve.session_id = "improve-session"
+        store.update(failed_improve)
+
+        active_resume = store.add(
+            "Active improve recovery",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert active_resume.id is not None
+        active_resume.status = "pending"
+        store.update(active_resume)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            no_docker=True,
+            resume=True,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+        )
+        root_decision = FailedRecoveryDecision(
+            task_id=impl.id,
+            action="skip",
+            reason_code="retry_limit_reached",
+            reason_text="blocked by newer failed recovery descendant",
+            launch_mode="none",
+            attempt_index=1,
+            attempt_limit=1,
+        )
+        descendant_decision = FailedRecoveryDecision(
+            task_id=failed_improve.id,
+            action="resume",
+            reason_code="timeout_style_failure",
+            reason_text="resume failed improve",
+            launch_mode="iterate",
+            attempt_index=1,
+            attempt_limit=1,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch(
+                "gza.cli.execution.decide_failed_task_recovery",
+                side_effect=[root_decision, descendant_decision],
+            ),
+            patch(
+                "gza.cli.execution.get_failed_recovery_needs_attention_reason",
+                return_value="newer-recovery-descendant-needs-attention",
+            ),
+            patch(
+                "gza.cli.execution.get_manual_resume_override_descendant",
+                return_value=failed_improve,
+            ),
+            patch(
+                "gza.cli.execution._create_resume_task",
+                side_effect=DuplicateActiveChildError(active_resume),
+            ),
+            patch(
+                "gza.cli.execution._run_foreground",
+                side_effect=AssertionError("iterate should not start foreground execution"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+        assert result == 1
+        assert (
+            f"Error: review-backed improve already pending/in progress for {failed_improve.id}: {active_resume.id}"
+            in output
+        )
+
     def test_failed_task_resume_descendant_requires_manual_review(self, tmp_path: Path):
         """iterate --resume should stop when shared policy marks a failed resume descendant manual-only."""
         setup_config(tmp_path)
@@ -18127,6 +18245,135 @@ class TestIterateCommand:
         assert "Error creating improve task" in output
         assert "Iterate blocked: improve_failed." in output
 
+    @pytest.mark.parametrize(
+        ("recovery_action", "creator_name"),
+        [
+            ("resume", "_create_resume_task"),
+            ("retry", "_create_retry_task"),
+        ],
+    )
+    def test_iterate_duplicate_failed_improve_recovery_releases_permit_and_blocks(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        recovery_action: str,
+        creator_name: str,
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.recovery_engine import FailedRecoveryDecision
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Failed improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_STEPS"
+        failed_improve.session_id = "improve-session"
+        store.update(failed_improve)
+
+        active_recovery = store.add(
+            "Active improve recovery",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert active_recovery.id is not None
+        active_recovery.status = "pending"
+        store.update(active_recovery)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.can_merge.return_value = True
+        decision = FailedRecoveryDecision(
+            task_id=failed_improve.id,
+            action=recovery_action,
+            reason_code="timeout_style_failure",
+            reason_text=f"{recovery_action} failed improve",
+            launch_mode="iterate",
+            attempt_index=1,
+            attempt_limit=1,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch(
+                "gza.cli.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch(
+                "gza.cli.execution.resolve_improve_action",
+                return_value=(recovery_action, failed_improve, decision),
+            ),
+            patch(
+                "gza.cli.execution.build_improve_needs_attention_result",
+                return_value=None,
+            ),
+            patch(
+                f"gza.cli.execution.{creator_name}",
+                side_effect=DuplicateActiveChildError(active_recovery),
+            ),
+            patch(
+                "gza.cli._run_foreground",
+                side_effect=AssertionError("foreground iterate should not run duplicate recovery"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        assert result == 3
+        assert (
+            f"Error creating improve task: review-backed improve already pending/in progress "
+            f"for {failed_improve.id}: {active_recovery.id}"
+        ) in output
+        assert "Iterate blocked: improve_failed." in output
+        permit = launch_permit(config, store)
+        permit.release()
+
     def test_iterate_run_review_auto_resumes_max_steps_failure(self, tmp_path: Path):
         import argparse
         from unittest.mock import MagicMock, patch
@@ -18788,6 +19035,239 @@ class TestIterateCommand:
         assert spawn_background.call_args.kwargs.get("prepared_task_id") is None
         assert [task for task in store.get_all() if task.task_type == "rebase"] == []
 
+    def test_iterate_background_duplicate_active_rebase_releases_capacity_and_leaves_no_prepared_task(
+        self, tmp_path: Path
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        active_rebase = store.add("Rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert active_rebase.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "needs_rebase", "description": "needs rebase"},
+            ),
+            patch(
+                "gza.cli.execution._create_rebase_task",
+                side_effect=DuplicateActiveChildError(active_rebase),
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        assert spawn_background.call_args.kwargs.get("prepared_task_id") is None
+        permit = launch_permit(config, store)
+        permit.release()
+
+    def test_iterate_retry_foreground_duplicate_resolved_failed_rebase_returns_phase1_error_and_releases_capacity(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            "Failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        store.update(failed_rebase)
+
+        active_retry = _create_retry_task(store, failed_rebase, trigger_source="manual")
+        assert active_retry.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            auto_iterate=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.resolve_recovery_planning_task",
+                return_value=failed_rebase,
+            ),
+            patch(
+                "gza.cli.execution._resolve_iterate_merge_state_for_current_target",
+                return_value=None,
+            ),
+            patch(
+                "gza.cli.execution._run_iterate_task_with_recovery",
+                side_effect=AssertionError("duplicate retry should not launch foreground execution"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert f"Error: rebase already pending/in progress for {failed_rebase.id}: {active_retry.id}" in output
+        permit = launch_permit(config, store)
+        permit.release()
+
+    def test_iterate_retry_background_duplicate_resolved_failed_rebase_skips_spawn_and_releases_capacity(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "failed"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            "Failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        store.update(failed_rebase)
+
+        active_retry = _create_retry_task(store, failed_rebase, trigger_source="manual")
+        assert active_retry.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=True,
+            auto_iterate=False,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.resolve_recovery_planning_task",
+                return_value=failed_rebase,
+            ),
+            patch(
+                "gza.cli.execution._create_retry_task",
+                side_effect=DuplicateActiveChildError(active_retry),
+            ) as create_retry,
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("duplicate retry should not spawn background iterate"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        create_retry.assert_called_once()
+        _ = capsys.readouterr()
+        permit = launch_permit(config, store)
+        permit.release()
+
     def test_iterate_background_does_not_prepare_or_spawn_blocked_pending_implementation(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -18977,6 +19457,202 @@ class TestIterateCommand:
             result = cmd_iterate(args)
 
         assert result == 0
+
+    def test_iterate_needs_rebase_duplicate_active_rebase_releases_capacity_and_continues(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        active_rebase = store.add("Rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert active_rebase.id is not None
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=2,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        first_action = True
+
+        def fake_iterate_action(*_args, **_kwargs):
+            nonlocal first_action
+            if first_action:
+                first_action = False
+                return {"type": "needs_rebase", "description": "needs rebase"}
+            return {"type": "merge", "description": "done"}
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.resolve_closing_review_action", return_value=None),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action",
+                side_effect=fake_iterate_action,
+            ),
+            patch(
+                "gza.cli.execution._create_rebase_task",
+                side_effect=DuplicateActiveChildError(active_rebase),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert f"Skipping rebase: rebase already pending/in progress for {impl.id}: {active_rebase.id}." in captured.out
+        permit = launch_permit(config, store)
+        permit.release()
+
+    @pytest.mark.parametrize(
+        ("recovery_action", "creator_name"),
+        [
+            ("resume", "_create_resume_task"),
+            ("retry", "_create_retry_task"),
+        ],
+    )
+    def test_background_iterate_duplicate_failed_improve_recovery_releases_permit_and_skips_spawn(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        recovery_action: str,
+        creator_name: str,
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.recovery_engine import FailedRecoveryDecision
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        failed_improve = store.add(
+            "Failed improve",
+            task_type="improve",
+            based_on=impl.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_STEPS"
+        failed_improve.session_id = "improve-session"
+        store.update(failed_improve)
+
+        active_recovery = store.add(
+            "Active improve recovery",
+            task_type="improve",
+            based_on=failed_improve.id,
+            depends_on=review.id,
+            same_branch=True,
+        )
+        assert active_recovery.id is not None
+        active_recovery.status = "pending"
+        store.update(active_recovery)
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+        )
+        mock_config = MagicMock(
+            project_dir=tmp_path,
+            use_docker=False,
+            project_prefix="testproject",
+            max_resume_attempts=1,
+            max_review_cycles=3,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_concurrent=1,
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        decision = FailedRecoveryDecision(
+            task_id=failed_improve.id,
+            action=recovery_action,
+            reason_code="timeout_style_failure",
+            reason_text=f"{recovery_action} failed improve",
+            launch_mode="iterate",
+            attempt_index=1,
+            attempt_limit=1,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch(
+                "gza.cli.execution.resolve_improve_action",
+                return_value=(recovery_action, failed_improve, decision),
+            ),
+            patch(
+                "gza.cli.execution.build_improve_needs_attention_result",
+                return_value=None,
+            ),
+            patch(
+                f"gza.cli.execution.{creator_name}",
+                side_effect=DuplicateActiveChildError(active_recovery),
+            ),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate should not spawn"),
+            ),
+        ):
+            result = cmd_iterate(args)
+
+        captured = capsys.readouterr()
+        output = captured.out + captured.err
+        assert result == 0
+        assert (
+            f"Skipping improve recovery: review-backed improve already pending/in progress "
+            f"for {failed_improve.id}: {active_recovery.id}."
+        ) in output
+        permit = launch_permit(config, store)
+        permit.release()
 
     def test_iterate_real_engine_needs_rebase_transition(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """When git reports conflicts, the advance engine should request a rebase."""
@@ -20126,6 +20802,64 @@ class TestRunForeground:
         assert workers[0].status == "failed"
         assert workers[0].exit_code == 1
 
+    def test_run_foreground_resume_duplicate_active_rebase_skips_run(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Foreground resume should stop cleanly when preflight rebase already exists."""
+        from gza.cli import _create_rebase_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Resume target", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.session_id = "resume-session"
+        task.branch = "feature/foreground-resume-target"
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch="release",
+            owner_task_id=task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        active_rebase = _create_rebase_task(
+            store,
+            task.id,
+            task.branch,
+            "release",
+            trigger_source="manual",
+        )
+        assert active_rebase.id is not None
+
+        workers_path = config.workers_path
+        workers_path.mkdir(parents=True, exist_ok=True)
+
+        with (
+            _clear_foreground_worker_env(),
+            patch("gza.cli.run") as mock_run,
+        ):
+            rc = _run_foreground(config, task_id=task.id, resume=True)
+
+        assert rc == 1
+        mock_run.assert_not_called()
+        captured = capsys.readouterr()
+        assert (
+            captured.err.strip()
+            == f"rebase already pending/in progress for {task.id}: {active_rebase.id}"
+        )
+        registry = WorkerRegistry(workers_path)
+        workers = registry.list_all(include_completed=True)
+        assert len(workers) == 1
+        assert workers[0].status == "failed"
+        assert workers[0].exit_code == 1
+        rebase_children = [t for t in store.get_based_on_children(task.id) if t.task_type == "rebase"]
+        assert [child.id for child in rebase_children] == [active_rebase.id]
+
     def test_run_foreground_resume_dependency_block_refuses_before_dispatch_side_effects(
         self,
         tmp_path: Path,
@@ -20273,6 +21007,54 @@ class TestRunForeground:
         assert mock_rebase.call_args.kwargs["failure_hint_lines"] == [
             "Use 'gza retry' to create a new retry attempt or run 'gza rebase' manually.",
         ]
+
+    def test_auto_rebase_before_resume_duplicate_active_rebase_returns_clean_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Resume preflight should fail closed when an active rebase child already exists."""
+        from gza.cli import _auto_rebase_before_resume, _create_rebase_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Resume target", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.session_id = "resume-session"
+        task.branch = "feature/resume-target"
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch="release",
+            owner_task_id=task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        active_rebase = _create_rebase_task(
+            store,
+            task.id,
+            task.branch,
+            "release",
+            trigger_source="manual",
+        )
+        assert active_rebase.id is not None
+
+        with patch("gza.cli.git_ops._run_task_backed_rebase") as mock_rebase:
+            rc = _auto_rebase_before_resume(config, task.id)
+
+        assert rc == 1
+        mock_rebase.assert_not_called()
+        captured = capsys.readouterr()
+        assert (
+            captured.err.strip()
+            == f"rebase already pending/in progress for {task.id}: {active_rebase.id}"
+        )
+        rebase_children = [t for t in store.get_based_on_children(task.id) if t.task_type == "rebase"]
+        assert [child.id for child in rebase_children] == [active_rebase.id]
 
     def test_run_foreground_marks_failed_on_keyboard_interrupt(self, tmp_path: Path):
         """_run_foreground marks worker as failed when interrupted."""
@@ -21384,6 +22166,55 @@ class TestForegroundInvocationContextWiring:
         created = next(task for task in store.get_pending() if task.based_on == failed.id)
         assert created.task_type == failed.task_type
 
+    def test_cmd_retry_rejects_duplicate_active_rebase_retry_and_releases_permit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli._common import _create_retry_task
+        from gza.cli.execution import cmd_retry
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        failed = store.add(
+            "Failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert failed.id is not None
+        failed.status = "failed"
+        store.update(failed)
+
+        active_retry = _create_retry_task(store, failed, trigger_source="manual")
+        assert active_retry.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            run=True,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        rc = cmd_retry(args)
+
+        assert rc == 1
+        output = capsys.readouterr().out
+        assert f"Error: rebase already pending/in progress for {failed.id}: {active_retry.id}" in output
+        permit = launch_permit(config, store)
+        permit.release()
+
     def test_bare_resume_defaults_to_queue(self, tmp_path: Path) -> None:
         from gza.cli.execution import cmd_resume
 
@@ -21413,6 +22244,56 @@ class TestForegroundInvocationContextWiring:
 
         created = next(task for task in store.get_pending() if task.based_on == failed.id)
         assert created.session_id == failed.session_id
+
+    def test_cmd_resume_rejects_duplicate_active_rebase_resume_and_releases_permit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli._common import _create_resume_task
+        from gza.cli.execution import cmd_resume
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        failed = store.add(
+            "Failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.session_id = "resume-session-1"
+        store.update(failed)
+
+        active_resume = _create_resume_task(store, failed, trigger_source="manual")
+        assert active_resume.id is not None
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=failed.id,
+            no_docker=True,
+            max_turns=None,
+            run=True,
+            background=False,
+            queue=False,
+            force=False,
+        )
+
+        rc = cmd_resume(args)
+
+        assert rc == 1
+        output = capsys.readouterr().out
+        assert f"Error: rebase already pending/in progress for {failed.id}: {active_resume.id}" in output
+        permit = launch_permit(config, store)
+        permit.release()
 
     def test_bare_fix_defaults_to_queue(self, tmp_path: Path) -> None:
         from gza.cli.execution import cmd_fix
@@ -22049,6 +22930,65 @@ class TestRunAsWorker:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.exit_code == 1
+
+    def test_run_as_worker_resume_duplicate_active_rebase_skips_run_without_worker_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Worker resume should surface duplicate active rebases as a controlled startup failure."""
+        from gza.cli import _create_rebase_task
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add("Worker resume target", task_type="implement")
+        assert task.id is not None
+        task.status = "failed"
+        task.session_id = "resume-session"
+        task.branch = "feature/worker-resume-target"
+        store.update(task)
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch="release",
+            owner_task_id=task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+        active_rebase = _create_rebase_task(
+            store,
+            task.id,
+            task.branch,
+            "release",
+            trigger_source="manual",
+        )
+        assert active_rebase.id is not None
+
+        registry = self._register_current_worker(config, task.id, "w-worker-resume-duplicate")
+        args = argparse.Namespace(task_ids=[task.id], resume=True)
+
+        with (
+            patch("gza.cli.signal.signal"),
+            patch("gza.cli.run") as mock_run,
+        ):
+            rc = _run_as_worker(args, config)
+
+        assert rc == 1
+        mock_run.assert_not_called()
+        captured = capsys.readouterr()
+        assert (
+            f"rebase already pending/in progress for {task.id}: {active_rebase.id}"
+            in captured.err
+        )
+        assert "Worker error:" not in captured.out
+        worker = registry.get("w-worker-resume-duplicate")
+        assert worker is not None
+        assert worker.status == "failed"
+        assert worker.exit_code == 1
+        assert worker.completion_reason == "startup failure before task claim"
+        rebase_children = [t for t in store.get_based_on_children(task.id) if t.task_type == "rebase"]
+        assert [child.id for child in rebase_children] == [active_rebase.id]
 
     def test_run_as_worker_precondition_refusal_marks_failed(self, tmp_path: Path):
         """Worker mode should record non-zero precondition refusal as failed, not completed."""
@@ -22706,6 +23646,84 @@ class TestAddCommandWithModelAndProvider:
 
 
 class TestRecoveryTaskScopeCloning:
+    @pytest.mark.parametrize("creator_name", ["_create_resume_task", "_create_retry_task"])
+    @pytest.mark.parametrize("task_kind", ["review", "rebase", "review_backed_improve"])
+    def test_singleton_recovery_creators_reject_duplicate_active_children(
+        self,
+        tmp_path: Path,
+        creator_name: str,
+        task_kind: str,
+    ) -> None:
+        from gza.cli._common import _create_resume_task, _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implement scoped slice", task_type="implement")
+        assert impl.id is not None
+
+        if task_kind == "review":
+            original = store.add("Review scoped slice", task_type="review", based_on=impl.id)
+        elif task_kind == "rebase":
+            original = store.add(
+                "Rebase scoped slice",
+                task_type="rebase",
+                based_on=impl.id,
+                same_branch=True,
+                base_branch="main",
+            )
+        else:
+            review = store.add("Review scoped slice", task_type="review", based_on=impl.id)
+            assert review.id is not None
+            original = store.add(
+                "Improve scoped slice",
+                task_type="improve",
+                based_on=impl.id,
+                depends_on=review.id,
+                same_branch=True,
+            )
+
+        assert original.id is not None
+        original.status = "failed"
+        if creator_name == "_create_resume_task":
+            original.session_id = f"session-{task_kind}"
+        store.update(original)
+
+        creator = _create_resume_task if creator_name == "_create_resume_task" else _create_retry_task
+        first = creator(store, original, trigger_source="manual")
+        assert first.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            creator(store, original, trigger_source="manual")
+
+        assert exc_info.value.active_child.id == first.id
+
+    @pytest.mark.parametrize("creator_name", ["_create_resume_task", "_create_retry_task"])
+    def test_comments_only_improve_recovery_creators_allow_multiple_active_children(
+        self,
+        tmp_path: Path,
+        creator_name: str,
+    ) -> None:
+        from gza.cli._common import _create_resume_task, _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        original = store.add("Improve from comments", task_type="improve", same_branch=True)
+        assert original.id is not None
+        original.status = "failed"
+        if creator_name == "_create_resume_task":
+            original.session_id = "comments-session"
+        store.update(original)
+
+        creator = _create_resume_task if creator_name == "_create_resume_task" else _create_retry_task
+        first = creator(store, original, trigger_source="manual")
+        second = creator(store, original, trigger_source="manual")
+
+        assert first.id is not None
+        assert second.id is not None
+        assert first.id != second.id
+
     def test_resume_task_preserves_model_explicitness(self, tmp_path: Path):
         from gza.cli._common import _create_resume_task
 

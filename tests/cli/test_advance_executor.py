@@ -33,7 +33,7 @@ from gza.cli.advance_executor import (
 )
 from gza.concurrency import launch_permit
 from gza.config import Config
-from gza.db import Task as DbTask
+from gza.db import DuplicateActiveChildError, Task as DbTask
 from gza.flaky_investigations import (
     FlakyInvestigationEvidence,
     build_flaky_reproduction_plan,
@@ -2521,6 +2521,84 @@ def test_reused_failed_task_recovery_reports_reuse_message(
     assert spawned == [(reused.id, expected_kind)]
 
 
+@pytest.mark.parametrize("action_type", ["resume", "retry"])
+def test_duplicate_singleton_recovery_action_skips_and_releases_reserved_launch_permit(
+    tmp_path: Path,
+    action_type: str,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    failed = store.add(
+        "Failed rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+        base_branch="main",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED" if action_type == "resume" else "INFRASTRUCTURE_ERROR"
+    failed.session_id = "resume-session-1" if action_type == "resume" else None
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    active_child = store.add(
+        f"Pending {action_type}",
+        task_type="rebase",
+        based_on=failed.id,
+        same_branch=True,
+        base_branch="main",
+        enforce_single_active_sibling=True,
+    )
+    assert active_child.id is not None
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=(
+            (lambda _task: (_ for _ in ()).throw(DuplicateActiveChildError(active_child)))
+            if action_type == "resume"
+            else lambda _task: pytest.fail("unused")
+        ),
+        create_retry_task=(
+            (lambda _task: (_ for _ in ()).throw(DuplicateActiveChildError(active_child)))
+            if action_type == "retry"
+            else lambda _task: pytest.fail("unused")
+        ),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+    )
+
+    result = execute_advance_action(
+        task=failed,
+        action={"type": action_type, "launch_mode": "worker"},
+        context=context,
+    )
+
+    assert result.status == "skip"
+    assert result.worker_consuming is False
+    assert result.work_done is False
+    assert result.message == f"SKIP: rebase already pending/in progress for {failed.id}: {active_child.id}"
+    permit = launch_permit(config, store)
+    permit.release()
+
+
 @pytest.mark.parametrize("trigger_source", ["manual", "watch"])
 def test_retry_action_uses_context_retry_factory_trigger_source(
     tmp_path: Path,
@@ -2803,6 +2881,49 @@ def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> N
     assert len(store.get_all()) == before_count
     rebase_rows = [t for t in store.get_all() if t.task_type == "rebase"]
     assert rebase_rows == []
+
+
+def test_needs_rebase_duplicate_active_rebase_skips_and_releases_capacity(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/needs-rebase-duplicate")
+    store.update(impl)
+
+    active_rebase = store.add("Rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert active_rebase.id is not None
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: (_ for _ in ()).throw(DuplicateActiveChildError(active_rebase)),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *_args, **_kwargs: pytest.fail("unused"),
+        config=config,
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    assert result.status == "skip"
+    assert result.worker_consuming is False
+    assert result.work_done is False
+    assert result.message == f"SKIP: rebase already pending/in progress for {impl.id}: {active_rebase.id}"
+    permit = launch_permit(config, store)
+    permit.release()
 
 
 def test_needs_rebase_skips_at_max_concurrent_without_creating_task(tmp_path: Path) -> None:
@@ -3407,6 +3528,59 @@ def test_reconcile_branch_divergence_conflict_creates_targeted_rebase_task(tmp_p
     assert result.status == "success"
     assert captured["target"] == "main"
     assert result.success_message.startswith("Created rebase task ")
+
+
+def test_reconcile_branch_divergence_duplicate_targeted_rebase_skips_and_releases_capacity(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/reconcile-duplicate")
+    store.update(impl)
+
+    active_rebase = store.add("Rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert active_rebase.id is not None
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        create_targeted_rebase_task=lambda _task, _target: (_ for _ in ()).throw(DuplicateActiveChildError(active_rebase)),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *_task, **_kwargs: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="needs_rebase",
+            message="Mechanical rebase conflicted",
+            rebase_target="main",
+        ),
+        config=config,
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "reconcile_branch_divergence"},
+        context=context,
+    )
+
+    assert result.status == "skip"
+    assert result.worker_consuming is False
+    assert result.work_done is False
+    assert result.message == f"SKIP: rebase already pending/in progress for {impl.id}: {active_rebase.id}"
+    permit = launch_permit(config, store)
+    permit.release()
 
 
 def test_reconcile_branch_divergence_needs_rebase_without_target_fails_closed(tmp_path: Path) -> None:

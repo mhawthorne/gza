@@ -12511,6 +12511,40 @@ def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) 
     assert selected_action["reason"] == "merge-selection-conflict-rebase"
 
 
+def test_conflict_needs_rebase_suppressed_when_active_rebase_exists(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    impl.branch = "feature/rebase-running"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    active_rebase = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    active_rebase.status = "in_progress"
+    store.update(active_rebase)
+
+    selected_action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=False),
+        impl,
+        "main",
+        selected_for_merge=True,
+    )
+
+    assert selected_action["type"] == "skip"
+    assert selected_action["description"] == f"SKIP: rebase {active_rebase.id} already in progress"
+
+
 def test_rebase_failure_circuit_breaker_trips_after_three_failures_without_progress(
     tmp_path: Path,
 ) -> None:

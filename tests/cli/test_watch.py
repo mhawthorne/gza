@@ -31,6 +31,7 @@ from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
+from gza.concurrency import launch_permit
 from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
@@ -39,6 +40,7 @@ from gza.cli.git_ops import (
     _ResolvedMergeSubject,
     ensure_watch_main_checkout,
 )
+from gza.db import DuplicateActiveChildError
 from gza.cli.watch import (
     SCOPED_WATCH_COMPLETE_MESSAGE,
     WatchSlotAllocation,
@@ -6974,6 +6976,76 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_r
     workers_dir = tmp_path / ".gza" / "workers"
     if workers_dir.exists():
         assert list(workers_dir.iterdir()) == []
+
+
+def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error_and_releases_capacity(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nmax_concurrent: 1\n"
+    )
+    store = make_store(tmp_path)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-duplicate"
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    active_rebase = store.add("Rebase", task_type="rebase", based_on=task.id, same_branch=True)
+    assert active_rebase.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.return_value = False
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, prepared, **_k: prepared),
+        patch(
+            "gza.cli.watch._create_rebase_task",
+            side_effect=DuplicateActiveChildError(active_rebase),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("duplicate rebase should not spawn"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    log_text = log_path.read_text()
+    assert "rebase already pending/in progress" in log_text
+    assert "failed to create rebase task" not in log_text
+    assert " ERROR " not in log_text
+    permit = launch_permit(config, store)
+    permit.release()
 
 
 def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_but_runs_other_actions(

@@ -523,6 +523,69 @@ class TestActiveChildGuard:
         )
         assert created.id is not None
 
+    def test_comments_only_improve_does_not_block_review_backed_singleton_scope(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent", task_type="implement")
+        assert parent.id is not None
+
+        comments_only = store.add(
+            "comments-only improve",
+            task_type="improve",
+            based_on=parent.id,
+            depends_on=None,
+        )
+        assert comments_only.id is not None
+
+        review = store.add("completed review", task_type="review", based_on=parent.id)
+        assert review.id is not None
+        store.mark_completed(review, has_commits=False)
+
+        review_backed = store.add(
+            "review-backed improve",
+            task_type="improve",
+            based_on=parent.id,
+            depends_on=review.id,
+            enforce_single_active_sibling=True,
+            single_active_sibling_scope="review_backed_improve",
+        )
+
+        assert review_backed.id is not None
+
+    def test_review_backed_improve_scope_rejects_active_review_backed_sibling(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent", task_type="implement")
+        assert parent.id is not None
+
+        first_review = store.add("first review", task_type="review", based_on=parent.id)
+        second_review = store.add("second review", task_type="review", based_on=parent.id)
+        assert first_review.id is not None
+        assert second_review.id is not None
+        first_improve = store.add(
+            "first review-backed improve",
+            task_type="improve",
+            based_on=parent.id,
+            depends_on=first_review.id,
+            enforce_single_active_sibling=True,
+            single_active_sibling_scope="review_backed_improve",
+        )
+        assert first_improve.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "second review-backed improve",
+                task_type="improve",
+                based_on=parent.id,
+                depends_on=second_review.id,
+                enforce_single_active_sibling=True,
+                single_active_sibling_scope="review_backed_improve",
+            )
+
+        assert exc_info.value.active_child.id == first_improve.id
+
     def test_rejected_duplicate_does_not_consume_sequence_id(self, tmp_path: Path) -> None:
         store = SqliteTaskStore(tmp_path / "test.db")
         parent = store.add("parent", task_type="implement")

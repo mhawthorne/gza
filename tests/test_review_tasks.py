@@ -353,6 +353,14 @@ class TestCreateReviewTask:
 
         assert store.add.call_args.kwargs["tags"] == task.tags
 
+    def test_review_creation_opts_into_singleton_guard(self):
+        store = self._mock_store()
+        task = _task(id=10)
+
+        create_review_task(store, task, trigger_source="manual")
+
+        assert store.add.call_args.kwargs["enforce_single_active_sibling"] is True
+
     def test_model_and_provider_default_to_none(self):
         store = self._mock_store()
         task = _task(id=10)
@@ -829,6 +837,88 @@ class TestFollowupTasks:
         assert created is created_task
         assert created_now is True
         assert store.add.call_args.kwargs["review_scope"] == format_followup_finding_context(finding)
+
+    def test_followup_implement_creation_does_not_opt_into_singleton_guard(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement")
+        finding = ReviewFinding(
+            id="F3",
+            severity="FOLLOWUP",
+            title="Title",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="carry scope through follow-ups",
+            tests=None,
+        )
+        created_task = _task(id="gza-403", task_type="implement")
+        store.get_based_on_children.return_value = []
+        store.add.return_value = created_task
+
+        create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            trigger_source="manual",
+        )
+
+        assert "enforce_single_active_sibling" not in store.add.call_args.kwargs
+
+    def test_followup_implement_fanout_remains_allowed_for_distinct_findings(self, tmp_path: Path):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement feature", task_type="implement")
+        assert impl_task.id is not None
+        review_task = store.add(
+            "Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+            based_on=impl_task.id,
+        )
+        assert review_task.id is not None
+        first_finding = ReviewFinding(
+            id="F1",
+            severity="FOLLOWUP",
+            title="First follow-up",
+            body="First body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="first fix",
+            tests=None,
+        )
+        second_finding = ReviewFinding(
+            id="F2",
+            severity="FOLLOWUP",
+            title="Second follow-up",
+            body="Second body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="second fix",
+            tests=None,
+        )
+
+        first_task, first_created = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=first_finding,
+            trigger_source="manual",
+        )
+        second_task, second_created = create_or_reuse_followup_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=second_finding,
+            trigger_source="manual",
+        )
+
+        assert first_created is True
+        assert second_created is True
+        assert first_task.id is not None
+        assert second_task.id is not None
+        active_followups = store.get_active_children_of_type(review_task.id, "implement")
+        assert {child.id for child in active_followups} == {first_task.id, second_task.id}
 
     def test_create_or_reuse_deferred_blocker_task_is_idempotent(self):
         store = MagicMock()

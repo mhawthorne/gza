@@ -39,6 +39,7 @@ from ..config import (
 from ..console import format_duration
 from ..db import (
     TASK_COMMENT_KIND_FEEDBACK,
+    DuplicateActiveChildError,
     InvalidTaskIdError,
     SqliteTaskStore,
     Task as DbTask,
@@ -126,6 +127,8 @@ from ._common import (
     _spawn_background_resume_worker,
     _spawn_background_worker,
     _spawn_background_workers,
+    format_duplicate_active_child_message,
+    format_duplicate_rebase_message,
     format_no_runnable_message_for_tags,
     format_review_outcome,
     get_review_verdict,
@@ -2892,7 +2895,15 @@ def cmd_retry(args: argparse.Namespace) -> int:
     reserved_launch = _reserve_immediate_execution_permit(args=args, config=config, store=store)
     if reserved_launch is False:
         return 1
-    new_task = _create_retry_task(store, task, trigger_source="manual")
+    try:
+        new_task = _create_retry_task(store, task, trigger_source="manual")
+    except DuplicateActiveChildError as exc:
+        if isinstance(reserved_launch, LaunchPermit):
+            reserved_launch.release()
+        return phase1_error(
+            args,
+            format_duplicate_active_child_message(exc, parent_task_id=task_id, task=task),
+        )
     assert new_task.id is not None
 
     def _emit_retry_created() -> None:
@@ -4212,8 +4223,24 @@ def _cmd_iterate_impl(
                         )
                         return None, None
                     return (existing_resume, target_decision), None
-                return (_create_resume_task(store, target_failed_task, trigger_source="manual"), target_decision), None
-            return (_create_resume_task(store, target_failed_task, trigger_source="manual"), target_decision), None
+                created_resume, duplicate_message = _create_iterate_recovery_clone(
+                    target_failed_task,
+                    recovery_action="resume",
+                    trigger_source="manual",
+                )
+                if duplicate_message is not None or created_resume is None:
+                    print_phase1_message(args, f"Error: {duplicate_message}")
+                    return None, None
+                return (created_resume, target_decision), None
+            created_resume, duplicate_message = _create_iterate_recovery_clone(
+                target_failed_task,
+                recovery_action="resume",
+                trigger_source="manual",
+            )
+            if duplicate_message is not None or created_resume is None:
+                print_phase1_message(args, f"Error: {duplicate_message}")
+                return None, None
+            return (created_resume, target_decision), None
         if decision.action != "resume":
             return None, (failed_task, decision)
         if decision.reuse_existing and decision.recovery_task_id is not None:
@@ -4226,7 +4253,15 @@ def _cmd_iterate_impl(
                 )
                 return None, None
             return (existing_resume, decision), None
-        return (_create_resume_task(store, failed_task, trigger_source="manual"), decision), None
+        created_resume, duplicate_message = _create_iterate_recovery_clone(
+            failed_task,
+            recovery_action="resume",
+            trigger_source="manual",
+        )
+        if duplicate_message is not None or created_resume is None:
+            print_phase1_message(args, f"Error: {duplicate_message}")
+            return None, None
+        return (created_resume, decision), None
 
     engine_config = _build_iterate_engine_config(
         config,
@@ -4526,6 +4561,35 @@ def _cmd_iterate_impl(
             reserve_task_launch_permit(str(prepared_task.id), permit)
         return prepared_task
 
+    def _create_iterate_recovery_clone(
+        failed_task: DbTask,
+        *,
+        recovery_action: Literal["resume", "retry"],
+        trigger_source: str,
+        permit: LaunchPermit | None = None,
+    ) -> tuple[DbTask | None, str | None]:
+        try:
+            if recovery_action == "resume":
+                return (
+                    _create_resume_task(store, failed_task, trigger_source=trigger_source),
+                    None,
+                )
+            return (
+                _create_retry_task(store, failed_task, trigger_source=trigger_source),
+                None,
+            )
+        except DuplicateActiveChildError as exc:
+            if permit is not None:
+                permit.release()
+            return (
+                None,
+                format_duplicate_active_child_message(
+                    exc,
+                    parent_task_id=failed_task.id,
+                    task=failed_task,
+                ),
+            )
+
     def _prepare_background_iterate_start(
         iterate_task: DbTask,
         preflight_context: _IterateBackgroundPreflightContext | None,
@@ -4703,13 +4767,18 @@ def _cmd_iterate_impl(
                 permit = _reserve_iterate_launch()
                 if permit is False:
                     return None, 1
-                action_task = _create_rebase_task(
-                    store,
-                    iterate_task.id,
-                    iterate_task.branch,
-                    preflight_context.target_branch,
-                    trigger_source="auto-recovery",
-                )
+                try:
+                    action_task = _create_rebase_task(
+                        store,
+                        iterate_task.id,
+                        iterate_task.branch,
+                        preflight_context.target_branch,
+                        trigger_source="auto-recovery",
+                    )
+                except DuplicateActiveChildError:
+                    if isinstance(permit, LaunchPermit):
+                        permit.release()
+                    return None, None
                 prepared_task = _prepare_reserved_iterate_task(action_task, permit=permit, rollback_on_failure=True)
                 if prepared_task is None:
                     return None, 1
@@ -4764,11 +4833,35 @@ def _cmd_iterate_impl(
                 if permit is False:
                     return None, 1
                 if improve_action == "resume" and failed_improve is not None:
-                    action_task = _create_resume_task(store, failed_improve, trigger_source="auto-recovery")
+                    recovery_task, duplicate_message = _create_iterate_recovery_clone(
+                        failed_improve,
+                        recovery_action="resume",
+                        trigger_source="auto-recovery",
+                        permit=permit,
+                    )
+                    if duplicate_message is not None or recovery_task is None:
+                        print_phase1_message(
+                            args,
+                            f"Skipping improve recovery: {duplicate_message}.",
+                        )
+                        return None, 0
+                    action_task = recovery_task
                     rollback_on_failure = True
                     initial_resume = True
                 elif improve_action == "retry" and failed_improve is not None:
-                    action_task = _create_retry_task(store, failed_improve, trigger_source="auto-recovery")
+                    recovery_task, duplicate_message = _create_iterate_recovery_clone(
+                        failed_improve,
+                        recovery_action="retry",
+                        trigger_source="auto-recovery",
+                        permit=permit,
+                    )
+                    if duplicate_message is not None or recovery_task is None:
+                        print_phase1_message(
+                            args,
+                            f"Skipping improve recovery: {duplicate_message}.",
+                        )
+                        return None, 0
+                    action_task = recovery_task
                     rollback_on_failure = True
                 else:
                     try:
@@ -4872,7 +4965,16 @@ def _cmd_iterate_impl(
             permit = _reserve_iterate_launch()
             if permit is False:
                 return None, 1
-            run_start_task = _create_retry_task(store, iterate_task, trigger_source="manual")
+            run_start_task_candidate, duplicate_message = _create_iterate_recovery_clone(
+                iterate_task,
+                recovery_action="retry",
+                trigger_source="manual",
+                permit=permit,
+            )
+            if duplicate_message is not None or run_start_task_candidate is None:
+                print_phase1_message(args, f"Skipping retry recovery: {duplicate_message}.")
+                return None, 0
+            run_start_task = run_start_task_candidate
             prepared_task = _prepare_reserved_iterate_task(
                 run_start_task,
                 permit=permit,
@@ -5107,7 +5209,16 @@ def _cmd_iterate_impl(
                 except MaxConcurrentTasksError as exc:
                     print(f"Error: {exc}")
                     return 1
-            run_start_task = _create_retry_task(store, impl_task, trigger_source="manual")
+            run_start_task_candidate, duplicate_message = _create_iterate_recovery_clone(
+                impl_task,
+                recovery_action="retry",
+                trigger_source="manual",
+                permit=permit,
+            )
+            if duplicate_message is not None or run_start_task_candidate is None:
+                print_phase1_message(args, f"Error: {duplicate_message}")
+                return 1
+            run_start_task = run_start_task_candidate
             prepared_run_start = (
                 _prepare_task_for_reserved_launch(
                     config,
@@ -5749,13 +5860,19 @@ def _cmd_iterate_impl(
                     final_stop_reason = "needs_rebase"
                     _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
                     break
-                created_rebase_task = _create_rebase_task(
-                    store,
-                    impl_task.id,
-                    impl_task.branch,
-                    target_branch,
-                    trigger_source="manual",
-                )
+                try:
+                    created_rebase_task = _create_rebase_task(
+                        store,
+                        impl_task.id,
+                        impl_task.branch,
+                        target_branch,
+                        trigger_source="manual",
+                    )
+                except DuplicateActiveChildError as exc:
+                    if isinstance(permit_for_rebase, LaunchPermit):
+                        permit_for_rebase.release()
+                    print(f"  Skipping rebase: {format_duplicate_rebase_message(exc, parent_task_id=impl_task.id)}.")
+                    continue
                 if isinstance(permit_for_rebase, LaunchPermit):
                     prepared_rebase_task = _prepare_reserved_iterate_task(
                         created_rebase_task,
@@ -6008,11 +6125,63 @@ def _cmd_iterate_impl(
                 permit_for_improve: LaunchPermit | None = permit_candidate
                 if improve_action == "resume" and failed_improve is not None:
                     assert failed_improve.id is not None
-                    created_improve_task = _create_resume_task(store, failed_improve, trigger_source="manual")
+                    created_improve_task, duplicate_message = _create_iterate_recovery_clone(
+                        failed_improve,
+                        recovery_action="resume",
+                        trigger_source="manual",
+                        permit=permit_for_improve,
+                    )
+                    if duplicate_message is not None or created_improve_task is None:
+                        print(f"  Error creating improve task: {duplicate_message}")
+                        final_status = "blocked"
+                        final_stop_reason = "improve_failed"
+                        if review_row_task is not None:
+                            _append_summary_row(
+                                summary_rows,
+                                iteration_index=iteration,
+                                task_type="review",
+                                task=review_row_task,
+                                verdict=review_row_verdict,
+                            )
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="improve",
+                            task=None,
+                            status="failed",
+                            failure_reason=duplicate_message,
+                        )
+                        break
                     initial_resume = True
                 elif improve_action == "retry" and failed_improve is not None:
                     assert failed_improve.id is not None
-                    created_improve_task = _create_retry_task(store, failed_improve, trigger_source="manual")
+                    created_improve_task, duplicate_message = _create_iterate_recovery_clone(
+                        failed_improve,
+                        recovery_action="retry",
+                        trigger_source="manual",
+                        permit=permit_for_improve,
+                    )
+                    if duplicate_message is not None or created_improve_task is None:
+                        print(f"  Error creating improve task: {duplicate_message}")
+                        final_status = "blocked"
+                        final_stop_reason = "improve_failed"
+                        if review_row_task is not None:
+                            _append_summary_row(
+                                summary_rows,
+                                iteration_index=iteration,
+                                task_type="review",
+                                task=review_row_task,
+                                verdict=review_row_verdict,
+                            )
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="improve",
+                            task=None,
+                            status="failed",
+                            failure_reason=duplicate_message,
+                        )
+                        break
                 else:
                     try:
                         created_improve_task = _create_improve_task(
@@ -6822,7 +6991,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
     reserved_launch = _reserve_immediate_execution_permit(args=args, config=config, store=store)
     if reserved_launch is False:
         return 1
-    new_task = _create_resume_task(store, task, trigger_source="manual")
+    try:
+        new_task = _create_resume_task(store, task, trigger_source="manual")
+    except DuplicateActiveChildError as exc:
+        if isinstance(reserved_launch, LaunchPermit):
+            reserved_launch.release()
+        return phase1_error(
+            args,
+            format_duplicate_active_child_message(exc, parent_task_id=task_id, task=task),
+        )
     assert new_task.id is not None
 
     def _emit_resume_created() -> None:
