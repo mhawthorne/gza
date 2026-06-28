@@ -246,17 +246,31 @@ def _select_targets(
     selected: list[SelectedParkedTask] = []
     seen_owner_reason: set[tuple[str, ParkReasonClass | None]] = set()
 
-    def _matches_filters(owner_task: DbTask, candidate: ParkedTaskCandidate | None) -> bool:
-        if tags is not None and not task_matches_tag_filters(task_tags=owner_task.tags, tag_filters=tags, any_tag=any_tag):
-            return False
-        if not reason_filter:
-            return True
-        return candidate is not None and candidate.reason_class in reason_filter
-
     def _matches_tag_only(owner_task: DbTask) -> bool:
         if tags is None:
             return True
         return task_matches_tag_filters(task_tags=owner_task.tags, tag_filters=tags, any_tag=any_tag)
+
+    def _matches_reason_only(candidate: ParkedTaskCandidate | None) -> bool:
+        if not reason_filter:
+            return True
+        return candidate is not None and candidate.reason_class in reason_filter
+
+    def _matches_filters(owner_task: DbTask, candidate: ParkedTaskCandidate | None) -> bool:
+        return _matches_tag_only(owner_task) and _matches_reason_only(candidate)
+
+    def _selection_mismatch_detail(owner_task: DbTask, owner_candidates: Sequence[ParkedTaskCandidate]) -> str | None:
+        if not owner_candidates:
+            return None
+        tag_matches = _matches_tag_only(owner_task)
+        reason_matches = any(_matches_reason_only(candidate) for candidate in owner_candidates)
+        if tags is not None and not tag_matches and reason_filter and not reason_matches:
+            return "does not match requested tag or reason"
+        if tags is not None and not tag_matches:
+            return "does not match requested tag"
+        if reason_filter and not reason_matches:
+            return "does not match requested reason"
+        return None
 
     def _append(
         owner_task: DbTask,
@@ -285,13 +299,15 @@ def _select_targets(
             owner_task = _resolve_owner_task_for_selection(store, candidates=candidates, task_id=task_id)
             if owner_task is None or owner_task.id is None:
                 continue
-            matching_candidates = [candidate for candidate in by_owner_id.get(owner_task.id, ()) if _matches_filters(owner_task, candidate)]
+            owner_candidates = by_owner_id.get(owner_task.id, ())
+            matching_candidates = [candidate for candidate in owner_candidates if _matches_filters(owner_task, candidate)]
             if matching_candidates:
                 for candidate in matching_candidates:
                     _append(owner_task, candidate)
                 continue
-            if reason_filter and by_owner_id.get(owner_task.id):
-                _append(owner_task, None, selection_detail="does not match requested reason")
+            mismatch_detail = _selection_mismatch_detail(owner_task, owner_candidates)
+            if mismatch_detail is not None:
+                _append(owner_task, None, selection_detail=mismatch_detail)
                 continue
             if _matches_tag_only(owner_task):
                 _append(owner_task, None)

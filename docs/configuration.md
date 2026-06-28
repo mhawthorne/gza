@@ -1857,10 +1857,15 @@ For `retry-limit`, a fresh `retry-limit` clear records one durable manual rearm 
 
 `unstick` also reports selector-visible skips when an owner is not currently parked or when merge proof cannot show the branch is still unresolved. Current operator-visible skip reasons include:
 - `already merged`
+- `does not match requested reason`
+- `does not match requested tag`
+- `does not match requested tag or reason`
 - `terminal empty`
 - `terminal redundant`
 - `missing branch cannot prove unresolved`
 - `not currently parked`
+
+For explicit `task_id` selections combined with `--tag` and/or `--reason`, `unstick` preserves the narrowing selector detail in skip output instead of collapsing every mismatch into a generic reason failure.
 
 ### main-verify
 

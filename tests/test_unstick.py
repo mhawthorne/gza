@@ -417,6 +417,43 @@ def test_select_and_clear_parked_tasks_reports_reason_mismatch_for_explicit_park
     assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
 
 
+def test_select_and_clear_parked_tasks_reports_tag_mismatch_when_reason_matches_explicit_parked_id(
+    tmp_path: Path,
+) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+
+    impl, _retry, owner_row = _make_retry_limit_owner(
+        store,
+        prompt="Retry limit tag mismatch",
+        branch="feature/retry-limit-tag-mismatch",
+    )
+    assert impl.id is not None
+    impl.tags = ("ops",)
+    store.update(impl)
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(impl.id,),
+            tags=("missing",),
+            reason_classes=("retry-limit",),
+        )
+
+    assert [(outcome.status, outcome.detail) for outcome in result.outcomes] == [
+        ("skipped", "does not match requested tag"),
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=owner_row.next_action["subject_task_id"],
+        attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
+    )
+    assert rearm is None
+
+
 def test_select_and_clear_parked_tasks_finds_and_rearms_real_retry_limit_owner_row(tmp_path: Path) -> None:
     setup_config(tmp_path)
     (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 1\n")

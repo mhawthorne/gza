@@ -1232,8 +1232,11 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "With `--run`, the command still clears first, then reuses the same scoped watch dispatch helper" in unstick_section
     assert "If no shared worker slots are available, `unstick --run` still clears the parked state and reports `0 started`" in unstick_section
     assert "fresh `retry-limit` clear records one durable manual rearm epoch" in unstick_section
+    assert "does not match requested tag" in unstick_section
+    assert "does not match requested tag or reason" in unstick_section
     assert "not currently parked" in unstick_section
     assert "missing branch cannot prove unresolved" in unstick_section
+    assert "preserves the narrowing selector detail in skip output" in unstick_section
     assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in config_content
     assert "Only list pending tasks matching tag filters by default" in config_content
     assert "Only list recovery, lifecycle, and pending lanes matching tag filters" not in config_content
