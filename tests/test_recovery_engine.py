@@ -236,6 +236,11 @@ def _stub_merge_context(
     )
 
 
+_REAL_LOAD_MERGE_CONTEXT = recovery_engine._load_merge_context
+_REAL_CONFIG = recovery_engine.Config
+_REAL_GIT = recovery_engine.Git
+
+
 def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
     depends_on = None
     based_on = None
@@ -900,6 +905,9 @@ def test_list_failed_tasks_for_recovery_warns_once_when_local_branch_batch_probe
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _REAL_LOAD_MERGE_CONTEXT)
+    monkeypatch.setattr(recovery_engine, "Config", _REAL_CONFIG)
+
     class _BranchListFailureGit:
         def __init__(self, project_dir: Path) -> None:
             self.project_dir = project_dir
@@ -950,6 +958,9 @@ def test_load_merge_context_warning_says_metadata_based_lineage_suppression_may_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(recovery_engine, "_load_merge_context", _REAL_LOAD_MERGE_CONTEXT)
+    monkeypatch.setattr(recovery_engine, "Config", _REAL_CONFIG)
+    monkeypatch.setattr(recovery_engine, "Git", _REAL_GIT)
     monkeypatch.setattr(
         recovery_engine.Config,
         "load",
