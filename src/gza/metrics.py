@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 import time
@@ -56,6 +57,60 @@ def _metric_key(name: str, labels: LabelMap | None) -> MetricKey:
     if not labels:
         return MetricKey(name=name)
     return MetricKey(name=name, labels=tuple(sorted(labels.items())))
+
+
+def _wrap_latency_callable(
+    func,
+    *,
+    metric_name: str,
+    labels: LabelMap,
+):
+    if getattr(func, "__gza_latency_instrumented__", False):
+        return func
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        if not enabled():
+            return func(*args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            observe_latency(metric_name, time.perf_counter() - started, labels=labels)
+
+    setattr(wrapped, "__gza_latency_instrumented__", True)
+    return wrapped
+
+
+def instrument_public_methods(metric_name: str, *, label_key: str = "method"):
+    """Class decorator that times public methods defined directly on a class."""
+
+    def decorate(cls):
+        for name, value in tuple(vars(cls).items()):
+            if name.startswith("_"):
+                continue
+
+            labels = {label_key: name}
+            if isinstance(value, classmethod):
+                setattr(
+                    cls,
+                    name,
+                    classmethod(_wrap_latency_callable(value.__func__, metric_name=metric_name, labels=labels)),
+                )
+                continue
+            if isinstance(value, staticmethod):
+                setattr(
+                    cls,
+                    name,
+                    staticmethod(_wrap_latency_callable(value.__func__, metric_name=metric_name, labels=labels)),
+                )
+                continue
+            if isinstance(value, property) or not callable(value):
+                continue
+            setattr(cls, name, _wrap_latency_callable(value, metric_name=metric_name, labels=labels))
+        return cls
+
+    return decorate
 
 
 def incr(name: str, *, labels: LabelMap | None = None, value: int = 1) -> None:

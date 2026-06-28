@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 from gza.artifact_paths import normalize_artifact_path
+from gza.metrics import instrument_public_methods
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
 logger = logging.getLogger(__name__)
@@ -3399,6 +3400,7 @@ def _project_identity_from_config(config: "Config") -> tuple[str, str]:
     return project_id, project_prefix
 
 
+@instrument_public_methods("gza_db_method_latency_seconds")
 class SqliteTaskStore:
     """SQLite-based task storage."""
 
