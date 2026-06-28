@@ -3145,7 +3145,7 @@ class TestReviewContextFromChain:
         assert "## Verify Timeout Guidance" not in context
 
     def test_improve_context_includes_unresolved_comments(self, tmp_path: Path):
-        """Comments remain atomic improve context even when review prose is unstructured."""
+        """Unstructured review prose should fail closed and keep comments outside the atomic set."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3176,17 +3176,22 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
-        assert "## Atomic Blocker Set" in context
-        assert "## Comments:" not in context
-        assert "source=direct; created_at=" in context
-        assert "author=alice" in context
-        assert "summary=Please harden input validation." in context
+        assert "## Atomic Blocker Set" not in context
+        assert "## Structured Review Parse Warning" in context
+        assert "Fail closed: do not treat any comments or summaries in this prompt as the complete closure set." in context
+        assert "Use the raw `## Review feedback to address:` section below as the authoritative review input" in context
+        assert "## Comments:" in context
+        assert "#1 (" in context
+        assert "source=direct, author=alice" in context
+        assert "Please harden input validation." in context
+        assert "## Review feedback to address:" in context
+        assert "Requested changes" in context
         assert "Scope note only" not in context
 
     def test_improve_context_renders_atomic_blocker_set_for_comments_when_review_has_no_parsed_blockers(
         self, tmp_path: Path
     ):
-        """Structured review context should keep comments in the atomic set even without parsed blockers."""
+        """CHANGES_REQUESTED reviews with unstructured blockers must fail closed before raw review."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3228,13 +3233,12 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
-        atomic_index = context.index("## Atomic Blocker Set")
-        raw_review_index = context.index("## Review feedback to address:")
-
-        assert atomic_index < raw_review_index
-        assert "feedback #" in context
-        assert "summary=Please harden input validation." in context
-        assert "## Comments:" not in context
+        assert "## Atomic Blocker Set" not in context
+        assert "## Structured Review Parse Warning" in context
+        assert "## Comments:" in context
+        assert "## Review feedback to address:" in context
+        assert "Fail closed: do not treat any comments or summaries in this prompt as the complete closure set." in context
+        assert "Please harden input validation." in context
         assert "## Blockers\n\n- Comments below remain open." in context
 
     def test_improve_context_excludes_comments_added_after_improve_creation(self, tmp_path: Path):
@@ -3267,7 +3271,7 @@ class TestReviewContextFromChain:
         assert "Comment added after improve creation" not in context
 
     def test_improve_retry_context_reads_comments_from_implementation_ancestor(self, tmp_path: Path):
-        """Retry/resume improves should still include unresolved comments from the root implementation."""
+        """Retry/resume improves should still read implementation comments, but fail closed on unstructured reviews."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3306,9 +3310,10 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_retry, store, tmp_path, git=None)
 
-        assert "## Atomic Blocker Set" in context
-        assert "## Comments:" not in context
-        assert "summary=Please keep this in retry context." in context
+        assert "## Atomic Blocker Set" not in context
+        assert "## Structured Review Parse Warning" in context
+        assert "## Comments:" in context
+        assert "Please keep this in retry context." in context
         assert "Comment on improve task should not be used." not in context
 
     def test_followup_implement_context_includes_parent_finding_details(self, tmp_path: Path):

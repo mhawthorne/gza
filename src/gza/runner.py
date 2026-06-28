@@ -4619,7 +4619,7 @@ def _render_atomic_blocker_set(
     """Render the compact improve blocker set when structured feedback is available."""
     parsed_review = parse_review_report(review_content)
     blockers = [finding for finding in parsed_review.findings if finding.severity == "BLOCKER"]
-    if not blockers and not unresolved_comments:
+    if not blockers:
         return None
 
     lines = [
@@ -4659,6 +4659,25 @@ def _render_atomic_blocker_set(
         )
 
     return "\n".join(lines)
+
+
+def _render_improve_review_parse_warning(review_task: Task) -> str:
+    """Render fail-closed guidance when a review cannot produce a complete blocker set."""
+    return "\n".join(
+        [
+            "## Structured Review Parse Warning",
+            "",
+            (
+                "The latest review could not be parsed into a complete structured blocker set. "
+                "Fail closed: do not treat any comments or summaries in this prompt as the complete closure set."
+            ),
+            (
+                "Use the raw `## Review feedback to address:` section below as the authoritative review input for this pass, "
+                "and close or explicitly dispute every blocking item described there before reporting completion."
+            ),
+            f"Review task: {review_task.id or 'unknown'}",
+        ]
+    )
 
 
 def _build_context_from_chain(
@@ -4752,6 +4771,9 @@ def _build_context_from_chain(
                         context_parts.append(atomic_blocker_set)
                         context_parts.append("")
                         rendered_atomic_blocker_set = True
+                    elif unresolved_comments:
+                        context_parts.append(_render_improve_review_parse_warning(review_task))
+                        context_parts.append("")
 
                 if unresolved_comments and not rendered_atomic_blocker_set:
                     context_parts.append("## Comments:\n")
