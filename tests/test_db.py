@@ -10494,6 +10494,53 @@ class TestSharedDbIsolationAndImportGating:
             for warning in query_store.startup_warnings()
         )
 
+    def test_query_only_open_v58_parked_task_rearms_reads_manual_state_without_v59_auto_fields(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        manual = store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="retry-limit-reached",
+            subject_task_id="gza-100",
+        )
+        assert manual is not None
+
+        for column in ("attempt_count", "last_attempt_at", "last_attempt_target_sha"):
+            _drop_table_column(db_path, "parked_task_rearms", column)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 58")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            supported = query_store.supports_parked_task_rearms()
+            rearm = query_store.get_parked_task_rearm(
+                subject_kind="task",
+                subject_id="gza-100",
+                attention_reason="retry-limit-reached",
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert supported is True
+        assert rearm == ParkedTaskRearmState(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="retry-limit-reached",
+            subject_task_id="gza-100",
+            manual_rearm_epoch=1,
+            manual_rearmed_at=manual.manual_rearmed_at,
+            attempt_count=0,
+            last_attempt_at=None,
+            last_attempt_target_sha=None,
+        )
+        assert not any("parked_task_rearms" in warning for warning in query_store.startup_warnings())
+
     def test_query_only_open_pre_v43_db_missing_changed_diff_reads_with_null(
         self, tmp_path: Path
     ) -> None:

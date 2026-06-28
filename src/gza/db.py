@@ -1885,9 +1885,6 @@ _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS: tuple[str, ...] = (
     "subject_task_id",
     "manual_rearm_epoch",
     "manual_rearmed_at",
-    "attempt_count",
-    "last_attempt_at",
-    "last_attempt_target_sha",
 )
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
@@ -5443,6 +5440,7 @@ class SqliteTaskStore:
     def _row_to_parked_task_rearm(self, row: sqlite3.Row | None) -> ParkedTaskRearmState | None:
         if row is None:
             return None
+        row_keys = row.keys()
         return ParkedTaskRearmState(
             subject_kind=str(row["subject_kind"]),
             subject_id=str(row["subject_id"]),
@@ -5450,10 +5448,16 @@ class SqliteTaskStore:
             subject_task_id=str(row["subject_task_id"]) if row["subject_task_id"] is not None else None,
             manual_rearm_epoch=int(row["manual_rearm_epoch"]) if row["manual_rearm_epoch"] is not None else 0,
             manual_rearmed_at=_parse_db_timestamp(row["manual_rearmed_at"]),
-            attempt_count=int(row["attempt_count"]) if row["attempt_count"] is not None else 0,
-            last_attempt_at=_parse_db_timestamp(row["last_attempt_at"]),
+            attempt_count=(
+                int(row["attempt_count"])
+                if "attempt_count" in row_keys and row["attempt_count"] is not None
+                else 0
+            ),
+            last_attempt_at=_parse_db_timestamp(row["last_attempt_at"] if "last_attempt_at" in row_keys else None),
             last_attempt_target_sha=(
-                str(row["last_attempt_target_sha"]) if row["last_attempt_target_sha"] is not None else None
+                str(row["last_attempt_target_sha"])
+                if "last_attempt_target_sha" in row_keys and row["last_attempt_target_sha"] is not None
+                else None
             ),
         )
 
