@@ -4668,6 +4668,21 @@ class TestFailureReasonTracking:
         assert retrieved is not None
         assert retrieved.failure_reason == "MAX_TURNS"
 
+    def test_drop_reason_persisted_through_update(self, tmp_path: Path):
+        """drop_reason is correctly persisted through the update method."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Dropped task")
+        task.status = "dropped"
+        task.completed_at = datetime.now(UTC)
+        task.drop_reason = "Superseded by follow-up"
+        store.update(task)
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.drop_reason == "Superseded by follow-up"
+
     def test_migration_v10_to_v11_adds_failure_reason_column(self, tmp_path: Path):
         """Migration from v10 to v11 adds failure_reason column and backfills failed tasks."""
         import sqlite3
@@ -4845,6 +4860,129 @@ class TestFailureReasonTracking:
 
         assert "completion_reason" in columns
         assert version == SCHEMA_VERSION
+
+    def test_migration_v59_to_v60_adds_drop_reason_column_without_backfilling(
+        self, tmp_path: Path
+    ) -> None:
+        """Migration from v59 to v60 adds drop_reason while preserving historical NULLs."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (59)")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                project_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT NOT NULL DEFAULT 'implement',
+                slug TEXT,
+                branch TEXT,
+                log_file TEXT,
+                report_file TEXT,
+                based_on TEXT,
+                has_commits INTEGER,
+                duration_seconds REAL,
+                num_steps_reported INTEGER,
+                num_steps_computed INTEGER,
+                num_turns INTEGER,
+                num_turns_reported INTEGER,
+                num_turns_computed INTEGER,
+                attach_count INTEGER,
+                attach_duration_seconds REAL,
+                cost_usd REAL,
+                created_at TEXT NOT NULL,
+                last_edited_at TEXT,
+                started_at TEXT,
+                running_pid INTEGER,
+                completed_at TEXT,
+                "group" TEXT,
+                depends_on TEXT,
+                spec TEXT,
+                review_scope TEXT,
+                create_review INTEGER DEFAULT 0,
+                auto_implement INTEGER DEFAULT 1,
+                create_pr INTEGER DEFAULT 0,
+                same_branch INTEGER DEFAULT 0,
+                task_type_hint TEXT,
+                output_content TEXT,
+                session_id TEXT,
+                pr_number INTEGER,
+                pr_state TEXT,
+                pr_last_synced_at TEXT,
+                sync_last_synced_at TEXT,
+                model TEXT,
+                provider TEXT,
+                provider_is_explicit INTEGER DEFAULT 0,
+                model_is_explicit INTEGER DEFAULT 0,
+                urgent INTEGER DEFAULT 0,
+                urgent_bumped_at TEXT,
+                queue_position INTEGER,
+                recovery_origin TEXT,
+                trigger_source TEXT,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                merge_status TEXT,
+                merged_at TEXT,
+                failure_reason TEXT,
+                completion_reason TEXT,
+                skip_learnings INTEGER DEFAULT 0,
+                diff_files_changed INTEGER,
+                diff_lines_added INTEGER,
+                diff_lines_removed INTEGER,
+                changed_diff INTEGER,
+                review_cleared_at TEXT,
+                review_score INTEGER,
+                review_verify_command TEXT,
+                review_verify_status TEXT,
+                review_verify_exit_status TEXT,
+                review_verify_failure TEXT,
+                review_verify_captured_at TEXT,
+                review_verify_head_sha TEXT,
+                review_verify_base_sha TEXT,
+                review_verify_branch TEXT,
+                review_verify_markdown TEXT,
+                review_verify_cwd TEXT,
+                review_verify_artifact_file TEXT,
+                log_schema_version INTEGER DEFAULT 1,
+                execution_mode TEXT,
+                base_branch TEXT,
+                PRIMARY KEY(project_id, id)
+            )
+            """
+        )
+        now = datetime.now(UTC).isoformat()
+        conn.execute(
+            """
+            INSERT INTO tasks (project_id, id, prompt, status, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("default", "gza-1", "Historical dropped task", "dropped", now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        store = SqliteTaskStore(db_path)
+        retrieved = store.get("gza-1")
+        assert retrieved is not None
+        assert retrieved.status == "dropped"
+        assert retrieved.drop_reason is None
+
+        with sqlite3.connect(db_path) as conn2:
+            columns = {row[1] for row in conn2.execute("PRAGMA table_info(tasks)").fetchall()}
+            version = conn2.execute("SELECT version FROM schema_version").fetchone()[0]
+            stored_reason = conn2.execute(
+                "SELECT drop_reason FROM tasks WHERE project_id = ? AND id = ?",
+                ("default", "gza-1"),
+            ).fetchone()
+
+        assert "drop_reason" in columns
+        assert version == SCHEMA_VERSION
+        assert stored_reason is not None
+        assert stored_reason[0] is None
 
     def test_migration_v40_to_v41_adds_recovery_origin_column(self, tmp_path: Path):
         """Migration from v40 to v41 adds recovery_origin column."""

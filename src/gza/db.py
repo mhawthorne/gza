@@ -513,6 +513,7 @@ class Task:
     merged_at: datetime | None = None  # When merge_status was set to 'merged'
     failure_reason: str | None = None
     completion_reason: str | None = None
+    drop_reason: str | None = None
     skip_learnings: bool = False
     diff_files_changed: int | None = None  # Files changed vs. main (v13)
     diff_lines_added: int | None = None    # Lines added vs. main (v13)
@@ -1156,8 +1157,13 @@ ALTER TABLE parked_task_rearms ADD COLUMN last_auto_attempt_at TEXT;
 ALTER TABLE parked_task_rearms ADD COLUMN last_auto_attempt_target_sha TEXT;
 """
 
+# Migration from v59 to v60: persist dropped-task operator reason
+MIGRATION_V59_TO_V60 = """
+ALTER TABLE tasks ADD COLUMN drop_reason TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 59
+SCHEMA_VERSION = 60
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1469,6 +1475,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 merged_at TEXT,
                 failure_reason TEXT,
                 completion_reason TEXT,
+                drop_reason TEXT,
                 skip_learnings INTEGER DEFAULT 0,
                 diff_files_changed INTEGER,
                 diff_lines_added INTEGER,
@@ -1578,7 +1585,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "last_edited_at", "started_at", "running_pid", "completed_at",
             "group", "depends_on", "spec", "review_scope", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
             "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
-            "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
+            "merge_status", "merged_at", "failure_reason", "completion_reason", "drop_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
             "changed_diff",
             "review_cleared_at", "review_score",
             "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
@@ -1626,7 +1633,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                     attach_count, attach_duration_seconds, cost_usd, created_at, last_edited_at, started_at, running_pid, completed_at,
                     "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                     pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, model_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
-                    merge_status, merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
+                    merge_status, merged_at, failure_reason, completion_reason, drop_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
                 changed_diff, review_cleared_at, review_score,
                 review_verify_command, review_verify_status, review_verify_exit_status, review_verify_failure,
                 review_verify_captured_at, review_verify_head_sha, review_verify_base_sha, review_verify_branch,
@@ -1948,7 +1955,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2277,6 +2284,11 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                     "Auto-migration to v59 incomplete: missing required column "
                     f"parked_task_rearms.{column}"
                 )
+    if target_version >= 60:
+        if not _table_has_column(conn, "tasks", "drop_reason"):
+            raise RuntimeError(
+                "Auto-migration to v60 incomplete: missing required column tasks.drop_reason"
+            )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -2795,6 +2807,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     merged_at TEXT,
     failure_reason TEXT,
     completion_reason TEXT,
+    drop_reason TEXT,
     skip_learnings INTEGER DEFAULT 0,
     diff_files_changed INTEGER,
     diff_lines_added INTEGER,
@@ -3271,6 +3284,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (57, MIGRATION_V56_TO_V57),
     (58, MIGRATION_V57_TO_V58),
     (59, MIGRATION_V58_TO_V59),
+    (60, MIGRATION_V59_TO_V60),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3744,6 +3758,11 @@ class SqliteTaskStore:
                 "Query-only DB open detected missing optional column tasks.completion_reason; "
                 "completion metadata will be unavailable."
             )
+        if not self._query_only_has_column("tasks", "drop_reason"):
+            self._startup_warnings.append(
+                "Query-only DB open detected missing optional column tasks.drop_reason; "
+                "dropped-task reason metadata will be unavailable."
+            )
         if not self._query_only_has_column("tasks", "changed_diff"):
             self._startup_warnings.append(
                 "Query-only DB open detected missing optional column tasks.changed_diff; "
@@ -4142,6 +4161,7 @@ class SqliteTaskStore:
             merged_at=_parse_db_timestamp(row["merged_at"]) if "merged_at" in keys else None,
             failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
             completion_reason=row["completion_reason"] if "completion_reason" in keys else None,
+            drop_reason=row["drop_reason"] if "drop_reason" in keys else None,
             skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in keys and row["skip_learnings"] is not None else False,
             diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in keys else None,
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in keys else None,
@@ -4573,6 +4593,7 @@ class SqliteTaskStore:
                     merged_at = ?,
                     failure_reason = ?,
                     completion_reason = ?,
+                    drop_reason = ?,
                     skip_learnings = ?,
                     diff_files_changed = ?,
                     diff_lines_added = ?,
@@ -4647,6 +4668,7 @@ class SqliteTaskStore:
                     _format_db_timestamp(task.merged_at),
                     task.failure_reason,
                     task.completion_reason,
+                    task.drop_reason,
                     1 if task.skip_learnings else 0,
                     task.diff_files_changed,
                     task.diff_lines_added,
@@ -8342,6 +8364,7 @@ class SqliteTaskStore:
         task.running_pid = None
         task.failure_reason = None
         task.completion_reason = completion_reason
+        task.drop_reason = None
         task.has_commits = has_commits
         if has_commits:
             task.merge_status = "unmerged" if task_owns_merge_status(task) else None
@@ -8445,6 +8468,7 @@ class SqliteTaskStore:
             task.output_tokens = stats.output_tokens
         task.failure_reason = failure_reason if failure_reason is not None else "UNKNOWN"
         task.completion_reason = None
+        task.drop_reason = None
         self.update(task)
         if has_commits and task.branch and task.id is not None and self.supports_merge_units():
             unit = self.get_or_create_merge_unit_for_task(task)
@@ -8471,6 +8495,7 @@ class SqliteTaskStore:
         task.has_commits = has_commits
         task.failure_reason = None
         task.completion_reason = None
+        task.drop_reason = None
         if branch:
             task.branch = branch
         if log_file:
@@ -8839,7 +8864,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
         "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
         "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
-        "merge_status", "merged_at", "failure_reason", "completion_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
+        "merge_status", "merged_at", "failure_reason", "completion_reason", "drop_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
         "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score",
         "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
         "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
@@ -8856,6 +8881,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "sync_last_synced_at": "NULL",
         "last_edited_at": "NULL",
         "completion_reason": "NULL",
+        "drop_reason": "NULL",
         "changed_diff": "NULL",
         "recovery_origin": "NULL",
         "trigger_source": "NULL",
@@ -9454,6 +9480,7 @@ def _task_to_dict(task: "Task") -> dict:
         "merge_status": task.merge_status,
         "failure_reason": task.failure_reason,
         "completion_reason": task.completion_reason,
+        "drop_reason": task.drop_reason,
         "skip_learnings": task.skip_learnings,
         "diff_files_changed": task.diff_files_changed,
         "diff_lines_added": task.diff_lines_added,
@@ -9754,6 +9781,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 merged_at TEXT,
                 failure_reason TEXT,
                 completion_reason TEXT,
+                drop_reason TEXT,
                 skip_learnings INTEGER DEFAULT 0,
                 diff_files_changed INTEGER,
                 diff_lines_added INTEGER,
@@ -9786,12 +9814,12 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     "group", depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint,
                     output_content, session_id, pr_number, model, provider, provider_is_explicit, recovery_origin,
                     trigger_source,
-                    input_tokens, output_tokens, merge_status, merged_at, failure_reason, completion_reason,
+                    input_tokens, output_tokens, merge_status, merged_at, failure_reason, completion_reason, drop_reason,
                     skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed, changed_diff,
                     review_cleared_at, log_schema_version, cycle_id, cycle_iteration_index,
                     cycle_role
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
                 """,
                 (
@@ -9830,6 +9858,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     row["merged_at"] if "merged_at" in row.keys() else None,
                     row["failure_reason"] if "failure_reason" in row.keys() else None,
                     row["completion_reason"] if "completion_reason" in row.keys() else None,
+                    row["drop_reason"] if "drop_reason" in row.keys() else None,
                     row["skip_learnings"] if "skip_learnings" in row.keys() else 0,
                     row["diff_files_changed"] if "diff_files_changed" in row.keys() else None,
                     row["diff_lines_added"] if "diff_lines_added" in row.keys() else None,
@@ -10339,6 +10368,7 @@ def run_v27_migration(db_path: Path) -> None:
                 merged_at TEXT,
                 failure_reason TEXT,
                 completion_reason TEXT,
+                drop_reason TEXT,
                 skip_learnings INTEGER DEFAULT 0,
                 diff_files_changed INTEGER,
                 diff_lines_added INTEGER,
@@ -10376,7 +10406,7 @@ def run_v27_migration(db_path: Path) -> None:
                 depends_on, spec, create_review, auto_implement, create_pr, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, recovery_origin, trigger_source, input_tokens, output_tokens, merge_status,
-                merged_at, failure_reason, completion_reason, skip_learnings, diff_files_changed,
+                merged_at, failure_reason, completion_reason, drop_reason, skip_learnings, diff_files_changed,
                 diff_lines_added, diff_lines_removed, changed_diff, review_cleared_at, log_schema_version
             )
             SELECT
@@ -10388,7 +10418,7 @@ def run_v27_migration(db_path: Path) -> None:
                 depends_on, spec, create_review, {legacy_auto_implement_expr}, {legacy_create_pr_expr}, same_branch, task_type_hint,
                 output_content, session_id, pr_number, model, provider,
                 provider_is_explicit, NULL AS recovery_origin, NULL AS trigger_source, input_tokens, output_tokens, merge_status,
-                merged_at, failure_reason, NULL AS completion_reason, skip_learnings, diff_files_changed,
+                merged_at, failure_reason, NULL AS completion_reason, NULL AS drop_reason, skip_learnings, diff_files_changed,
                 diff_lines_added, diff_lines_removed, NULL AS changed_diff, review_cleared_at, log_schema_version
             FROM tasks
         """)

@@ -264,6 +264,7 @@ _PROJECTION_PRESET_FIELDS: dict[str, tuple[str, ...]] = {
         "stats",
         "completion_reason",
         "failure_reason",
+        "drop_reason",
     ),
 }
 

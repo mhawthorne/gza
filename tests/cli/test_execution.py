@@ -20375,26 +20375,128 @@ class TestSetStatusCommand:
         assert result.returncode == 2
         assert "unrecognized arguments: --execution-mode skill_inline" in result.stderr
 
-    def test_set_status_reason_warns_for_statuses_without_reason_support(self, tmp_path: Path):
-        """set-status warns when --reason is used outside failed transitions."""
+    def test_set_status_dropped_with_reason_persists_drop_reason(self, tmp_path: Path):
+        """set-status should persist a drop reason for dropped tasks."""
         setup_db_with_tasks(tmp_path, [
             {"prompt": "A task", "status": "in_progress"},
         ])
 
-        store = make_store(tmp_path)
-        task = store.get_all()[0]
+        task = make_store(tmp_path).get_all()[0]
         result = invoke_gza(
-            "set-status", str(task.id), "dropped", "--reason", "Ignored reason", "--project", str(tmp_path)
+            "set-status",
+            str(task.id),
+            "dropped",
+            "--reason",
+            "Superseded by follow-up fix",
+            "--project",
+            str(tmp_path),
         )
 
         assert result.returncode == 0
-        assert "Warning" in result.stdout or "warning" in result.stdout.lower()
-        assert "--reason is only meaningful for 'failed' status" in result.stdout
+        assert "Warning" not in result.stdout
 
         updated = make_store(tmp_path).get(task.id)
         assert updated is not None
+        assert updated.status == "dropped"
         assert updated.failure_reason is None
         assert updated.completion_reason is None
+        assert updated.drop_reason == "Superseded by follow-up fix"
+
+    def test_set_status_dropped_without_reason_leaves_drop_reason_null(self, tmp_path: Path) -> None:
+        """set-status dropped without --reason should leave drop_reason unset."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "in_progress"},
+        ])
+
+        task = make_store(tmp_path).get_all()[0]
+        result = invoke_gza("set-status", str(task.id), "dropped", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == "dropped"
+        assert updated.drop_reason is None
+
+    def test_set_status_dropped_preserves_failure_reason_and_persists_drop_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """Dropping a failed task should preserve failure_reason and store drop_reason."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "failed"},
+        ])
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task.failure_reason = "TEST_FAILURE"
+        store.update(task)
+
+        result = invoke_gza(
+            "set-status",
+            str(task.id),
+            "dropped",
+            "--reason",
+            "Abandoned after triage",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == "dropped"
+        assert updated.failure_reason == "TEST_FAILURE"
+        assert updated.drop_reason == "Abandoned after triage"
+
+    def test_set_status_dropped_preserves_completion_reason_and_persists_drop_reason(
+        self, tmp_path: Path
+    ) -> None:
+        """Dropping a completed task should preserve completion_reason and store drop_reason."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "completed"},
+        ])
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task.completed_at = datetime.now(UTC)
+        task.completion_reason = "EXTRACTION_ALREADY_MERGED"
+        store.update(task)
+
+        result = invoke_gza(
+            "set-status",
+            str(task.id),
+            "dropped",
+            "--reason",
+            "Historical row is being abandoned",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+
+        updated = make_store(tmp_path).get(task.id)
+        assert updated is not None
+        assert updated.status == "dropped"
+        assert updated.completion_reason == "EXTRACTION_ALREADY_MERGED"
+        assert updated.drop_reason == "Historical row is being abandoned"
+
+    def test_show_renders_drop_reason(self, tmp_path: Path) -> None:
+        """gza show should surface persisted drop reasons."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "dropped"},
+        ])
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task.completed_at = datetime.now(UTC)
+        task.drop_reason = "Replaced by gza-3002"
+        store.update(task)
+
+        result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Drop Reason: Replaced by gza-3002" in result.stdout
 
     def test_set_status_reason_warns_for_pending_un_drop(self, tmp_path: Path) -> None:
         """set-status warns and ignores --reason when reviving a dropped task."""
@@ -20408,13 +20510,14 @@ class TestSetStatusCommand:
         )
 
         assert result.returncode == 0
-        assert "--reason is only meaningful for 'failed' status" in result.stdout
+        assert "--reason is only meaningful for 'failed' or 'dropped' status" in result.stdout
 
         updated = make_store(tmp_path).get(task.id)
         assert updated is not None
         assert updated.status == "pending"
         assert updated.failure_reason is None
         assert updated.completion_reason is None
+        assert updated.drop_reason is None
 
     def test_set_status_invalid_status_rejected(self, tmp_path: Path):
         """set-status rejects unknown status values."""
@@ -20438,6 +20541,7 @@ class TestSetStatusCommand:
         assert result.returncode == 0
         assert "Override a task's status for recovery or correction." in result.stdout
         assert "Allowed targets: failed, dropped (any source), pending (only from" in result.stdout
+        assert "Failure/drop reason for failed or dropped status" in result.stdout
         assert "gza mark-completed <id>" in result.stdout
         assert "gza retry <id>" in result.stdout
         assert "gza resume <id>" in result.stdout

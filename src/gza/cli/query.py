@@ -4374,6 +4374,8 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Failure Reason:[/{c['label']}] [{c['value']}]{task.failure_reason}[/{c['value']}]")
     if task.completion_reason:
         console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
+    if task.drop_reason:
+        console.print(f"[{c['label']}]Drop Reason:[/{c['label']}] [{c['value']}]{task.drop_reason}[/{c['value']}]")
     if task.task_type in {"rebase", "improve"}:
         console.print(
             f"[{c['label']}]Changed Diff:[/{c['label']}] "

@@ -34,13 +34,13 @@ def apply_manual_task_status(
         task.completed_at = None
         task.failure_reason = None
         task.completion_reason = None
+        task.drop_reason = None
         store.update(task)
         return
     if status == "dropped":
         task.status = status
         task.completed_at = datetime.now(UTC)
-        task.failure_reason = None
-        task.completion_reason = None
+        task.drop_reason = reason
         store.update(task)
         return
     raise ValueError(f"Unsupported manual task status: {status}")

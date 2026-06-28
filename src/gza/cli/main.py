@@ -3008,7 +3008,7 @@ def main() -> int:
     set_status_parser.add_argument(
         "--reason",
         default=None,
-        help="Failure reason for failed status; ignored with a warning for pending/dropped",
+        help="Failure/drop reason for failed or dropped status; ignored with a warning for pending",
     )
     add_common_args(set_status_parser)
 

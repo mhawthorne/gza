@@ -3172,9 +3172,9 @@ def cmd_set_status(args: argparse.Namespace) -> int:
             )
             return 1
 
-    if args.reason and args.status != "failed":
+    if args.reason and args.status not in {"failed", "dropped"}:
         print(
-            "Warning: --reason is only meaningful for 'failed' status "
+            "Warning: --reason is only meaningful for 'failed' or 'dropped' status "
             f"(current target: '{args.status}')"
         )
 
