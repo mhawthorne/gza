@@ -2922,7 +2922,8 @@ class TestReviewContextFromChain:
         assert "source=github; created_at=" in context
         assert "author=alice" in context
         assert "summary=Please keep the stale-review guard covered by a targeted regression." in context
-        assert "## Comments:" not in context
+        assert "## Comments:" in context
+        assert "Please keep the stale-review guard covered by a targeted regression." in context
         assert "### B1 verify_command failure: failed root resume attention regression" in context
         assert "### B2 Missing stale-review guard" in context
 
@@ -3236,11 +3237,127 @@ class TestReviewContextFromChain:
         assert "- feedback #1: source=direct; created_at=" in context
         assert "summary=Please harden input validation." in context
         assert "## Structured Review Parse Warning" not in context
-        assert "## Comments:" not in context
+        assert "## Comments:" in context
         assert "## Review feedback to address:" in context
         assert "Please harden input validation." in context
         assert "## Blockers\n\nNone." in context
         assert context.index("## Atomic Blocker Set") < context.index("## Review feedback to address:")
+
+    def test_improve_context_atomic_blocker_set_preserves_full_long_comment_body_with_blockers(
+        self, tmp_path: Path
+    ):
+        """Structured atomic context must preserve full long comment bodies alongside summaries."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Validation missing.\n\n"
+            "## Blockers\n\n"
+            "### B1 Missing input validation\n"
+            "Evidence: request path still accepts malformed IDs.\n"
+            "Open-state citation: `src/gza/api.py:14`\n"
+            "Impact: malformed requests still crash.\n"
+            "Required fix: validate IDs before parsing.\n"
+            "Required tests: add malformed-ID regression coverage.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        long_comment = (
+            "Please preserve the structured improve evidence trail across the long multi-line comment body so "
+            "the worker still sees every instruction before editing.\n"
+            "Unique tail: KEEP-ATOMIC-COMMENT-TAIL-XYZ."
+        )
+        store.add_comment(
+            impl_task.id,
+            long_comment,
+            source="github",
+            author="alice",
+        )
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Atomic Blocker Set" in context
+        assert "summary=Please preserve the structured improve evidence trail across the long multi-line comment body" in context
+        assert "## Comments:" in context
+        assert "Unique tail: KEEP-ATOMIC-COMMENT-TAIL-XYZ." in context
+        assert context.index("## Atomic Blocker Set") < context.index("## Comments:")
+        assert context.index("## Comments:") < context.index("## Review feedback to address:")
+
+    def test_improve_context_atomic_blocker_set_preserves_full_long_comment_body_without_blockers(
+        self, tmp_path: Path
+    ):
+        """Parseable zero-blocker reviews must still keep full long comment bodies in context."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add(prompt="Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        review_task = store.add(
+            prompt="Review feature",
+            task_type="review",
+            depends_on=impl_task.id,
+        )
+        review_task.status = "completed"
+        review_task.output_content = (
+            "## Summary\n\n- Follow the unresolved comments.\n\n"
+            "## Blockers\n\nNone.\n\n"
+            "## Follow-Ups\n\nNone.\n\n"
+            "## Questions / Assumptions\n\nNone.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        )
+        store.update(review_task)
+
+        long_comment = (
+            "Please keep every operator-visible note in the comment body even when the review contributes no "
+            "parsed blockers and the atomic summary is available.\n"
+            "Unique tail: KEEP-COMMENTS-ONLY-TAIL-XYZ."
+        )
+        store.add_comment(
+            impl_task.id,
+            long_comment,
+            source="direct",
+            author="alice",
+        )
+
+        improve_task = store.add(
+            prompt="Improve feature",
+            task_type="improve",
+            based_on=impl_task.id,
+            depends_on=review_task.id,
+        )
+
+        context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
+
+        assert "## Atomic Blocker Set" in context
+        assert "summary=Please keep every operator-visible note in the comment body even when the review contributes no parsed blockers" in context
+        assert "## Comments:" in context
+        assert "Unique tail: KEEP-COMMENTS-ONLY-TAIL-XYZ." in context
+        assert context.index("## Atomic Blocker Set") < context.index("## Comments:")
+        assert context.index("## Comments:") < context.index("## Review feedback to address:")
 
     def test_improve_context_fails_closed_for_malformed_blocker_prose_with_comments(
         self, tmp_path: Path

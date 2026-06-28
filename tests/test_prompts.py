@@ -1164,6 +1164,7 @@ class TestPromptBuilderImproveTask:
         assert "persisted `verify_command_output` artifact reference" in template
         assert "inspect that captured stdout/stderr before rerunning the full command" in template
         assert "SIGTERM-triggered stack dumps" in template
+        assert "their full bodies may appear under `## Comments:` and/or be summarized in `## Atomic Blocker Set`" in template
 
 
 class TestPromptBuilderReviewTask:

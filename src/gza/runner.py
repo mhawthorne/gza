@@ -4670,6 +4670,23 @@ def _render_atomic_blocker_set(
     return "\n".join(lines)
 
 
+def _render_improve_comments_section(unresolved_comments: list[TaskComment]) -> list[str]:
+    """Render unresolved improve feedback comments with full comment bodies."""
+    if not unresolved_comments:
+        return []
+
+    lines = ["## Comments:\n"]
+    for comment in unresolved_comments:
+        source_author = f"source={comment.source}"
+        if comment.author:
+            source_author += f", author={comment.author}"
+        lines.append(
+            f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
+        )
+        lines.append(comment.content)
+    return lines
+
+
 def _render_improve_review_parse_warning(review_task: Task) -> str:
     """Render fail-closed guidance when a review cannot produce a complete blocker set."""
     return "\n".join(
@@ -4762,8 +4779,6 @@ def _build_context_from_chain(
                 kinds=(TASK_COMMENT_KIND_FEEDBACK,),
             )
 
-        rendered_atomic_blocker_set = False
-
         # Get the review we're addressing
         if task.depends_on:
             review_task = store.get(task.depends_on)
@@ -4779,21 +4794,14 @@ def _build_context_from_chain(
                     if atomic_blocker_set:
                         context_parts.append(atomic_blocker_set)
                         context_parts.append("")
-                        rendered_atomic_blocker_set = True
                     elif unresolved_comments:
                         context_parts.append(_render_improve_review_parse_warning(review_task))
                         context_parts.append("")
 
-                if unresolved_comments and not rendered_atomic_blocker_set:
-                    context_parts.append("## Comments:\n")
-                    for comment in unresolved_comments:
-                        source_author = f"source={comment.source}"
-                        if comment.author:
-                            source_author += f", author={comment.author}"
-                        context_parts.append(
-                            f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
-                        )
-                        context_parts.append(comment.content)
+                if unresolved_comments:
+                    context_parts.extend(
+                        _render_improve_comments_section(unresolved_comments)
+                    )
 
                 if review_content:
                     context_parts.append("## Review feedback to address:\n")
@@ -4832,25 +4840,9 @@ def _build_context_from_chain(
                         f"(review task {review_task.id} exists but content unavailable on this machine - flag as blocker)"
                     )
             elif unresolved_comments:
-                context_parts.append("## Comments:\n")
-                for comment in unresolved_comments:
-                    source_author = f"source={comment.source}"
-                    if comment.author:
-                        source_author += f", author={comment.author}"
-                    context_parts.append(
-                        f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
-                    )
-                    context_parts.append(comment.content)
+                context_parts.extend(_render_improve_comments_section(unresolved_comments))
         elif unresolved_comments:
-            context_parts.append("## Comments:\n")
-            for comment in unresolved_comments:
-                source_author = f"source={comment.source}"
-                if comment.author:
-                    source_author += f", author={comment.author}"
-                context_parts.append(
-                    f"- #{comment.id} ({comment.created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC, {source_author})"
-                )
-                context_parts.append(comment.content)
+            context_parts.extend(_render_improve_comments_section(unresolved_comments))
 
         if impl_ancestor is not None:
             plan_task = get_plan_for_task(store, impl_ancestor)

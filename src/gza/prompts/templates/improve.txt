@@ -3,7 +3,7 @@ This is an improve task. Your feedback context can come from two sources:
 - A completed review with **Must-Fix** items (blockers) and **Suggestions** (follow-ups).
 - Unresolved task **Comments** attached to the implementation.
 
-One or both of these sections may appear above. If a review is present, it will be under a `## Review feedback to address:` heading. If comments are present, they will be under a `## Comments:` heading. Treat whichever sections are present as the authoritative feedback for this pass. If no review section is present, comments alone are sufficient to drive this improve — you are not required to fabricate Must-Fix structure when the feedback source is comments only.
+One or both of these sections may appear above. If a review is present, it will be under a `## Review feedback to address:` heading. If comments are present, their full bodies may appear under `## Comments:` and/or be summarized in `## Atomic Blocker Set` when structured review context is available. Treat whichever sections are present as the authoritative feedback for this pass. If no review section is present, comments alone are sufficient to drive this improve — you are not required to fabricate Must-Fix structure when the feedback source is comments only.
 
 Your job is to address every blocking feedback item presented:
 - Treat review **Must-Fix** items as **Blockers** for this pass, and address every such item when a review section is present.
