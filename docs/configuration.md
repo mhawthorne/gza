@@ -74,7 +74,7 @@ Gza reads configuration from three YAML layers:
 | `max_concurrent` | Integer | explicit `watch.batch` or `5` | Hard global ceiling on concurrently running task-executing processes across `work`, `watch`, `advance`, iterate/recovery helpers, and internal task runners. Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5` |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
-| `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, dispatch_start_timeout: 2}` | Defaults for `gza watch` loop behavior |
+| `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, dispatch_start_timeout: 2, parked_auto_rearm: {enabled: false, budget: 2, cooldown_hours: 12, require_target_advanced: true}}` | Defaults for `gza watch` loop behavior |
 | `quiet_period_seconds` | Integer | `300` | Seconds a newly created task stays in the Quiet lane of `gza queue` / `gza next` before rejoining normal pending display order; current releases still do not change worker pickup eligibility, and `0` disables the quiet lane |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
@@ -1965,6 +1965,19 @@ watch:
 When enabled, `watch.parked_auto_rearm.budget` caps blind auto-rearm attempts per parked subject/reason pair, `watch.parked_auto_rearm.cooldown_hours` enforces at most one blind attempt per cooldown window for that pair, and `watch.parked_auto_rearm.require_target_advanced` makes unchanged target SHAs a no-spend skip. With the default `require_target_advanced: true`, watch records the current target SHA on each successful blind auto-rearm and will not clear the same parked subject/reason again until the target branch advances. `enabled: false` preserves the existing manual behavior: parked owners stay parked until an operator clears them or other shared lifecycle state changes.
 
 `watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` enforces before relaunching the same transient failed recovery or improve action. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
+
+Auto-rearm groundwork is now discoverable under these keys:
+
+```yaml
+watch:
+  parked_auto_rearm:
+    enabled: false
+    budget: 2
+    cooldown_hours: 12
+    require_target_advanced: true
+```
+
+`watch.parked_auto_rearm.enabled` exposes the future watch-owned parked-task auto-rearm policy switch, but current releases do not change watch behavior yet. `watch.parked_auto_rearm.budget`, `watch.parked_auto_rearm.cooldown_hours`, and `watch.parked_auto_rearm.require_target_advanced` are likewise durable/operator-visible groundwork only in this slice: they flow through config validation, effective-config output, source attribution, docs, and generated examples now so later slices can consume them without another config-surface migration.
 
 When a non-global scope is active, watch emits an explicit scope line to console and
 `.gza/watch.log`: `INFO      scope: tags=<comma-separated-tags> mode=any|all` for tag

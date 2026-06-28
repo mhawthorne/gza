@@ -103,6 +103,10 @@ DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET = 2
 DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS = 12
 DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED = True
 DEFAULT_WATCH_RECOVERY_SLOTS = 1
+DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED = False
+DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET = 2
+DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS = 12
+DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED = True
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
@@ -355,6 +359,12 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "failure_backoff_max": None,
         "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
+        "parked_auto_rearm": {
+            "enabled": None,
+            "budget": None,
+            "cooldown_hours": None,
+            "require_target_advanced": None,
+        },
     },
     "iterate_max_iterations": None,
     "max_resume_attempts": None,
@@ -966,8 +976,8 @@ class TmuxConfig:
 
 
 @dataclass
-class ParkedAutoRearmConfig:
-    """Configuration for watch-owned blind parked auto-rearm."""
+class WatchParkedAutoRearmConfig:
+    """Configuration for bounded watch-owned parked-task auto rearm."""
 
     enabled: bool = DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED
     budget: int = DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET
@@ -990,7 +1000,7 @@ class WatchConfig:
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
     no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
     dispatch_start_timeout: int = DEFAULT_WATCH_DISPATCH_START_TIMEOUT
-    parked_auto_rearm: ParkedAutoRearmConfig = field(default_factory=ParkedAutoRearmConfig)
+    parked_auto_rearm: WatchParkedAutoRearmConfig = field(default_factory=WatchParkedAutoRearmConfig)
 
 
 @dataclass
@@ -2172,36 +2182,40 @@ class Config:
         )
         if watch_dispatch_start_timeout is None:
             raise ConfigError("watch.dispatch_start_timeout must be a positive integer")
-        parked_auto_rearm_data = watch_data.get("parked_auto_rearm", {})
-        if parked_auto_rearm_data is None:
-            parked_auto_rearm_data = {}
-        if not isinstance(parked_auto_rearm_data, dict):
-            raise ConfigError("watch.parked_auto_rearm must be a dictionary/object")
-        parked_auto_rearm_enabled = parked_auto_rearm_data.get(
+        watch_parked_auto_rearm_data = watch_data.get("parked_auto_rearm") or {}
+        if not isinstance(watch_parked_auto_rearm_data, dict):
+            raise ConfigError("'watch.parked_auto_rearm' must be a dictionary")
+        auto_rearm_enabled = watch_parked_auto_rearm_data.get(
             "enabled",
             DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED,
         )
-        if not isinstance(parked_auto_rearm_enabled, bool):
-            raise ConfigError("watch.parked_auto_rearm.enabled must be a boolean (true/false)")
-        parked_auto_rearm_budget = _validate_non_negative_int_field(
-            parked_auto_rearm_data.get("budget", DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET),
+        if not isinstance(auto_rearm_enabled, bool):
+            raise ConfigError("'watch.parked_auto_rearm.enabled' must be a boolean (true/false)")
+        auto_rearm_budget = _validate_positive_int_field(
+            watch_parked_auto_rearm_data.get(
+                "budget",
+                DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET,
+            ),
             "watch.parked_auto_rearm.budget",
         )
-        if parked_auto_rearm_budget is None:
-            raise ConfigError("watch.parked_auto_rearm.budget must be a non-negative integer")
-        parked_auto_rearm_cooldown_hours = _validate_positive_int_field(
-            parked_auto_rearm_data.get("cooldown_hours", DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS),
+        if auto_rearm_budget is None:
+            raise ConfigError("'watch.parked_auto_rearm.budget' must be a positive integer")
+        auto_rearm_cooldown_hours = _validate_positive_int_field(
+            watch_parked_auto_rearm_data.get(
+                "cooldown_hours",
+                DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS,
+            ),
             "watch.parked_auto_rearm.cooldown_hours",
         )
-        if parked_auto_rearm_cooldown_hours is None:
-            raise ConfigError("watch.parked_auto_rearm.cooldown_hours must be a positive integer")
-        parked_auto_rearm_require_target_advanced = parked_auto_rearm_data.get(
+        if auto_rearm_cooldown_hours is None:
+            raise ConfigError("'watch.parked_auto_rearm.cooldown_hours' must be a positive integer")
+        auto_rearm_require_target_advanced = watch_parked_auto_rearm_data.get(
             "require_target_advanced",
             DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED,
         )
-        if not isinstance(parked_auto_rearm_require_target_advanced, bool):
+        if not isinstance(auto_rearm_require_target_advanced, bool):
             raise ConfigError(
-                "watch.parked_auto_rearm.require_target_advanced must be a boolean (true/false)"
+                "'watch.parked_auto_rearm.require_target_advanced' must be a boolean (true/false)"
             )
 
         watch_config = WatchConfig(
@@ -2217,11 +2231,11 @@ class Config:
             failure_halt_after=watch_failure_halt_after,
             no_progress_cycles=watch_no_progress_cycles,
             dispatch_start_timeout=watch_dispatch_start_timeout,
-            parked_auto_rearm=ParkedAutoRearmConfig(
-                enabled=parked_auto_rearm_enabled,
-                budget=parked_auto_rearm_budget,
-                cooldown_hours=parked_auto_rearm_cooldown_hours,
-                require_target_advanced=parked_auto_rearm_require_target_advanced,
+            parked_auto_rearm=WatchParkedAutoRearmConfig(
+                enabled=auto_rearm_enabled,
+                budget=auto_rearm_budget,
+                cooldown_hours=auto_rearm_cooldown_hours,
+                require_target_advanced=auto_rearm_require_target_advanced,
             ),
         )
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
@@ -2821,12 +2835,17 @@ class Config:
                 if "parked_auto_rearm" in watch_data:
                     parked_auto_rearm = watch_data["parked_auto_rearm"]
                     if not isinstance(parked_auto_rearm, dict):
-                        errors.append("watch.parked_auto_rearm must be a dictionary")
+                        errors.append("'watch.parked_auto_rearm' must be a dictionary")
                     else:
-                        if "enabled" in parked_auto_rearm and not isinstance(parked_auto_rearm["enabled"], bool):
-                            errors.append("watch.parked_auto_rearm.enabled must be a boolean")
+                        if "enabled" in parked_auto_rearm and not isinstance(
+                            parked_auto_rearm["enabled"],
+                            bool,
+                        ):
+                            errors.append(
+                                "'watch.parked_auto_rearm.enabled' must be a boolean (true/false)"
+                            )
                         if "budget" in parked_auto_rearm:
-                            _validate_non_negative_int_field(
+                            _validate_positive_int_field(
                                 parked_auto_rearm["budget"],
                                 "watch.parked_auto_rearm.budget",
                                 errors=errors,
@@ -2842,7 +2861,7 @@ class Config:
                             bool,
                         ):
                             errors.append(
-                                "watch.parked_auto_rearm.require_target_advanced must be a boolean"
+                                "'watch.parked_auto_rearm.require_target_advanced' must be a boolean (true/false)"
                             )
 
         if "claude_args" in data:

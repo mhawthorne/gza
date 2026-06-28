@@ -669,7 +669,11 @@ def _recovery_policy_epoch(
             subject_id=ancestor_id,
             attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
         )
-        if rearm_state is None:
+        if (
+            rearm_state is None
+            or rearm_state.manual_rearm_epoch <= 0
+            or rearm_state.manual_rearmed_at is None
+        ):
             continue
         for candidate_time in (
             rearm_state.manual_rearmed_at if rearm_state.manual_rearm_epoch > 0 else None,

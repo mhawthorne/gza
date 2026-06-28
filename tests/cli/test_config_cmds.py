@@ -1135,6 +1135,46 @@ class TestLocalConfigOverrides:
         assert payload["effective"]["watch"]["dispatch_start_timeout"] == 7
         assert payload["sources"]["watch.dispatch_start_timeout"] == "local"
 
+    def test_config_command_includes_watch_parked_auto_rearm_json_and_sources(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """gza config --json should expose watch.parked_auto_rearm effective values and sources."""
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "watch:\n"
+            "  parked_auto_rearm:\n"
+            "    enabled: true\n"
+            "    budget: 5\n"
+        )
+        (tmp_path / "gza.local.yaml").write_text(
+            "watch:\n"
+            "  parked_auto_rearm:\n"
+            "    cooldown_hours: 9\n"
+            "    require_target_advanced: false\n"
+        )
+
+        result = invoke_gza(
+            "config",
+            "--json",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        payload = json.loads(result.stdout)
+        assert payload["effective"]["watch"]["parked_auto_rearm"] == {
+            "enabled": True,
+            "budget": 5,
+            "cooldown_hours": 9,
+            "require_target_advanced": False,
+        }
+        assert payload["sources"]["watch.parked_auto_rearm.enabled"] == "base"
+        assert payload["sources"]["watch.parked_auto_rearm.budget"] == "base"
+        assert payload["sources"]["watch.parked_auto_rearm.cooldown_hours"] == "local"
+        assert payload["sources"]["watch.parked_auto_rearm.require_target_advanced"] == "local"
+
     def test_config_command_includes_quiet_period_seconds_json_and_source(self, tmp_path: Path):
         """gza config --json should expose quiet_period_seconds with source attribution."""
 

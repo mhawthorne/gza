@@ -372,18 +372,20 @@ project_name: my-project
 #   Default: 3
 #   no_progress_cycles: 3
 #   parked_auto_rearm:
-#     Maximum blind auto-rearm attempts `gza watch` may spend per parked subject/reason pair before
-#     leaving it parked.
+#     Per parked subject/reason auto-rearm attempt budget reserved for future watch-owned rearm
+#     policy; no attempts are spent yet.
 #     Default: 2
 #     budget: 2
-#     Cooldown window between blind parked auto-rearm attempts for the same subject/reason pair.
+#     Cooldown window in hours reserved for future watch-owned parked-task auto rearm; current
+#     releases store the setting without changing watch behavior yet.
 #     Default: 12
 #     cooldown_hours: 12
-#     Enable the watch-owned blind parked auto-rearm phase for eligible parked owner/reason pairs.
+#     Enable durable watch-owned parked-task auto-rearm policy wiring; current releases expose only
+#     config/state groundwork and do not change watch behavior yet.
 #     Default: false
 #     enabled: false
-#     Require the target branch SHA to advance since the last blind auto-rearm attempt before watch
-#     spends another attempt for the same parked subject/reason pair.
+#     Require target-branch advancement before future watch-owned parked-task auto rearm is eligible;
+#     current releases expose the key without changing watch behavior yet.
 #     Default: true
 #     require_target_advanced: true
 #   Polling interval seconds for `gza watch`.

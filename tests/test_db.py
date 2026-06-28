@@ -7574,6 +7574,46 @@ def _drop_tasks_column(db_path: Path, column_name: str) -> None:
     conn.close()
 
 
+def _drop_table_column(db_path: Path, table_name: str, column_name: str) -> None:
+    """Rebuild a table without a specific column."""
+    import sqlite3
+
+    def _quote(column: str) -> str:
+        return f'"{column}"' if column in ("group",) else column
+
+    conn = sqlite3.connect(db_path)
+    old_name = f"{table_name}_old"
+    conn.execute(f"ALTER TABLE {table_name} RENAME TO {old_name}")
+    pragma_rows = list(conn.execute(f"PRAGMA table_info({old_name})"))
+    cols = [row[1] for row in pragma_rows]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(_quote(c) for c in kept_cols)
+    col_defs = []
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        quoted_name = _quote(name)
+        parts = [quoted_name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(_quote(name) for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE {table_name} ({', '.join(col_defs)})")
+    conn.execute(f"INSERT INTO {table_name} ({cols_str}) SELECT {cols_str} FROM {old_name}")
+    conn.execute(f"DROP TABLE {old_name}")
+    conn.commit()
+    conn.close()
+
+
 def _drop_task_comments_column(db_path: Path, column_name: str) -> None:
     """Rebuild task_comments table without a specific column."""
     import sqlite3
@@ -10155,16 +10195,14 @@ class TestSharedDbIsolationAndImportGating:
         assert "parked_task_rearms" in tables
         assert "idx_parked_task_rearms_task_reason" in indexes
 
-    def test_auto_migration_v58_to_v59_adds_parked_task_auto_rearm_columns(self, tmp_path: Path) -> None:
+    def test_auto_migration_v58_to_v59_extends_parked_task_rearms_auto_fields(self, tmp_path: Path) -> None:
         import sqlite3
 
         db_path = tmp_path / "test.db"
         SqliteTaskStore(db_path, prefix="gza")
 
-        _drop_parked_task_rearms_columns(
-            db_path,
-            {"auto_attempt_count", "last_auto_attempt_at", "last_auto_attempt_target_sha"},
-        )
+        for column in ("attempt_count", "last_attempt_at", "last_attempt_target_sha"):
+            _drop_table_column(db_path, "parked_task_rearms", column)
         with sqlite3.connect(db_path) as conn:
             conn.execute("UPDATE schema_version SET version = 58")
             conn.commit()
@@ -10176,9 +10214,9 @@ class TestSharedDbIsolationAndImportGating:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(parked_task_rearms)").fetchall()}
 
         assert version == SCHEMA_VERSION
-        assert "auto_attempt_count" in columns
-        assert "last_auto_attempt_at" in columns
-        assert "last_auto_attempt_target_sha" in columns
+        assert "attempt_count" in columns
+        assert "last_attempt_at" in columns
+        assert "last_attempt_target_sha" in columns
 
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
@@ -10289,38 +10327,77 @@ class TestSharedDbIsolationAndImportGating:
             attention_reason="retry-limit-reached",
         ) == second
 
-    def test_parked_task_auto_rearm_round_trip_and_increment(self, tmp_path: Path) -> None:
+    def test_parked_task_rearm_state_tracks_auto_attempts_without_resetting_manual_epoch(
+        self,
+        tmp_path: Path,
+    ) -> None:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")
 
+        manual = store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id="gza-200",
+            attention_reason="watch-no-progress-backstop",
+            subject_task_id="gza-200",
+        )
+        assert manual is not None
+
         first = store.record_parked_task_auto_rearm_attempt(
             subject_kind="task",
-            subject_id="gza-100",
+            subject_id="gza-200",
             attention_reason="watch-no-progress-backstop",
-            subject_task_id="gza-100",
-            target_sha="abc123",
+            subject_task_id="gza-200",
+            target_sha="sha-main-1",
+        )
+        second = store.record_parked_task_auto_rearm_attempt(
+            subject_kind="task",
+            subject_id="gza-200",
+            attention_reason="watch-no-progress-backstop",
+            subject_task_id="gza-200",
+            target_sha="sha-main-2",
         )
 
         assert first is not None
-        assert first.subject_task_id == "gza-100"
-        assert first.manual_rearm_epoch == 0
-        assert first.auto_attempt_count == 1
-        assert first.last_auto_attempt_at is not None
-        assert first.last_auto_attempt_target_sha == "abc123"
-
-        second = store.record_parked_task_auto_rearm_attempt(
+        assert second is not None
+        assert first.manual_rearm_epoch == 1
+        assert first.attempt_count == 1
+        assert first.last_attempt_at is not None
+        assert first.last_attempt_target_sha == "sha-main-1"
+        assert second.manual_rearm_epoch == 1
+        assert second.attempt_count == 2
+        assert second.last_attempt_at is not None
+        assert second.last_attempt_at >= first.last_attempt_at
+        assert second.last_attempt_target_sha == "sha-main-2"
+        assert store.get_parked_task_rearm(
             subject_kind="task",
-            subject_id="gza-100",
+            subject_id="gza-200",
             attention_reason="watch-no-progress-backstop",
-            subject_task_id="gza-100",
-            target_sha="def456",
+        ) == second
+
+    def test_parked_task_rearm_state_keeps_reason_rows_distinct_for_same_subject(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        retry_limit = store.record_parked_task_auto_rearm_attempt(
+            subject_kind="task",
+            subject_id="gza-300",
+            attention_reason="retry-limit-reached",
+            subject_task_id="gza-300",
+            target_sha="sha-main-1",
+        )
+        backstop = store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id="gza-300",
+            attention_reason="watch-no-progress-backstop",
+            subject_task_id="gza-300",
         )
 
-        assert second is not None
-        assert second.auto_attempt_count == 2
-        assert second.last_auto_attempt_at is not None
-        assert second.last_auto_attempt_at >= first.last_auto_attempt_at
-        assert second.last_auto_attempt_target_sha == "def456"
+        assert retry_limit is not None
+        assert backstop is not None
+        assert retry_limit.attempt_count == 1
+        assert retry_limit.manual_rearm_epoch == 0
+        assert backstop.attempt_count == 0
+        assert backstop.manual_rearm_epoch == 1
 
     def test_query_only_open_pre_v56_missing_watch_recovery_backoffs_degrades_safely(
         self, tmp_path: Path

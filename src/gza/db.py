@@ -742,9 +742,9 @@ class ParkedTaskRearmState:
     subject_task_id: str | None = None
     manual_rearm_epoch: int = 0
     manual_rearmed_at: datetime | None = None
-    auto_attempt_count: int = 0
-    last_auto_attempt_at: datetime | None = None
-    last_auto_attempt_target_sha: str | None = None
+    attempt_count: int = 0
+    last_attempt_at: datetime | None = None
+    last_attempt_target_sha: str | None = None
 
 
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -774,7 +774,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
     "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
-    "parked_task_rearms": ("manual_rearmed_at", "last_auto_attempt_at"),
+    "parked_task_rearms": ("manual_rearmed_at", "last_attempt_at"),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
     column for columns in _DB_TIMESTAMP_COLUMNS.values() for column in columns
@@ -1116,9 +1116,9 @@ CREATE TABLE IF NOT EXISTS parked_task_rearms (
     subject_task_id TEXT,
     manual_rearm_epoch INTEGER NOT NULL DEFAULT 0,
     manual_rearmed_at TEXT NOT NULL,
-    auto_attempt_count INTEGER NOT NULL DEFAULT 0,
-    last_auto_attempt_at TEXT,
-    last_auto_attempt_target_sha TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    last_attempt_target_sha TEXT,
     PRIMARY KEY(project_id, subject_kind, subject_id, attention_reason)
 );
 CREATE INDEX IF NOT EXISTS idx_parked_task_rearms_task_reason
@@ -1140,20 +1140,20 @@ CREATE TABLE IF NOT EXISTS parked_task_rearms (
     subject_task_id TEXT,
     manual_rearm_epoch INTEGER NOT NULL DEFAULT 0,
     manual_rearmed_at TEXT NOT NULL,
-    auto_attempt_count INTEGER NOT NULL DEFAULT 0,
-    last_auto_attempt_at TEXT,
-    last_auto_attempt_target_sha TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    last_attempt_target_sha TEXT,
     PRIMARY KEY(project_id, subject_kind, subject_id, attention_reason)
 );
 CREATE INDEX IF NOT EXISTS idx_parked_task_rearms_task_reason
     ON parked_task_rearms(project_id, subject_task_id, attention_reason);
 """
 
-# Migration from v58 to v59: durable blind parked auto-rearm attempt state
+# Migration from v58 to v59: extend parked-task rearm state for future auto-rearm budgets
 MIGRATION_V58_TO_V59 = """
-ALTER TABLE parked_task_rearms ADD COLUMN auto_attempt_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE parked_task_rearms ADD COLUMN last_auto_attempt_at TEXT;
-ALTER TABLE parked_task_rearms ADD COLUMN last_auto_attempt_target_sha TEXT;
+ALTER TABLE parked_task_rearms ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE parked_task_rearms ADD COLUMN last_attempt_at TEXT;
+ALTER TABLE parked_task_rearms ADD COLUMN last_attempt_target_sha TEXT;
 """
 
 # Schema version for migrations
@@ -1885,9 +1885,9 @@ _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS: tuple[str, ...] = (
     "subject_task_id",
     "manual_rearm_epoch",
     "manual_rearmed_at",
-    "auto_attempt_count",
-    "last_auto_attempt_at",
-    "last_auto_attempt_target_sha",
+    "attempt_count",
+    "last_attempt_at",
+    "last_attempt_target_sha",
 )
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
@@ -2197,7 +2197,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         56: ("watch_recovery_backoffs", "updated_at"),
         57: ("tasks", "last_edited_at"),
         58: ("parked_task_rearms", "manual_rearmed_at"),
-        59: ("parked_task_rearms", "last_auto_attempt_target_sha"),
+        59: ("parked_task_rearms", "last_attempt_target_sha"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -2271,7 +2271,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 "idx_parked_task_rearms_task_reason"
             )
     if target_version >= 59:
-        for column in ("auto_attempt_count", "last_auto_attempt_at", "last_auto_attempt_target_sha"):
+        for column in ("attempt_count", "last_attempt_at", "last_attempt_target_sha"):
             if not _table_has_column(conn, "parked_task_rearms", column):
                 raise RuntimeError(
                     "Auto-migration to v59 incomplete: missing required column "
@@ -2660,9 +2660,9 @@ def _ensure_required_auto_migration_artifacts(
                         subject_task_id TEXT,
                         manual_rearm_epoch INTEGER NOT NULL DEFAULT 0,
                         manual_rearmed_at TEXT NOT NULL,
-                        auto_attempt_count INTEGER NOT NULL DEFAULT 0,
-                        last_auto_attempt_at TEXT,
-                        last_auto_attempt_target_sha TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        last_attempt_at TEXT,
+                        last_attempt_target_sha TEXT,
                         PRIMARY KEY(project_id, subject_kind, subject_id, attention_reason)
                     )
                     """
@@ -2696,24 +2696,34 @@ def _ensure_required_auto_migration_artifacts(
                     "idx_parked_task_rearms_task_reason: use a writable database."
                 ) from exc
     if target_version >= 59:
-        for column_name, column_sql in (
-            ("auto_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("last_auto_attempt_at", "TEXT"),
-            ("last_auto_attempt_target_sha", "TEXT"),
+        for column, alter_sql in (
+            (
+                "attempt_count",
+                "ALTER TABLE parked_task_rearms ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_attempt_at",
+                "ALTER TABLE parked_task_rearms ADD COLUMN last_attempt_at TEXT",
+            ),
+            (
+                "last_attempt_target_sha",
+                "ALTER TABLE parked_task_rearms ADD COLUMN last_attempt_target_sha TEXT",
+            ),
         ):
-            if _table_has_column(conn, "parked_task_rearms", column_name):
+            if _table_has_column(conn, "parked_task_rearms", column):
                 continue
             try:
-                conn.execute(f"ALTER TABLE parked_task_rearms ADD COLUMN {column_name} {column_sql}")
+                conn.execute(alter_sql)
             except sqlite3.OperationalError as exc:
                 if _is_readonly_snapshot_operational_error(exc):
                     raise SchemaIntegrityError(
-                        "Query-only DB open detected incomplete parked_task_rearms schema; "
-                        "use a writable database to complete migration to v59, then retry."
+                        "Query-only DB open detected missing required column "
+                        f"parked_task_rearms.{column}; use a writable database to complete "
+                        "migration to v59, then retry."
                     ) from exc
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required column "
-                    f"parked_task_rearms.{column_name}: use a writable database."
+                    f"parked_task_rearms.{column}: use a writable database."
                 ) from exc
 
 SCHEMA = """
@@ -3513,7 +3523,7 @@ class SqliteTaskStore:
             return _table_exists(conn, "watch_recovery_backoffs")
 
     def supports_parked_task_rearms(self) -> bool:
-        """Return whether durable parked-task manual rearm storage is available."""
+        """Return whether durable parked-task rearm storage is available."""
         if self._open_mode == "query_only":
             return self._query_only_supports_parked_task_rearms()
         with self._connect() as conn:
@@ -3833,12 +3843,12 @@ class SqliteTaskStore:
             if self._query_only_table_exists.get("parked_task_rearms", False):
                 self._startup_warnings.append(
                     "Query-only DB open detected incomplete parked_task_rearms schema; "
-                    "parked-task manual rearm state will be unavailable."
+                    "parked-task rearm state will be unavailable."
                 )
             else:
                 self._startup_warnings.append(
                     "Query-only DB open detected missing required table parked_task_rearms; "
-                    "parked-task manual rearm state will be unavailable."
+                    "parked-task rearm state will be unavailable."
                 )
         run_steps_issue = self._query_only_run_steps_warning()
         if run_steps_issue is not None:
@@ -5440,12 +5450,10 @@ class SqliteTaskStore:
             subject_task_id=str(row["subject_task_id"]) if row["subject_task_id"] is not None else None,
             manual_rearm_epoch=int(row["manual_rearm_epoch"]) if row["manual_rearm_epoch"] is not None else 0,
             manual_rearmed_at=_parse_db_timestamp(row["manual_rearmed_at"]),
-            auto_attempt_count=int(row["auto_attempt_count"]) if row["auto_attempt_count"] is not None else 0,
-            last_auto_attempt_at=_parse_db_timestamp(row["last_auto_attempt_at"]),
-            last_auto_attempt_target_sha=(
-                str(row["last_auto_attempt_target_sha"])
-                if row["last_auto_attempt_target_sha"] is not None
-                else None
+            attempt_count=int(row["attempt_count"]) if row["attempt_count"] is not None else 0,
+            last_attempt_at=_parse_db_timestamp(row["last_attempt_at"]),
+            last_attempt_target_sha=(
+                str(row["last_attempt_target_sha"]) if row["last_attempt_target_sha"] is not None else None
             ),
         )
 
@@ -6043,9 +6051,9 @@ class SqliteTaskStore:
                     subject_task_id,
                     manual_rearm_epoch,
                     manual_rearmed_at,
-                    auto_attempt_count,
-                    last_auto_attempt_at,
-                    last_auto_attempt_target_sha
+                    attempt_count,
+                    last_attempt_at,
+                    last_attempt_target_sha
                 )
                 VALUES (?, ?, ?, ?, ?, 1, ?, 0, NULL, NULL)
                 ON CONFLICT(project_id, subject_kind, subject_id, attention_reason)
@@ -6082,16 +6090,16 @@ class SqliteTaskStore:
         subject_kind: str,
         subject_id: str,
         attention_reason: str,
-        target_sha: str | None,
         subject_task_id: str | None = None,
+        target_sha: str | None = None,
     ) -> ParkedTaskRearmState | None:
-        """Increment and persist one blind auto-rearm attempt for a parked subject/reason pair."""
+        """Increment and persist future auto-rearm attempt accounting for one parked subject/reason pair."""
         if not self.supports_parked_task_rearms():
             return None
-        attempt_recorded_at = _format_db_timestamp(datetime.now(UTC))
-        assert attempt_recorded_at is not None
-        manual_placeholder = _format_db_timestamp(datetime.fromtimestamp(0, UTC))
-        assert manual_placeholder is not None
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
+        manual_rearmed_at = _format_db_timestamp(datetime.fromtimestamp(0, tz=UTC))
+        assert manual_rearmed_at is not None
         with self._connect() as conn:
             conn.execute(
                 """
@@ -6103,17 +6111,17 @@ class SqliteTaskStore:
                     subject_task_id,
                     manual_rearm_epoch,
                     manual_rearmed_at,
-                    auto_attempt_count,
-                    last_auto_attempt_at,
-                    last_auto_attempt_target_sha
+                    attempt_count,
+                    last_attempt_at,
+                    last_attempt_target_sha
                 )
                 VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?)
                 ON CONFLICT(project_id, subject_kind, subject_id, attention_reason)
                 DO UPDATE SET
                     subject_task_id = excluded.subject_task_id,
-                    auto_attempt_count = parked_task_rearms.auto_attempt_count + 1,
-                    last_auto_attempt_at = excluded.last_auto_attempt_at,
-                    last_auto_attempt_target_sha = excluded.last_auto_attempt_target_sha
+                    attempt_count = parked_task_rearms.attempt_count + 1,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_attempt_target_sha = excluded.last_attempt_target_sha
                 """,
                 (
                     self._project_id,
@@ -6121,8 +6129,8 @@ class SqliteTaskStore:
                     subject_id,
                     attention_reason,
                     subject_task_id,
-                    manual_placeholder,
-                    attempt_recorded_at,
+                    manual_rearmed_at,
+                    now,
                     target_sha,
                 ),
             )

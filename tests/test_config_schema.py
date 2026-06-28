@@ -1,5 +1,6 @@
 """Parity tests for discoverable configuration key registry."""
 
+import re
 import py_compile
 from dataclasses import fields
 from pathlib import Path
@@ -11,6 +12,10 @@ from gza.config import (
     ConfigError,
     DEFAULT_QUIET_PERIOD_SECONDS,
     DEFAULT_WATCH_DISPATCH_START_TIMEOUT,
+    DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET,
+    DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS,
+    DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED,
+    DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED,
 )
 from gza.config_schema import (
     CONFIG_KEY_REGISTRY,
@@ -176,15 +181,21 @@ def test_config_load_parses_watch_dispatch_start_timeout(tmp_path) -> None:
 
 
 def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
-    """watch.parked_auto_rearm should default to the conservative blind-policy settings."""
+    """watch.parked_auto_rearm should default when omitted."""
     (tmp_path / "gza.yaml").write_text("project_name: demo\n")
 
     config = Config.load(tmp_path)
 
-    assert config.watch.parked_auto_rearm.enabled is False
-    assert config.watch.parked_auto_rearm.budget == 2
-    assert config.watch.parked_auto_rearm.cooldown_hours == 12
-    assert config.watch.parked_auto_rearm.require_target_advanced is True
+    assert config.watch.parked_auto_rearm.enabled is DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED
+    assert config.watch.parked_auto_rearm.budget == DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET
+    assert (
+        config.watch.parked_auto_rearm.cooldown_hours
+        == DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS
+    )
+    assert (
+        config.watch.parked_auto_rearm.require_target_advanced
+        is DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED
+    )
 
 
 def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
@@ -194,7 +205,7 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
         "watch:\n"
         "  parked_auto_rearm:\n"
         "    enabled: true\n"
-        "    budget: 3\n"
+        "    budget: 4\n"
         "    cooldown_hours: 6\n"
         "    require_target_advanced: false\n"
     )
@@ -202,7 +213,7 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
     config = Config.load(tmp_path)
 
     assert config.watch.parked_auto_rearm.enabled is True
-    assert config.watch.parked_auto_rearm.budget == 3
+    assert config.watch.parked_auto_rearm.budget == 4
     assert config.watch.parked_auto_rearm.cooldown_hours == 6
     assert config.watch.parked_auto_rearm.require_target_advanced is False
 
@@ -268,7 +279,7 @@ def test_config_validation_rejects_invalid_quiet_period_seconds(
     assert expected in errors
     assert warnings == []
 
-    with pytest.raises(ConfigError, match=expected):
+    with pytest.raises(ConfigError, match=re.escape(expected)):
         Config.load(tmp_path)
 
 
@@ -285,7 +296,7 @@ def test_config_load_rejects_invalid_docker_startup_timeout(tmp_path, value: str
         if value in {"0", "-1"}
         else "'docker_startup_timeout' must be an integer"
     )
-    with pytest.raises(ConfigError, match=expected):
+    with pytest.raises(ConfigError, match=re.escape(expected)):
         Config.load(tmp_path)
 
 
@@ -329,5 +340,41 @@ def test_config_watch_dispatch_start_timeout_validation(tmp_path, value: str, ex
     assert expected in errors
     assert warnings == []
 
-    with pytest.raises(ConfigError, match=expected):
+    with pytest.raises(ConfigError, match=re.escape(expected)):
+        Config.load(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ("enabled: nope", "'watch.parked_auto_rearm.enabled' must be a boolean (true/false)"),
+        ("budget: 0", "'watch.parked_auto_rearm.budget' must be positive"),
+        ("budget: 1.5", "'watch.parked_auto_rearm.budget' must be an integer"),
+        ("cooldown_hours: -1", "'watch.parked_auto_rearm.cooldown_hours' must be positive"),
+        (
+            "require_target_advanced: 1",
+            "'watch.parked_auto_rearm.require_target_advanced' must be a boolean (true/false)",
+        ),
+    ],
+)
+def test_config_validation_rejects_invalid_watch_parked_auto_rearm(
+    tmp_path,
+    body: str,
+    expected: str,
+) -> None:
+    """Load and validate should reject invalid watch.parked_auto_rearm values."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        "  parked_auto_rearm:\n"
+        f"    {body}\n"
+    )
+
+    is_valid, errors, warnings = Config.validate(tmp_path)
+
+    assert not is_valid
+    assert expected in errors
+    assert warnings == []
+
+    with pytest.raises(ConfigError, match=re.escape(expected)):
         Config.load(tmp_path)
