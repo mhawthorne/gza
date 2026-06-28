@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+from unittest.mock import patch
 
 from gza.concurrency import MaxConcurrentTasksError, get_concurrency_snapshot, launch_permit
 from gza.config import Config
@@ -13,6 +14,16 @@ from tests.cli.conftest import make_store, setup_config
 def _append_config(tmp_path, extra: str) -> None:
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + extra)
+
+
+@pytest.fixture(autouse=True)
+def _stub_worker_death_os_hint():
+    """Keep reconciliation cleanup in the unit suite off the Darwin log subprocess."""
+    with patch(
+        "gza.cli._common._darwin_worker_death_hint",
+        return_value="darwin log hint (best effort): mocked unit-test hint",
+    ):
+        yield
 
 
 def test_launch_permit_allows_under_limit(tmp_path) -> None:
@@ -87,7 +98,13 @@ def test_snapshot_ignores_dead_registry_and_task_pids(tmp_path) -> None:
         )
     )
 
-    snapshot = get_concurrency_snapshot(config, store)
+    with patch(
+        "gza.cli._common._darwin_worker_death_hint",
+        return_value="darwin log hint (best effort): mocked unit-test hint",
+    ) as mock_hint:
+        snapshot = get_concurrency_snapshot(config, store)
+
+    mock_hint.assert_called_once()
     assert snapshot.running == 0
     assert snapshot.available == 2
     assert snapshot.running_task_ids == ()

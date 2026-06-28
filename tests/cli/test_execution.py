@@ -4885,6 +4885,15 @@ class TestBackgroundWorkerCommand:
 class TestReconciliation:
     """Tests for in-progress reconciliation behavior."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_worker_death_os_hint(self):
+        """Keep the dead-worker unit path on an in-process Darwin hint seam."""
+        with patch(
+            "gza.cli._common._darwin_worker_death_hint",
+            return_value="darwin log hint (best effort): mocked unit-test hint",
+        ):
+            yield
+
     def test_reconciliation_warns_on_task_failure_and_continues(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Per-task reconciliation failures should be visible, not silent."""
         from gza.cli._common import reconcile_in_progress_tasks
@@ -5747,7 +5756,13 @@ class TestReconciliation:
             )
         )
 
-        reconcile_in_progress_tasks(config)
+        with patch(
+            "gza.cli._common._darwin_worker_death_hint",
+            return_value="darwin log hint (best effort): mocked unit-test hint",
+        ) as mock_hint:
+            reconcile_in_progress_tasks(config)
+
+        mock_hint.assert_called_once()
 
         refreshed = store.get(task.id)
         assert refreshed is not None
@@ -5767,6 +5782,7 @@ class TestReconciliation:
         assert "Failure Reason: WORKER_DIED" in show_result.stdout
         assert "Worker Exit: SIGKILL, exit code -9" in show_result.stdout
         assert "Worker Death Stage: after_preflight_before_worker_start" in show_result.stdout
+        assert "mocked unit-test hint" in show_result.stdout
         assert "fatal: worker vanished before claim" in show_result.stdout
 
         log_result = invoke_gza("log", str(task.id), "--failure", "--project", str(tmp_path))
@@ -5774,6 +5790,7 @@ class TestReconciliation:
         assert "Failure Reason: WORKER_DIED" in log_result.stdout
         assert "Worker Exit: SIGKILL, exit code -9" in log_result.stdout
         assert "Worker Death Stage: after_preflight_before_worker_start" in log_result.stdout
+        assert "mocked unit-test hint" in log_result.stdout
         assert "fatal: worker vanished before claim" in log_result.stdout
 
     def test_reconciliation_leaves_pending_task_with_clean_completed_worker_pending(
