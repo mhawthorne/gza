@@ -1,4 +1,4 @@
-"""End-to-end coverage for the guarded unit serial-rerun bridge."""
+"""End-to-end coverage for the guarded verify-lane serial-rerun bridge."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def _run_test_unit(
     env_updates: dict[str, str] | None = None,
     use_verify_phase: bool = False,
     timeout_seconds: float = _TEST_UNIT_SUBPROCESS_TIMEOUT_SECONDS,
+    phase_name: str = "unit",
 ) -> subprocess.CompletedProcess[str]:
     env = _repo_env()
     if env_updates:
@@ -36,6 +37,8 @@ def _run_test_unit(
         sys.executable,
         "-m",
         "gza.test_serial_rerun",
+        "--phase",
+        phase_name,
         "--summary",
         "--",
         str(suite_dir),
@@ -48,7 +51,7 @@ def _run_test_unit(
         *extra_args,
     ]
     if use_verify_phase:
-        cmd = [sys.executable, "-m", "gza.tools.verify_phase", "unit", "--", *module_cmd]
+        cmd = [sys.executable, "-m", "gza.tools.verify_phase", phase_name, "--", *module_cmd]
     else:
         cmd = module_cmd
     return subprocess.run(
@@ -86,6 +89,28 @@ def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_un
     assert "gza-verify phase=passed name=unit duration_seconds=" in result.stdout
     assert "latency: " in result.stdout
     assert "PARALLEL-ONLY FAILURE (passed serially):" in result.stderr
+
+
+@pytest.mark.timeout(60, method="signal")
+def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_functional_phase_line(tmp_path: Path) -> None:
+    suite_dir = tmp_path / "parallel_only_functional_watchdog"
+    suite_dir.mkdir()
+    (suite_dir / "test_parallel_only_watchdog.py").write_text(
+        "import os\n"
+        "import time\n"
+        "import pytest\n\n"
+        "@pytest.mark.timeout(1, method='signal')\n"
+        "def test_parallel_only_watchdog_probe():\n"
+        "    if int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', '0')) > 1:\n"
+        "        time.sleep(2)\n",
+        encoding="utf-8",
+    )
+
+    result = _run_test_unit(suite_dir, use_verify_phase=True, phase_name="functional")
+
+    assert result.returncode == 0, result.stderr
+    assert "gza-verify phase=passed name=functional duration_seconds=" in result.stdout
+    assert "functional-rerun: PARALLEL-ONLY FAILURE (passed serially):" in result.stderr
 
 
 @pytest.mark.timeout(60, method="signal")

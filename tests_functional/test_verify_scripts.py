@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS = 10
+
 
 def _make_executable(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
@@ -120,14 +122,17 @@ def test_full_verify_defaults_to_ci_parity_xdist_worker_count_on_high_core_machi
         env=env,
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
     assert "cores=16 xdist_workers=2" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
     assert "test-unit --summary -- tests/ -n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
-    assert "pytest tests_functional/ -n 2 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert (
+        "python -m gza.test_serial_rerun --phase functional -- tests_functional/ -n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        in tool_invocations
+    )
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -159,7 +164,7 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
         env=env,
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
@@ -168,7 +173,7 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     assert "python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert "test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
-        "python -m gza.tools.verify_phase functional -- pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
+        "python -m gza.tools.verify_phase functional -- python -m gza.test_serial_rerun --phase functional -- tests_functional/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
     )
     assert uv_log.read_text(encoding="utf-8") == ""
@@ -200,7 +205,7 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
         env=env,
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
@@ -208,7 +213,10 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     uv_invocations = uv_log.read_text(encoding="utf-8")
     assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
     assert "uv run python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in uv_invocations
-    assert "uv run python -m gza.tools.verify_phase functional -- uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+    assert (
+        "uv run python -m gza.tools.verify_phase functional -- uv run python -m gza.test_serial_rerun --phase functional -- tests_functional/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        in uv_invocations
+    )
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -232,12 +240,15 @@ def test_full_verify_only_runs_integration_suite_with_integration_flag(tmp_path:
         env=env,
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
     assert default_result.returncode == 0, default_result.stderr
     default_invocations = tool_log.read_text(encoding="utf-8")
-    assert "pytest tests_functional/ -n 3 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in default_invocations
+    assert (
+        "python -m gza.test_serial_rerun --phase functional -- tests_functional/ -n 3 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        in default_invocations
+    )
     assert "pytest tests_integration -xv" not in default_invocations
 
     tool_log.write_text("", encoding="utf-8")
@@ -248,7 +259,7 @@ def test_full_verify_only_runs_integration_suite_with_integration_flag(tmp_path:
         env=env,
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
     assert integration_result.returncode == 0, integration_result.stderr
@@ -275,7 +286,7 @@ def test_quick_verify_omits_tree_fingerprint_when_gitdir_is_unavailable(tmp_path
         env=env,
         capture_output=True,
         text=True,
-        timeout=4,
+        timeout=_VERIFY_SCRIPT_SUBPROCESS_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
