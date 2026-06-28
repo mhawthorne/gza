@@ -1581,12 +1581,77 @@ class WorkspaceSetupResult:
     failure_reason: str = "GIT_ERROR"
     phase: str = "workspace_setup"
     branch: str | None = None
+    error_type: str | None = None
+    error_detail: str | None = None
 
     def __bool__(self) -> bool:
         return self.ok
 
 
-def _mark_workspace_setup_failure(
+@dataclass(frozen=True)
+class StartupFailureRecord:
+    """Structured startup failure persisted before normal task execution begins."""
+
+    message: str
+    failure_reason: str
+    phase: str
+    setup_phase: str
+    branch: str | None = None
+    error_type: str | None = None
+    error_detail: str | None = None
+
+
+def _build_startup_failure_record(
+    *,
+    phase: str,
+    setup_phase: str,
+    message: str,
+    branch: str | None = None,
+    failure_reason: str | None = None,
+    error: BaseException | None = None,
+    error_type: str | None = None,
+    error_detail: str | None = None,
+) -> StartupFailureRecord:
+    """Build a structured startup failure record with resolved classification."""
+    resolved_failure_reason = failure_reason
+    if resolved_failure_reason is None:
+        if error is not None:
+            resolved_failure_reason = _resolved_git_failure(error).reason
+        elif git_error_indicates_containerized_worktree_metadata_failure(message):
+            resolved_failure_reason = "INFRASTRUCTURE_ERROR"
+        else:
+            resolved_failure_reason = "GIT_ERROR"
+    resolved_error_type = error_type
+    if resolved_error_type is None and error is not None:
+        resolved_error_type = error.__class__.__name__
+    detail = (error_detail or "").strip()
+    if not detail and error is not None:
+        detail = str(error).strip()
+    if not detail:
+        detail = message.strip()
+    return StartupFailureRecord(
+        message=message,
+        failure_reason=resolved_failure_reason,
+        phase=phase,
+        setup_phase=setup_phase,
+        branch=branch,
+        error_type=resolved_error_type,
+        error_detail=detail or None,
+    )
+
+
+def _append_jsonl_entry(path: Path, payload: Mapping[str, Any]) -> None:
+    """Append one raw JSONL payload to ``path`` without rerouting to ops."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(payload)) + "\n")
+            f.flush()
+    except Exception:
+        logger.warning("Failed to append JSONL entry to %s", path, exc_info=True)
+
+
+def _record_startup_failure(
     *,
     task: Task,
     config: Config,
@@ -1595,17 +1660,15 @@ def _mark_workspace_setup_failure(
     invocation: RunInvocationContext | None,
     interaction_mode: str,
     resume: bool,
-    message: str,
-    failure_reason: str = "GIT_ERROR",
-    phase: str = "workspace_setup",
-    branch: str | None = None,
+    failure: StartupFailureRecord,
     exit_code: int = 1,
     prelude_written: bool = False,
 ) -> None:
     """Write a canonical setup-failure outcome before marking the task failed."""
     log_file = ensure_task_log_path(config, store, task)
     provider_name = provider if isinstance(provider, str) else provider.name
-    if branch and not task.branch:
+    branch = failure.branch or task.branch
+    if branch and task.branch != branch:
         task.branch = branch
         store.update(task)
 
@@ -1641,16 +1704,34 @@ def _mark_workspace_setup_failure(
             resumed=resume,
         )
 
+    startup_payload: dict[str, Any] = {
+        "type": "gza",
+        "subtype": "startup_failure",
+        "message": failure.message,
+        "exit_code": exit_code,
+        "failure_reason": failure.failure_reason,
+        "phase": failure.phase,
+        "setup_phase": failure.setup_phase,
+    }
+    if branch:
+        startup_payload["branch"] = branch
+    if failure.error_type:
+        startup_payload["error_type"] = failure.error_type
+    if failure.error_detail:
+        startup_payload["error_detail"] = failure.error_detail
+
+    _append_jsonl_entry(log_file, startup_payload)
+    write_log_entry(log_file, startup_payload)
     write_log_entry(
         log_file,
         {
             "type": "gza",
             "subtype": "outcome",
-            "message": message,
+            "message": failure.message,
             "exit_code": exit_code,
-            "failure_reason": failure_reason,
-            "phase": "workspace_setup",
-            "setup_phase": phase,
+            "failure_reason": failure.failure_reason,
+            "phase": failure.phase,
+            "setup_phase": failure.setup_phase,
             **({"branch": branch} if branch else {}),
         },
     )
@@ -1660,9 +1741,51 @@ def _mark_workspace_setup_failure(
         store=store,
         log_file=log_file,
         branch=branch,
-        explicit_reason=failure_reason,
+        explicit_reason=failure.failure_reason,
         error_type=None,
         exit_code=exit_code,
+    )
+
+
+def _mark_workspace_setup_failure(
+    *,
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    provider: Provider | str,
+    invocation: RunInvocationContext | None,
+    interaction_mode: str,
+    resume: bool,
+    message: str,
+    failure_reason: str = "GIT_ERROR",
+    phase: str = "workspace_setup",
+    branch: str | None = None,
+    error: BaseException | None = None,
+    error_type: str | None = None,
+    error_detail: str | None = None,
+    exit_code: int = 1,
+    prelude_written: bool = False,
+) -> None:
+    _record_startup_failure(
+        task=task,
+        config=config,
+        store=store,
+        provider=provider,
+        invocation=invocation,
+        interaction_mode=interaction_mode,
+        resume=resume,
+        failure=_build_startup_failure_record(
+            phase="workspace_setup",
+            setup_phase=phase,
+            message=message,
+            branch=branch,
+            failure_reason=failure_reason,
+            error=error,
+            error_type=error_type,
+            error_detail=error_detail,
+        ),
+        exit_code=exit_code,
+        prelude_written=prelude_written,
     )
 
 
@@ -1689,6 +1812,9 @@ __all__ = [
     "open_task_startup_log",
     "open_task_startup_logs",
     "rename_startup_log_to_slug",
+    "StartupFailureRecord",
+    "_build_startup_failure_record",
+    "_record_startup_failure",
 ]
 
 
@@ -7343,7 +7469,27 @@ def run(
 
     # Setup git on the main repo (for worktree operations)
     git = Git(config.project_dir)
-    default_branch = git.default_branch()
+    try:
+        default_branch = git.default_branch()
+    except GitError as exc:
+        message = str(exc)
+        error_message(f"Git error: {message}")
+        _record_startup_failure(
+            task=task,
+            config=config,
+            store=store,
+            provider=provider,
+            invocation=invocation_context,
+            interaction_mode=resolved_interaction_mode,
+            resume=resume,
+            failure=_build_startup_failure_record(
+                phase="runner_startup",
+                setup_phase="default_branch",
+                message=message,
+                error=exc,
+            ),
+        )
+        return 1
 
     # Refresh origin/default_branch when possible, then choose the worktree base later via
     # _select_worktree_base_ref(), which prefers the local default branch unless origin is
@@ -7357,20 +7503,40 @@ def run(
     # Always generate when slug is not set (new tasks, including new resume tasks).
     # Keep existing slug only when resuming a task that already has one assigned.
     if task.slug is None:
-        slug_override = _compute_slug_override(task, store)
-        task.slug = generate_slug(
-            task.prompt,
-            existing_id=None,
-            log_path=config.log_path,
-            git=git,
-            store=store,
-            exclude_task_id=task.id,
-            project_name=config.project_name,
-            project_prefix=config.project_prefix,
-            slug_override=slug_override,
-            branch_strategy=config.branch_strategy,
-            explicit_type=task.task_type_hint,
-        )
+        try:
+            slug_override = _compute_slug_override(task, store)
+            task.slug = generate_slug(
+                task.prompt,
+                existing_id=None,
+                log_path=config.log_path,
+                git=git,
+                store=store,
+                exclude_task_id=task.id,
+                project_name=config.project_name,
+                project_prefix=config.project_prefix,
+                slug_override=slug_override,
+                branch_strategy=config.branch_strategy,
+                explicit_type=task.task_type_hint,
+            )
+        except GitError as exc:
+            message = str(exc)
+            error_message(f"Git error: {message}")
+            _record_startup_failure(
+                task=task,
+                config=config,
+                store=store,
+                provider=provider,
+                invocation=invocation_context,
+                interaction_mode=resolved_interaction_mode,
+                resume=resume,
+                failure=_build_startup_failure_record(
+                    phase="runner_startup",
+                    setup_phase="slug_generation",
+                    message=message,
+                    error=exc,
+                ),
+            )
+            return 1
     if task.slug and task.log_file:
         startup_log = config.project_dir / Path(task.log_file)
         if startup_log.name.endswith(".startup.log"):
@@ -7634,11 +7800,15 @@ def _setup_code_task_worktree(
         except GitError as e:
             message = f"Could not check out branch {branch_name} in worktree: {e}"
             error_message(f"Error: {message}")
+            resolved_failure = _resolved_git_failure(e)
             return WorkspaceSetupResult(
                 ok=False,
                 message=message,
+                failure_reason=resolved_failure.reason,
                 phase="worktree_add_existing",
                 branch=branch_name,
+                error_type=e.__class__.__name__,
+                error_detail=str(e),
             )
 
     # Delete existing branch if in single mode (worktree_add will recreate it)
@@ -7655,11 +7825,15 @@ def _setup_code_task_worktree(
     except GitError as e:
         message = str(e)
         error_message(f"Git error: {message}")
+        resolved_failure = _resolved_git_failure(e)
         return WorkspaceSetupResult(
             ok=False,
             message=message,
+            failure_reason=resolved_failure.reason,
             phase="worktree_add",
             branch=branch_name,
+            error_type=e.__class__.__name__,
+            error_detail=message,
         )
 
 
@@ -8646,6 +8820,7 @@ def _run_inner(
             resume=resume,
             message=message,
             phase="default_branch",
+            error=exc,
         )
         return 1
 
@@ -8664,6 +8839,7 @@ def _run_inner(
             resume=resume,
             message=message,
             phase="branch_resolution",
+            error=exc,
         )
         return 1
     if branch_name is None:
@@ -8723,6 +8899,7 @@ def _run_inner(
                 message=message,
                 phase="isolated_checkout",
                 branch=branch_name,
+                error=exc,
             )
             return 1
         worktree_path = isolated_checkout.path
@@ -8760,6 +8937,8 @@ def _run_inner(
                 failure_reason=failure_reason,
                 phase=phase,
                 branch=failed_branch,
+                error_type=setup_result.error_type if isinstance(setup_result, WorkspaceSetupResult) else None,
+                error_detail=setup_result.error_detail if isinstance(setup_result, WorkspaceSetupResult) else None,
             )
             return 1
 
@@ -9849,6 +10028,7 @@ def _run_non_code_task(
             message=message,
             failure_reason=resolved_failure.reason,
             phase="detached_worktree",
+            error=e,
             prelude_written=True,
         )
         return 1

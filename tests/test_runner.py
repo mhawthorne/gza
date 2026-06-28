@@ -18510,6 +18510,149 @@ class TestExceptionHandlerMarkFailed:
         assert outcome["setup_phase"] == "detached_worktree"
         assert any(entry.get("subtype") == "execution" for entry in ops_entries)
 
+    def test_run_records_structured_runner_startup_failure_before_execution(self, tmp_path: Path) -> None:
+        """Direct runner startup failures should persist a structured startup_failure record."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement startup failure logging", task_type="implement")
+        assert task.id is not None
+        task.branch = "feature/existing-startup-branch"
+        store.update(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.check_credentials.return_value = True
+        provider.verify_credentials.return_value = PreflightCheckResult.success()
+
+        git = Mock(spec=Git)
+        startup_error = "fatal: broken startup default branch probe"
+        git.default_branch.side_effect = GitError(startup_error)
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=provider),
+            patch("gza.runner.Git", return_value=git),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.branch == "feature/existing-startup-branch"
+        assert refreshed.log_file is not None
+
+        log_file = config.project_dir / refreshed.log_file
+        assert log_file.exists()
+        conversation_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        startup_entry = next(
+            entry for entry in conversation_entries if entry.get("subtype") == "startup_failure"
+        )
+        assert startup_entry["message"] == startup_error
+        assert startup_entry["failure_reason"] == "GIT_ERROR"
+        assert startup_entry["phase"] == "runner_startup"
+        assert startup_entry["setup_phase"] == "default_branch"
+        assert startup_entry["branch"] == "feature/existing-startup-branch"
+        assert startup_entry["error_type"] == "GitError"
+        assert startup_entry["error_detail"] == startup_error
+
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        ops_start = next(entry for entry in ops_entries if entry.get("subtype") == "startup_failure")
+        assert ops_start["phase"] == "runner_startup"
+        outcome = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome["phase"] == "runner_startup"
+        assert outcome["setup_phase"] == "default_branch"
+
+    def test_run_records_structured_workspace_setup_failure_before_execution(self, tmp_path: Path) -> None:
+        """Workspace setup GitErrors should preserve structured startup-failure fields."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+        task = store.add(prompt="Implement workspace setup failure logging", task_type="implement")
+        assert task.id is not None
+        task.slug = "20260628-workspace-setup-failure"
+        task.branch = "feature/workspace-setup-failure"
+        store.update(task)
+
+        provider = Mock()
+        provider.name = "TestProvider"
+        provider.check_credentials.return_value = True
+        provider.verify_credentials.return_value = PreflightCheckResult.success()
+
+        git = Mock(spec=Git)
+        setup_error = "fatal: cannot lock ref 'refs/heads/feature/workspace-setup-failure'"
+        git.default_branch.return_value = "main"
+        git.worktree_add.side_effect = GitError(setup_error)
+
+        with (
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.get_provider", return_value=provider),
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._resolve_code_task_branch_name",
+                return_value="feature/workspace-setup-failure",
+            ),
+        ):
+            rc = run(config, task_id=task.id)
+
+        assert rc == 1
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.branch == "feature/workspace-setup-failure"
+        assert refreshed.log_file is not None
+
+        log_file = config.project_dir / refreshed.log_file
+        assert log_file.exists()
+        conversation_entries = [
+            json.loads(line)
+            for line in log_file.read_text().splitlines()
+            if line.strip()
+        ]
+        startup_entry = next(
+            entry for entry in conversation_entries if entry.get("subtype") == "startup_failure"
+        )
+        assert startup_entry["phase"] == "workspace_setup"
+        assert startup_entry["setup_phase"] == "worktree_add"
+        assert startup_entry["branch"] == "feature/workspace-setup-failure"
+        assert startup_entry["error_type"] == "GitError"
+        assert startup_entry["error_detail"] == setup_error
+
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        ops_start = next(entry for entry in ops_entries if entry.get("subtype") == "startup_failure")
+        assert ops_start["phase"] == "workspace_setup"
+        assert ops_start["setup_phase"] == "worktree_add"
+        assert ops_start["branch"] == "feature/workspace-setup-failure"
+        assert ops_start["error_type"] == "GitError"
+        assert ops_start["error_detail"] == setup_error
+
     def test_git_error_in_run_inner_marks_failed(self, tmp_path: Path):
         """Test that GitError during post-run finalization marks the task as failed."""
 
