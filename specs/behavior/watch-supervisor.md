@@ -410,13 +410,18 @@ When the installed `gza` package fingerprint changes while watch is running:
   separate hand-curated allowlist of parked slugs.
 - Watch MUST NOT start a new iterate worker for a lineage whose latest shared action is
   already one of those parked human-needed states.
-- `uv run gza unstick` is the manual operator escape hatch for the subset of parked
-  owner states that are intentionally clear-only in this slice: `watch-no-progress-backstop`
-  and `reconcile-needs-manual-resolution`. That command MUST clear only watch-owned
-  exclusion state for the selected owner/subject and MUST NOT itself start work, bypass
-  slot accounting, or invent a second lifecycle engine. After the clear, the next shared
-  owner-row evaluation by `watch` or `advance` decides whether the owner is actionable
-  again or still parked for the same underlying reason.
+- `uv run gza unstick` is the manual operator escape hatch for parked owner states such as
+  `watch-no-progress-backstop`, `retry-limit-reached`, and
+  `reconcile-needs-manual-resolution`.
+- Plain `uv run gza unstick` MUST clear only the watch-owned exclusion state for the
+  selected owner/subject and MUST NOT itself start work.
+- `uv run gza unstick --run` MAY immediately dispatch only the owners it just cleared, but
+  it MUST do so by reusing the same scoped watch dispatch path, slot accounting, and
+  launch-permit rules instead of inventing a second lifecycle engine or bypassing shared
+  capacity. If no slots are available, it MUST still clear state and report zero starts.
+- After the clear-only or clear-plus-run pass, the next shared owner-row evaluation by
+  `watch` or `advance` decides whether the owner is actionable again or still parked for
+  the same underlying reason.
 - `uv run gza unstick` MUST require an explicit selector (`task-id`, `--tag`, `--reason`,
   or `--all`) so an operator cannot accidentally clear every parked owner in the project.
 - For the no-progress backstop, the command MAY discover parked owners either from the

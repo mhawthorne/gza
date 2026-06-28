@@ -239,9 +239,13 @@ its stored action.
   after the owner is no longer currently parked MUST be a safe no-op that reports `not
   currently parked`, not a second effective reset.
 - `backstop` and `reconcile` clears remain clear-only watch-state resets. `retry-limit`
-  clear is also clear-only in the sense that it MUST NOT spawn workers itself; it only
-  records the durable rearm epoch that lets the next shared recovery evaluation become
-  actionable again.
+  clear is also clear-only in the sense that the clear operation itself MUST NOT spawn
+  workers; it only records the durable rearm epoch that lets the next shared recovery
+  evaluation become actionable again.
+- `uv run gza unstick --run` MAY immediately dispatch the just-cleared owner through the
+  shared scoped watch dispatcher, but it MUST still spend recovery capacity only through
+  the same shared slot and permit rules that `watch` uses, and direct recovery actions
+  such as reconcile MUST NOT consume worker slots.
 
 ## Policy knobs
 

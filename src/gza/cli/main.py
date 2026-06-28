@@ -523,9 +523,10 @@ def main() -> int:
     # unstick command
     unstick_parser = subparsers.add_parser(
         "unstick",
-        help="Manually clear eligible parked backstop/retry-limit/reconcile owner state without starting work",
+        help="Manually clear eligible parked backstop/retry-limit/reconcile owner state, optionally dispatching it through scoped watch",
         description=(
-            "Manually clear eligible parked backstop/retry-limit/reconcile owner state without starting work. "
+            "Manually clear eligible parked backstop/retry-limit/reconcile owner state. "
+            "With --run, dispatch cleared owners through the shared scoped watch path. "
             "Requires at least one explicit selector."
         ),
     )
@@ -560,6 +561,17 @@ def main() -> int:
         "--all",
         action="store_true",
         help="Select all currently parked owners within the requested tag/reason scope",
+    )
+    unstick_parser.add_argument(
+        "--run",
+        action="store_true",
+        help="After clearing parked state, dispatch only the cleared owners through the shared scoped watch path",
+    )
+    unstick_parser.add_argument(
+        "--limit",
+        type=_parse_non_negative_int,
+        metavar="N",
+        help="Cap shared dispatch starts for --run (default: max_concurrent; still bounded by live worker capacity)",
     )
     add_common_args(unstick_parser)
 

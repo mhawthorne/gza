@@ -1817,7 +1817,7 @@ Held completed plans use `next_action = awaiting_human` with `reason=awaiting-hu
 
 ### unstick
 
-Manually clear currently parked owner state for eligible backstop, retry-limit, or reconcile rows without starting any worker.
+Manually clear currently parked owner state for eligible backstop, retry-limit, or reconcile rows. Optionally dispatch the cleared owners through the shared scoped watch path.
 
 ```bash
 uv run gza unstick [task_id ...] [options]
@@ -1830,10 +1830,19 @@ uv run gza unstick [task_id ...] [options]
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--reason backstop\|retry-limit\|reconcile` | Only select the named parked reason class (repeatable) |
 | `--all` | Select all currently parked owners within the requested tag/reason scope |
+| `--run` | After clearing parked state, dispatch only the cleared owners through the shared scoped watch path |
+| `--limit N` | Cap new worker-consuming starts for `--run` (default: `max_concurrent`; actual starts still respect live worker capacity and shared permits) |
 
 `uv run gza unstick` requires at least one explicit selector: one or more `task_id` arguments, `--tag`, `--reason backstop|retry-limit|reconcile`, or `--all`. Combinations narrow the selected parked-owner set: explicit IDs define the starting set, then tag and reason filters further restrict it.
 
-This is a clear-only / no-worker operator command. It clears the shared parked-state exclusion for the selected owner and exits; it does not spawn `watch` or dispatch an iterate worker. Once cleared, the next normal `uv run gza advance` or `uv run gza watch` pass re-evaluates the owner through the same shared lifecycle planning.
+Plain `uv run gza unstick` remains the clear-only / no-worker operator command. It clears the shared parked-state exclusion for the selected owner and exits; it does not spawn `watch` or own a second executor. With `--run`, the command still clears first, then reuses the same scoped watch dispatch helper, live slot ceiling, `max_concurrent`, and launch-permit rules that `uv run gza watch` already uses. `--limit N` caps new worker-consuming starts in that scoped pass; existing live workers still count against the shared ceiling first.
+
+`uv run gza unstick --run` reports three post-clear outcomes for the owners it successfully re-armed:
+- `started` — shared dispatch actually launched worker-consuming follow-up work
+- `cleared-only` — the owner was cleared but either only direct shared lifecycle work ran or no worker-consuming action was started in that scoped pass
+- `capacity-blocked` — the next shared worker-consuming action was eligible, but no shared watch worker slots were available
+
+If no shared worker slots are available, `unstick --run` still clears the parked state and reports `0 started`; it does not bypass watch capacity rules or start work outside the shared dispatcher.
 
 `backstop` maps to `watch-no-progress-backstop`. `retry-limit` maps to `retry-limit-reached`. `reconcile` maps to `reconcile-needs-manual-resolution`. For all supported reason classes, `unstick` reuses the same landed/moot guardrails before clearing. Rows already proved `merged`, or already terminal as `empty` / `redundant`, are reported as skips instead of being re-armed.
 

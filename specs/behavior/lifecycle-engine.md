@@ -275,19 +275,14 @@ When a current review exists for the implementation lineage:
   - An improve is `in_progress` → `wait_improve`; `pending` → `run_improve`. (See
     [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
   - No improve yet, and no bound is tripped → create an `improve` task.
-  - The latest review's parsed `BLOCKER` findings plus any unresolved `feedback`
-    comments newer than that review form one atomic improve closure set. Improve MUST
-    inventory the full current set before editing, plan fixes against the set
-    collectively, re-check previously addressed entries after the last edit, and
-    complete only when every in-scope entry is closed or explicitly disputed under the
-    existing dispute contract.
-  - Improve reports MUST include a machine-readable `## Blocker Closure Ledger
-    (Machine Readable)` section covering every in-scope blocker/comment, its closure
-    status, and closure/verify evidence. The ledger is an accountability/reporting
-    contract; it does not by itself clear review state or override lifecycle decisions.
-  - Targeted tests during improve are inner-loop checks only. Improve completion still
-    requires the configured full final verify gate after the last edit unless the
-    existing no-op dispute or verify-only review-clearance contract explicitly applies.
+  - Improve work is atomic over the full current blocker/comment set for that pass. The
+    improve worker MUST inventory every current review blocker and unresolved feedback
+    comment before editing, plan one shared fix set, re-check the full set after the last
+    edit, and run the configured final full verify gate after any targeted inner-loop
+    checks before reporting closure.
+  - Improve reports MUST include a machine-readable `## Blocker Closure Ledger (Machine
+    Readable)` section covering every in-scope blocker/comment, including disputed no-op
+    entries, so operators can audit closure evidence separately from free-form narrative.
   - A completed no-op improve MAY dispute a non-verify CODE blocker only by supplying
     structured current-state evidence that the blocker is unreproducible, stale, already
     satisfied, out of scope, or otherwise invalid. Prior review text or task history
@@ -306,11 +301,6 @@ When a current review exists for the implementation lineage:
 - When a resolved review scope exists, that scope is the only gradeable ask for review.
   Linked plan text MUST be rendered only as labeled background context and MUST NOT
   widen the contract beyond the resolved review scope.
-- When improve-lineage context exists, review SHOULD narrowly re-check for regressions of
-  blocker classes the latest improve was expected to close, but review MUST report
-  blockers only from current-source evidence in the current diff/code under the active
-  review scope. Prior review prose, improve lineage, or task history are not
-  independent blocker proof.
 - Verdict is unknown / unclassifiable → `needs_discussion` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 
@@ -647,9 +637,9 @@ when the resolved implementation already reached `completed`; if the implementat
 completed and is merely parked/failed, operators must be directed to retry or
 re-implement instead of creating a fix task.
 
-Manual clear-only operator semantics are intentionally narrow. `uv run gza unstick`
-may target parked owners with reason class `backstop` (`watch-no-progress-backstop`),
-`retry-limit` (`retry-limit-reached`), or `reconcile`
+Manual operator semantics for `uv run gza unstick` are intentionally narrow. The
+command may target parked owners with reason class `backstop`
+(`watch-no-progress-backstop`), `retry-limit` (`retry-limit-reached`), or `reconcile`
 (`reconcile-needs-manual-resolution`).
 
 - For `backstop` and `reconcile`, it MUST clear only the watch-owned exclusion state that
@@ -657,7 +647,11 @@ may target parked owners with reason class `backstop` (`watch-no-progress-backst
 - For `retry-limit`, it MUST record one durable manual-rearm epoch for the parked subject
   and reason so the next shared recovery evaluation measures retry budget from that epoch
   instead of lifetime history.
-- In all cases it MUST NOT start workers itself or downgrade landed/moot guards.
+- Plain `uv run gza unstick` MUST remain clear-only and MUST NOT start workers itself.
+- `uv run gza unstick --run` MAY immediately dispatch only the owners it just cleared, but
+  it MUST do so by reusing the shared scoped watch dispatch path, shared slot ceiling,
+  `max_concurrent`, and launch-permit rules rather than owning a second executor.
+- In all cases it MUST NOT downgrade landed/moot guards.
 
 If the selected owner is already merged, terminal `empty`/`redundant`, branch-missing
 and therefore unprovable, or otherwise not currently parked, the command MUST skip it

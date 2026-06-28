@@ -2426,6 +2426,9 @@ class _CycleResult:
     confirmed_start_count: int = 0
 
 
+_DispatchObserver = Callable[[str, Literal["started", "direct", "capacity_blocked"], str], None]
+
+
 @dataclass(frozen=True)
 class _ExpectedStart:
     recovery_action: str
@@ -3469,6 +3472,8 @@ def _dispatch_scoped_watch_once(
     emit_cycle_header: bool = True,
     emit_lifecycle_summary: bool = True,
     scoped_owner_ids: tuple[str, ...],
+    dispatch_observer: _DispatchObserver | None = None,
+    new_worker_start_cap: int | None = None,
 ) -> _CycleResult:
     """Run one scoped watch dispatch pass through the shared watch execution path."""
     return _run_cycle(
@@ -3493,6 +3498,8 @@ def _dispatch_scoped_watch_once(
         emit_cycle_header=emit_cycle_header,
         emit_lifecycle_summary=emit_lifecycle_summary,
         scoped_owner_ids=scoped_owner_ids,
+        dispatch_observer=dispatch_observer,
+        new_worker_start_cap=new_worker_start_cap,
     )
 
 
@@ -3521,6 +3528,8 @@ def _run_cycle(
     emit_cycle_header: bool = True,
     emit_lifecycle_summary: bool = True,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    dispatch_observer: _DispatchObserver | None = None,
+    new_worker_start_cap: int | None = None,
 ) -> _CycleResult:
     from ._common import (
         prune_terminal_dead_workers,
@@ -3578,6 +3587,11 @@ def _run_cycle(
     expected_starts: dict[str, _ExpectedStart] = {}
     step1_handled_child_task_ids: set[str] = set()
     reserved_recovery_slots = 0
+    remaining_new_worker_starts = (
+        max(0, new_worker_start_cap)
+        if new_worker_start_cap is not None
+        else None
+    )
 
     def _check_canonical_checkout_boundary(action: str) -> None:
         if dry_run:
@@ -3662,9 +3676,29 @@ def _run_cycle(
         nonlocal slots, reserved_recovery_slots
         if not result.worker_consuming:
             return
+        _consume_new_worker_start(reserve_recovery_slot=reserve_recovery_slot)
+
+    def _consume_new_worker_start(*, reserve_recovery_slot: bool = False) -> None:
+        nonlocal slots, reserved_recovery_slots, remaining_new_worker_starts
         slots = max(0, slots - 1)
         if reserve_recovery_slot:
             reserved_recovery_slots = max(0, reserved_recovery_slots - 1)
+        if remaining_new_worker_starts is not None:
+            remaining_new_worker_starts = max(0, remaining_new_worker_starts - 1)
+
+    def _free_worker_start_slots() -> int:
+        if remaining_new_worker_starts is None:
+            return slots
+        return min(slots, remaining_new_worker_starts)
+
+    def _observe_dispatch(
+        owner_task_id: str | None,
+        outcome: Literal["started", "direct", "capacity_blocked"],
+        action_type: str,
+    ) -> None:
+        if dispatch_observer is None or owner_task_id is None:
+            return
+        dispatch_observer(str(owner_task_id), outcome, action_type)
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
@@ -3798,7 +3832,7 @@ def _run_cycle(
         max_resume_attempts=max_recovery_attempts,
         use_iterate_for_create_implement=True,
         use_iterate_for_needs_rebase=False,
-        can_spawn_worker=lambda _kind: slots > 0,
+        can_spawn_worker=lambda _kind: _free_worker_start_slots() > 0,
         no_worker_capacity_message=lambda worker_label: f"SKIP: no watch worker slots available for {worker_label}",
         prepare_task_for_background_start=lambda task, rollback_on_failure: _prepare_task_for_immediate_execution(
             config,
@@ -3963,7 +3997,7 @@ def _run_cycle(
                 )
         execution_decisions = plan_lifecycle_execution(
             action_plan,
-            free_worker_slots=slots,
+            free_worker_slots=_free_worker_start_slots(),
             get_action=lambda item: item[2],
         )
         if can_merge and not merge_halted_for_cycle:
@@ -4035,7 +4069,11 @@ def _run_cycle(
                 )
                 continue
 
-            if not _shared_lifecycle_actions.should_execute_lifecycle_action(action, free_worker_slots=slots):
+            if not _shared_lifecycle_actions.should_execute_lifecycle_action(
+                action,
+                free_worker_slots=_free_worker_start_slots(),
+            ):
+                _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
                 log.emit(
                     "SKIP",
                     f"{display_task.id}: no watch worker slots available for {action_type}",
@@ -4253,7 +4291,7 @@ def _run_cycle(
                                 )
                                 continue
                             step1_handled_child_task_ids.add(str(rebase_task.id))
-                            if slots > 0:
+                            if _free_worker_start_slots() > 0:
                                 rebase_task_before = _snapshot_watch_dispatch_task(prepared_rebase_task)
                                 rebase_rc = _watch_spawn_worker(prepared_rebase_task, "rebase")
                                 _release_watch_reserved_task(str(prepared_rebase_task.id))
@@ -4279,7 +4317,7 @@ def _run_cycle(
                                         continue
                                     log.emit("START", f"{prepared_rebase_task.id} rebase")
                                     started_task_ids.add(str(prepared_rebase_task.id))
-                                    slots -= 1
+                                    _consume_new_worker_start()
                                     work_done = True
                                 else:
                                     log.emit(
@@ -4372,6 +4410,11 @@ def _run_cycle(
             guarded_pending_task_id = exec_result.guarded_pending_task_id
 
             if exec_result.status == "skip":
+                if (
+                    display_task.id is not None
+                    and exec_result.message.startswith("SKIP: no watch worker slots available for ")
+                ):
+                    _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
                 if guarded_pending_task_id is not None:
                     step1_handled_child_task_ids.add(str(guarded_pending_task_id))
                 message = exec_result.message
@@ -4535,6 +4578,7 @@ def _run_cycle(
                     no_progress_cycles=config.watch.no_progress_cycles,
                 )
                 started_task_ids.add(str(child_id))
+                _observe_dispatch(display_task.id, "started", str(action_type))
                 _consume_worker_slot_if_needed(exec_result)
                 work_done = True
                 if no_progress_attention is not None:
@@ -4555,6 +4599,7 @@ def _run_cycle(
                     no_progress_cycles=config.watch.no_progress_cycles,
                 )
                 if display_task.id is not None:
+                    _observe_dispatch(display_task.id, "direct", str(action_type))
                     log.emit(
                         "REPAIR",
                         f"{display_task.id}: {exec_result.success_message or exec_result.message}",
@@ -4567,6 +4612,8 @@ def _run_cycle(
                         )
                 work_done = True
             elif exec_result.status == "success":
+                if display_task.id is not None and not exec_result.worker_consuming:
+                    _observe_dispatch(display_task.id, "direct", str(action_type))
                 refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
                 no_progress_attention = _finalize_watch_no_progress_after_execution(
                     config=config,
@@ -4695,6 +4742,8 @@ def _run_cycle(
         include_pending=scoped_owner_ids is None,
     )
     reserved_recovery_slots = dispatch_plan.recovery_worker_slots
+    if remaining_new_worker_starts is not None:
+        reserved_recovery_slots = min(reserved_recovery_slots, remaining_new_worker_starts)
     pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
     nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids) | set(analysis.active_recovery_subject_ids)
     recovery_started_this_cycle = False
@@ -4728,7 +4777,8 @@ def _run_cycle(
                 action=recovery_action,
             ):
                 continue
-        if worker_consuming_recovery and reserved_recovery_slots <= 0:
+        if worker_consuming_recovery and (_free_worker_start_slots() <= 0 or reserved_recovery_slots <= 0):
+            _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
             continue
         if not dry_run:
             no_progress_attention = _maybe_park_watch_no_progress(
@@ -4772,6 +4822,8 @@ def _run_cycle(
                 continue
             exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
             if exec_result.status == "skip":
+                if exec_result.message.startswith("SKIP: no watch worker slots available for "):
+                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
                 attention = resolve_execution_needs_attention(failed, exec_result)
                 if attention is not None:
                     log.emit_attention(
@@ -4793,6 +4845,7 @@ def _run_cycle(
                 )
                 continue
             if exec_result.status == "success":
+                _observe_dispatch(row.owner_task.id, "direct", recovery_action_type)
                 refreshed_failed = store.get(failed.id) if failed.id is not None else None
                 no_progress_attention = _finalize_watch_no_progress_after_execution(
                     config=config,
@@ -4850,6 +4903,8 @@ def _run_cycle(
                 continue
             exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
             if exec_result.status == "skip":
+                if exec_result.message.startswith("SKIP: no watch worker slots available for "):
+                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
                 attention = resolve_execution_needs_attention(failed, exec_result)
                 if attention is not None:
                     log.emit_attention(
@@ -4886,6 +4941,7 @@ def _run_cycle(
             )
             recovery_started_this_cycle = True
             started_task_ids.add(recovered_task_id)
+            _observe_dispatch(row.owner_task.id, "started", recovery_action_type)
             expected_starts[recovered_task_id] = _ExpectedStart(
                 recovery_action="needs_rebase",
                 parent_failed_id=str(failed.id),
@@ -4910,13 +4966,13 @@ def _run_cycle(
                         f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
                     ),
                 )
-                slots -= 1
-                reserved_recovery_slots -= 1
+                _consume_new_worker_start(reserve_recovery_slot=True)
                 work_done = True
                 continue
             if decision.launch_mode == "worker":
                 reserved_launch = _reserve_watch_launch("resume", str(failed.id))
                 if reserved_launch is None:
+                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
                     continue
                 if decision.reuse_existing:
                     assert decision.recovery_task_id is not None
@@ -4968,6 +5024,7 @@ def _run_cycle(
             else:
                 reserved_launch = _reserve_watch_launch("iterate", str(failed.id))
                 if reserved_launch is None:
+                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
                     continue
                 if decision.reuse_existing:
                     assert decision.recovery_task_id is not None
@@ -5033,8 +5090,7 @@ def _run_cycle(
                         f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
                     ),
                 )
-                slots -= 1
-                reserved_recovery_slots -= 1
+                _consume_new_worker_start(reserve_recovery_slot=True)
                 work_done = True
                 continue
             reserved_launch = _reserve_watch_launch(
@@ -5042,6 +5098,7 @@ def _run_cycle(
                 str(failed.id),
             )
             if reserved_launch is None:
+                _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
                 continue
             if decision.reuse_existing:
                 assert decision.recovery_task_id is not None
@@ -5140,13 +5197,13 @@ def _run_cycle(
         )
         recovery_started_this_cycle = True
         started_task_ids.add(recovered_task_id)
+        _observe_dispatch(row.owner_task.id, "started", recovery_action_type)
         expected_starts[recovered_task_id] = _ExpectedStart(
             recovery_action=recovery_action_type,
             parent_failed_id=str(failed.id),
             launch_mode=decision.launch_mode,
         )
-        slots -= 1
-        reserved_recovery_slots -= 1
+        _consume_new_worker_start(reserve_recovery_slot=True)
         work_done = True
         if no_progress_attention is not None:
             log.emit_attention(

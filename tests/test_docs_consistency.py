@@ -589,22 +589,6 @@ def test_lifecycle_spec_preserves_typed_review_comment_contract() -> None:
     assert "Unresolved review comments newer than the latest completed review MUST be addressed" not in lifecycle_flat
 
 
-def test_lifecycle_and_workflow_docs_capture_atomic_improve_contract() -> None:
-    """Spec and workflow docs should agree on the atomic improve closure contract."""
-    repo_root = Path(__file__).resolve().parents[1]
-    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
-    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
-
-    assert "one atomic improve closure set" in lifecycle
-    assert "machine-readable `## Blocker Closure Ledger" in lifecycle
-    assert "Targeted tests during improve are inner-loop checks only." in lifecycle
-    assert "full final verify gate after the last edit" in lifecycle
-    assert "The improve worker contract is now atomic across the current review/comment set." in workflow
-    assert "emit a required `## Blocker Closure Ledger (Machine Readable)`" in workflow
-    assert "Targeted tests remain the inner loop for improve work" in workflow
-    assert "may only report blockers backed by current-source evidence" in workflow
-
-
 def test_verify_only_noop_improve_contract_does_not_claim_generic_recapture() -> None:
     """Spec/report text should stay aligned with the narrowed same-head failed-review recapture path."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -1237,8 +1221,10 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
     assert "requires at least one explicit selector" in unstick_section
     assert "--reason backstop\\|retry-limit\\|reconcile" in unstick_section
-    assert "clear-only / no-worker operator command" in unstick_section
-    assert "does not spawn `watch` or dispatch an iterate worker" in unstick_section
+    assert "Cap new worker-consuming starts for `--run`" in unstick_section
+    assert "Plain `uv run gza unstick` remains the clear-only / no-worker operator command" in unstick_section
+    assert "With `--run`, the command still clears first, then reuses the same scoped watch dispatch helper" in unstick_section
+    assert "If no shared worker slots are available, `unstick --run` still clears the parked state and reports `0 started`" in unstick_section
     assert "fresh `retry-limit` clear records one durable manual rearm epoch" in unstick_section
     assert "not currently parked" in unstick_section
     assert "missing branch cannot prove unresolved" in unstick_section

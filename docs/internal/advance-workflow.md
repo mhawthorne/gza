@@ -12,6 +12,12 @@ The shared rule engine introduced for `advance` is also the decision source for 
 
 As a result, this change set includes iterate-facing contract alignment where needed (status wording, help text, and regressions) in the same patch as the engine migration, rather than splitting into a separate task with duplicated decision logic changes.
 
+`uv run gza unstick --run` follows the same principle. It does not own a second
+executor. After clearing parked state, it reuses watch's scoped one-shot dispatch helper
+for only the selected owners, so slot ceilings, launch permits, recovery routing, and
+worker-consuming-vs-direct action accounting stay identical across `watch` and
+`unstick --run`.
+
 Manual `gza merge` has one deliberate operator-only escape hatch that `advance`/`watch`
 do not share: it can defer review blockers into urgent PR-required follow-up tasks when a
 human explicitly invokes merge (or when the latest blocked review is verify-only). The
@@ -273,24 +279,13 @@ no-op, duplicate-blocker, or bounded-review-loop parks; if runtime behavior stil
 that mismatch is an implementation gap against the spec, not operator-facing no-op-only
 guidance.
 
-The improve worker contract is now atomic across the current review/comment set. For a
-given `(implementation, review)` pair, the latest review's parsed blockers plus any
-unresolved `feedback` comments form one closure unit for the improve pass. The improve
-prompt must tell the worker to inventory the full set before editing, plan fixes against
-that set collectively, re-check previously addressed entries after the last edit, and
-emit a required `## Blocker Closure Ledger (Machine Readable)` covering every in-scope
-blocker/comment with status plus closure/verify evidence. That ledger is observability
-and accountability only; runtime does not clear review state from the ledger by itself.
-
-Targeted tests remain the inner loop for improve work, but they are not completion proof.
-The pass still requires the configured full final verify command after the last edit,
-unless the existing no-op dispute contract or verify-only same-head clearance contract is
-the applicable path.
-
-Review prompts also carry a narrow improve-lineage anti-regression rule: if lineage
-history shows the latest improve was expected to close a blocker class, the reviewer
-should re-check the current code/diff for regressions of that class, but may only report blockers backed by current-source evidence. Prior review text or lineage metadata can
-point at what to inspect; they are not enough to reopen a blocker by themselves.
+More generally, the improve worker contract is atomic over the full current blocker set,
+not one finding at a time. Improve prompts must require the worker to inventory every
+current review blocker and unresolved feedback comment before editing, plan one shared fix
+set, re-check that same full set after the last edit, and run the configured final full
+verify gate after any targeted inner-loop checks. The report must also include a machine-
+readable `## Blocker Closure Ledger (Machine Readable)` section so humans and later tasks
+can audit exactly which blockers/comments were addressed, disputed, or left unresolved.
 
 Advance also computes a duplicate-blocker streak from completed review reports only. When the latest completed `CHANGES_REQUESTED` review and the two immediately preceding completed review cycles all carry the same primary blocker fingerprint (normalized blocker title plus the first open-state citation, or the normalized required-fix text when no citation exists), the engine first routes that repeated blocker through review-blocker adjudication using synthesized dispute metadata bound to the current reviewed branch state. Only if adjudication later returns `NEEDS_HUMAN` (or the adjudication path is otherwise exhausted) does lifecycle surface `needs_discussion` with reason `duplicate-blocker-no-progress`. The streak resets across any completed same-lineage rebase between the compared reviews, on any non-`CHANGES_REQUESTED` review, on missing blocker fingerprints, or when the primary blocker changes.
 
