@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,11 +16,18 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
+import gza.metrics as metrics
 from gza.artifact_paths import normalize_artifact_path
-from gza.metrics import instrument_public_methods
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
 logger = logging.getLogger(__name__)
+
+_SQLITE_OPERATION_LATENCY_METRIC = "gza_sqlite_operation_latency_seconds"
+_SQLITE_CONNECT_LABELS = {"operation": "connect"}
+_SQLITE_EXECUTE_LABELS = {"operation": "execute"}
+_SQLITE_EXECUTEMANY_LABELS = {"operation": "executemany"}
+_SQLITE_EXECUTESCRIPT_LABELS = {"operation": "executescript"}
+_SQLITE_CLOSE_LABELS = {"operation": "close"}
 
 if TYPE_CHECKING:
     from gza.config import Config
@@ -65,6 +73,7 @@ __all__ = [
 ]
 
 StoreOpenMode = Literal["readwrite", "query_only"]
+SqliteIsolationLevel = Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None
 
 TASK_COMMENT_KIND_FEEDBACK = "feedback"
 TASK_COMMENT_KIND_REVIEW_SCOPE = "review_scope"
@@ -146,7 +155,80 @@ class DuplicateActiveChildError(ValueError):
         )
 
 
-class _ClosingSqliteConnection(sqlite3.Connection):
+def _observe_sqlite_latency(seconds: float, *, labels: dict[str, str]) -> None:
+    """Record one aggregate sqlite latency observation with bounded labels."""
+    metrics.observe_latency(_SQLITE_OPERATION_LATENCY_METRIC, seconds, labels=labels)
+
+
+def _timed_sqlite_connect(
+    database: str | Path,
+    *,
+    isolation_level: SqliteIsolationLevel,
+    timeout: float,
+    factory: type[sqlite3.Connection],
+) -> sqlite3.Connection:
+    """Open a sqlite connection and record one aggregate connect observation."""
+    if not metrics.enabled():
+        return sqlite3.connect(
+            database,
+            isolation_level=isolation_level,
+            timeout=timeout,
+            factory=factory,
+        )
+    started = time.perf_counter()
+    try:
+        return sqlite3.connect(
+            database,
+            isolation_level=isolation_level,
+            timeout=timeout,
+            factory=factory,
+        )
+    finally:
+        _observe_sqlite_latency(time.perf_counter() - started, labels=_SQLITE_CONNECT_LABELS)
+
+
+class _InstrumentedSqliteConnection(sqlite3.Connection):
+    """sqlite3 connection that records aggregate latency at SQL chokepoints."""
+
+    def execute(self, sql: str, parameters=(), /):
+        if not metrics.enabled():
+            return super().execute(sql, parameters)
+        started = time.perf_counter()
+        try:
+            return super().execute(sql, parameters)
+        finally:
+            _observe_sqlite_latency(time.perf_counter() - started, labels=_SQLITE_EXECUTE_LABELS)
+
+    def executemany(self, sql: str, seq_of_parameters, /):
+        if not metrics.enabled():
+            return super().executemany(sql, seq_of_parameters)
+        started = time.perf_counter()
+        try:
+            return super().executemany(sql, seq_of_parameters)
+        finally:
+            _observe_sqlite_latency(time.perf_counter() - started, labels=_SQLITE_EXECUTEMANY_LABELS)
+
+    def executescript(self, sql_script: str, /):
+        if not metrics.enabled():
+            return super().executescript(sql_script)
+        started = time.perf_counter()
+        try:
+            return super().executescript(sql_script)
+        finally:
+            _observe_sqlite_latency(time.perf_counter() - started, labels=_SQLITE_EXECUTESCRIPT_LABELS)
+
+    def close(self) -> None:
+        if not metrics.enabled():
+            super().close()
+            return
+        started = time.perf_counter()
+        try:
+            super().close()
+        finally:
+            _observe_sqlite_latency(time.perf_counter() - started, labels=_SQLITE_CLOSE_LABELS)
+
+
+class _ClosingSqliteConnection(_InstrumentedSqliteConnection):
     """sqlite3 connection that always closes when exiting a context manager."""
 
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:
@@ -3400,7 +3482,7 @@ def _project_identity_from_config(config: "Config") -> tuple[str, str]:
     return project_id, project_prefix
 
 
-@instrument_public_methods("gza_db_method_latency_seconds")
+@metrics.instrument_public_methods("gza_db_method_latency_seconds")
 class SqliteTaskStore:
     """SQLite-based task storage."""
 
@@ -4054,9 +4136,11 @@ class SqliteTaskStore:
 
     def _open_connection(self, *, close_on_exit: bool) -> sqlite3.Connection:
         """Create a database connection with the store's standard pragmas and mode."""
-        factory: type[sqlite3.Connection] = _ClosingSqliteConnection if close_on_exit else sqlite3.Connection
+        factory: type[sqlite3.Connection] = (
+            _ClosingSqliteConnection if close_on_exit else _InstrumentedSqliteConnection
+        )
         if self._query_only_empty_db:
-            conn = sqlite3.connect(
+            conn = _timed_sqlite_connect(
                 ":memory:",
                 isolation_level=None,
                 timeout=15,
@@ -4068,7 +4152,7 @@ class SqliteTaskStore:
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
             return conn
 
-        conn = sqlite3.connect(
+        conn = _timed_sqlite_connect(
             self.db_path,
             isolation_level=None,
             timeout=15,

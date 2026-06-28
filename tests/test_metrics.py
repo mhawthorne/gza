@@ -7,6 +7,8 @@ import inspect
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from pytest import approx
 
 
@@ -14,6 +16,16 @@ def _reload_metrics():
     import gza.metrics as metrics_module
 
     return importlib.reload(metrics_module)
+
+
+def _latency_count(metrics, snapshot, *, operation: str) -> int:
+    return snapshot.latencies.get(
+        metrics.MetricKey(
+            "gza_sqlite_operation_latency_seconds",
+            (("operation", operation),),
+        ),
+        metrics.LatencyAggregate(),
+    ).count
 
 
 def test_metrics_disabled_are_safe_noops(monkeypatch) -> None:
@@ -149,3 +161,90 @@ def test_sqlite_task_store_public_methods_are_wrapped_without_private_helpers(mo
     assert hasattr(db_module.SqliteTaskStore.startup_warnings, "__wrapped__")
     assert db_module.SqliteTaskStore.startup_warnings.__wrapped__(store) == ()
     assert not hasattr(db_module.SqliteTaskStore._row_to_task, "__gza_latency_instrumented__")
+
+
+def test_sqlite_connect_context_records_connect_execute_and_close_once(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics = _reload_metrics()
+    db_module = importlib.import_module("gza.db")
+    store = db_module.SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    before = metrics.snapshot()
+    conn = store._connect()
+    after_open = metrics.snapshot()
+    with conn as active:
+        active.execute("SELECT 1")
+    after_execute = metrics.snapshot()
+    after_close = metrics.snapshot()
+
+    assert _latency_count(metrics, after_open, operation="connect") == _latency_count(
+        metrics, before, operation="connect"
+    ) + 1
+    assert _latency_count(metrics, after_open, operation="execute") == _latency_count(
+        metrics, before, operation="execute"
+    ) + 1
+    assert _latency_count(metrics, after_execute, operation="execute") == _latency_count(
+        metrics, after_open, operation="execute"
+    ) + 1
+    assert _latency_count(metrics, after_close, operation="close") == _latency_count(
+        metrics, before, operation="close"
+    ) + 1
+
+    with pytest.raises(db_module.sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")
+
+
+def test_sqlite_read_session_reuses_one_connection_and_emits_one_connect_close(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics = _reload_metrics()
+    db_module = importlib.import_module("gza.db")
+    store = db_module.SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+    task = store.add("Task 1", group="release")
+
+    before = metrics.snapshot()
+    with store.read_session():
+        with store.read_session():
+            assert store._read_session_conn is not None
+            first_conn = store._read_session_conn
+            assert store.get(task.id) is not None
+            assert store.get_all()
+        assert store._read_session_conn is first_conn
+        first_conn.execute("SELECT 1")
+    after = metrics.snapshot()
+
+    assert _latency_count(metrics, after, operation="connect") == _latency_count(
+        metrics, before, operation="connect"
+    ) + 1
+    assert _latency_count(metrics, after, operation="close") == _latency_count(metrics, before, operation="close") + 1
+    assert _latency_count(metrics, after, operation="execute") >= _latency_count(
+        metrics, before, operation="execute"
+    ) + 3
+
+    with pytest.raises(db_module.sqlite3.ProgrammingError):
+        first_conn.execute("SELECT 1")
+
+
+def test_sqlite_operation_metrics_distinguish_executemany_and_executescript(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics = _reload_metrics()
+    db_module = importlib.import_module("gza.db")
+    store = db_module.SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    before = metrics.snapshot()
+    with store._connect() as conn:
+        conn.execute("CREATE TABLE sample(value TEXT)")
+        conn.executemany("INSERT INTO sample(value) VALUES (?)", [("a",), ("b",)])
+        conn.executescript(
+            """
+            INSERT INTO sample(value) VALUES ('c');
+            INSERT INTO sample(value) VALUES ('d');
+            """
+        )
+    after = metrics.snapshot()
+
+    assert _latency_count(metrics, after, operation="executemany") == _latency_count(
+        metrics, before, operation="executemany"
+    ) + 1
+    assert _latency_count(metrics, after, operation="executescript") == _latency_count(
+        metrics, before, operation="executescript"
+    ) + 1
