@@ -122,7 +122,25 @@ Each watch cycle MUST execute these phases in order:
    purpose match the current classification before queue-bumping it.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
-4. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
+4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
+   reconciled the freshest target state for this cycle, watch MAY run one conservative
+   parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay
+   supervisor-owned and MUST reuse the shared parked clear service; it MUST NOT create a
+   judge task, inspect per-merge relevance, or fork a second lifecycle policy. For each
+   currently parked subject/reason candidate, watch MUST apply these gates in order:
+   feature enabled, budget remaining, cooldown elapsed, and target branch advanced when
+   `watch.parked_auto_rearm.require_target_advanced` is true. A failed gate MUST leave the
+   parked row untouched and MUST NOT spend an attempt. In particular, an unchanged target
+   SHA under `require_target_advanced` spends no attempt and performs no clear. A
+   successful blind auto-rearm MUST clear only the shared parked exclusion state, persist
+   the current target SHA plus attempt timestamp, increment the per-subject/per-reason
+   blind auto-attempt count, and then return the owner to the same cycle's ordinary watch
+   planning. Slot use is unchanged: the rearm phase itself consumes no worker slot, and any
+   follow-on recovery or lifecycle work spawned because of that clear MUST reuse the same
+   remaining worker-slot accounting as every other same-cycle dispatch. Cooldown identity
+   is subject plus parked reason, so a burst of watch cycles or merges inside one cooldown
+   window yields at most one blind auto-rearm attempt for that pair.
+5. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
    lifecycle worker starts selected by the shared engine. Recovery allocation is not a
    pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before
    pending pickup, and `--recovery-only` MUST gate pending pickup entirely while any
@@ -136,7 +154,7 @@ Each watch cycle MUST execute these phases in order:
    cycle. The dedupe identity for that quiet `SKIP` MUST include the task and its
    current hold-until time so a later meaningful edit that moves the quiet window causes
    exactly one new `SKIP`.
-5. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
+6. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
    parked states, recovery decisions, and failures. Snapshot-based transition detection
    remains responsible for repaired or otherwise out-of-band merge transitions, but it
    MUST emit at most one `MERGE` line per merge unit per cycle and MUST NOT duplicate a
@@ -151,7 +169,7 @@ Each watch cycle MUST execute these phases in order:
    operator warning rather than a clean `START`; terminal outcomes observed before then
    stand on their own and MUST NOT also emit a contradictory no-show warning. This is
    required by invariant S6's outcome-over-launch rule.
-6. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
+7. **Decide the next boundary.** Stop, back off, re-exec, idle-exit, or sleep until the
    next poll interval.
 
 The supervisor MUST NOT reorder these phases in a way that can cause older target-branch

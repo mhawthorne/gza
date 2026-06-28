@@ -232,9 +232,16 @@ its stored action.
   `retry-limit-reached`. It MUST persist one durable manual-rearm record keyed by the
   parked subject and reason, with an incrementing `manual_rearm_epoch` plus
   `manual_rearmed_at`.
+- Blind watch-owned parked auto-rearm MAY also create a new effective retry-limit rearm
+  epoch for that same parked subject/reason, but only through its own bounded
+  per-subject/per-reason budget and cooldown policy owned by
+  [watch-supervisor.md](watch-supervisor.md). It MUST additionally persist its own attempt
+  count plus last-attempt target SHA/timestamp so unchanged-target and cooldown skips do
+  not spend more recovery budget.
 - Shared recovery policy MUST evaluate bounded retry/resume budget relative to the latest
-  applicable manual-rearm epoch for that recovery chain, not relative to lifetime failed
-  descendants. Historical recovery descendants MUST remain intact for auditability.
+  applicable retry-limit rearm epoch for that recovery chain, whether that epoch came from
+  a manual unstick or a bounded watch-owned blind auto-rearm, not relative to lifetime
+  failed descendants. Historical recovery descendants MUST remain intact for auditability.
 - A fresh manual clear MUST create exactly one new effective epoch. Re-running `unstick`
   after the owner is no longer currently parked MUST be a safe no-op that reports `not
   currently parked`, not a second effective reset.
@@ -242,6 +249,9 @@ its stored action.
   clear is also clear-only in the sense that the clear operation itself MUST NOT spawn
   workers; it only records the durable rearm epoch that lets the next shared recovery
   evaluation become actionable again.
+- Disabled blind auto-rearm MUST preserve that manual operator escape hatch exactly: when
+  the feature is off, parked `retry-limit-reached` owners stay parked until an operator
+  clears them or lineage state otherwise changes.
 - `uv run gza unstick --run` MAY immediately dispatch the just-cleared owner through the
   shared scoped watch dispatcher, but it MUST still spend recovery capacity only through
   the same shared slot and permit rules that `watch` uses, and direct recovery actions

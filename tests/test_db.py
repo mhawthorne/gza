@@ -7783,6 +7783,48 @@ def _drop_watch_recovery_backoffs_column(db_path: Path, column_name: str) -> Non
     conn.close()
 
 
+def _drop_parked_task_rearms_columns(db_path: Path, column_names: set[str]) -> None:
+    """Rebuild parked_task_rearms without specific columns."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE parked_task_rearms RENAME TO parked_task_rearms_old")
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(parked_task_rearms_old)")]
+    kept_cols = [c for c in cols if c not in column_names]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(parked_task_rearms_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] not in column_names and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] in column_names:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(name for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE parked_task_rearms ({', '.join(col_defs)})")
+    conn.execute(
+        "INSERT INTO parked_task_rearms "
+        f"({cols_str}) SELECT {cols_str} FROM parked_task_rearms_old"
+    )
+    conn.execute("DROP TABLE parked_task_rearms_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_parked_task_rearms_task_reason "
+        "ON parked_task_rearms(project_id, subject_task_id, attention_reason)"
+    )
+    conn.commit()
+    conn.close()
+
+
 class TestMigrationUtilityFunctions:
     """Tests for migration utilities and manual migration chaining."""
 
@@ -10113,6 +10155,31 @@ class TestSharedDbIsolationAndImportGating:
         assert "parked_task_rearms" in tables
         assert "idx_parked_task_rearms_task_reason" in indexes
 
+    def test_auto_migration_v58_to_v59_adds_parked_task_auto_rearm_columns(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        _drop_parked_task_rearms_columns(
+            db_path,
+            {"auto_attempt_count", "last_auto_attempt_at", "last_auto_attempt_target_sha"},
+        )
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 58")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(parked_task_rearms)").fetchall()}
+
+        assert version == SCHEMA_VERSION
+        assert "auto_attempt_count" in columns
+        assert "last_auto_attempt_at" in columns
+        assert "last_auto_attempt_target_sha" in columns
+
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
 
@@ -10221,6 +10288,39 @@ class TestSharedDbIsolationAndImportGating:
             subject_id="gza-100",
             attention_reason="retry-limit-reached",
         ) == second
+
+    def test_parked_task_auto_rearm_round_trip_and_increment(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_parked_task_auto_rearm_attempt(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="watch-no-progress-backstop",
+            subject_task_id="gza-100",
+            target_sha="abc123",
+        )
+
+        assert first is not None
+        assert first.subject_task_id == "gza-100"
+        assert first.manual_rearm_epoch == 0
+        assert first.auto_attempt_count == 1
+        assert first.last_auto_attempt_at is not None
+        assert first.last_auto_attempt_target_sha == "abc123"
+
+        second = store.record_parked_task_auto_rearm_attempt(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="watch-no-progress-backstop",
+            subject_task_id="gza-100",
+            target_sha="def456",
+        )
+
+        assert second is not None
+        assert second.auto_attempt_count == 2
+        assert second.last_auto_attempt_at is not None
+        assert second.last_auto_attempt_at >= first.last_auto_attempt_at
+        assert second.last_auto_attempt_target_sha == "def456"
 
     def test_query_only_open_pre_v56_missing_watch_recovery_backoffs_degrades_safely(
         self, tmp_path: Path

@@ -175,6 +175,38 @@ def test_config_load_parses_watch_dispatch_start_timeout(tmp_path) -> None:
     assert config.watch.dispatch_start_timeout == 7
 
 
+def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
+    """watch.parked_auto_rearm should default to the conservative blind-policy settings."""
+    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+
+    config = Config.load(tmp_path)
+
+    assert config.watch.parked_auto_rearm.enabled is False
+    assert config.watch.parked_auto_rearm.budget == 2
+    assert config.watch.parked_auto_rearm.cooldown_hours == 12
+    assert config.watch.parked_auto_rearm.require_target_advanced is True
+
+
+def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
+    """watch.parked_auto_rearm should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        "  parked_auto_rearm:\n"
+        "    enabled: true\n"
+        "    budget: 3\n"
+        "    cooldown_hours: 6\n"
+        "    require_target_advanced: false\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.watch.parked_auto_rearm.enabled is True
+    assert config.watch.parked_auto_rearm.budget == 3
+    assert config.watch.parked_auto_rearm.cooldown_hours == 6
+    assert config.watch.parked_auto_rearm.require_target_advanced is False
+
+
 def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should default when omitted."""
     (tmp_path / "gza.yaml").write_text("project_name: demo\n")

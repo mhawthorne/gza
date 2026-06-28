@@ -53,6 +53,7 @@ from gza.cli.watch import (
     _CycleResult,
     _emit_cycle_attention_summary,
     _emit_transition_events,
+    _evaluate_blind_parked_auto_rearm,
     _finalize_watch_no_progress_after_execution,
     _find_open_main_verify_remediation_task,
     _format_elapsed,
@@ -201,6 +202,60 @@ def _make_watch_git() -> Git:
     git.get_diff_stat_parsed = MagicMock(return_value=(1, 1, 0))  # type: ignore[method-assign]
     git.get_diff_numstat = MagicMock(return_value="1\t0\tfeature.txt\n")  # type: ignore[method-assign]
     return git
+
+
+def _setup_retry_limit_parked_lineage(tmp_path: Path) -> tuple[object, Config, DbTask, DbTask]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/parked-retry-limit"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**\n\nPlease fix."
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_TURNS"
+    failed_improve.session_id = "sess-parked-improve"
+    failed_improve.branch = impl.branch
+    failed_improve.completed_at = datetime.now(UTC)
+    store.update(failed_improve)
+
+    exhausted_improve = store.add(
+        "Failed retry improve",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=failed_improve.id,
+        same_branch=True,
+    )
+    assert exhausted_improve.id is not None
+    exhausted_improve.status = "failed"
+    exhausted_improve.failure_reason = "TIMEOUT"
+    exhausted_improve.session_id = failed_improve.session_id
+    exhausted_improve.branch = impl.branch
+    exhausted_improve.completed_at = datetime.now(UTC)
+    store.update(exhausted_improve)
+
+    config = Config.load(tmp_path)
+    return store, config, impl, exhausted_improve
 
 
 def _seed_watch_lifecycle_summary_fixture(tmp_path: Path) -> tuple[object, object]:
@@ -12199,6 +12254,163 @@ def test_watch_cycle_skips_parked_retry_limit_lineage_without_recomputing_or_spa
     assert "ATTENTION" in log_text
     assert "reason=retry-limit-reached" in log_text
     assert not any(line.split(maxsplit=2)[1] == "START" for line in log_text.splitlines())
+
+
+def test_blind_parked_auto_rearm_skips_unchanged_target_sha_without_spending_attempt(tmp_path: Path) -> None:
+    store, config, impl, exhausted_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 1
+    config.watch.parked_auto_rearm.require_target_advanced = True
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-1")  # type: ignore[method-assign]
+    assert exhausted_improve.id is not None
+    store.record_parked_task_auto_rearm_attempt(
+        subject_kind="task",
+        subject_id=exhausted_improve.id,
+        attention_reason="retry-limit-reached",
+        subject_task_id=exhausted_improve.id,
+        target_sha="main-sha-1",
+    )
+    with store._connect() as conn:  # noqa: SLF001 - targeted state backdate
+        conn.execute(
+            "UPDATE parked_task_rearms SET last_auto_attempt_at = ? WHERE subject_id = ?",
+            ((datetime.now(UTC) - timedelta(days=2)).isoformat(), exhausted_improve.id),
+        )
+
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=impl,
+        subject_task=exhausted_improve,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+    with (
+        patch("gza.cli.watch.skip_reason_for_landed_or_moot", return_value=None),
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)),
+    ):
+        result = _evaluate_blind_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-1",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+        )
+
+    assert [(decision.status, decision.detail) for decision in result.decisions] == [
+        ("skipped", "target SHA unchanged")
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=exhausted_improve.id,
+        attention_reason="retry-limit-reached",
+    )
+    assert rearm is not None
+    assert rearm.auto_attempt_count == 1
+
+
+def test_blind_parked_auto_rearm_skips_cooldown_window_without_spending_attempt(tmp_path: Path) -> None:
+    store, config, impl, exhausted_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 12
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-2")  # type: ignore[method-assign]
+    assert exhausted_improve.id is not None
+    store.record_parked_task_auto_rearm_attempt(
+        subject_kind="task",
+        subject_id=exhausted_improve.id,
+        attention_reason="retry-limit-reached",
+        subject_task_id=exhausted_improve.id,
+        target_sha="main-sha-1",
+    )
+
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=impl,
+        subject_task=exhausted_improve,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+    with (
+        patch("gza.cli.watch.skip_reason_for_landed_or_moot", return_value=None),
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)),
+    ):
+        result = _evaluate_blind_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-2",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+        )
+
+    assert [(decision.status, decision.detail) for decision in result.decisions] == [
+        ("skipped", "cooldown active")
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=exhausted_improve.id,
+        attention_reason="retry-limit-reached",
+    )
+    assert rearm is not None
+    assert rearm.auto_attempt_count == 1
+
+
+def test_watch_cycle_blind_auto_rearm_returns_retry_limit_owner_to_same_cycle_watch_planning(tmp_path: Path) -> None:
+    store, config, impl, exhausted_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 1
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-1")  # type: ignore[method-assign]
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=impl,
+        subject_task=exhausted_improve,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+
+    with patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)):
+        rearm_result = _evaluate_blind_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-1",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+        )
+
+    assert [(decision.status, decision.detail) for decision in rearm_result.decisions] == [
+        ("rearmed", "blind auto-rearm")
+    ]
+
+    refreshed_decision = decide_failed_task_recovery(
+        store,
+        exhausted_improve,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    assert refreshed_decision.action in {"resume", "retry"}
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=str(exhausted_improve.id),
+        attention_reason="retry-limit-reached",
+    )
+    assert rearm is not None
+    assert rearm.auto_attempt_count == 1
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,7 @@ from ..dispatch_preview import (
     plan_watch_dispatch_entries,
 )
 from ..git import Git, GitError
+from ..git import resolve_ref_if_possible
 from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
 from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_is_complete_for_lifecycle
 from ..lineage_query import (
@@ -95,6 +96,12 @@ from ..task_query import (
     collect_scoped_tag_scope_gaps,
     normalize_tag_filters,
     task_matches_tag_filters,
+)
+from ..unstick import (
+    ParkedTaskCandidate,
+    clear_parked_candidate_state,
+    discover_parked_tasks,
+    skip_reason_for_landed_or_moot,
 )
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
@@ -2470,6 +2477,27 @@ class _RecoveryReport:
 
 
 @dataclass(frozen=True)
+class _BlindParkedAutoRearmDecision:
+    candidate: ParkedTaskCandidate
+    status: Literal["rearmed", "skipped"]
+    detail: str
+
+
+@dataclass(frozen=True)
+class _BlindParkedAutoRearmResult:
+    decisions: tuple[_BlindParkedAutoRearmDecision, ...]
+
+    @property
+    def rearmed_owner_ids(self) -> tuple[str, ...]:
+        owner_ids: list[str] = []
+        for decision in self.decisions:
+            owner_id = decision.candidate.owner_task.id
+            if decision.status == "rearmed" and owner_id is not None:
+                owner_ids.append(owner_id)
+        return tuple(owner_ids)
+
+
+@dataclass(frozen=True)
 class _WatchCycleAnalysis:
     target_branch: str
     scope_gaps: tuple[ScopedTagScopeGap, ...]
@@ -3252,6 +3280,103 @@ def _analyze_watch_cycle(
             actionable_failed=tuple(actionable_failed),
             pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
         )
+
+
+def _evaluate_blind_parked_auto_rearm(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
+    target_sha: str | None,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    scoped_owner_ids: tuple[str, ...] | None,
+) -> _BlindParkedAutoRearmResult:
+    """Blindly auto-rearm eligible parked subjects using the shared parked clear service."""
+    policy = config.watch.parked_auto_rearm
+    if not policy.enabled:
+        return _BlindParkedAutoRearmResult(decisions=())
+
+    cooldown = timedelta(hours=policy.cooldown_hours)
+    candidates, _stale_cleared = discover_parked_tasks(
+        store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+    )
+    scoped_owner_id_set = frozenset(scoped_owner_ids or ())
+    now = datetime.now(UTC)
+    decisions: list[_BlindParkedAutoRearmDecision] = []
+
+    for candidate in candidates:
+        owner_task = candidate.owner_task
+        owner_id = owner_task.id
+        subject_id = candidate.subject_task.id
+        if owner_id is None or subject_id is None:
+            continue
+        if scoped_owner_ids is not None and owner_id not in scoped_owner_id_set:
+            continue
+        if tags is not None and not task_matches_tag_filters(
+            task_tags=owner_task.tags,
+            tag_filters=tags,
+            any_tag=any_tag,
+        ):
+            continue
+
+        guard_reason = skip_reason_for_landed_or_moot(
+            store,
+            git=git,
+            target_branch=target_branch,
+            task=owner_task,
+        )
+        if guard_reason is not None:
+            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", guard_reason))
+            continue
+
+        rearm_state = store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=subject_id,
+            attention_reason=candidate.attention_reason,
+        )
+        auto_attempt_count = rearm_state.auto_attempt_count if rearm_state is not None else 0
+        if auto_attempt_count >= policy.budget:
+            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "budget exhausted"))
+            continue
+
+        last_auto_attempt_at = rearm_state.last_auto_attempt_at if rearm_state is not None else None
+        if last_auto_attempt_at is not None and now < last_auto_attempt_at + cooldown:
+            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "cooldown active"))
+            continue
+
+        if policy.require_target_advanced:
+            if not target_sha:
+                decisions.append(
+                    _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unavailable")
+                )
+                continue
+            last_target_sha = rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
+            if last_target_sha == target_sha:
+                decisions.append(
+                    _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unchanged")
+                )
+                continue
+
+        clear_parked_candidate_state(
+            store,
+            candidate,
+            record_manual_retry_limit_rearm=False,
+        )
+        store.record_parked_task_auto_rearm_attempt(
+            subject_kind="task",
+            subject_id=subject_id,
+            attention_reason=candidate.attention_reason,
+            subject_task_id=subject_id,
+            target_sha=target_sha,
+        )
+        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "blind auto-rearm"))
+
+    return _BlindParkedAutoRearmResult(decisions=tuple(decisions))
 
 def _scoped_member_task_ids(owner_rows: list[LineageOwnerRow], owner_task_ids: tuple[str, ...]) -> set[str]:
     member_ids = set(owner_task_ids)
@@ -4631,6 +4756,44 @@ def _run_cycle(
                         attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
                         message=_watch_needs_attention_message(display_task, no_progress_attention),
                     )
+
+    if not dry_run:
+        target_sha = resolve_ref_if_possible(git, target_branch).sha
+        auto_rearm_result = _evaluate_blind_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch=target_branch,
+            target_sha=target_sha,
+            tags=tags,
+            any_tag=any_tag,
+            scoped_owner_ids=scoped_owner_ids,
+        )
+        for decision in auto_rearm_result.decisions:
+            owner_id = decision.candidate.owner_task.id
+            if decision.status == "rearmed" and owner_id is not None:
+                log.emit(
+                    "REARM",
+                    (
+                        f"{owner_id}: blind auto-rearm cleared "
+                        f"{decision.candidate.attention_reason}"
+                    ),
+                    dedupe_key=f"blind-auto-rearm:{owner_id}:{decision.candidate.attention_reason}",
+                )
+                work_done = True
+        if auto_rearm_result.rearmed_owner_ids:
+            analysis = _analyze_watch_cycle(
+                config=config,
+                store=store,
+                git=git,
+                slots=slots,
+                tags=tags,
+                any_tag=any_tag,
+                recovery_slots=recovery_slots,
+                recovery_mode=recovery_mode,
+                max_recovery_attempts=max_recovery_attempts,
+                scoped_owner_ids=scoped_owner_ids,
+            )
 
     # 2) Recovery queue for failed tasks.
     pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)

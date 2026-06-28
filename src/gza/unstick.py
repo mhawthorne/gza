@@ -325,7 +325,7 @@ def _apply_selected_target(
 ) -> UnstickOutcome:
     owner_task = selected.owner_task
     parked = selected.current_candidate
-    guard_reason = _skip_reason_for_landed_or_moot(store, git=git, target_branch=target_branch, task=owner_task)
+    guard_reason = skip_reason_for_landed_or_moot(store, git=git, target_branch=target_branch, task=owner_task)
     if guard_reason is not None:
         return UnstickOutcome(
             owner_task=owner_task,
@@ -340,14 +340,7 @@ def _apply_selected_target(
             status="skipped",
             detail="not currently parked",
         )
-    clear_watch_progress_subject(store, subject_task=parked.subject_task)
-    if parked.reason_class == "retry-limit" and parked.subject_task.id is not None:
-        store.record_parked_task_manual_rearm(
-            subject_kind="task",
-            subject_id=parked.subject_task.id,
-            attention_reason=parked.attention_reason,
-            subject_task_id=parked.subject_task.id,
-        )
+    clear_parked_candidate_state(store, parked, record_manual_retry_limit_rearm=True)
     return UnstickOutcome(
         owner_task=owner_task,
         reason_class=parked.reason_class,
@@ -356,7 +349,33 @@ def _apply_selected_target(
     )
 
 
-def _skip_reason_for_landed_or_moot(
+def clear_parked_candidate_state(
+    store: SqliteTaskStore,
+    candidate: ParkedTaskCandidate,
+    *,
+    record_manual_retry_limit_rearm: bool,
+) -> None:
+    """Clear one parked candidate's shared exclusion state.
+
+    Manual `unstick` uses this with `record_manual_retry_limit_rearm=True` so retry-limit
+    clear also advances the durable manual rearm epoch. Watch-owned blind auto-rearm uses
+    the same clear path with that flag disabled.
+    """
+    clear_watch_progress_subject(store, subject_task=candidate.subject_task)
+    if (
+        record_manual_retry_limit_rearm
+        and candidate.reason_class == "retry-limit"
+        and candidate.subject_task.id is not None
+    ):
+        store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id=candidate.subject_task.id,
+            attention_reason=candidate.attention_reason,
+            subject_task_id=candidate.subject_task.id,
+        )
+
+
+def skip_reason_for_landed_or_moot(
     store: SqliteTaskStore,
     *,
     git: Git,

@@ -1219,6 +1219,9 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
     assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
+    assert "watch.parked_auto_rearm.enabled" in watch_section
+    assert "watch.parked_auto_rearm.require_target_advanced" in watch_section
+    assert "unchanged target SHAs a no-spend skip" in watch_section
     assert "requires at least one explicit selector" in unstick_section
     assert "--reason backstop\\|retry-limit\\|reconcile" in unstick_section
     assert "Cap new worker-consuming starts for `--run`" in unstick_section
@@ -1293,6 +1296,9 @@ def test_watch_supervisor_spec_pins_per_cycle_human_required_owner_parity() -> N
     assert f"### 2A. Per-{cycle_word} human-required parity belongs to phase 5" in supervisor
     assert "the supervisor MUST recompute the in-scope" in compact
     assert f"human-required failed-task set on **every** {cycle_word} from the same shared failed-task" in compact
+    assert "**Blind parked auto-rearm phase.**" in supervisor
+    assert "feature enabled, budget remaining, cooldown elapsed, and target branch advanced" in compact
+    assert "the rearm phase itself consumes no worker slot" in compact
     assert "already-landed suppression" in compact
     assert "[recovery.md](recovery.md) R5" in supervisor
     assert "[lineage.md](lineage.md) P1 and P4" in supervisor

@@ -157,7 +157,7 @@ class RecoveryChainState:
 class _RecoveryPolicyEpoch:
     """Effective retry-budget epoch for one recovery-chain evaluation."""
 
-    manual_rearmed_at: datetime | None
+    effective_rearmed_at: datetime | None
     effective_steps: tuple[RecoveryRole, ...]
 
     @property
@@ -660,37 +660,43 @@ def _recovery_policy_epoch(
     read_context: RecoveryReadContext | None = None,
 ) -> _RecoveryPolicyEpoch:
     if not store.supports_parked_task_rearms():
-        return _RecoveryPolicyEpoch(manual_rearmed_at=None, effective_steps=snapshot.steps)
+        return _RecoveryPolicyEpoch(effective_rearmed_at=None, effective_steps=snapshot.steps)
 
-    latest_manual_rearmed_at: datetime | None = None
+    latest_rearmed_at: datetime | None = None
     for ancestor_id in snapshot.ancestor_ids:
         rearm_state = store.get_parked_task_rearm(
             subject_kind="task",
             subject_id=ancestor_id,
             attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
         )
-        if rearm_state is None or rearm_state.manual_rearmed_at is None:
+        if rearm_state is None:
             continue
-        if latest_manual_rearmed_at is None or rearm_state.manual_rearmed_at > latest_manual_rearmed_at:
-            latest_manual_rearmed_at = rearm_state.manual_rearmed_at
+        for candidate_time in (
+            rearm_state.manual_rearmed_at if rearm_state.manual_rearm_epoch > 0 else None,
+            rearm_state.last_auto_attempt_at,
+        ):
+            if candidate_time is None:
+                continue
+            if latest_rearmed_at is None or candidate_time > latest_rearmed_at:
+                latest_rearmed_at = candidate_time
 
-    if latest_manual_rearmed_at is None:
-        return _RecoveryPolicyEpoch(manual_rearmed_at=None, effective_steps=snapshot.steps)
+    if latest_rearmed_at is None:
+        return _RecoveryPolicyEpoch(effective_rearmed_at=None, effective_steps=snapshot.steps)
 
     ancestry_tasks: list[DbTask] = []
     for ancestor_id in snapshot.ancestor_ids:
         ancestor = _task_for_recovery_snapshot_id(store, task_id=ancestor_id, read_context=read_context)
         if ancestor is None:
-            return _RecoveryPolicyEpoch(manual_rearmed_at=latest_manual_rearmed_at, effective_steps=())
+            return _RecoveryPolicyEpoch(effective_rearmed_at=latest_rearmed_at, effective_steps=())
         ancestry_tasks.append(ancestor)
 
     effective_steps: list[RecoveryRole] = []
     for child, step in zip(ancestry_tasks[1:], snapshot.steps, strict=False):
-        if child.created_at is not None and child.created_at > latest_manual_rearmed_at:
+        if child.created_at is not None and child.created_at > latest_rearmed_at:
             effective_steps.append(step)
 
     return _RecoveryPolicyEpoch(
-        manual_rearmed_at=latest_manual_rearmed_at,
+        effective_rearmed_at=latest_rearmed_at,
         effective_steps=tuple(effective_steps),
     )
 
@@ -1320,7 +1326,7 @@ def _matching_failed_terminal_descendants(
     snapshot: _RecoveryChainSnapshot,
     *,
     expected_action: RecoveryAction | None,
-    manual_rearmed_at: datetime | None = None,
+    effective_rearmed_at: datetime | None = None,
     read_context: RecoveryReadContext | None = None,
 ) -> list[DbTask]:
     if expected_action is None:
@@ -1330,9 +1336,9 @@ def _matching_failed_terminal_descendants(
         for descendant in snapshot.terminal_descendants
         if descendant.status == "failed"
         and (
-            manual_rearmed_at is None
+            effective_rearmed_at is None
             or descendant.created_at is None
-            or descendant.created_at > manual_rearmed_at
+            or descendant.created_at > effective_rearmed_at
         )
         and classify_recovery_row(store, descendant, read_context=read_context) == expected_action
     ]
@@ -1711,7 +1717,7 @@ def decide_failed_task_recovery(
             store,
             snapshot,
             expected_action=expected_action,
-            manual_rearmed_at=policy_epoch.manual_rearmed_at,
+            effective_rearmed_at=policy_epoch.effective_rearmed_at,
             read_context=read_context,
         )
     ) + direct_reconcile_attempts
@@ -1966,15 +1972,15 @@ def decide_failed_task_recovery(
         store,
         snapshot,
         expected_action=expected_action,
-        manual_rearmed_at=policy_epoch.manual_rearmed_at,
+        effective_rearmed_at=policy_epoch.effective_rearmed_at,
         read_context=read_context,
     )
     unresolved_terminals = [
         descendant
         for descendant in _list_unresolved_recovery_terminal_descendants(snapshot)
-        if policy_epoch.manual_rearmed_at is None
+        if policy_epoch.effective_rearmed_at is None
         or descendant.created_at is None
-        or descendant.created_at > policy_epoch.manual_rearmed_at
+        or descendant.created_at > policy_epoch.effective_rearmed_at
     ]
     if any(descendant.status == "dropped" for descendant in unresolved_terminals):
         return _skip_decision(
