@@ -14,6 +14,8 @@ from unittest.mock import patch
 import pytest
 
 from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
+import gza.concurrency as concurrency_module
+import gza.workers as workers_module
 from gza.pytest_timeout_diagnostics import positive_int_env, register_sigterm_faulthandler
 
 # The unit suite uses two separate guards:
@@ -29,6 +31,10 @@ UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED = (
 )
 _CPU_DELTA_KEY: pytest.StashKey[float] = pytest.StashKey()
 _EXPLICIT_TIMEOUT_KEY: pytest.StashKey[bool] = pytest.StashKey()
+_ORIGINAL_PID_ALIVE = concurrency_module._pid_alive
+_ORIGINAL_WORKER_IS_RUNNING = workers_module.WorkerRegistry.is_running
+_ORIGINAL_READ_LINUX_PROC_STAT = workers_module._read_linux_proc_stat
+_ORIGINAL_READ_PID_START_TICKS = workers_module._read_pid_start_ticks
 
 # Keep the runtime guard on for the default unit lane. Any future exemption
 # must stay narrow, temporary, and point at a dedicated follow-up implement
@@ -352,3 +358,18 @@ def _isolate_launch_permit_state():
         yield
     finally:
         _clear_process_local_launch_state()
+
+
+@pytest.fixture(autouse=True)
+def _restore_worker_liveness_seams():
+    concurrency_module._pid_alive = _ORIGINAL_PID_ALIVE
+    workers_module.WorkerRegistry.is_running = _ORIGINAL_WORKER_IS_RUNNING
+    workers_module._read_linux_proc_stat = _ORIGINAL_READ_LINUX_PROC_STAT
+    workers_module._read_pid_start_ticks = _ORIGINAL_READ_PID_START_TICKS
+    try:
+        yield
+    finally:
+        concurrency_module._pid_alive = _ORIGINAL_PID_ALIVE
+        workers_module.WorkerRegistry.is_running = _ORIGINAL_WORKER_IS_RUNNING
+        workers_module._read_linux_proc_stat = _ORIGINAL_READ_LINUX_PROC_STAT
+        workers_module._read_pid_start_ticks = _ORIGINAL_READ_PID_START_TICKS

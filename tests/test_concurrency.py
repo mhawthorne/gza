@@ -63,6 +63,10 @@ def test_launch_permit_allows_same_pid_reentry(tmp_path) -> None:
         permit.release()
 
 
+def test_worker_registry_liveness_override_can_leak_without_shared_reset() -> None:
+    WorkerRegistry.is_running = lambda self, _worker_id: True  # type: ignore[method-assign]
+
+
 def test_snapshot_ignores_dead_registry_and_task_pids(tmp_path) -> None:
     setup_config(tmp_path)
     _append_config(tmp_path, "max_concurrent: 2\n")
