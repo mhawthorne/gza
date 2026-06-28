@@ -107,6 +107,7 @@ from gza.lineage_query import LineageOwnerRow
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
+from gza.review_verdict import ParsedReviewReport
 from gza.watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     WatchProgressCandidate,
@@ -3085,6 +3086,68 @@ def test_watch_cycle_default_recovery_slot_caps_pending_implement_starts(tmp_pat
     assert len(pending_calls) == 2
 
 
+def test_watch_dispatch_preview_recovery_preflight_rebase_is_runnable_and_consumes_only_recovery_slot(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed_impl = store.add("Failed implementation", task_type="implement")
+    assert failed_impl.id is not None
+    failed_impl.status = "failed"
+    failed_impl.failure_reason = "MAX_STEPS"
+    failed_impl.session_id = "sess-watch-recovery-preflight"
+    failed_impl.completed_at = datetime.now(UTC)
+    failed_impl.branch = "feature/watch-recovery-preflight"
+    failed_impl.merge_status = "unmerged"
+    failed_impl.has_commits = True
+    failed_impl.num_steps_computed = 1
+    store.update(failed_impl)
+
+    pending_impl = store.add("Pending implement fallback", task_type="implement")
+    assert pending_impl.id is not None
+
+    config = Config.load(tmp_path)
+    git = _make_watch_git()
+    git.ref_exists = MagicMock(side_effect=lambda ref: ref == f"origin/{failed_impl.branch}")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "target-tip" if ref == "main" else "branch-tip"
+    )
+    git.is_ancestor = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ancestor, descendant: ancestor == "main" and descendant == f"origin/{failed_impl.branch}" and False
+    )
+    preview = build_dispatch_preview(
+        store,
+        config=config,
+        git=git,
+        target_branch="main",
+        tags=None,
+        any_tag=True,
+        max_recovery_attempts=config.max_resume_attempts,
+    )
+    recovery_entries = [entry for entry in preview.recovery_entries if entry.task.id == failed_impl.id]
+    pending_entries = [entry for entry in preview.pending_entries if entry.task.id == pending_impl.id]
+
+    assert len(recovery_entries) == 1
+    assert recovery_entries[0].advance_action is not None
+    assert recovery_entries[0].advance_action["type"] == "needs_rebase"
+    assert recovery_entries[0].advance_action["rebase_parent_task_id"] == failed_impl.id
+    assert recovery_entries[0].worker_consuming is True
+    assert len(pending_entries) == 1
+
+    plan = plan_watch_dispatch_entries(
+        preview.runnable_entries,
+        slots=1,
+        recovery_slot_cap=config.watch.recovery_slots,
+        selection_mode="default",
+    )
+
+    assert plan.recovery_worker_slots == 1
+    assert plan.pending_slots == 0
+    assert len(plan.entries) == 1
+    assert plan.entries[0].task.id == failed_impl.id
+
+
 def test_watch_cycle_dry_run_matches_shared_preview_dispatch_plan_order(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -5389,6 +5452,244 @@ def test_watch_cycle_uses_default_branch_for_advance_planning_off_default_branch
 
     assert determine_action.call_count == 1
     assert determine_action.call_args.args[4] == "main"
+
+
+def test_watch_cycle_reprojects_selected_merge_candidate_for_preview_and_execution(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Watch selected merge candidate", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-selected-merge"
+    task.has_commits = True
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.default_branch.return_value = "main"
+
+    selected_flags: list[bool] = []
+    executed_action_types: list[tuple[bool, str]] = []
+
+    def _fake_determine(_config, _store, _git, planned_task, _target_branch, **kwargs):
+        assert planned_task.id == task.id
+        selected = bool(kwargs.get("selected_for_merge", False))
+        selected_flags.append(selected)
+        if selected:
+            return {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"}
+        return {"type": "merge", "description": "Merge"}
+
+    def _fake_execute(*, task, action, context):
+        executed_action_types.append((context.dry_run, str(action["type"])))
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=str(action["type"]),
+                status="dry_run",
+                message="Would create rebase task",
+                worker_consuming=True,
+            )
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="success",
+            message="Started rebase",
+            success_message="Started rebase",
+            work_done=True,
+            attempted_spawn=True,
+            worker_started=True,
+            worker_label="rebase",
+            worker_consuming=True,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        dry_run_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+        execute_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert dry_run_result.work_done is True
+    assert execute_result.work_done is True
+    assert selected_flags.count(True) >= 2
+    assert executed_action_types == [(True, "needs_rebase"), (False, "needs_rebase")]
+    execute_merge.assert_not_called()
+    log_text = log_path.read_text()
+    assert f"START     (new) rebase for {task.id} [dry-run]" in log_text
+
+
+def test_watch_cycle_reprojected_selected_merge_rebase_respects_zero_worker_capacity(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Watch selected merge candidate at capacity", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-selected-merge-at-capacity"
+    task.has_commits = True
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.default_branch.return_value = "main"
+
+    selected_flags: list[bool] = []
+
+    def _fake_determine(_config, _store, _git, planned_task, _target_branch, **kwargs):
+        assert planned_task.id == task.id
+        selected = bool(kwargs.get("selected_for_merge", False))
+        selected_flags.append(selected)
+        if selected:
+            return {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"}
+        return {"type": "merge", "description": "Merge"}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action") as execute_action,
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        dry_run_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+        execute_result = _run_cycle(
+            config=config,
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert dry_run_result.work_done is False
+    assert execute_result.work_done is False
+    assert selected_flags.count(True) >= 2
+    execute_action.assert_not_called()
+    execute_merge.assert_not_called()
+    log_text = log_path.read_text()
+    assert f"START     (new) rebase for {task.id}" not in log_text
+    assert f"{task.id}: no watch worker slots available for needs_rebase" in log_text
+
+
+def test_watch_cycle_does_not_reproject_selected_merge_when_merge_lane_unavailable(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Watch selected merge candidate off default branch", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-selected-merge-off-default"
+    task.has_commits = True
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+
+    selected_flags: list[bool] = []
+
+    def _fake_determine(_config, _store, _git, planned_task, _target_branch, **kwargs):
+        assert planned_task.id == task.id
+        selected = bool(kwargs.get("selected_for_merge", False))
+        selected_flags.append(selected)
+        if selected:
+            return {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"}
+        return {"type": "merge", "description": "Merge"}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action") as execute_action,
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    assert True not in selected_flags
+    execute_action.assert_not_called()
+    execute_merge.assert_not_called()
+    log_text = log_path.read_text()
+    assert "merge actions skipped: not on default branch" in log_text
+    assert f"START     (new) rebase for {task.id}" not in log_text
 
 
 def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_checkout(tmp_path: Path) -> None:
@@ -10626,14 +10927,21 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     impl.status = "completed"
     impl.completed_at = datetime.now(UTC)
     impl.branch = "feature/rebase-me"
+    impl.merge_status = "unmerged"
     store.update(impl)
-    store.set_merge_status(impl.id, "unmerged")
+    unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="release",
+        owner_task_id=impl.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
 
     config = Config.load(tmp_path)
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     git = MagicMock()
-    git.current_branch.return_value = "main"
-    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "release"
+    git.default_branch.return_value = "release"
     git.can_merge.return_value = False
 
     rebase_task = SimpleNamespace(id="test-rebase-id")
@@ -10642,6 +10950,10 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"},
+        ),
         patch("gza.cli.watch.launch_permit"),
         patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
@@ -10658,6 +10970,7 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
 
     assert result.work_done is True
     assert create_rebase.call_count == 1
+    assert create_rebase.call_args.args[3] == "release"
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == rebase_task.id
     lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
@@ -11751,6 +12064,98 @@ def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_resp
     assert text.count("Needs attention (1 task):") == 1
     assert text.count("1 task still need attention (unchanged)") == 1
     assert f"reason={PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE}" in text
+    assert str(impl.id) in text
+    assert "START" not in text
+
+
+def test_watch_dry_run_surfaces_resolution_review_metadata_attention(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-resolution-metadata-invalid"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+
+    rebase = store.add(
+        "Completed rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime.now(UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    store.update(rebase)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: {
+            impl.branch: "rebased-sha",
+            "main": None,
+        }.get(ref)
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("needs-attention dry-run should not spawn iterate"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("needs-attention dry-run should not spawn workers"),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert result.work_done is False
+    text = log_path.read_text()
+    assert "ATTENTION" in text
+    assert "resolution-review-metadata-invalid" in text
     assert str(impl.id) in text
     assert "START" not in text
 

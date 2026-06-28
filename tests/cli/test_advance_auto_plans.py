@@ -424,6 +424,7 @@ def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unav
     assert "Would advance 1 task(s):" in captured.out
     assert str(failed.id) in captured.out
     assert "Retry failed task (INFRASTRUCTURE_ERROR)" in captured.out
+    assert "Rebase before failed-task recovery" not in captured.out
     assert captured.err.count("Warning: Failed-task recovery could not inspect repository branch reachability;") == 1
     assert "git branch reachability suppression is unavailable for this run" in captured.err
     assert "metadata-based same-lineage merged-task suppression may still apply" in captured.err
@@ -481,6 +482,7 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     assert "reason=rebase-failed-needs-manual-resolution" in captured.out
     assert str(failed_impl.id) in captured.out
     assert "Resume failed task (MAX_TURNS)" in captured.out
+    assert "Rebase before failed-task recovery" not in captured.out
 
     with (
         patch("gza.cli.git_ops.Git", return_value=_mock_git()),
@@ -497,7 +499,7 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     assert str(impl.id) in captured.out
     assert "reason=rebase-failed-needs-manual-resolution" in captured.out
     assert str(failed_impl.id) not in captured.out
-    assert "Resume failed task (MAX_TURNS)" not in captured.out
+    assert "Rebase before failed-task recovery" not in captured.out
     assert "No eligible tasks to advance" not in captured.out
 
 
@@ -566,10 +568,36 @@ def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
     completed_rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
     completed_rebase.branch = impl.branch
     completed_rebase.has_commits = True
+    completed_rebase.review_scope = (
+        "Rebase diff provenance: yes\n"
+        "Pre-rebase head SHA: old-head\n"
+        "Pre-rebase target SHA: target-before\n"
+        "Pre-rebase merge-base SHA: old-base\n"
+        "Resolved head SHA: rebased-sha\n"
+        "Resolved target SHA: target-sha\n"
+        "Recovered baseline: no"
+    )
     store.update(completed_rebase)
 
+    git = Mock()
+    git.current_branch.return_value = "main"
+    git.can_merge.return_value = True
+    git.branch_exists.side_effect = lambda branch: branch == impl.branch
+    git.ref_exists.return_value = False
+    git.resolve_merge_source_ref.side_effect = lambda branch: branch if branch == impl.branch else None
+    git.resolve_fresh_merge_source_ref.side_effect = lambda branch: branch if branch == impl.branch else None
+    git.resolve_fresh_merge_source.side_effect = (
+        lambda branch: SimpleNamespace(ref=branch if branch == impl.branch else None, warning=None)
+    )
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        impl.branch: "rebased-sha",
+        "main": "target-sha",
+    }.get(ref)
+    git.is_ancestor.return_value = False
+    git.is_merged.return_value = False
+
     with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch("gza.cli.git_ops.Git", return_value=git),
         patch(
             "gza.recovery_engine._load_merge_context",
             lambda _project_dir=None: _merge_context_without_repo_state(),
@@ -589,7 +617,7 @@ def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "Create review (rebase" in captured.out
+    assert "Create resolution review (rebase" in captured.out
     assert "change unknown" in captured.out
     assert "reason=rebase-failed-needs-manual-resolution" not in captured.out
 
@@ -750,7 +778,7 @@ def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "rebase --resolve (conflicts detected)" in captured.out
+    assert "Create closing review (latest implementation has no review yet)" in captured.out
     assert str(orphan.id) not in captured.out
 
 

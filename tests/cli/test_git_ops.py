@@ -4582,6 +4582,190 @@ def test_cmd_advance_orders_direct_non_worker_actions_before_slot_gated_worker_a
     assert "skipping" in output
 
 
+def test_cmd_advance_reprojects_selected_merge_candidate_for_preview_and_execution(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Advance selected merge candidate", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/advance-selected-merge"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = False
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    selected_flags: list[bool] = []
+    executed_action_types: list[tuple[bool, str]] = []
+
+    def _fake_determine(_config, _store, _git, planned_task, _target_branch, **kwargs):
+        assert planned_task.id == task.id
+        selected = bool(kwargs.get("selected_for_merge", False))
+        selected_flags.append(selected)
+        if selected:
+            return {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"}
+        return {"type": "merge", "description": "Merge"}
+
+    def _fake_execute(*, task, action, context):
+        executed_action_types.append((context.dry_run, str(action["type"])))
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=str(action["type"]),
+                status="dry_run",
+                message="Would create rebase task",
+                worker_consuming=True,
+            )
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="success",
+            message="Started rebase",
+            success_message="Started rebase",
+            attempted_spawn=True,
+            worker_started=True,
+            worker_label="rebase",
+            worker_consuming=True,
+        )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch(
+            "gza.cli.git_ops.get_concurrency_snapshot",
+            return_value=SimpleNamespace(available=1, running=0, limit=1),
+        ),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.git_ops.execute_advance_action", side_effect=_fake_execute),
+        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
+    ):
+        dry_run_args = argparse.Namespace(**{**vars(_advance_args(tmp_path, task.id)), "dry_run": True})
+        dry_run_rc = cmd_advance(dry_run_args)
+        execute_rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert dry_run_rc == 0
+    assert execute_rc == 0
+    assert selected_flags.count(True) >= 2
+    assert "Would create rebase task" in output
+    assert "Started rebase" in output
+    assert executed_action_types == [
+        (True, "needs_rebase"),
+        (True, "needs_rebase"),
+        (False, "needs_rebase"),
+    ]
+    execute_merge.assert_not_called()
+
+
+def test_cmd_advance_reprojected_selected_merge_rebase_respects_zero_worker_capacity(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Advance selected merge candidate at capacity", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/advance-selected-merge-at-capacity"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = False
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    selected_flags: list[bool] = []
+
+    def _fake_determine(_config, _store, _git, planned_task, _target_branch, **kwargs):
+        assert planned_task.id == task.id
+        selected = bool(kwargs.get("selected_for_merge", False))
+        selected_flags.append(selected)
+        if selected:
+            return {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"}
+        return {"type": "merge", "description": "Merge"}
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch(
+            "gza.cli.git_ops.get_concurrency_snapshot",
+            return_value=SimpleNamespace(available=0, running=1, limit=1),
+        ),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.git_ops.execute_advance_action") as execute_action,
+        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
+    ):
+        dry_run_args = argparse.Namespace(**{**vars(_advance_args(tmp_path, task.id)), "dry_run": True})
+        dry_run_rc = cmd_advance(dry_run_args)
+        execute_rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert dry_run_rc == 0
+    assert execute_rc == 0
+    assert selected_flags.count(True) >= 2
+    assert "Would create rebase task" not in output
+    assert "Started rebase" not in output
+    assert "already at max concurrent tasks: 1 running, limit is 1, skipping" in output
+    execute_action.assert_not_called()
+    execute_merge.assert_not_called()
+
+
 def test_cmd_advance_all_tasks_query_uses_one_read_session_connection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

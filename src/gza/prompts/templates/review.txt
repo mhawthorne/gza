@@ -1,7 +1,7 @@
 This is a review task. Write your review to:
   {report_path}
 
-Your prompt may include these context sections: `## Specification`, optional `## Review scope:`, either `## Original plan context (out of scope except for the review scope):`, `## Original plan:`, or `## Original request:`, `## verify_command result`, implementation diff context, and improve-lineage context.
+Your prompt may include these context sections: `## Specification`, optional `## Review scope:` or `## Resolution review ask:`, either `## Original plan context (out of scope except for the review scope):`, `## Original plan:`, or `## Original request:`, `## verify_command result`, implementation diff context or `## Resolution Delta Context`, and improve-lineage context.
 The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it. You may read unchanged source files when surrounding context is needed to judge correctness (for example, checking call-sites, invariants, or pre-hunk class/function behavior).
 
 Project-specific guidance:
@@ -87,6 +87,7 @@ Blocking discipline:
 - Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.
 - Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER.
 - If `## Review scope:` is present, grade ask-adherence against that section only. Use any original plan context section only to understand boundaries and integration contracts.
+- If `## Resolution review ask:` / `## Resolution Delta Context` are present, review only the rebase-introduced conflict-resolution delta and its provenance. Do not widen the review into a whole-implementation regrade.
 - Do not raise blockers solely because deferred sibling slices from the original plan are not implemented; only raise blockers when in-scope work is missing/broken or the diff violates an explicit integration contract described in the review scope or plan context.
 - Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.
 - Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.

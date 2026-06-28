@@ -8,6 +8,26 @@ from dataclasses import dataclass
 from .db import TASK_COMMENT_KIND_REVIEW_SCOPE, SqliteTaskStore, Task, TaskComment
 from .lineage import get_plan_for_task
 
+_RESOLUTION_REVIEW_MODE_RE = re.compile(r"^Review mode:\s*resolution\s*$", re.MULTILINE)
+_RESOLUTION_REVIEW_FIELD_RE = re.compile(
+    r"^(Implementation task|Rebase task|Pre-rebase head SHA|Pre-rebase target SHA|Pre-rebase merge-base SHA|Resolved head SHA|Resolved target SHA):\s*(.*?)\s*$",
+    re.MULTILINE,
+)
+_RESOLUTION_REVIEW_REQUIRED_FIELDS = (
+    "Implementation task",
+    "Rebase task",
+    "Resolved head SHA",
+    "Resolved target SHA",
+)
+_RESOLUTION_REVIEW_OPTIONAL_FIELDS = (
+    "Pre-rebase head SHA",
+    "Pre-rebase target SHA",
+    "Pre-rebase merge-base SHA",
+)
+_RESOLUTION_REVIEW_ALLOWED_FIELDS = frozenset(
+    _RESOLUTION_REVIEW_REQUIRED_FIELDS + _RESOLUTION_REVIEW_OPTIONAL_FIELDS
+)
+
 _SLICE_HEADER_RE = re.compile(
     r"^Implement\s+plan\s+(?P<plan_id>\S+),\s*slice\s+(?P<slice_label>.+?)(?::\s*(?P<summary>.+))?$",
     re.IGNORECASE,
@@ -22,6 +42,118 @@ class ReviewScope:
     summary: str
     out_of_scope_context: str | None = None
     source: str = "task_field"
+
+
+@dataclass(frozen=True)
+class ResolutionReviewScope:
+    """Parsed structured metadata for a resolution-scoped review."""
+
+    implementation_task_id: str
+    rebase_task_id: str
+    resolved_head_sha: str
+    resolved_target_sha: str
+    pre_rebase_head_sha: str | None = None
+    pre_rebase_target_sha: str | None = None
+    pre_rebase_merge_base_sha: str | None = None
+
+
+def declares_resolution_review_mode(scope: str | None) -> bool:
+    """Return whether scope text claims to be resolution-review metadata."""
+    return bool(scope and _RESOLUTION_REVIEW_MODE_RE.search(scope))
+
+
+def build_resolution_review_scope(
+    *,
+    implementation_task_id: str,
+    rebase_task_id: str,
+    resolved_head_sha: str,
+    resolved_target_sha: str,
+    pre_rebase_head_sha: str | None = None,
+    pre_rebase_target_sha: str | None = None,
+    pre_rebase_merge_base_sha: str | None = None,
+) -> str:
+    """Build persisted structured scope text for a resolution-scoped review."""
+    return "\n".join(
+        (
+            "Review mode: resolution",
+            f"Implementation task: {implementation_task_id}",
+            f"Rebase task: {rebase_task_id}",
+            f"Pre-rebase head SHA: {pre_rebase_head_sha or ''}",
+            f"Pre-rebase target SHA: {pre_rebase_target_sha or ''}",
+            f"Pre-rebase merge-base SHA: {pre_rebase_merge_base_sha or ''}",
+            f"Resolved head SHA: {resolved_head_sha}",
+            f"Resolved target SHA: {resolved_target_sha}",
+            "",
+            "Review only the conflict-resolution delta introduced by this rebase.",
+            "Do not re-review the whole implementation except where context is required.",
+        )
+    )
+
+
+def parse_resolution_review_scope(scope: str | None) -> ResolutionReviewScope | None:
+    """Parse persisted resolution-review metadata from review_scope text.
+
+    Returns ``None`` when the scope is not a resolution-review scope at all.
+    Raises ``ValueError`` when the scope claims to be a resolution review but the
+    structured metadata block is malformed.
+    """
+    if not declares_resolution_review_mode(scope):
+        return None
+    assert scope is not None
+    lines = scope.splitlines()
+    mode_index = next(
+        (
+            index
+            for index, raw_line in enumerate(lines)
+            if raw_line.strip() == "Review mode: resolution"
+        ),
+        None,
+    )
+    if mode_index is None:
+        raise ValueError("resolution review metadata header is malformed")
+
+    raw_fields: dict[str, str] = {}
+    for raw_line in lines[mode_index + 1 :]:
+        line = raw_line.strip()
+        if not line:
+            break
+        match = _RESOLUTION_REVIEW_FIELD_RE.match(line)
+        if match is None:
+            raise ValueError(f"resolution review metadata line is malformed: {line}")
+        field_name, field_value = match.groups()
+        if field_name not in _RESOLUTION_REVIEW_ALLOWED_FIELDS:
+            raise ValueError(f"unexpected resolution review metadata field: {field_name}")
+        if field_name in raw_fields:
+            raise ValueError(f"duplicate resolution review metadata field: {field_name}")
+        raw_fields[field_name] = field_value.strip()
+
+    missing_fields = [field for field in _RESOLUTION_REVIEW_REQUIRED_FIELDS if not raw_fields.get(field)]
+    if missing_fields:
+        raise ValueError(
+            "resolution review metadata is missing required fields: "
+            + ", ".join(missing_fields)
+        )
+    fields = {
+        field.lower().replace(" ", "_").replace("-", "_"): value.strip()
+        for field, value in raw_fields.items()
+    }
+    implementation_task_id = fields.get("implementation_task")
+    rebase_task_id = fields.get("rebase_task")
+    resolved_head_sha = fields.get("resolved_head_sha")
+    resolved_target_sha = fields.get("resolved_target_sha")
+    assert implementation_task_id is not None
+    assert rebase_task_id is not None
+    assert resolved_head_sha is not None
+    assert resolved_target_sha is not None
+    return ResolutionReviewScope(
+        implementation_task_id=implementation_task_id,
+        rebase_task_id=rebase_task_id,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+        pre_rebase_head_sha=fields.get("pre_rebase_head_sha") or None,
+        pre_rebase_target_sha=fields.get("pre_rebase_target_sha") or None,
+        pre_rebase_merge_base_sha=fields.get("pre_rebase_merge_base_sha") or None,
+    )
 
 
 def _normalize_scope_text(text: str | None) -> str | None:

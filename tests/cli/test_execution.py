@@ -1706,6 +1706,7 @@ class TestRetryCommand:
             task_type="rebase",
             based_on=impl.id,
             same_branch=True,
+            base_branch="release",
         )
         assert failed_rebase.id is not None
         failed_rebase.status = "failed"
@@ -1716,7 +1717,7 @@ class TestRetryCommand:
         retry_task = _create_retry_task(store, failed_rebase, trigger_source="manual")
         assert retry_task.based_on == failed_rebase.id
         assert retry_task.same_branch is True
-        assert retry_task.base_branch is None
+        assert retry_task.base_branch == "release"
         assert retry_task.branch == impl.branch
         assert retry_task.recovery_origin == "retry"
 
@@ -1738,6 +1739,7 @@ class TestRetryCommand:
             task_type="rebase",
             based_on=impl.id,
             same_branch=True,
+            base_branch="release",
         )
         assert orphan_parent.id is not None
         orphan_parent.status = "failed"
@@ -1754,6 +1756,7 @@ class TestRetryCommand:
             task_type="rebase",
             based_on=orphan_parent.id,
             same_branch=True,
+            base_branch="release",
         )
         assert failed_rebase.id is not None
         failed_rebase.status = "failed"
@@ -1765,7 +1768,7 @@ class TestRetryCommand:
         retry_task = _create_retry_task(store, failed_rebase, trigger_source="manual")
         assert retry_task.id is not None
         assert retry_task.same_branch is True
-        assert retry_task.base_branch is None
+        assert retry_task.base_branch == "release"
         assert retry_task.branch == "feature/impl"
         retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
         assert retry_unit is not None
@@ -1788,6 +1791,7 @@ class TestRetryCommand:
             task_type="rebase",
             based_on=impl.id,
             same_branch=True,
+            base_branch="release",
         )
         assert failed_rebase.id is not None
         failed_rebase.status = "failed"
@@ -1801,7 +1805,7 @@ class TestRetryCommand:
         retry_task = get_latest_task(store, based_on=failed_rebase.id, task_type="rebase")
         assert retry_task is not None
         assert retry_task.same_branch is True
-        assert retry_task.base_branch is None
+        assert retry_task.base_branch == "release"
         assert retry_task.branch == impl.branch
         assert retry_task.trigger_source == "manual"
 
@@ -1823,6 +1827,7 @@ class TestRetryCommand:
             task_type="rebase",
             based_on=impl.id,
             same_branch=True,
+            base_branch="release",
         )
         assert orphan_parent.id is not None
         orphan_parent.status = "failed"
@@ -1838,6 +1843,7 @@ class TestRetryCommand:
             task_type="rebase",
             based_on=orphan_parent.id,
             same_branch=True,
+            base_branch="release",
         )
         assert failed_rebase.id is not None
         failed_rebase.status = "failed"
@@ -1854,7 +1860,7 @@ class TestRetryCommand:
         )
         assert retry_task.id is not None
         assert retry_task.same_branch is True
-        assert retry_task.base_branch is None
+        assert retry_task.base_branch == "release"
         assert retry_task.branch == "feature/impl"
         retry_unit = store.resolve_merge_unit_for_task(retry_task.id)
         assert retry_unit is not None
@@ -18664,12 +18670,16 @@ class TestIterateCommand:
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
 
-        engine_actions = [
-            {"type": "needs_rebase", "description": "needs rebase"},
-            {"type": "needs_rebase", "description": "needs rebase"},
-            {"type": "resume", "description": "resume"},
-            {"type": "merge", "description": "done"},
-        ]
+        resume_task = store.add("Resume", task_type="implement", based_on=impl.id)
+
+        def fake_iterate_action(*_args, **_kwargs):
+            current_rebase = store.get(rebase_task.id)
+            if current_rebase is None or current_rebase.status != "completed":
+                return {"type": "needs_rebase", "description": "needs rebase"}
+            current_resume = store.get(resume_task.id)
+            if current_resume is None or current_resume.status != "completed":
+                return {"type": "resume", "description": "resume"}
+            return {"type": "merge", "description": "done"}
 
         def fake_run_foreground(config, task_id, resume=False, **kwargs):
             task = store.get(task_id)
@@ -18683,13 +18693,12 @@ class TestIterateCommand:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli.determine_next_action", side_effect=engine_actions),
+            patch("gza.cli.execution._determine_selected_iterate_action", side_effect=fake_iterate_action),
             patch("gza.cli.resolve_closing_review_action", return_value=None),
-            patch("gza.cli._create_rebase_task", return_value=rebase_task) as create_rebase,
-            patch("gza.cli._create_resume_task") as create_resume,
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli.execution._create_rebase_task", return_value=rebase_task) as create_rebase,
+            patch("gza.cli.execution._create_resume_task") as create_resume,
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
         ):
-            resume_task = store.add("Resume", task_type="implement", based_on=impl.id)
             create_resume.return_value = resume_task
             result = cmd_iterate(args)
 
@@ -18915,6 +18924,14 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        first_action = True
+
+        def fake_iterate_action(*_args, **_kwargs):
+            nonlocal first_action
+            if first_action:
+                first_action = False
+                return {"type": "needs_rebase", "description": "needs rebase"}
+            return {"type": "merge", "description": "done"}
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -18935,13 +18952,10 @@ class TestIterateCommand:
                 ),
             ),
             patch(
-                "gza.cli.determine_next_action",
-                side_effect=[
-                    {"type": "needs_rebase", "description": "needs rebase"},
-                    {"type": "merge", "description": "done"},
-                ],
+                "gza.cli.execution._determine_selected_iterate_action",
+                side_effect=fake_iterate_action,
             ),
-            patch("gza.cli._create_rebase_task", side_effect=AssertionError("should not create rebase")),
+            patch("gza.cli.execution._create_rebase_task", side_effect=AssertionError("should not create rebase")),
         ):
             result = cmd_iterate(args)
 
@@ -18975,6 +18989,7 @@ class TestIterateCommand:
             impl,
             "main",
             max_resume_attempts=1,
+            selected_for_merge=True,
         )
 
         assert action["type"] == "needs_rebase"
@@ -20168,8 +20183,16 @@ class TestRunForeground:
         task.session_id = "resume-session"
         task.branch = "feature/resume-target"
         store.update(task)
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch="release",
+            owner_task_id=task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
         def fake_task_backed_rebase(*, store, rebase_task, branch, target_branch, **_kwargs):
+            assert target_branch == "release"
             store.mark_completed(
                 rebase_task,
                 branch=branch,
@@ -20193,7 +20216,8 @@ class TestRunForeground:
         rebase_task = rebase_children[0]
         assert rebase_task.status == "completed"
         assert rebase_task.branch == task.branch
-        assert "Rebased" in (rebase_task.output_content or "")
+        assert rebase_task.base_branch == "release"
+        assert "onto 'release'" in (rebase_task.output_content or "")
         assert rebase_task.log_file is not None
 
     def test_auto_rebase_before_resume_uses_retry_hint_without_start_fresh_wording(self, tmp_path: Path):
@@ -20210,6 +20234,13 @@ class TestRunForeground:
         task.session_id = "resume-session"
         task.branch = "feature/resume-target"
         store.update(task)
+        unit = store.create_merge_unit(
+            source_branch=task.branch,
+            target_branch="release",
+            owner_task_id=task.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(task.id, unit.id, "owner")
 
         mock_git = MagicMock()
         mock_git.default_branch.return_value = "main"
@@ -20221,6 +20252,7 @@ class TestRunForeground:
             rc = _auto_rebase_before_resume(config, task.id)
 
         assert rc == 1
+        assert mock_rebase.call_args.kwargs["target_branch"] == "release"
         assert mock_rebase.call_args.kwargs["failure_hint_lines"] == [
             "Use 'gza retry' to create a new retry attempt or run 'gza rebase' manually.",
         ]
@@ -21521,14 +21553,11 @@ class TestForegroundInvocationContextWiring:
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground,
             patch("gza.cli.resolve_closing_review_action", return_value=None),
             patch(
-                "gza.cli.execution.determine_next_action",
-                side_effect=[
-                    {"type": "merge", "description": "merge ready"},
-                    {"type": "merge", "description": "merge ready"},
-                ],
+                "gza.cli.execution._determine_selected_iterate_action",
+                side_effect=lambda *_args, **_kwargs: {"type": "merge", "description": "merge ready"},
             ),
         ):
             rc = cmd_iterate(args)
@@ -21590,14 +21619,11 @@ class TestForegroundInvocationContextWiring:
         with (
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli.run", side_effect=fake_run),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run),
             patch("gza.cli.resolve_closing_review_action", return_value=None),
             patch(
-                "gza.cli.execution.determine_next_action",
-                side_effect=[
-                    {"type": "merge", "description": "merge ready"},
-                    {"type": "merge", "description": "merge ready"},
-                ],
+                "gza.cli.execution._determine_selected_iterate_action",
+                side_effect=lambda *_args, **_kwargs: {"type": "merge", "description": "merge ready"},
             ),
         ):
             rc = cmd_iterate(args)
@@ -21676,14 +21702,11 @@ class TestForegroundInvocationContextWiring:
         with (
             patch("gza.cli.get_store", return_value=store),
             patch("gza.cli.Git", return_value=mock_git),
-            patch("gza.cli.run", side_effect=fake_run),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run),
             patch("gza.cli.resolve_closing_review_action", return_value=None),
             patch(
-                "gza.cli.execution.determine_next_action",
-                side_effect=[
-                    {"type": "merge", "description": "merge ready"},
-                    {"type": "merge", "description": "merge ready"},
-                ],
+                "gza.cli.execution._determine_selected_iterate_action",
+                side_effect=lambda *_args, **_kwargs: {"type": "merge", "description": "merge ready"},
             ),
         ):
             rc = cmd_iterate(iterate_args)
@@ -21749,17 +21772,25 @@ class TestForegroundInvocationContextWiring:
             with (
                 patch("gza.cli.get_store", return_value=store),
                 patch("gza.cli.Git", return_value=mock_git),
-                patch("gza.cli.run", side_effect=fake_run),
+                patch("gza.cli.execution._run_foreground", side_effect=fake_run),
                 patch("gza.cli.resolve_closing_review_action", return_value=None),
                 patch(
-                    "gza.cli.execution.determine_next_action",
-                    side_effect=[
-                        {"type": "merge", "description": "merge ready"},
-                        {"type": "merge", "description": "merge ready"},
-                    ],
+                    "gza.cli.execution._determine_selected_iterate_action",
+                    side_effect=lambda *_args, **_kwargs: {"type": "merge", "description": "merge ready"},
                 ),
             ):
                 assert cmd_iterate(iterate_args) == 0
+            registry = WorkerRegistry(config.workers_path)
+            registry.register(
+                WorkerMetadata(
+                    worker_id=worker_id,
+                    task_id=impl.id,
+                    pid=os.getpid(),
+                    status="completed",
+                    startup_log_file=f"{worker_id}-startup.log",
+                    exit_code=0,
+                )
+            )
             mock_proc = MagicMock()
             mock_proc.pid = os.getpid()
             return mock_proc, f".gza/workers/{worker_id}-startup.log"

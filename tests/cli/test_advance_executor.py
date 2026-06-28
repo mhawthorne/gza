@@ -21,6 +21,7 @@ from gza.advance_engine import (
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli._common import _create_retry_task, _materialize_plan_review_slices, resolve_improve_action
 from gza.cli.advance_executor import (
+    _prepare_resolution_review_action,
     _WORKER_ACTIONS,
     ITERATE_ROUTABLE_ACTIONS,
     AdvanceActionExecutionContext,
@@ -2297,6 +2298,53 @@ def test_create_review_can_route_through_iterate_before_creating_child(tmp_path:
     assert spawned == [(impl.id, "iterate")]
 
 
+def test_prepare_resolution_review_action_persists_rebase_completion_target_after_target_moves(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/resolution-target-moved")
+    store.update(impl)
+
+    rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    _mark_completed(rebase, branch=impl.branch)
+    rebase.review_scope = (
+        "Rebase diff provenance: yes\n"
+        "Pre-rebase head SHA: old-head\n"
+        "Pre-rebase target SHA: target-before\n"
+        "Pre-rebase merge-base SHA: old-base\n"
+        "Resolved head SHA: rebased-head\n"
+        "Resolved target SHA: target-at-rebase\n"
+        "Recovered baseline: no"
+    )
+    store.update(rebase)
+
+    result = _prepare_resolution_review_action(
+        store,
+        impl,
+        {
+            "type": "create_review",
+            "review_mode": "resolution",
+            "resolution_rebase_task_id": rebase.id,
+            "resolution_head_sha": "rebased-head",
+            "resolution_target_sha": "target-at-rebase",
+        },
+        trigger_source="manual",
+    )
+
+    assert result.status == "created"
+    assert result.review_task is not None
+    persisted = store.get(result.review_task.id)
+    assert persisted is not None
+    assert persisted.review_scope is not None
+    assert "Resolved head SHA: rebased-head" in persisted.review_scope
+    assert "Resolved target SHA: target-at-rebase" in persisted.review_scope
+
+
 def test_retry_iterate_missing_launcher_releases_reserved_launch_permit(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
@@ -2629,6 +2677,74 @@ def test_advance_executor_skips_needs_rebase_if_target_already_merged_before_cre
     assert result.status == "skip"
     assert result.message == "target implementation already merged"
     assert result.worker_consuming is False
+
+
+def test_needs_rebase_recovery_preflight_uses_explicit_rebase_parent_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/recovery-preflight-parent")
+    store.update(impl)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.branch = impl.branch
+    store.update(failed_improve)
+
+    created_from: list[str] = []
+    spawned: list[tuple[str, str]] = []
+
+    def _create_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        created_from.append(parent.id)
+        return store.add(
+            prompt=f"Rebase {parent.id}",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_retry_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task_obj, kind: spawned.append((str(task_obj.id), kind)) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=failed_improve,
+        action={
+            "type": "needs_rebase",
+            "reason": "recovery-preflight-rebase",
+            "rebase_parent_task_id": impl.id,
+        },
+        context=context,
+    )
+
+    assert result.status == "success"
+    assert created_from == [impl.id]
+    assert result.created_task is not None
+    assert result.created_task.based_on == impl.id
+    assert spawned == [(result.created_task.id, "rebase")]
 
 
 def test_needs_rebase_iterate_rolls_back_when_prepare_fails(tmp_path: Path) -> None:

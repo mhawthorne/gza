@@ -50,7 +50,9 @@ from gza.query import (
     get_code_changing_descendants_for_root,
     get_reviews_for_root,
     resolve_lineage_root,
+    resolve_same_branch_lineage_root,
 )
+from gza.rebase_diff import parse_rebase_diff_provenance
 from gza.recovery_engine import (
     FailedRecoveryDecision,
     classify_failure_reason,
@@ -65,6 +67,7 @@ from gza.review_clearance import (
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
     is_verify_only_noop_review_clearance_status,
 )
+from gza.review_scope import ResolutionReviewScope, parse_resolution_review_scope
 from gza.review_tasks import (
     build_review_blocker_dispute_metadata,
     find_existing_review_blocker_adjudication_task,
@@ -320,6 +323,7 @@ class AdvanceContext:
     plan_slice_target_timeout_minutes: int
     max_noop_improve_cycles: int
     max_resume_attempts: int
+    selected_for_merge: bool = False
 
     auto_implement_enabled: bool = True
     has_non_dropped_implement_descendant: bool = False
@@ -343,6 +347,9 @@ class AdvanceContext:
     review_invalidation_reason: str | None = None
     review_preserved_by_rebase: DbTask | None = None
     review_invalidated_by_rebase: DbTask | None = None
+    resolution_review_required: bool = False
+    resolution_review_metadata: ResolutionReviewScope | None = None
+    resolution_review_metadata_invalid: bool = False
     current_review_head_sha: str | None = None
     current_review_head_probe_warning: str | None = None
     latest_reviewed_head_sha: str | None = None
@@ -2239,16 +2246,22 @@ def _rebase_change_reason(rebase_task: DbTask | None) -> str:
 def _rebase_create_review_description(rebase_task: DbTask | None) -> str:
     task_id = _task_id(rebase_task)
     if rebase_task is not None and rebase_task.changed_diff is None:
-        return f"Create review (rebase {task_id} change unknown)"
-    return f"Create review (rebase {task_id} changed diff)"
+        return f"Create resolution review (rebase {task_id} change unknown)"
+    return f"Create resolution review (rebase {task_id} changed diff)"
 
 
 def _rebase_pending_review_description(review_task: DbTask | None, rebase_task: DbTask | None) -> str:
-    return f"Run pending review {_task_id(review_task)} (rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+    return (
+        f"Run pending resolution review {_task_id(review_task)} "
+        f"(rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+    )
 
 
 def _rebase_wait_review_description(review_task: DbTask | None, rebase_task: DbTask | None) -> str:
-    return f"SKIP: review {_task_id(review_task)} in progress (rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+    return (
+        f"SKIP: resolution review {_task_id(review_task)} in progress "
+        f"(rebase {_task_id(rebase_task)} {_rebase_change_reason(rebase_task)})"
+    )
 
 
 def _stale_review_create_review_description(ctx: AdvanceContext) -> str:
@@ -2281,6 +2294,85 @@ def _review_freshness_probe_failed_description(ctx: AdvanceContext) -> str:
     return (
         "SKIP: latest review freshness could not be verified because "
         f"{ctx.current_review_head_probe_warning}"
+    )
+
+
+def _resolution_review_metadata_invalid_action(ctx: AdvanceContext) -> dict[str, Any]:
+    review_root_task = getattr(ctx, "review_root_task", None)
+    subject_task = review_root_task if review_root_task is not None else ctx.task
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": "SKIP: required resolution-review metadata is missing or malformed",
+        },
+        reason="resolution-review-metadata-invalid",
+        subject_task_id=subject_task.id,
+    )
+
+
+def _resolve_planned_resolution_review_metadata(ctx: AdvanceContext) -> tuple[str | None, str | None, str | None]:
+    """Resolve the metadata required to create a new resolution review."""
+    rebase_task = ctx.review_invalidated_by_rebase
+    if rebase_task is None or rebase_task.id is None:
+        return None, None, None
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if (
+        provenance is None
+        or not provenance.resolved_head_sha
+        or not provenance.resolved_target_sha
+    ):
+        return rebase_task.id, None, None
+    return rebase_task.id, provenance.resolved_head_sha, provenance.resolved_target_sha
+
+
+def _planned_resolution_review_metadata_is_valid(ctx: AdvanceContext) -> bool:
+    rebase_task_id, resolved_head_sha, resolved_target_sha = _resolve_planned_resolution_review_metadata(ctx)
+    return bool(rebase_task_id and resolved_head_sha and resolved_target_sha)
+
+
+def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
+    action: dict[str, Any] = {
+        "type": "create_review",
+        "description": _stale_review_create_review_description(ctx),
+    }
+    if ctx.review_invalidation_reason == "rebase_changed_diff":
+        rebase_task = ctx.review_invalidated_by_rebase
+        if rebase_task is None:
+            raise AssertionError("rebase-changed stale review requires review_invalidated_by_rebase")
+        rebase_task_id, resolved_head_sha, resolved_target_sha = _resolve_planned_resolution_review_metadata(ctx)
+        if not rebase_task_id or not resolved_head_sha or not resolved_target_sha:
+            raise AssertionError("resolution review action requires validated rebase/head/target metadata")
+        action.update(
+            {
+                "review_mode": "resolution",
+                "resolution_rebase_task_id": rebase_task_id,
+                "resolution_head_sha": resolved_head_sha,
+                "resolution_target_sha": resolved_target_sha,
+            }
+        )
+    return action
+
+
+def _resolution_review_metadata_matches_context(
+    metadata: ResolutionReviewScope | None,
+    *,
+    impl_task: DbTask,
+    rebase_task: DbTask | None,
+) -> bool:
+    if metadata is None or impl_task.id is None or rebase_task is None or rebase_task.id is None:
+        return False
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if (
+        provenance is None
+        or not provenance.resolved_head_sha
+        or not provenance.resolved_target_sha
+    ):
+        return False
+    return (
+        metadata.implementation_task_id == impl_task.id
+        and metadata.rebase_task_id == rebase_task.id
+        and metadata.resolved_head_sha == provenance.resolved_head_sha
+        and metadata.resolved_target_sha == provenance.resolved_target_sha
     )
 
 
@@ -2731,7 +2823,10 @@ def _branch_contains_target_tip(ctx: AdvanceContext) -> bool:
     state = ctx.post_merge_rebase_state
     if state is None:
         return False
-    return state.rebase_resolution_proved or state.target_is_ancestor_of_branch is True
+    return (
+        bool(getattr(state, "rebase_resolution_proved", False))
+        or getattr(state, "target_is_ancestor_of_branch", None) is True
+    )
 
 
 def _rebase_failure_circuit_breaker_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -2790,7 +2885,68 @@ def _failed_task_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
 
 def _failed_task_resume_or_retry_action(ctx: AdvanceContext) -> dict[str, Any]:
     assert ctx.failed_recovery_decision is not None
+    if ctx.failed_recovery_decision.action == "reconcile":
+        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+    if ctx.task.task_type == "rebase":
+        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+    if not ctx.task.branch:
+        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+    if not ctx.task.has_commits:
+        return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+
+    rebase_parent_task = _resolve_recovery_preflight_rebase_parent_task(ctx.store, ctx.task)
+    same_branch_rebases = _get_same_branch_rebase_descendants_for_root(ctx.store, rebase_parent_task)
+    active_same_branch_rebase = next(
+        (
+            rebase
+            for rebase in same_branch_rebases
+            if rebase.status in {"pending", "in_progress"}
+        ),
+        None,
+    )
+    deferred_action = failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+    recovery_preflight_metadata = {
+        "deferred_action_type": deferred_action["type"],
+        "failed_task_id": ctx.task.id,
+        "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
+        "rebase_parent_task_id": rebase_parent_task.id,
+        "rebase_parent_task_type": rebase_parent_task.task_type,
+        "rebase_parent_branch": rebase_parent_task.branch,
+        "reason": "recovery-preflight-rebase",
+    }
+    if active_same_branch_rebase is not None:
+        return {
+            "type": "skip",
+            "description": f"SKIP: rebase {_task_id(active_same_branch_rebase)} already in progress",
+            "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
+            "reason": "recovery-preflight-rebase",
+            "active_rebase_task_id": active_same_branch_rebase.id,
+            "recovery_preflight": recovery_preflight_metadata,
+        }
+    if not _branch_contains_target_tip(ctx):
+        return {
+            "type": "needs_rebase",
+            "description": "Rebase before failed-task recovery",
+            "reason": "recovery-preflight-rebase",
+            "deferred_action_type": deferred_action["type"],
+            "failed_task_id": ctx.task.id,
+            "recovery_task_id": ctx.failed_recovery_decision.recovery_task_id,
+            "rebase_parent_task_id": rebase_parent_task.id,
+            "recovery_preflight": recovery_preflight_metadata,
+        }
     return failed_recovery_decision_to_action(ctx.task, ctx.failed_recovery_decision)
+
+
+def _resolve_recovery_preflight_rebase_parent_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Attach recovery-preflight rebases to the canonical same-branch implementation lineage."""
+    if task.id is None or not task.branch:
+        return task
+    if task.task_type == "rebase":
+        resolved_target = resolve_rebase_target_task(store, task)
+        if resolved_target is not None:
+            return resolved_target
+        return task
+    return resolve_same_branch_lineage_root(store, task)
 
 
 def with_needs_attention(
@@ -4341,6 +4497,9 @@ def _resolve_pre_closing_review_git_context(
     review_invalidation_reason: str | None = None
     review_preserved_by_rebase: DbTask | None = None
     review_invalidated_by_rebase: DbTask | None = None
+    resolution_review_required = False
+    resolution_review_metadata: ResolutionReviewScope | None = None
+    resolution_review_metadata_invalid = False
     review_cycle_boundary = ReviewCycleBoundary()
     completed_review_cycles = ctx.completed_review_cycles
     latest_reviewed_head_sha = (
@@ -4366,15 +4525,82 @@ def _resolve_pre_closing_review_git_context(
             review_invalidated_by_progress = True
             review_invalidation_reason = "rebase_changed_diff"
             review_invalidated_by_rebase = latest_completed_rebase
+            resolution_review_required = True
     if (
         ctx.latest_completed_review is not None
         and latest_reviewed_head_sha is not None
         and current_review_head_sha is not None
         and latest_reviewed_head_sha != current_review_head_sha
+        and ctx.latest_completed_code_change is not None
+        and ctx.latest_completed_code_change.id != ctx.latest_completed_review.id
+        and _task_event_time(ctx.latest_completed_code_change)
+        > _task_event_time(ctx.latest_completed_review)
     ):
         review_invalidated_by_progress = True
         if review_invalidation_reason is None:
             review_invalidation_reason = "branch_head_advanced"
+
+    if resolution_review_required and ctx.active_review is not None:
+        try:
+            resolution_review_metadata = parse_resolution_review_scope(ctx.active_review.review_scope)
+        except ValueError:
+            resolution_review_metadata_invalid = True
+        else:
+            if not _resolution_review_metadata_matches_context(
+                resolution_review_metadata,
+                impl_task=review_root_task,
+                rebase_task=latest_completed_rebase,
+            ):
+                resolution_review_metadata_invalid = True
+    elif (
+        resolution_review_required
+        and ctx.latest_completed_review is not None
+        and latest_completed_rebase is not None
+        and ctx.latest_completed_review.completed_at is not None
+        and latest_completed_rebase.completed_at is not None
+        and ctx.latest_completed_review.completed_at > latest_completed_rebase.completed_at
+    ):
+        try:
+            resolution_review_metadata = parse_resolution_review_scope(ctx.latest_completed_review.review_scope)
+        except ValueError:
+            resolution_review_metadata_invalid = True
+        else:
+            if not _resolution_review_metadata_matches_context(
+                resolution_review_metadata,
+                impl_task=review_root_task,
+                rebase_task=latest_completed_rebase,
+            ):
+                resolution_review_metadata_invalid = True
+    elif resolution_review_required and not _planned_resolution_review_metadata_is_valid(
+        replace(
+            ctx,
+            review_invalidated_by_rebase=latest_completed_rebase,
+            current_review_head_sha=current_review_head_sha,
+            post_merge_rebase_state=post_merge_rebase_state,
+        )
+    ):
+        resolution_review_metadata_invalid = True
+
+    if (
+        not resolution_review_metadata_invalid
+        and latest_completed_rebase is not None
+        and latest_completed_rebase.changed_diff is not False
+        and ctx.latest_completed_review is not None
+        and ctx.latest_completed_review.completed_at is not None
+        and latest_completed_rebase.completed_at is not None
+        and ctx.latest_completed_review.completed_at > latest_completed_rebase.completed_at
+    ):
+        try:
+            resolution_review_metadata = parse_resolution_review_scope(ctx.latest_completed_review.review_scope)
+        except ValueError:
+            resolution_review_metadata_invalid = True
+        else:
+            if not _resolution_review_metadata_matches_context(
+                resolution_review_metadata,
+                impl_task=review_root_task,
+                rebase_task=latest_completed_rebase,
+            ):
+                resolution_review_metadata_invalid = True
 
     if (
         ctx.review_verdict == "CHANGES_REQUESTED"
@@ -4427,6 +4653,9 @@ def _resolve_pre_closing_review_git_context(
         review_invalidation_reason=review_invalidation_reason,
         review_preserved_by_rebase=review_preserved_by_rebase,
         review_invalidated_by_rebase=review_invalidated_by_rebase,
+        resolution_review_required=resolution_review_required,
+        resolution_review_metadata=resolution_review_metadata,
+        resolution_review_metadata_invalid=resolution_review_metadata_invalid,
         current_review_head_sha=current_review_head_sha,
         current_review_head_probe_warning=current_review_head_probe_warning,
         latest_reviewed_head_sha=latest_reviewed_head_sha,
@@ -4530,6 +4759,7 @@ def resolve_advance_context(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
+    selected_for_merge: bool = False,
 ) -> AdvanceContext:
     """Resolve state once, then let rules evaluate pure context."""
     assert task.id is not None
@@ -4609,10 +4839,15 @@ def resolve_advance_context(
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
         )
-        return replace(base_ctx, **_resolve_plan_review_state(config=config, store=store, task=task))
+        return replace(
+            base_ctx,
+            selected_for_merge=selected_for_merge,
+            **_resolve_plan_review_state(config=config, store=store, task=task),
+        )
 
     if not task.branch:
-        return _build_base_advance_context(
+        return replace(
+            _build_base_advance_context(
             config=config,
             store=store,
             task=task,
@@ -4629,6 +4864,8 @@ def resolve_advance_context(
             is_resumable_failed=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
+            ),
+            selected_for_merge=selected_for_merge,
         )
 
     review_root_task = _resolve_review_root_task(store, task)
@@ -4695,6 +4932,7 @@ def resolve_advance_context(
     )
     ctx = replace(
         ctx,
+        selected_for_merge=selected_for_merge,
         reviews=reviews,
         review_root_task=review_root_task,
         active_review=active_review,
@@ -5258,8 +5496,12 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="conflict_needs_rebase",
-        matches=lambda ctx: not ctx.can_merge and not _branch_contains_target_tip(ctx),
-        action=lambda ctx: {"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"},
+        matches=lambda ctx: ctx.selected_for_merge and not ctx.can_merge and not _branch_contains_target_tip(ctx),
+        action=lambda ctx: {
+            "type": "needs_rebase",
+            "description": "rebase --resolve (conflicts detected)",
+            "reason": "merge-selection-conflict-rebase",
+        },
     ),
     AdvanceRule(
         name="already_rebased_but_lineage_incomplete",
@@ -5269,6 +5511,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.task.status != "completed"
         ),
         action=_already_rebased_but_lineage_incomplete_action,
+    ),
+    AdvanceRule(
+        name="resolution_review_metadata_invalid",
+        matches=lambda ctx: (
+            ctx.resolution_review_metadata_invalid
+            and _is_implementation_owned_lineage(ctx)
+            and ctx.requires_review
+        ),
+        action=_resolution_review_metadata_invalid_action,
     ),
     AdvanceRule(
         name="stale_review_run_pending_review",
@@ -5318,10 +5569,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="stale_review_create_review",
         matches=lambda ctx: _stale_review_refresh_required(ctx) and ctx.create_reviews,
-        action=lambda ctx: {
-            "type": "create_review",
-            "description": _stale_review_create_review_description(ctx),
-        },
+        action=_stale_review_create_review_action,
     ),
     AdvanceRule(
         name="stale_review_needs_manual_refresh",
@@ -5706,6 +5954,7 @@ def evaluate_advance_rules(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     read_context: RecoveryReadContext | None = None,
+    selected_for_merge: bool = False,
 ) -> dict[str, Any]:
     """Evaluate ordered advance rules for a task and return an action dict."""
     context = resolve_advance_context(
@@ -5719,6 +5968,7 @@ def evaluate_advance_rules(
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
         read_context=read_context,
+        selected_for_merge=selected_for_merge,
     )
 
     for rule in ADVANCE_RULES:

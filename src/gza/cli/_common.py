@@ -27,7 +27,11 @@ from rich.panel import Panel
 
 from ..artifact_paths import resolve_artifact_path
 from ..artifacts import store_command_output_artifact
-from ..branch_resolution import resolve_rebase_target_branch, resolve_rebase_target_task
+from ..branch_resolution import (
+    resolve_rebase_base_branch,
+    resolve_rebase_target_branch,
+    resolve_rebase_target_task,
+)
 from ..concurrency import (
     LaunchPermit,
     launch_permit,
@@ -2665,6 +2669,7 @@ def _create_rebase_task(
         task_type="rebase",
         based_on=parent_task_id,
         same_branch=True,
+        base_branch=target_branch,
         review_scope=(
             _resolved_review_scope_metadata(parent_task)
             if parent_task is not None
@@ -3638,6 +3643,8 @@ def _create_retry_task(
     if should_fork_retry_branch:
         retry_same_branch = False
         retry_base_branch = original_task.branch
+    elif original_task.task_type == "rebase":
+        retry_base_branch = resolve_rebase_base_branch(original_task)
 
     retry_task = store.add(
         prompt=original_task.prompt,
@@ -3727,21 +3734,21 @@ def _resolve_retry_merge_unit(store: SqliteTaskStore, original_task: DbTask):
 
 
 def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
-    """Rebase resumable code-task branches onto the default branch before resuming."""
-    from ..git import Git
-
-    task = get_store(config).get(task_id)
+    """Rebase resumable code-task branches onto their canonical local target before resuming."""
+    store = get_store(config)
+    task = store.get(task_id)
     if task is None or not task.branch or task.task_type not in {"task", "implement", "improve"}:
         return 0
 
-    git = Git(config.project_dir)
-    default_branch = git.default_branch()
-    store = get_store(config)
+    merge_unit = _resolve_retry_merge_unit(store, task)
+    target_branch = (
+        merge_unit.target_branch if merge_unit is not None else store.default_merge_target(strict=True)
+    )
     rebase_task = _create_rebase_task(
         store,
         task.id or task_id,
         task.branch,
-        default_branch,
+        target_branch,
         trigger_source="manual",
     )
     assert rebase_task.id is not None
@@ -3749,13 +3756,13 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
     store.update(rebase_task)
     from .git_ops import _run_task_backed_rebase
 
-    print(f"Auto-rebasing task {task.id} onto '{default_branch}' before resume...")
+    print(f"Auto-rebasing task {task.id} onto '{target_branch}' before resume...")
     return _run_task_backed_rebase(
         config=config,
         store=store,
         rebase_task=rebase_task,
         branch=task.branch,
-        target_branch=default_branch,
+        target_branch=target_branch,
         remote=False,
         parent_task_id=task.id,
         failure_hint_lines=[

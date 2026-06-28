@@ -170,6 +170,7 @@ def _build_tag_filtered_merge_unit_case(tmp_path: Path) -> tuple[SqliteTaskStore
         branch=branch,
         has_commits=True,
     )
+    rebase.changed_diff = False
     store.update(rebase)
     assert rebase.id is not None
 
@@ -1712,7 +1713,7 @@ def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actiona
     assert row.lifecycle_action_task is not None
     assert row.lifecycle_action_task.id == impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "needs_rebase"
+    assert row.next_action["type"] == "create_review"
     unresolved_ids = {task.id for task in row.unresolved_tasks if task.id is not None}
     assert orphan.id not in unresolved_ids
 
@@ -2240,7 +2241,9 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     assert rows_by_owner[failed_impl.id].recovery_action_task is not None
     assert rows_by_owner[failed_impl.id].recovery_action_task.id == failed_impl.id
     assert rows_by_owner[failed_impl.id].next_action is not None
-    assert rows_by_owner[failed_impl.id].next_action["type"] == "resume"
+    assert rows_by_owner[failed_impl.id].next_action["type"] == "needs_rebase"
+    assert rows_by_owner[failed_impl.id].next_action["reason"] == "recovery-preflight-rebase"
+    assert rows_by_owner[failed_impl.id].next_action["recovery_preflight"]["failed_task_id"] == failed_impl.id
 
 
 def test_query_lineage_owner_rows_excludes_completed_empty_implementation(tmp_path: Path) -> None:
@@ -2314,7 +2317,7 @@ def test_query_lineage_owner_rows_failed_timeout_no_review_prefers_resume_over_m
     assert row.recovery_action_task is not None
     assert row.recovery_action_task.id == failed_impl.id
     assert row.next_action is not None
-    assert row.next_action["type"] == "resume"
+    assert row.next_action["type"] == "needs_rebase"
 
 
 def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ from ..db import SqliteTaskStore, Task as DbTask
 from ..dispatch_preview import build_dispatch_preview
 from ..git import Git
 from ..recovery_engine import FailedRecoveryDecision
-from .advance_engine import failed_recovery_decision_to_attention_action
+from .advance_engine import classify_advance_action, failed_recovery_decision_to_attention_action
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,7 @@ class RecoveryLaneEntry:
     owner_task: DbTask
     task: DbTask
     decision: FailedRecoveryDecision
+    action: dict[str, Any] | None = None
     attention_action: dict[str, Any] | None = None
 
 
@@ -47,10 +48,27 @@ def collect_recovery_lane_entries(
         task = preview_entry.task
         owner_task = preview_entry.owner_task
         decision = preview_entry.decision
+        action = preview_entry.advance_action
         if task.id is None or owner_task is None or decision is None:
             continue
+        if action is not None:
+            action_class = classify_advance_action(action)
+            if action_class == "actionable":
+                entries.append(RecoveryLaneEntry(owner_task=owner_task, task=task, decision=decision, action=action))
+                continue
+            if action_class == "needs_attention":
+                entries.append(
+                    RecoveryLaneEntry(
+                        owner_task=owner_task,
+                        task=task,
+                        decision=decision,
+                        action=action,
+                        attention_action=action,
+                    )
+                )
+                continue
         if decision.action in {"resume", "retry"}:
-            entries.append(RecoveryLaneEntry(owner_task=owner_task, task=task, decision=decision))
+            entries.append(RecoveryLaneEntry(owner_task=owner_task, task=task, decision=decision, action=action))
             continue
         attention_action = failed_recovery_decision_to_attention_action(
             store,
@@ -66,6 +84,7 @@ def collect_recovery_lane_entries(
                 owner_task=owner_task,
                 task=task,
                 decision=decision,
+                action=action,
                 attention_action=attention_action,
             )
         )

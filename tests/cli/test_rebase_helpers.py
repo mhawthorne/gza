@@ -237,6 +237,7 @@ def test_create_rebase_task_prompt_preserves_caller_target_branch_and_forbids_re
     assert "do not run git ls-remote" in rebase_task.prompt
     assert "do not use HTTPS fallback" in rebase_task.prompt
     assert "If the local target branch is missing, stop and report the failure" in rebase_task.prompt
+    assert rebase_task.base_branch == "master"
 
 
 def test_ensure_skill_returns_true_when_skill_already_present(tmp_path: Path) -> None:

@@ -41,6 +41,9 @@ def _normalize_action_reason(action: dict[str, Any]) -> str:
     reason = action.get("needs_attention_reason")
     if isinstance(reason, str) and reason:
         return reason
+    reason = action.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
     description = action.get("description")
     if isinstance(description, str):
         return description.strip()

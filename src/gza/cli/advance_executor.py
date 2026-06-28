@@ -33,8 +33,10 @@ from ..git import Git, GitError
 from ..plan_review_verdict import PlanReviewManifest
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
 from ..review_tasks import (
+    DuplicateReviewError,
     OffTopicVerifyPersistenceError,
     build_review_blocker_dispute_metadata,
+    create_resolution_review_task,
     persist_review_clearance_artifact,
 )
 from ..runner import (
@@ -157,6 +159,13 @@ class AdvanceExecutionNeedsAttention:
     action: dict[str, Any]
 
 
+@dataclass
+class _InlineCreateReviewActionResult:
+    status: str
+    review_task: DbTask | None
+    message: str
+
+
 _WORKER_ACTIONS = frozenset(
     {
         "create_plan_review",
@@ -193,6 +202,49 @@ def _should_continue_branch_publication_after_reconcile(
     if decision.action != "reconcile":
         return False
     return task.status == "failed" and task.failure_reason in {"BRANCH_UNPUSHABLE", "PR_REQUIRED"}
+
+
+def _prepare_resolution_review_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: dict[str, Any],
+    *,
+    trigger_source: str,
+) -> CreateReviewActionResult:
+    rebase_task_id = action.get("resolution_rebase_task_id")
+    resolved_head_sha = str(action.get("resolution_head_sha") or "").strip()
+    resolved_target_sha = str(action.get("resolution_target_sha") or "").strip()
+    if not isinstance(rebase_task_id, str) or not rebase_task_id.strip():
+        return _InlineCreateReviewActionResult(status="skip", review_task=None, message="SKIP: missing resolution rebase task")
+    rebase_task = store.get(rebase_task_id)
+    if rebase_task is None:
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message=f"SKIP: missing rebase task {rebase_task_id}",
+        )
+    try:
+        review_task = create_resolution_review_task(
+            store,
+            task,
+            rebase_task=rebase_task,
+            resolved_head_sha=resolved_head_sha,
+            resolved_target_sha=resolved_target_sha,
+            trigger_source=trigger_source,
+        )
+    except DuplicateReviewError as exc:
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=exc.active_review,
+            message=f"SKIP: review {exc.active_review.id} is already {exc.active_review.status}",
+        )
+    except ValueError as exc:
+        return _InlineCreateReviewActionResult(status="skip", review_task=None, message=f"SKIP: {exc}")
+    return _InlineCreateReviewActionResult(
+        status="created",
+        review_task=review_task,
+        message=f"Created resolution review task {review_task.id}",
+    )
 def build_improve_needs_attention_result(
     *,
     store: SqliteTaskStore,
@@ -511,7 +563,11 @@ def _persist_verify_only_noop_clearance(
 ) -> datetime | None:
     if context.config is None or task.id is None or review_task.id is None or noop_improve_task.id is None:
         return None
-    persisted_at = datetime.now(UTC)
+    persisted_at = _verify_only_noop_recorded_at(
+        review_task=review_task,
+        noop_improve_task=noop_improve_task,
+        captured_at=captured_at,
+    )
     clearance_payload = {
         "schema_version": 1,
         "clearance_kind": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
@@ -546,6 +602,21 @@ def _persist_verify_only_noop_clearance(
     return persisted.review_cleared_at
 
 
+def _verify_only_noop_recorded_at(
+    *,
+    review_task: DbTask,
+    noop_improve_task: DbTask,
+    captured_at: datetime | None,
+) -> datetime:
+    """Clamp verify-only noop persistence to the latest known lineage event."""
+    recorded_at = captured_at or datetime.now(UTC)
+    if review_task.completed_at is not None and review_task.completed_at > recorded_at:
+        recorded_at = review_task.completed_at
+    if noop_improve_task.completed_at is not None and noop_improve_task.completed_at > recorded_at:
+        recorded_at = noop_improve_task.completed_at
+    return recorded_at
+
+
 def _verify_only_noop_attention_result(
     *,
     action_type: str,
@@ -575,6 +646,11 @@ def _persist_verify_only_noop_attention(
 ) -> None:
     if context.config is None:
         raise ValueError("config is required to persist verify-only no-op recovery attention")
+    persisted_at = _verify_only_noop_recorded_at(
+        review_task=review_task,
+        noop_improve_task=noop_improve_task,
+        captured_at=captured_at,
+    )
     store_command_output_artifact(
         context.store,
         noop_improve_task,
@@ -597,7 +673,7 @@ def _persist_verify_only_noop_attention(
             "outcome_kind": outcome_kind,
             "verify_status": verify_status,
         },
-        created_at=captured_at,
+        created_at=persisted_at,
     )
 
 
@@ -940,6 +1016,7 @@ def _execute_recover_verify_only_noop_review(
             )
         refreshed_task = context.store.get(task.id) or task
         refreshed_task.review_cleared_at = persisted_clearance
+        context.store.update(refreshed_task)
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="success",
@@ -1232,7 +1309,15 @@ def execute_advance_action(
         )
         if blocked is not None:
             return blocked
-        create_result = context.prepare_create_review(task)
+        if action.get("review_mode") == "resolution":
+            create_result = _prepare_resolution_review_action(
+                context.store,
+                task,
+                action,
+                trigger_source=context.trigger_source,
+            )
+        else:
+            create_result = context.prepare_create_review(task)
         if create_result.status == "skip":
             if permit is not None:
                 permit.release()
@@ -1977,7 +2062,26 @@ def execute_advance_action(
         )
         if blocked is not None:
             return blocked
-        rebase_task = context.create_rebase_task(task)
+        rebase_parent_task = task
+        rebase_parent_task_id = action.get("rebase_parent_task_id")
+        if isinstance(rebase_parent_task_id, str) and rebase_parent_task_id:
+            resolved_parent_task = context.store.get(rebase_parent_task_id)
+            if resolved_parent_task is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=f"Cannot rebase: recovery preflight parent task {rebase_parent_task_id} is missing",
+                )
+            if not resolved_parent_task.branch:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=(
+                        f"Cannot rebase: recovery preflight parent task {rebase_parent_task_id} has no branch"
+                    ),
+                )
+            rebase_parent_task = resolved_parent_task
+        rebase_task = context.create_rebase_task(rebase_parent_task)
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -1993,7 +2097,7 @@ def execute_advance_action(
         assert prepared_rebase_task.id is not None
         if context.use_iterate_for_needs_rebase:
             rc = context.spawn_iterate_worker(
-                task,
+                rebase_parent_task,
                 "rebase",
                 prepared_task=prepared_rebase_task,
                 prepared_phase="iteration",

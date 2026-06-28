@@ -31,7 +31,7 @@ from .branch_publication import (
     load_branch_publication_state,
     persist_branch_publication_state,
 )
-from .branch_resolution import resolve_rebase_target_branch
+from .branch_resolution import resolve_rebase_base_branch, resolve_rebase_target_branch
 from .canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canonical_checkout_invariant
 from .commit_messages import build_task_commit_message
 from .config import (
@@ -121,8 +121,11 @@ from .providers.log_renderers import UnknownLogProviderError, get_log_renderer
 from .rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checkout
 from .rebase_diff import (
     RebaseDiffBaseline,
+    RebaseDiffProvenance,
+    build_rebase_diff_provenance,
     capture_rebase_diff_baseline,
     compute_rebase_changed_diff,
+    compute_resolution_delta_context,
 )
 from .rebase_publish import publish_rebased_branch
 from .review_clearance import (
@@ -130,7 +133,12 @@ from .review_clearance import (
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
 )
-from .review_scope import resolve_review_scope_for_impl
+from .review_scope import (
+    ResolutionReviewScope,
+    declares_resolution_review_mode,
+    parse_resolution_review_scope,
+    resolve_review_scope_for_impl,
+)
 from .review_tasks import (
     DuplicateReviewError,
     create_review_task,
@@ -4524,6 +4532,72 @@ def _build_review_diff_context(
     return "\n".join(parts)
 
 
+def _build_resolution_review_delta_context(
+    git: Git | None,
+    resolution_review_scope: ResolutionReviewScope,
+) -> str:
+    """Build focused conflict-resolution review context for resolution-scoped reviews."""
+    provenance = RebaseDiffProvenance(
+        old_tip=resolution_review_scope.pre_rebase_head_sha,
+        target_at_start=resolution_review_scope.pre_rebase_target_sha,
+        merge_base_at_start=resolution_review_scope.pre_rebase_merge_base_sha,
+        resolved_head_sha=resolution_review_scope.resolved_head_sha,
+        resolved_target_sha=resolution_review_scope.resolved_target_sha,
+        recovered=False,
+    )
+
+    parts = [
+        "## Resolution Delta Context",
+        "",
+        f"Implementation task: {resolution_review_scope.implementation_task_id}",
+        f"Rebase task: {resolution_review_scope.rebase_task_id}",
+        f"Pre-rebase head SHA: {resolution_review_scope.pre_rebase_head_sha or 'unavailable'}",
+        f"Pre-rebase target SHA: {resolution_review_scope.pre_rebase_target_sha or 'unavailable'}",
+        f"Pre-rebase merge-base SHA: {resolution_review_scope.pre_rebase_merge_base_sha or 'unavailable'}",
+        f"Resolved head SHA: {resolution_review_scope.resolved_head_sha}",
+        f"Resolved target SHA: {resolution_review_scope.resolved_target_sha}",
+    ]
+    if git is None:
+        parts.extend(
+            (
+                "",
+                "Resolution delta status: unavailable",
+                "Fail closed reason: resolution delta unavailable because git context is not available in this runner prompt build.",
+                "Do not widen this into a whole-implementation review. Flag the missing focused delta as a blocker.",
+            )
+        )
+        return "\n".join(parts)
+
+    delta_context = compute_resolution_delta_context(git, provenance=provenance)
+    if not delta_context.available:
+        parts.extend(
+            (
+                "",
+                "Resolution delta status: unavailable",
+                f"Fail closed reason: {delta_context.summary}",
+                "Do not widen this into a whole-implementation review. Flag the missing focused delta as a blocker.",
+            )
+        )
+        if delta_context.before_range:
+            parts.append(f"Expected pre-rebase range: {delta_context.before_range}")
+        if delta_context.after_range:
+            parts.append(f"Expected rebased range: {delta_context.after_range}")
+        return "\n".join(parts)
+
+    parts.extend(
+        (
+            "",
+            "Resolution delta status: available",
+            f"Pre-rebase range: {delta_context.before_range}",
+            f"Rebased range: {delta_context.after_range}",
+            "",
+            "Range-diff (review this delta, not the whole implementation):",
+            delta_context.range_diff or "",
+        )
+    )
+    return "\n".join(parts)
+
+
 def _build_context_from_chain(
     task: Task,
     store: SqliteTaskStore,
@@ -4763,8 +4837,33 @@ def _build_context_from_chain(
                 review_scope_text = (task.review_scope or "").strip() or (
                     resolved_scope.summary if resolved_scope is not None else None
                 )
+                resolution_review_scope: ResolutionReviewScope | None = None
+                resolution_review_scope_error: str | None = None
+                resolution_review_mode_claimed = declares_resolution_review_mode(review_scope_text)
+                try:
+                    resolution_review_scope = parse_resolution_review_scope(review_scope_text)
+                except ValueError as exc:
+                    resolution_review_scope_error = str(exc)
 
-                if review_scope_text:
+                include_full_implementation_diff = not resolution_review_mode_claimed
+                if resolution_review_mode_claimed:
+                    context_parts.append("\n## Resolution review ask:\n")
+                    context_parts.append(
+                        "Review only the conflict-resolution delta introduced while rebasing an already-reviewed implementation."
+                    )
+                    context_parts.append(
+                        f"Implementation task: {impl_task.id}"
+                    )
+                    if resolution_review_scope is not None:
+                        context_parts.append(
+                            f"Rebase task: {resolution_review_scope.rebase_task_id}"
+                        )
+                    else:
+                        context_parts.append("Rebase task: (unavailable; metadata malformed)")
+                    context_parts.append(
+                        "Do not re-grade the whole implementation diff. Use the focused resolution-delta context and provenance below."
+                    )
+                elif review_scope_text:
                     context_parts.append("\n## Review scope:\n")
                     context_parts.append(f"Implementation task: {impl_task.id}")
                     context_parts.append(
@@ -4776,6 +4875,20 @@ def _build_context_from_chain(
                         context_parts.append("")
                         context_parts.append("Out-of-scope sibling context:")
                         context_parts.append(resolved_scope.out_of_scope_context)
+                if resolution_review_scope_error is not None:
+                    context_parts.append("")
+                    context_parts.append(
+                        "Resolution review metadata is malformed. Fail closed and request operator attention instead of silently treating this as a full implementation review."
+                    )
+                    context_parts.append(f"Parser error: {resolution_review_scope_error}")
+                if resolution_review_scope is not None:
+                    context_parts.append("")
+                    context_parts.append(
+                        "Resolution review mode: review only the conflict-resolution delta introduced by the rebase."
+                    )
+                    context_parts.append("")
+                    context_parts.append(_build_resolution_review_delta_context(git, resolution_review_scope))
+                    include_full_implementation_diff = False
 
                 if plan_task:
                     plan_content = _get_task_output(plan_task, project_dir)
@@ -4801,7 +4914,7 @@ def _build_context_from_chain(
                     context_parts.append(review_verify_result)
 
                 # Get diff if we have a branch (tiered strategy based on diff size)
-                if impl_task.branch and git:
+                if impl_task.branch and git and include_full_implementation_diff:
                     try:
                         default_branch = git.default_branch()
                         revision_range = f"{default_branch}...{impl_task.branch}"
@@ -7574,8 +7687,8 @@ def _complete_code_task(
 
         if not has_uncommitted:
             # Check if branch already has commits from a previous run
-            default_branch = worktree_git.default_branch()
-            commits_ahead = worktree_git.count_commits_ahead(branch_name, default_branch)
+            comparison_branch = target_branch if target_branch is not None else worktree_git.default_branch()
+            commits_ahead = worktree_git.count_commits_ahead(branch_name, comparison_branch)
             if commits_ahead == 0:
                 # No uncommitted changes and no commits on branch - real failure
                 # Note: No need to save WIP here since there are no changes
@@ -7605,18 +7718,18 @@ def _complete_code_task(
                             store=store,
                             task=task,
                             git=worktree_git,
-                            target_branch=default_branch,
+                            target_branch=comparison_branch,
                         )
                     except GitError as exc:
                         warning_message = (
                             "Warning: Could not classify no-work merge state for "
-                            f"{branch_name} against {default_branch}: {exc}. "
+                            f"{branch_name} against {comparison_branch}: {exc}. "
                             "Leaving terminal no-work unclassified."
                         )
                         logger.warning(
                             "runner: no-work merge-state probe failed for branch %s against %s: %s",
                             branch_name,
-                            default_branch,
+                            comparison_branch,
                             exc,
                         )
                         write_log_entry(
@@ -7626,7 +7739,7 @@ def _complete_code_task(
                                 "subtype": "warning",
                                 "message": warning_message,
                                 "branch": branch_name,
-                                "target_branch": default_branch,
+                                "target_branch": comparison_branch,
                                 "probe_error": str(exc),
                             },
                         )
@@ -8006,6 +8119,19 @@ def _post_complete_code_task(
         assert task.id is not None
         store.set_rebase_changed_diff(task.id, rebase_comparison.changed_diff)
         task.changed_diff = rebase_comparison.changed_diff
+        resolved_head_sha = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
+        resolved_target_sha = target_branch if target_branch is not None else worktree_git.default_branch()
+        resolved_target_head_sha = worktree_git.rev_parse_if_exists(resolved_target_sha)
+        task.review_scope = build_rebase_diff_provenance(
+            baseline=(
+                rebase_diff_baseline
+                if rebase_diff_baseline is not None
+                else RebaseDiffBaseline(old_tip=None, target_at_start=None, merge_base_at_start=None, recovered=True)
+            ),
+            resolved_head_sha=resolved_head_sha,
+            resolved_target_sha=resolved_target_head_sha,
+        )
+        store.update(task)
         if rebase_comparison.warning:
             logger.warning(rebase_comparison.warning)
             console.print(f"[yellow]Warning: {rebase_comparison.warning}[/yellow]")
@@ -8020,7 +8146,7 @@ def _post_complete_code_task(
                 impl_ancestor,
                 branch=branch_name,
                 old_head_sha=rebase_diff_baseline.old_tip if rebase_diff_baseline is not None else None,
-                new_head_sha=worktree_git.rev_parse_if_exists(branch_name) if branch_name else None,
+                new_head_sha=resolved_head_sha,
             )
         parent = store.get(rebase_review_target_id)
         parent_unit = (
@@ -8266,7 +8392,26 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
 
     task.failure_reason = None
     task.completion_reason = None
-    target_branch: str | None = git.default_branch() if task.branch and task.has_commits else None
+    if task.task_type == "rebase" and task.branch and task.has_commits:
+        target_branch: str | None = resolve_rebase_base_branch(task)
+        if target_branch is None:
+            print(
+                f"Error: Rebase task {task.id} is missing its persisted local target branch; "
+                "cannot retry PR completion without falling back to the repository default branch."
+            )
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=task.log_file,
+                has_commits=bool(task.has_commits),
+                explicit_reason="GIT_ERROR",
+                error_type=None,
+                exit_code=1,
+            )
+            return 1
+    else:
+        target_branch = git.default_branch() if task.branch and task.has_commits else None
     head_sha = git.rev_parse_if_exists(task.branch) if task.branch and task.has_commits else None
     base_sha = git.rev_parse_if_exists(target_branch) if target_branch and task.has_commits else None
     retry_logger = None
@@ -8422,13 +8567,37 @@ def _run_inner(
     if branch_name is None:
         return 1
 
+    rebase_execution_target: str | None = None
+    if task.task_type == "rebase":
+        rebase_execution_target = resolve_rebase_base_branch(task)
+        if rebase_execution_target is None:
+            message = (
+                f"Rebase task {task.id} is missing its persisted local target branch. "
+                "Parked instead of falling back to the repository default branch."
+            )
+            error_message(f"Error: {message}")
+            _mark_workspace_setup_failure(
+                task=task,
+                config=config,
+                store=store,
+                provider=provider,
+                invocation=invocation,
+                interaction_mode=interaction_mode,
+                resume=resume,
+                message=message,
+                phase="rebase_target_resolution",
+                branch=branch_name,
+            )
+            return 1
+
     # Create worktree path
     assert task.slug is not None
     worktree_path = config.worktree_path / task.slug
     isolated_checkout_cm = None
     isolated_checkout = None
     if _should_use_isolated_runner_rebase_checkout(task=task, config=config):
-        rebase_target = default_branch
+        assert rebase_execution_target is not None
+        rebase_target = rebase_execution_target
         try:
             isolated_checkout_cm = isolated_rebase_checkout(
                 config=config,
@@ -8770,10 +8939,11 @@ def _run_inner(
     improve_diff_baseline: ImproveDiffBaseline | None = None
     rebase_diff_baseline: RebaseDiffBaseline | None = None
     if task.task_type == "rebase":
+        assert rebase_execution_target is not None
         rebase_diff_baseline = capture_rebase_diff_baseline(
             worktree_git,
             branch=branch_name,
-            target=default_branch,
+            target=rebase_execution_target,
             recovered=_is_recovered_rebase_lineage(task, resume=resume),
         )
     if task.task_type == "improve":
@@ -8928,7 +9098,9 @@ def _run_inner(
             worktree_summary_path,
             summary_path,
             summary_dir,
-            target_branch=default_branch,
+            target_branch=(
+                rebase_execution_target if task.task_type == "rebase" else default_branch
+            ),
             skip_commit=task.task_type == "rebase",
             create_pr=create_pr,
             fix_commits_ahead_before_run=fix_commits_ahead_before_run,

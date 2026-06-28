@@ -26,6 +26,29 @@ class RebaseDiffResult:
     warning: str | None = None
 
 
+@dataclass(frozen=True)
+class RebaseDiffProvenance:
+    """Persisted provenance needed to reconstruct a resolution-review delta."""
+
+    old_tip: str | None
+    target_at_start: str | None
+    merge_base_at_start: str | None
+    resolved_head_sha: str | None
+    resolved_target_sha: str | None
+    recovered: bool = False
+
+
+@dataclass(frozen=True)
+class ResolutionDeltaContext:
+    """Focused review context for a changed rebase."""
+
+    available: bool
+    summary: str
+    before_range: str | None = None
+    after_range: str | None = None
+    range_diff: str | None = None
+
+
 def capture_rebase_diff_baseline(
     git: Git,
     *,
@@ -114,6 +137,104 @@ def compute_rebase_changed_diff(
     return RebaseDiffResult(
         changed_diff=True,
         detail="yes (review must be refreshed)",
+    )
+
+
+def build_rebase_diff_provenance(
+    *,
+    baseline: RebaseDiffBaseline,
+    resolved_head_sha: str | None,
+    resolved_target_sha: str | None,
+) -> str:
+    """Serialize the refs needed for later resolution-delta review context."""
+    return "\n".join(
+        (
+            "Rebase diff provenance: yes",
+            f"Pre-rebase head SHA: {baseline.old_tip or ''}",
+            f"Pre-rebase target SHA: {baseline.target_at_start or ''}",
+            f"Pre-rebase merge-base SHA: {baseline.merge_base_at_start or ''}",
+            f"Resolved head SHA: {resolved_head_sha or ''}",
+            f"Resolved target SHA: {resolved_target_sha or ''}",
+            f"Recovered baseline: {'yes' if baseline.recovered else 'no'}",
+        )
+    )
+
+
+def parse_rebase_diff_provenance(text: str | None) -> RebaseDiffProvenance | None:
+    """Parse persisted rebase diff provenance from task metadata text."""
+    if text is None or "Rebase diff provenance: yes" not in text:
+        return None
+    fields: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    return RebaseDiffProvenance(
+        old_tip=fields.get("pre-rebase head sha") or None,
+        target_at_start=fields.get("pre-rebase target sha") or None,
+        merge_base_at_start=fields.get("pre-rebase merge-base sha") or None,
+        resolved_head_sha=fields.get("resolved head sha") or None,
+        resolved_target_sha=fields.get("resolved target sha") or None,
+        recovered=(fields.get("recovered baseline") or "").lower() == "yes",
+    )
+
+
+def compute_resolution_delta_context(
+    git: Git,
+    *,
+    provenance: RebaseDiffProvenance,
+) -> ResolutionDeltaContext:
+    """Reconstruct focused resolution-review context from persisted rebase provenance."""
+    if provenance.recovered:
+        return ResolutionDeltaContext(
+            available=False,
+            summary=(
+                "resolution delta unavailable: recovered or resumed rebase provenance cannot "
+                "prove the original pre-rebase delta; fail closed and review manually"
+            ),
+        )
+    if not all(
+        (
+            provenance.old_tip,
+            provenance.merge_base_at_start,
+            provenance.resolved_head_sha,
+            provenance.resolved_target_sha,
+        )
+    ):
+        return ResolutionDeltaContext(
+            available=False,
+            summary=(
+                "resolution delta unavailable: missing pre/post rebase provenance refs; "
+                "fail closed and review manually"
+            ),
+        )
+    before_range = f"{provenance.merge_base_at_start}..{provenance.old_tip}"
+    after_range = f"{provenance.resolved_target_sha}..{provenance.resolved_head_sha}"
+    result = git._run("range-diff", "--no-color", before_range, after_range, check=False)  # noqa: SLF001
+    if result.returncode != 0:
+        error_output = (result.stderr or result.stdout or "").strip()
+        detail = (
+            "resolution delta unavailable: git range-diff failed while reconstructing the "
+            "conflict-resolution delta"
+        )
+        if error_output:
+            detail += f" ({error_output})"
+        return ResolutionDeltaContext(
+            available=False,
+            summary=detail,
+            before_range=before_range,
+            after_range=after_range,
+        )
+    range_diff = result.stdout.strip()
+    if not range_diff:
+        range_diff = "(git range-diff produced no textual delta; inspect the reconstructed ranges directly)"
+    return ResolutionDeltaContext(
+        available=True,
+        summary="resolution delta available",
+        before_range=before_range,
+        after_range=after_range,
+        range_diff=range_diff,
     )
 
 

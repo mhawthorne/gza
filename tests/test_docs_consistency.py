@@ -218,6 +218,61 @@ def test_off_topic_verify_contract_is_indexed_and_cross_linked() -> None:
     assert "fail closed" in contract_flat
 
 
+def test_deferred_conflict_rebase_contract_is_encoded_in_behavior_specs() -> None:
+    """The behavior specs should preserve deferred rebase ownership and narrow stale-review semantics."""
+    repo_root = Path(__file__).resolve().parents[1]
+    overview = (repo_root / "specs" / "behavior" / "00-overview.md").read_text()
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    recovery = (repo_root / "specs" / "behavior" / "recovery.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+    recovery_flat = " ".join(recovery.split())
+
+    assert "selected for merge,\\nconflicts with target" in overview
+    assert "recovery preflight,\\nbranch lacks target tip" in overview
+    assert "Target movement alone does not trigger this row." in overview
+
+    assert "Ordinary queue-wide lifecycle projection MUST evaluate unresolved work units with `selected_for_merge = false` by default." in lifecycle_flat
+    assert "Conflict-driven `needs_rebase` is merge-selection scoped." in lifecycle
+    assert "`merge-selection-conflict-rebase` is the canonical slug." in lifecycle
+    assert "`recovery-preflight-rebase`" in lifecycle
+    assert "Target-branch movement alone MUST NOT invalidate a valid review." in lifecycle
+    assert "resolution-scoped review" in lifecycle
+    assert "`resolution-review-metadata-invalid`" in lifecycle
+
+    assert "recovery decides `resume`/`retry`/manual, and [lifecycle-engine.md](lifecycle-engine.md) §4 owns the local-target-only `recovery-preflight-rebase`" in recovery_flat
+
+
+def test_stale_completed_rebase_spec_only_parks_when_current_target_tip_is_already_present() -> None:
+    """Lifecycle spec and internal docs must agree on the stale-completed-rebase split."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    internal = (repo_root / "docs" / "internal" / "advance-rebase-flow.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+
+    assert (
+        "Branch cannot merge AND a same-branch rebase already `completed`, the branch still "
+        "conflicts, AND the branch already contains the current local target tip → "
+        "`needs_discussion`"
+    ) in lifecycle_flat
+    assert (
+        "A selected merge candidate with only a stale completed rebase and no "
+        "current-target-tip containment remains eligible for "
+        "`merge-selection-conflict-rebase` above."
+    ) in lifecycle_flat
+    assert (
+        "completed`, conflicts still remain, and the branch already contains the current target tip"
+    ) in internal
+    assert (
+        "only a stale completed rebase) and the branch does not already contain the target tip"
+    ) in internal
+    assert (
+        "a same-branch rebase child already completed AND the branch already contains the current target tip"
+    ) in workflow
+    assert (
+        "including stale completed rebases whose branch no longer contains the current target tip"
+    ) in workflow
+
 def test_off_topic_verify_lifecycle_wording_stays_reconciled_with_focused_contract() -> None:
     """Lifecycle wording should not contradict the focused off-topic verify contract."""
     repo_root = Path(__file__).resolve().parents[1]

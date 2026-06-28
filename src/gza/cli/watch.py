@@ -136,6 +136,7 @@ from ._lifecycle_actions import (
     lifecycle_action_execution_sort_key,
     plan_lifecycle_execution,
     print_lifecycle_action_entries,
+    reproject_selected_merge_actions,
 )
 from ._queue_render import (
     QueueRenderRow,
@@ -2472,12 +2473,13 @@ class _WatchCycleAnalysis:
     recovery_lane_entry_by_failed_id: dict[str, RecoveryLaneEntry]
     action_plan: tuple[tuple[LineageOwnerRow, DbTask, dict[str, Any]], ...]
     recovery_attention_rows: tuple[tuple[DbTask, FailedRecoveryDecision, dict[str, Any]], ...]
-    recovery_visible_skips: tuple[tuple[DbTask, DbTask, FailedRecoveryDecision], ...]
+    recovery_visible_skips: tuple[tuple[DbTask, DbTask, FailedRecoveryDecision, dict[str, Any]], ...]
+    active_recovery_subject_ids: frozenset[str] = frozenset()
     actionable_failed: tuple[
         tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask],
         ...,
-    ]
-    pending_recovery_task_ids: frozenset[str]
+    ] = ()
+    pending_recovery_task_ids: frozenset[str] = frozenset()
 
 
 SCOPED_WATCH_COMPLETE_MESSAGE = "scoped watch complete; all named owner units are terminal or parked"
@@ -2792,6 +2794,7 @@ def _emit_recovery_dry_run_report(
     )
     visible_entry_by_task_id = {entry.task.id: entry for entry in entries if entry.task.id is not None}
     reconcile = 0
+    rebase = 0
     for row in failed_rows:
         task = row.recovery_leaf_task
         assert task is not None
@@ -2803,10 +2806,25 @@ def _emit_recovery_dry_run_report(
             if visible_entry.attention_action is not None:
                 attention_rows.append((task, visible_entry.attention_action))
                 continue
+            action = visible_entry.action or {}
         else:
             decision = decide_failed_task_recovery(
                 store, task, max_recovery_attempts=max_recovery_attempts, read_context=report_read_context
             )
+            action = {}
+        action_type = str(action.get("type", ""))
+        if action_type == "needs_rebase":
+            reason = action.get("reason")
+            reason_text = f" reason={reason}" if isinstance(reason, str) and reason else ""
+            deferred = action.get("deferred_action_type")
+            deferred_text = f" deferred={deferred}" if isinstance(deferred, str) and deferred else ""
+            print(
+                f"{action_type:<12} {_format_recovery_report_subject(row, task)} {task.task_type:<9} "
+                f"{str(action.get('description', '')).strip()}{reason_text}{deferred_text}"
+            )
+            actionable += 1
+            rebase += 1
+            continue
         if decision.action in {"resume", "retry", "reconcile"}:
             launch = decision.launch_mode
             print(
@@ -2839,14 +2857,24 @@ def _emit_recovery_dry_run_report(
             print(f"  {_watch_needs_attention_message(task, action)}")
     print()
     skipped_summary = skipped if show_skipped else hidden_skipped
+    actionable_breakdown = (
+        f"{rebase} needs_rebase, {resume} resume, {retry} retry, {reconcile} reconcile"
+        if rebase > 0
+        else f"{resume} resume, {retry} retry, {reconcile} reconcile"
+    )
+    hidden_breakdown = (
+        f"{rebase} needs_rebase, {resume} resume, {retry} retry"
+        if rebase > 0
+        else f"{resume} resume, {retry} retry"
+    )
     if show_skipped:
         print(
-            f"Summary: {actionable} actionable ({resume} resume, {retry} retry, {reconcile} reconcile), "
+            f"Summary: {actionable} actionable ({actionable_breakdown}), "
             f"{len(attention_rows)} needs attention, {skipped_summary} skipped"
         )
     else:
         print(
-            f"Summary: {actionable} actionable ({resume} resume, {retry} retry), "
+            f"Summary: {actionable} actionable ({hidden_breakdown}), "
             f"{len(attention_rows)} needs attention, {skipped_summary} skipped hidden"
         )
     return _RecoveryReport(actionable_count=actionable, resume_count=resume, retry_count=retry)
@@ -2854,7 +2882,10 @@ def _emit_recovery_dry_run_report(
 
 def _collect_scoped_recovery_lane_entries(
     *,
+    config: Config,
     store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
     recovery_rows: list[LineageOwnerRow],
     read_context: RecoveryReadContext,
     max_recovery_attempts: int,
@@ -2875,11 +2906,31 @@ def _collect_scoped_recovery_lane_entries(
             max_recovery_attempts=max_recovery_attempts,
             read_context=read_context,
         )
-        if decision.action in {"resume", "retry"}:
+        action = _determine_recovery_lane_action(
+            config=config,
+            store=store,
+            git=git,
+            failed_task=failed,
+            target_branch=target_branch,
+            max_recovery_attempts=max_recovery_attempts,
+            read_context=read_context,
+            decision=decision,
+        )
+        if action is not None and classify_advance_action(action) == "actionable":
             entries[str(failed.id)] = RecoveryLaneEntry(
                 owner_task=row.owner_task,
                 task=failed,
                 decision=decision,
+                action=action,
+            )
+            continue
+        if action is not None and classify_advance_action(action) == "needs_attention":
+            entries[str(failed.id)] = RecoveryLaneEntry(
+                owner_task=row.owner_task,
+                task=failed,
+                decision=decision,
+                action=action,
+                attention_action=action,
             )
             continue
         attention_action = _owner_failed_recovery_attention_action(
@@ -2895,9 +2946,63 @@ def _collect_scoped_recovery_lane_entries(
             owner_task=row.owner_task,
             task=failed,
             decision=decision,
+            action=action,
             attention_action=attention_action,
         )
     return entries
+
+
+def _determine_recovery_lane_action(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    failed_task: DbTask,
+    target_branch: str,
+    max_recovery_attempts: int,
+    read_context: RecoveryReadContext,
+    decision: FailedRecoveryDecision,
+    impl_based_on_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    from .advance_engine import determine_next_action as _shared_determine_next_action
+
+    active_recovery_task = (
+        store.get(decision.recovery_task_id)
+        if isinstance(decision.recovery_task_id, str) and decision.recovery_task_id
+        else None
+    )
+    has_active_recovery_child = active_recovery_task is not None and active_recovery_task.status in {"pending", "in_progress"}
+    active_recovery_mode = (
+        resolve_pending_recovery_execution_mode(active_recovery_task)
+        if active_recovery_task is not None
+        else None
+    )
+
+    shared_action = _shared_determine_next_action(
+        config,
+        store,
+        git,
+        failed_task,
+        target_branch,
+        impl_based_on_ids=impl_based_on_ids,
+        max_resume_attempts=max_recovery_attempts,
+        read_context=read_context,
+    )
+    if str(shared_action.get("type", "")) == "needs_rebase":
+        return shared_action
+    if has_active_recovery_child:
+        assert active_recovery_task is not None and active_recovery_task.id is not None
+        if active_recovery_task.recovery_origin in {"resume", "retry"} or active_recovery_mode in {"resume", "retry"}:
+            return shared_action
+        return {
+            "type": "skip",
+            "description": f"SKIP: recovery task {active_recovery_task.id} already {active_recovery_task.status}",
+            "reason": f"recovery_already_{active_recovery_task.status}",
+        }
+    if decision.reason_code in {"recovery_already_pending", "recovery_already_running"}:
+        return failed_recovery_decision_to_action(failed_task, decision)
+
+    return shared_action
 
 
 def _compute_failure_backoff_seconds(config: Config, streak: int) -> int:
@@ -2983,7 +3088,10 @@ def _analyze_watch_cycle(
             }
         else:
             recovery_lane_entry_by_failed_id = _collect_scoped_recovery_lane_entries(
+                config=config,
                 store=store,
+                git=git,
+                target_branch=target_branch,
                 recovery_rows=recovery_rows,
                 read_context=watch_read_context,
                 max_recovery_attempts=max_recovery_attempts,
@@ -3021,7 +3129,8 @@ def _analyze_watch_cycle(
 
         pending_recovery_task_ids: set[str] = set()
         recovery_attention_rows: list[tuple[DbTask, FailedRecoveryDecision, dict[str, Any]]] = []
-        recovery_visible_skips: list[tuple[DbTask, DbTask, FailedRecoveryDecision]] = []
+        recovery_visible_skips: list[tuple[DbTask, DbTask, FailedRecoveryDecision, dict[str, Any]]] = []
+        active_recovery_subject_ids: set[str] = set()
         actionable_failed: list[
             tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
         ] = []
@@ -3036,9 +3145,23 @@ def _analyze_watch_cycle(
                 max_recovery_attempts=max_recovery_attempts,
                 read_context=watch_read_context,
             )
-            if decision.action != "skip" and decision.recovery_task_id is not None:
-                pending_recovery_task_ids.add(decision.recovery_task_id)
-            if decision.action == "skip":
+            recovery_action = _determine_recovery_lane_action(
+                config=config,
+                store=store,
+                git=git,
+                failed_task=failed,
+                target_branch=target_branch,
+                max_recovery_attempts=max_recovery_attempts,
+                read_context=watch_read_context,
+                decision=decision,
+                impl_based_on_ids=impl_based_on_ids,
+            )
+            recovery_action_type = str(recovery_action.get("type", ""))
+            recovery_action_class = classify_advance_action(recovery_action)
+            recovery_task_id = recovery_action.get("recovery_task_id")
+            if recovery_action_class == "actionable" and isinstance(recovery_task_id, str) and recovery_task_id:
+                pending_recovery_task_ids.add(recovery_task_id)
+            if recovery_action_class == "needs_attention":
                 if should_hide_failed_recovery_decision(decision):
                     continue
                 recovery_entry = recovery_lane_entry_by_failed_id.get(str(failed.id))
@@ -3061,15 +3184,50 @@ def _analyze_watch_cycle(
                 if attention_action is not None and classify_advance_action(attention_action) == "needs_attention":
                     recovery_attention_rows.append((owner_task, decision, attention_action))
                     continue
-                if not _is_watch_observable_recovery_skip(decision):
-                    recovery_visible_skips.append((owner_task, failed, decision))
+                if recovery_action_class != "skip" and not _is_watch_observable_recovery_skip(decision):
+                    recovery_visible_skips.append((owner_task, failed, decision, recovery_action))
                     continue
-            recovery_action = failed_recovery_decision_to_action(failed, decision)
-            worker_consuming_recovery = is_worker_consuming_advance_action(str(recovery_action.get("type", "")))
-            action_task = _resolve_recovery_action_task(
+            if recovery_action_class == "skip":
+                action_task = _resolve_recovery_action_task(
+                    store,
+                    failed_task=failed,
+                    recovery_task_id=decision.recovery_task_id,
+                )
+                parked_candidate_action = (
+                    failed_recovery_decision_to_action(failed, decision)
+                    if decision.reason_code in {"recovery_already_pending", "recovery_already_running"}
+                    else recovery_action
+                )
+                candidate = build_watch_progress_candidate(
+                    store,
+                    subject_task=failed,
+                    action=parked_candidate_action,
+                    action_task=action_task,
+                    failed_task=failed,
+                )
+                parked_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+                if parked_attention is not None:
+                    recovery_attention_rows.append((row.owner_task, decision, parked_attention))
+                    active_recovery_subject_ids.add(str(failed.id))
+                    continue
+                if (
+                    str(recovery_action.get("reason", "")).startswith("recovery_already_")
+                    or decision.reason_code in {"recovery_already_pending", "recovery_already_running"}
+                ):
+                    active_recovery_subject_ids.add(str(failed.id))
+                recovery_visible_skips.append((row.owner_task, failed, decision, recovery_action))
+                continue
+            if recovery_action_class != "actionable":
+                continue
+            worker_consuming_recovery = is_worker_consuming_advance_action(recovery_action_type)
+            action_task = (
+                store.get(str(recovery_action.get("active_rebase_task_id")))
+                if isinstance(recovery_action.get("active_rebase_task_id"), str)
+                else None
+            ) or _resolve_recovery_action_task(
                 store,
                 failed_task=failed,
-                recovery_task_id=decision.recovery_task_id,
+                recovery_task_id=recovery_task_id if isinstance(recovery_task_id, str) else None,
             )
             actionable_failed.append((row, failed, decision, recovery_action, worker_consuming_recovery, action_task))
         return _WatchCycleAnalysis(
@@ -3083,6 +3241,7 @@ def _analyze_watch_cycle(
             action_plan=tuple(action_plan),
             recovery_attention_rows=tuple(recovery_attention_rows),
             recovery_visible_skips=tuple(recovery_visible_skips),
+            active_recovery_subject_ids=frozenset(active_recovery_subject_ids),
             actionable_failed=tuple(actionable_failed),
             pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
         )
@@ -3722,11 +3881,6 @@ def _run_cycle(
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
-        lifecycle_summary = format_cycle_lifecycle_action_summary(
-            (row.owner_task, action) for row, _task, action in action_plan
-        )
-        if emit_lifecycle_summary and lifecycle_summary is not None:
-            log.emit("INFO", lifecycle_summary)
         has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan)
         can_merge = merge_actions_available
         if has_merge_action:
@@ -3745,9 +3899,28 @@ def _run_cycle(
             free_worker_slots=slots,
             get_action=lambda item: item[2],
         )
+        if can_merge and not merge_halted_for_cycle:
+            execution_decisions = reproject_selected_merge_actions(
+                execution_decisions,
+                reproject_action=lambda item: determine_next_action(
+                    config,
+                    store,
+                    git,
+                    item[1],
+                    target_branch,
+                    impl_based_on_ids=collect_non_dropped_implement_source_ids(store.get_all()),
+                    selected_for_merge=True,
+                ),
+            )
+        lifecycle_summary = format_cycle_lifecycle_action_summary(
+            (decision.item[0].owner_task, decision.action) for decision in execution_decisions
+        )
+        if emit_lifecycle_summary and lifecycle_summary is not None:
+            log.emit("INFO", lifecycle_summary)
 
         for execution_decision in execution_decisions:
             row, task, action = execution_decision.item
+            action = dict(execution_decision.action)
             display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
@@ -3796,6 +3969,11 @@ def _run_cycle(
                 continue
 
             if not execution_decision.selected:
+                log.emit(
+                    "SKIP",
+                    f"{display_task.id}: no watch worker slots available for {action_type}",
+                    dedupe_key=f"advance-capacity-skip:{action_type}:{display_task.id}",
+                )
                 continue
 
             if action_type in {"merge", "merge_with_followups"}:
@@ -4342,12 +4520,16 @@ def _run_cycle(
             attention_key=f"failed-recovery-attention:{owner_id}:{decision.reason_code}",
             message=_watch_needs_attention_message(owner_task, attention_action),
         )
-    for owner_task, failed, decision in analysis.recovery_visible_skips:
+    for owner_task, failed, decision, recovery_action in analysis.recovery_visible_skips:
         if recovery_slots > 0 and show_skipped:
+            description = str(recovery_action.get("description", "")).strip()
             log.emit(
                 "SKIP",
-                f"{owner_task.id} failed {failed.task_type}: {decision.reason_code}",
-                dedupe_key=f"recovery-skip:{owner_task.id}:{decision.reason_code}",
+                description or f"{owner_task.id} failed {failed.task_type}: {decision.reason_code}",
+                dedupe_key=(
+                    f"recovery-skip:{owner_task.id}:"
+                    f"{str(recovery_action.get('reason', decision.reason_code or 'skip'))}"
+                ),
             )
     if not dry_run:
         for _row, failed, decision, recovery_action, _worker_consuming, action_task in actionable_failed:
@@ -4439,11 +4621,12 @@ def _run_cycle(
     )
     reserved_recovery_slots = dispatch_plan.recovery_worker_slots
     pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
-    nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids)
+    nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids) | set(analysis.active_recovery_subject_ids)
     recovery_started_this_cycle = False
     for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
         if failed.id is None:
             continue
+        recovery_action_type = str(recovery_action.get("type", ""))
         if str(failed.id) not in dispatch_recovery_task_ids:
             continue
         if str(failed.id) in parked_recovery_subject_ids:
@@ -4458,7 +4641,7 @@ def _run_cycle(
                 active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
                 if active_attention is not None:
                     log.emit_attention(
-                        attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
                         message=_watch_needs_attention_message(failed, active_attention),
                     )
             continue
@@ -4496,19 +4679,11 @@ def _run_cycle(
                 if decision.recovery_task_id is not None:
                     pending_recovery_task_ids.add(decision.recovery_task_id)
                 log.emit_attention(
-                    attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
                     message=_watch_needs_attention_message(failed, no_progress_attention),
                 )
                 continue
-        if decision.action == "skip":
-            if recovery_slots > 0 and show_skipped:
-                log.emit(
-                    "SKIP",
-                    f"{row.owner_task.id} failed {failed.task_type}: {decision.reason_code}",
-                    dedupe_key=f"recovery-skip:{row.owner_task.id}:{decision.reason_code}",
-                )
-            continue
-        if decision.action == "reconcile":
+        if recovery_action_type == "reconcile_branch_divergence":
             if dry_run:
                 log.emit(
                     "RECOVR",
@@ -4569,13 +4744,80 @@ def _run_cycle(
                 )
                 if no_progress_attention is not None:
                     log.emit_attention(
-                        attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
                         message=_watch_needs_attention_message(failed, no_progress_attention),
                     )
                 work_done = True
                 continue
             continue
-        if decision.action == "resume":
+        if recovery_action_type == "needs_rebase":
+            if dry_run:
+                deferred = recovery_action.get("deferred_action_type")
+                deferred_text = f" deferred={deferred}" if isinstance(deferred, str) and deferred else ""
+                log.emit(
+                    "RECOVR",
+                    (
+                        f"{failed.id} needs_rebase [owner={row.owner_task.id}] "
+                        f"({recovery_action.get('reason', 'recovery-preflight-rebase')}{deferred_text}) [dry-run]"
+                    ),
+                )
+                slots -= 1
+                reserved_recovery_slots -= 1
+                work_done = True
+                continue
+            exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
+            if exec_result.status == "skip":
+                attention = resolve_execution_needs_attention(failed, exec_result)
+                if attention is not None:
+                    log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}",
+                        message=_watch_needs_attention_message(attention.task, attention.action),
+                    )
+                else:
+                    log.emit(
+                        "SKIP",
+                        f"{failed.id}: {exec_result.message}",
+                        dedupe_key=f"recovery-needs-rebase-skip:{failed.id}:{exec_result.message}",
+                    )
+                continue
+            if exec_result.status == "error":
+                log.emit(
+                    "REPAIR",
+                    f"{failed.id}: {exec_result.message}",
+                    dedupe_key=f"recovery-needs-rebase-error:{failed.id}:{exec_result.message}",
+                )
+                continue
+            if exec_result.status != "success" or exec_result.created_task is None or exec_result.created_task.id is None:
+                continue
+            recovered_task_id = str(exec_result.created_task.id)
+            refreshed_recovered_task = store.get(recovered_task_id)
+            no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+                config=config,
+                store=store,
+                subject_task=failed,
+                action=recovery_action,
+                action_task_before=action_task,
+                action_task_after=refreshed_recovered_task,
+                failed_task=failed,
+                no_progress_cycles=config.watch.no_progress_cycles,
+            )
+            recovery_started_this_cycle = True
+            started_task_ids.add(recovered_task_id)
+            expected_starts[recovered_task_id] = _ExpectedStart(
+                recovery_action="needs_rebase",
+                parent_failed_id=str(failed.id),
+                launch_mode="worker",
+            )
+            slots -= 1
+            reserved_recovery_slots -= 1
+            work_done = True
+            if no_progress_attention is not None:
+                log.emit_attention(
+                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                    message=_watch_needs_attention_message(failed, no_progress_attention),
+                )
+            continue
+        if recovery_action_type == "resume":
             if dry_run:
                 destination = decision.recovery_task_id or "(new task)"
                 log.emit(
@@ -4676,7 +4918,7 @@ def _run_cycle(
                     ),
                 )
                 _release_watch_reserved_task(recovered_task_id)
-        else:
+        elif recovery_action_type == "retry":
             if dry_run:
                 destination = decision.recovery_task_id or "(new task)"
                 log.emit(
@@ -4765,6 +5007,8 @@ def _run_cycle(
                 )
             )
             _release_watch_reserved_task(recovered_task_id)
+        else:
+            continue
 
         if rc != 0:
             continue
@@ -4782,7 +5026,7 @@ def _run_cycle(
         recovery_started_this_cycle = True
         started_task_ids.add(recovered_task_id)
         expected_starts[recovered_task_id] = _ExpectedStart(
-            recovery_action=decision.action,
+            recovery_action=recovery_action_type,
             parent_failed_id=str(failed.id),
             launch_mode=decision.launch_mode,
         )
@@ -4791,7 +5035,7 @@ def _run_cycle(
         work_done = True
         if no_progress_attention is not None:
             log.emit_attention(
-                attention_key=f"recovery-attention:{failed.id}:{decision.action}:watch-no-progress",
+                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
                 message=_watch_needs_attention_message(failed, no_progress_attention),
             )
 
@@ -6043,6 +6287,29 @@ def _format_queue_recovery_lane_detail(entry: RecoveryLaneEntry) -> Text:
         rendered.stylize(colors.task_type, task_type_start, task_type_start + len(task_type))
         if display.prompt_end > display.prompt_start:
             rendered.stylize(colors.prompt, display.prompt_start, display.prompt_end)
+        return rendered
+
+    action = entry.action or {}
+    action_type = str(action.get("type", "")).strip()
+    if action_type and action_type not in {"resume", "retry", "reconcile_branch_divergence"}:
+        prefix = f"{action_type:<12} {task_id} [{task_type}] "
+        prompt = shorten_prompt(task.prompt, prompt_available_width(prefix=len(prefix), suffix=0))
+        rendered = Text()
+        rendered.append(f"{action_type:<12} ")
+        rendered.append(task_id, style=colors.task_id)
+        rendered.append(" ")
+        rendered.append(f"[{task_type}]", style=colors.task_type)
+        rendered.append(" ")
+        rendered.append(prompt, style=colors.prompt)
+        description = str(action.get("description", "")).strip()
+        if description:
+            rendered.append(f" {description}")
+        reason = action.get("reason")
+        if isinstance(reason, str) and reason:
+            rendered.append(f" reason={reason}")
+        deferred = action.get("deferred_action_type")
+        if isinstance(deferred, str) and deferred:
+            rendered.append(f" deferred={deferred}")
         return rendered
 
     decision = entry.decision

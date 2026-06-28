@@ -22,6 +22,11 @@ This spec owns the **policy layer** for failed-task recovery.
 
 The same shared policy MUST be reused by `advance`, `iterate`, `watch`, queue/query
 surfaces, and recovery dry-run output. Recovery semantics MUST NOT fork by command.
+Whether a recoverable failed task must first be mechanically rebased onto the canonical
+local target is **not** a recovery-owned branch of this policy: recovery decides
+`resume`/`retry`/manual, and [lifecycle-engine.md](lifecycle-engine.md) §4 owns the
+local-target-only `recovery-preflight-rebase` that may wrap a recoverable decision before
+the resumed or retried execution is launched.
 
 ## Principles
 
@@ -102,6 +107,11 @@ Consequences:
   choose `resume` on the first automatic recovery attempt.
 - Retryable provider/infrastructure failures that should not reuse the same execution
   thread MUST choose `retry`.
+- Recovery policy MUST make that `resume` vs `retry` choice **before** lifecycle decides
+  whether a local-target recovery-preflight rebase is required. Recovery does not own
+  merge-target freshness or rebase mechanics; it returns the recoverable action, and
+  lifecycle MAY temporarily defer executing that action behind
+  `recovery-preflight-rebase`.
 - A code-task run that cannot read post-run worktree git status (for example
   `git status --porcelain` fails because the worktree admin linkage was detached or
   pruned) MUST classify as the existing retryable infrastructure failure bucket,

@@ -142,6 +142,7 @@ from ._common import (
     run_with_recovery,
     set_task_urgency,
 )
+from ._lifecycle_actions import reproject_selected_merge_action
 from ._recovery_lane import collect_recovery_lane_entries
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
@@ -3827,6 +3828,41 @@ class _AdvanceEngineConfigAdapter:
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
 
 
+def _determine_selected_iterate_action(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    max_resume_attempts: int,
+) -> dict[str, Any]:
+    """Resolve the selected iterate action through the same merge-selection reprojection."""
+    action = determine_next_action(
+        config,
+        store,
+        git,
+        task,
+        target_branch,
+        max_resume_attempts=max_resume_attempts,
+    )
+    return dict(
+        reproject_selected_merge_action(
+            action,
+            selected=True,
+            reproject_action=lambda: determine_next_action(
+                config,
+                store,
+                git,
+                task,
+                target_branch,
+                max_resume_attempts=max_resume_attempts,
+                selected_for_merge=True,
+            ),
+        )
+    )
+
+
 def _iterate_action_description(action: dict[str, Any]) -> str:
     """Return a user-facing description for an iterate action."""
     description = action.get("description")
@@ -4232,7 +4268,7 @@ def _cmd_iterate_impl(
             return None
         if iterate_task.status != "completed" or preflight_context is None:
             return None
-        initial_action = determine_next_action(
+        initial_action = _determine_selected_iterate_action(
             engine_config,
             store,
             preflight_context.git_runtime,
@@ -4333,7 +4369,7 @@ def _cmd_iterate_impl(
         assert preflight_context is not None
         if initial_action is None:
             try:
-                initial_action = determine_next_action(
+                initial_action = _determine_selected_iterate_action(
                     engine_config,
                     store,
                     preflight_context.git_runtime,
@@ -4523,7 +4559,7 @@ def _cmd_iterate_impl(
                 return None, 1
 
             try:
-                initial_action = determine_next_action(
+                initial_action = _determine_selected_iterate_action(
                     config,
                     store,
                     preflight_context.git_runtime,
@@ -5312,7 +5348,7 @@ def _cmd_iterate_impl(
         if closing_action is None:
             return False
         current_impl_task = _current_impl_task()
-        current_action = determine_next_action(
+        current_action = _determine_selected_iterate_action(
             engine_config,
             store,
             git_runtime,
@@ -5475,7 +5511,7 @@ def _cmd_iterate_impl(
             }
             prepared_iteration_start = None
         else:
-            action = determine_next_action(
+            action = _determine_selected_iterate_action(
                 engine_config,
                 store,
                 git_runtime,
@@ -5631,7 +5667,13 @@ def _cmd_iterate_impl(
             elif exec_result.message:
                 print(f"  {exec_result.message.removeprefix('SKIP: ')}")
             if exec_result.status == "success":
-                impl_task = store.get(impl_task.id) or impl_task
+                refreshed_impl = exec_result.created_task if isinstance(exec_result.created_task, DbTask) else None
+                if refreshed_impl is not None and refreshed_impl.id == impl_task.id:
+                    impl_task = refreshed_impl
+                else:
+                    impl_task = store.get(impl_task.id) if impl_task.id is not None else None
+                    if impl_task is None:
+                        raise ValueError("implementation task disappeared during verify-only noop recovery")
                 continue
             if exec_result.status == "skip":
                 attention = resolve_execution_needs_attention(impl_task, exec_result)

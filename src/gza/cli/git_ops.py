@@ -148,6 +148,7 @@ from ._lifecycle_actions import (
     lifecycle_action_execution_sort_key,
     plan_lifecycle_execution,
     print_lifecycle_action_entries,
+    reproject_selected_merge_actions,
 )
 from .advance_engine import (
     NEEDS_ATTENTION_LABEL,
@@ -3611,8 +3612,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 return f"batch limit reached ({selected_workers}/{batch_limit}), skipping"
             return f"{capacity_message}, skipping"
 
+        if main_verify_attention is None:
+            execution_decisions = reproject_selected_merge_actions(
+                execution_decisions,
+                reproject_action=lambda item: determine_next_action(
+                    config,
+                    store,
+                    git,
+                    item[1],
+                    target_branch,
+                    max_resume_attempts=max_resume_attempts,
+                    selected_for_merge=True,
+                ),
+            )
+
         for decision in execution_decisions:
             row, task, action = decision.item
+            action = dict(decision.action)
             if classify_advance_action(action) != "actionable":
                 continue
             if not decision.selected:
@@ -3854,6 +3870,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     for decision in execution_decisions:
         row, task, action = decision.item
+        action = dict(decision.action)
         assert task.id is not None
         display_task = row.owner_task
         prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))

@@ -16618,6 +16618,52 @@ class TestIncompleteCommand:
         ]
         assert result.stderr == ""
 
+    def test_incomplete_cli_json_projects_recovery_preflight_rebase(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_STEPS"
+        failed.session_id = "sess-recovery"
+        failed.completed_at = datetime.now(UTC)
+        failed.branch = "feature/query-recovery-preflight"
+        failed.has_commits = True
+        failed.merge_status = "unmerged"
+        failed.num_steps_computed = 1
+        store.update(failed)
+
+        git = _mock_unmerged_git()
+        git.ref_exists = MagicMock(side_effect=lambda ref: ref == f"origin/{failed.branch}")
+        git.rev_parse_if_exists = MagicMock(
+            side_effect=lambda ref: "target-tip" if ref == "main" else "branch-tip"
+        )
+        git.is_ancestor = MagicMock(
+            side_effect=lambda ancestor, descendant: (
+                ancestor == "main" and descendant == f"origin/{failed.branch}" and False
+            )
+        )
+
+        with patch("gza.cli.query.Git", return_value=git):
+            result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id,next_action,next_action_reason",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [
+            {
+                "id": failed.id,
+                "next_action": "needs_rebase",
+                "next_action_reason": "Rebase before failed-task recovery",
+            }
+        ]
+
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,
         tmp_path: Path,
@@ -17903,7 +17949,7 @@ class TestLineageOwnerParity:
         assert result == 0
         one_line_output = captured.out
         assert self._one_line_row_id(one_line_output) == impl.id
-        assert "rebase --resolve (conflicts detected)" in one_line_output
+        assert "Create closing review (latest implementation has no review yet)" in one_line_output
         assert f"{dropped_one.id} (dropped)" not in one_line_output
         assert f"{dropped_two.id} (dropped)" not in one_line_output
 

@@ -15,7 +15,8 @@ from .config import Config
 from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
 from .prompts import PromptBuilder
-from .review_scope import resolve_review_scope_for_impl
+from .rebase_diff import parse_rebase_diff_provenance
+from .review_scope import build_resolution_review_scope, resolve_review_scope_for_impl
 from .review_verdict import ReviewFinding
 from .task_slug import (
     extract_task_id_suffix,
@@ -201,6 +202,54 @@ def create_review_task(
     impl_unit = store.resolve_merge_unit_for_task(impl_task.id)
     if impl_unit is not None:
         store.get_or_create_merge_unit_for_task(review_task)
+    return review_task
+
+
+def create_resolution_review_task(
+    store: SqliteTaskStore,
+    impl_task: Task,
+    *,
+    rebase_task: Task,
+    resolved_head_sha: str,
+    resolved_target_sha: str,
+    trigger_source: str,
+    model: str | None = None,
+    provider: str | None = None,
+) -> Task:
+    """Create a resolution-scoped review task for a changed/unknown rebase."""
+    if impl_task.id is None:
+        raise ValueError("Cannot create resolution review for task without an ID.")
+    if rebase_task.id is None:
+        raise ValueError("Cannot create resolution review without a rebase task ID.")
+    if not resolved_head_sha or not resolved_target_sha:
+        raise ValueError("Resolution review requires resolved head and target SHAs.")
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if provenance is None or not provenance.resolved_head_sha or not provenance.resolved_target_sha:
+        raise ValueError("Resolution review requires persisted rebase provenance with resolved head and target SHAs.")
+    if (
+        resolved_head_sha != provenance.resolved_head_sha
+        or resolved_target_sha != provenance.resolved_target_sha
+    ):
+        raise ValueError("Resolution review metadata must match the completed rebase provenance.")
+
+    review_task = create_review_task(
+        store,
+        impl_task,
+        trigger_source=trigger_source,
+        model=model,
+        provider=provider,
+        prompt_mode="cli",
+    )
+    review_task.review_scope = build_resolution_review_scope(
+        implementation_task_id=impl_task.id,
+        rebase_task_id=rebase_task.id,
+        resolved_head_sha=provenance.resolved_head_sha,
+        resolved_target_sha=provenance.resolved_target_sha,
+        pre_rebase_head_sha=provenance.old_tip,
+        pre_rebase_target_sha=provenance.target_at_start,
+        pre_rebase_merge_base_sha=provenance.merge_base_at_start,
+    )
+    store.update(review_task)
     return review_task
 
 

@@ -457,6 +457,8 @@ def resolve_pending_recovery_execution_mode(task: DbTask) -> PendingRecoveryExec
         return "resume" if task.session_id else "retry"
     if task.recovery_origin == "retry":
         return "retry"
+    if task.session_id and task.based_on:
+        return "resume"
     return None
 
 

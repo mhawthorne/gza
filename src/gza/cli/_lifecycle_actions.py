@@ -36,6 +36,7 @@ class LifecycleExecutionDecision(Generic[T]):
     """Shared lifecycle execution-gate decision for one sorted plan item."""
 
     item: T
+    action: Mapping[str, Any]
     free_worker_slots: int
     selected: bool
 
@@ -169,6 +170,7 @@ def plan_lifecycle_execution(
         decisions.append(
             LifecycleExecutionDecision(
                 item=item,
+                action=action,
                 free_worker_slots=remaining_slots,
                 selected=selected,
             )
@@ -177,6 +179,48 @@ def plan_lifecycle_execution(
             remaining_slots -= 1
 
     return decisions
+
+
+def reproject_selected_merge_actions(
+    decisions: Iterable[LifecycleExecutionDecision[T]],
+    *,
+    reproject_action: Callable[[T], Mapping[str, Any]],
+) -> list[LifecycleExecutionDecision[T]]:
+    """Re-evaluate selected merge candidates and reapply the final action gates."""
+    reprojection: list[LifecycleExecutionDecision[T]] = []
+    remaining_slots: int | None = None
+    for decision in decisions:
+        if remaining_slots is None:
+            remaining_slots = decision.free_worker_slots
+        action = reproject_selected_merge_action(
+            decision.action,
+            selected=decision.selected,
+            reproject_action=lambda: reproject_action(decision.item),
+        )
+        selected = should_execute_lifecycle_action(action, free_worker_slots=remaining_slots)
+        reprojection.append(
+            LifecycleExecutionDecision(
+                item=decision.item,
+                action=action,
+                free_worker_slots=remaining_slots,
+                selected=selected,
+            )
+        )
+        if selected and is_worker_consuming_advance_action(str(action.get("type", ""))):
+            remaining_slots -= 1
+    return reprojection
+
+
+def reproject_selected_merge_action(
+    action: Mapping[str, Any],
+    *,
+    selected: bool,
+    reproject_action: Callable[[], Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Return the selected-for-merge action for one merge candidate."""
+    if selected and str(action.get("type", "")) in {"merge", "merge_with_followups"}:
+        return reproject_action()
+    return action
 
 
 def _advance_action_color(action_type: str) -> str:

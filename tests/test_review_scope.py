@@ -1,9 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from gza.db import SqliteTaskStore
 from gza.review_scope import (
+    build_resolution_review_scope,
+    declares_resolution_review_mode,
     extract_review_scope_from_prompt,
     get_latest_review_scope_comment_for_impl,
+    parse_resolution_review_scope,
     resolve_review_scope_for_impl,
 )
 
@@ -101,3 +106,56 @@ def test_resolve_review_scope_derives_plan_backed_scope_for_unsliced_prompt(tmp_
     assert "Implementation request: Implement the bridge slices for the serial rerun path." in resolved.summary
     assert "Treat the linked plan as background context" in resolved.summary
     assert resolved.source == f"plan_fallback:{plan.id}"
+
+
+def test_resolution_review_scope_round_trips() -> None:
+    scope = build_resolution_review_scope(
+        implementation_task_id="gza-10",
+        rebase_task_id="gza-11",
+        resolved_head_sha="head123",
+        resolved_target_sha="target456",
+        pre_rebase_head_sha="old123",
+        pre_rebase_target_sha="target-start",
+        pre_rebase_merge_base_sha="base789",
+    )
+
+    parsed = parse_resolution_review_scope(scope)
+
+    assert parsed is not None
+    assert parsed.implementation_task_id == "gza-10"
+    assert parsed.rebase_task_id == "gza-11"
+    assert parsed.pre_rebase_head_sha == "old123"
+    assert parsed.pre_rebase_target_sha == "target-start"
+    assert parsed.pre_rebase_merge_base_sha == "base789"
+    assert parsed.resolved_head_sha == "head123"
+    assert parsed.resolved_target_sha == "target456"
+
+
+def test_declares_resolution_review_mode_detects_header_without_parsing() -> None:
+    assert declares_resolution_review_mode(
+        "Review mode: resolution\nImplementation task: gza-10\n"
+    )
+    assert not declares_resolution_review_mode("Review only the parser slice.")
+
+
+def test_resolution_review_scope_parser_rejects_missing_required_fields() -> None:
+    with pytest.raises(ValueError, match="missing required fields"):
+        parse_resolution_review_scope(
+            "Review mode: resolution\nImplementation task: gza-10\nRebase task: gza-11\n"
+        )
+
+
+def test_resolution_review_scope_parser_rejects_duplicate_fields() -> None:
+    with pytest.raises(ValueError, match="duplicate resolution review metadata field"):
+        parse_resolution_review_scope(
+            "\n".join(
+                (
+                    "Review mode: resolution",
+                    "Implementation task: gza-10",
+                    "Implementation task: gza-10",
+                    "Rebase task: gza-11",
+                    "Resolved head SHA: head123",
+                    "Resolved target SHA: target456",
+                )
+            )
+        )

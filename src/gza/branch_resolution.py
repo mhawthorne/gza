@@ -45,3 +45,16 @@ def resolve_rebase_target_branch(store: SqliteTaskStore, task: DbTask) -> str | 
     """
     target_task = resolve_rebase_target_task(store, task)
     return target_task.branch if target_task is not None else None
+
+
+def resolve_rebase_base_branch(task: DbTask) -> str | None:
+    """Return the persisted local target branch for a rebase task.
+
+    Rebase execution must use the target chosen when the task was created. A
+    missing value means the row predates durable target persistence, so callers
+    should fail closed instead of substituting the repository default branch.
+    """
+    if task.task_type != "rebase":
+        return None
+    target = (task.base_branch or "").strip()
+    return target or None

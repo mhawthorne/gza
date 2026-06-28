@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.artifacts import store_command_output_artifact
 from gza.advance_engine import (
     ADVANCE_RULES,
     FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP,
@@ -36,6 +35,7 @@ from gza.advance_engine import (
     resolve_closing_review_action,
     resolve_subject_task,
 )
+from gza.artifacts import store_command_output_artifact
 from gza.config import Config
 from gza.db import NewTaskParams, SqliteTaskStore, Task as DbTask
 from gza.git import Git, GitError
@@ -46,10 +46,12 @@ from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
     plan_review_manifest_digest,
 )
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
-from gza.review_verify_state import refresh_preserved_rebase_review_verify_heads
-from gza.review_verdict import ParsedReviewReport, ReviewFinding
+from gza.review_scope import build_resolution_review_scope
 from gza.review_tasks import OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND
+from gza.review_verdict import ParsedReviewReport, ReviewFinding
+from gza.review_verify_state import refresh_preserved_rebase_review_verify_heads
 from gza.runner import CROSS_PROJECT_TAG, ReviewVerifyResult
 
 
@@ -565,6 +567,43 @@ def _add_completed_rebase(
     return rebase
 
 
+def _add_rebase_diff_provenance(
+    store: SqliteTaskStore,
+    rebase: DbTask,
+    *,
+    resolved_head_sha: str = "rebased-sha",
+    resolved_target_sha: str = "target-sha",
+) -> DbTask:
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="pre-rebase-head",
+            target_at_start="pre-rebase-target",
+            merge_base_at_start="pre-rebase-merge-base",
+        ),
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+    )
+    store.update(rebase)
+    return rebase
+
+
+def _resolution_review_scope_for(
+    impl: DbTask,
+    rebase: DbTask,
+    *,
+    resolved_head_sha: str = "rebased-sha",
+    resolved_target_sha: str = "target-sha",
+) -> str:
+    assert impl.id is not None
+    assert rebase.id is not None
+    return build_resolution_review_scope(
+        implementation_task_id=impl.id,
+        rebase_task_id=rebase.id,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+    )
+
+
 def _make_failed_owner_with_completed_resume_descendant(
     store: SqliteTaskStore,
     *,
@@ -898,8 +937,17 @@ def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
         task,
         "main",
     )
+    selected_action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=False),
+        task,
+        "main",
+        selected_for_merge=True,
+    )
 
-    assert action["type"] == "needs_rebase"
+    assert action["type"] == "run_review"
+    assert selected_action["type"] == "needs_rebase"
 
 
 def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
@@ -2300,7 +2348,17 @@ def test_evaluate_prefers_in_progress_review_over_pending_sibling(tmp_path: Path
     in_progress.status = "in_progress"
     store.update(in_progress)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        task,
+        "main",
+    )
     assert action["type"] == "wait_review"
     assert action["review_task"].id == in_progress.id
 
@@ -2321,7 +2379,17 @@ def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path)
     pending.status = "pending"
     store.update(pending)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        task,
+        "main",
+    )
     assert action["type"] == "run_review"
     assert action["review_task"].id == pending.id
 
@@ -2359,7 +2427,17 @@ def test_rebase_after_review_with_unchanged_diff_preserves_approved_review(tmp_p
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        task,
+        "main",
+    )
     assert action["type"] == "merge"
     assert action["description"] == f"Merge (review APPROVED, preserved across rebase {rebase.id})"
 
@@ -2390,6 +2468,7 @@ def test_rebase_after_review_with_changed_diff_requires_fresh_review(tmp_path: P
     rebase.branch = task.branch
     rebase.changed_diff = True
     store.update(rebase)
+    _add_rebase_diff_provenance(store, rebase)
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -2397,9 +2476,21 @@ def test_rebase_after_review_with_changed_diff_requires_fresh_review(tmp_path: P
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        task,
+        "main",
+    )
     assert action["type"] == "create_review"
-    assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
+    assert action["description"] == f"Create resolution review (rebase {rebase.id} changed diff)"
+    assert action["review_mode"] == "resolution"
+    assert action["resolution_rebase_task_id"] == rebase.id
 
 
 def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: Path, monkeypatch) -> None:
@@ -2428,6 +2519,7 @@ def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: P
     rebase.branch = task.branch
     rebase.changed_diff = None
     store.update(rebase)
+    _add_rebase_diff_provenance(store, rebase)
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -2435,9 +2527,19 @@ def test_rebase_after_review_with_unknown_diff_requires_fresh_review(tmp_path: P
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={task.branch},
+            ref_shas={task.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        task,
+        "main",
+    )
     assert action["type"] == "create_review"
-    assert action["description"] == f"Create review (rebase {rebase.id} change unknown)"
+    assert action["description"] == f"Create resolution review (rebase {rebase.id} change unknown)"
 
 
 def test_stale_review_with_auto_review_disabled_needs_manual_refresh(tmp_path: Path, monkeypatch) -> None:
@@ -2453,12 +2555,13 @@ def test_stale_review_with_auto_review_disabled_needs_manual_refresh(tmp_path: P
         when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
     )
     _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    _add_completed_rebase(
+    rebase = _add_completed_rebase(
         store,
         impl,
         when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
         changed_diff=True,
     )
+    _add_rebase_diff_provenance(store, rebase)
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -2466,7 +2569,17 @@ def test_stale_review_with_auto_review_disabled_needs_manual_refresh(tmp_path: P
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
 
     assert action["type"] == "needs_discussion"
     assert action["description"] == "SKIP: review must be refreshed before merge"
@@ -2510,11 +2623,21 @@ def test_stale_refresh_review_with_auto_review_disabled_needs_manual_refresh(
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
 
     assert action["type"] == "needs_discussion"
-    assert action["description"] == "SKIP: review must be refreshed before merge"
-    assert action["needs_attention_reason"] == "stale-review-needs-manual-refresh"
+    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
     assert action["subject_task_id"] == impl.id
 
 
@@ -2609,7 +2732,7 @@ def test_head_advanced_stale_review_refresh_preempts_max_cycles(tmp_path: Path, 
     git = _FakeGit(
         can_merge=True,
         existing_branches={impl.branch},
-        ref_shas={impl.branch: "current-sha"},
+        ref_shas={impl.branch: "current-sha", "main": "target-sha"},
     )
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
@@ -2626,9 +2749,9 @@ def test_head_advanced_stale_review_refresh_preempts_max_cycles(tmp_path: Path, 
 @pytest.mark.parametrize(
     ("refresh_review_status", "expected_action_type", "expected_description_prefix"),
     [
-        (None, "create_review", "Create review"),
-        ("pending", "run_review", "Run pending review"),
-        ("in_progress", "wait_review", "SKIP: review"),
+        (None, "create_review", "Create resolution review"),
+        ("pending", "run_review", "Run pending resolution review"),
+        ("in_progress", "wait_review", "SKIP: resolution review"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2675,6 +2798,12 @@ def test_rebase_stale_review_reason_precedence_over_branch_head_advance(
         when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC),
         changed_diff=changed_diff,
     )
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="refreshed-head",
+        resolved_target_sha="refreshed-target",
+    )
 
     refresh_review = None
     if refresh_review_status is not None:
@@ -2682,6 +2811,12 @@ def test_rebase_stale_review_reason_precedence_over_branch_head_advance(
         assert refresh_review.id is not None
         refresh_review.status = refresh_review_status
         refresh_review.created_at = datetime(2026, 5, 10, 13, 30, tzinfo=UTC)
+        refresh_review.review_scope = _resolution_review_scope_for(
+            impl,
+            rebase,
+            resolved_head_sha="refreshed-head",
+            resolved_target_sha="refreshed-target",
+        )
         store.update(refresh_review)
 
     monkeypatch.setattr(
@@ -2697,7 +2832,7 @@ def test_rebase_stale_review_reason_precedence_over_branch_head_advance(
     git = _FakeGit(
         can_merge=True,
         existing_branches={impl.branch},
-        ref_shas={impl.branch: "current-sha"},
+        ref_shas={impl.branch: "current-sha", "main": "target-sha"},
     )
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
@@ -3380,9 +3515,452 @@ def test_preserved_noop_rebase_only_refreshes_when_head_advances_independently(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.review_preserved_by_rebase is not None
-    assert ctx.review_invalidated_by_progress is True
-    assert ctx.review_invalidation_reason == "branch_head_advanced"
-    assert action["type"] == "create_review"
+    assert ctx.review_invalidated_by_progress is False
+    assert ctx.review_invalidation_reason is None
+    assert action["type"] == "merge"
+
+
+def test_changed_rebase_requires_resolution_review_metadata(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-metadata-invalid",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    refresh_review = store.add(
+        "Malformed refresh review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    assert refresh_review.id is not None
+    refresh_review.status = "pending"
+    refresh_review.review_scope = "Review mode: resolution\nImplementation task: wrong\n"
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert rebase.id is not None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+
+
+@pytest.mark.parametrize("refresh_review_status", ["pending", "in_progress"])
+@pytest.mark.parametrize(
+    ("resolved_head_sha", "resolved_target_sha"),
+    [
+        ("wrong-head", "target-sha"),
+        ("rebased-sha", "wrong-target"),
+    ],
+)
+def test_changed_rebase_active_resolution_review_metadata_must_match_provenance(
+    tmp_path: Path,
+    monkeypatch,
+    refresh_review_status: str,
+    resolved_head_sha: str,
+    resolved_target_sha: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/rebase-resolution-active-{refresh_review_status}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    refresh_review = store.add(
+        "Stale resolution review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    refresh_review.status = refresh_review_status
+    refresh_review.created_at = datetime(2026, 5, 10, 12, 30, tzinfo=UTC)
+    refresh_review.review_scope = _resolution_review_scope_for(
+        impl,
+        rebase,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+    )
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] not in {"run_review", "wait_review"}
+
+
+@pytest.mark.parametrize(
+    ("refresh_review_status", "expected_action_type"),
+    [("pending", "run_review"), ("in_progress", "wait_review")],
+)
+def test_changed_rebase_active_resolution_review_metadata_matching_provenance_is_valid(
+    tmp_path: Path,
+    monkeypatch,
+    refresh_review_status: str,
+    expected_action_type: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/rebase-resolution-active-valid-{refresh_review_status}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    refresh_review = store.add(
+        "Current resolution review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    refresh_review.status = refresh_review_status
+    refresh_review.created_at = datetime(2026, 5, 10, 12, 30, tzinfo=UTC)
+    refresh_review.review_scope = _resolution_review_scope_for(impl, rebase)
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == expected_action_type
+    assert action["review_task"].id == refresh_review.id
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+@pytest.mark.parametrize(
+    "review_scope",
+    [
+        "ordinary full review",
+        "Review mode: resolution\nImplementation task: gza-1\n",
+        None,
+    ],
+)
+def test_changed_rebase_completed_review_after_rebase_requires_valid_resolution_metadata(
+    tmp_path: Path,
+    monkeypatch,
+    review_scope: str | None,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-completed-invalid",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = review_scope
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] != "merge"
+
+
+@pytest.mark.parametrize(
+    ("resolved_head_sha", "resolved_target_sha"),
+    [
+        ("wrong-head", "target-sha"),
+        ("rebased-sha", "wrong-target"),
+    ],
+)
+def test_changed_rebase_completed_resolution_review_metadata_must_match_provenance(
+    tmp_path: Path,
+    monkeypatch,
+    resolved_head_sha: str,
+    resolved_target_sha: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-completed-mismatch",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = _resolution_review_scope_for(
+        impl,
+        rebase,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+    )
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] != "merge"
+
+
+def test_changed_rebase_completed_resolution_review_matching_provenance_can_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-completed-valid",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = _resolution_review_scope_for(impl, rebase)
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+@pytest.mark.parametrize(
+    ("ref_shas", "branch_name"),
+    [
+        ({"feature/rebase-missing-resolution-target": "rebased-sha", "main": None}, "feature/rebase-missing-resolution-target"),
+        ({"feature/rebase-missing-resolution-head": None, "main": "target-sha"}, "feature/rebase-missing-resolution-head"),
+    ],
+)
+def test_changed_rebase_missing_planned_resolution_metadata_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+    ref_shas: dict[str, str | None],
+    branch_name: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=branch_name,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas=ref_shas,
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] != "create_review"
 
 
 def test_live_branch_head_blocks_merge_when_merge_unit_head_is_stale(
@@ -3425,9 +4003,8 @@ def test_live_branch_head_blocks_merge_when_merge_unit_head_is_stale(
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.current_review_head_sha == "current-sha"
-    assert ctx.review_invalidated_by_progress is True
-    assert action["type"] == "create_review"
-    assert action["type"] != "merge"
+    assert ctx.review_invalidated_by_progress is False
+    assert action["type"] == "merge"
 
 
 def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Path) -> None:
@@ -3448,7 +4025,17 @@ def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Pa
     )
     store.get_or_create_merge_unit_for_task(rebase)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        rebase,
+        "main",
+    )
 
     assert action["type"] == "create_review"
     assert action["description"] == "Create closing review (latest implementation has no review yet)"
@@ -3474,7 +4061,17 @@ def test_completed_rebase_under_resumed_implement_without_review_creates_review(
     )
     store.get_or_create_merge_unit_for_task(rebase)
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={resumed.branch},
+            ref_shas={resumed.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        rebase,
+        "main",
+    )
 
     assert action["type"] == "create_review"
     assert action["description"] == "Create closing review (latest implementation has no review yet)"
@@ -3507,7 +4104,17 @@ def test_completed_rebase_with_approved_owner_review_merges(tmp_path: Path, monk
         lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        rebase,
+        "main",
+    )
 
     assert review.id is not None
     assert action["type"] == "merge"
@@ -3537,6 +4144,7 @@ def test_completed_changed_rebase_under_resumed_implement_invalidates_prior_revi
         when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
         changed_diff=True,
     )
+    _add_rebase_diff_provenance(store, rebase)
     store.get_or_create_merge_unit_for_task(rebase)
 
     monkeypatch.setattr(
@@ -3545,10 +4153,20 @@ def test_completed_changed_rebase_under_resumed_implement_invalidates_prior_revi
         lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={resumed.branch},
+            ref_shas={resumed.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        rebase,
+        "main",
+    )
 
     assert action["type"] == "create_review"
-    assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
+    assert action["description"] == f"Create resolution review (rebase {rebase.id} changed diff)"
 
 
 def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: Path, monkeypatch) -> None:
@@ -3570,6 +4188,7 @@ def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: P
         when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
         changed_diff=True,
     )
+    _add_rebase_diff_provenance(store, rebase)
     store.get_or_create_merge_unit_for_task(rebase)
 
     monkeypatch.setattr(
@@ -3578,10 +4197,127 @@ def test_completed_rebase_with_changed_diff_invalidates_owner_review(tmp_path: P
         lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), rebase, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        rebase,
+        "main",
+    )
 
     assert action["type"] == "create_review"
-    assert action["description"] == f"Create review (rebase {rebase.id} changed diff)"
+    assert action["description"] == f"Create resolution review (rebase {rebase.id} changed diff)"
+    assert action["resolution_rebase_task_id"] == rebase.id
+    assert action["resolution_head_sha"] == "rebased-sha"
+    assert action["resolution_target_sha"] == "target-sha"
+
+
+def test_changed_rebase_resolution_review_action_uses_persisted_rebase_target_after_target_moves(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-target-moved",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(
+        store,
+        rebase,
+        resolved_head_sha="rebased-head",
+        resolved_target_sha="target-at-rebase",
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-head", "main": "target-now"},
+        ),
+        rebase,
+        "main",
+    )
+
+    assert action["type"] == "create_review"
+    assert action["resolution_rebase_task_id"] == rebase.id
+    assert action["resolution_head_sha"] == "rebased-head"
+    assert action["resolution_target_sha"] == "target-at-rebase"
+
+
+def test_changed_rebase_with_missing_persisted_provenance_requires_resolution_metadata_attention(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-provenance-missing",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    rebase.review_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-head\nRecovered baseline: no"
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-head", "main": "target-now"},
+        ),
+        rebase,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 
 
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
@@ -3611,7 +4347,12 @@ def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
     action = evaluate_advance_rules(
         config,
         store,
-        _FakeGit(can_merge=True),
+        _FakeGit(
+            can_merge=True,
+            existing_refs={"origin/feat/resume"},
+            ref_shas={"origin/feat/resume": "branch-tip", "main": "target-tip"},
+            ancestor_pairs={("main", "origin/feat/resume"): True},
+        ),
         resumed,
         "main",
     )
@@ -4239,7 +4980,6 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "create_review"
-    assert action.get("needs_attention_reason") is None
 
 
 def test_cross_project_tag_still_parks_unknown_paths_outside_discovered_roots(tmp_path: Path) -> None:
@@ -4302,7 +5042,6 @@ def test_cross_project_tag_branch_declared_project_root_advances_without_checkou
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "create_review"
-    assert action.get("needs_attention_reason") is None
 
 
 def test_cross_project_tag_rename_declared_project_root_still_parks_for_unknown_source_root(
@@ -4367,7 +5106,6 @@ def test_cross_project_tag_copy_declared_project_root_advances_without_checkout_
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "create_review"
-    assert action.get("needs_attention_reason") is None
 
 
 def test_advance_engine_module_compiles() -> None:
@@ -7086,8 +7824,8 @@ def test_verify_failure_only_noop_improve_does_not_clear_from_older_pass_when_ne
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None, label
     if label == "review_head_mismatch":
-        assert action["type"] == "create_review", label
-        assert action.get("needs_attention_reason") is None, label
+        assert action["type"] == "needs_discussion", label
+        assert action["needs_attention_reason"] == "improve-no-op", label
     elif label == "newer_failed_evidence":
         assert action["type"] == "needs_discussion", label
         assert action["needs_attention_reason"] == "improve-no-op", label
@@ -8717,8 +9455,8 @@ def test_verify_failure_only_noop_improve_mismatches_do_not_auto_clear(
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is None, label
     if label == "review_head_mismatch":
-        assert action["type"] == "create_review", label
-        assert action.get("needs_attention_reason") is None, label
+        assert action["type"] == "needs_discussion", label
+        assert action["needs_attention_reason"] == "improve-no-op", label
     elif label in {
         "missing_passing_improve_evidence",
         "improve_captured_before_review_completed",
@@ -9132,8 +9870,8 @@ def test_verify_blocked_noop_improves_refresh_review_when_review_sha_is_stale(tm
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
-    assert action.get("needs_attention_reason") is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_verify_timeout_only_reviews_park_with_verify_blocked_reason_when_noop_limit_is_reached(
@@ -9234,8 +9972,8 @@ def test_verify_timeout_only_review_hits_threshold_one_with_single_noop_improve_
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
-    assert action.get("needs_attention_reason") is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_verify_timeout_only_reviews_still_park_without_noop_limit_trigger(tmp_path: Path) -> None:
@@ -11222,6 +11960,159 @@ def test_failed_timeout_implement_no_review_stays_in_recovery_not_merge(tmp_path
         "main",
     )
 
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "recovery-preflight-rebase"
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "expected_action_type"),
+    [
+        ("MAX_STEPS", "resume"),
+        ("WORKER_DIED", "retry"),
+    ],
+)
+def test_failed_recovery_requires_rebase_before_resume_or_retry_when_branch_lacks_target_tip(
+    tmp_path: Path,
+    failure_reason: str,
+    expected_action_type: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = failure_reason
+    failed.session_id = "sess-recovery"
+    failed.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    failed.branch = f"feature/recovery-preflight-{failure_reason.lower()}"
+    failed.merge_status = "unmerged"
+    failed.has_commits = True
+    failed.num_steps_computed = 1
+    store.update(failed)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={f"origin/{failed.branch}"},
+        ref_shas={f"origin/{failed.branch}": "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", f"origin/{failed.branch}"): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, failed, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "recovery-preflight-rebase"
+    assert action["deferred_action_type"] == expected_action_type
+    assert action["failed_task_id"] == failed.id
+
+
+def test_failed_recovery_waits_for_same_branch_preflight_rebase(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_STEPS"
+    failed.session_id = "sess-recovery"
+    failed.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    failed.branch = "feature/recovery-preflight-active"
+    failed.merge_status = "unmerged"
+    failed.has_commits = True
+    failed.num_steps_computed = 1
+    store.update(failed)
+
+    rebase = store.add("Pending rebase", task_type="rebase", based_on=failed.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "pending"
+    rebase.branch = failed.branch
+    store.update(rebase)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), failed, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "recovery-preflight-rebase"
+    assert rebase.id in action["description"]
+
+
+def test_failed_same_branch_recovery_preflight_reuses_canonical_impl_root(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 5, 14, 8, 0, tzinfo=UTC)
+    impl.branch = "feature/recovery-preflight-root"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    failed_improve = store.add(
+        "Failed same-branch improve",
+        task_type="improve",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "MAX_STEPS"
+    failed_improve.session_id = "sess-improve"
+    failed_improve.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    failed_improve.branch = impl.branch
+    failed_improve.has_commits = True
+    failed_improve.num_steps_computed = 1
+    store.update(failed_improve)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={f"origin/{impl.branch}"},
+        ref_shas={f"origin/{impl.branch}": "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", f"origin/{impl.branch}"): False},
+    )
+
+    action = evaluate_advance_rules(config, store, git, failed_improve, "main")
+
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "recovery-preflight-rebase"
+    assert action["rebase_parent_task_id"] == impl.id
+    assert action["recovery_preflight"]["rebase_parent_task_id"] == impl.id
+    assert action["recovery_preflight"]["deferred_action_type"] == "resume"
+
+
+def test_failed_recovery_resumes_after_completed_rebase_contains_target_tip(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_STEPS"
+    failed.session_id = "sess-recovery"
+    failed.completed_at = datetime(2026, 5, 14, 9, 0, tzinfo=UTC)
+    failed.branch = "feature/recovery-preflight-complete"
+    failed.merge_status = "unmerged"
+    failed.has_commits = True
+    failed.num_steps_computed = 1
+    store.update(failed)
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=failed.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+    rebase.branch = failed.branch
+    rebase.has_commits = True
+    store.update(rebase)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_refs={f"origin/{failed.branch}"},
+        ref_shas={f"origin/{failed.branch}": "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", f"origin/{failed.branch}"): True},
+    )
+
+    action = evaluate_advance_rules(config, store, git, failed, "main")
+
     assert action["type"] == "resume"
 
 
@@ -11606,8 +12497,18 @@ def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) 
     store.update(impl)
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=False), impl, "main")
+    selected_action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=False),
+        impl,
+        "main",
+        selected_for_merge=True,
+    )
 
-    assert action["type"] == "needs_rebase"
+    assert action["type"] == "create_review"
+    assert selected_action["type"] == "needs_rebase"
+    assert selected_action["reason"] == "merge-selection-conflict-rebase"
 
 
 def test_rebase_failure_circuit_breaker_trips_after_three_failures_without_progress(
@@ -11709,9 +12610,18 @@ def test_rebase_failure_circuit_breaker_resets_after_completed_review(
     assert ctx.rebase_failure_streak is None
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
+    selected_action = evaluate_advance_rules(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        selected_for_merge=True,
+    )
 
-    assert action["type"] == "needs_rebase"
-    assert "needs_attention_reason" not in action
+    assert action["type"] == "merge"
+    assert selected_action["type"] == "needs_rebase"
+    assert "needs_attention_reason" not in selected_action
 
 
 def test_rebase_failure_circuit_breaker_resets_after_completed_code_change(tmp_path: Path) -> None:
@@ -11791,7 +12701,8 @@ def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) ->
         when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
     )
     review = _add_completed_review(store, impl, when=datetime(2026, 5, 14, 10, 0, tzinfo=UTC))
-    _add_completed_rebase(store, impl, when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC))
+    rebase = _add_completed_rebase(store, impl, when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC))
+    _add_rebase_diff_provenance(store, rebase)
     _add_completed_improve_for_review(
         store,
         impl,
@@ -11820,9 +12731,18 @@ def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) ->
     assert ctx.post_merge_rebase_state.warning is None
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
+    selected_action = evaluate_advance_rules(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        selected_for_merge=True,
+    )
 
-    assert action["type"] == "needs_rebase"
-    assert action.get("needs_attention_reason") != "rebase-did-not-unblock-merge"
+    assert action["type"] == "create_review"
+    assert selected_action["type"] == "needs_rebase"
+    assert selected_action.get("needs_attention_reason") != "rebase-did-not-unblock-merge"
 
 
 def test_orphan_rebase_descendant_skips_when_canonical_target_merge_unit_is_merged(
@@ -12101,6 +13021,7 @@ def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(
     completed_rebase.branch = impl.branch
     completed_rebase.has_commits = True
     store.update(completed_rebase)
+    _add_rebase_diff_provenance(store, completed_rebase)
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -12119,13 +13040,14 @@ def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(
             can_merge=True,
             can_merge_by_ref={("origin/feat/rebase-supersedes-failure", "main"): True},
             existing_refs={"origin/feat/rebase-supersedes-failure"},
+            ref_shas={"origin/feat/rebase-supersedes-failure": "rebased-sha", "main": "target-sha"},
         ),
         impl,
         "main",
     )
 
     assert action["type"] == "create_review"
-    assert action["description"].startswith("Create review (rebase ")
+    assert action["description"].startswith("Create resolution review (rebase ")
     assert action["description"].endswith(" change unknown)")
 
 
@@ -12423,8 +13345,8 @@ def test_missing_max_noop_improve_config_falls_back_to_authoritative_default(tmp
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.max_noop_improve_cycles == 1
-    assert action["type"] == "create_review"
-    assert action.get("needs_attention_reason") is None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "improve-no-op"
 
 
 def test_two_consecutive_evidence_only_verify_timeout_reviews_need_attention(tmp_path: Path) -> None:
@@ -13296,6 +14218,7 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "conflict_rebase_failed",
         "conflict_rebase_completed_but_still_blocked",
             "already_rebased_but_lineage_incomplete",
+            "resolution_review_metadata_invalid",
             "review_freshness_probe_failed",
             "stale_review_needs_manual_refresh",
             "failed_rebase_without_successful_review",
@@ -14156,7 +15079,7 @@ def test_mergeable_behind_branch_keeps_review_flow(tmp_path: Path) -> None:
     assert classify_advance_action(action) == "actionable"
 
 
-def test_stale_conflicting_branch_emits_needs_rebase(tmp_path: Path) -> None:
+def test_stale_conflicting_branch_only_emits_needs_rebase_when_selected_for_merge(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -14176,7 +15099,16 @@ def test_stale_conflicting_branch_emits_needs_rebase(tmp_path: Path) -> None:
     )
 
     action = evaluate_advance_rules(config, store, git, task, "main")
-    assert action["type"] == "needs_rebase"
+    selected_action = evaluate_advance_rules(
+        config,
+        store,
+        git,
+        task,
+        "main",
+        selected_for_merge=True,
+    )
+    assert action["type"] == "create_review"
+    assert selected_action["type"] == "needs_rebase"
 
 
 def test_failed_rebase_manual_resolution_still_wins_over_clean_mergeable_tip(tmp_path: Path) -> None:

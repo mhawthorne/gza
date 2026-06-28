@@ -729,6 +729,21 @@ def _is_branch_target_live(args: argparse.Namespace) -> bool:
 def _format_recovery_lane_detail(entry: RecoveryLaneEntry) -> str:
     if entry.attention_action is not None:
         return format_needs_attention_entry_for_display(entry.task, action=entry.attention_action)
+    action = entry.action or {}
+    action_type = str(action.get("type", "")).strip()
+    if action_type and action_type not in {"resume", "retry", "reconcile_branch_divergence"}:
+        detail = (
+            f"{action_type:<12} {entry.task.id} [{entry.task.task_type}] "
+            f"{shorten_prompt(entry.task.prompt, prompt_available_width(prefix=38, suffix=0))} "
+            f"{str(action.get('description', '')).strip()}"
+        )
+        reason = action.get("reason")
+        if isinstance(reason, str) and reason:
+            detail += f" reason={reason}"
+        deferred = action.get("deferred_action_type")
+        if isinstance(deferred, str) and deferred:
+            detail += f" deferred={deferred}"
+        return detail
     decision = entry.decision
     return (
         f"{decision.action:<6} {entry.task.id} [{entry.task.task_type}] "

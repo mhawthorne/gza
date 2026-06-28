@@ -1418,7 +1418,193 @@ class TestReviewContextFromChain:
 
         assert "## Original request:" in context
         assert full_prompt in context
+
+    def test_review_context_marks_resolution_review_scope(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Implement task gza-1", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review rebased implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope=(
+                "Review mode: resolution\n"
+                f"Implementation task: {impl_task.id}\n"
+                "Rebase task: gza-2\n"
+                "Resolved head SHA: rebased-head\n"
+                "Resolved target SHA: target-head\n"
+            ),
+        )
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=None)
+
+        assert "## Resolution review ask:" in context
+        assert "Resolution review mode: review only the conflict-resolution delta introduced by the rebase." in context
         assert "## Original plan:" not in context
+
+    def test_resolution_review_context_uses_range_diff_and_skips_full_impl_diff(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Implement task gza-1", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/resolution-review"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review rebased implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope=(
+                "Review mode: resolution\n"
+                f"Implementation task: {impl_task.id}\n"
+                "Rebase task: gza-2\n"
+                "Pre-rebase head SHA: old-head\n"
+                "Pre-rebase target SHA: old-target\n"
+                "Pre-rebase merge-base SHA: merge-base\n"
+                "Resolved head SHA: rebased-head\n"
+                "Resolved target SHA: target-head\n"
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.default_branch.side_effect = AssertionError("full implementation diff should be skipped")
+
+        def _run(*args: str, **_kwargs: object):
+            if args == ("range-diff", "--no-color", "merge-base..old-head", "target-head..rebased-head"):
+                return Mock(returncode=0, stdout="1:  old = 1:  new\n- old hunk\n+ new hunk\n", stderr="")
+            raise AssertionError(f"Unexpected git call: {args!r}")
+
+        git._run.side_effect = _run
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=git)
+
+        assert "## Resolution review ask:" in context
+        assert f"Implementation task: {impl_task.id}" in context
+        assert "Rebase task: gza-2" in context
+        assert "## Resolution Delta Context" in context
+        assert "Range-diff (review this delta, not the whole implementation):" in context
+        assert "new hunk" in context
+        assert "## Implementation Diff Context" not in context
+
+    def test_resolution_review_with_malformed_metadata_fails_closed_and_skips_full_impl_diff(
+        self,
+        tmp_path: Path,
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Implement task gza-1", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/resolution-review-malformed"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review rebased implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope=(
+                "Review mode: resolution\n"
+                f"Implementation task: {impl_task.id}\n"
+                "Rebase task: gza-2\n"
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.default_branch.side_effect = AssertionError("full implementation diff should be skipped")
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=git)
+
+        assert "## Resolution review ask:" in context
+        assert "Resolution review metadata is malformed." in context
+        assert "Parser error: resolution review metadata is missing required fields" in context
+        assert "## Implementation Diff Context" not in context
+
+    def test_resolution_review_context_uses_persisted_rebase_target_even_if_target_has_moved(
+        self,
+        tmp_path: Path,
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Implement task gza-1", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/resolution-review-target-moved"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review rebased implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope=(
+                "Review mode: resolution\n"
+                f"Implementation task: {impl_task.id}\n"
+                "Rebase task: gza-2\n"
+                "Pre-rebase head SHA: old-head\n"
+                "Pre-rebase target SHA: target-before\n"
+                "Pre-rebase merge-base SHA: merge-base\n"
+                "Resolved head SHA: rebased-head\n"
+                "Resolved target SHA: target-at-rebase\n"
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.default_branch.side_effect = AssertionError("full implementation diff should be skipped")
+
+        def _run(*args: str, **_kwargs: object):
+            if args == (
+                "range-diff",
+                "--no-color",
+                "merge-base..old-head",
+                "target-at-rebase..rebased-head",
+            ):
+                return Mock(returncode=0, stdout="1:  old = 1:  new\n- old hunk\n+ new hunk\n", stderr="")
+            raise AssertionError(f"Unexpected git call: {args!r}")
+
+        git._run.side_effect = _run
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=git)
+
+        assert "Resolved target SHA: target-at-rebase" in context
+        assert "target-at-rebase..rebased-head" in context
+
+    def test_non_resolution_review_context_keeps_full_impl_diff_behavior(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Implement task gza-1", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/ordinary-review"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope="Review only the parser slice.",
+        )
+
+        git = MagicMock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.get_diff_numstat.return_value = "1\t1\tsrc/parser.py\n"
+        git.merge_base.return_value = "merge-base-sha"
+        git.rev_parse.side_effect = lambda ref: {
+            "main": "main-sha",
+            "feature/ordinary-review": "branch-sha",
+        }[ref]
+        git.get_diff_stat.return_value = " src/parser.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n"
+        git.get_diff.return_value = "--- diff body ---"
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=git)
+
+        assert "## Review scope:" in context
+        assert "## Resolution review ask:" not in context
+        assert "## Implementation Diff Context" in context
+        assert "--- diff body ---" in context
 
     def test_review_context_includes_verify_result_when_provided(self, tmp_path: Path):
         """Autonomous review context should thread structured verify output into the prompt."""
@@ -4061,6 +4247,7 @@ class TestReviewTaskSlugGeneration:
             task_type="rebase",
             based_on=impl_task.id,
             same_branch=True,
+            base_branch="main",
         )
         rebase_task.status = "completed"
         rebase_task.slug = "20260212-rebase-auth"
@@ -9341,6 +9528,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=impl.id,
             same_branch=True,
+            base_branch="main",
         )
         assert failed_rebase.id is not None
         failed_rebase.slug = "20260512-rebase1"
@@ -9373,7 +9561,7 @@ class TestExtractedRunInnerHelpers:
         assert second_recovery.id is not None
         second_recovery.slug = "20260512-rebase-branch-orphan-2"
         assert second_recovery.same_branch is True
-        assert second_recovery.base_branch is None
+        assert second_recovery.base_branch == "main"
         assert second_recovery.branch == impl.branch
 
         git = Mock(spec=Git)
@@ -15346,6 +15534,7 @@ class TestExtractedRunInnerHelpers:
             based_on=parent.id,
             same_branch=True,
             create_pr=True,
+            base_branch="main",
         )
         task.slug = "20260516-retry-rebase-pr-required"
         task.status = "failed"
@@ -15425,6 +15614,7 @@ class TestExtractedRunInnerHelpers:
             based_on=parent.id,
             same_branch=True,
             create_pr=True,
+            base_branch="main",
         )
         rebase_task.slug = "20260515-rebase-pr-required-baseline"
         store.mark_in_progress(rebase_task)
@@ -15495,6 +15685,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         rebase_task.slug = "20260401-rebase-push"
         store.mark_in_progress(rebase_task)
@@ -15552,6 +15743,7 @@ class TestExtractedRunInnerHelpers:
             based_on=parent.id,
             same_branch=True,
             create_pr=True,
+            base_branch="main",
         )
         rebase_task.slug = "20260516-rebase-pr-order"
         store.mark_in_progress(rebase_task)
@@ -15646,6 +15838,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="release",
         )
         assert task.id is not None
         task.slug = "20260515-runner-rebase-publish-failure"
@@ -15753,6 +15946,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         assert task.id is not None
         task.slug = "20260515-runner-rebase-lookup-failure"
@@ -15859,6 +16053,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         task.slug = "20260515-retry-rebase-publish-failure"
         task.status = "failed"
@@ -15943,6 +16138,7 @@ class TestExtractedRunInnerHelpers:
             based_on=parent.id,
             same_branch=True,
             create_pr=True,
+            base_branch="main",
         )
         task.slug = "20260516-retry-rebase-pr-order"
         task.status = "failed"
@@ -16036,6 +16232,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         task.slug = "20260515-retry-rebase-lookup-failure"
         task.status = "failed"
@@ -16135,6 +16332,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="release",
         )
         assert task.id is not None
         task.slug = "20260512-runner-rebase-resume"
@@ -16165,7 +16363,7 @@ class TestExtractedRunInnerHelpers:
 
         def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
             assert branch == parent.branch
-            assert target == "main"
+            assert target == "release"
             assert recovered is True
             return RebaseDiffBaseline(
                 old_tip="old-tip",
@@ -16188,6 +16386,7 @@ class TestExtractedRunInnerHelpers:
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=True)
 
         assert rc == 0
+        assert mock_complete.call_args.kwargs["target_branch"] == "release"
         assert mock_complete.call_args.kwargs["rebase_diff_baseline"] == RebaseDiffBaseline(
             old_tip="old-tip",
             target_at_start="start-target",
@@ -16221,6 +16420,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="release",
         )
         assert failed_rebase.id is not None
         failed_rebase.slug = "20260512-failed-rebase"
@@ -16232,6 +16432,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=failed_rebase.id,
             same_branch=True,
+            base_branch="release",
             recovery_origin="retry",
         )
         assert task.id is not None
@@ -16261,7 +16462,7 @@ class TestExtractedRunInnerHelpers:
 
         def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
             assert branch == parent.branch
-            assert target == "main"
+            assert target == "release"
             assert recovered is True
             return RebaseDiffBaseline(
                 old_tip="old-tip",
@@ -16284,12 +16485,67 @@ class TestExtractedRunInnerHelpers:
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
 
         assert rc == 0
+        assert mock_complete.call_args.kwargs["target_branch"] == "release"
         assert mock_complete.call_args.kwargs["rebase_diff_baseline"] == RebaseDiffBaseline(
             old_tip="old-tip",
             target_at_start="start-target",
             merge_base_at_start="merge-base",
             recovered=True,
         )
+
+    def test_run_inner_parks_legacy_rebase_without_persisted_target(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260512-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_in_progress(parent)
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Legacy rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.slug = "20260512-legacy-rebase"
+        store.update(task)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("worktree setup should not run")),
+            patch("gza.runner.isolated_rebase_checkout", side_effect=AssertionError("isolated checkout should not run")),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        output = capsys.readouterr()
+        surfaced = output.out + output.err
+        assert "missing its persisted local target branch" in surfaced
+        assert "repository default branch" in surfaced
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.branch == parent.branch
 
     def test_run_inner_uses_private_checkout_for_docker_rebase_and_completes_on_canonical_git(
         self,
@@ -16316,6 +16572,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="release",
         )
         assert task.id is not None
         task.slug = "20260512-runner-rebase-isolated"
@@ -16335,7 +16592,7 @@ class TestExtractedRunInnerHelpers:
                     path=isolated_path,
                     git=isolated_git,
                     branch=parent.branch,
-                    target_ref="main",
+                    target_ref="release",
                     imported_refs=(),
                     source_repo=tmp_path,
                 )
@@ -16365,7 +16622,7 @@ class TestExtractedRunInnerHelpers:
         def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
             assert _git is isolated_git
             assert branch == parent.branch
-            assert target == "main"
+            assert target == "release"
             assert recovered is False
             return RebaseDiffBaseline(
                 old_tip="old-tip",
@@ -16375,12 +16632,13 @@ class TestExtractedRunInnerHelpers:
 
         def complete_code_task(*args, **kwargs):
             assert args[3] is mock_main_git
+            assert kwargs["target_branch"] == "release"
             return 0
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
             patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
-            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()) as isolated_checkout,
             patch("gza.runner._stage_worktree_agent_resources", return_value=0),
             patch("gza.runner._copy_learnings_to_worktree"),
             patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
@@ -16398,13 +16656,14 @@ class TestExtractedRunInnerHelpers:
             rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
 
         assert rc == 0
+        assert isolated_checkout.call_args.kwargs["target_ref"] == "release"
         import_tip.assert_called_once_with(
             destination_git=mock_main_git,
             checkout=IsolatedRebaseCheckout(
                 path=isolated_path,
                 git=isolated_git,
                 branch=parent.branch,
-                target_ref="main",
+                target_ref="release",
                 imported_refs=(),
                 source_repo=tmp_path,
             ),
@@ -16873,6 +17132,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         assert task.id is not None
         task.slug = "20260512-runner-rebase-stale-import"
@@ -16988,6 +17248,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         assert task.id is not None
         task.slug = "20260512-runner-rebase-resume"
@@ -16996,6 +17257,10 @@ class TestExtractedRunInnerHelpers:
         store.update(task)
 
         mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            parent.branch: "rebased-head",
+            "release": "release-head",
+        }.get(ref)
         config = self._make_config(tmp_path)
 
         caplog.set_level(logging.WARNING)
@@ -17011,7 +17276,7 @@ class TestExtractedRunInnerHelpers:
                 mock_worktree_git,
                 parent.branch,
                 TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
-                target_branch="main",
+                target_branch="release",
                 rebase_diff_baseline=RebaseDiffBaseline(
                     old_tip="old-tip",
                     target_at_start="start-target",
@@ -17026,6 +17291,8 @@ class TestExtractedRunInnerHelpers:
         refreshed_rebase = store.get(task.id)
         assert refreshed_rebase is not None
         assert refreshed_rebase.changed_diff is True
+        assert refreshed_rebase.review_scope is not None
+        assert "Resolved target SHA: release-head" in refreshed_rebase.review_scope
 
         refreshed_parent = store.get(parent.id)
         assert refreshed_parent is not None
@@ -17068,6 +17335,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         assert failed_rebase.id is not None
         failed_rebase.status = "failed"
@@ -17079,6 +17347,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=failed_rebase.id,
             same_branch=True,
+            base_branch="main",
             recovery_origin="retry",
         )
         assert task.id is not None
@@ -17152,6 +17421,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         assert task.id is not None
         task.slug = "20260512-runner-rebase-in-progress"
@@ -17238,6 +17508,7 @@ class TestExtractedRunInnerHelpers:
             task_type="rebase",
             based_on=parent.id,
             same_branch=True,
+            base_branch="main",
         )
         assert task.id is not None
         task.slug = "20260626-runner-rebase-invalid-container-git-path"

@@ -24,6 +24,7 @@ from gza.review_tasks import (
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
     create_review_task,
+    create_resolution_review_task,
     extract_deferred_blocker_prompt_parts,
     extract_followup_prompt_parts,
     extract_review_blocker_adjudication_dispute_reference,
@@ -410,6 +411,76 @@ class TestCreateReviewTask:
         store.resolve_merge_unit_for_task.assert_called_once_with("gza-12")
         review_task = store.add.return_value
         store.get_or_create_merge_unit_for_task.assert_called_once_with(review_task)
+
+    def test_create_resolution_review_task_persists_structured_scope(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        rebase_task = store.add("Rebase feature", task_type="rebase", based_on=impl_task.id, same_branch=True)
+        rebase_task.status = "completed"
+        rebase_task.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-head\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase_task)
+
+        review_task = create_resolution_review_task(
+            store,
+            impl_task,
+            rebase_task=rebase_task,
+            resolved_head_sha="rebased-head",
+            resolved_target_sha="target-head",
+            trigger_source="manual",
+        )
+        persisted = store.get(review_task.id)
+
+        assert persisted is not None
+        assert persisted.review_scope is not None
+        assert "Review mode: resolution" in persisted.review_scope
+        assert f"Implementation task: {impl_task.id}" in persisted.review_scope
+        assert f"Rebase task: {rebase_task.id}" in persisted.review_scope
+        assert "Pre-rebase head SHA: old-head" in persisted.review_scope
+        assert "Pre-rebase target SHA: old-target" in persisted.review_scope
+        assert "Pre-rebase merge-base SHA: old-base" in persisted.review_scope
+        assert "Resolved head SHA: rebased-head" in persisted.review_scope
+        assert "Resolved target SHA: target-head" in persisted.review_scope
+
+    def test_create_resolution_review_task_rejects_mismatched_provenance(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement feature", task_type="implement")
+        impl_task.status = "completed"
+        store.update(impl_task)
+        rebase_task = store.add("Rebase feature", task_type="rebase", based_on=impl_task.id, same_branch=True)
+        rebase_task.status = "completed"
+        rebase_task.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: target-at-rebase\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-at-rebase\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase_task)
+
+        with pytest.raises(
+            ValueError,
+            match="Resolution review metadata must match the completed rebase provenance.",
+        ):
+            create_resolution_review_task(
+                store,
+                impl_task,
+                rebase_task=rebase_task,
+                resolved_head_sha="rebased-head",
+                resolved_target_sha="target-now",
+                trigger_source="manual",
+            )
 
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "dropped"])

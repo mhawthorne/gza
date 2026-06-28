@@ -145,10 +145,34 @@ MUST verify the branch diff stays within the work unit's declared project scope.
 Conflict is decided against the canonical local target (see
 [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).
 
-- Branch cannot merge AND a rebase child is `pending`/`in_progress` → `skip` (see
+- Ordinary queue-wide lifecycle projection MUST evaluate unresolved work units with
+  `selected_for_merge = false` by default. Under that ordinary projection, a branch that
+  merely conflicts with the current local target MUST NOT emit `needs_rebase` yet. It
+  remains on its review/improve/merge lane until a narrower rebase-owning path below
+  applies.
+- Conflict-driven `needs_rebase` is merge-selection scoped. The engine MUST emit it only
+  when the unit has already been selected for merge in the current cycle, or when the
+  shared failed-task recovery policy requires a recovery-preflight rebase before a
+  `resume`/`retry` can safely proceed.
+- A selected merge candidate that reprojects to `needs_rebase` MUST be selected and
+  reported under that final action's worker-slot and merge-lane gates. A cycle with no
+  worker capacity, halted merges, or an unavailable merge lane MUST NOT preview or start a
+  merge-selection rebase for that candidate.
+- A selected-for-merge branch that cannot merge AND already has a rebase child
+  `pending`/`in_progress` → `skip` (see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1).
-- Branch cannot merge AND no rebase child AND the branch does not already contain the
-  target tip → create a `rebase` task (`needs_rebase`).
+- A selected-for-merge branch that cannot merge, has no rebase child, and does not
+  already contain the local target tip → create a `rebase` task (`needs_rebase`). The
+  action's machine-readable reason slug MUST distinguish this merge-lane path from the
+  recovery-preflight path; `merge-selection-conflict-rebase` is the canonical slug.
+- A recovery-preflight rebase MUST remain lifecycle-owned around recovery policy. When
+  recovery would otherwise choose `resume` or `retry`, but the branch does not contain the
+  local target tip, lifecycle MUST emit `needs_rebase` first instead of spawning the
+  recovery action. That `needs_rebase` action MUST carry a stable machine-readable reason
+  slug, `recovery-preflight-rebase`, plus metadata identifying the deferred recovery
+  action to resume on the next pass. Recovery policy owns deciding **whether** the failed
+  task is recoverable; lifecycle owns this local-target rebase preflight around that
+  policy decision.
 - Local branch and `origin/<branch>` have diverged → reconcile publication host-side.
   The engine MAY inspect, fetch, and publish the unit's own `origin/<branch>` ref to
   decide whether the local side is strictly ahead, patch-equivalent, or otherwise safe to
@@ -162,8 +186,13 @@ Conflict is decided against the canonical local target (see
   landed → `needs_discussion` (rebase-failed). The proof set is intentionally narrow: the
   merge unit is recorded `merged`, the branch tip equals the target tip, or the branch
   already contains the target tip.
-- Branch cannot merge AND a same-branch rebase already `completed` → `needs_discussion`
-  (reason `rebase-did-not-unblock-merge`). The engine MUST NOT re-queue an identical
+- Branch cannot merge AND a same-branch rebase already `completed`, the branch still
+  conflicts, AND the branch already contains the current local target tip →
+  `needs_discussion` (reason `rebase-did-not-unblock-merge`). This park rule applies
+  only when the completed rebase already includes the current target tip, so a fresh
+  same-target rebase is already proved futile. A selected merge candidate with only a
+  stale completed rebase and no current-target-tip containment remains eligible for
+  `merge-selection-conflict-rebase` above. The engine MUST NOT re-queue an identical
   rebase (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2).
 - Repeated rebase failures reach the **circuit-breaker bound** with no intervening success,
   review, or code change → `needs_discussion` (reason `rebase-failure-circuit-breaker`).
@@ -177,19 +206,31 @@ of the narrow local proofs exists.
 
 **Rebase outcome → review impact.** A completed rebase records whether it changed the
 normalized implementation patch. If unchanged, a prior approval MUST be carried across the
-rebase. If changed (or equivalence cannot be proven), prior review evidence MUST be
-treated as stale (§5). Recovered/resumed rebases MUST fail closed and be treated as
-changed.
+rebase, and target movement alone MUST NOT stale that review. If changed (or equivalence
+cannot be proven), prior whole-task review evidence MUST be treated as stale for merge,
+but the required refresh is a **resolution-scoped review** of the conflict-resolution
+delta, not a generic full-task review refresh (§5). Recovered/resumed rebases MUST fail
+closed and be treated as changed.
 
 ### §5 — Stale review invalidation
 
 - If `require_review_before_merge` is off → fall through to the no-review merge path; the
   engine MUST NOT create or wait on a refresh review.
 - A rebase that changed code and is newer than the latest review, with
-  `advance_create_reviews` on → `create_review`.
-- The current implementation branch/merge-unit head differs from the latest completed
-  review's recorded `review_verify_head_sha`, when both SHAs are known, with
-  `advance_create_reviews` on → `create_review`.
+  `advance_create_reviews` on → `create_review`, but that created review MUST be marked
+  and described as a **resolution review** limited to the rebase-introduced
+  conflict-resolution delta.
+- Resolution review scope MUST be narrow by default: reviewers re-check only the delta
+  introduced while rebasing an already-reviewed branch, not the whole implementation,
+  except where broader context is required to understand the resolution hunks.
+- Target-branch movement alone MUST NOT invalidate a valid review. A later local target
+  tip MAY force a merge-lane or recovery-preflight rebase (§4), but it MUST NOT by itself
+  trigger stale review refresh while the implementation patch is still preserved.
+- The current implementation branch/merge-unit head differing from the latest completed
+  review's recorded `review_verify_head_sha` is stale-review evidence only when lifecycle
+  can tie that head change to an implementation-changing event (for example a changed
+  rebase, code-changing improve, or other durable lineage change). Known target movement
+  alone MUST NOT be treated as branch-head stale review.
 - If the live branch-head probe fails while checking that freshness, the engine MUST fail
   closed: it MUST NOT treat cached merge-unit head metadata as proof that the latest
   completed review is current, and it MUST surface a stop-for-human action instead of
@@ -200,6 +241,10 @@ changed.
   (park for a manual review refresh before merge).
 - Missing `review_verify_head_sha` evidence MUST fail closed for freshness: the engine
   MUST NOT infer stale branch-head advancement from absence alone.
+- If lifecycle cannot parse or validate the persisted metadata that defines a required
+  resolution review, it MUST fail closed and park the lineage with
+  `resolution-review-metadata-invalid`. It MUST NOT silently preserve the old approval,
+  and it MUST NOT silently widen that refresh into a generic whole-task review.
 - Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
 - `max_review_cycles` MUST count only completed review/improve cycles inside the current
   durable-progress epoch. The epoch resets only when persisted evidence shows a new
@@ -377,8 +422,10 @@ The shared recovery policy referenced in this section is specified in
 Failed tasks are evaluated by the same ordered engine, through one shared recovery policy
 (so `advance`, `iterate`, and `watch` agree on one resume/retry/manual boundary).
 
-- Recovery policy says `resume` → create a resume task and run it.
-- Recovery policy says `retry` → create a retry task and run it.
+- Recovery policy says `resume` → create a resume task and run it, unless §4 first emits a
+  `recovery-preflight-rebase`.
+- Recovery policy says `retry` → create a retry task and run it, unless §4 first emits a
+  `recovery-preflight-rebase`.
 - Recovery is disabled (attempt budget = 0) → stop; surface that automatic recovery is
   off.
 - Recovery limit reached, ambiguous, or a terminal manual situation (e.g. failed resume
@@ -541,8 +588,9 @@ is a spec change. The accompanying human message is free text.
 | `rebase-did-not-unblock-merge` | HumanParked | §4 rebase completed, still conflicts |
 | `rebase-failure-circuit-breaker` | HumanParked | §4 repeated rebase failures, no progress |
 | `branch-already-rebased-lineage-incomplete` | needs_discussion | §4 branch contains target tip, lineage unresolved |
-| `stale-review-needs-manual-refresh` | needs_discussion | §5 rebase-changed or branch-head-advanced stale review, `advance_create_reviews` off |
-| `review-freshness-unverified` | needs_discussion | §5 live branch-head probe failed while checking whether the latest completed review is still current |
+| `stale-review-needs-manual-refresh` | needs_discussion | §5 code-changing stale review requires a manual refresh or manual resolution review, `advance_create_reviews` off |
+| `review-freshness-unverified` | needs_discussion | §5 live branch-head probe failed while checking whether a code-changing event made the latest completed review stale |
+| `resolution-review-metadata-invalid` | needs_discussion | §5 required resolution-review metadata is missing, malformed, or inconsistent |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no current in-improve passing verify evidence clearing the verify-only review |
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound when current in-improve passing verify evidence did not clear the verify-only review |

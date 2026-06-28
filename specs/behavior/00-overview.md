@@ -80,7 +80,6 @@ stateDiagram-v2
     Implementing --> Recovering: implement fails
 
     Implemented --> ScopeParked: touches out-of-scope paths\n(not tagged cross-project)
-    Implemented --> Rebasing: cannot merge into target\n(attempts < limit)
     Implemented --> Reviewing: review required,\nno valid review
     Implemented --> Mergeable: review not required
 
@@ -93,11 +92,11 @@ stateDiagram-v2
     Improving --> Recovering: improve fails
     Improving --> HumanParked: no-op cycles >= limit
 
-    Rebasing --> Reviewing: rebased, code changed\n(fresh review required)
-    Rebasing --> Mergeable: rebased, code unchanged\n(prior approval carried)
+    Mergeable --> Rebasing: selected for merge,\nconflicts with target
+    Recovering --> Rebasing: recovery preflight,\nbranch lacks target tip
+    Rebasing --> Reviewing: rebased, resolution delta changed\n(resolution review required)
+    Rebasing --> Mergeable: rebased, implementation patch preserved\n(prior approval carried)
     Rebasing --> HumanParked: rebase failed / circuit breaker /\ndid not unblock merge
-
-    Mergeable --> Rebasing: target moved,\nnow conflicts
     MergeableWithFollowups --> Merged: file follow-ups, then merge
     Mergeable --> Merged: merge succeeds
 
@@ -174,8 +173,8 @@ time, so each row names what would let us remove it.
 | `needs_discussion` — rebase did not unblock | A rebase completed but the branch still cannot merge. | Decide manually; don't let the engine re-queue an identical rebase. | Detect why the rebase was a no-op. |
 | `needs_discussion` — rebase circuit breaker | Repeated rebase attempts (default bound) with no intervening progress. | Resolve manually. | Same as autonomous conflict resolution. |
 | `needs_discussion` — incomplete lineage, rebase moot | The branch already contains the target tip but the lineage is still unresolved. | Inspect the lineage; resolve the real blocker. | Tighten lineage-resolution detection. |
-| `needs_discussion` — review refresh blocked | A rebase changed code or the durable branch head advanced past the latest completed review, so the review is stale, but auto-review creation is off. | Refresh the review manually, then merge. | Re-enable auto-review creation for the lineage. |
-| `needs_discussion` — review freshness unverified | The engine could not probe the live branch head while checking whether the latest completed review still applies, so freshness is unknown. | Fix the branch-head probe problem or refresh review state manually, then re-advance. | More robust git freshness probing and better operator diagnostics. |
+| `needs_discussion` — review refresh blocked | A completed rebase changed the implementation patch or conflict-resolution delta after the latest completed review, so a narrower refresh review is required, but auto-review creation is off. Target movement alone does not trigger this row. | Refresh the review manually, then merge. | Re-enable auto-review creation for the lineage. |
+| `needs_discussion` — review freshness unverified | The engine could not verify whether the latest completed review still matches the current implementation head after a code-changing lineage event, so freshness is unknown. Target movement alone does not trigger this row. | Fix the branch-head probe problem or refresh review state manually, then re-advance. | More robust git freshness probing and better operator diagnostics. |
 | `needs_discussion` — inconsistent review | Verdict `APPROVED_WITH_FOLLOWUPS` but zero parsed follow-ups (self-contradictory output). | Re-review / correct the review output. | More reliable verdict extraction. |
 | `needs_discussion` — verify-blocked | Review keeps failing only because the verify step times out, not on code issues, once timeout-only reviews hit the threshold and no runner-owned review-fail → no-op-improve-pass transition at the same branch head has already cleared the review. Ordinary verify-failure-only stale reviews are handled by that same-head evidence-clear path or, failing that proof, by the generic no-op improve stop instead of this timeout-specific park. | Fix the environment/verify config, then re-advance. | Separate "verify infra failed" from "code rejected." |
 | `max_cycles_reached` — review churn | Review→improve cycles within the current durable-progress epoch hit the bound (`max_review_cycles`) and no stale-review refresh path is available. Historical churn from older reviewed heads does not count once fresh durable progress has produced a new epoch. | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |

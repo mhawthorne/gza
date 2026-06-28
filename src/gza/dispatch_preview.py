@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from .config import Config
 from .db import SqliteTaskStore, Task as DbTask, task_id_numeric_key
@@ -14,11 +14,12 @@ from .lineage_query import (
     LineageOwnerRow,
     query_lineage_owner_rows_in_read_session,
 )
-from .pickup import get_runnable_pending_tasks
+from .pickup import get_runnable_pending_tasks, is_worker_consuming_advance_action
 from .recovery_engine import (
     FailedRecoveryDecision,
     classify_failure_reason,
     decide_failed_task_recovery,
+    resolve_pending_recovery_execution_mode,
     should_hide_failed_recovery_decision,
 )
 from .recovery_read_context import RecoveryReadContext
@@ -55,6 +56,7 @@ class DispatchPreviewEntry:
     worker_consuming: bool
     owner_task: DbTask | None = None
     decision: FailedRecoveryDecision | None = None
+    advance_action: dict[str, Any] | None = None
     lineage_row: LineageOwnerRow | None = None
     queue_position: int | None = None
     manual_only: bool = False
@@ -252,6 +254,8 @@ def _build_recovery_preview_entries(
     any_tag: bool,
     max_recovery_attempts: int,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext, tuple[DispatchPreviewEntry, ...]]:
+    from .cli.advance_engine import classify_advance_action, determine_next_action
+
     if owner_rows is None:
         owner_rows, read_context = query_lineage_owner_rows_in_read_session(
             store,
@@ -296,16 +300,61 @@ def _build_recovery_preview_entries(
             continue
         manual_only = classify_failure_reason(task.failure_reason or "UNKNOWN") == "manual"
         action = decision.action
+        active_recovery_task = (
+            store.get(decision.recovery_task_id)
+            if isinstance(decision.recovery_task_id, str) and decision.recovery_task_id
+            else None
+        )
+        has_active_recovery_child = active_recovery_task is not None and active_recovery_task.status in {"pending", "in_progress"}
+        active_recovery_mode = (
+            resolve_pending_recovery_execution_mode(active_recovery_task)
+            if active_recovery_task is not None
+            else None
+        )
+        advance_action = (
+            determine_next_action(
+                config,
+                store,
+                git,
+                task,
+                target_branch,
+                max_resume_attempts=max_recovery_attempts,
+                read_context=read_context,
+            )
+            if config is not None and git is not None and target_branch
+            else None
+        )
+        if (
+            has_active_recovery_child
+            and advance_action is not None
+            and str(advance_action.get("type", "")) != "needs_rebase"
+            and active_recovery_task is not None
+            and active_recovery_task.recovery_origin not in {"resume", "retry"}
+            and active_recovery_mode not in {"resume", "retry"}
+        ):
+            assert active_recovery_task is not None and active_recovery_task.id is not None
+            advance_action = {
+                "type": "skip",
+                "description": f"SKIP: recovery task {active_recovery_task.id} already {active_recovery_task.status}",
+                "reason": f"recovery_already_{active_recovery_task.status}",
+            }
+        if advance_action is None:
+            runnable = action in _RUNNABLE_RECOVERY_ACTIONS
+            worker_consuming = action in {"resume", "retry"}
+        else:
+            runnable = classify_advance_action(advance_action) == "actionable"
+            worker_consuming = is_worker_consuming_advance_action(str(advance_action.get("type", "")))
         entries.append(
             DispatchPreviewEntry(
                 lane="recovery",
                 task=task,
                 owner_task=row.owner_task,
                 decision=decision,
+                advance_action=advance_action,
                 lineage_row=row,
                 queue_position=task.queue_position,
-                runnable=action in _RUNNABLE_RECOVERY_ACTIONS,
-                worker_consuming=action in {"resume", "retry"},
+                runnable=runnable,
+                worker_consuming=worker_consuming,
                 manual_only=manual_only,
             )
         )

@@ -5,7 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from gza.git import Git
-from gza.rebase_diff import RebaseDiffBaseline, compute_rebase_changed_diff
+from gza.rebase_diff import (
+    RebaseDiffBaseline,
+    RebaseDiffProvenance,
+    compute_rebase_changed_diff,
+    compute_resolution_delta_context,
+)
 
 
 def _git_completed_process(*, returncode: int = 0, stdout: str = "", stderr: str = "") -> SimpleNamespace:
@@ -96,3 +101,47 @@ def test_compute_rebase_changed_diff_treats_recovered_baseline_as_changed(tmp_pa
     assert comparison.warning == (
         "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed"
     )
+
+
+def test_compute_resolution_delta_context_returns_range_diff_for_changed_rebase() -> None:
+    git = MagicMock(spec=Git)
+
+    def _run(*args: str, **_kwargs: object) -> SimpleNamespace:
+        if args == ("range-diff", "--no-color", "base-tip..old-tip", "main-tip..feature-tip"):
+            return _git_completed_process(stdout="1:  old = 1:  new\n- old hunk\n+ new hunk\n")
+        raise AssertionError(f"Unexpected git call: args={args!r}, kwargs={_kwargs!r}")
+
+    git._run.side_effect = _run
+    context = compute_resolution_delta_context(
+        git,
+        provenance=RebaseDiffProvenance(
+            old_tip="old-tip",
+            target_at_start="main-start",
+            merge_base_at_start="base-tip",
+            resolved_head_sha="feature-tip",
+            resolved_target_sha="main-tip",
+        ),
+    )
+
+    assert context.available is True
+    assert context.before_range == "base-tip..old-tip"
+    assert context.after_range == "main-tip..feature-tip"
+    assert "new hunk" in (context.range_diff or "")
+
+
+def test_compute_resolution_delta_context_fails_closed_when_provenance_missing() -> None:
+    git = MagicMock(spec=Git)
+    context = compute_resolution_delta_context(
+        git,
+        provenance=RebaseDiffProvenance(
+            old_tip=None,
+            target_at_start="main-start",
+            merge_base_at_start=None,
+            resolved_head_sha="feature-tip",
+            resolved_target_sha="main-tip",
+        ),
+    )
+
+    assert context.available is False
+    assert "resolution delta unavailable" in context.summary
+    git._run.assert_not_called()
