@@ -20,6 +20,7 @@ from gza.lineage import (
     walk_ancestors,
     walk_based_on_descendants,
 )
+from gza.metrics import instrument_module_functions
 from gza.task_query import (
     DateFilter,
     TaskQuery,
@@ -1007,3 +1008,10 @@ def resolve_lineage_owner_task(store: SqliteTaskStore, task: Task) -> Task:
         return resolve_unmerged_branch_owner(store, task)
 
     return task
+
+
+instrument_module_functions(
+    globals(),
+    metric_name="gza_query_function_latency_seconds",
+    module_name=__name__,
+)

@@ -18,6 +18,12 @@ def _reload_metrics():
     return importlib.reload(metrics_module)
 
 
+def _reset_metrics_state(metrics) -> None:
+    with metrics._STATE.lock:  # noqa: SLF001
+        metrics._STATE.counters.clear()  # noqa: SLF001
+        metrics._STATE.latencies.clear()  # noqa: SLF001
+
+
 def _latency_count(metrics, snapshot, *, operation: str) -> int:
     return snapshot.latencies.get(
         metrics.MetricKey(
@@ -161,6 +167,95 @@ def test_sqlite_task_store_public_methods_are_wrapped_without_private_helpers(mo
     assert hasattr(db_module.SqliteTaskStore.startup_warnings, "__wrapped__")
     assert db_module.SqliteTaskStore.startup_warnings.__wrapped__(store) == ()
     assert not hasattr(db_module.SqliteTaskStore._row_to_task, "__gza_latency_instrumented__")
+
+
+def test_query_module_public_functions_are_wrapped_without_private_helpers(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics = importlib.import_module("gza.metrics")
+    _reset_metrics_state(metrics)
+    db_module = importlib.import_module("gza.db")
+    query_module = importlib.import_module("gza.query")
+    store = db_module.SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    root = store.add("root task", task_type="implement")
+    assert root.id is not None
+    root.branch = "feat/root"
+    store.update(root)
+
+    child = store.add("child task", task_type="improve", based_on=root.id, same_branch=True)
+    assert child.id is not None
+    child.branch = root.branch
+    store.update(child)
+
+    resolved = query_module.resolve_same_branch_lineage_root(store, child)
+    snapshot = metrics.snapshot()
+
+    assert resolved.id == root.id
+    assert hasattr(query_module.resolve_same_branch_lineage_root, "__wrapped__")
+    assert snapshot.latencies[
+        metrics.MetricKey(
+            "gza_query_function_latency_seconds",
+            (("function", "resolve_same_branch_lineage_root"), ("module", "gza.query")),
+        )
+    ].count == 1
+    assert (
+        metrics.MetricKey(
+            "gza_query_function_latency_seconds",
+            (("function", "_get_parent_ids"), ("module", "gza.query")),
+        )
+        not in snapshot.latencies
+    )
+    assert (
+        metrics.MetricKey(
+            "gza_query_function_latency_seconds",
+            (("function", "_normalize_lineage_time"), ("module", "gza.query")),
+        )
+        not in snapshot.latencies
+    )
+
+
+def test_lineage_query_module_public_functions_are_wrapped_without_private_helpers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics = importlib.import_module("gza.metrics")
+    _reset_metrics_state(metrics)
+    db_module = importlib.import_module("gza.db")
+    lineage_query_module = importlib.import_module("gza.lineage_query")
+    store = db_module.SqliteTaskStore(tmp_path / "test.db", prefix="gza")
+
+    failed = store.add("failed impl", task_type="implement")
+    failed.status = "failed"
+    store.update(failed)
+
+    rows = lineage_query_module.filter_display_unresolved_tasks_for_incomplete(
+        (failed,),
+        merge_units_by_task_id={},
+        exclude_dropped=False,
+    )
+    snapshot = metrics.snapshot()
+
+    assert len(rows) == 1
+    assert hasattr(lineage_query_module.filter_display_unresolved_tasks_for_incomplete, "__wrapped__")
+    assert snapshot.latencies[
+        metrics.MetricKey(
+            "gza_query_function_latency_seconds",
+            (
+                ("function", "filter_display_unresolved_tasks_for_incomplete"),
+                ("module", "gza.lineage_query"),
+            ),
+        )
+    ].count == 1
+    assert (
+        metrics.MetricKey(
+            "gza_query_function_latency_seconds",
+            (
+                ("function", "_task_is_terminal_for_incomplete_display"),
+                ("module", "gza.lineage_query"),
+            ),
+        )
+        not in snapshot.latencies
+    )
 
 
 def test_sqlite_connect_context_records_connect_execute_and_close_once(monkeypatch, tmp_path: Path) -> None:

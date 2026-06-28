@@ -17,6 +17,7 @@ from .lifecycle_completion import (
 )
 from .main_integration_verify import MAIN_INTEGRATION_VERIFY_REASON, current_main_integration_verify_alert
 from .merge_state import classify_branch_merge_state_for_target
+from .metrics import instrument_module_functions
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
 from .source_followup import (
@@ -1717,3 +1718,10 @@ __all__ = [
     "query_lineage_owner_rows",
     "resolve_lineage_owner_task_id",
 ]
+
+
+instrument_module_functions(
+    globals(),
+    metric_name="gza_query_function_latency_seconds",
+    module_name=__name__,
+)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 import threading
 import time
@@ -111,6 +112,28 @@ def instrument_public_methods(metric_name: str, *, label_key: str = "method"):
         return cls
 
     return decorate
+
+
+def instrument_module_functions(
+    module_globals: dict[str, object],
+    *,
+    metric_name: str,
+    module_name: str,
+    module_label_key: str = "module",
+    function_label_key: str = "function",
+) -> None:
+    """Wrap public functions defined directly in a module."""
+
+    for name, value in tuple(module_globals.items()):
+        if name.startswith("_") or not inspect.isfunction(value):
+            continue
+        if value.__module__ != module_name:
+            continue
+        module_globals[name] = _wrap_latency_callable(
+            value,
+            metric_name=metric_name,
+            labels={module_label_key: module_name, function_label_key: name},
+        )
 
 
 def incr(name: str, *, labels: LabelMap | None = None, value: int = 1) -> None:

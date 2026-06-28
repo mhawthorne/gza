@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, TypeVar
 
-from . import lineage
+from . import lineage, metrics
 from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
@@ -19,6 +19,8 @@ DateField = Literal["created", "completed", "effective"]
 PresentationMode = Literal["flat", "blocks", "grouped", "lineage", "tree", "one_line", "json", "rich"]
 BranchOwnerMode = Literal["generic", "unmerged_same_branch"]
 _T = TypeVar("_T")
+_TASK_QUERY_METHOD_LATENCY_METRIC = "gza_task_query_method_latency_seconds"
+_TASK_QUERY_RUN_LABELS = {"method": "run"}
 
 
 @dataclass(frozen=True)
@@ -433,40 +435,41 @@ class TaskQueryService:
         target_branch: str | None = None,
     ) -> TaskQueryResult:
         """Execute a query and return projected rows."""
-        projection_now = datetime.now(UTC)
-        if query.scope == "lineages":
-            all_lineages = self._collect_lineages_unlimited(
-                query,
-                config=config,
-                git=git,
-                target_branch=target_branch,
-            )
-            lineages = self._apply_limit(all_lineages, query.limit)
-            lineage_rows = tuple(
-                self._project_lineage_row(
-                    row,
+        with metrics.timer(_TASK_QUERY_METHOD_LATENCY_METRIC, labels=_TASK_QUERY_RUN_LABELS):
+            projection_now = datetime.now(UTC)
+            if query.scope == "lineages":
+                all_lineages = self._collect_lineages_unlimited(
                     query,
                     config=config,
                     git=git,
                     target_branch=target_branch,
                 )
-                for row in lineages
-            )
-            return TaskQueryResult(query=query, rows=lineage_rows, total_count=len(all_lineages))
+                lineages = self._apply_limit(all_lineages, query.limit)
+                lineage_rows = tuple(
+                    self._project_lineage_row(
+                        row,
+                        query,
+                        config=config,
+                        git=git,
+                        target_branch=target_branch,
+                    )
+                    for row in lineages
+                )
+                return TaskQueryResult(query=query, rows=lineage_rows, total_count=len(all_lineages))
 
-        all_tasks = self._collect_tasks_unlimited(query)
-        tasks = self._apply_limit(all_tasks, query.limit)
-        task_rows = tuple(
-            self._project_task_row(
-                task,
-                query,
-                config=config,
-                target_branch=target_branch,
-                now=projection_now,
+            all_tasks = self._collect_tasks_unlimited(query)
+            tasks = self._apply_limit(all_tasks, query.limit)
+            task_rows = tuple(
+                self._project_task_row(
+                    task,
+                    query,
+                    config=config,
+                    target_branch=target_branch,
+                    now=projection_now,
+                )
+                for task in tasks
             )
-            for task in tasks
-        )
-        return TaskQueryResult(query=query, rows=task_rows, total_count=len(all_tasks))
+            return TaskQueryResult(query=query, rows=task_rows, total_count=len(all_tasks))
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
         return self._apply_limit(self._collect_tasks_unlimited(query), query.limit)

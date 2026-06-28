@@ -1,5 +1,6 @@
 """Tests for unified task query service."""
 
+import importlib
 import inspect
 from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
@@ -45,6 +46,45 @@ def test_search_default_matches_pending_and_internal(tmp_path: Path) -> None:
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert pending.prompt in prompts
     assert internal.prompt in prompts
+
+
+def test_task_query_service_run_emits_metrics_without_private_helper_metrics(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GZA_PROFILE", "1")
+    metrics_module = importlib.import_module("gza.metrics")
+    with metrics_module._STATE.lock:  # noqa: SLF001
+        metrics_module._STATE.counters.clear()  # noqa: SLF001
+        metrics_module._STATE.latencies.clear()  # noqa: SLF001
+
+    store = _store(tmp_path)
+    store.add("needle pending", task_type="implement")
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.search("needle", limit=None))
+    snapshot = metrics_module.snapshot()
+
+    assert len(result.rows) == 1
+    assert snapshot.latencies[
+        metrics_module.MetricKey(
+            "gza_task_query_method_latency_seconds",
+            (("method", "run"),),
+        )
+    ].count == 1
+    assert (
+        metrics_module.MetricKey(
+            "gza_task_query_method_latency_seconds",
+            (("method", "_collect_tasks_unlimited"),),
+        )
+        not in snapshot.latencies
+    )
+    assert (
+        metrics_module.MetricKey(
+            "gza_task_query_method_latency_seconds",
+            (("method", "_collect_lineages_unlimited"),),
+        )
+        not in snapshot.latencies
+    )
 
 
 def test_date_filter_completed_excludes_rows_without_completed_at(tmp_path: Path) -> None:
