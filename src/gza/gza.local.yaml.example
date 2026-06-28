@@ -326,6 +326,21 @@
 #   Repeated unchanged watch-action cycles before the subject is parked for manual attention.
 #   Default: 3
 #   no_progress_cycles: 3
+#   parked_auto_rearm:
+#     Maximum blind auto-rearm attempts `gza watch` may spend per parked subject/reason pair before
+#     leaving it parked.
+#     Default: 2
+#     budget: 2
+#     Cooldown window between blind parked auto-rearm attempts for the same subject/reason pair.
+#     Default: 12
+#     cooldown_hours: 12
+#     Enable the watch-owned blind parked auto-rearm phase for eligible parked owner/reason pairs.
+#     Default: false
+#     enabled: false
+#     Require the target branch SHA to advance since the last blind auto-rearm attempt before watch
+#     spends another attempt for the same parked subject/reason pair.
+#     Default: true
+#     require_target_advanced: true
 #   Polling interval seconds for `gza watch`.
 #   Default: 300
 #   poll: 300
