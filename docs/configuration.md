@@ -1960,7 +1960,7 @@ watch:
 
 `watch.dispatch_start_timeout` bounds how long `gza watch` waits after selecting work for it to reach a live running state. If the worker never becomes live within that window, watch logs the undispatched action, does not advance no-progress accounting for it, and keeps scanning the current watch pass for another runnable candidate instead of leaving the slot idle.
 
-`watch.parked_auto_rearm.enabled` turns on a conservative watch-owned blind parked auto-rearm phase. It runs after watch finishes the direct non-worker lifecycle phase for the current pass and before worker dispatch planning, so same-cycle slot reuse still goes through the ordinary shared watch planner instead of a separate executor.
+`watch.parked_auto_rearm.enabled` turns on a conservative watch-owned blind parked auto-rearm phase. It runs after watch finishes the direct non-worker lifecycle phase for the current pass and before worker dispatch planning, so same-pass slot reuse still goes through the ordinary shared watch planner instead of a separate executor.
 
 When enabled, `watch.parked_auto_rearm.budget` caps blind auto-rearm attempts per parked subject/reason pair, `watch.parked_auto_rearm.cooldown_hours` enforces at most one blind attempt per cooldown window for that pair, and `watch.parked_auto_rearm.require_target_advanced` makes unchanged target SHAs a no-spend skip. With the default `require_target_advanced: true`, watch records the current target SHA on each successful blind auto-rearm and will not clear the same parked subject/reason again until the target branch advances. `enabled: false` preserves the existing manual behavior: parked owners stay parked until an operator clears them or other shared lifecycle state changes.
 
