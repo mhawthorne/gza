@@ -89,6 +89,11 @@ and default to **off**.
   with no implementation follow-up MUST enter automated `plan_review` first when
   `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
   then materialize bounded implementation slices only after an approved valid manifest.
+  If the same plan source is explicitly held (`auto_implement` off), an approved valid
+  latest completed `plan_review` MUST first release that hold through the shared
+  `auto_implement=true` transition, without materializing slices in the same action; the
+  next evaluation pass MUST then reuse the existing approved-manifest materialization path
+  unchanged.
   `gza iterate <plan>` MUST reuse this same intake path for completed plan sources, and
   `gza iterate <failed-plan> --resume|--retry` MUST re-enter the same plan loop only
   after the failed plan source itself has been restarted through the shared failed-task
@@ -110,7 +115,10 @@ and default to **off**.
   Once iterate materializes approved slices, it MUST stop at that materialization result;
   it MUST NOT continue by iterating the newly created implement children in the same run.
 - A completed `plan` explicitly held for review (`auto_implement` off) MUST go to
-  `awaiting_human` with parked reason `awaiting-human-review`.
+  `awaiting_human` with parked reason `awaiting-human-review` unless its latest completed
+  `plan_review` is `APPROVED` and the manifest validates, in which case lifecycle MUST
+  release the hold first and only then fall through to normal approved-slice
+  materialization on the next pass.
   Operators MUST NOT pre-create `implement` dependents for that held plan via
   `gza add --type implement --depends-on <plan-id>` or a `--based-on` lineage rooted at the
   held plan; those creation/edit attempts MUST fail with explicit release guidance directing

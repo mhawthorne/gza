@@ -146,6 +146,25 @@ class EffectivePlanReviewManifestState:
     validation_error: str | None = None
 
 
+def enable_held_plan_source_auto_implement(plan_task: DbTask) -> bool:
+    """Mark a held plan source for automatic implementation follow-up in memory."""
+    if plan_task.auto_implement is True:
+        return False
+    plan_task.auto_implement = True
+    return True
+
+
+def release_held_plan_source(store: SqliteTaskStore, plan_task: DbTask) -> bool:
+    """Persist automatic implementation follow-up for a held plan source.
+
+    Returns True only when the stored state changed.
+    """
+    if not enable_held_plan_source_auto_implement(plan_task):
+        return False
+    store.update(plan_task)
+    return True
+
+
 def format_task_status_text(task: DbTask) -> str:
     """Return the inline status label used by lineage-oriented displays."""
     if task.status == "failed":

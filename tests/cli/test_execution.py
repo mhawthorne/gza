@@ -6384,6 +6384,138 @@ class TestImplementCommand:
         assert refreshed is not None
         assert refreshed.auto_implement is True
 
+    def test_cmd_implement_releases_hold_via_shared_helper(self, tmp_path: Path) -> None:
+        from gza.cli._common import release_held_plan_source as shared_release_held_plan_source
+        from gza.cli.execution import cmd_implement
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Plan auth migration", task_type="plan", auto_implement=False)
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            no_docker=True,
+            max_turns=None,
+            plan_task_id=plan_task.id,
+            prompt=None,
+            group=None,
+            depends_on=None,
+            review=False,
+            same_branch=False,
+            branch_type=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            review_scope=None,
+            run=False,
+            background=False,
+            queue=True,
+            force=False,
+            create_pr=False,
+        )
+
+        with patch.object(
+            _execution_module,
+            "release_held_plan_source",
+            wraps=shared_release_held_plan_source,
+        ) as release_hold:
+            assert cmd_implement(args) == 0
+
+        release_hold.assert_called_once()
+        assert release_hold.call_args.args[1].id == plan_task.id
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.auto_implement is True
+
+    @pytest.mark.parametrize("flag", ["--no-hold-for-review", "--auto-implement"])
+    def test_cmd_edit_completed_plan_release_uses_shared_helper(self, tmp_path: Path, flag: str) -> None:
+        from gza.cli._common import (
+            enable_held_plan_source_auto_implement as shared_enable_held_plan_source_auto_implement,
+        )
+        from gza.cli.execution import cmd_edit
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Held completed plan", task_type="plan", auto_implement=False)
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=plan_task.id,
+            clear_tags=False,
+            set_tags=None,
+            add_tags=[],
+            remove_tags=[],
+            prompt_file=None,
+            prompt=None,
+            based_on_flag=None,
+            depends_on_flag=None,
+            clear_depends_on=False,
+            explore=False,
+            task=False,
+            review=False,
+            create_pr=False,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            hold_for_review=False,
+            hold_for_review_flags=(flag,),
+        )
+
+        with patch.object(
+            _execution_module,
+            "enable_held_plan_source_auto_implement",
+            wraps=shared_enable_held_plan_source_auto_implement,
+        ) as release_hold:
+            assert cmd_edit(args) == 0
+
+        release_hold.assert_called_once()
+        assert release_hold.call_args.args[0].id == plan_task.id
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.auto_implement is True
+
+    @pytest.mark.parametrize("flag", ["--no-hold-for-review", "--auto-implement"])
+    def test_edit_completed_plan_release_with_invalid_add_tag_is_atomic(
+        self, tmp_path: Path, flag: str
+    ) -> None:
+        """Failed tag validation must not release a completed held plan."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Held completed plan", task_type="plan", auto_implement=False)
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        result = invoke_gza(
+            "edit",
+            str(plan_task.id),
+            flag,
+            "--add-tag",
+            "",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error: tag must not be empty" in result.stdout
+
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.auto_implement is False
+
     def test_implement_prefers_approved_plan_review_manifest(self, tmp_path: Path):
         """Manual implement should materialize approved slices instead of one legacy task."""
 
@@ -6549,11 +6681,14 @@ class TestImplementCommand:
             "falling back to legacy single implement task."
         ) in result.stdout
 
-    def test_implement_queue_reuses_existing_materialized_slices(self, tmp_path: Path) -> None:
+    def test_implement_queue_reuses_existing_materialized_slices_after_releasing_held_plan(
+        self,
+        tmp_path: Path,
+    ) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
-        plan_task = store.add("Plan auth migration", task_type="plan")
+        plan_task = store.add("Plan auth migration", task_type="plan", auto_implement=False)
         assert plan_task.id is not None
         plan_task.status = "completed"
         plan_task.completed_at = datetime.now(UTC)
@@ -6590,6 +6725,9 @@ class TestImplementCommand:
         assert second.returncode == 0
         created = [task for task in store.get_all() if task.task_type == "implement"]
         assert len(created) == 1
+        refreshed_plan = store.get(plan_task.id)
+        assert refreshed_plan is not None
+        assert refreshed_plan.auto_implement is True
         assert "Created implement task" in first.stdout
         assert "Reused implement task" in second.stdout
         assert "Created implement task" not in second.stdout
@@ -10837,6 +10975,98 @@ class TestIterateCommand:
             assert cmd_iterate(disabled_args) == 1
         disabled_output = capsys.readouterr().out
         assert "no plan-review loop is configured" in disabled_output.lower()
+
+    def test_plan_iterate_release_approved_review_releases_then_materializes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Held approved plan", task_type="plan", auto_implement=False)
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Approved plan review", task_type="plan_review", depends_on=plan_task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 0
+        output = capsys.readouterr().out
+        refreshed_plan = store.get(plan_task.id)
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+
+        assert refreshed_plan is not None
+        assert refreshed_plan.auto_implement is True
+        assert len(implement_tasks) > 0
+        assert "Created implement task" in output
+        assert "unsupported_action:release_approved_plan_review" not in output
+
+    def test_plan_iterate_dry_run_surfaces_release_without_unsupported_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Held approved plan", task_type="plan", auto_implement=False)
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Approved plan review", task_type="plan_review", depends_on=plan_task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        assert cmd_iterate(args) == 0
+        output = capsys.readouterr().out
+        refreshed_plan = store.get(plan_task.id)
+
+        assert refreshed_plan is not None
+        assert refreshed_plan.auto_implement is False
+        assert f"[dry-run] Would release held plan {plan_task.id} after approved plan review {review.id}" in output
+        assert "unsupported_action:release_approved_plan_review" not in output
 
     def test_plan_iterate_invalid_approved_manifest_blocks_with_detail(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

@@ -5022,6 +5022,32 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="release_approved_plan_review",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and not ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.plan_review_verdict == "APPROVED"
+            and ctx.validated_plan_review_manifest is not None
+            and ctx.latest_completed_plan_review is not None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
+        ),
+        action=lambda ctx: {
+            "type": "release_approved_plan_review",
+            "description": (
+                "Release held plan after approved plan review "
+                f"{_task_id(ctx.latest_completed_plan_review)}"
+            ),
+            "plan_source_task": ctx.latest_plan_source or ctx.task,
+            "plan_review_task": ctx.latest_completed_plan_review,
+        },
+    ),
+    AdvanceRule(
         name="awaiting_human_plan_review",
         matches=lambda ctx: (
             ctx.task_type in {"plan", "plan_improve"}

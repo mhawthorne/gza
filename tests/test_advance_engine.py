@@ -956,6 +956,7 @@ def test_worker_action_taxonomy_covers_batch_accounting_actions() -> None:
     assert "create_implement" in WORKER_CONSUMING_ACTIONS
     assert "create_plan_review" in WORKER_CONSUMING_ACTIONS
     assert "run_plan_improve" in WORKER_CONSUMING_ACTIONS
+    assert "release_approved_plan_review" not in WORKER_CONSUMING_ACTIONS
     assert removed_action not in WORKER_CONSUMING_ACTIONS
 
 
@@ -2256,6 +2257,113 @@ def test_completed_held_plan_awaits_human_review(tmp_path: Path) -> None:
     assert classify_advance_action(action) == "needs_attention"
     assert action["needs_attention_reason"] == "awaiting-human-review"
     assert action["subject_task_id"] == plan.id
+
+
+def test_completed_held_plan_without_review_stays_awaiting_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Held plan without review", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "awaiting_human"
+    assert action["needs_attention_reason"] == "awaiting-human-review"
+
+
+def test_completed_held_plan_with_pending_review_stays_awaiting_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Held plan with pending review", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Pending plan review", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "awaiting_human"
+    assert action["needs_attention_reason"] == "awaiting-human-review"
+
+
+def test_completed_held_plan_with_approved_valid_review_releases_before_awaiting_human(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Held approved plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Approved review", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = _approved_plan_review_report(_approved_plan_review_manifest(plan.id))
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "release_approved_plan_review"
+    assert action["plan_source_task"].id == plan.id
+    assert action["plan_review_task"].id == review.id
+
+    refreshed_plan = store.get(plan.id)
+    assert refreshed_plan is not None
+    refreshed_plan.auto_implement = True
+    store.update(refreshed_plan)
+
+    second_action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), refreshed_plan, "main")
+
+    assert second_action["type"] == "materialize_plan_slices"
+    assert second_action["plan_review_task"].id == review.id
+
+
+@pytest.mark.parametrize(
+    ("review_output", "review_status"),
+    [
+        pytest.param("## Verdict\n\nVerdict: CHANGES_REQUESTED\n", "completed", id="changes_requested"),
+        pytest.param("## Verdict\n\nVerdict: NEEDS_DISCUSSION\n", "completed", id="needs_discussion"),
+        pytest.param("## Verdict\n\nVerdict: MAYBE\n", "completed", id="unknown_verdict"),
+        pytest.param("## Verdict\n\nVerdict: APPROVED\n", "completed", id="invalid_approved"),
+        pytest.param(_approved_plan_review_report(_approved_plan_review_manifest("source-id")), "pending", id="pending_status"),
+    ],
+)
+def test_completed_held_plan_with_non_releasing_review_stays_awaiting_human(
+    tmp_path: Path,
+    review_output: str,
+    review_status: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    review.status = review_status
+    if review_status == "completed":
+        review.completed_at = datetime.now(UTC)
+    review.output_content = review_output.replace("source-id", plan.id)
+    store.update(review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), plan, "main")
+
+    assert action["type"] == "awaiting_human"
+    assert action["needs_attention_reason"] == "awaiting-human-review"
 
 
 def test_completed_impl_without_review_and_auto_review_disabled_needs_manual_creation_attention(

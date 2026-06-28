@@ -1459,6 +1459,107 @@ def test_execute_create_plan_improve_reports_created_task_when_spawn_fails(tmp_p
     assert persisted.task_type == "plan_improve"
 
 
+def test_execute_release_approved_plan_review_persists_hold_release_without_materializing(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    _mark_completed(plan)
+    store.update(plan)
+
+    review = store.add("Approved review", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    before_count = len(store.get_all())
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=plan,
+        action={
+            "type": "release_approved_plan_review",
+            "plan_source_task": plan,
+            "plan_review_task": review,
+        },
+        context=context,
+    )
+
+    refreshed = store.get(plan.id)
+    assert refreshed is not None
+    assert result.status == "success"
+    assert result.work_done is True
+    assert result.handled_task_id == plan.id
+    assert result.success_message == f"Released held plan {plan.id} after approved plan review {review.id}"
+    assert refreshed.auto_implement is True
+    assert len(store.get_all()) == before_count
+
+
+def test_execute_release_approved_plan_review_dry_run_does_not_mutate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    _mark_completed(plan)
+    store.update(plan)
+
+    review = store.add("Approved review", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=True,
+        max_resume_attempts=3,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+    )
+
+    result = execute_advance_action(
+        task=plan,
+        action={
+            "type": "release_approved_plan_review",
+            "plan_source_task": plan,
+            "plan_review_task": review,
+        },
+        context=context,
+    )
+
+    refreshed = store.get(plan.id)
+    assert refreshed is not None
+    assert result.status == "dry_run"
+    assert result.work_done is True
+    assert result.message == f"Released held plan {plan.id} after approved plan review {review.id}"
+    assert refreshed.auto_implement is False
+
+
 def test_materialize_plan_review_slices_reuses_existing_materialization(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

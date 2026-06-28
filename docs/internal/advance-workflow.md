@@ -78,6 +78,7 @@ For each task, `evaluate_advance_rules()` returns an action from `src/gza/advanc
 
 | Condition | Action |
 |-----------|--------|
+| Completed held plan whose latest completed `plan_review` is `APPROVED` with a valid manifest and no materialized slices yet | `release_approved_plan_review` — persist `auto_implement=true` only, then let the next evaluation reuse the existing `materialize_plan_slices` path |
 | Completed held plan with no implement child (`auto_implement = false`) | `awaiting_human` — review the plan, then run `uv run gza implement <id>` or re-enable automatic follow-up (`reason=awaiting-human-review`) |
 
 Manual `implement` follow-up for a held plan is intentionally explicit. `uv run gza add --type implement --depends-on <plan-id>` and `uv run gza add --type implement --based-on <plan-id>` are not valid substitutes while the plan is still held; the CLI refuses them and tells the operator to release the hold first with `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review`.
@@ -331,6 +332,7 @@ These actions create background workers and count toward the batch limit. The so
 |--------|-------------|
 | `merge` | Merges the task's branch synchronously. Respects `merge_squash_threshold`. |
 | `merge_with_followups` | Creates/reuses follow-up `implement` tasks from parsed `## Follow-Ups` findings, then merges synchronously. |
+| `release_approved_plan_review` | Releases a held approved plan source by persisting `auto_implement=true`; slice materialization remains a later pass through the normal approved-manifest action. |
 | `clear_off_topic_verify_blocker` | Clears a verify-only review blocker after audited off-topic classification, then durably creates or reuses one non-blocking investigation task per normalized failure signature before the lineage can continue toward merge. |
 
 ### Skip actions

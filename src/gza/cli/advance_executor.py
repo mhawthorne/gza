@@ -59,6 +59,7 @@ from ._common import (
     _prepare_task_for_reserved_launch,
     format_duplicate_active_child_message,
     format_duplicate_rebase_message,
+    release_held_plan_source,
     resolve_improve_action,
 )
 from .advance_engine import (
@@ -190,6 +191,8 @@ _WORKER_ACTIONS = frozenset(
         "reconcile_branch_divergence",
     }
 )
+
+_DIRECT_ACTIONS = frozenset({"release_approved_plan_review"})
 
 
 def _should_continue_branch_publication_after_reconcile(
@@ -1080,7 +1083,7 @@ def execute_advance_action(
     """Execute one worker-style advance action with shared side-effect logic."""
     action_type = str(action.get("type", "skip"))
 
-    if action_type not in _WORKER_ACTIONS:
+    if action_type not in _WORKER_ACTIONS and action_type not in _DIRECT_ACTIONS:
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="unsupported",
@@ -1326,6 +1329,42 @@ def execute_advance_action(
             work_done=bool(created_tasks),
             handled_task_id=review_task.id,
             created_task=created_tasks[0] if created_tasks else None,
+        )
+
+    if action_type == "release_approved_plan_review":
+        review_task = action.get("plan_review_task")
+        plan_source_task = action.get("plan_source_task")
+        if (
+            not isinstance(review_task, DbTask)
+            or review_task.id is None
+            or not isinstance(plan_source_task, DbTask)
+            or plan_source_task.id is None
+        ):
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message="missing held-plan release inputs",
+            )
+        message = (
+            f"Released held plan {plan_source_task.id} after approved plan review {review_task.id}"
+        )
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=message,
+                work_done=True,
+                handled_task_id=plan_source_task.id,
+            )
+
+        changed = release_held_plan_source(context.store, plan_source_task)
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            message=message,
+            success_message=message,
+            work_done=changed,
+            handled_task_id=plan_source_task.id,
         )
 
     if action_type == "create_review":

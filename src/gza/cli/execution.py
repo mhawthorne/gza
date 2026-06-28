@@ -127,6 +127,7 @@ from ._common import (
     _spawn_background_resume_worker,
     _spawn_background_worker,
     _spawn_background_workers,
+    enable_held_plan_source_auto_implement,
     format_duplicate_active_child_message,
     format_duplicate_rebase_message,
     format_no_runnable_message_for_tags,
@@ -138,6 +139,7 @@ from ._common import (
     persist_plan_review_override_manifest,
     phase1_error,
     print_phase1_message,
+    release_held_plan_source,
     resolve_comments_improve_action,
     resolve_effective_plan_review_manifest_state,
     resolve_id,
@@ -1845,8 +1847,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
             )
             if not materialization.tasks:
                 return phase1_error(args, f"Plan review {approved_review.id} did not materialize any implementation slices.")
-            plan_task.auto_implement = True
-            store.update(plan_task)
+            release_held_plan_source(store, plan_task)
 
             if execution_mode == "queue":
                 _emit_plan_slice_materialization(
@@ -1955,8 +1956,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         impl_task = prepared_impl_task
         mark_launch_transferred()
 
-        plan_task.auto_implement = True
-        store.update(plan_task)
+        release_held_plan_source(store, plan_task)
 
         # Handle queue mode - add to queue without executing
         if execution_mode == "queue":
@@ -2754,14 +2754,20 @@ def cmd_edit(args: argparse.Namespace) -> int:
         changed = True
 
     if hold_flag_requested:
-        task.auto_implement = not hold_for_review_requested
         if hold_for_review_requested:
+            task.auto_implement = False
             update_messages.append(
                 f"✓ Enabled hold-for-review for plan task {task.id}; automatic implementation follow-up is disabled"
             )
+            changed = True
         else:
-            update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
-        changed = True
+            if enable_held_plan_source_auto_implement(task):
+                update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
+                changed = True
+            else:
+                info_messages.append(
+                    f"Task {task.id} already has automatic implementation follow-up enabled"
+                )
 
     # Handle --model flag
     if hasattr(args, "model") and args.model is not None:
@@ -6617,7 +6623,15 @@ def _cmd_iterate_plan(
 
     if dry_run:
         print(f"[dry-run] Would iterate plan {source_task.id} (max {max_iterations} improve cycles)")
-        if initial_action_type == "materialize_plan_slices":
+        if initial_action_type == "release_approved_plan_review":
+            plan_review_task = initial_action.get("plan_review_task")
+            review_label = (
+                plan_review_task.id
+                if isinstance(plan_review_task, DbTask) and plan_review_task.id is not None
+                else "approved plan review"
+            )
+            print(f"[dry-run] Would release held plan {source_task.id} after approved plan review {review_label}")
+        elif initial_action_type == "materialize_plan_slices":
             plan_review_task = initial_action.get("plan_review_task")
             review_label = (
                 plan_review_task.id
@@ -6651,6 +6665,18 @@ def _cmd_iterate_plan(
             max_resume_attempts=effective_max_resume_attempts,
         )
         action_type = action["type"]
+
+        if action_type == "release_approved_plan_review":
+            action_source = action.get("plan_source_task")
+            if not isinstance(action_source, DbTask):
+                action_source = source_task
+            release_held_plan_source(store, action_source)
+            if action_source.id is not None:
+                action_source = store.get(action_source.id) or action_source
+            if plan_task.id == action_source.id:
+                plan_task = action_source
+            source_task = _resolve_latest_plan_source(store, plan_task)
+            continue
 
         if action_type in {"create_plan_improve", "run_plan_improve"} and improve_iteration >= max_iterations:
             final_status = "blocked"

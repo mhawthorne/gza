@@ -17,6 +17,7 @@ from gza.cli._common import (
     _failure_summary,
     _looks_like_task_id,
     format_stats,
+    release_held_plan_source,
     run_with_resume,
 )
 from gza.config import Config
@@ -412,6 +413,34 @@ class TestDerivedTaskReviewScopePropagation:
         assert improve_task.id is not None
         assert add_task.call_args.kwargs["enforce_single_active_sibling"] is False
         assert add_task.call_args.kwargs["single_active_sibling_scope"] is None
+
+
+class TestReleaseHeldPlanSource:
+    def test_persists_auto_implement_true_for_held_plan(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add("Held plan", task_type="plan", auto_implement=False)
+
+        changed = release_held_plan_source(store, plan_task)
+
+        assert changed is True
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.auto_implement is True
+
+    def test_is_idempotent_after_first_release(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        plan_task = store.add("Held plan", task_type="plan", auto_implement=False)
+
+        with patch.object(store, "update", wraps=store.update) as update_task:
+            first = release_held_plan_source(store, plan_task)
+            second = release_held_plan_source(store, plan_task)
+
+        assert first is True
+        assert second is False
+        assert update_task.call_count == 1
+        refreshed = store.get(plan_task.id)
+        assert refreshed is not None
+        assert refreshed.auto_implement is True
 
     def test_create_review_backed_improve_ignores_active_comments_only_improve(
         self, tmp_path: Path

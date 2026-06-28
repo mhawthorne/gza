@@ -70,6 +70,7 @@ stateDiagram-v2
 
     Planned --> PlanReviewing: auto_implement\n(create/run plan_review)
     Planned --> AwaitingHuman: plan held\n(auto_implement = false)
+    AwaitingHuman --> Planned: APPROVED valid plan_review\n(release hold only)
     PlanReviewing --> SlicingMaterializing: APPROVED valid manifest
     SlicingMaterializing --> Implementing: materialize reviewed slices
     PlanReviewing --> PlanImproving: CHANGES_REQUESTED

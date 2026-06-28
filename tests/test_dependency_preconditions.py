@@ -6,6 +6,7 @@ from gza.dependency_preconditions import (
     empty_prereq_satisfies_dependency,
     get_unmerged_dependency_precondition,
 )
+from gza.cli._common import release_held_plan_source
 from gza.db import SqliteTaskStore
 from gza.lineage_query import _load_indexes
 from gza.recovery_read_context import RecoveryReadContext
@@ -182,6 +183,28 @@ def test_dependency_precondition_blocks_when_unit_is_blocked_even_if_legacy_row_
     downstream = store.add("Downstream", task_type="implement", depends_on=dependency.id)
 
     assert get_unmerged_dependency_precondition(store, downstream).id == dependency.id
+
+
+def test_dependency_precondition_held_plan_unblocks_after_release_helper(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    plan = store.add("Held plan", task_type="plan", auto_implement=False)
+    assert plan.id is not None
+    store.mark_completed(plan)
+
+    downstream = store.add("Downstream", task_type="implement", depends_on=plan.id)
+
+    blocked = dependency_readiness(store, downstream)
+    assert blocked.ready is False
+    assert blocked.reason == "plan_awaiting_review"
+
+    refreshed_plan = store.get(plan.id)
+    assert refreshed_plan is not None
+    assert release_held_plan_source(store, refreshed_plan) is True
+
+    ready = dependency_readiness(store, downstream)
+    assert ready.ready is True
+    assert ready.reason == "ready"
 
 
 def test_dependency_precondition_uses_canonical_dependency_lineage_merge_unit(tmp_path: Path) -> None:
