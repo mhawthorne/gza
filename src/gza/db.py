@@ -30,6 +30,7 @@ def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
 
 __all__ = [
     "DB_UNSET",
+    "DuplicateActiveChildError",
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
     "TASK_COMMENT_KINDS",
@@ -130,6 +131,17 @@ class SchemaIntegrityError(RuntimeError):
 
 class MergeTargetResolutionError(RuntimeError):
     """Raised when write paths cannot determine the real default merge target."""
+
+
+class DuplicateActiveChildError(ValueError):
+    """Raised when a singleton derived child already exists in an active state."""
+
+    def __init__(self, active_child: "Task") -> None:
+        self.active_child = active_child
+        super().__init__(
+            f"active {active_child.task_type} child already exists for parent "
+            f"{active_child.based_on}: {active_child.id}"
+        )
 
 
 class _ClosingSqliteConnection(sqlite3.Connection):
@@ -652,6 +664,7 @@ class NewTaskParams:
     model_is_explicit: bool | None = None
     recovery_origin: str | None = None
     trigger_source: str | None = None
+    enforce_single_active_sibling: bool = False
     urgent: bool = False
     skip_learnings: bool = False
 
@@ -4132,6 +4145,7 @@ class SqliteTaskStore:
         model_is_explicit: bool | None = None,
         recovery_origin: str | None = None,
         trigger_source: str | None = None,
+        enforce_single_active_sibling: bool = False,
         urgent: bool = False,
         skip_learnings: bool = False,
     ) -> Task:
@@ -4157,11 +4171,24 @@ class SqliteTaskStore:
             model_is_explicit=model_is_explicit,
             recovery_origin=recovery_origin,
             trigger_source=trigger_source,
+            enforce_single_active_sibling=enforce_single_active_sibling,
             urgent=urgent,
             skip_learnings=skip_learnings,
         )
-        with self._connect() as conn:
-            return self._add_task_conn(conn, params)
+        conn = cast(sqlite3.Connection, self._connect())
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            created = self._add_task_conn(conn, params)
+            conn.commit()
+            return created
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _add_task_conn(self, conn: sqlite3.Connection, params: NewTaskParams) -> Task:
         """Insert one task using an already-open connection."""
@@ -4177,6 +4204,14 @@ class SqliteTaskStore:
         model_is_explicit = params.model_is_explicit
         if model_is_explicit is None:
             model_is_explicit = params.model is not None
+        if params.enforce_single_active_sibling and params.based_on is not None:
+            active_children = self.get_active_children_of_type(
+                params.based_on,
+                params.task_type,
+                conn=conn,
+            )
+            if active_children:
+                raise DuplicateActiveChildError(active_children[0])
         new_id = params.task_id or self._next_id(conn)
         conn.execute(
             """
@@ -4966,6 +5001,41 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
+    def get_active_children_of_type(
+        self,
+        task_id: str,
+        task_type: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> list[Task]:
+        """Return active direct based_on children of one task type."""
+        if conn is not None:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND based_on = ?
+                  AND task_type = ?
+                  AND status IN ('pending', 'in_progress')
+                ORDER BY created_at ASC
+                """,
+                (self._project_id, task_id, task_type),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+        with self._connect() as owned_conn:
+            cur = owned_conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND based_on = ?
+                  AND task_type = ?
+                  AND status IN ('pending', 'in_progress')
+                ORDER BY created_at ASC
+                """,
+                (self._project_id, task_id, task_type),
+            )
+            return self._rows_to_tasks(owned_conn, cur.fetchall())
+
     def get_lineage_children(self, task_id: str) -> list[Task]:
         """Return direct lineage children linked by based_on or depends_on.
 
@@ -5412,6 +5482,7 @@ class SqliteTaskStore:
                         model_is_explicit=params.model_is_explicit,
                         recovery_origin=params.recovery_origin,
                         trigger_source=params.trigger_source,
+                        enforce_single_active_sibling=params.enforce_single_active_sibling,
                         urgent=params.urgent,
                         skip_learnings=params.skip_learnings,
                     )

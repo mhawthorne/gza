@@ -1,10 +1,12 @@
 """Tests for database operations and task chaining."""
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import hashlib
 import json
 import os
 import sqlite3
 import stat
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -14,6 +16,7 @@ import pytest
 from gza.db import (
     DB_UNSET,
     SCHEMA_VERSION,
+    DuplicateActiveChildError,
     ManualMigrationRequired,
     MergeTargetResolutionError,
     NewTaskParams,
@@ -465,6 +468,147 @@ def test_add_tasks_with_artifact_atomic_rollback_does_not_delete_reused_ids(tmp_
     refreshed = store.get(replacement.id)
     assert refreshed is not None
     assert refreshed.prompt == "Replacement task"
+
+
+class TestActiveChildGuard:
+    def test_rejects_duplicate_active_direct_child_of_same_type(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent", task_type="implement")
+        assert parent.id is not None
+
+        first = store.add(
+            "first review",
+            task_type="review",
+            based_on=parent.id,
+            enforce_single_active_sibling=True,
+        )
+        assert first.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "second review",
+                task_type="review",
+                based_on=parent.id,
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == first.id
+
+        store.mark_completed(first, has_commits=False)
+        replacement = store.add(
+            "replacement review",
+            task_type="review",
+            based_on=parent.id,
+            enforce_single_active_sibling=True,
+        )
+        assert replacement.id is not None
+
+    def test_guard_uses_based_on_only_not_depends_on(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent", task_type="implement")
+        assert parent.id is not None
+
+        depends_only = store.add(
+            "depends-only review",
+            task_type="review",
+            depends_on=parent.id,
+        )
+        assert depends_only.id is not None
+
+        created = store.add(
+            "guarded review",
+            task_type="review",
+            based_on=parent.id,
+            enforce_single_active_sibling=True,
+        )
+        assert created.id is not None
+
+    def test_rejected_duplicate_does_not_consume_sequence_id(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent", task_type="implement")
+        assert parent.id == "gza-1"
+
+        first = store.add(
+            "first improve",
+            task_type="improve",
+            based_on=parent.id,
+            enforce_single_active_sibling=True,
+        )
+        assert first.id == "gza-2"
+
+        with pytest.raises(DuplicateActiveChildError):
+            store.add(
+                "duplicate improve",
+                task_type="improve",
+                based_on=parent.id,
+                enforce_single_active_sibling=True,
+            )
+
+        next_task = store.add("ordinary task", task_type="implement")
+        assert next_task.id == "gza-3"
+
+    def test_opt_out_flows_still_allow_multiple_active_siblings(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("parent", task_type="review")
+        assert parent.id is not None
+
+        first = store.add("follow-up 1", task_type="implement", based_on=parent.id)
+        second = store.add("follow-up 2", task_type="implement", based_on=parent.id)
+
+        assert first.id is not None
+        assert second.id is not None
+        assert first.id != second.id
+
+    def test_guarded_add_is_atomic_across_independent_store_connections(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        first_store = SqliteTaskStore(db_path)
+        competing_store = SqliteTaskStore(db_path)
+        observer_store = SqliteTaskStore(db_path)
+        parent = first_store.add("parent", task_type="implement")
+        assert parent.id is not None
+
+        original_next_id = first_store._next_id
+        started_competing_add = threading.Event()
+
+        def competing_add() -> Task:
+            started_competing_add.set()
+            return competing_store.add(
+                "competing review",
+                task_type="review",
+                based_on=parent.id,
+                enforce_single_active_sibling=True,
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            competing_future = None
+
+            def start_competing_add_before_first_insert(conn: sqlite3.Connection) -> str:
+                nonlocal competing_future
+                if competing_future is None:
+                    competing_future = executor.submit(competing_add)
+                    assert started_competing_add.wait(timeout=1)
+                    try:
+                        competing_future.result(timeout=0.2)
+                    except FutureTimeoutError:
+                        pass
+                return original_next_id(conn)
+
+            with patch.object(first_store, "_next_id", side_effect=start_competing_add_before_first_insert):
+                created = first_store.add(
+                    "first review",
+                    task_type="review",
+                    based_on=parent.id,
+                    enforce_single_active_sibling=True,
+                )
+
+            assert created.id is not None
+            assert competing_future is not None
+            with pytest.raises(DuplicateActiveChildError) as exc_info:
+                competing_future.result(timeout=5)
+
+        assert exc_info.value.active_child.id == created.id
+        active_children = observer_store.get_active_children_of_type(parent.id, "review")
+        assert [child.id for child in active_children] == [created.id]
 
 
 class TestTaskChaining:
