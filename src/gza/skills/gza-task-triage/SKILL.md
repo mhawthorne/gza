@@ -1,8 +1,8 @@
 ---
 name: gza-task-triage
 description: Triage `gza incomplete` rows — classify each unresolved merge-unit lineage and recommend the right corrective action (drop moot leaves, escalate to fix, surface manual-resolve rebases, etc.). Never merges, retries, resumes, or deletes branches; never edits code.
-allowed-tools: Read, Bash(uv run gza show:*), Bash(uv run gza incomplete:*), Bash(uv run gza lineage:*), Bash(uv run gza log:*), Bash(uv run gza set-status:*), Bash(uv run python -c:*), Bash(git:*), AskUserQuestion
-version: 1.1.0
+allowed-tools: Read, Bash(uv run gza show:*), Bash(uv run gza incomplete:*), Bash(uv run gza lineage:*), Bash(uv run gza log:*), Bash(uv run gza search:*), Bash(uv run gza set-status:*), Bash(uv run python -c:*), Bash(git:*), AskUserQuestion
+version: 1.2.0
 public: true
 ---
 
@@ -116,6 +116,14 @@ For each row, print:
 3. The unresolved leaves and their lifecycles (short).
 4. The recommended action — a single concrete `gza` command, or "manual: …" with a one-line description.
 5. A short rationale (one sentence).
+
+**Before recommending a fix or `/gza-task-fix` handoff, dedup by ID.** A fix for this lineage may already be filed — fix tasks cite their originating task/merge-unit ID in their prompt, so that ID is the reliable dedup key (keyword guessing is not). Probe it:
+
+```bash
+uv run gza search "<merge-unit-owner-id>"   # also the gza-mu-… id, and any leaf you'd hand to fix
+```
+
+If an open (pending / in-flight) task already cites it, recommend **"tracked by gza-XXXX — wait for it"** instead of a fresh `fix`/escalation, and note its status / watch-scope. Don't make the user be the one who remembers the fix already exists.
 
 Action recipes by classification:
 

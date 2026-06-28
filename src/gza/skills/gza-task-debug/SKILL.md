@@ -1,8 +1,8 @@
 ---
 name: gza-task-debug
 description: Diagnose why a gza task failed — analyzes logs, detects loops, checks diffs, compares baselines, and suggests fixes
-allowed-tools: Read, Bash(uv run python -c:*), Bash(git:*), Bash(wc:*), Bash(grep:*)
-version: 1.0.0
+allowed-tools: Read, Bash(uv run python -c:*), Bash(uv run gza search:*), Bash(git:*), Bash(wc:*), Bash(grep:*)
+version: 1.1.0
 public: true
 ---
 
@@ -228,6 +228,14 @@ Output a structured diagnosis with these sections:
 ---
 
 ### Step 10: Offer to create follow-up tasks
+
+**First, dedup by ID.** Before offering to create any replacement/fix task, check whether one already exists — fix tasks cite their originating task ID in their prompt, so the task ID is the reliable dedup key (keyword guessing is not):
+
+```bash
+uv run gza search "<task-id>"
+```
+
+If an open (pending / in-flight) task already cites this ID, surface **"already tracked by gza-XXXX"** and offer to wait for it rather than filing a duplicate. Only offer new tasks after this returns nothing.
 
 After the diagnosis, ask:
 

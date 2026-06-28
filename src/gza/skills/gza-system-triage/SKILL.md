@@ -2,7 +2,7 @@
 name: gza-system-triage
 description: Turn the recurring `watch` stuck-task pile into (1) a diagnosis of why each class is stuck, (2) the existing stuck rows actually cleared now, and (3) systemic prevention so it does not recur. Snapshots watch/incomplete/queue, buckets stuck tasks by failure class, dedups against already-tracked `system` work, unsticks each row by its clearing action (drop moot/dead/stale, spawn follow-up, hand review-loop rows to /gza-task-fix), then ranks and files `system`-tagged prevention fixes by blast radius (cascade-preventer first). Never merges, retries, resumes, deletes branches, or edits code.
 allowed-tools: Read, Write, AskUserQuestion, Bash(uv run gza incomplete:*), Bash(uv run gza search:*), Bash(uv run gza history:*), Bash(uv run gza next:*), Bash(uv run gza show:*), Bash(uv run gza log:*), Bash(uv run gza add:*), Bash(uv run gza implement:*), Bash(uv run gza set-status:*), Bash(uv run gza queue:*), Bash(uv run gza ps:*), Bash(uv run python -c:*), Bash(mkdir:*), Bash(date:*)
-version: 1.5.0
+version: 1.6.0
 public: false
 ---
 
@@ -94,6 +94,14 @@ uv run gza next --all --tag system
 
 `gza next` has no `--json`; read the text lanes and run `uv run gza show <id>` on any candidate to confirm which class its prompt covers. If an open `system` task already covers the class, **collapse those rows to "tracked by gza-XXXX — skip"** and move on.
 
+**Also dedup by the specific stuck task/unit ID — the reliable key.** Tag-lane dedup only catches a class when you've named it the same way the existing fix did. The cheaper, surer probe is the ID of the row you're investigating, because a fix task cites its originating task/merge-unit in its prompt. For each stuck row (and its merge-unit owner / `gza-mu-…` id), run:
+
+```bash
+uv run gza search "<stuck-task-id>"        # repeat for the merge-unit id, e.g. gza-mu-458
+```
+
+If any open (pending / in-flight) task's prompt cites that ID, it is **already tracked** — collapse to "tracked by gza-XXXX — skip" and never file a duplicate. This is the check that catches a fix already filed under a class name you would not have guessed. Do not make the operator be the one who remembers the fix already exists.
+
 Then check recurrence-after-fix against **landed** `system` fixes:
 
 ```bash
@@ -102,7 +110,7 @@ uv run gza history --status completed --tag system --json --last 0
 
 If a class still recurs *after* its fix landed, flag it for **cause-layer escalation** — do not propose another narrow guard (behavior-spec rule).
 
-(Note: `gza search` is substring-over-prompt and requires a search term, so it is not the right tool for a pure tag-scoped lane query — use `next`/`history` with `--tag` as above.)
+(Note: `gza search` is substring-over-prompt and requires a search term, so it is not the right tool for a pure tag-scoped *lane* query — use `next`/`history` with `--tag` for those. It **is** the right tool for the ID-keyed probe above: searching a specific task/unit ID finds any open fix whose prompt cites it.)
 
 ### Step 5: Rank the remaining classes by blast radius
 
