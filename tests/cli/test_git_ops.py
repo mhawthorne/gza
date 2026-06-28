@@ -5119,7 +5119,7 @@ def test_advance_post_merge_red_main_skips_later_merges_and_surfaces_attention(
         patch("gza.git.Git", return_value=fake_git),
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[first_row, second_row]),
         patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
-        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=[green, red]),
+        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=[green, red]) as verify_check,
         patch("gza.cli.git_ops._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         rc = cmd_advance(args)
@@ -5127,6 +5127,7 @@ def test_advance_post_merge_red_main_skips_later_merges_and_surfaces_attention(
     output = capsys.readouterr().out
     assert rc == 0
     assert merge_calls == [first.id]
+    assert [call.kwargs["red_reruns"] for call in verify_check.call_args_list] == [2, 2]
     assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing" in output
     assert f"{second.id}" in output
     assert "1 advanced" in output
@@ -5197,6 +5198,7 @@ def test_advance_refreshes_red_main_before_preview_and_skips_confirmation_prompt
     output = capsys.readouterr().out
     assert rc == 0
     assert verify_check.call_args.kwargs["reason"] == "advance-pre-merge"
+    assert verify_check.call_args.kwargs["red_reruns"] == 2
     assert "No eligible tasks to advance" in output
     assert "main verify RED at `cafebabe1234` - merges halted; phase `unit` failing" in output
     assert "Will advance 1 task(s):" not in output

@@ -3251,6 +3251,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             store,
             git,
             reason="advance-pre-merge",
+            red_reruns=2,
         )
         if not main_verify.merges_halted or main_verify.state.task.id is None:
             return None
@@ -3953,6 +3954,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     store,
                     git,
                     reason="advance-post-merge",
+                    red_reruns=2,
                 )
                 if main_verify.merges_halted and main_verify.state.task.id is not None:
                     merge_halt_attention = {
