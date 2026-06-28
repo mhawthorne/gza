@@ -12275,7 +12275,7 @@ def test_blind_parked_auto_rearm_skips_unchanged_target_sha_without_spending_att
     )
     with store._connect() as conn:  # noqa: SLF001 - targeted state backdate
         conn.execute(
-            "UPDATE parked_task_rearms SET last_auto_attempt_at = ? WHERE subject_id = ?",
+            "UPDATE parked_task_rearms SET last_attempt_at = ? WHERE subject_id = ?",
             ((datetime.now(UTC) - timedelta(days=2)).isoformat(), exhausted_improve.id),
         )
 
@@ -12310,7 +12310,7 @@ def test_blind_parked_auto_rearm_skips_unchanged_target_sha_without_spending_att
         attention_reason="retry-limit-reached",
     )
     assert rearm is not None
-    assert rearm.auto_attempt_count == 1
+    assert rearm.attempt_count == 1
 
 
 def test_blind_parked_auto_rearm_skips_cooldown_window_without_spending_attempt(tmp_path: Path) -> None:
@@ -12362,7 +12362,7 @@ def test_blind_parked_auto_rearm_skips_cooldown_window_without_spending_attempt(
         attention_reason="retry-limit-reached",
     )
     assert rearm is not None
-    assert rearm.auto_attempt_count == 1
+    assert rearm.attempt_count == 1
 
 
 def test_watch_cycle_blind_auto_rearm_returns_retry_limit_owner_to_same_cycle_watch_planning(tmp_path: Path) -> None:
@@ -12410,7 +12410,7 @@ def test_watch_cycle_blind_auto_rearm_returns_retry_limit_owner_to_same_cycle_wa
         attention_reason="retry-limit-reached",
     )
     assert rearm is not None
-    assert rearm.auto_attempt_count == 1
+    assert rearm.attempt_count == 1
 
 
 @pytest.mark.parametrize(

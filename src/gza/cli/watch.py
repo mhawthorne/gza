@@ -3338,12 +3338,12 @@ def _evaluate_blind_parked_auto_rearm(
             subject_id=subject_id,
             attention_reason=candidate.attention_reason,
         )
-        auto_attempt_count = rearm_state.auto_attempt_count if rearm_state is not None else 0
+        auto_attempt_count = rearm_state.attempt_count if rearm_state is not None else 0
         if auto_attempt_count >= policy.budget:
             decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "budget exhausted"))
             continue
 
-        last_auto_attempt_at = rearm_state.last_auto_attempt_at if rearm_state is not None else None
+        last_auto_attempt_at = rearm_state.last_attempt_at if rearm_state is not None else None
         if last_auto_attempt_at is not None and now < last_auto_attempt_at + cooldown:
             decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "cooldown active"))
             continue
@@ -3354,7 +3354,7 @@ def _evaluate_blind_parked_auto_rearm(
                     _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unavailable")
                 )
                 continue
-            last_target_sha = rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
+            last_target_sha = rearm_state.last_attempt_target_sha if rearm_state is not None else None
             if last_target_sha == target_sha:
                 decisions.append(
                     _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unchanged")
