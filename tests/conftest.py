@@ -373,3 +373,17 @@ def _restore_worker_liveness_seams():
         workers_module.WorkerRegistry.is_running = _ORIGINAL_WORKER_IS_RUNNING
         workers_module._read_linux_proc_stat = _ORIGINAL_READ_LINUX_PROC_STAT
         workers_module._read_pid_start_ticks = _ORIGINAL_READ_PID_START_TICKS
+
+
+@pytest.fixture(autouse=True)
+def _stub_darwin_worker_death_hint():
+    """Keep best-effort macOS worker-death hints out of the unit suite.
+
+    ``_darwin_worker_death_hint`` shells out to ``log show`` on Darwin to find a
+    dead worker's root cause. Unit tests that exercise the dead-worker
+    reconciliation/snapshot path would otherwise invoke a real subprocess and
+    trip the unit-suite boundary guard -- and the hint is best-effort, not the
+    unit under test. Functional coverage exercises the real hint.
+    """
+    with patch("gza.cli._common._darwin_worker_death_hint", return_value=None):
+        yield
