@@ -3188,10 +3188,10 @@ class TestReviewContextFromChain:
         assert "Requested changes" in context
         assert "Scope note only" not in context
 
-    def test_improve_context_renders_atomic_blocker_set_for_comments_when_review_has_no_parsed_blockers(
+    def test_improve_context_renders_atomic_blocker_set_for_comments_when_review_has_no_blockers(
         self, tmp_path: Path
     ):
-        """CHANGES_REQUESTED reviews with unstructured blockers must fail closed before raw review."""
+        """Parseable reviews with only unresolved feedback comments still get atomic context."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3208,8 +3208,7 @@ class TestReviewContextFromChain:
         review_task.status = "completed"
         review_task.output_content = (
             "## Summary\n\n- Follow the unresolved comments.\n\n"
-            "## Blockers\n\n"
-            "- Comments below remain open.\n\n"
+            "## Blockers\n\nNone.\n\n"
             "## Follow-Ups\n\nNone.\n\n"
             "## Questions / Assumptions\n\nNone.\n\n"
             "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
@@ -3233,13 +3232,15 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
-        assert "## Atomic Blocker Set" not in context
-        assert "## Structured Review Parse Warning" in context
-        assert "## Comments:" in context
+        assert "## Atomic Blocker Set" in context
+        assert "- feedback #1: source=direct; created_at=" in context
+        assert "summary=Please harden input validation." in context
+        assert "## Structured Review Parse Warning" not in context
+        assert "## Comments:" not in context
         assert "## Review feedback to address:" in context
-        assert "Fail closed: do not treat any comments or summaries in this prompt as the complete closure set." in context
         assert "Please harden input validation." in context
-        assert "## Blockers\n\n- Comments below remain open." in context
+        assert "## Blockers\n\nNone." in context
+        assert context.index("## Atomic Blocker Set") < context.index("## Review feedback to address:")
 
     def test_improve_context_excludes_comments_added_after_improve_creation(self, tmp_path: Path):
         """Improve context should include only unresolved comments present at improve creation time."""

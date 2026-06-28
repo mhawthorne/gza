@@ -280,6 +280,9 @@ When a current review exists for the implementation lineage:
     comment before editing, plan one shared fix set, re-check the full set after the last
     edit, and run the configured final full verify gate after any targeted inner-loop
     checks before reporting closure.
+    When the latest review is otherwise parseable but contributes zero structured
+    blockers, unresolved feedback comments still form that atomic set; fail-closed parse
+    warnings are reserved for genuinely unparseable or malformed review blocker input.
   - Improve reports MUST include a machine-readable `## Blocker Closure Ledger (Machine
     Readable)` section covering every in-scope blocker/comment, including disputed no-op
     entries, so operators can audit closure evidence separately from free-form narrative.
