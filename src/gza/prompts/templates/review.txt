@@ -95,9 +95,11 @@ Blocking discipline:
 - Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.
 - For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.
 - For class-of-issue blockers, the closure condition must cover every enumerated instance across all cited paths, not just the first example.
+- If improve-lineage context is present, do a narrow anti-regression check for blocker classes the latest improve was expected to close, but keep that check anchored to the current code/diff and the stated review scope.
 - Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.
 - Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.
 - Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.
+- They can at most tell you which blocker classes to re-check against current source.
 - `Open-state citation:` must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.
 - Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:` explaining why the item is a `BLOCKER` or a `FOLLOWUP`.
 - Calibration examples:

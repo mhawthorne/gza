@@ -10,13 +10,17 @@ Your job is to address every blocking feedback item presented:
 - Address every unresolved entry in the Comments section, when it is present.
 - Treat review **Suggestions**/**Follow-Ups** as optional follow-up work unless the task prompt or review explicitly says they are required in this pass.
 
-Work through each blocking item systematically. For each item:
-- Identify the specific change required.
-- Implement the fix.
-- Verify your change addresses the issue described.
-- Add or update targeted tests that cover the specific failure mode called out in the feedback.
+Before you edit, inventory the entire current blocker/comment set and treat it as one atomic closure unit for this pass. Do not pick off only the newest item. Plan the edits against the full set collectively so you do not fix one blocker while regressing another or silently leaving an older comment open.
+
+Work through the full blocking set systematically:
+- First list every in-scope review Blocker and every unresolved comment you must close in this pass.
+- Identify the specific change required for each item and the shared fix plan across the set.
+- Implement the fix set.
+- Add or update targeted tests that cover the specific failure mode called out in the feedback. Treat these targeted tests as inner-loop checks only, not final closure proof.
 - If the feedback concerns CLI, config, docs, prompts, or other operator-facing behavior, update the relevant help text or documentation in the same pass.
 - If the context includes a failed or timed-out `## verify_command result`, inspect its captured stdout/stderr, `Failing output (trimmed)`, and any referenced `verify_command_output` artifacts before rerunning the full verify command.
+- After the last edit, re-check every listed blocker/comment again, including items you believe were already addressed earlier in the pass.
+- After the last edit, run the configured full final verify command required elsewhere in this prompt. Passing targeted tests alone is insufficient; the blocker/comment set is not closed until the full final verify gate is green unless the existing no-op dispute or verify-only clearance contract explicitly applies.
 
 Before finishing, verify that every blocking item has an explicit closure condition in your final report:
 - The review item you addressed
@@ -45,6 +49,27 @@ Downstream task: <optional full prefixed task id if the work belongs elsewhere>
 
 If you emit `## Disputed Blockers`, make the rest of the report explicit about why no
 code change was required and which current code/tests prove the blocker is not open.
+Disputed entries must still appear in the required machine-readable blocker closure ledger below.
+
+Your final report must include this exact section and cover every in-scope review Blocker and unresolved comment from this pass, even if the item was disputed or required no code change:
+
+````markdown
+## Blocker Closure Ledger (Machine Readable)
+
+```yaml
+improve_result: addressed | disputed_noop | blocked_external | needs_user
+blockers:
+  - source: review | comment
+    source_id: <B1/comment id>
+    summary: <short summary>
+    status: addressed | disputed | deferred | needs_user
+    closure_evidence: <code/test/current-state proof>
+    verify_evidence: <targeted checks plus final full verify result>
+final_verify:
+  command: <configured verify command or per-project commands>
+  status: passed | failed | unavailable
+```
+````
 
 Do not leave blocking feedback items partially addressed. The goal is to resolve all gating feedback in a single pass without creating extra scope.
 Treat a cited path or line range as an instance of a class of issue, not the full scope of the fix. If a blocker calls out one path for a broader issue, audit every analogous path for the same problem and fix them in this pass. When multiple sites share the same fix shape, prefer a centralized helper or shared code path over per-call-site patches. "Extra scope" means unrelated changes, not other instances of the same blocker class.

@@ -46,6 +46,18 @@ IMPROVE_DISPUTE_CONTRACT_CLAUSES = [
     "Downstream task: <optional full prefixed task id if the work belongs elsewhere>",
 ]
 
+IMPROVE_ATOMIC_SET_CONTRACT_CLAUSES = [
+    "inventory the entire current blocker/comment set and treat it as one atomic closure unit",
+    "Plan the edits against the full set collectively",
+    "re-check every listed blocker/comment again, including items you believe were already addressed earlier in the pass",
+    "Treat these targeted tests as inner-loop checks only, not final closure proof.",
+    "After the last edit, run the configured full final verify command required elsewhere in this prompt.",
+    "## Blocker Closure Ledger (Machine Readable)",
+    "cover every in-scope review Blocker and unresolved comment from this pass",
+    "source: review | comment",
+    "verify_evidence: <targeted checks plus final full verify result>",
+]
+
 REVIEW_SUMMARY_CHECKLIST_COUNT = 6
 REVIEW_SUMMARY_CHECKLIST_ITEMS = [
     "Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?",
@@ -177,6 +189,7 @@ class TestPromptBuilderBuild:
             "If a Must-Fix/Blocker item no longer applies because the code already satisfies it"
             not in result
         )
+        _assert_contains_all_clauses(result, IMPROVE_ATOMIC_SET_CONTRACT_CLAUSES)
         assert "Treat a cited path or line range as an instance of a class of issue" in result
         assert "reviewer-enumerated class" in result
         assert '"Extra scope" means unrelated changes, not other instances of the same blocker class.' in result
@@ -837,6 +850,29 @@ class TestPromptBuilderBuild:
             "",
         )
         assert "`Severity:`" not in directive_content
+
+    def test_review_template_adds_improve_lineage_antiregression_but_keeps_current_evidence_rule(
+        self,
+    ):
+        """Improve lineage may guide inspection, but only current evidence may block."""
+        content = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "gza"
+            / "prompts"
+            / "templates"
+            / "review.txt"
+        ).read_text()
+
+        assert (
+            "If improve-lineage context is present, do a narrow anti-regression check for blocker classes the latest improve was expected to close"
+            in content
+        )
+        assert "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker." in content
+        assert (
+            "They can at most tell you which blocker classes to re-check against current source."
+            in content
+        )
 
     def test_review_template_includes_borderline_rubric_justification_and_calibration_examples(self):
         """Review template should explain borderline classification and anchor it with examples."""
