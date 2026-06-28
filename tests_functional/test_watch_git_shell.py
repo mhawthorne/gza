@@ -21,6 +21,15 @@ from tests.cli.conftest import make_store, setup_config
 from tests_functional.git_helpers import init_basic_repo, setup_git_repo_with_task_branch
 
 
+def _is_expected_corrupt_linked_worktree_probe_stderr(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return (
+        "not a git repository" in lowered
+        or "invalid commondir" in lowered
+        or "invalid path '/gza-git'" in lowered
+    )
+
+
 def _install_counting_git_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     counter_path = tmp_path / "git-count.log"
     shim_dir = tmp_path / "bin"
@@ -115,6 +124,17 @@ def _corrupt_linked_worktree_commondir_for_probe_failure(
         if probe.returncode != 0:
             return candidate, probe
     pytest.fail("corrupt linked-worktree commondir did not break `git worktree list --porcelain`")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "fatal: invalid commondir /gza-git/common\nfatal: not a git repository: /workspace/.git/worktrees/broken\n",
+        "fatal: Invalid path '/gza-git': No such file or directory\n",
+    ],
+)
+def test_corrupt_linked_worktree_probe_failure_accepts_known_git_stderr_variants(stderr: str) -> None:
+    assert _is_expected_corrupt_linked_worktree_probe_stderr(stderr)
 
 
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) -> None:
@@ -436,14 +456,7 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     )
     assert corrupt_value.startswith("/gza-git/common")
     assert broken_probe.returncode != 0
-    assert (
-        "not a git repository" in broken_probe.stderr
-        or "invalid commondir" in broken_probe.stderr
-        # Older git (e.g. host 2.41) reports the container-only commondir path as an
-        # invalid path rather than a missing repo; production recognizes this marker too
-        # (see recovery_engine._REBASE_INFRA_LOG_MARKERS).
-        or "invalid path '/gza-git'" in broken_probe.stderr.lower()
-    )
+    assert _is_expected_corrupt_linked_worktree_probe_stderr(broken_probe.stderr), broken_probe.stderr
 
     args = argparse.Namespace(
         project_dir=project_dir,
