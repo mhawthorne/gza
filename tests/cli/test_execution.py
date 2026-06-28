@@ -10125,9 +10125,6 @@ class TestIterateCommand:
         assert payload_path.exists()
         assert '"captured_at": "2026-06-27T12:00:00+00:00"' in payload_path.read_text()
 
-    def test_cycle_rejects_non_implement_task(self, tmp_path: Path):
-        """gza iterate rejects tasks that are not implement type."""
-
     def test_cmd_iterate_routes_plan_tasks_and_rejects_unsupported_types(self, tmp_path: Path) -> None:
         import argparse
 
@@ -10153,7 +10150,7 @@ class TestIterateCommand:
         )
         explore_args = argparse.Namespace(**{**vars(plan_args), "impl_task_id": explore_task.id})
 
-        with patch("gza.cli.execution._cmd_iterate_plan", return_value=0) as plan_iterate:
+        with patch("gza.cli._cmd_iterate_plan", return_value=0) as plan_iterate:
             assert cmd_iterate(plan_args) == 0
 
         plan_iterate.assert_called_once()
@@ -10204,7 +10201,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         output = capsys.readouterr().out
@@ -10258,7 +10255,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         output = capsys.readouterr().out
@@ -10375,7 +10372,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         output = capsys.readouterr().out
@@ -10430,7 +10427,7 @@ class TestIterateCommand:
             store.update(task)
             return 1
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground) as run_foreground:
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
@@ -10498,7 +10495,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         output = capsys.readouterr().out
@@ -10574,7 +10571,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         output = capsys.readouterr().out
@@ -10626,7 +10623,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         output = capsys.readouterr().out
@@ -10699,7 +10696,7 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        with patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground):
+        with patch("gza.cli._run_foreground", side_effect=fake_run_foreground):
             rc = cmd_iterate(args)
 
         implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
@@ -10768,7 +10765,7 @@ class TestIterateCommand:
 
         with (
             patch("gza.cli.execution.Config.load", return_value=config),
-            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
         ):
             rc = cmd_iterate(args)
 
