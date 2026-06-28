@@ -67,10 +67,11 @@ not longer budgets:
 - Verification wrappers should omit `tree_fingerprint=` entirely when exact
   fingerprinting is unavailable, rather than emitting placeholder values.
 
-## Unit parallel-only rerun bridge
+## Unit and functional parallel-only rerun bridge
 
-The unit verify lane keeps its wall-clock behavior unchanged on the all-green
-path, but it now has a bounded bridge for contention-style parallel failures:
+The unit and functional verify lanes keep their wall-clock behavior unchanged
+on the all-green path, but they now have a bounded bridge for contention-style
+parallel failures:
 
 - the parallel xdist pass runs first with `--maxfail=GZA_UNIT_RERUN_CAP+1`, so
   the harness can see the whole bounded failure set instead of stopping at the
@@ -79,12 +80,15 @@ path, but it now has a bounded bridge for contention-style parallel failures:
   the harness reruns just those node IDs serially with the normal per-test
   timeout and logs each `PARALLEL-ONLY FAILURE (passed serially)` line;
 - collection errors, internal errors, unattributable exits, or failure sets
-  over the cap fail immediately with `unit-rerun: NOT masking - ...`.
+  over the cap fail immediately with `unit-rerun: NOT masking - ...` or
+  `functional-rerun: NOT masking - ...`.
 
 This bridge is intentionally narrow. It is an interim run-level arbiter for
 known xdist contention artifacts, not a replacement for the durable per-test
-budgeting work. `GZA_UNIT_SERIAL_RERUN=0` disables the bridge for operator
-triage, and `GZA_UNIT_RERUN_CAP` keeps broad failure sets fail-closed.
+budgeting work. `GZA_UNIT_SERIAL_RERUN=0` or
+`GZA_FUNCTIONAL_SERIAL_RERUN=0` disables the bridge for operator triage, and
+`GZA_UNIT_RERUN_CAP` plus `GZA_FUNCTIONAL_RERUN_CAP` keep broad failure sets
+fail-closed.
 
 ## Unit-suite per-test guards
 

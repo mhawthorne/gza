@@ -144,16 +144,18 @@ that CI uses under `--dist loadscope`, so local `./bin/tests` reproduces the
 same worker grouping on high-core developer machines unless an operator
 explicitly overrides `PYTEST_XDIST_WORKERS`.
 
-The unit lane also uses a guarded serial-rerun bridge in
-`python -m gza.test_serial_rerun` as an interim arbiter for bounded
-parallel-only flakes. The bridge keeps the normal parallel xdist pass, then
-reruns only the captured failing node IDs serially when, and only when, the
-entire failure set is a bounded set of per-test failures. Collection errors,
-internal pytest errors, unattributable non-zero exits, or failure sets above
-`GZA_UNIT_RERUN_CAP` fail the phase without masking. Operators can disable the
-bridge with `GZA_UNIT_SERIAL_RERUN=0` when debugging suspected parallel-only
-real failures. Treat the `unit-rerun: PARALLEL-ONLY FAILURE (passed serially)`
-lines as a real signal to follow up, not as noise to suppress.
+The unit and functional lanes also use a guarded serial-rerun bridge in
+`python -m gza.test_serial_rerun` and `python -m gza.functional_serial_rerun`
+as an interim arbiter for bounded parallel-only flakes. The bridge keeps the
+normal parallel xdist pass, then reruns only the captured failing node IDs
+serially when, and only when, the entire failure set is a bounded set of
+per-test failures. Collection errors, internal pytest errors, unattributable
+non-zero exits, or failure sets above the relevant cap fail the phase without
+masking. Operators can disable the bridge with `GZA_UNIT_SERIAL_RERUN=0` or
+`GZA_FUNCTIONAL_SERIAL_RERUN=0` when debugging suspected parallel-only real
+failures. Treat `unit-rerun: PARALLEL-ONLY FAILURE (passed serially)` and
+`functional-rerun: PARALLEL-ONLY FAILURE (passed serially)` lines as a real
+signal to follow up, not as noise to suppress.
 
 ## Gitignored derived artifacts are not review blockers
 

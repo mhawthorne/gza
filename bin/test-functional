@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+
+if [ -x "$VENV_PYTHON" ]; then
+    exec "$VENV_PYTHON" -m gza.functional_serial_rerun "$@"
+fi
+
+exec uv run python -m gza.functional_serial_rerun "$@"
