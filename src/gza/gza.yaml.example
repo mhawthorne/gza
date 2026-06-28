@@ -382,6 +382,16 @@ project_name: my-project
 #     Enable the watch-owned blind parked auto-rearm phase for eligible parked owner/reason pairs.
 #     Default: false
 #     enabled: false
+#     Minimum cooldown between batched parked auto-rearm judge passes.
+#     Default: 12
+#     judge_cooldown_hours: 12
+#     Enable one batched internal judge task on post-merge watch boundaries before falling back to
+#     blind parked auto-rearm.
+#     Default: false
+#     judge_enabled: false
+#     Maximum parked candidates included in one batched judge prompt.
+#     Default: 50
+#     judge_max_parked_tasks: 50
 #     Require the target branch SHA to advance since the last blind auto-rearm attempt before watch
 #     spends another attempt for the same parked subject/reason pair.
 #     Default: true

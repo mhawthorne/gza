@@ -185,6 +185,9 @@ def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
     assert config.watch.parked_auto_rearm.budget == 2
     assert config.watch.parked_auto_rearm.cooldown_hours == 12
     assert config.watch.parked_auto_rearm.require_target_advanced is True
+    assert config.watch.parked_auto_rearm.judge_enabled is False
+    assert config.watch.parked_auto_rearm.judge_cooldown_hours == 12
+    assert config.watch.parked_auto_rearm.judge_max_parked_tasks == 50
 
 
 def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
@@ -197,6 +200,9 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
         "    budget: 3\n"
         "    cooldown_hours: 6\n"
         "    require_target_advanced: false\n"
+        "    judge_enabled: true\n"
+        "    judge_cooldown_hours: 4\n"
+        "    judge_max_parked_tasks: 12\n"
     )
 
     config = Config.load(tmp_path)
@@ -205,6 +211,9 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
     assert config.watch.parked_auto_rearm.budget == 3
     assert config.watch.parked_auto_rearm.cooldown_hours == 6
     assert config.watch.parked_auto_rearm.require_target_advanced is False
+    assert config.watch.parked_auto_rearm.judge_enabled is True
+    assert config.watch.parked_auto_rearm.judge_cooldown_hours == 4
+    assert config.watch.parked_auto_rearm.judge_max_parked_tasks == 12
 
 
 def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:

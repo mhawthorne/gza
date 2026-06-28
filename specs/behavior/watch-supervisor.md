@@ -122,24 +122,37 @@ Each watch cycle MUST execute these phases in order:
    purpose match the current classification before queue-bumping it.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
-4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
+4. **Parked auto-rearm phase.** **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
    reconciled the freshest target state for this cycle, watch MAY run one conservative
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay
-   supervisor-owned and MUST reuse the shared parked clear service; it MUST NOT create a
-   judge task, inspect per-merge relevance, or fork a second lifecycle policy. For each
-   currently parked subject/reason candidate, watch MUST apply these gates in order:
-   feature enabled, budget remaining, cooldown elapsed, and target branch advanced when
-   `watch.parked_auto_rearm.require_target_advanced` is true. A failed gate MUST leave the
-   parked row untouched and MUST NOT spend an attempt. In particular, an unchanged target
-   SHA under `require_target_advanced` spends no attempt and performs no clear. A
-   successful blind auto-rearm MUST clear only the shared parked exclusion state, persist
-   the current target SHA plus attempt timestamp, increment the per-subject/per-reason
-   blind auto-attempt count, and then return the owner to the same cycle's ordinary watch
-   planning. Slot use is unchanged: the rearm phase itself consumes no worker slot, and any
-   follow-on recovery or lifecycle work spawned because of that clear MUST reuse the same
-   remaining worker-slot accounting as every other same-cycle dispatch. Cooldown identity
-   is subject plus parked reason, so a burst of watch cycles or merges inside one cooldown
-   window yields at most one blind auto-rearm attempt for that pair.
+   supervisor-owned and MUST reuse the shared parked clear service plus the shared
+   per-subject/per-reason parked auto-rearm budget state; it MUST NOT fork a second
+   lifecycle policy. For each currently parked subject/reason candidate, watch MUST apply
+   these gates in order: feature enabled, budget remaining, cooldown elapsed, and target
+   branch advanced when `watch.parked_auto_rearm.require_target_advanced` is true. A
+   failed gate MUST leave the parked row untouched and MUST NOT spend an attempt. In
+   particular, an unchanged target SHA under `require_target_advanced` spends no attempt
+   and performs no clear.
+
+   When `watch.parked_auto_rearm.judge_enabled` is false, watch MAY use the existing blind
+   pass directly. When that judge flag is true and the current cycle has crossed one
+   debounced post-merge boundary, watch MAY first create at most one `internal` judge task
+   for the whole merge window through the standard runner path. That judge prompt MUST
+   batch the merge-window context and a bounded parked-candidate set, MUST require strict
+   machine-readable output, and MUST validate returned task IDs against the supplied
+   candidate set before clearing anything. Unknown IDs from otherwise valid output MUST be
+   ignored safely. Malformed output, task failure, or other judge execution failure MUST
+   fall back to the configured blind behavior for that pass or leave work parked if blind
+   auto-rearm is not configured. A successful judged or blind auto-rearm MUST clear only
+   the shared parked exclusion state, persist the current target SHA plus attempt
+   timestamp, increment the shared per-subject/per-reason auto-attempt count, and then
+   return the owner to the same cycle's ordinary watch planning. Slot use is unchanged:
+   the rearm phase itself consumes no worker slot, and any follow-on recovery or lifecycle
+   work spawned because of that clear MUST reuse the same remaining worker-slot accounting
+   as every other same-cycle dispatch. Cooldown identity is subject plus parked reason, so
+   a burst of watch cycles or merges inside one cooldown window yields at most one
+   successful shared auto-rearm attempt for that pair; `judge_cooldown_hours` separately
+   caps how often watch may create the batched judge task.
 5. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
    lifecycle worker starts selected by the shared engine. Recovery allocation is not a
    pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before

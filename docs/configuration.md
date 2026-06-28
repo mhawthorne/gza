@@ -1027,6 +1027,9 @@ watch.parked_auto_rearm.enabled
 watch.parked_auto_rearm.budget
 watch.parked_auto_rearm.cooldown_hours
 watch.parked_auto_rearm.require_target_advanced
+watch.parked_auto_rearm.judge_enabled
+watch.parked_auto_rearm.judge_cooldown_hours
+watch.parked_auto_rearm.judge_max_parked_tasks
 watch.max_iterations
 watch.poll
 watch.recovery_slots
@@ -1960,9 +1963,13 @@ watch:
 
 `watch.dispatch_start_timeout` bounds how long `gza watch` waits after selecting work for it to reach a live running state. If the worker never becomes live within that window, watch logs the undispatched action, does not advance no-progress accounting for it, and keeps scanning the current watch pass for another runnable candidate instead of leaving the slot idle.
 
-`watch.parked_auto_rearm.enabled` turns on a conservative watch-owned blind parked auto-rearm phase. It runs after watch finishes the direct non-worker lifecycle phase for the current pass and before worker dispatch planning, so same-pass slot reuse still goes through the ordinary shared watch planner instead of a separate executor.
+`watch.parked_auto_rearm.enabled` turns on a conservative watch-owned parked auto-rearm phase. It runs after watch finishes the direct non-worker lifecycle phase for the current pass and before worker dispatch planning, so same-pass slot reuse still goes through the ordinary shared watch planner instead of a separate executor.
 
-When enabled, `watch.parked_auto_rearm.budget` caps blind auto-rearm attempts per parked subject/reason pair, `watch.parked_auto_rearm.cooldown_hours` enforces at most one blind attempt per cooldown window for that pair, and `watch.parked_auto_rearm.require_target_advanced` makes unchanged target SHAs a no-spend skip. With the default `require_target_advanced: true`, watch records the current target SHA on each successful blind auto-rearm and will not clear the same parked subject/reason again until the target branch advances. `enabled: false` preserves the existing manual behavior: parked owners stay parked until an operator clears them or other shared lifecycle state changes.
+When enabled, `watch.parked_auto_rearm.budget` caps auto-rearm attempts per parked subject/reason pair, `watch.parked_auto_rearm.cooldown_hours` enforces at most one blind attempt per cooldown window for that pair, and `watch.parked_auto_rearm.require_target_advanced` makes unchanged target SHAs a no-spend skip. With the default `require_target_advanced: true`, watch records the current target SHA on each successful auto-rearm and will not clear the same parked subject/reason again until the target branch advances. `enabled: false` preserves the existing manual behavior: parked owners stay parked until an operator clears them or other shared lifecycle state changes.
+
+`watch.parked_auto_rearm.judge_enabled` adds one batched `internal` judge task on post-merge watch boundaries. Watch supplies the current merge window plus a bounded parked-candidate set, requires strict JSON back, validates the returned task IDs against the supplied candidates, and then spends the same shared parked auto-rearm budget only for the validated subset. The judge path still uses the standard internal-task runner path; it does not create a second execution mechanism.
+
+`watch.parked_auto_rearm.judge_cooldown_hours` caps how often watch creates those batched judge tasks, and `watch.parked_auto_rearm.judge_max_parked_tasks` bounds how many parked candidates are serialized into one judge prompt. Unknown candidate IDs from the judge are ignored safely. If the judge is disabled, fails, or returns malformed output, watch falls back to the configured blind parked auto-rearm behavior for that pass.
 
 `watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` enforces before relaunching the same transient failed recovery or improve action. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
 

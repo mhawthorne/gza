@@ -1221,7 +1221,10 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
     assert "watch.parked_auto_rearm.enabled" in watch_section
     assert "watch.parked_auto_rearm.require_target_advanced" in watch_section
+    assert "watch.parked_auto_rearm.judge_enabled" in watch_section
+    assert "watch.parked_auto_rearm.judge_max_parked_tasks" in watch_section
     assert "unchanged target SHAs a no-spend skip" in watch_section
+    assert "strict JSON back" in watch_section
     assert "requires at least one explicit selector" in unstick_section
     assert "--reason backstop\\|retry-limit\\|reconcile" in unstick_section
     assert "Cap new worker-consuming starts for `--run`" in unstick_section

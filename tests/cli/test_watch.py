@@ -52,6 +52,7 @@ from gza.cli.watch import (
     _count_live_workers,
     _CycleResult,
     _emit_cycle_attention_summary,
+    _evaluate_judged_parked_auto_rearm,
     _emit_transition_events,
     _evaluate_blind_parked_auto_rearm,
     _finalize_watch_no_progress_after_execution,
@@ -256,6 +257,39 @@ def _setup_retry_limit_parked_lineage(tmp_path: Path) -> tuple[object, Config, D
 
     config = Config.load(tmp_path)
     return store, config, impl, exhausted_improve
+
+
+def _make_simple_retry_limit_candidate(
+    store,
+    *,
+    prompt: str,
+    branch: str,
+) -> tuple[DbTask, DbTask, watch_module.ParkedTaskCandidate]:
+    owner = store.add(prompt, task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = branch
+    owner.has_commits = True
+    store.update(owner)
+    store.set_merge_status(owner.id, "unmerged")
+
+    subject = store.add(f"{prompt} retry", task_type="improve", based_on=owner.id, same_branch=True)
+    assert subject.id is not None
+    subject.status = "failed"
+    subject.failure_reason = "TIMEOUT"
+    subject.completed_at = datetime.now(UTC)
+    subject.branch = branch
+    store.update(subject)
+
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=owner,
+        subject_task=subject,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+    return owner, subject, candidate
 
 
 def _seed_watch_lifecycle_summary_fixture(tmp_path: Path) -> tuple[object, object]:
@@ -12411,6 +12445,223 @@ def test_watch_cycle_blind_auto_rearm_returns_retry_limit_owner_to_same_cycle_wa
     )
     assert rearm is not None
     assert rearm.auto_attempt_count == 1
+
+
+def test_judged_parked_auto_rearm_batches_candidates_into_one_internal_task(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.judge_enabled = True
+    config.watch.parked_auto_rearm.judge_max_parked_tasks = 10
+
+    git = _make_watch_git()
+    owner_a, subject_a, candidate_a = _make_simple_retry_limit_candidate(
+        store,
+        prompt="Retry candidate A",
+        branch="feature/judge-a",
+    )
+    owner_b, _subject_b, candidate_b = _make_simple_retry_limit_candidate(
+        store,
+        prompt="Retry candidate B",
+        branch="feature/judge-b",
+    )
+
+    def _fake_runner_run(_config, task_id=None, on_task_claimed=None, **_kwargs):
+        assert task_id is not None
+        task = store.get(task_id)
+        assert task is not None
+        if on_task_claimed is not None:
+            on_task_claimed(task)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.output_content = json.dumps({"rearm_task_ids": [subject_a.id]})
+        store.update(task)
+        return 0
+
+    with (
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate_a, candidate_b), 0)),
+        patch("gza.cli.watch.skip_reason_for_landed_or_moot", return_value=None),
+        patch("gza.runner.run", side_effect=_fake_runner_run),
+    ):
+        result, error = _evaluate_judged_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-1",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+            merge_window_owner_ids=(owner_a.id, owner_b.id),
+        )
+
+    assert error is None
+    assert result is not None
+    assert [(decision.candidate.subject_task.id, decision.status, decision.detail) for decision in result.decisions] == [
+        (subject_a.id, "rearmed", "judge-selected auto-rearm"),
+        (candidate_b.subject_task.id, "skipped", "judge not selected"),
+    ]
+    judge_tasks = [
+        task for task in store.get_all()
+        if task.task_type == "internal" and task.trigger_source == "watch-unstick-judge"
+    ]
+    assert len(judge_tasks) == 1
+
+
+def test_judged_parked_auto_rearm_reports_malformed_output(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.judge_enabled = True
+
+    git = _make_watch_git()
+    owner, subject, candidate = _make_simple_retry_limit_candidate(
+        store,
+        prompt="Retry candidate malformed",
+        branch="feature/judge-malformed",
+    )
+
+    def _fake_runner_run(_config, task_id=None, on_task_claimed=None, **_kwargs):
+        assert task_id is not None
+        task = store.get(task_id)
+        assert task is not None
+        if on_task_claimed is not None:
+            on_task_claimed(task)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.output_content = "not-json"
+        store.update(task)
+        return 0
+
+    with (
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)),
+        patch("gza.cli.watch.skip_reason_for_landed_or_moot", return_value=None),
+        patch("gza.runner.run", side_effect=_fake_runner_run),
+    ):
+        result, error = _evaluate_judged_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-1",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+            merge_window_owner_ids=(owner.id,),
+        )
+
+    assert result is None
+    assert error == "judge output malformed"
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=subject.id,
+        attention_reason="retry-limit-reached",
+    ) is None
+
+
+def test_judged_parked_auto_rearm_ignores_unknown_selected_ids(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.judge_enabled = True
+
+    git = _make_watch_git()
+    owner, subject, candidate = _make_simple_retry_limit_candidate(
+        store,
+        prompt="Retry candidate validation",
+        branch="feature/judge-validation",
+    )
+
+    def _fake_runner_run(_config, task_id=None, on_task_claimed=None, **_kwargs):
+        assert task_id is not None
+        task = store.get(task_id)
+        assert task is not None
+        if on_task_claimed is not None:
+            on_task_claimed(task)
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.output_content = json.dumps({"rearm_task_ids": ["gza-999999"]})
+        store.update(task)
+        return 0
+
+    with (
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)),
+        patch("gza.cli.watch.skip_reason_for_landed_or_moot", return_value=None),
+        patch("gza.runner.run", side_effect=_fake_runner_run),
+    ):
+        result, error = _evaluate_judged_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha-1",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+            merge_window_owner_ids=(owner.id,),
+        )
+
+    assert error is None
+    assert result is not None
+    assert [(decision.status, decision.detail) for decision in result.decisions] == [
+        ("skipped", "judge not selected")
+    ]
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=subject.id,
+        attention_reason="retry-limit-reached",
+    ) is None
+
+
+def test_watch_cycle_falls_back_to_blind_auto_rearm_when_judge_fails(tmp_path: Path) -> None:
+    store, config, impl, exhausted_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.judge_enabled = True
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-1")  # type: ignore[method-assign]
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=impl,
+        subject_task=exhausted_improve,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+    judge_task = store.add("judge task", task_type="internal", trigger_source="watch-unstick-judge")
+    assert judge_task.id is not None
+    judge_task.created_at = datetime.now(UTC) - timedelta(days=2)
+    store.update(judge_task)
+
+    with (
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)),
+        patch("gza.cli.watch._evaluate_judged_parked_auto_rearm", return_value=(None, "judge output malformed")),
+        patch("gza.cli.watch.resolve_ref_if_possible", return_value=SimpleNamespace(sha="main-sha-1")),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=("main", None)),
+        patch("gza.cli.watch._build_watch_cycle_plan", return_value=_empty_scoped_watch_plan(slots=0)),
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
+        patch("gza.cli.watch.Git", return_value=git),
+    ):
+        log_path = tmp_path / "watch.log"
+        log = _WatchLog(log_path, quiet=True)
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    assert "parked judge fallback: judge output malformed" in log_text
+    assert "blind auto-rearm cleared retry-limit-reached" in log_text
 
 
 @pytest.mark.parametrize(

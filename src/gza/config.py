@@ -102,6 +102,9 @@ DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED = False
 DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET = 2
 DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS = 12
 DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED = True
+DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_ENABLED = False
+DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_COOLDOWN_HOURS = 12
+DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_MAX_PARKED_TASKS = 50
 DEFAULT_WATCH_RECOVERY_SLOTS = 1
 DEFAULT_ITERATE_MAX_ITERATIONS = 3
 DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
@@ -249,6 +252,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
             "budget": None,
             "cooldown_hours": None,
             "require_target_advanced": None,
+            "judge_enabled": None,
+            "judge_cooldown_hours": None,
+            "judge_max_parked_tasks": None,
         },
     },
     "iterate_max_iterations": None,
@@ -967,12 +973,15 @@ class TmuxConfig:
 
 @dataclass
 class ParkedAutoRearmConfig:
-    """Configuration for watch-owned blind parked auto-rearm."""
+    """Configuration for watch-owned parked auto-rearm and optional judge batching."""
 
     enabled: bool = DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED
     budget: int = DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET
     cooldown_hours: int = DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS
     require_target_advanced: bool = DEFAULT_WATCH_PARKED_AUTO_REARM_REQUIRE_TARGET_ADVANCED
+    judge_enabled: bool = DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_ENABLED
+    judge_cooldown_hours: int = DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_COOLDOWN_HOURS
+    judge_max_parked_tasks: int = DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_MAX_PARKED_TASKS
 
 
 @dataclass
@@ -2203,6 +2212,30 @@ class Config:
             raise ConfigError(
                 "watch.parked_auto_rearm.require_target_advanced must be a boolean (true/false)"
             )
+        parked_auto_rearm_judge_enabled = parked_auto_rearm_data.get(
+            "judge_enabled",
+            DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_ENABLED,
+        )
+        if not isinstance(parked_auto_rearm_judge_enabled, bool):
+            raise ConfigError("watch.parked_auto_rearm.judge_enabled must be a boolean (true/false)")
+        parked_auto_rearm_judge_cooldown_hours = _validate_positive_int_field(
+            parked_auto_rearm_data.get(
+                "judge_cooldown_hours",
+                DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_COOLDOWN_HOURS,
+            ),
+            "watch.parked_auto_rearm.judge_cooldown_hours",
+        )
+        if parked_auto_rearm_judge_cooldown_hours is None:
+            raise ConfigError("watch.parked_auto_rearm.judge_cooldown_hours must be a positive integer")
+        parked_auto_rearm_judge_max_parked_tasks = _validate_positive_int_field(
+            parked_auto_rearm_data.get(
+                "judge_max_parked_tasks",
+                DEFAULT_WATCH_PARKED_AUTO_REARM_JUDGE_MAX_PARKED_TASKS,
+            ),
+            "watch.parked_auto_rearm.judge_max_parked_tasks",
+        )
+        if parked_auto_rearm_judge_max_parked_tasks is None:
+            raise ConfigError("watch.parked_auto_rearm.judge_max_parked_tasks must be a positive integer")
 
         watch_config = WatchConfig(
             batch=watch_batch,
@@ -2222,6 +2255,9 @@ class Config:
                 budget=parked_auto_rearm_budget,
                 cooldown_hours=parked_auto_rearm_cooldown_hours,
                 require_target_advanced=parked_auto_rearm_require_target_advanced,
+                judge_enabled=parked_auto_rearm_judge_enabled,
+                judge_cooldown_hours=parked_auto_rearm_judge_cooldown_hours,
+                judge_max_parked_tasks=parked_auto_rearm_judge_max_parked_tasks,
             ),
         )
         interactive_worktree_dir = data.get("interactive_worktree_dir", DEFAULT_INTERACTIVE_WORKTREE_DIR)
@@ -2843,6 +2879,23 @@ class Config:
                         ):
                             errors.append(
                                 "watch.parked_auto_rearm.require_target_advanced must be a boolean"
+                            )
+                        if "judge_enabled" in parked_auto_rearm and not isinstance(
+                            parked_auto_rearm["judge_enabled"],
+                            bool,
+                        ):
+                            errors.append("watch.parked_auto_rearm.judge_enabled must be a boolean")
+                        if "judge_cooldown_hours" in parked_auto_rearm:
+                            _validate_positive_int_field(
+                                parked_auto_rearm["judge_cooldown_hours"],
+                                "watch.parked_auto_rearm.judge_cooldown_hours",
+                                errors=errors,
+                            )
+                        if "judge_max_parked_tasks" in parked_auto_rearm:
+                            _validate_positive_int_field(
+                                parked_auto_rearm["judge_max_parked_tasks"],
+                                "watch.parked_auto_rearm.judge_max_parked_tasks",
+                                errors=errors,
                             )
 
         if "claude_args" in data:

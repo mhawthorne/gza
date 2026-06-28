@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import hashlib
 import io
+import json
 import os
 import re
 import signal
@@ -34,6 +35,7 @@ from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
     DuplicateActiveChildError,
+    ParkedTaskRearmState,
     SqliteTaskStore,
     Task as DbTask,
     WatchProgressObservation,
@@ -199,6 +201,7 @@ _WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON = "transient-recovery-backoff"
 _WATCH_PARKED_NEEDS_ATTENTION_REASONS = frozenset(
     {*WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS, WATCH_NO_PROGRESS_BACKSTOP_REASON}
 )
+_PARKED_AUTO_REARM_JUDGE_TRIGGER_SOURCE = "watch-unstick-judge"
 _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
 )
@@ -2497,6 +2500,26 @@ class _BlindParkedAutoRearmResult:
 
 
 @dataclass(frozen=True)
+class _ParkedAutoRearmMergeWindowEntry:
+    owner_task_id: str
+    prompt_summary: str
+    branch: str | None
+    merged_at: datetime | None
+    merge_unit_id: str | None
+    merge_head_sha: str | None
+    diff_files_changed: int | None
+    diff_lines_added: int | None
+    diff_lines_removed: int | None
+
+
+@dataclass(frozen=True)
+class _ParkedAutoRearmGateDecision:
+    candidate: ParkedTaskCandidate
+    rearm_state: ParkedTaskRearmState | None
+    skip_detail: str | None
+
+
+@dataclass(frozen=True)
 class _WatchCycleAnalysis:
     target_branch: str
     scope_gaps: tuple[ScopedTagScopeGap, ...]
@@ -3297,7 +3320,63 @@ def _evaluate_blind_parked_auto_rearm(
     if not policy.enabled:
         return _BlindParkedAutoRearmResult(decisions=())
 
+    candidates = _collect_scoped_parked_auto_rearm_candidates(
+        config=config,
+        store=store,
+        git=git,
+        target_branch=target_branch,
+        tags=tags,
+        any_tag=any_tag,
+        scoped_owner_ids=scoped_owner_ids,
+    )
     cooldown = timedelta(hours=policy.cooldown_hours)
+    now = datetime.now(UTC)
+    decisions: list[_BlindParkedAutoRearmDecision] = []
+
+    for candidate in candidates:
+        gate = _evaluate_parked_auto_rearm_gate(
+            config=config,
+            store=store,
+            git=git,
+            target_branch=target_branch,
+            target_sha=target_sha,
+            candidate=candidate,
+            now=now,
+            cooldown=cooldown,
+        )
+        if gate.skip_detail is not None:
+            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", gate.skip_detail))
+            continue
+
+        clear_parked_candidate_state(
+            store,
+            candidate,
+            record_manual_retry_limit_rearm=False,
+        )
+        subject_id = candidate.subject_task.id
+        assert subject_id is not None
+        store.record_parked_task_auto_rearm_attempt(
+            subject_kind="task",
+            subject_id=subject_id,
+            attention_reason=candidate.attention_reason,
+            subject_task_id=subject_id,
+            target_sha=target_sha,
+        )
+        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "blind auto-rearm"))
+
+    return _BlindParkedAutoRearmResult(decisions=tuple(decisions))
+
+
+def _collect_scoped_parked_auto_rearm_candidates(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    scoped_owner_ids: tuple[str, ...] | None,
+) -> tuple[ParkedTaskCandidate, ...]:
     candidates, _stale_cleared = discover_parked_tasks(
         store,
         config=config,
@@ -3305,62 +3384,364 @@ def _evaluate_blind_parked_auto_rearm(
         target_branch=target_branch,
     )
     scoped_owner_id_set = frozenset(scoped_owner_ids or ())
-    now = datetime.now(UTC)
-    decisions: list[_BlindParkedAutoRearmDecision] = []
-
+    filtered: list[ParkedTaskCandidate] = []
     for candidate in candidates:
-        owner_task = candidate.owner_task
-        owner_id = owner_task.id
-        subject_id = candidate.subject_task.id
-        if owner_id is None or subject_id is None:
+        owner_id = candidate.owner_task.id
+        if owner_id is None or candidate.subject_task.id is None:
             continue
         if scoped_owner_ids is not None and owner_id not in scoped_owner_id_set:
             continue
         if tags is not None and not task_matches_tag_filters(
-            task_tags=owner_task.tags,
+            task_tags=candidate.owner_task.tags,
             tag_filters=tags,
             any_tag=any_tag,
         ):
             continue
+        filtered.append(candidate)
+    return tuple(filtered)
 
-        guard_reason = skip_reason_for_landed_or_moot(
-            store,
+
+def _evaluate_parked_auto_rearm_gate(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
+    target_sha: str | None,
+    candidate: ParkedTaskCandidate,
+    now: datetime,
+    cooldown: timedelta,
+) -> _ParkedAutoRearmGateDecision:
+    guard_reason = skip_reason_for_landed_or_moot(
+        store,
+        git=git,
+        target_branch=target_branch,
+        task=candidate.owner_task,
+    )
+    if guard_reason is not None:
+        return _ParkedAutoRearmGateDecision(candidate=candidate, rearm_state=None, skip_detail=guard_reason)
+
+    subject_id = candidate.subject_task.id
+    if subject_id is None:
+        return _ParkedAutoRearmGateDecision(
+            candidate=candidate,
+            rearm_state=None,
+            skip_detail="candidate subject missing",
+        )
+
+    rearm_state = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=subject_id,
+        attention_reason=candidate.attention_reason,
+    )
+    auto_attempt_count = rearm_state.auto_attempt_count if rearm_state is not None else 0
+    if auto_attempt_count >= config.watch.parked_auto_rearm.budget:
+        return _ParkedAutoRearmGateDecision(
+            candidate=candidate,
+            rearm_state=rearm_state,
+            skip_detail="budget exhausted",
+        )
+
+    last_auto_attempt_at = rearm_state.last_auto_attempt_at if rearm_state is not None else None
+    if last_auto_attempt_at is not None and now < last_auto_attempt_at + cooldown:
+        return _ParkedAutoRearmGateDecision(
+            candidate=candidate,
+            rearm_state=rearm_state,
+            skip_detail="cooldown active",
+        )
+
+    if config.watch.parked_auto_rearm.require_target_advanced:
+        if not target_sha:
+            return _ParkedAutoRearmGateDecision(
+                candidate=candidate,
+                rearm_state=rearm_state,
+                skip_detail="target SHA unavailable",
+            )
+        last_target_sha = rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
+        if last_target_sha == target_sha:
+            return _ParkedAutoRearmGateDecision(
+                candidate=candidate,
+                rearm_state=rearm_state,
+                skip_detail="target SHA unchanged",
+            )
+
+    return _ParkedAutoRearmGateDecision(candidate=candidate, rearm_state=rearm_state, skip_detail=None)
+
+
+def _latest_parked_auto_rearm_judge_task(store: SqliteTaskStore) -> DbTask | None:
+    latest: DbTask | None = None
+    for task in store.get_all():
+        if task.task_type != "internal":
+            continue
+        if task.trigger_source != _PARKED_AUTO_REARM_JUDGE_TRIGGER_SOURCE:
+            continue
+        if task.created_at is None:
+            continue
+        if latest is None or (
+            latest.created_at is not None and task.created_at > latest.created_at
+        ):
+            latest = task
+    return latest
+
+
+def _build_merge_window_entries(
+    *,
+    store: SqliteTaskStore,
+    owner_task_ids: Sequence[str],
+) -> tuple[_ParkedAutoRearmMergeWindowEntry, ...]:
+    entries: list[_ParkedAutoRearmMergeWindowEntry] = []
+    for owner_task_id in owner_task_ids:
+        owner_task = store.get(owner_task_id)
+        if owner_task is None or owner_task.id is None:
+            continue
+        unit = store.resolve_merge_unit_for_task(owner_task.id)
+        entries.append(
+            _ParkedAutoRearmMergeWindowEntry(
+                owner_task_id=owner_task.id,
+                prompt_summary=shorten_prompt(owner_task.prompt, available=120),
+                branch=owner_task.branch,
+                merged_at=unit.merged_at if unit is not None else owner_task.merged_at,
+                merge_unit_id=unit.id if unit is not None else None,
+                merge_head_sha=unit.head_sha if unit is not None else None,
+                diff_files_changed=unit.diff_files_changed if unit is not None else None,
+                diff_lines_added=unit.diff_lines_added if unit is not None else None,
+                diff_lines_removed=unit.diff_lines_removed if unit is not None else None,
+            )
+        )
+    return tuple(entries)
+
+
+def _bounded_task_context(task: DbTask, *, max_prompt_chars: int = 220, max_output_chars: int = 320) -> dict[str, object]:
+    output_excerpt = (task.output_content or "").strip()
+    if len(output_excerpt) > max_output_chars:
+        output_excerpt = output_excerpt[:max_output_chars].rstrip() + "... [truncated]"
+    return {
+        "task_id": task.id,
+        "task_type": task.task_type,
+        "status": task.status,
+        "branch": task.branch,
+        "failure_reason": task.failure_reason,
+        "prompt_summary": shorten_prompt(task.prompt, available=max_prompt_chars),
+        "output_excerpt": output_excerpt or None,
+    }
+
+
+def _build_parked_auto_rearm_judge_prompt(
+    *,
+    target_branch: str,
+    target_sha: str | None,
+    merge_window: Sequence[_ParkedAutoRearmMergeWindowEntry],
+    candidate_gates: Sequence[_ParkedAutoRearmGateDecision],
+) -> str:
+    merge_window_payload = [
+        {
+            "owner_task_id": entry.owner_task_id,
+            "prompt_summary": entry.prompt_summary,
+            "branch": entry.branch,
+            "merged_at": entry.merged_at.isoformat() if entry.merged_at is not None else None,
+            "merge_unit_id": entry.merge_unit_id,
+            "merge_head_sha": entry.merge_head_sha,
+            "diff_files_changed": entry.diff_files_changed,
+            "diff_lines_added": entry.diff_lines_added,
+            "diff_lines_removed": entry.diff_lines_removed,
+        }
+        for entry in merge_window
+    ]
+    parked_candidates_payload = []
+    for gate in candidate_gates:
+        candidate = gate.candidate
+        rearm_state = gate.rearm_state
+        parked_candidates_payload.append(
+            {
+                "candidate_task_id": candidate.subject_task.id,
+                "owner_task_id": candidate.owner_task.id,
+                "parked_reason": candidate.attention_reason,
+                "reason_class": candidate.reason_class,
+                "owner": _bounded_task_context(candidate.owner_task),
+                "subject": _bounded_task_context(candidate.subject_task),
+                "auto_attempt_count": rearm_state.auto_attempt_count if rearm_state is not None else 0,
+                "last_auto_attempt_at": (
+                    rearm_state.last_auto_attempt_at.isoformat()
+                    if rearm_state is not None and rearm_state.last_auto_attempt_at is not None
+                    else None
+                ),
+                "last_auto_attempt_target_sha": (
+                    rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
+                ),
+                "eligible_now": gate.skip_detail is None,
+                "ineligible_reason": gate.skip_detail,
+            }
+        )
+    request_payload = {
+        "target_branch": target_branch,
+        "target_sha": target_sha,
+        "merge_window": merge_window_payload,
+        "parked_candidates": parked_candidates_payload,
+        "response_contract": {
+            "rearm_task_ids": ["candidate_task_id", "..."],
+            "rationale": {"candidate_task_id": "brief reason"},
+        },
+    }
+    payload_text = json.dumps(request_payload, indent=2, sort_keys=True)
+    return (
+        "You are deciding which currently parked tasks are plausibly unblocked by the "
+        "recent merge window.\n\n"
+        "Return strict JSON only. No prose. No markdown fences.\n"
+        "The only allowed top-level keys are `rearm_task_ids` and optional `rationale`.\n"
+        "`rearm_task_ids` must be an array of candidate_task_id strings drawn only from the "
+        "provided parked_candidates list.\n"
+        "If nothing should be rearmed, return {\"rearm_task_ids\":[]}.\n\n"
+        f"{payload_text}"
+    )
+
+
+def _parse_parked_auto_rearm_judge_output(
+    output_content: str,
+) -> tuple[tuple[str, ...], bool]:
+    try:
+        parsed = json.loads(output_content)
+    except json.JSONDecodeError:
+        return (), False
+    if not isinstance(parsed, dict):
+        return (), False
+    allowed_keys = {"rearm_task_ids", "rationale"}
+    if any(key not in allowed_keys for key in parsed):
+        return (), False
+    raw_ids = parsed.get("rearm_task_ids")
+    if not isinstance(raw_ids, list) or any(not isinstance(item, str) or not item for item in raw_ids):
+        return (), False
+    raw_rationale = parsed.get("rationale")
+    if raw_rationale is not None:
+        if not isinstance(raw_rationale, dict):
+            return (), False
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in raw_rationale.items()):
+            return (), False
+    return tuple(raw_ids), True
+
+
+def _run_parked_auto_rearm_judge_task(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    prompt: str,
+) -> tuple[DbTask | None, tuple[str, ...] | None, str | None]:
+    from .. import runner as _runner_mod
+
+    try:
+        permit = launch_permit(config, store, current_pid=os.getpid())
+        try:
+            judge_task = store.add(
+                prompt=prompt,
+                task_type="internal",
+                skip_learnings=True,
+                trigger_source=_PARKED_AUTO_REARM_JUDGE_TRIGGER_SOURCE,
+            )
+            judge_task_id = judge_task.id
+            if judge_task_id is None:
+                permit.release()
+                return None, None, "judge task missing id"
+
+            def _on_task_claimed(_task: DbTask) -> None:
+                permit.release()
+
+            try:
+                exit_code = _runner_mod.run(config, task_id=judge_task_id, on_task_claimed=_on_task_claimed)
+            finally:
+                permit.release()
+        except Exception:
+            permit.release()
+            raise
+    except Exception as exc:
+        return None, None, f"judge launch failed: {exc}"
+
+    refreshed = store.get(judge_task_id)
+    if exit_code != 0 or refreshed is None or refreshed.status != "completed":
+        return refreshed, None, "judge task failed"
+    if not refreshed.output_content:
+        return refreshed, None, "judge output missing"
+    selected_ids, parsed_ok = _parse_parked_auto_rearm_judge_output(refreshed.output_content)
+    if not parsed_ok:
+        return refreshed, None, "judge output malformed"
+    return refreshed, selected_ids, None
+
+
+def _evaluate_judged_parked_auto_rearm(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
+    target_sha: str | None,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    scoped_owner_ids: tuple[str, ...] | None,
+    merge_window_owner_ids: Sequence[str],
+) -> tuple[_BlindParkedAutoRearmResult | None, str | None]:
+    policy = config.watch.parked_auto_rearm
+    if not policy.enabled or not policy.judge_enabled or not merge_window_owner_ids:
+        return None, None
+
+    latest_judge_task = _latest_parked_auto_rearm_judge_task(store)
+    now = datetime.now(UTC)
+    if latest_judge_task is not None and latest_judge_task.created_at is not None:
+        judge_cooldown = timedelta(hours=policy.judge_cooldown_hours)
+        if now < latest_judge_task.created_at + judge_cooldown:
+            return None, None
+
+    candidates = _collect_scoped_parked_auto_rearm_candidates(
+        config=config,
+        store=store,
+        git=git,
+        target_branch=target_branch,
+        tags=tags,
+        any_tag=any_tag,
+        scoped_owner_ids=scoped_owner_ids,
+    )
+    if not candidates:
+        return _BlindParkedAutoRearmResult(decisions=()), None
+
+    cooldown = timedelta(hours=policy.cooldown_hours)
+    candidate_gates = tuple(
+        _evaluate_parked_auto_rearm_gate(
+            config=config,
+            store=store,
             git=git,
             target_branch=target_branch,
-            task=owner_task,
+            target_sha=target_sha,
+            candidate=candidate,
+            now=now,
+            cooldown=cooldown,
         )
-        if guard_reason is not None:
-            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", guard_reason))
+        for candidate in candidates[: policy.judge_max_parked_tasks]
+    )
+    if not candidate_gates:
+        return _BlindParkedAutoRearmResult(decisions=()), None
+
+    prompt = _build_parked_auto_rearm_judge_prompt(
+        target_branch=target_branch,
+        target_sha=target_sha,
+        merge_window=_build_merge_window_entries(store=store, owner_task_ids=merge_window_owner_ids),
+        candidate_gates=candidate_gates,
+    )
+    _judge_task, selected_ids, error_detail = _run_parked_auto_rearm_judge_task(
+        config=config,
+        store=store,
+        prompt=prompt,
+    )
+    if error_detail is not None:
+        return None, error_detail
+
+    selected_id_set = frozenset(selected_ids or ())
+    decisions: list[_BlindParkedAutoRearmDecision] = []
+    for gate in candidate_gates:
+        candidate = gate.candidate
+        subject_id = candidate.subject_task.id
+        if gate.skip_detail is not None:
+            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", gate.skip_detail))
             continue
-
-        rearm_state = store.get_parked_task_rearm(
-            subject_kind="task",
-            subject_id=subject_id,
-            attention_reason=candidate.attention_reason,
-        )
-        auto_attempt_count = rearm_state.auto_attempt_count if rearm_state is not None else 0
-        if auto_attempt_count >= policy.budget:
-            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "budget exhausted"))
+        if subject_id is None or subject_id not in selected_id_set:
+            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "judge not selected"))
             continue
-
-        last_auto_attempt_at = rearm_state.last_auto_attempt_at if rearm_state is not None else None
-        if last_auto_attempt_at is not None and now < last_auto_attempt_at + cooldown:
-            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "cooldown active"))
-            continue
-
-        if policy.require_target_advanced:
-            if not target_sha:
-                decisions.append(
-                    _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unavailable")
-                )
-                continue
-            last_target_sha = rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
-            if last_target_sha == target_sha:
-                decisions.append(
-                    _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unchanged")
-                )
-                continue
-
         clear_parked_candidate_state(
             store,
             candidate,
@@ -3373,9 +3754,8 @@ def _evaluate_blind_parked_auto_rearm(
             subject_task_id=subject_id,
             target_sha=target_sha,
         )
-        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "blind auto-rearm"))
-
-    return _BlindParkedAutoRearmResult(decisions=tuple(decisions))
+        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "judge-selected auto-rearm"))
+    return _BlindParkedAutoRearmResult(decisions=tuple(decisions)), None
 
 def _scoped_member_task_ids(owner_rows: list[LineageOwnerRow], owner_task_ids: tuple[str, ...]) -> set[str]:
     member_ids = set(owner_task_ids)
@@ -3716,6 +4096,7 @@ def _run_cycle(
         if new_worker_start_cap is not None
         else None
     )
+    merge_window_owner_ids: list[str] = []
 
     def _check_canonical_checkout_boundary(action: str) -> None:
         if dry_run:
@@ -4288,6 +4669,7 @@ def _run_cycle(
                     ):
                         log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
                         log.note_merge_logged(merge_event.merge_key)
+                        merge_window_owner_ids.append(merge_event.display_task_id)
                 if rc == 0 and merge_execution_git is not None:
                     main_verify = _run_with_optional_stdout_suppressed(
                         quiet,
@@ -4758,7 +5140,7 @@ def _run_cycle(
 
     if not dry_run:
         target_sha = resolve_ref_if_possible(git, target_branch).sha
-        auto_rearm_result = _evaluate_blind_parked_auto_rearm(
+        auto_rearm_result, judge_error = _evaluate_judged_parked_auto_rearm(
             config=config,
             store=store,
             git=git,
@@ -4767,19 +5149,44 @@ def _run_cycle(
             tags=tags,
             any_tag=any_tag,
             scoped_owner_ids=scoped_owner_ids,
+            merge_window_owner_ids=tuple(dict.fromkeys(merge_window_owner_ids)),
         )
+        if auto_rearm_result is None:
+            auto_rearm_result = _evaluate_blind_parked_auto_rearm(
+                config=config,
+                store=store,
+                git=git,
+                target_branch=target_branch,
+                target_sha=target_sha,
+                tags=tags,
+                any_tag=any_tag,
+                scoped_owner_ids=scoped_owner_ids,
+            )
+            if judge_error is not None:
+                log.emit("WARN", f"parked judge fallback: {judge_error}")
         for auto_rearm_decision in auto_rearm_result.decisions:
             owner_id = auto_rearm_decision.candidate.owner_task.id
             if auto_rearm_decision.status == "rearmed" and owner_id is not None:
-                log.emit(
-                    "REARM",
-                    (
+                if auto_rearm_decision.detail == "judge-selected auto-rearm":
+                    message = (
+                        f"{owner_id}: judge auto-rearm cleared "
+                        f"{auto_rearm_decision.candidate.attention_reason}"
+                    )
+                    dedupe_key = (
+                        f"judge-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}"
+                    )
+                else:
+                    message = (
                         f"{owner_id}: blind auto-rearm cleared "
                         f"{auto_rearm_decision.candidate.attention_reason}"
-                    ),
-                    dedupe_key=(
+                    )
+                    dedupe_key = (
                         f"blind-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}"
-                    ),
+                    )
+                log.emit(
+                    "REARM",
+                    message,
+                    dedupe_key=dedupe_key,
                 )
                 work_done = True
         if auto_rearm_result.rearmed_owner_ids:
