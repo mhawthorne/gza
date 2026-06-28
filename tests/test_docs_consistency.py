@@ -1220,9 +1220,10 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
     assert "requires at least one explicit selector" in unstick_section
-    assert "--reason backstop\\|reconcile" in unstick_section
+    assert "--reason backstop\\|retry-limit\\|reconcile" in unstick_section
     assert "clear-only / no-worker operator command" in unstick_section
-    assert "does not spawn `watch`, dispatch an iterate worker, or reset any separate recovery budget" in unstick_section
+    assert "does not spawn `watch` or dispatch an iterate worker" in unstick_section
+    assert "fresh `retry-limit` clear records one durable manual rearm epoch" in unstick_section
     assert "not currently parked" in unstick_section
     assert "missing branch cannot prove unresolved" in unstick_section
     assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in config_content
@@ -1262,7 +1263,7 @@ def test_watch_attention_docs_describe_changed_only_inline_attention_behavior() 
     assert "Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set" in watch_section
     assert "Each watch pass also emits one counted `Lifecycle actions (...)` summary line before execution when actionable lifecycle work is queued for that pass" in watch_section
     assert "Guarded pending routing skips use the same centralized attention path on the first observed guarded skip" in watch_section
-    assert "watch does not re-select them for a fresh iterate worker in the meantime" in watch_section
+    assert "after that durable manual rearm, watch can select fresh shared recovery work again" in watch_section
     assert "Ordinary wait/skip states keep the existing `SKIP` dedupe behavior." in watch_section
     assert "Inline `ATTENTION` appears only when an attention key is newly visible" in internal_content
     assert "Each watch pass that emits visible attention also prints a counted `Needs attention (...)` section with the same formatted task rows for the full current visible set" in internal_content

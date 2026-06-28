@@ -523,9 +523,9 @@ def main() -> int:
     # unstick command
     unstick_parser = subparsers.add_parser(
         "unstick",
-        help="Manually clear eligible parked backstop/reconcile owner state without starting work",
+        help="Manually clear eligible parked backstop/retry-limit/reconcile owner state without starting work",
         description=(
-            "Manually clear eligible parked backstop/reconcile owner state without starting work. "
+            "Manually clear eligible parked backstop/retry-limit/reconcile owner state without starting work. "
             "Requires at least one explicit selector."
         ),
     )
@@ -552,8 +552,8 @@ def main() -> int:
         "--reason",
         action="append",
         dest="reasons",
-        choices=["backstop", "reconcile"],
-        metavar="{backstop,reconcile}",
+        choices=["backstop", "retry-limit", "reconcile"],
+        metavar="{backstop,retry-limit,reconcile}",
         help="Only select the named parked reason class (repeatable)",
     )
     unstick_parser.add_argument(

@@ -3359,6 +3359,118 @@ def test_recovery_engine_attempt_cap_reached_skips(tmp_path: Path) -> None:
     assert decision.reason_code == "retry_limit_reached"
 
 
+def test_recovery_engine_manual_rearm_resets_retry_limit_for_current_failed_subject(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
+    attempt = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
+    assert attempt.id is not None
+    attempt.status = "failed"
+    attempt.failure_reason = "INFRASTRUCTURE_ERROR"
+    attempt.completed_at = datetime.now(UTC)
+    store.update(attempt)
+
+    decision = decide_failed_task_recovery(store, attempt, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "retry_limit_reached"
+
+    rearm = store.record_parked_task_manual_rearm(
+        subject_kind="task",
+        subject_id=attempt.id,
+        attention_reason="retry-limit-reached",
+        subject_task_id=attempt.id,
+    )
+
+    assert rearm is not None
+    assert rearm.manual_rearm_epoch == 1
+
+    rearmed_decision = decide_failed_task_recovery(store, attempt, max_recovery_attempts=1)
+    assert rearmed_decision.action == "retry"
+    assert rearmed_decision.reason_code == "INFRASTRUCTURE_ERROR"
+    assert (rearmed_decision.attempt_index, rearmed_decision.attempt_limit) == (1, 2)
+
+
+def test_recovery_engine_manual_rearm_makes_timeout_resume_actionable_again(tmp_path: Path) -> None:
+    store, root = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
+    retry_child = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)
+    assert retry_child.id is not None
+    retry_child.status = "failed"
+    retry_child.failure_reason = "MAX_TURNS"
+    retry_child.session_id = "sess-rearmed-retry"
+    retry_child.completed_at = datetime.now(UTC)
+    store.update(retry_child)
+
+    resumed_retry = store.add(
+        retry_child.prompt,
+        task_type=retry_child.task_type,
+        based_on=retry_child.id,
+        depends_on=retry_child.depends_on,
+    )
+    assert resumed_retry.id is not None
+    resumed_retry.status = "failed"
+    resumed_retry.failure_reason = "TIMEOUT"
+    resumed_retry.session_id = retry_child.session_id
+    resumed_retry.spec = retry_child.spec
+    resumed_retry.branch = retry_child.branch
+    resumed_retry.completed_at = datetime.now(UTC)
+    store.update(resumed_retry)
+
+    decision = decide_failed_task_recovery(store, resumed_retry, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "retry_limit_reached"
+
+    store.record_parked_task_manual_rearm(
+        subject_kind="task",
+        subject_id=resumed_retry.id,
+        attention_reason="retry-limit-reached",
+        subject_task_id=resumed_retry.id,
+    )
+
+    rearmed_decision = decide_failed_task_recovery(store, resumed_retry, max_recovery_attempts=1)
+    assert rearmed_decision.action == "resume"
+    assert rearmed_decision.reason_code == "TIMEOUT"
+    assert (rearmed_decision.attempt_index, rearmed_decision.attempt_limit) == (1, 2)
+
+
+def test_recovery_engine_retry_limit_budget_is_relative_to_latest_manual_rearm_epoch(tmp_path: Path) -> None:
+    store, task = _failed_task(tmp_path, reason="INFRASTRUCTURE_ERROR", session_id=None)
+    first_retry = store.add(task.prompt, task_type=task.task_type, based_on=task.id, depends_on=task.depends_on)
+    assert first_retry.id is not None
+    first_retry.status = "failed"
+    first_retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    first_retry.completed_at = datetime.now(UTC)
+    store.update(first_retry)
+
+    initial = decide_failed_task_recovery(store, first_retry, max_recovery_attempts=1)
+    assert initial.reason_code == "retry_limit_reached"
+
+    store.record_parked_task_manual_rearm(
+        subject_kind="task",
+        subject_id=first_retry.id,
+        attention_reason="retry-limit-reached",
+        subject_task_id=first_retry.id,
+    )
+
+    after_rearm = decide_failed_task_recovery(store, first_retry, max_recovery_attempts=1)
+    assert after_rearm.action == "retry"
+    assert (after_rearm.attempt_index, after_rearm.attempt_limit) == (1, 2)
+
+    second_retry = store.add(
+        first_retry.prompt,
+        task_type=first_retry.task_type,
+        based_on=first_retry.id,
+        depends_on=first_retry.depends_on,
+    )
+    assert second_retry.id is not None
+    second_retry.status = "failed"
+    second_retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    second_retry.completed_at = datetime.now(UTC)
+    store.update(second_retry)
+
+    exhausted_again = decide_failed_task_recovery(store, second_retry, max_recovery_attempts=1)
+    assert exhausted_again.action == "skip"
+    assert exhausted_again.reason_code == "retry_limit_reached"
+    assert (exhausted_again.attempt_index, exhausted_again.attempt_limit) == (2, 2)
+
+
 def test_recovery_engine_resume_child_failure_stops(tmp_path: Path) -> None:
     store, root = _failed_task(tmp_path, reason="MAX_TURNS", session_id="sess-1")
     child = store.add(root.prompt, task_type=root.task_type, based_on=root.id, depends_on=root.depends_on)

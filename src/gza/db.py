@@ -46,6 +46,7 @@ __all__ = [
     "MergeUnit",
     "WatchProgressObservation",
     "WatchRecoveryBackoff",
+    "ParkedTaskRearmState",
     "TaskComment",
     "TaskStats",
     "SqliteTaskStore",
@@ -731,6 +732,18 @@ class WatchRecoveryBackoff:
     updated_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class ParkedTaskRearmState:
+    """Persisted manual rearm epoch for one parked subject/reason pair."""
+
+    subject_kind: str
+    subject_id: str
+    attention_reason: str
+    subject_task_id: str | None = None
+    manual_rearm_epoch: int = 0
+    manual_rearmed_at: datetime | None = None
+
+
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
@@ -758,6 +771,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
     "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
+    "parked_task_rearms": ("manual_rearmed_at",),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
     column for columns in _DB_TIMESTAMP_COLUMNS.values() for column in columns
@@ -1090,6 +1104,19 @@ CREATE TABLE IF NOT EXISTS watch_recovery_backoffs (
 );
 CREATE INDEX IF NOT EXISTS idx_watch_recovery_backoffs_due
     ON watch_recovery_backoffs(project_id, next_retry_at);
+
+CREATE TABLE IF NOT EXISTS parked_task_rearms (
+    project_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    attention_reason TEXT NOT NULL,
+    subject_task_id TEXT,
+    manual_rearm_epoch INTEGER NOT NULL DEFAULT 0,
+    manual_rearmed_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, subject_kind, subject_id, attention_reason)
+);
+CREATE INDEX IF NOT EXISTS idx_parked_task_rearms_task_reason
+    ON parked_task_rearms(project_id, subject_task_id, attention_reason);
 """
 
 # Migration from v56 to v57: persist last meaningful task edit timestamp
@@ -1097,8 +1124,24 @@ MIGRATION_V56_TO_V57 = """
 ALTER TABLE tasks ADD COLUMN last_edited_at TEXT;
 """
 
+# Migration from v57 to v58: durable parked-task manual rearm epochs
+MIGRATION_V57_TO_V58 = """
+CREATE TABLE IF NOT EXISTS parked_task_rearms (
+    project_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    attention_reason TEXT NOT NULL,
+    subject_task_id TEXT,
+    manual_rearm_epoch INTEGER NOT NULL DEFAULT 0,
+    manual_rearmed_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, subject_kind, subject_id, attention_reason)
+);
+CREATE INDEX IF NOT EXISTS idx_parked_task_rearms_task_reason
+    ON parked_task_rearms(project_id, subject_task_id, attention_reason);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 57
+SCHEMA_VERSION = 58
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1818,6 +1861,15 @@ _QUERY_ONLY_REQUIRED_WATCH_RECOVERY_BACKOFF_COLUMNS: tuple[str, ...] = (
     "next_retry_at",
     "updated_at",
 )
+_QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "subject_kind",
+    "subject_id",
+    "attention_reason",
+    "subject_task_id",
+    "manual_rearm_epoch",
+    "manual_rearmed_at",
+)
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
     "id",
@@ -1877,7 +1929,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2125,6 +2177,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         54: ("task_comments", "kind"),
         56: ("watch_recovery_backoffs", "updated_at"),
         57: ("tasks", "last_edited_at"),
+        58: ("parked_task_rearms", "manual_rearmed_at"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -2186,6 +2239,16 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             raise RuntimeError(
                 "Auto-migration to v56 incomplete: missing required index "
                 "idx_watch_recovery_backoffs_due"
+            )
+    if target_version >= 58:
+        if not _table_exists(conn, "parked_task_rearms"):
+            raise RuntimeError(
+                "Auto-migration to v58 incomplete: missing required table parked_task_rearms"
+            )
+        if not _index_exists(conn, "idx_parked_task_rearms_task_reason"):
+            raise RuntimeError(
+                "Auto-migration to v58 incomplete: missing required index "
+                "idx_parked_task_rearms_task_reason"
             )
 
 
@@ -2556,6 +2619,51 @@ def _ensure_required_auto_migration_artifacts(
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required index "
                     "idx_watch_recovery_backoffs_due: use a writable database."
+                ) from exc
+    if target_version >= 58:
+        if not _table_exists(conn, "parked_task_rearms"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS parked_task_rearms (
+                        project_id TEXT NOT NULL,
+                        subject_kind TEXT NOT NULL,
+                        subject_id TEXT NOT NULL,
+                        attention_reason TEXT NOT NULL,
+                        subject_task_id TEXT,
+                        manual_rearm_epoch INTEGER NOT NULL DEFAULT 0,
+                        manual_rearmed_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, subject_kind, subject_id, attention_reason)
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table parked_task_rearms; "
+                        "use a writable database to complete migration to v58, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "parked_task_rearms: use a writable database."
+                ) from exc
+        if not _index_exists(conn, "idx_parked_task_rearms_task_reason"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_parked_task_rearms_task_reason
+                        ON parked_task_rearms(project_id, subject_task_id, attention_reason)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required index idx_parked_task_rearms_task_reason; "
+                        "use a writable database to complete migration to v58, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_parked_task_rearms_task_reason: use a writable database."
                 ) from exc
 
 SCHEMA = """
@@ -3111,6 +3219,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (55, MIGRATION_V54_TO_V55),
     (56, MIGRATION_V55_TO_V56),
     (57, MIGRATION_V56_TO_V57),
+    (58, MIGRATION_V57_TO_V58),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3352,6 +3461,13 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "watch_recovery_backoffs")
 
+    def supports_parked_task_rearms(self) -> bool:
+        """Return whether durable parked-task manual rearm storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_supports_parked_task_rearms()
+        with self._connect() as conn:
+            return _table_exists(conn, "parked_task_rearms")
+
     def supports_task_artifacts(self) -> bool:
         """Return whether task artifact storage is available."""
         if self._open_mode == "query_only":
@@ -3542,6 +3658,7 @@ class SqliteTaskStore:
             "task_artifacts",
             "watch_progress_observations",
             "watch_recovery_backoffs",
+            "parked_task_rearms",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -3661,6 +3778,17 @@ class SqliteTaskStore:
                     "Query-only DB open detected missing required table watch_recovery_backoffs; "
                     "watch transient-recovery cooldowns will be unavailable."
                 )
+        if not self._query_only_supports_parked_task_rearms():
+            if self._query_only_table_exists.get("parked_task_rearms", False):
+                self._startup_warnings.append(
+                    "Query-only DB open detected incomplete parked_task_rearms schema; "
+                    "parked-task manual rearm state will be unavailable."
+                )
+            else:
+                self._startup_warnings.append(
+                    "Query-only DB open detected missing required table parked_task_rearms; "
+                    "parked-task manual rearm state will be unavailable."
+                )
         run_steps_issue = self._query_only_run_steps_warning()
         if run_steps_issue is not None:
             self._startup_warnings.append(run_steps_issue)
@@ -3725,6 +3853,15 @@ class SqliteTaskStore:
         return self._query_only_table_exists.get("watch_recovery_backoffs", False) and all(
             self._query_only_has_column("watch_recovery_backoffs", column)
             for column in _QUERY_ONLY_REQUIRED_WATCH_RECOVERY_BACKOFF_COLUMNS
+        )
+
+    def _query_only_supports_parked_task_rearms(self) -> bool:
+        """Return True when query-only reads can safely use parked-task rearm artifacts."""
+        if self._open_mode != "query_only":
+            return True
+        return self._query_only_table_exists.get("parked_task_rearms", False) and all(
+            self._query_only_has_column("parked_task_rearms", column)
+            for column in _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS
         )
 
     def _query_only_supports_run_steps(self) -> bool:
@@ -5242,6 +5379,18 @@ class SqliteTaskStore:
             updated_at=_parse_db_timestamp(row["updated_at"]),
         )
 
+    def _row_to_parked_task_rearm(self, row: sqlite3.Row | None) -> ParkedTaskRearmState | None:
+        if row is None:
+            return None
+        return ParkedTaskRearmState(
+            subject_kind=str(row["subject_kind"]),
+            subject_id=str(row["subject_id"]),
+            attention_reason=str(row["attention_reason"]),
+            subject_task_id=str(row["subject_task_id"]) if row["subject_task_id"] is not None else None,
+            manual_rearm_epoch=int(row["manual_rearm_epoch"]) if row["manual_rearm_epoch"] is not None else 0,
+            manual_rearmed_at=_parse_db_timestamp(row["manual_rearmed_at"]),
+        )
+
     def _row_to_task_artifact(self, row: sqlite3.Row | None) -> TaskArtifact | None:
         if row is None:
             return None
@@ -5787,6 +5936,84 @@ class SqliteTaskStore:
                     updated_at,
                 ),
             )
+
+    def get_parked_task_rearm(
+        self,
+        *,
+        subject_kind: str,
+        subject_id: str,
+        attention_reason: str,
+    ) -> ParkedTaskRearmState | None:
+        """Fetch one persisted parked-task manual rearm row."""
+        if not self.supports_parked_task_rearms():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM parked_task_rearms
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                  AND attention_reason = ?
+                """,
+                (self._project_id, subject_kind, subject_id, attention_reason),
+            ).fetchone()
+        return self._row_to_parked_task_rearm(row)
+
+    def record_parked_task_manual_rearm(
+        self,
+        *,
+        subject_kind: str,
+        subject_id: str,
+        attention_reason: str,
+        subject_task_id: str | None = None,
+    ) -> ParkedTaskRearmState | None:
+        """Increment and persist the manual rearm epoch for one parked subject/reason pair."""
+        if not self.supports_parked_task_rearms():
+            return None
+        manual_rearmed_at = _format_db_timestamp(datetime.now(UTC))
+        assert manual_rearmed_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO parked_task_rearms(
+                    project_id,
+                    subject_kind,
+                    subject_id,
+                    attention_reason,
+                    subject_task_id,
+                    manual_rearm_epoch,
+                    manual_rearmed_at
+                )
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(project_id, subject_kind, subject_id, attention_reason)
+                DO UPDATE SET
+                    subject_task_id = excluded.subject_task_id,
+                    manual_rearm_epoch = parked_task_rearms.manual_rearm_epoch + 1,
+                    manual_rearmed_at = excluded.manual_rearmed_at
+                """,
+                (
+                    self._project_id,
+                    subject_kind,
+                    subject_id,
+                    attention_reason,
+                    subject_task_id,
+                    manual_rearmed_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM parked_task_rearms
+                WHERE project_id = ?
+                  AND subject_kind = ?
+                  AND subject_id = ?
+                  AND attention_reason = ?
+                """,
+                (self._project_id, subject_kind, subject_id, attention_reason),
+            ).fetchone()
+        return self._row_to_parked_task_rearm(row)
 
     def upsert_watch_progress_observation(self, observation: WatchProgressObservation) -> None:
         """Insert or replace one persisted watch observation row."""

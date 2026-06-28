@@ -20,6 +20,7 @@ from gza.db import (
     ManualMigrationRequired,
     MergeTargetResolutionError,
     NewTaskParams,
+    ParkedTaskRearmState,
     SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
@@ -10083,6 +10084,35 @@ class TestSharedDbIsolationAndImportGating:
         assert "watch_recovery_backoffs" in tables
         assert "idx_watch_recovery_backoffs_due" in indexes
 
+    def test_auto_migration_v57_to_v58_adds_parked_task_rearms_table(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_parked_task_rearms_task_reason")
+            conn.execute("DROP TABLE IF EXISTS parked_task_rearms")
+            conn.execute("UPDATE schema_version SET version = 57")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            indexes = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+            }
+
+        assert version == SCHEMA_VERSION
+        assert "parked_task_rearms" in tables
+        assert "idx_parked_task_rearms_task_reason" in indexes
+
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
 
@@ -10152,6 +10182,45 @@ class TestSharedDbIsolationAndImportGating:
             )
             is None
         )
+
+    def test_parked_task_manual_rearm_round_trip_and_increment(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="retry-limit-reached",
+            subject_task_id="gza-100",
+        )
+
+        assert first is not None
+        assert first == ParkedTaskRearmState(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="retry-limit-reached",
+            subject_task_id="gza-100",
+            manual_rearm_epoch=1,
+            manual_rearmed_at=first.manual_rearmed_at,
+        )
+        assert first.manual_rearmed_at is not None
+
+        second = store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="retry-limit-reached",
+            subject_task_id="gza-100",
+        )
+
+        assert second is not None
+        assert second.manual_rearm_epoch == 2
+        assert second.manual_rearmed_at is not None
+        assert second.manual_rearmed_at >= first.manual_rearmed_at
+        assert store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id="gza-100",
+            attention_reason="retry-limit-reached",
+        ) == second
 
     def test_query_only_open_pre_v56_missing_watch_recovery_backoffs_degrades_safely(
         self, tmp_path: Path

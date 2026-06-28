@@ -629,14 +629,23 @@ when the resolved implementation already reached `completed`; if the implementat
 completed and is merely parked/failed, operators must be directed to retry or
 re-implement instead of creating a fix task.
 
-Manual clear-only operator semantics are intentionally narrow in this slice. `uv run gza unstick`
-may target parked owners with reason class `backstop` (`watch-no-progress-backstop`) or
-`reconcile` (`reconcile-needs-manual-resolution`), but it MUST clear only the watch-owned
-exclusion state that kept the owner out of normal watch/advance pickup. It MUST NOT start
-workers, reset recovery-attempt budgets, or downgrade landed/moot guards. If the selected
-owner is already merged, terminal `empty`/`redundant`, branch-missing and therefore
-unprovable, or otherwise not currently parked, the command MUST skip it with an
-operator-visible reason instead of forcing it back into the actionable set.
+Manual clear-only operator semantics are intentionally narrow. `uv run gza unstick`
+may target parked owners with reason class `backstop` (`watch-no-progress-backstop`),
+`retry-limit` (`retry-limit-reached`), or `reconcile`
+(`reconcile-needs-manual-resolution`).
+
+- For `backstop` and `reconcile`, it MUST clear only the watch-owned exclusion state that
+  kept the owner out of normal watch/advance pickup.
+- For `retry-limit`, it MUST record one durable manual-rearm epoch for the parked subject
+  and reason so the next shared recovery evaluation measures retry budget from that epoch
+  instead of lifetime history.
+- In all cases it MUST NOT start workers itself or downgrade landed/moot guards.
+
+If the selected owner is already merged, terminal `empty`/`redundant`, branch-missing
+and therefore unprovable, or otherwise not currently parked, the command MUST skip it
+with an operator-visible reason instead of forcing it back into the actionable set. A
+second `retry-limit` clear after the owner is no longer parked MUST therefore report
+`not currently parked`, not create another effective reset.
 
 *Status: reconciled to the strings the engine actually emits as of the 2026-06-02
 behavior-check (`reviews/20260602003648-behavior-check.md`), spec-follows-code. Remaining

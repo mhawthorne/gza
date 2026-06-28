@@ -59,6 +59,7 @@ _REBASE_INFRA_LOG_MARKERS = (
     "/gza-git/",
     "worktree metadata became unavailable",
 )
+RETRY_LIMIT_REACHED_ATTENTION_REASON = "retry-limit-reached"
 
 _ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
 _MANUAL_ONLY_REASONS = {
@@ -150,6 +151,20 @@ class RecoveryChainState:
     @property
     def has_resume(self) -> bool:
         return "resume" in self.steps
+
+
+@dataclass(frozen=True)
+class _RecoveryPolicyEpoch:
+    """Effective retry-budget epoch for one recovery-chain evaluation."""
+
+    manual_rearmed_at: datetime | None
+    effective_steps: tuple[RecoveryRole, ...]
+
+    @property
+    def role(self) -> RecoveryRole:
+        if not self.effective_steps:
+            return "original"
+        return self.effective_steps[-1]
 
 
 @dataclass(frozen=True)
@@ -624,6 +639,60 @@ def get_recovery_chain_root_task_id(
 ) -> str | None:
     """Return the recovery-only lineage root for a task."""
     return _build_recovery_chain_snapshot(store, task, read_context=read_context).root_task.id
+
+
+def _task_for_recovery_snapshot_id(
+    store: SqliteTaskStore,
+    *,
+    task_id: str,
+    read_context: RecoveryReadContext | None,
+) -> DbTask | None:
+    if read_context is not None:
+        return read_context.get_task(task_id)
+    return store.get(task_id)
+
+
+def _recovery_policy_epoch(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    snapshot: _RecoveryChainSnapshot,
+    read_context: RecoveryReadContext | None = None,
+) -> _RecoveryPolicyEpoch:
+    if not store.supports_parked_task_rearms():
+        return _RecoveryPolicyEpoch(manual_rearmed_at=None, effective_steps=snapshot.steps)
+
+    latest_manual_rearmed_at: datetime | None = None
+    for ancestor_id in snapshot.ancestor_ids:
+        rearm_state = store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=ancestor_id,
+            attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
+        )
+        if rearm_state is None or rearm_state.manual_rearmed_at is None:
+            continue
+        if latest_manual_rearmed_at is None or rearm_state.manual_rearmed_at > latest_manual_rearmed_at:
+            latest_manual_rearmed_at = rearm_state.manual_rearmed_at
+
+    if latest_manual_rearmed_at is None:
+        return _RecoveryPolicyEpoch(manual_rearmed_at=None, effective_steps=snapshot.steps)
+
+    ancestry_tasks: list[DbTask] = []
+    for ancestor_id in snapshot.ancestor_ids:
+        ancestor = _task_for_recovery_snapshot_id(store, task_id=ancestor_id, read_context=read_context)
+        if ancestor is None:
+            return _RecoveryPolicyEpoch(manual_rearmed_at=latest_manual_rearmed_at, effective_steps=())
+        ancestry_tasks.append(ancestor)
+
+    effective_steps: list[RecoveryRole] = []
+    for child, step in zip(ancestry_tasks[1:], snapshot.steps, strict=False):
+        if child.created_at is not None and child.created_at > latest_manual_rearmed_at:
+            effective_steps.append(step)
+
+    return _RecoveryPolicyEpoch(
+        manual_rearmed_at=latest_manual_rearmed_at,
+        effective_steps=tuple(effective_steps),
+    )
 
 
 def has_recovery_chain_ancestor_in_ids(
@@ -1223,7 +1292,7 @@ def list_failed_tasks_for_recovery(
 
 
 def _policy_attempt_counters(
-    chain: RecoveryChainState,
+    chain: RecoveryChainState | _RecoveryPolicyEpoch,
     *,
     max_recovery_attempts: int,
     consumed_attempts: int = 0,
@@ -1233,7 +1302,7 @@ def _policy_attempt_counters(
     attempt_limit = 2
     # Display counters should reflect the bounded shared policy budget, not raw
     # based_on depth, so exhausted chains saturate at N/N instead of N+1/N.
-    attempt_index = min(max(len(chain.steps) + 1, consumed_attempts + 1), attempt_limit)
+    attempt_index = min(max(len(chain.effective_steps if isinstance(chain, _RecoveryPolicyEpoch) else chain.steps) + 1, consumed_attempts + 1), attempt_limit)
     return (attempt_index, attempt_limit)
 
 
@@ -1251,6 +1320,7 @@ def _matching_failed_terminal_descendants(
     snapshot: _RecoveryChainSnapshot,
     *,
     expected_action: RecoveryAction | None,
+    manual_rearmed_at: datetime | None = None,
     read_context: RecoveryReadContext | None = None,
 ) -> list[DbTask]:
     if expected_action is None:
@@ -1259,6 +1329,11 @@ def _matching_failed_terminal_descendants(
         descendant
         for descendant in snapshot.terminal_descendants
         if descendant.status == "failed"
+        and (
+            manual_rearmed_at is None
+            or descendant.created_at is None
+            or descendant.created_at > manual_rearmed_at
+        )
         and classify_recovery_row(store, descendant, read_context=read_context) == expected_action
     ]
 
@@ -1558,8 +1633,9 @@ def decide_failed_task_recovery(
     assert task.id is not None
     task_id = str(task.id)
     launch_mode: Literal["iterate", "worker", "none"] = "iterate" if task.task_type == "implement" else "worker"
-    chain = get_recovery_chain_state(store, task, read_context=read_context)
     snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
+    chain = get_recovery_chain_state(store, task, read_context=read_context)
+    policy_epoch = _recovery_policy_epoch(store, task, snapshot=snapshot, read_context=read_context)
     attempt_index, attempt_limit = _policy_attempt_counters(chain, max_recovery_attempts=max_recovery_attempts)
 
     if task.status != "failed":
@@ -1616,11 +1692,15 @@ def decide_failed_task_recovery(
         expected_action = _expected_recovery_action(
             task,
             reason=reason,
-            chain=chain,
+            chain=RecoveryChainState(role=policy_epoch.role, steps=policy_epoch.effective_steps),
             prerequisite_reconciliation=prerequisite_reconciliation,
         )
     else:
-        expected_action = _expected_recovery_action(task, reason=reason, chain=chain)
+        expected_action = _expected_recovery_action(
+            task,
+            reason=reason,
+            chain=RecoveryChainState(role=policy_epoch.role, steps=policy_epoch.effective_steps),
+        )
     direct_reconcile_attempts = (
         load_branch_publication_state(store, task.id).reconcile_attempts_consumed
         if expected_action == "reconcile"
@@ -1631,11 +1711,12 @@ def decide_failed_task_recovery(
             store,
             snapshot,
             expected_action=expected_action,
+            manual_rearmed_at=policy_epoch.manual_rearmed_at,
             read_context=read_context,
         )
     ) + direct_reconcile_attempts
     attempt_index, attempt_limit = _policy_attempt_counters(
-        chain,
+        policy_epoch,
         max_recovery_attempts=max_recovery_attempts,
         consumed_attempts=consumed_attempts,
     )
@@ -1881,13 +1962,20 @@ def decide_failed_task_recovery(
                 attempt_limit=attempt_limit,
                 recovery_task_id=_single_descendant_id_with_status(deeper_descendants, status=status),
             )
-    unresolved_terminals = _list_unresolved_recovery_terminal_descendants(snapshot)
     matching_failed_terminals = _matching_failed_terminal_descendants(
         store,
         snapshot,
         expected_action=expected_action,
+        manual_rearmed_at=policy_epoch.manual_rearmed_at,
         read_context=read_context,
     )
+    unresolved_terminals = [
+        descendant
+        for descendant in _list_unresolved_recovery_terminal_descendants(snapshot)
+        if policy_epoch.manual_rearmed_at is None
+        or descendant.created_at is None
+        or descendant.created_at > policy_epoch.manual_rearmed_at
+    ]
     if any(descendant.status == "dropped" for descendant in unresolved_terminals):
         return _skip_decision(
             task_id=task_id,
@@ -2051,7 +2139,7 @@ def _get_failed_recovery_needs_attention_reason(
     if decision.reason_code == "retryable_provider_error":
         return "retryable-provider-error"
     if decision.reason_code in {"retry_limit_reached", "manual_review_required"}:
-        return "retry-limit-reached"
+        return RETRY_LIMIT_REACHED_ATTENTION_REASON
     if decision.reason_code == "recovery_ambiguous":
         return "recovery-ambiguous"
     if decision.reason_code != "recovery_has_newer_unresolved_descendant":

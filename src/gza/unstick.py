@@ -11,6 +11,7 @@ from .config import Config
 from .db import SqliteTaskStore, Task as DbTask
 from .git import Git
 from .lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows_in_read_session
+from .recovery_engine import RETRY_LIMIT_REACHED_ATTENTION_REASON
 from .sync_ops import build_branch_cohorts_for_tasks, reconcile_branch_merge_truth
 from .task_query import normalize_tag_filters, task_matches_tag_filters
 from .watch_progress import (
@@ -19,14 +20,16 @@ from .watch_progress import (
     reconcile_stale_watch_no_progress_parks,
 )
 
-ParkReasonClass = Literal["backstop", "reconcile"]
+ParkReasonClass = Literal["backstop", "retry-limit", "reconcile"]
 
 RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON = "reconcile-needs-manual-resolution"
-SUPPORTED_PARK_REASON_CLASSES: tuple[ParkReasonClass, ...] = ("backstop", "reconcile")
+SUPPORTED_PARK_REASON_CLASSES: tuple[ParkReasonClass, ...] = ("backstop", "retry-limit", "reconcile")
+_UNSTICK_DISCOVERY_STATUSES: tuple[str, ...] = ("failed", "completed", "unmerged", "dropped")
 _REASON_CLASS_BY_ATTENTION_REASON = cast(
     "Mapping[str, ParkReasonClass]",
     {
         WATCH_NO_PROGRESS_BACKSTOP_REASON: "backstop",
+        RETRY_LIMIT_REACHED_ATTENTION_REASON: "retry-limit",
         RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON: "reconcile",
     },
 )
@@ -84,7 +87,7 @@ def discover_parked_tasks(
         store,
         LineageOwnerQuery(
             limit=None,
-            statuses=("completed", "unmerged", "dropped"),
+            statuses=_UNSTICK_DISCOVERY_STATUSES,
             include_skipped=True,
             exclude_dropped_from_planning=True,
             max_recovery_attempts=config.max_resume_attempts,
@@ -94,6 +97,7 @@ def discover_parked_tasks(
         target_branch=target_branch,
         persist_post_merge_rebase_state=False,
         persist_review_clearance=False,
+        reuse_recovery_merge_context=True,
     )
 
     member_owner_rows: dict[str, LineageOwnerRow] = {}
@@ -248,6 +252,11 @@ def _select_targets(
             return True
         return candidate is not None and candidate.reason_class in reason_filter
 
+    def _matches_tag_only(owner_task: DbTask) -> bool:
+        if tags is None:
+            return True
+        return task_matches_tag_filters(task_tags=owner_task.tags, tag_filters=tags, any_tag=any_tag)
+
     def _append(owner_task: DbTask, candidate: ParkedTaskCandidate | None) -> None:
         owner_id = owner_task.id
         if owner_id is None:
@@ -269,7 +278,7 @@ def _select_targets(
                 for candidate in matching_candidates:
                     _append(owner_task, candidate)
                 continue
-            if _matches_filters(owner_task, None):
+            if _matches_tag_only(owner_task):
                 _append(owner_task, None)
         return tuple(selected)
 
@@ -332,6 +341,13 @@ def _apply_selected_target(
             detail="not currently parked",
         )
     clear_watch_progress_subject(store, subject_task=parked.subject_task)
+    if parked.reason_class == "retry-limit" and parked.subject_task.id is not None:
+        store.record_parked_task_manual_rearm(
+            subject_kind="task",
+            subject_id=parked.subject_task.id,
+            attention_reason=parked.attention_reason,
+            subject_task_id=parked.subject_task.id,
+        )
     return UnstickOutcome(
         owner_task=owner_task,
         reason_class=parked.reason_class,

@@ -12,7 +12,7 @@ from ._common import get_store, parse_cli_tag_filters
 
 
 def cmd_unstick(args: argparse.Namespace) -> int:
-    """Clear eligible parked watch/reconcile exclusion state without starting work."""
+    """Clear eligible parked owner state without starting work."""
     task_ids = tuple(getattr(args, "task_ids", ()) or ())
     reason_classes = tuple(getattr(args, "reasons", ()) or ())
     select_all = bool(getattr(args, "all", False))

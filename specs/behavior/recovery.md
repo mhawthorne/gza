@@ -228,11 +228,20 @@ its stored action.
   `state in {dropped, superseded}`.
 - `watch`, `advance`, `iterate`, and query/recovery-lane surfaces MUST agree on the same
   recovery decision for the same task.
-- The clear-only manual `uv run gza unstick` slice does **not** alter failed-task recovery
-  budget state, retry-limit state, or recovery-attempt accounting. In this slice it is
-  limited to clearing watch-owned exclusion state for selected `watch-no-progress-backstop`
-  or `reconcile-needs-manual-resolution` owners, leaving `retry-limit-reached` and the
-  rest of the recovery budget contract unchanged.
+- Manual `uv run gza unstick --reason retry-limit` is the operator-controlled rearm for
+  `retry-limit-reached`. It MUST persist one durable manual-rearm record keyed by the
+  parked subject and reason, with an incrementing `manual_rearm_epoch` plus
+  `manual_rearmed_at`.
+- Shared recovery policy MUST evaluate bounded retry/resume budget relative to the latest
+  applicable manual-rearm epoch for that recovery chain, not relative to lifetime failed
+  descendants. Historical recovery descendants MUST remain intact for auditability.
+- A fresh manual clear MUST create exactly one new effective epoch. Re-running `unstick`
+  after the owner is no longer currently parked MUST be a safe no-op that reports `not
+  currently parked`, not a second effective reset.
+- `backstop` and `reconcile` clears remain clear-only watch-state resets. `retry-limit`
+  clear is also clear-only in the sense that it MUST NOT spawn workers itself; it only
+  records the durable rearm epoch that lets the next shared recovery evaluation become
+  actionable again.
 
 ## Policy knobs
 

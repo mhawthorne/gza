@@ -7,7 +7,9 @@ from unittest.mock import Mock
 
 from gza.config import Config
 from gza.db import WatchProgressObservation
+from gza.git import Git
 from gza.lineage_query import LineageOwnerRow
+from gza.recovery_engine import RETRY_LIMIT_REACHED_ATTENTION_REASON, _MergeContext, decide_failed_task_recovery
 from gza.unstick import (
     RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON,
     discover_parked_tasks,
@@ -20,19 +22,33 @@ from gza.watch_progress import (
 from tests.cli.conftest import make_store, setup_config
 
 
-class _GitDouble:
+class _GitDouble(Git):
+    def __init__(self) -> None:
+        pass
+
     def default_branch(self) -> str:
         return "main"
 
     def branch_exists(self, branch: str) -> bool:
         return not branch.startswith("missing/")
 
+    def branches_exist(self, branches: tuple[str, ...]) -> dict[str, bool]:
+        return {branch: self.branch_exists(branch) for branch in branches}
+
     def ref_exists(self, ref: str) -> bool:
         return False
+
+    def resolve_refs(self, refs, peel: str = "commit") -> dict[str, str | None]:
+        del peel
+        return {str(ref): self.rev_parse_if_exists(str(ref)) for ref in refs}
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
         del into, use_cherry
         return branch.startswith("merged/")
+
+    def can_merge(self, branch: str, into: str | None = None) -> bool:
+        del branch, into
+        return True
 
     def get_diff_numstat(self, revision_range: str) -> str:
         del revision_range
@@ -46,6 +62,9 @@ class _GitDouble:
 
     def rev_parse_if_exists(self, ref: str) -> str | None:
         return f"sha-{ref}"
+
+    def local_branch_names(self) -> tuple[str, ...]:
+        return ()
 
 
 def _config_and_store(tmp_path: Path):
@@ -116,6 +135,44 @@ def _make_backstop_owner(store, *, prompt: str, branch: str):
         unresolved_leaf_summary=(),
     )
     return impl, owner_row
+
+
+def _make_retry_limit_owner(store, *, prompt: str, branch: str):
+    impl = store.add(prompt, task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.failure_reason = "INFRASTRUCTURE_ERROR"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = branch
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    retry = store.add(prompt, task_type="implement", based_on=impl.id, depends_on=impl.depends_on)
+    assert retry.id is not None
+    retry.status = "failed"
+    retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    retry.completed_at = datetime.now(UTC)
+    retry.branch = branch
+    retry.has_commits = True
+    store.update(retry)
+
+    owner_row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, retry),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "skip",
+            "description": "automatic recovery stops here; retry limit reached",
+            "needs_attention_reason": RETRY_LIMIT_REACHED_ATTENTION_REASON,
+            "subject_task_id": retry.id,
+        },
+        next_action_reason="needs_attention",
+        unresolved_tasks=(retry,),
+        unresolved_leaf_summary=(),
+    )
+    return impl, retry, owner_row
 
 
 def test_discover_parked_tasks_includes_owner_row_reconcile_and_watch_backstop(tmp_path: Path) -> None:
@@ -224,6 +281,86 @@ def test_discover_parked_tasks_includes_owner_row_reconcile_and_watch_backstop(t
     }
 
 
+def test_discover_parked_tasks_includes_retry_limit_owner_row(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    impl, retry, owner_row = _make_retry_limit_owner(
+        store,
+        prompt="Retry limit owner",
+        branch="feature/retry-limit",
+    )
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        candidates, stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert stale_cleared == 0
+    assert len(candidates) == 1
+    assert candidates[0].owner_task.id == impl.id
+    assert candidates[0].subject_task.id == retry.id
+    assert candidates[0].reason_class == "retry-limit"
+
+
+def test_discover_parked_tasks_includes_real_retry_limit_failed_owner_row(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = _GitDouble()
+
+    impl = store.add("Real retry limit owner", task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.failure_reason = "MAX_TURNS"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/real-retry-limit"
+    impl.session_id = "sess-real-retry-limit"
+    impl.has_commits = False
+    store.update(impl)
+
+    first_retry = store.add(impl.prompt, task_type="implement", based_on=impl.id, depends_on=impl.depends_on)
+    assert first_retry.id is not None
+    first_retry.status = "failed"
+    first_retry.failure_reason = "MAX_TURNS"
+    first_retry.completed_at = datetime.now(UTC)
+    first_retry.branch = impl.branch
+    first_retry.session_id = impl.session_id
+    first_retry.has_commits = False
+    store.update(first_retry)
+
+    exhausted_retry = store.add(impl.prompt, task_type="implement", based_on=impl.id, depends_on=impl.depends_on)
+    assert exhausted_retry.id is not None
+    exhausted_retry.status = "failed"
+    exhausted_retry.failure_reason = "MAX_TURNS"
+    exhausted_retry.completed_at = datetime.now(UTC)
+    exhausted_retry.branch = impl.branch
+    exhausted_retry.session_id = impl.session_id
+    exhausted_retry.has_commits = False
+    store.update(exhausted_retry)
+
+    with patch("gza.recovery_engine._load_merge_context", return_value=_MergeContext(git=git, default_branch="main")):
+        decision = decide_failed_task_recovery(store, impl, max_recovery_attempts=config.max_resume_attempts)
+    assert decision.action == "skip"
+    assert decision.reason_code == "retry_limit_reached"
+
+    with patch("gza.recovery_engine._load_merge_context", return_value=_MergeContext(git=git, default_branch="main")):
+        candidates, stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert stale_cleared == 0
+    assert [(candidate.owner_task.id, candidate.subject_task.id, candidate.reason_class) for candidate in candidates] == [
+        (impl.id, impl.id, "retry-limit"),
+    ]
+
+
 def test_select_and_clear_parked_tasks_clears_backstop_and_is_idempotent(tmp_path: Path) -> None:
     config, store = _config_and_store(tmp_path)
     git = _GitDouble()
@@ -253,6 +390,73 @@ def test_select_and_clear_parked_tasks_clears_backstop_and_is_idempotent(tmp_pat
             task_ids=(impl.id,),
         )
     assert [(outcome.status, outcome.detail) for outcome in second.outcomes] == [("skipped", "not currently parked")]
+
+
+def test_select_and_clear_parked_tasks_finds_and_rearms_real_retry_limit_owner_row(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = _GitDouble()
+
+    impl = store.add("Retry limit clear from live discovery", task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.failure_reason = "MAX_TURNS"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/live-retry-limit-clear"
+    impl.session_id = "sess-live-retry-limit-clear"
+    impl.has_commits = False
+    store.update(impl)
+
+    first_retry = store.add(impl.prompt, task_type="implement", based_on=impl.id, depends_on=impl.depends_on)
+    assert first_retry.id is not None
+    first_retry.status = "failed"
+    first_retry.failure_reason = "MAX_TURNS"
+    first_retry.completed_at = datetime.now(UTC)
+    first_retry.branch = impl.branch
+    first_retry.session_id = impl.session_id
+    first_retry.has_commits = False
+    store.update(first_retry)
+
+    exhausted_retry = store.add(impl.prompt, task_type="implement", based_on=impl.id, depends_on=impl.depends_on)
+    assert exhausted_retry.id is not None
+    exhausted_retry.status = "failed"
+    exhausted_retry.failure_reason = "MAX_TURNS"
+    exhausted_retry.completed_at = datetime.now(UTC)
+    exhausted_retry.branch = impl.branch
+    exhausted_retry.session_id = impl.session_id
+    exhausted_retry.has_commits = False
+    store.update(exhausted_retry)
+
+    with patch("gza.recovery_engine._load_merge_context", return_value=_MergeContext(git=git, default_branch="main")):
+        before = decide_failed_task_recovery(store, impl, max_recovery_attempts=config.max_resume_attempts)
+    assert before.action == "skip"
+    assert before.reason_code == "retry_limit_reached"
+
+    with patch("gza.recovery_engine._load_merge_context", return_value=_MergeContext(git=git, default_branch="main")):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(exhausted_retry.id,),
+            reason_classes=("retry-limit",),
+        )
+
+    assert [(outcome.status, outcome.reason_class, outcome.detail) for outcome in result.outcomes] == [
+        ("rearmed", "retry-limit", f"cleared {RETRY_LIMIT_REACHED_ATTENTION_REASON}"),
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=impl.id,
+        attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
+    )
+    assert rearm is not None
+    assert rearm.manual_rearm_epoch == 1
+    with patch("gza.recovery_engine._load_merge_context", return_value=_MergeContext(git=git, default_branch="main")):
+        after = decide_failed_task_recovery(store, impl, max_recovery_attempts=config.max_resume_attempts)
+    assert after.action == "resume"
 
 
 def test_select_and_clear_parked_tasks_handles_reconcile_clear_only(tmp_path: Path) -> None:
@@ -298,6 +502,60 @@ def test_select_and_clear_parked_tasks_handles_reconcile_clear_only(tmp_path: Pa
         ("rearmed", "reconcile", f"cleared {RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON}"),
     ]
     assert store.list_all_watch_progress_observations() == []
+
+
+def test_select_and_clear_parked_tasks_records_retry_limit_manual_rearm_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    _impl, retry, owner_row = _make_retry_limit_owner(
+        store,
+        prompt="Retry limit clear",
+        branch="feature/retry-limit-clear",
+    )
+    assert retry.id is not None
+    retry.branch = None
+    store.update(retry)
+
+    before = decide_failed_task_recovery(store, retry, max_recovery_attempts=1)
+    assert before.action == "skip"
+    assert before.reason_code == "retry_limit_reached"
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        first = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(retry.id,),
+            reason_classes=("retry-limit",),
+        )
+
+    assert [(outcome.status, outcome.reason_class, outcome.detail) for outcome in first.outcomes] == [
+        ("rearmed", "retry-limit", f"cleared {RETRY_LIMIT_REACHED_ATTENTION_REASON}"),
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=retry.id,
+        attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
+    )
+    assert rearm is not None
+    assert rearm.manual_rearm_epoch == 1
+    after = decide_failed_task_recovery(store, retry, max_recovery_attempts=1)
+    assert after.action == "retry"
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((), object())):
+        second = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(retry.id,),
+            reason_classes=("retry-limit",),
+        )
+
+    assert [(outcome.status, outcome.detail) for outcome in second.outcomes] == [("skipped", "not currently parked")]
 
 
 def test_select_and_clear_parked_tasks_applies_landed_and_missing_branch_guards(tmp_path: Path) -> None:
