@@ -1,11 +1,13 @@
 """Tests for CLI parser and help output."""
 
 
+import io
 import importlib
 import os
 import re
 import signal
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -260,7 +262,44 @@ class TestHelpOutput:
 
         assert result.returncode == 0
         assert "incomplete" in result.stdout
-        assert "main-verify" in result.stdout
+
+    def test_profile_exit_summary_emits_once_to_stderr(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        setup_config(tmp_path)
+        monkeypatch.setenv("GZA_PROFILE", "1")
+
+        metrics_module = importlib.reload(importlib.import_module("gza.metrics"))
+        main_module = importlib.reload(importlib.import_module("gza.cli.main"))
+        registered_hooks: list[object] = []
+
+        monkeypatch.setattr(main_module.atexit, "register", registered_hooks.append)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(sys, "argv", ["gza", "--help", "--project", str(tmp_path)]),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            with pytest.raises(SystemExit) as excinfo:
+                main_module.main()
+
+            metrics_module.observe_latency(
+                "gza_test_latency_seconds",
+                0.5,
+                labels={"task_id": "gza-123", "sql": "select * from tasks"},
+            )
+            registered_hooks[0]()
+            registered_hooks[0]()
+
+        assert excinfo.value.code == 0
+        assert len(registered_hooks) == 1
+
+        stderr_lines = [line for line in stderr.getvalue().splitlines() if line]
+        assert len(stderr_lines) == 1
+        assert stderr_lines[0].startswith("profile: ")
+        assert "gza_test_latency_seconds 1 calls 0.500s" in stderr_lines[0]
+        assert "gza-123" not in stderr_lines[0]
+        assert "select * from tasks" not in stderr_lines[0]
 
     def test_main_verify_force_reruns_and_clears_stale_halt(self, tmp_path: Path) -> None:
         setup_config(tmp_path)

@@ -1,7 +1,9 @@
 """Parser setup, subparser definitions, dispatch, and main() entry point."""
 
 import argparse
+import atexit
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ from ..db import (
     run_v27_migration,
 )
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
+from ..metrics import enabled as metrics_enabled, render_cli_summary, snapshot
 from ..task_types import CLI_ADD_TASK_TYPES
 from ._common import (
     GzaArgumentParser,
@@ -232,7 +235,40 @@ def _keyboard_interrupt_exit() -> int:
     return 130
 
 
+_PROFILE_EXIT_HOOK_REGISTERED = False
+_PROFILE_EXIT_SUMMARY_EMITTED = False
+_PROFILE_EXIT_STARTED_AT = 0.0
+
+
+def _emit_profile_exit_summary() -> None:
+    """Write the aggregate profile summary to stderr once per process."""
+    global _PROFILE_EXIT_SUMMARY_EMITTED
+
+    if _PROFILE_EXIT_SUMMARY_EMITTED or not metrics_enabled():
+        return
+
+    _PROFILE_EXIT_SUMMARY_EMITTED = True
+    print(
+        render_cli_summary(snapshot(), total_seconds=time.perf_counter() - _PROFILE_EXIT_STARTED_AT),
+        file=sys.stderr,
+    )
+
+
+def _install_profile_exit_summary() -> None:
+    """Register the CLI profile exit hook once in the canonical startup path."""
+    global _PROFILE_EXIT_HOOK_REGISTERED, _PROFILE_EXIT_STARTED_AT
+
+    if _PROFILE_EXIT_HOOK_REGISTERED or not metrics_enabled():
+        return
+
+    _PROFILE_EXIT_HOOK_REGISTERED = True
+    _PROFILE_EXIT_STARTED_AT = time.perf_counter()
+    atexit.register(_emit_profile_exit_summary)
+
+
 def main() -> int:
+    _install_profile_exit_summary()
+
     parser = GzaArgumentParser(
         description="Gza - AI agent task runner",
         formatter_class=SortingHelpFormatter,
