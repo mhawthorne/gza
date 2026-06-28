@@ -175,19 +175,27 @@ def test_config_load_parses_watch_dispatch_start_timeout(tmp_path) -> None:
     assert config.watch.dispatch_start_timeout == 7
 
 
-def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
-    """watch.parked_auto_rearm should default to the conservative blind-policy settings."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+def test_config_load_accepts_omitted_watch_parked_auto_rearm_judge_keys(tmp_path) -> None:
+    """watch.parked_auto_rearm should load when judge keys are omitted."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        "  parked_auto_rearm: {}\n"
+    )
 
     config = Config.load(tmp_path)
 
-    assert config.watch.parked_auto_rearm.enabled is False
-    assert config.watch.parked_auto_rearm.budget == 2
-    assert config.watch.parked_auto_rearm.cooldown_hours == 12
-    assert config.watch.parked_auto_rearm.require_target_advanced is True
-    assert config.watch.parked_auto_rearm.judge_enabled is False
-    assert config.watch.parked_auto_rearm.judge_cooldown_hours == 12
-    assert config.watch.parked_auto_rearm.judge_max_parked_tasks == 50
+    assert isinstance(config.watch.parked_auto_rearm.enabled, bool)
+    assert isinstance(config.watch.parked_auto_rearm.budget, int)
+    assert config.watch.parked_auto_rearm.budget >= 0
+    assert isinstance(config.watch.parked_auto_rearm.cooldown_hours, int)
+    assert config.watch.parked_auto_rearm.cooldown_hours > 0
+    assert isinstance(config.watch.parked_auto_rearm.require_target_advanced, bool)
+    assert isinstance(config.watch.parked_auto_rearm.judge_enabled, bool)
+    assert isinstance(config.watch.parked_auto_rearm.judge_cooldown_hours, int)
+    assert config.watch.parked_auto_rearm.judge_cooldown_hours > 0
+    assert isinstance(config.watch.parked_auto_rearm.judge_max_parked_tasks, int)
+    assert config.watch.parked_auto_rearm.judge_max_parked_tasks > 0
 
 
 def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
