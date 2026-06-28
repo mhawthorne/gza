@@ -1,12 +1,17 @@
 """Tests for shared failure-reason resolution and ownership."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from checks.failure_reason_ownership import check_file as check_failure_reason_ownership
 from gza.db import TaskStats
-from gza.failure_reasons import preserves_failure_reason_over_terminal_no_work, resolve_failure_reason
+from gza.failure_reasons import (
+    is_readonly_db_failure,
+    preserves_failure_reason_over_terminal_no_work,
+    resolve_failure_reason,
+)
 
 
 def _find_failure_reason_ownership_violations(repo_root: Path, source_root: Path) -> list[str]:
@@ -99,6 +104,20 @@ def test_resolve_failure_reason_prefers_infrastructure_error_before_log_fallback
         )
         == "INFRASTRUCTURE_ERROR"
     )
+
+
+@pytest.mark.parametrize(
+    ("error_or_message", "expected"),
+    [
+        (sqlite3.OperationalError("attempt to write a readonly database"), True),
+        (sqlite3.OperationalError("database is locked"), False),
+    ],
+)
+def test_is_readonly_db_failure_classifies_sqlite_operational_error_variants(
+    error_or_message: BaseException,
+    expected: bool,
+) -> None:
+    assert is_readonly_db_failure(error_or_message) is expected
 
 
 def test_resolve_failure_reason_log_fallback_preserves_config_error(tmp_path: Path) -> None:

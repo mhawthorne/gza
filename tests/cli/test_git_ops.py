@@ -1,6 +1,7 @@
 """Tests for git-oriented CLI helpers."""
 
 import argparse
+import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
     _remove_watch_merge_checkout,
+    _classify_rebase_git_failure,
     _reconcile_diverged_branch_with_origin,
     SquashBranchReconcileResult,
     _build_auto_merge_args,
@@ -2600,6 +2602,54 @@ def test_run_task_backed_rebase_container_git_metadata_failure_retries_as_infra(
     with (
         patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
         patch("gza.cli.git_ops.cleanup_worktree_for_branch", side_effect=invalid_path_error),
+        patch("gza.cli.git_ops.mark_task_failed_from_cause", return_value=None) as mark_failed,
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 1
+    mark_failed.assert_called_once()
+    assert mark_failed.call_args.kwargs["explicit_reason"] == "INFRASTRUCTURE_ERROR"
+
+
+def test_classify_rebase_git_failure_marks_readonly_sqlite_error_as_infra() -> None:
+    error = sqlite3.OperationalError("attempt to write a readonly database")
+
+    assert _classify_rebase_git_failure(error) == "INFRASTRUCTURE_ERROR"
+
+
+def test_run_task_backed_rebase_readonly_db_git_failure_retries_as_infra(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+
+    readonly_db_error = GitError("sqlite3.OperationalError: attempt to write a readonly database")
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", side_effect=readonly_db_error),
         patch("gza.cli.git_ops.mark_task_failed_from_cause", return_value=None) as mark_failed,
     ):
         rc = _run_task_backed_rebase(
