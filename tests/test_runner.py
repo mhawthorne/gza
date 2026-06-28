@@ -12772,6 +12772,7 @@ class TestExtractedRunInnerHelpers:
         improve.review_verify_head_sha = "abc1234"
         improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
         store.update(improve)
+        recorded_at = review.completed_at + timedelta(seconds=2)
 
         config = self._make_config(tmp_path)
         config.max_resume_attempts = 3
@@ -12789,11 +12790,13 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner.compute_improve_changed_diff",
                 return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
             ),
+            patch("gza.runner.datetime", wraps=datetime) as mock_datetime,
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
+            mock_datetime.now.return_value = recorded_at
             rc = _post_complete_code_task(
                 improve,
                 config,
@@ -12809,10 +12812,10 @@ class TestExtractedRunInnerHelpers:
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
-        assert refreshed_impl.review_cleared_at is not None
-        assert refreshed_impl.review_cleared_at >= review.completed_at
+        assert refreshed_impl.review_cleared_at == recorded_at
         clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
         assert len(clearance_artifacts) == 1
+        assert clearance_artifacts[0].created_at == recorded_at
         assert clearance_artifacts[0].status == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
         assert clearance_artifacts[0].head_sha == "abc1234"
         assert clearance_artifacts[0].metadata == {
@@ -12823,6 +12826,9 @@ class TestExtractedRunInnerHelpers:
             "noop_improve_kind": "verify_only",
             "reviewed_head_sha": "abc1234",
         }
+        assert json.loads((tmp_path / clearance_artifacts[0].path).read_text())["captured_at"] == (
+            improve.review_verify_captured_at.isoformat()
+        )
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
 
