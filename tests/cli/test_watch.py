@@ -12751,6 +12751,60 @@ def test_watch_cycle_falls_back_to_blind_auto_rearm_when_judge_fails(tmp_path: P
     assert "blind auto-rearm cleared retry-limit-reached" in log_text
 
 
+def test_watch_cycle_judge_enabled_without_merge_window_leaves_parked_work_untouched(tmp_path: Path) -> None:
+    store, config, impl, exhausted_improve = _setup_retry_limit_parked_lineage(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.judge_enabled = True
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-1")  # type: ignore[method-assign]
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=impl,
+        subject_task=exhausted_improve,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+
+    with (
+        patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)),
+        patch("gza.cli.watch.clear_parked_candidate_state") as clear_candidate_state,
+        patch("gza.cli.watch.resolve_ref_if_possible", return_value=SimpleNamespace(sha="main-sha-1")),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=("main", None)),
+        patch("gza.cli.watch._build_watch_cycle_plan", return_value=_empty_scoped_watch_plan(slots=0)),
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
+        patch("gza.cli.watch.Git", return_value=git),
+    ):
+        log_path = tmp_path / "watch.log"
+        log = _WatchLog(log_path, quiet=True)
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    clear_candidate_state.assert_not_called()
+    log_text = log_path.read_text()
+    assert "parked judge fallback" not in log_text
+    assert "auto-rearm cleared retry-limit-reached" not in log_text
+    assert [
+        task for task in store.get_all()
+        if task.task_type == "internal" and task.trigger_source == "watch-unstick-judge"
+    ] == []
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=str(exhausted_improve.id),
+        attention_reason="retry-limit-reached",
+    ) is None
+
+
 @pytest.mark.parametrize(
     "reason",
     [

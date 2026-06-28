@@ -3696,15 +3696,17 @@ def _evaluate_judged_parked_auto_rearm(
     merge_window_owner_ids: Sequence[str],
 ) -> tuple[_BlindParkedAutoRearmResult | None, str | None]:
     policy = config.watch.parked_auto_rearm
-    if not policy.enabled or not policy.judge_enabled or not merge_window_owner_ids:
+    if not policy.enabled or not policy.judge_enabled:
         return None, None
+    if not merge_window_owner_ids:
+        return _BlindParkedAutoRearmResult(decisions=()), None
 
     latest_judge_task = _latest_parked_auto_rearm_judge_task(store)
     now = datetime.now(UTC)
     if latest_judge_task is not None and latest_judge_task.created_at is not None:
         judge_cooldown = timedelta(hours=policy.judge_cooldown_hours)
         if now < latest_judge_task.created_at + judge_cooldown:
-            return None, None
+            return _BlindParkedAutoRearmResult(decisions=()), None
 
     candidates = _collect_scoped_parked_auto_rearm_candidates(
         config=config,
