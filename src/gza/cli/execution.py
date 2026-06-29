@@ -5619,6 +5619,7 @@ def _cmd_iterate_impl(
         return True
 
     while iteration < max_iterations:
+        assert impl_task is not None
         if prepared_iteration_start is not None:
             action = {
                 "type": prepared_iteration_start.action_type,

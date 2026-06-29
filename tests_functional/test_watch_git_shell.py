@@ -439,6 +439,10 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     assert (
         "not a git repository" in broken_probe.stderr
         or "invalid commondir" in broken_probe.stderr
+        # Older git (e.g. host 2.41) reports the container-only commondir path as an
+        # invalid path rather than a missing repo; production recognizes this marker too
+        # (see recovery_engine._REBASE_INFRA_LOG_MARKERS).
+        or "invalid path '/gza-git'" in broken_probe.stderr.lower()
     )
 
     args = argparse.Namespace(
