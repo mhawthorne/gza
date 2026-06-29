@@ -88,8 +88,11 @@ Each watch cycle MUST execute these phases in order:
    fingerprint differs from the last verified fingerprint, when the configured verify-gate
    identity changes on the same tree, and after each successful merge onto that target,
    watch MUST rerun the configured verify gate against the local target tree. Freshness is
-   keyed at least by the normalized `verify_command` plus gate-enabled/no-gate state, and
-   the current implementation also includes the resolved automation timeout settings.
+   keyed at least by the normalized `verify_command`, gate-enabled/no-gate state, and the
+   verify environment identity that produced the checkpoint; the current implementation
+   also includes the resolved automation timeout settings. For configured gates, an older
+   checkpoint that lacks the required environment identity MUST be treated as stale rather
+   than reused optimistically.
    Independently of tree change, a configured-gate checkpoint that is not `passed` MUST
    expire after a bounded configured TTL and be rerun on that cadence so red/unavailable
    results cannot persist indefinitely on an unchanged target tree. If the current

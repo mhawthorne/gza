@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import platform
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
@@ -46,6 +49,16 @@ def _set_completed(task, *, when: datetime, branch: str | None, has_commits: boo
     task.completed_at = when
     task.branch = branch
     task.has_commits = has_commits
+
+
+def _main_verify_environment_identity_payload() -> dict[str, str]:
+    return {
+        "runner_class": "host",
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "python_executable": sys.executable,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
 
 
 def _set_dropped(task, *, when: datetime, branch: str | None, has_commits: bool) -> None:
@@ -4041,16 +4054,20 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     main_verify_task.review_verify_exit_status = "1"
     main_verify_task.review_verify_failure = "verify_command failed"
     main_verify_task.review_verify_head_sha = "abc123"
-    main_verify_task.output_content = (
-        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
-        '"captured_at":"2026-06-23T00:00:00+00:00",'
-        '"failing_phase":"unit",'
-        '"gate_enabled":true,'
-        '"head_sha":"abc123",'
-        '"tree_fingerprint":"fp",'
-        '"verify_command":"./bin/tests",'
-        '"verify_timeout_grace_seconds":5.0,'
-        '"verify_timeout_seconds":120}'
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
     )
     store.update(main_verify_task)
 
@@ -4220,16 +4237,20 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     main_verify_task.review_verify_exit_status = "1"
     main_verify_task.review_verify_failure = "verify_command failed"
     main_verify_task.review_verify_head_sha = "abc123"
-    main_verify_task.output_content = (
-        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
-        '"captured_at":"2026-06-23T00:00:00+00:00",'
-        '"failing_phase":"unit",'
-        '"gate_enabled":true,'
-        '"head_sha":"abc123",'
-        '"tree_fingerprint":"fp",'
-        '"verify_command":"./bin/tests",'
-        '"verify_timeout_grace_seconds":5.0,'
-        '"verify_timeout_seconds":120}'
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
     )
     store.update(main_verify_task)
 
@@ -4312,16 +4333,20 @@ def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_defau
     main_verify_task.review_verify_exit_status = "1"
     main_verify_task.review_verify_failure = "verify_command failed"
     main_verify_task.review_verify_head_sha = "abc123"
-    main_verify_task.output_content = (
-        '{"alert_message":"main verify RED at `abc123` - merges halted; phase `unit` failing",'
-        '"captured_at":"2026-06-23T00:00:00+00:00",'
-        '"failing_phase":"unit",'
-        '"gate_enabled":true,'
-        '"head_sha":"abc123",'
-        '"tree_fingerprint":"fp",'
-        '"verify_command":"./bin/tests",'
-        '"verify_timeout_grace_seconds":5.0,'
-        '"verify_timeout_seconds":120}'
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
     )
     store.update(main_verify_task)
 

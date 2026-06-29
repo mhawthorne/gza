@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import platform
+import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .config import Config
 from .db import SqliteTaskStore, Task
@@ -36,6 +38,7 @@ class MainIntegrationVerifyState:
     verify_command: str | None
     verify_timeout_seconds: int | None
     verify_timeout_grace_seconds: float | None
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
     tree_fingerprint: str | None
     head_sha: str | None
     verify_status: str | None
@@ -78,6 +81,58 @@ class MainIntegrationVerifyGateIdentity:
     verify_command: str | None
     verify_timeout_seconds: int | None
     verify_timeout_grace_seconds: float | None
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
+
+
+@dataclass(frozen=True)
+class MainIntegrationVerifyEnvironmentIdentity:
+    """Compact runtime identity for a persisted main integration verify checkpoint."""
+
+    runner_class: Literal["host", "container"]
+    platform_system: str
+    platform_machine: str
+    python_executable: str
+    python_version: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "runner_class": self.runner_class,
+            "platform_system": self.platform_system,
+            "platform_machine": self.platform_machine,
+            "python_executable": self.python_executable,
+            "python_version": self.python_version,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> MainIntegrationVerifyEnvironmentIdentity | None:
+        if not isinstance(payload, dict):
+            return None
+        runner_class = payload.get("runner_class")
+        platform_system = payload.get("platform_system")
+        platform_machine = payload.get("platform_machine")
+        python_executable = payload.get("python_executable")
+        python_version = payload.get("python_version")
+        if runner_class not in {"host", "container"}:
+            return None
+        if not all(isinstance(value, str) and value for value in (
+            platform_system,
+            platform_machine,
+            python_executable,
+            python_version,
+        )):
+            return None
+        typed_runner_class = cast(Literal["host", "container"], runner_class)
+        typed_platform_system = cast(str, platform_system)
+        typed_platform_machine = cast(str, platform_machine)
+        typed_python_executable = cast(str, python_executable)
+        typed_python_version = cast(str, python_version)
+        return cls(
+            runner_class=typed_runner_class,
+            platform_system=typed_platform_system,
+            platform_machine=typed_platform_machine,
+            python_executable=typed_python_executable,
+            python_version=typed_python_version,
+        )
 
 
 def _find_main_integration_verify_task(store: SqliteTaskStore) -> Task | None:
@@ -139,6 +194,9 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         verify_command=_payload_verify_command(task, payload),
         verify_timeout_seconds=_coerce_optional_int(payload.get("verify_timeout_seconds")),
         verify_timeout_grace_seconds=_coerce_optional_float(payload.get("verify_timeout_grace_seconds")),
+        environment_identity=MainIntegrationVerifyEnvironmentIdentity.from_payload(
+            payload.get("environment_identity")
+        ),
         tree_fingerprint=payload.get("tree_fingerprint") if isinstance(payload.get("tree_fingerprint"), str) else None,
         head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else task.review_verify_head_sha,
         verify_status=task.review_verify_status,
@@ -246,6 +304,16 @@ def _normalized_verify_command(config: Config) -> str:
     return config.verify_command.strip() if isinstance(config.verify_command, str) else ""
 
 
+def _current_verify_environment_identity() -> MainIntegrationVerifyEnvironmentIdentity:
+    return MainIntegrationVerifyEnvironmentIdentity(
+        runner_class="host",
+        platform_system=platform.system(),
+        platform_machine=platform.machine(),
+        python_executable=sys.executable,
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+    )
+
+
 def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
     verify_command = _normalized_verify_command(config)
     gate_enabled = bool(verify_command)
@@ -255,6 +323,7 @@ def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
             verify_command=None,
             verify_timeout_seconds=None,
             verify_timeout_grace_seconds=None,
+            environment_identity=None,
         )
 
     timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
@@ -263,6 +332,7 @@ def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
         verify_command=verify_command,
         verify_timeout_seconds=timeout_seconds,
         verify_timeout_grace_seconds=timeout_grace_seconds,
+        environment_identity=_current_verify_environment_identity(),
     )
 
 
@@ -295,6 +365,10 @@ def _gate_identity_matches(
         and state.verify_command == current_gate.verify_command
         and state.verify_timeout_seconds == current_gate.verify_timeout_seconds
         and state.verify_timeout_grace_seconds == current_gate.verify_timeout_grace_seconds
+        and (
+            current_gate.environment_identity is None
+            or state.environment_identity == current_gate.environment_identity
+        )
     )
 
 
@@ -306,6 +380,7 @@ def _persist_main_integration_verify_payload(
     verify_command: str | None,
     verify_timeout_seconds: int | None,
     verify_timeout_grace_seconds: float | None,
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None,
     tree_fingerprint: str | None,
     head_sha: str | None,
     failing_phase: str | None,
@@ -318,6 +393,7 @@ def _persist_main_integration_verify_payload(
             "verify_command": verify_command,
             "verify_timeout_seconds": verify_timeout_seconds,
             "verify_timeout_grace_seconds": verify_timeout_grace_seconds,
+            "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
             "tree_fingerprint": tree_fingerprint,
             "head_sha": head_sha,
             "failing_phase": failing_phase,
@@ -474,6 +550,7 @@ def run_main_integration_verify(
         verify_command=gate.verify_command,
         verify_timeout_seconds=gate.verify_timeout_seconds,
         verify_timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+        environment_identity=gate.environment_identity,
         tree_fingerprint=tree_fingerprint,
         head_sha=head_sha,
         failing_phase=failing_phase,

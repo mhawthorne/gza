@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import signal
 import sys
@@ -130,6 +131,16 @@ def _task_count(store) -> int:
         row = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()
     assert row is not None
     return int(row["c"])
+
+
+def _main_verify_environment_identity_payload() -> dict[str, str]:
+    return {
+        "runner_class": "host",
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "python_executable": sys.executable,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
 
 
 def _empty_scoped_watch_plan(
@@ -9839,6 +9850,7 @@ def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row
         {
             "alert_message": None,
             "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
             "failing_phase": None,
             "gate_enabled": True,
             "head_sha": "deadbeefcafe",
@@ -9879,6 +9891,7 @@ def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row
             {
                 "alert_message": red.state.alert_message,
                 "captured_at": "2026-06-23T00:05:00+00:00",
+                "environment_identity": _main_verify_environment_identity_payload(),
                 "failing_phase": "unit",
                 "gate_enabled": True,
                 "head_sha": "feedfacecafe",
