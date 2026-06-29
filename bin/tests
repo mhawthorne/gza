@@ -95,9 +95,9 @@ else
 fi
 run_phase unit ./bin/test-unit --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 if [[ "$USE_VENV" -eq 1 ]]; then
-    run_phase functional pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+    run_phase functional ./bin/test-functional -- tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 else
-    run_phase functional uv run pytest tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+    run_phase functional ./bin/test-functional -- tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope -x --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 fi
 
 if [[ "$RUN_INTEGRATION" -eq 1 ]]; then

@@ -27,6 +27,11 @@ def _setup_verify_script_fixture(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (fixture_root / "bin" / "test-unit").chmod(0o755)
+    (fixture_root / "bin" / "test-functional").write_text(
+        (repo_root / "bin" / "test-functional").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (fixture_root / "bin" / "test-functional").chmod(0o755)
     return fixture_root
 
 
@@ -127,7 +132,10 @@ def test_full_verify_defaults_to_ci_parity_xdist_worker_count_on_high_core_machi
     assert "cores=16 xdist_workers=2" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
     assert "test-unit --summary -- tests/ -n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
-    assert "pytest tests_functional/ -n 2 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
+    assert (
+        "test-functional -- tests_functional/ -n 2 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
+        in tool_invocations
+    )
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -168,9 +176,10 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     assert "python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert "test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
-        "python -m gza.tools.verify_phase functional -- pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
+        "python -m gza.tools.verify_phase functional -- ./bin/test-functional -- tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
     )
+    assert "python -m gza.test_serial_rerun --phase functional -- tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert uv_log.read_text(encoding="utf-8") == ""
 
 
@@ -208,7 +217,10 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     uv_invocations = uv_log.read_text(encoding="utf-8")
     assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
     assert "uv run python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in uv_invocations
-    assert "uv run python -m gza.tools.verify_phase functional -- uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
+    assert (
+        "uv run python -m gza.tools.verify_phase functional -- ./bin/test-functional -- tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
+        in uv_invocations
+    )
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -237,7 +249,10 @@ def test_full_verify_only_runs_integration_suite_with_integration_flag(tmp_path:
 
     assert default_result.returncode == 0, default_result.stderr
     default_invocations = tool_log.read_text(encoding="utf-8")
-    assert "pytest tests_functional/ -n 3 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in default_invocations
+    assert (
+        "test-functional -- tests_functional/ -n 3 --dist loadscope -x --durations=25 -o faulthandler_timeout=60"
+        in default_invocations
+    )
     assert "pytest tests_integration -xv" not in default_invocations
 
     tool_log.write_text("", encoding="utf-8")

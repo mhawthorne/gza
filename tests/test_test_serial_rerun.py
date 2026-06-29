@@ -156,6 +156,42 @@ def test_run_unit_phase_reports_confirmed_failures_from_serial_rerun(
     assert "CONFIRMED FAILURE (failed serially too): tests/test_sample.py::test_broken" in capsys.readouterr().err
 
 
+def test_run_functional_phase_serial_rerun_uses_functional_log_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[list[str]] = []
+    results = iter(
+        [
+            (_pass_result(exit_code=1, failed_nodeids=["tests_functional/test_sample.py::test_flake"]), None),
+            (_pass_result(exit_code=0), None),
+        ]
+    )
+
+    def _fake_run(pytest_args: list[str], *, emit_sigterm_summary: bool) -> tuple[test_serial_rerun._PytestPassResult, str | None]:
+        del emit_sigterm_summary
+        calls.append(pytest_args)
+        return next(results)
+
+    monkeypatch.setattr(test_serial_rerun, "_run_pytest_pass", _fake_run)
+
+    exit_code = test_serial_rerun.run_functional_phase(
+        ["tests_functional/", "-n", "2", "-o", "faulthandler_timeout=60"],
+        cap=2,
+        rerun_enabled=True,
+        emit_summary=False,
+    )
+
+    assert exit_code == 0
+    assert calls == [
+        ["tests_functional/", "-n", "2", "-o", "faulthandler_timeout=60", "--maxfail=3"],
+        ["tests_functional/test_sample.py::test_flake", "-n0", "-v", "--maxfail=0", "-o", "faulthandler_timeout=60"],
+    ]
+    captured = capsys.readouterr()
+    assert "functional-rerun: parallel pass failed; 1 test(s) failed and are within cap 2; re-running serially:" in captured.err
+    assert "functional-rerun: PARALLEL-ONLY FAILURE (passed serially): tests_functional/test_sample.py::test_flake" in captured.err
+
+
 def test_main_rejects_invalid_env_values(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setenv("GZA_UNIT_RERUN_CAP", "0")
 
@@ -174,3 +210,14 @@ def test_main_honors_disable_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert exit_code == 0
     assert run_unit_phase.call_args.kwargs["rerun_enabled"] is False
+
+
+def test_main_functional_honors_disable_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GZA_FUNCTIONAL_SERIAL_RERUN", "0")
+    run_functional_phase = Mock(return_value=0)
+    monkeypatch.setattr(test_serial_rerun, "run_functional_phase", run_functional_phase)
+
+    exit_code = test_serial_rerun.main(["--phase", "functional", "--", "tests_functional/", "-n", "2"])
+
+    assert exit_code == 0
+    assert run_functional_phase.call_args.kwargs["rerun_enabled"] is False
