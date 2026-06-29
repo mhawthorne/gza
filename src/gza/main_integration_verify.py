@@ -161,7 +161,7 @@ class CandidateIntegrationVerifyCheck:
     """Outcome of verifying one exact candidate checkout without mutating main state."""
 
     evidence: CandidateIntegrationVerifyEvidence
-    classification: Literal["pass", "deterministic_red", "flake", "unavailable"]
+    classification: Literal["pass", "red", "deterministic_red", "flake", "unavailable"]
     merges_halted: bool
     remediation: MainIntegrationVerifyRemediation | None = None
     verify_runs: int = 0
@@ -789,13 +789,15 @@ def run_candidate_integration_verify(
 def _classify_candidate_integration_verify(
     evidence: CandidateIntegrationVerifyEvidence,
     remediation: MainIntegrationVerifyRemediation | None,
-) -> Literal["pass", "deterministic_red", "flake", "unavailable"]:
+) -> Literal["pass", "red", "deterministic_red", "flake", "unavailable"]:
     if evidence.verify_status == "unavailable":
         return "unavailable"
     if remediation is not None and remediation.kind == "deflake":
         return "flake"
     if _verify_result_is_red(status=evidence.verify_status, gate_enabled=evidence.gate_enabled):
-        return "deterministic_red"
+        if remediation is not None and remediation.kind == "fix":
+            return "deterministic_red"
+        return "red"
     return "pass"
 
 
@@ -817,7 +819,7 @@ def check_candidate_integration_verify(
     return CandidateIntegrationVerifyCheck(
         evidence=evidence,
         classification=classification,
-        merges_halted=evidence.gate_enabled and classification in {"deterministic_red", "unavailable"},
+        merges_halted=evidence.gate_enabled and classification in {"red", "deterministic_red", "unavailable"},
         remediation=remediation,
         verify_runs=verify_runs,
     )

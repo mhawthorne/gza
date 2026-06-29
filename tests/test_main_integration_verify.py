@@ -337,6 +337,52 @@ def test_check_candidate_integration_verify_red_rerun_classifies_flake(tmp_path)
     assert check.remediation.failure == "verify_command failed"
 
 
+def test_check_candidate_integration_verify_single_red_without_rerun_stays_unconfirmed(tmp_path) -> None:
+    setup_config(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+
+    red_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output="gza-verify phase=failed name=functional duration_seconds=4.0",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=red_result) as run_verify,
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-unconfirmed-red",
+            red_reruns=0,
+        )
+
+    run_verify.assert_called_once()
+    assert check.classification == "red"
+    assert check.classification != "deterministic_red"
+    assert check.verify_runs == 1
+    assert check.merges_halted is True
+    assert check.evidence.verify_status == "failed"
+    assert check.evidence.failing_phase == "functional"
+    assert check.remediation is None
+
+
 def test_check_candidate_integration_verify_red_rerun_classifies_deterministic_red(tmp_path) -> None:
     setup_config(tmp_path)
 
