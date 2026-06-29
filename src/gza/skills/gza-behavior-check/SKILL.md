@@ -144,7 +144,7 @@ Write to `reviews/<timestamp>-behavior-check.md`.
 
 ## Output format
 
-```markdown
+````markdown
 # Behavior conformance check
 
 **Scope:** <all behavior specs | doc | assertion-ID prefix>
@@ -180,7 +180,66 @@ stays dirty.
 ## Recommendations
 1. <highest-priority code bug>
 2. <spec gap to resolve with the owner>
+
+## Machine-readable findings
+
+```json
+[
+  {
+    "assertion_id": "LE-§6-IMPROVE-CHAIN",
+    "verdict": "DIVERGES",
+    "recommendation": "code bug",
+    "spec_file": "specs/behavior/lifecycle-engine.md",
+    "spec_section": "§6",
+    "summary": "Improve chain queries follow the implementation link instead of the review link.",
+    "evidence": [
+      {
+        "path": "src/gza/<file>.py",
+        "line": 123,
+        "note": "Filters by the implementation link, so review-linked retries are missed."
+      }
+    ],
+    "report_path": "reviews/<timestamp>-behavior-check.md"
+  },
+  {
+    "assertion_id": "LE-P4-LOCAL-TARGET",
+    "verdict": "HOLDS",
+    "recommendation": null,
+    "spec_file": "specs/behavior/lifecycle-engine.md",
+    "spec_section": "P4",
+    "summary": "Merge-proof resolves the local target only.",
+    "evidence": [
+      {
+        "path": "src/gza/<file>.py",
+        "line": 88,
+        "note": "Uses the local target ref and does not fall back to origin."
+      }
+    ],
+    "report_path": "reviews/<timestamp>-behavior-check.md"
+  }
+]
 ```
+````
+
+The human-readable sections above stay exactly as written. The JSON appendix is additive
+and MUST appear at the end of every report so automation can parse the run without
+scraping prose.
+
+Emit **one JSON object per checked assertion** (HOLDS, DIVERGES, and UNDETERMINED), using
+this schema:
+
+- `assertion_id` — stable assertion ID from Step 1.
+- `verdict` — `HOLDS`, `DIVERGES`, or `UNDETERMINED`.
+- `recommendation` — `code bug`, `spec gap`, or `ambiguous` for `DIVERGES`; use `null` for
+  `HOLDS` and `UNDETERMINED`.
+- `spec_file` — behavior-spec path under `specs/behavior/`.
+- `spec_section` — local section/anchor for the assertion (`INV3`, `P4`, `§6`, `MV2`, `RC`,
+  `KNOB`, etc.).
+- `summary` — one-sentence result summary for that assertion.
+- `evidence` — array of `{path, line, note}` objects. Include every cited implementation
+  path here; use an empty array only if `UNDETERMINED` truly has no safe code citation.
+- `report_path` — the relative `reviews/<timestamp>-behavior-check.md` path written by this
+  run.
 
 ## Rules
 
@@ -202,3 +261,6 @@ stays dirty.
 - **Draft vs ratified.** Note in the report whether each checked area is ratified contract
   or still draft, so a divergence in a draft rule reads as "confirm intent" rather than
   "definite bug."
+- **The JSON appendix is mandatory.** Make it valid JSON, keep it in a fenced `json` code
+  block under `## Machine-readable findings`, and ensure every object's `report_path`
+  matches the report you wrote.

@@ -829,6 +829,36 @@ class TestSkillContentValidation:
         assert "MUST NOT edit the spec or the code" in content
         assert "reviews/<timestamp>-spec-coherence.md" in content
 
+    def test_gza_behavior_check_installed_skill_includes_machine_readable_findings_appendix(
+        self, tmp_path: Path
+    ):
+        """Installed behavior-check skill should bundle the machine-readable findings appendix contract."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result = invoke_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "gza-behavior-check",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+
+        installed = (tmp_path / ".claude" / "skills" / "gza-behavior-check" / "SKILL.md").read_text()
+        bundled = (get_skills_source_path() / "gza-behavior-check" / "SKILL.md").read_text()
+        normalized = " ".join(installed.split())
+
+        assert installed == bundled
+        assert "## Machine-readable findings" in installed
+        assert '"assertion_id": "LE-§6-IMPROVE-CHAIN"' in installed
+        assert '"recommendation": null' in installed
+        assert '"report_path": "reviews/<timestamp>-behavior-check.md"' in installed
+        assert "Emit **one JSON object per checked assertion** (HOLDS, DIVERGES, and UNDETERMINED)" in installed
+        assert "use `null` for `HOLDS` and `UNDETERMINED`." in normalized
+
     def test_gza_task_run_routes_to_first_class_run_inline_command(self):
         """gza-task-run should delegate execution to `gza run-inline` instead of synthetic lifecycle steps."""
         from gza.skills_utils import get_skills_source_path

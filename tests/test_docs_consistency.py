@@ -404,6 +404,24 @@ def test_behavior_check_skill_tracks_open_ended_principle_inventory() -> None:
     assert "`LIN-P6-TERMINAL-LANDED-NOT-ACTIONABLE`" in behavior_check
 
 
+def test_behavior_check_skill_requires_machine_readable_findings_appendix() -> None:
+    """Behavior-check should require a parseable JSON appendix without replacing the prose report."""
+    repo_root = Path(__file__).resolve().parents[1]
+    behavior_check = (repo_root / "src" / "gza" / "skills" / "gza-behavior-check" / "SKILL.md").read_text()
+    normalized = " ".join(behavior_check.split())
+
+    assert "## Machine-readable findings" in behavior_check
+    assert '"assertion_id": "LE-§6-IMPROVE-CHAIN"' in behavior_check
+    assert '"recommendation": "code bug"' in behavior_check
+    assert '"recommendation": null' in behavior_check
+    assert '"evidence": [' in behavior_check
+    assert '"report_path": "reviews/<timestamp>-behavior-check.md"' in behavior_check
+    assert "The human-readable sections above stay exactly as written." in behavior_check
+    assert "Emit **one JSON object per checked assertion** (HOLDS, DIVERGES, and UNDETERMINED)" in behavior_check
+    assert "use `null` for `HOLDS` and `UNDETERMINED`." in normalized
+    assert "The JSON appendix is mandatory." in behavior_check
+
+
 def test_watch_feature_spec_distinguishes_worker_consuming_capacity_from_direct_recovery() -> None:
     """Feature spec should match the watch scheduler contract for recovery slot usage."""
     repo_root = Path(__file__).resolve().parents[1]
