@@ -69,8 +69,12 @@ _DISPUTE_SOURCE_TASK_ID_RE = re.compile(r"^Dispute source task:\s*(\S+)\s*$", re
 _VERIFY_FIX_PROMPT_RE = re.compile(
     r"^Fix verify failures for task (?P<impl_task_id>\S+) "
     r"\[branch=(?P<branch>\S+) head=(?P<head>\S+) command=(?P<command>.+?) "
-    r"timeout=(?P<timeout>\S+) grace=(?P<grace>\S+)\]$"
+    r"timeout=(?P<timeout>\S+) grace=(?P<grace>\S+)\]$",
+    re.DOTALL,
 )
+VERIFY_FIX_EPOCH_ARTIFACT_KIND = "verify_fix_epoch"
+VERIFY_FIX_EPOCH_ARTIFACT_LABEL = "verify_fix_epoch"
+VERIFY_FIX_EPOCH_ARTIFACT_SCHEMA_VERSION = 1
 
 OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND = "off_topic_verify_investigation"
 OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES = frozenset({"pending", "in_progress"})
@@ -207,6 +211,127 @@ def build_verify_fix_prompt(impl_task_id: str, verify_epoch: VerifyEpoch) -> str
         verify_timeout_seconds=verify_epoch.verify_timeout_seconds,
         verify_timeout_grace_seconds=verify_epoch.verify_timeout_grace_seconds,
     )
+
+
+def _verify_fix_epoch_artifact_metadata(
+    impl_task_id: str,
+    verify_epoch: VerifyEpoch,
+) -> dict[str, Any]:
+    return {
+        "schema_version": VERIFY_FIX_EPOCH_ARTIFACT_SCHEMA_VERSION,
+        "impl_task_id": impl_task_id,
+        "verify_epoch": {
+            "reviewed_branch": verify_epoch.reviewed_branch,
+            "reviewed_head_sha": verify_epoch.reviewed_head_sha,
+            "verify_command": verify_epoch.verify_command,
+            "verify_timeout_seconds": verify_epoch.verify_timeout_seconds,
+            "verify_timeout_grace_seconds": verify_epoch.verify_timeout_grace_seconds,
+        },
+    }
+
+
+def parse_verify_fix_epoch_artifact_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> tuple[str, VerifyEpoch] | None:
+    """Parse structured verify_fix epoch metadata stored on the verify_fix task."""
+    if not isinstance(metadata, Mapping):
+        return None
+    if metadata.get("schema_version") != VERIFY_FIX_EPOCH_ARTIFACT_SCHEMA_VERSION:
+        return None
+    impl_task_id = metadata.get("impl_task_id")
+    epoch_payload = metadata.get("verify_epoch")
+    if not isinstance(impl_task_id, str) or not impl_task_id.strip():
+        return None
+    if not isinstance(epoch_payload, Mapping):
+        return None
+    timeout_raw = epoch_payload.get("verify_timeout_seconds")
+    grace_raw = epoch_payload.get("verify_timeout_grace_seconds")
+    timeout_seconds = timeout_raw if isinstance(timeout_raw, int) and not isinstance(timeout_raw, bool) else None
+    grace_seconds = (
+        float(grace_raw)
+        if isinstance(grace_raw, (int, float)) and not isinstance(grace_raw, bool)
+        else None
+    )
+    return (
+        impl_task_id,
+        VerifyEpoch(
+            reviewed_branch=cast(str | None, epoch_payload.get("reviewed_branch"))
+            if isinstance(epoch_payload.get("reviewed_branch"), str)
+            else None,
+            reviewed_head_sha=cast(str | None, epoch_payload.get("reviewed_head_sha"))
+            if isinstance(epoch_payload.get("reviewed_head_sha"), str)
+            else None,
+            verify_command=cast(str | None, epoch_payload.get("verify_command"))
+            if isinstance(epoch_payload.get("verify_command"), str)
+            else None,
+            verify_timeout_seconds=timeout_seconds,
+            verify_timeout_grace_seconds=grace_seconds,
+        ),
+    )
+
+
+def _persist_verify_fix_epoch_artifact(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    task: Task,
+    impl_task_id: str,
+    verify_epoch: VerifyEpoch,
+    conn: sqlite3.Connection | None = None,
+) -> TaskArtifact:
+    if task.id is None:
+        raise ValueError("verify_fix task must be persisted before epoch metadata can be stored")
+    metadata = _verify_fix_epoch_artifact_metadata(impl_task_id, verify_epoch)
+    payload = json.dumps(metadata, sort_keys=True, indent=2) + "\n"
+    prepared = prepare_command_output_artifact(
+        config.project_dir,
+        task.id,
+        label=VERIFY_FIX_EPOCH_ARTIFACT_LABEL,
+        output=payload,
+        created_at=task.created_at,
+    )
+    if conn is None:
+        return store.add_artifact(
+            task.id,
+            kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+            label=VERIFY_FIX_EPOCH_ARTIFACT_LABEL,
+            path=prepared.path,
+            content_type="application/json",
+            byte_size=prepared.bytes,
+            sha256=prepared.digest,
+            created_at=task.created_at,
+            producer="review_tasks",
+            head_sha=verify_epoch.reviewed_head_sha,
+            metadata=metadata,
+        )
+    return store._add_artifact_conn(
+        conn,
+        task.id,
+        kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND,
+        label=VERIFY_FIX_EPOCH_ARTIFACT_LABEL,
+        path=prepared.path,
+        content_type="application/json",
+        byte_size=prepared.bytes,
+        sha256=prepared.digest,
+        created_at=task.created_at,
+        producer="review_tasks",
+        head_sha=verify_epoch.reviewed_head_sha,
+        metadata=metadata,
+    )
+
+
+def resolve_verify_fix_task_identity(
+    store: SqliteTaskStore,
+    task: Task,
+) -> tuple[str, VerifyEpoch] | None:
+    """Resolve a verify_fix task's structured identity, preferring task artifacts."""
+    if task.id is not None:
+        for artifact in store.list_artifacts(task.id, kind=VERIFY_FIX_EPOCH_ARTIFACT_KIND):
+            metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+            parsed = parse_verify_fix_epoch_artifact_metadata(metadata)
+            if parsed is not None:
+                return parsed
+    return parse_verify_fix_prompt(task.prompt)
 
 
 def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:
@@ -393,11 +518,11 @@ def resolve_verify_fix_context(
     resolved_epoch = verify_epoch
 
     if task is not None and (resolved_impl is None or resolved_epoch is None):
-        parsed = parse_verify_fix_prompt(task.prompt)
+        parsed = resolve_verify_fix_task_identity(store, task)
         if parsed is None:
             task_id = task.id or "(unsaved)"
             raise VerifyFixContextError(
-                f"verify_fix task {task_id} cannot resolve its verify epoch from the task prompt. "
+                f"verify_fix task {task_id} cannot resolve its structured verify epoch metadata. "
                 "Stop and ask the operator to recreate the task from failed verify evidence instead of proceeding blind."
             )
         prompt_impl_id, prompt_epoch = parsed
@@ -536,21 +661,25 @@ def find_existing_verify_fix_task(
     verify_epoch: VerifyEpoch,
 ) -> Task | None:
     """Return the latest non-dropped verify_fix task for the given verify epoch."""
-    expected_prompt = build_verify_fix_prompt(impl_task_id, verify_epoch)
     candidates = [
         task
         for task in store.get_verify_fix_tasks_by_root(impl_task_id)
-        if task.prompt == expected_prompt and task.status != "dropped"
+        if task.status != "dropped"
     ]
-    if not candidates:
+    matches: list[Task] = []
+    expected_prompt = build_verify_fix_prompt(impl_task_id, verify_epoch)
+    for task in candidates:
+        identity = resolve_verify_fix_task_identity(store, task)
+        if identity is not None:
+            candidate_impl_id, candidate_epoch = identity
+            if candidate_impl_id == impl_task_id and candidate_epoch == verify_epoch:
+                matches.append(task)
+                continue
+        if task.prompt == expected_prompt:
+            matches.append(task)
+    if not matches:
         return None
-    return max(
-        candidates,
-        key=lambda task: (
-            task.created_at or datetime.min.replace(tzinfo=UTC),
-            task.id or "",
-        ),
-    )
+    return max(matches, key=lambda task: (task.created_at or datetime.min.replace(tzinfo=UTC), task.id or ""))
 
 
 def create_or_reuse_verify_fix_task(
@@ -605,22 +734,39 @@ def create_or_reuse_verify_fix_task(
         impl_task=impl_task,
         verify_epoch=verify_epoch,
     )
-
-    created = store.add(
+    resolved_scope = resolve_review_scope_for_impl(store, impl_task)
+    params = NewTaskParams(
         prompt=build_verify_fix_prompt(impl_task.id, verify_epoch),
         task_type="verify_fix",
         based_on=based_on_task.id,
         same_branch=True,
         tags=resolve_derived_task_tags(impl_task),
-        review_scope=(
-            resolved_scope.summary
-            if (resolved_scope := resolve_review_scope_for_impl(store, impl_task)) is not None
-            else None
-        ),
+        review_scope=resolved_scope.summary if resolved_scope is not None else None,
         model=model,
         provider=provider,
         trigger_source=trigger_source,
     )
+    conn = store._require_write_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        created = store._add_task_conn(conn, params)
+        _persist_verify_fix_epoch_artifact(
+            store,
+            config,
+            task=created,
+            impl_task_id=impl_task.id,
+            verify_epoch=verify_epoch,
+            conn=conn,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
     return created, True
 
 

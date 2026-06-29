@@ -419,7 +419,8 @@ class PromptBuilder:
         """Build the stable task prompt title for one verify-fix epoch."""
         branch = reviewed_branch or "unknown-branch"
         head = reviewed_head_sha or "unknown-head"
-        command = normalized_verify_command(verify_command) or "unknown-command"
+        normalized_command = normalized_verify_command(verify_command)
+        command = " ".join(normalized_command.split()) if normalized_command else "unknown-command"
         timeout = str(verify_timeout_seconds) if verify_timeout_seconds is not None else "unset"
         grace = (
             str(verify_timeout_grace_seconds)

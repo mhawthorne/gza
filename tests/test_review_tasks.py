@@ -42,10 +42,12 @@ from gza.review_tasks import (
     format_blocker_finding_context,
     format_followup_finding_context,
     format_verify_fix_context,
+    parse_verify_fix_epoch_artifact_metadata,
     parse_verify_fix_prompt,
     persist_off_topic_verify_clearance,
     resolve_latest_failed_verify_epoch,
     resolve_verify_fix_context,
+    resolve_verify_fix_task_identity,
 )
 from gza.review_verdict import ReviewFinding
 from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
@@ -182,6 +184,28 @@ class TestVerifyFixTasks:
         )
         assert parse_verify_fix_prompt(prompt) == ("gza-101", epoch)
 
+    def test_parse_verify_fix_epoch_artifact_metadata_round_trips_multiline_command(self) -> None:
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="set -e\n./bin/tests",
+            verify_timeout_seconds=300,
+            verify_timeout_grace_seconds=5.0,
+        )
+        metadata = {
+            "schema_version": 1,
+            "impl_task_id": "gza-101",
+            "verify_epoch": {
+                "reviewed_branch": epoch.reviewed_branch,
+                "reviewed_head_sha": epoch.reviewed_head_sha,
+                "verify_command": epoch.verify_command,
+                "verify_timeout_seconds": epoch.verify_timeout_seconds,
+                "verify_timeout_grace_seconds": epoch.verify_timeout_grace_seconds,
+            },
+        }
+
+        assert parse_verify_fix_epoch_artifact_metadata(metadata) == ("gza-101", epoch)
+
     def test_create_or_reuse_verify_fix_task_reuses_same_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
@@ -224,6 +248,7 @@ class TestVerifyFixTasks:
         assert created.task_type == "verify_fix"
         assert created.same_branch is True
         assert created.based_on == improve.id
+        assert resolve_verify_fix_task_identity(store, created) == (impl.id, epoch)
 
     def test_create_or_reuse_verify_fix_task_creates_new_lane_for_new_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
@@ -527,6 +552,54 @@ class TestVerifyFixTasks:
         assert "- Failure: pytest failed" in rendered
         assert f"- Output artifact path: `{artifact_path}`" in rendered
         assert "AssertionError: expected green" in rendered
+
+    def test_resolve_verify_fix_context_prefers_structured_task_artifact_for_multiline_command(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="set -e\n./bin/tests",
+            verify_timeout_seconds=300,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=epoch,
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+        )
+
+        created, did_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+        reused, reused_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+        assert did_create is True
+        assert reused_create is False
+        assert reused.id == created.id
+
+        context = resolve_verify_fix_context(store, config, task=created)
+
+        assert context.command == "set -e\n./bin/tests"
+        assert context.trimmed_output.endswith("AssertionError: expected green")
 
 
 # ---------------------------------------------------------------------------
