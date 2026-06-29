@@ -434,6 +434,23 @@ def _verify_fix_task_branch_and_head(
     return branch, head_sha
 
 
+def _verify_fix_same_branch_code_changing_lineage_task(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    impl_task: Task,
+    verify_epoch: VerifyEpoch,
+) -> bool:
+    if task.task_type not in _VERIFY_FIX_CODE_CHANGING_TASK_TYPES:
+        return False
+    if task.id is not None and impl_task.id is not None and task.id == impl_task.id:
+        return True
+    if task.same_branch:
+        return True
+    task_branch, _ = _verify_fix_task_branch_and_head(store, task)
+    return task_branch == verify_epoch.reviewed_branch
+
+
 def resolve_verify_fix_representative_task(
     store: SqliteTaskStore,
     *,
@@ -456,18 +473,24 @@ def resolve_verify_fix_representative_task(
             f"verify_fix for {impl_task.id} requires failed verify evidence, but the latest matching result is {lookup.result.status!r}"
         )
 
-    lineage_tasks = [
-        task
-        for task in _verify_fix_lineage_tasks(store, impl_task)
-        if task.task_type in _VERIFY_FIX_CODE_CHANGING_TASK_TYPES
-    ]
+    lineage_tasks = _verify_fix_lineage_tasks(store, impl_task)
     source_task_id = lookup.result.source_task_id
     if source_task_id is not None:
         for task in lineage_tasks:
-            if task.id == source_task_id:
+            if task.id != source_task_id:
+                continue
+            if _verify_fix_same_branch_code_changing_lineage_task(
+                store,
+                task,
+                impl_task=impl_task,
+                verify_epoch=verify_epoch,
+            ):
                 return task
+            break
     matching_candidates: list[Task] = []
     for task in lineage_tasks:
+        if task.task_type not in _VERIFY_FIX_CODE_CHANGING_TASK_TYPES:
+            continue
         task_branch, task_head_sha = _verify_fix_task_branch_and_head(store, task)
         if (
             task_branch == verify_epoch.reviewed_branch
