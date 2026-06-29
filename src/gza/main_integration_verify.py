@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import platform
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
@@ -135,6 +136,40 @@ class MainIntegrationVerifyEnvironmentIdentity:
         )
 
 
+@dataclass(frozen=True)
+class CandidateIntegrationVerifyEvidence:
+    """Structured verification evidence for one exact candidate checkout."""
+
+    gate_enabled: bool
+    verify_command: str | None
+    verify_timeout_seconds: int | None
+    verify_timeout_grace_seconds: float | None
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
+    tree_fingerprint: str | None
+    head_sha: str | None
+    verify_status: str | None
+    verify_exit_status: str | None
+    failure: str | None
+    failing_phase: str | None
+    reviewed_branch: str | None
+    working_directory: str | None
+    captured_at: datetime | None
+
+
+@dataclass(frozen=True)
+class CandidateIntegrationVerifyCheck:
+    """Outcome of verifying one exact candidate checkout without mutating main state."""
+
+    evidence: CandidateIntegrationVerifyEvidence
+    classification: Literal["pass", "deterministic_red", "flake", "unavailable"]
+    merges_halted: bool
+    remediation: MainIntegrationVerifyRemediation | None = None
+    verify_runs: int = 0
+
+
+IntegrationVerifyEvidence = MainIntegrationVerifyState | CandidateIntegrationVerifyEvidence
+
+
 def _find_main_integration_verify_task(store: SqliteTaskStore) -> Task | None:
     for task in store.get_all():
         if task.task_type != "internal":
@@ -239,10 +274,10 @@ def _verify_failure_signature(
     return f"status:{status}:exit:{exit_status}"
 
 
-def _build_main_integration_verify_remediation(
+def _build_integration_verify_remediation(
     *,
     kind: Literal["deflake", "fix"],
-    state: MainIntegrationVerifyState,
+    state: IntegrationVerifyEvidence,
 ) -> MainIntegrationVerifyRemediation:
     return MainIntegrationVerifyRemediation(
         kind=kind,
@@ -562,17 +597,15 @@ def run_main_integration_verify(
     return state
 
 
-def _run_main_integration_verify_with_red_reruns(
-    config: Config,
-    store: SqliteTaskStore,
-    git: Git,
+def _run_integration_verify_with_red_reruns(
+    run_once: Callable[[str], IntegrationVerifyEvidence],
     *,
     reason: str,
     red_reruns: int,
-    prior_red_state: MainIntegrationVerifyState | None = None,
-) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
+    prior_red_state: IntegrationVerifyEvidence | None = None,
+) -> tuple[IntegrationVerifyEvidence, MainIntegrationVerifyRemediation | None, int]:
     """Run verify, optionally rerunning red verdicts to classify flakes vs deterministic reds."""
-    state = run_main_integration_verify(config, store, git, reason=reason)
+    state = run_once(reason)
     verify_runs = 1
     if red_reruns <= 0:
         return state, None, verify_runs
@@ -589,23 +622,18 @@ def _run_main_integration_verify_with_red_reruns(
     if not _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
         return (
             state,
-            _build_main_integration_verify_remediation(kind="deflake", state=reference_state),
+            _build_integration_verify_remediation(kind="deflake", state=reference_state),
             verify_runs,
         )
 
     confirmed_red_state = state
     for attempt in range(1, red_reruns + 1):
-        rerun_state = run_main_integration_verify(
-            config,
-            store,
-            git,
-            reason=f"{reason}-rerun-{attempt}",
-        )
+        rerun_state = run_once(f"{reason}-rerun-{attempt}")
         verify_runs += 1
         if not _verify_result_is_red(status=rerun_state.verify_status, gate_enabled=rerun_state.gate_enabled):
             return (
                 rerun_state,
-                _build_main_integration_verify_remediation(kind="deflake", state=confirmed_red_state),
+                _build_integration_verify_remediation(kind="deflake", state=confirmed_red_state),
                 verify_runs,
             )
         confirmed_red_state = rerun_state
@@ -613,9 +641,27 @@ def _run_main_integration_verify_with_red_reruns(
 
     return (
         state,
-        _build_main_integration_verify_remediation(kind="fix", state=confirmed_red_state),
+        _build_integration_verify_remediation(kind="fix", state=confirmed_red_state),
         verify_runs,
     )
+
+
+def _run_main_integration_verify_with_red_reruns(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    reason: str,
+    red_reruns: int,
+    prior_red_state: MainIntegrationVerifyState | None = None,
+) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
+    state, remediation, verify_runs = _run_integration_verify_with_red_reruns(
+        lambda run_reason: run_main_integration_verify(config, store, git, reason=run_reason),
+        reason=reason,
+        red_reruns=red_reruns,
+        prior_red_state=prior_red_state,
+    )
+    return cast(MainIntegrationVerifyState, state), remediation, verify_runs
 
 
 def check_main_integration_verify(
@@ -673,6 +719,105 @@ def check_main_integration_verify(
             status=refreshed.verify_status,
             gate_enabled=refreshed.gate_enabled,
         ),
+        remediation=remediation,
+        verify_runs=verify_runs,
+    )
+
+
+def run_candidate_integration_verify(
+    config: Config,
+    git: Git,
+    *,
+    reason: str,
+) -> CandidateIntegrationVerifyEvidence:
+    """Run the configured verify gate against an exact candidate checkout."""
+    del reason
+    captured_at = datetime.now(UTC)
+    head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
+    gate = _current_gate_identity(config)
+    verify_command = gate.verify_command or ""
+    gate_enabled = gate.gate_enabled
+    current_branch = git.current_branch()
+    working_directory = str(git.repo_dir)
+
+    if not gate_enabled:
+        result = _make_review_verify_result(
+            "(verify_command unavailable)",
+            status="unavailable",
+            exit_status="not configured",
+            captured_at=captured_at,
+            reviewed_branch=current_branch,
+            reviewed_head_sha=head_sha,
+            working_directory=working_directory,
+            failure="verify_command is not configured",
+        )
+    else:
+        assert gate.verify_timeout_seconds is not None
+        assert gate.verify_timeout_grace_seconds is not None
+        result = _run_review_verify_command(
+            verify_command,
+            cwd=git.repo_dir,
+            reviewed_branch=current_branch,
+            reviewed_head_sha=head_sha,
+            timeout_seconds=gate.verify_timeout_seconds,
+            timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+        )
+
+    failing_phase = _verify_failure_phase_name(result.output)
+    tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
+    if gate_enabled and result.status == "passed" and tree_fingerprint is None:
+        result = _coerce_result_to_freshness_unavailable(result)
+
+    return CandidateIntegrationVerifyEvidence(
+        gate_enabled=gate_enabled,
+        verify_command=gate.verify_command,
+        verify_timeout_seconds=gate.verify_timeout_seconds,
+        verify_timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+        environment_identity=gate.environment_identity,
+        tree_fingerprint=tree_fingerprint,
+        head_sha=head_sha,
+        verify_status=result.status,
+        verify_exit_status=result.exit_status,
+        failure=result.failure,
+        failing_phase=failing_phase,
+        reviewed_branch=result.reviewed_branch,
+        working_directory=result.working_directory,
+        captured_at=result.captured_at,
+    )
+
+
+def _classify_candidate_integration_verify(
+    evidence: CandidateIntegrationVerifyEvidence,
+    remediation: MainIntegrationVerifyRemediation | None,
+) -> Literal["pass", "deterministic_red", "flake", "unavailable"]:
+    if evidence.verify_status == "unavailable":
+        return "unavailable"
+    if remediation is not None and remediation.kind == "deflake":
+        return "flake"
+    if _verify_result_is_red(status=evidence.verify_status, gate_enabled=evidence.gate_enabled):
+        return "deterministic_red"
+    return "pass"
+
+
+def check_candidate_integration_verify(
+    config: Config,
+    git: Git,
+    *,
+    reason: str,
+    red_reruns: int = 0,
+) -> CandidateIntegrationVerifyCheck:
+    """Run candidate integration verify for an exact checkout without touching main state."""
+    evidence, remediation, verify_runs = _run_integration_verify_with_red_reruns(
+        lambda run_reason: run_candidate_integration_verify(config, git, reason=run_reason),
+        reason=reason,
+        red_reruns=red_reruns,
+    )
+    evidence = cast(CandidateIntegrationVerifyEvidence, evidence)
+    classification = _classify_candidate_integration_verify(evidence, remediation)
+    return CandidateIntegrationVerifyCheck(
+        evidence=evidence,
+        classification=classification,
+        merges_halted=evidence.gate_enabled and classification in {"deterministic_red", "unavailable"},
         remediation=remediation,
         verify_runs=verify_runs,
     )

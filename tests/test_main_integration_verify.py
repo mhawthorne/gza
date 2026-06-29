@@ -11,6 +11,7 @@ from gza.db import SqliteTaskStore
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MainIntegrationVerifyEnvironmentIdentity,
+    check_candidate_integration_verify,
     check_main_integration_verify,
     current_main_integration_verify_alert,
     load_main_integration_verify_state,
@@ -214,6 +215,234 @@ def test_check_main_integration_verify_treats_environment_identity_mismatch_as_s
     run_verify.assert_called_once()
     assert check.performed_verify is True
     assert check.state.environment_identity == _current_host_identity()
+
+
+def test_check_candidate_integration_verify_pass_returns_structured_evidence_without_persisting_main_state(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+
+    fingerprint = "a" * 64
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        output=f"gza-verify phase=passed name=unit duration_seconds=3.25 tree_fingerprint={fingerprint}",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=fingerprint) as compute_fingerprint,
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify,
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-pass",
+        )
+
+    run_verify.assert_called_once_with(
+        "./bin/tests",
+        cwd=tmp_path,
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        timeout_seconds=120,
+        timeout_grace_seconds=5.0,
+    )
+    compute_fingerprint.assert_not_called()
+    assert check.classification == "pass"
+    assert check.verify_runs == 1
+    assert check.merges_halted is False
+    assert check.remediation is None
+    assert check.evidence.environment_identity == _current_host_identity()
+    assert check.evidence.tree_fingerprint == fingerprint
+    assert check.evidence.head_sha == "def456"
+    assert check.evidence.reviewed_branch == "candidate-main"
+    assert check.evidence.working_directory == str(tmp_path)
+    assert check.evidence.verify_status == "passed"
+    assert check.evidence.failing_phase is None
+    assert load_main_integration_verify_state(store) is None
+
+
+def test_check_candidate_integration_verify_red_rerun_classifies_flake(tmp_path) -> None:
+    setup_config(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+
+    red_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output="gza-verify phase=failed name=functional duration_seconds=4.0",
+    )
+    green_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 1, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=[red_result, green_result]) as run_verify,
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-flake",
+            red_reruns=1,
+        )
+
+    assert run_verify.call_count == 2
+    assert check.classification == "flake"
+    assert check.verify_runs == 2
+    assert check.merges_halted is False
+    assert check.evidence.verify_status == "passed"
+    assert check.remediation is not None
+    assert check.remediation.kind == "deflake"
+    assert check.remediation.signature == "phase:functional"
+    assert check.remediation.tree_fingerprint == "fp-candidate"
+    assert check.remediation.failing_phase == "functional"
+    assert check.remediation.failure == "verify_command failed"
+
+
+def test_check_candidate_integration_verify_red_rerun_classifies_deterministic_red(tmp_path) -> None:
+    setup_config(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+
+    first_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output="gza-verify phase=failed name=functional duration_seconds=4.0",
+    )
+    second_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 29, 12, 1, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        failure="verify_command failed again",
+        output="gza-verify phase=failed name=functional duration_seconds=4.1",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=[first_red, second_red]) as run_verify,
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-red",
+            red_reruns=1,
+        )
+
+    assert run_verify.call_count == 2
+    assert check.classification == "deterministic_red"
+    assert check.verify_runs == 2
+    assert check.merges_halted is True
+    assert check.evidence.verify_status == "failed"
+    assert check.evidence.failing_phase == "functional"
+    assert check.remediation is not None
+    assert check.remediation.kind == "fix"
+    assert check.remediation.signature == "phase:functional"
+    assert check.remediation.tree_fingerprint == "fp-candidate"
+    assert check.remediation.failure == "verify_command failed again"
+
+
+def test_check_candidate_integration_verify_treats_missing_fingerprint_as_unavailable(tmp_path) -> None:
+    setup_config(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None) as compute_fingerprint,
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify,
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-unavailable",
+        )
+
+    run_verify.assert_called_once()
+    compute_fingerprint.assert_called_once_with(git)
+    assert check.classification == "unavailable"
+    assert check.verify_runs == 1
+    assert check.merges_halted is True
+    assert check.remediation is None
+    assert check.evidence.tree_fingerprint is None
+    assert check.evidence.verify_status == "unavailable"
+    assert check.evidence.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+    assert check.evidence.failure == (
+        "could not prove exact local target tree freshness because the tree fingerprint is unavailable"
+    )
 
 
 def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint_is_unavailable(tmp_path) -> None:
