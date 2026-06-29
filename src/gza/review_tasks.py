@@ -265,6 +265,11 @@ def create_spec_coherence_review_task(
     if not changed:
         raise ValueError("Spec coherence review requires at least one changed behavior-spec path.")
 
+    inherited_tags = tuple(resolve_derived_task_tags(impl_task))
+    review_tags = inherited_tags + tuple(
+        tag for tag in ("spec-coherence", "specs-behavior") if tag not in inherited_tags
+    )
+
     existing_reviews = store.get_reviews_for_task(impl_task.id)
     active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
     if active_reviews:
@@ -274,7 +279,7 @@ def create_spec_coherence_review_task(
         prompt=build_spec_coherence_review_prompt(impl_task, changed_paths=changed),
         task_type="review",
         depends_on=impl_task.id,
-        tags=resolve_derived_task_tags(impl_task),
+        tags=review_tags,
         based_on=impl_task.id,
         enforce_single_active_sibling=True,
         review_scope=build_spec_coherence_review_scope(

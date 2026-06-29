@@ -164,6 +164,7 @@ def test_create_spec_coherence_review_task_sets_scope_and_prompt_contract(tmp_pa
     impl = store.add("Update behavior spec", task_type="implement")
     assert impl.id is not None
     impl.status = "completed"
+    impl.tags = ("existing-tag",)
     store.update(impl)
 
     review = create_spec_coherence_review_task(
@@ -181,6 +182,7 @@ def test_create_spec_coherence_review_task_sets_scope_and_prompt_contract(tmp_pa
     assert scope.implementation_task_id == impl.id
     assert scope.reviewed_head_sha == "head123"
     assert scope.changed_paths == ("specs/behavior/lifecycle-engine.md",)
+    assert persisted.tags == ("existing-tag", "spec-coherence", "specs-behavior")
     assert "`## Verdict`" in persisted.prompt
 
     def test_slug_preserves_semantic_impl_subject_api2(self):

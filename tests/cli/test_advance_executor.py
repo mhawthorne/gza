@@ -3784,6 +3784,7 @@ def test_prepare_spec_coherence_review_action_creates_after_ordinary_review_comp
     impl = store.add("Update behavior spec", task_type="implement")
     assert impl.id is not None
     _mark_completed(impl, branch="feature/spec-coherence-executor")
+    impl.tags = ("lineage-tag",)
     store.update(impl)
 
     ordinary_review = store.add("Ordinary review", task_type="review", depends_on=impl.id)
@@ -3806,4 +3807,5 @@ def test_prepare_spec_coherence_review_action_creates_after_ordinary_review_comp
     assert result.review_task is not None
     assert "Review mode: spec-coherence" in (result.review_task.review_scope or "")
     assert "Reviewed head SHA: head123" in (result.review_task.review_scope or "")
+    assert result.review_task.tags == ("lineage-tag", "spec-coherence", "specs-behavior")
     assert "`## Verdict`" in result.review_task.prompt
