@@ -163,7 +163,10 @@ from .review_verdict import (
     parse_review_verdict,
     validate_review_report_contract,
 )
-from .review_verify_state import refresh_preserved_rebase_review_verify_heads
+from .review_verify_state import (
+    persist_verify_gate_artifact,
+    refresh_preserved_rebase_review_verify_heads,
+)
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
     extract_task_id_suffix,
@@ -3082,6 +3085,7 @@ class _StoredReviewVerifyArtifacts:
 
     artifact_id: int | None = None
     artifact_path: str | None = None
+    artifact_task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3285,9 +3289,29 @@ def _store_review_verify_artifact_records(
         if result.output:
             latest_content_artifact = (result.captured_at, stored.id, stored.path)
     if latest_content_artifact is None:
-        return _StoredReviewVerifyArtifacts()
+        return _StoredReviewVerifyArtifacts(artifact_task_id=artifact_owner.id)
     _, artifact_id, artifact_path = latest_content_artifact
-    return _StoredReviewVerifyArtifacts(artifact_id=artifact_id, artifact_path=artifact_path)
+    return _StoredReviewVerifyArtifacts(
+        artifact_id=artifact_id,
+        artifact_path=artifact_path,
+        artifact_task_id=artifact_owner.id,
+    )
+
+
+def _resolve_verify_gate_owner_task(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    artifact_task: Task | None = None,
+) -> Task | None:
+    """Return the canonical task that should own neutral verify-gate evidence."""
+    if artifact_task is not None:
+        return artifact_task
+    if task.task_type == "review" and task.depends_on:
+        impl_task = store.get(task.depends_on)
+        if impl_task is not None:
+            return impl_task
+    return task
 
 
 def _persist_review_verify_result(
@@ -3362,6 +3386,25 @@ def _capture_review_verify_result(
         markdown=markdown,
         artifact_file=stored_artifacts.artifact_path,
     )
+    verify_gate_owner = _resolve_verify_gate_owner_task(store, task, artifact_task=artifact_task)
+    if verify_gate_owner is not None:
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=verify_gate_owner,
+            source_task=task,
+            result=persisted_result,
+            verify_timeout_seconds=(
+                metadata.get("timeout_seconds") if isinstance(metadata, dict) else None
+            ),
+            verify_timeout_grace_seconds=(
+                metadata.get("timeout_grace_seconds") if isinstance(metadata, dict) else None
+            ),
+            output_artifact_id=stored_artifacts.artifact_id,
+            output_artifact_task_id=stored_artifacts.artifact_task_id,
+            output_artifact_path=stored_artifacts.artifact_path,
+            producer=producer,
+        )
     store.update(task)
     if task_logger is not None:
         task_logger.phase(
@@ -5456,6 +5499,7 @@ def _capture_noop_improve_review_verify_result(
         metadata={
             "review_task_id": review_task.id,
             "timeout_seconds": timeout_seconds,
+            "timeout_grace_seconds": timeout_grace_seconds,
         },
     )
     return result
@@ -9693,7 +9737,10 @@ def _run_non_code_task(
                         markdown=review_verify_markdown,
                         project_results=persisted_project_results if reviewed_head_sha is not None else (),
                         task_logger=task_logger,
-                        metadata={"timeout_seconds": autonomous_verify_timeout_seconds},
+                        metadata={
+                            "timeout_seconds": autonomous_verify_timeout_seconds,
+                            "timeout_grace_seconds": review_verify_timeout_grace_seconds,
+                        },
                     )
             prompt = build_prompt(
                 task,
