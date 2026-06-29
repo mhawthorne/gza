@@ -47,6 +47,7 @@ from gza.review_tasks import (
     persist_off_topic_verify_clearance,
     resolve_latest_failed_verify_epoch,
     resolve_verify_fix_context,
+    resolve_verify_fix_representative_task,
     resolve_verify_fix_task_identity,
 )
 from gza.review_verdict import ReviewFinding
@@ -386,6 +387,49 @@ class TestVerifyFixTasks:
         assert did_create is True
         assert created.based_on == rebase.id
         assert created.task_type == "verify_fix"
+
+    def test_resolve_verify_fix_representative_task_prefers_evidence_source_without_head_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        improve.status = "completed"
+        improve.branch = "feature/test"
+        improve.has_commits = True
+        improve.completed_at = datetime(2026, 6, 29, 12, 1, tzinfo=UTC)
+        store.update(improve)
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=improve.id, same_branch=True)
+        rebase.status = "completed"
+        rebase.branch = "feature/test"
+        rebase.has_commits = True
+        rebase.completed_at = datetime(2026, 6, 29, 12, 2, tzinfo=UTC)
+        store.update(rebase)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=rebase,
+            epoch=epoch,
+        )
+
+        representative = resolve_verify_fix_representative_task(
+            store,
+            impl_task=impl,
+            verify_epoch=epoch,
+        )
+
+        assert representative.id == rebase.id
 
     def test_create_or_reuse_verify_fix_task_fails_closed_without_matching_failed_evidence(
         self, tmp_path: Path
