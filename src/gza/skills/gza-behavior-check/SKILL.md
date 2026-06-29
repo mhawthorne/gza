@@ -225,6 +225,10 @@ The human-readable sections above stay exactly as written. The JSON appendix is 
 and MUST appear at the end of every report so automation can parse the run without
 scraping prose.
 
+The appendix MUST contain exactly one JSON object per checked assertion, and every object
+MUST include `assertion_id`, `verdict`, `recommendation`, `spec_file`, `spec_section`,
+`summary`, `evidence`, and `report_path`.
+
 Emit **one JSON object per checked assertion** (HOLDS, DIVERGES, and UNDETERMINED), using
 this schema:
 

@@ -854,8 +854,20 @@ class TestSkillContentValidation:
         assert installed == bundled
         assert "## Machine-readable findings" in installed
         assert '"assertion_id": "LE-§6-IMPROVE-CHAIN"' in installed
+        assert '"verdict": "DIVERGES"' in installed
         assert '"recommendation": null' in installed
+        assert '"spec_file": "specs/behavior/lifecycle-engine.md"' in installed
+        assert '"spec_section": "§6"' in installed
+        assert '"summary": "Improve chain queries follow the implementation link instead of the review link."' in installed
+        assert '"path": "src/gza/<file>.py"' in installed
+        assert '"line": 123' in installed
+        assert '"note": "Filters by the implementation link, so review-linked retries are missed."' in installed
         assert '"report_path": "reviews/<timestamp>-behavior-check.md"' in installed
+        assert "The appendix MUST contain exactly one JSON object per checked assertion" in installed
+        assert (
+            "every object MUST include `assertion_id`, `verdict`, `recommendation`, `spec_file`, "
+            "`spec_section`, `summary`, `evidence`, and `report_path`." in normalized
+        )
         assert "Emit **one JSON object per checked assertion** (HOLDS, DIVERGES, and UNDETERMINED)" in installed
         assert "use `null` for `HOLDS` and `UNDETERMINED`." in normalized
 

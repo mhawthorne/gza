@@ -412,11 +412,23 @@ def test_behavior_check_skill_requires_machine_readable_findings_appendix() -> N
 
     assert "## Machine-readable findings" in behavior_check
     assert '"assertion_id": "LE-§6-IMPROVE-CHAIN"' in behavior_check
+    assert '"verdict": "DIVERGES"' in behavior_check
     assert '"recommendation": "code bug"' in behavior_check
     assert '"recommendation": null' in behavior_check
+    assert '"spec_file": "specs/behavior/lifecycle-engine.md"' in behavior_check
+    assert '"spec_section": "§6"' in behavior_check
+    assert '"summary": "Improve chain queries follow the implementation link instead of the review link."' in behavior_check
     assert '"evidence": [' in behavior_check
+    assert '"path": "src/gza/<file>.py"' in behavior_check
+    assert '"line": 123' in behavior_check
+    assert '"note": "Filters by the implementation link, so review-linked retries are missed."' in behavior_check
     assert '"report_path": "reviews/<timestamp>-behavior-check.md"' in behavior_check
     assert "The human-readable sections above stay exactly as written." in behavior_check
+    assert "The appendix MUST contain exactly one JSON object per checked assertion" in behavior_check
+    assert (
+        "every object MUST include `assertion_id`, `verdict`, `recommendation`, `spec_file`, "
+        "`spec_section`, `summary`, `evidence`, and `report_path`." in normalized
+    )
     assert "Emit **one JSON object per checked assertion** (HOLDS, DIVERGES, and UNDETERMINED)" in behavior_check
     assert "use `null` for `HOLDS` and `UNDETERMINED`." in normalized
     assert "The JSON appendix is mandatory." in behavior_check
