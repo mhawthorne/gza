@@ -365,7 +365,9 @@ def task_owns_merge_status(task: "Task") -> bool:
     """
     if task.task_type not in {"task", "implement", "improve", "verify_fix", "fix", "rebase", "explore"}:
         return False
-    return not (task.task_type in {"improve", "verify_fix", "fix", "rebase"} and task.based_on is not None)
+    if task.task_type == "verify_fix":
+        return False
+    return not (task.task_type in {"improve", "fix", "rebase"} and task.based_on is not None)
 
 
 MERGE_UNIT_ACTIONABLE_STATES: frozenset[str] = frozenset({"unmerged", "blocked", "stale"})

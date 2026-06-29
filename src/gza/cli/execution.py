@@ -2408,6 +2408,26 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("Error: plan_improve must be based on the same plan source reviewed by its plan_review dependency")
             return 1
 
+    if task_type == "verify_fix":
+        if based_on is None:
+            print(
+                "Error: verify_fix tasks require --based-on <implementation-lineage-task-id> "
+                "and must target an existing implementation lineage."
+            )
+            return 1
+        if not same_branch:
+            print(
+                "Error: verify_fix tasks require --same-branch so they stay attached to the implementation merge unit."
+            )
+            return 1
+        impl_owner, err = resolve_impl_task(store, based_on)
+        if impl_owner is None:
+            print(
+                "Error: verify_fix --based-on must reference an implementation-lineage task "
+                f"(implement/improve/verify_fix/fix/rebase). {err}"
+            )
+            return 1
+
     if task_type == "implement":
         held_plan_error = _validate_new_implement_source_not_held_for_review(
             store,

@@ -141,12 +141,16 @@ from .review_scope import (
 )
 from .review_tasks import (
     DuplicateReviewError,
+    VerifyFixContextError,
     create_review_task,
     extract_followup_prompt_parts,
     extract_review_blocker_adjudication_dispute_metadata,
     extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_prompt_parts,
+    format_verify_fix_context,
+    format_verify_fix_context_error,
     persist_review_clearance_artifact,
+    resolve_verify_fix_context,
 )
 from .review_verdict import (
     ReviewFinding,
@@ -4991,6 +4995,39 @@ def _build_context_from_chain(
             elif root_impl.prompt:
                 context_parts.append("\n## Original request:\n")
                 context_parts.append(root_impl.prompt)
+
+    if task.task_type == "verify_fix":
+        if config is None:
+            context_parts.append(
+                "## verify_fix evidence status\n\n"
+                "verify_fix cannot resolve failed verify evidence because prompt context was built without project config.\n"
+                "- Action: stop and ask the operator to rerun the task through the normal prompt-building path.\n"
+            )
+        else:
+            try:
+                verify_fix_context = resolve_verify_fix_context(
+                    store,
+                    config,
+                    task=task,
+                )
+            except VerifyFixContextError as exc:
+                context_parts.append(format_verify_fix_context_error(task, exc))
+            else:
+                context_parts.append(format_verify_fix_context(verify_fix_context))
+                plan_task = get_plan_for_task(store, verify_fix_context.impl_task)
+                if plan_task:
+                    plan_content = _get_task_output(plan_task, project_dir)
+                    if plan_content:
+                        context_parts.append("\n## Original plan:\n")
+                        context_parts.append(plan_content)
+                    else:
+                        context_parts.append(
+                            "\n## Original plan:\n"
+                            f"(plan task {plan_task.id} exists but content unavailable on this machine - flag as blocker)"
+                        )
+                elif verify_fix_context.impl_task.prompt:
+                    context_parts.append("\n## Original request:\n")
+                    context_parts.append(verify_fix_context.impl_task.prompt)
 
     # For implement tasks, include plan from lineage chain.
     if task.task_type == "implement":

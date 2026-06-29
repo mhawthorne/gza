@@ -120,6 +120,76 @@ def test_cmd_add_accepts_well_formed_plan_review_plan_improve_and_verify_fix_tas
     ]
 
 
+def test_cmd_add_rejects_verify_fix_without_lineage_anchor(tmp_path: Path, capsys) -> None:
+    _write_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        prompt="verify_fix prompt",
+        prompt_file=None,
+        edit=False,
+        type="verify_fix",
+        explore=False,
+        depends_on=None,
+        based_on=None,
+        review=False,
+        hold_for_review=False,
+        create_pr=False,
+        same_branch=False,
+        spec=None,
+        review_scope=None,
+        branch_type=None,
+        model=None,
+        provider=None,
+        skip_learnings=False,
+        next=False,
+        tags=None,
+    )
+
+    rc = cmd_add(args)
+
+    assert rc == 1
+    assert "verify_fix tasks require --based-on" in capsys.readouterr().out
+
+
+def test_cmd_add_accepts_same_branch_verify_fix_anchored_to_code_lineage(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    store = _load_store(tmp_path)
+    impl = store.add("Implement the plan", task_type="implement")
+    improve = store.add("Improve the plan", task_type="improve", based_on=impl.id, same_branch=True)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        prompt="verify_fix prompt",
+        prompt_file=None,
+        edit=False,
+        type="verify_fix",
+        explore=False,
+        depends_on=None,
+        based_on=improve.id,
+        review=False,
+        hold_for_review=False,
+        create_pr=False,
+        same_branch=True,
+        spec=None,
+        review_scope=None,
+        branch_type=None,
+        model=None,
+        provider=None,
+        skip_learnings=False,
+        next=False,
+        tags=None,
+    )
+
+    with patch("gza.cli.execution.set_task_urgency", return_value=True):
+        rc = cmd_add(args)
+
+    assert rc == 0
+    verify_fix = next(task for task in store.get_pending() if task.task_type == "verify_fix")
+    assert verify_fix.based_on == improve.id
+    assert verify_fix.same_branch is True
+
+
 def test_cmd_add_rejects_plan_review_without_plan_source_dependency(tmp_path: Path, capsys) -> None:
     _write_config(tmp_path)
 

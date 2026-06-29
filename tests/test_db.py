@@ -41,6 +41,7 @@ from gza.db import (
     run_v25_migration,
     run_v26_migration,
     run_v27_migration,
+    task_owns_merge_status,
 )
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
@@ -3338,6 +3339,21 @@ class TestMergeStatus:
         assert impl_unit.id == review_unit.id == improve_unit.id == verify_fix_unit.id
         attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
         assert attached_ids == {impl.id, review.id, improve.id, verify_fix.id}
+
+    def test_verify_fix_never_owns_merge_status(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        verify_fix = Task(id="gza-999", prompt="verify fix", task_type="verify_fix", based_on=None)
+
+        assert task_owns_merge_status(verify_fix) is False
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/impl")
+        verify_fix_task = store.add("Verify fix feature", task_type="verify_fix", based_on=impl.id, same_branch=True)
+        store.mark_completed(verify_fix_task, has_commits=True, branch="feature/impl")
+
+        unit = store.resolve_merge_unit_for_task(verify_fix_task.id)
+        assert unit is not None
+        assert unit.owner_task_id == impl.id
 
     def test_mark_completed_without_explicit_target_raises_when_project_default_branch_fails(
         self,

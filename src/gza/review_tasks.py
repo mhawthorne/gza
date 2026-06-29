@@ -10,10 +10,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .artifacts import prepare_command_output_artifact, store_command_output_artifact
 from .config import Config
 from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
+from .lineage import resolve_impl_task
 from .prompts import PromptBuilder
 from .rebase_diff import parse_rebase_diff_provenance
 from .review_scope import (
@@ -22,7 +24,7 @@ from .review_scope import (
     resolve_review_scope_for_impl,
 )
 from .review_verdict import ReviewFinding
-from .review_verify_state import VerifyEpoch
+from .review_verify_state import VerifyEpoch, latest_verify_result_for_epoch
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -58,6 +60,11 @@ _REVIEW_BLOCKER_ADJUDICATION_CURRENT_STATE_CITATION_RE = re.compile(
 )
 _DISPUTE_ARTIFACT_ID_RE = re.compile(r"^Dispute artifact id:\s*(\d+)\s*$", re.MULTILINE)
 _DISPUTE_SOURCE_TASK_ID_RE = re.compile(r"^Dispute source task:\s*(\S+)\s*$", re.MULTILINE)
+_VERIFY_FIX_PROMPT_RE = re.compile(
+    r"^Fix verify failures for task (?P<impl_task_id>\S+) "
+    r"\[branch=(?P<branch>\S+) head=(?P<head>\S+) command=(?P<command>.+?) "
+    r"timeout=(?P<timeout>\S+) grace=(?P<grace>\S+)\]$"
+)
 
 OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND = "off_topic_verify_investigation"
 OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES = frozenset({"pending", "in_progress"})
@@ -78,6 +85,10 @@ class OffTopicVerifyPersistenceError(RuntimeError):
     """Raised when audited off-topic investigation or clearance persistence fails closed."""
 
 
+class VerifyFixContextError(ValueError):
+    """Raised when verify_fix cannot resolve the failed verify evidence it must remediate."""
+
+
 @dataclass(frozen=True)
 class OffTopicVerifyClearancePersistenceResult:
     """Persisted off-topic verify clearance details."""
@@ -92,6 +103,28 @@ class ReviewClearancePersistenceResult:
     """Persisted structured review-clearance details."""
 
     review_cleared_at: datetime
+
+
+@dataclass(frozen=True)
+class VerifyFixContext:
+    """Resolved failed verify evidence for one verify_fix prompt."""
+
+    impl_task: Task
+    owner_task: Task
+    verify_epoch: VerifyEpoch
+    status: str
+    exit_status: str
+    command: str
+    working_directory: str
+    reviewed_branch: str
+    reviewed_head_sha: str
+    reviewed_base_sha: str | None
+    failure: str
+    artifact_path: str
+    trimmed_output: str
+    source: str
+    source_task_id: str | None
+    source_task_type: str | None
 
 
 def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) -> set[str]:
@@ -165,6 +198,179 @@ def build_verify_fix_prompt(impl_task_id: str, verify_epoch: VerifyEpoch) -> str
     )
 
 
+def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:
+    """Extract the implementation owner and verify epoch identity from a verify_fix prompt."""
+    match = _VERIFY_FIX_PROMPT_RE.match(prompt.strip())
+    if match is None:
+        return None
+    timeout_raw = match.group("timeout")
+    grace_raw = match.group("grace")
+    try:
+        timeout_seconds = int(timeout_raw)
+        grace_seconds = float(grace_raw)
+    except ValueError:
+        return None
+    return (
+        match.group("impl_task_id"),
+        VerifyEpoch(
+            reviewed_branch=match.group("branch"),
+            reviewed_head_sha=match.group("head"),
+            verify_command=match.group("command"),
+            verify_timeout_seconds=timeout_seconds,
+            verify_timeout_grace_seconds=grace_seconds,
+        ),
+    )
+
+
+def resolve_verify_fix_context(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    task: Task | None = None,
+    impl_task: Task | None = None,
+    verify_epoch: VerifyEpoch | None = None,
+) -> VerifyFixContext:
+    """Resolve the failed verify evidence a verify_fix task must use, or fail closed."""
+    resolved_impl = impl_task
+    resolved_epoch = verify_epoch
+
+    if task is not None and (resolved_impl is None or resolved_epoch is None):
+        parsed = parse_verify_fix_prompt(task.prompt)
+        if parsed is None:
+            task_id = task.id or "(unsaved)"
+            raise VerifyFixContextError(
+                f"verify_fix task {task_id} cannot resolve its verify epoch from the task prompt. "
+                "Stop and ask the operator to recreate the task from failed verify evidence instead of proceeding blind."
+            )
+        prompt_impl_id, prompt_epoch = parsed
+        if resolved_impl is None:
+            resolved_impl, err = resolve_impl_task(store, prompt_impl_id)
+            if resolved_impl is None:
+                raise VerifyFixContextError(
+                    f"verify_fix task {task.id or '(unsaved)'} cannot resolve implementation owner {prompt_impl_id}: {err}"
+                )
+        if resolved_epoch is None:
+            resolved_epoch = prompt_epoch
+
+    if resolved_impl is None or resolved_impl.id is None:
+        raise VerifyFixContextError("verify_fix requires a persisted implementation owner task")
+    if resolved_epoch is None:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} is missing verify epoch metadata and cannot resolve failed evidence"
+        )
+
+    lookup = latest_verify_result_for_epoch(store, resolved_impl, current_epoch=resolved_epoch)
+    if lookup.result is None or lookup.source is None or not lookup.is_current:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} has no current failed verify evidence for "
+            f"branch={resolved_epoch.reviewed_branch} head={resolved_epoch.reviewed_head_sha} "
+            f"command={resolved_epoch.verify_command!r}. Re-run or persist the failing verify result first."
+        )
+
+    result = lookup.result
+    if result.status != "failed":
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} requires failed verify evidence, but the latest matching result is {result.status!r}"
+        )
+    if not result.command:
+        raise VerifyFixContextError(f"verify_fix for {resolved_impl.id} is missing the verify command in persisted evidence")
+    if not result.working_directory:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} is missing the verify working directory in persisted evidence"
+        )
+    if not result.reviewed_branch or not result.reviewed_head_sha:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} is missing branch/head provenance in persisted verify evidence"
+        )
+    artifact_path = result.output_artifact_path
+    if not artifact_path:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} is missing the persisted verify output artifact path"
+        )
+    try:
+        resolved_artifact_path = resolve_artifact_path(config.project_dir, artifact_path)
+    except InvalidArtifactPathError as exc:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} references invalid verify output artifact path {artifact_path!r}: {exc}"
+        ) from exc
+    if not resolved_artifact_path.exists():
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} references missing verify output artifact path {artifact_path!r}"
+        )
+    trimmed_output = resolved_artifact_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not trimmed_output:
+        raise VerifyFixContextError(
+            f"verify_fix for {resolved_impl.id} has an empty verify output artifact at {artifact_path!r}"
+        )
+    if len(trimmed_output) > 4000:
+        trimmed_output = trimmed_output[-4000:].lstrip()
+    lines = trimmed_output.splitlines()
+    if len(lines) > 40:
+        trimmed_output = "\n".join(lines[-40:])
+    return VerifyFixContext(
+        impl_task=resolved_impl,
+        owner_task=resolved_impl,
+        verify_epoch=resolved_epoch,
+        status=result.status,
+        exit_status=result.exit_status,
+        command=result.command,
+        working_directory=result.working_directory,
+        reviewed_branch=result.reviewed_branch,
+        reviewed_head_sha=result.reviewed_head_sha,
+        reviewed_base_sha=result.reviewed_base_sha,
+        failure=result.failure or "(not captured)",
+        artifact_path=artifact_path,
+        trimmed_output=trimmed_output,
+        source=lookup.source,
+        source_task_id=result.source_task_id,
+        source_task_type=result.source_task_type,
+    )
+
+
+def format_verify_fix_context(context: VerifyFixContext) -> str:
+    """Render first-class verify_fix prompt context from failed verify evidence."""
+    lines = [
+        "## verify_fix failed verify context",
+        "",
+        f"- Implementation owner: `{context.impl_task.id}`",
+        f"- Evidence source: `{context.source}`",
+        f"- Evidence task: `{context.source_task_id or '(unknown)'}` ({context.source_task_type or 'unknown'})",
+        f"- Status: `{context.status}`",
+        f"- Exit status: `{context.exit_status}`",
+        f"- Command: `{context.command}`",
+        f"- Working directory: `{context.working_directory}`",
+        f"- Reviewed branch: `{context.reviewed_branch}`",
+        f"- Reviewed head: `{context.reviewed_head_sha}`",
+    ]
+    if context.reviewed_base_sha:
+        lines.append(f"- Reviewed base/default SHA: `{context.reviewed_base_sha}`")
+    lines.extend(
+        [
+            f"- Failure: {context.failure}",
+            f"- Output artifact path: `{context.artifact_path}`",
+            "",
+            "Failing output (trimmed):",
+            "```text",
+            context.trimmed_output,
+            "```",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_verify_fix_context_error(task: Task, exc: VerifyFixContextError) -> str:
+    """Render an explicit fail-closed diagnostic for provider prompts."""
+    task_id = task.id or "(unsaved)"
+    return (
+        "## verify_fix evidence status\n\n"
+        "verify_fix cannot proceed automatically because the failed verify evidence could not be resolved.\n"
+        f"- Task: `{task_id}`\n"
+        f"- Reason: {exc}\n"
+        "- Action: stop, report this as a blocker, and ask the operator to recreate or re-run the failed verify capture.\n"
+        "- Do not make blind edits or rerun the full suite hoping to rediscover context."
+    )
+
+
 def find_existing_verify_fix_task(
     store: SqliteTaskStore,
     *,
@@ -191,6 +397,7 @@ def find_existing_verify_fix_task(
 
 def create_or_reuse_verify_fix_task(
     store: SqliteTaskStore,
+    config: Config,
     *,
     impl_task: Task,
     based_on_task: Task,
@@ -212,6 +419,13 @@ def create_or_reuse_verify_fix_task(
     )
     if existing is not None:
         return existing, False
+
+    resolve_verify_fix_context(
+        store,
+        config,
+        impl_task=impl_task,
+        verify_epoch=verify_epoch,
+    )
 
     created = store.add(
         prompt=build_verify_fix_prompt(impl_task.id, verify_epoch),

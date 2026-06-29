@@ -1,14 +1,18 @@
 """Tests for the PromptBuilder class in gza.prompts."""
 
+from datetime import UTC, datetime
 import re
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+from gza.artifacts import store_command_output_artifact
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.prompts import PromptBuilder
+from gza.review_tasks import create_or_reuse_verify_fix_task
+from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 
 REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
@@ -218,6 +222,117 @@ class TestPromptBuilderBuild:
         assert "Do not weaken guardrails to make the verify pass." in result
         assert str(summary_path) in result
         assert "Required final verify command: `./bin/tests`" in result
+
+    def test_build_verify_fix_prompt_includes_failed_verify_context(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        output_artifact = store_command_output_artifact(
+            store,
+            improve,
+            config,
+            kind="verify_command_output",
+            producer="test",
+            label="verify_command_output",
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            head_sha="deadbeef",
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "command": "./bin/tests",
+                "status": "failed",
+                "exit_status": "1",
+                "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+                "reviewed_branch": "feature/test",
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "base-sha",
+                "working_directory": str(tmp_path / "worktrees" / "verify"),
+                "failure": "pytest failed",
+            },
+        )()
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=improve,
+            result=result,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            output_artifact_id=output_artifact.id,
+            output_artifact_task_id=improve.id,
+            output_artifact_path=output_artifact.path,
+            producer="test",
+        )
+        task, created = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+
+        summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
+        prompt = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert created is True
+        assert "## verify_fix failed verify context" in prompt
+        assert "- Status: `failed`" in prompt
+        assert "- Command: `./bin/tests`" in prompt
+        assert "- Working directory: " in prompt
+        assert "- Reviewed branch: `feature/test`" in prompt
+        assert "- Reviewed head: `deadbeef`" in prompt
+        assert "- Reviewed base/default SHA: `base-sha`" in prompt
+        assert "- Failure: pytest failed" in prompt
+        assert f"- Output artifact path: `{output_artifact.path}`" in prompt
+        assert "AssertionError: expected green" in prompt
+
+    def test_build_verify_fix_prompt_fail_closed_when_evidence_missing(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(
+            prompt=(
+                "Fix verify failures for task gza-101 "
+                "[branch=feature/test head=deadbeef command=./bin/tests timeout=120 grace=5.0]"
+            ),
+            task_type="verify_fix",
+            based_on="gza-101",
+        )
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
+        prompt = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert "## verify_fix evidence status" in prompt
+        assert "cannot proceed automatically" in prompt
+        assert "Do not make blind edits" in prompt
 
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
         self, tmp_path: Path

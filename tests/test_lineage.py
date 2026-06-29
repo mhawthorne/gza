@@ -72,7 +72,7 @@ def test_walk_lineage_descendants_follows_both_based_on_and_depends_on_links(tmp
     assert grandchild.id in descendant_ids
 
 
-def test_resolve_impl_task_for_implement_review_improve_verify_fix_and_fix(tmp_path: Path) -> None:
+def test_resolve_impl_task_for_implement_review_improve_verify_fix_fix_and_rebase(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     impl = store.add("Implementation", task_type="implement")
     review = store.add("Review", task_type="review", depends_on=impl.id)
@@ -80,6 +80,7 @@ def test_resolve_impl_task_for_implement_review_improve_verify_fix_and_fix(tmp_p
     improve2 = store.add("Improve 2", task_type="improve", based_on=improve1.id, depends_on=review.id)
     verify_fix = store.add("Verify fix", task_type="verify_fix", based_on=improve2.id, same_branch=True)
     fix = store.add("Fix", task_type="fix", based_on=verify_fix.id, depends_on=review.id)
+    rebase = store.add("Rebase", task_type="rebase", based_on=verify_fix.id, same_branch=True)
 
     resolved_impl, err = resolve_impl_task(store, impl.id)
     assert err is None
@@ -105,6 +106,11 @@ def test_resolve_impl_task_for_implement_review_improve_verify_fix_and_fix(tmp_p
     assert err is None
     assert resolved_fix is not None
     assert resolved_fix.id == impl.id
+
+    resolved_rebase, err = resolve_impl_task(store, rebase.id)
+    assert err is None
+    assert resolved_rebase is not None
+    assert resolved_rebase.id == impl.id
 
 
 def test_resolve_impl_task_review_error_paths(tmp_path: Path) -> None:

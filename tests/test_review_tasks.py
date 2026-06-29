@@ -15,6 +15,7 @@ from gza.review_scope import parse_spec_coherence_review_scope
 from gza.review_tasks import (
     DuplicateReviewError,
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+    VerifyFixContextError,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
@@ -34,6 +35,7 @@ from gza.review_tasks import (
     extract_followup_prompt_parts,
     extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_dispute_identity,
+    format_verify_fix_context,
     find_existing_deferred_blocker_task,
     find_existing_followup_task,
     find_existing_review_blocker_adjudication_task,
@@ -41,8 +43,9 @@ from gza.review_tasks import (
     format_blocker_finding_context,
     format_followup_finding_context,
     persist_off_topic_verify_clearance,
+    resolve_verify_fix_context,
 )
-from gza.review_verify_state import VerifyEpoch
+from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 from gza.review_verdict import ReviewFinding
 
 
@@ -64,6 +67,60 @@ def _make_store(tmp_path: Path) -> tuple[Config, SqliteTaskStore]:
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return config, SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+
+def _seed_failed_verify_evidence(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    impl: Task,
+    source_task: Task,
+    epoch: VerifyEpoch,
+    output: str = "phase=pytest\nAssertionError: expected green\n",
+) -> str:
+    stored_output = store_command_output_artifact(
+        store,
+        source_task,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output=output,
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="1",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+    )
+    result = type(
+        "Result",
+        (),
+        {
+            "command": epoch.verify_command,
+            "status": "failed",
+            "exit_status": "1",
+            "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            "reviewed_branch": epoch.reviewed_branch,
+            "reviewed_head_sha": epoch.reviewed_head_sha,
+            "reviewed_base_sha": "base-sha",
+            "working_directory": str(config.project_dir / "worktrees" / "verify"),
+            "failure": "pytest failed",
+        },
+    )()
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=source_task,
+        result=result,
+        verify_timeout_seconds=epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=epoch.verify_timeout_grace_seconds,
+        output_artifact_id=stored_output.id,
+        output_artifact_task_id=source_task.id,
+        output_artifact_path=stored_output.path,
+        producer="test",
+    )
+    return stored_output.path
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +164,7 @@ class TestVerifyFixTasks:
         )
 
     def test_create_or_reuse_verify_fix_task_reuses_same_epoch(self, tmp_path: Path) -> None:
-        _config, store = _make_store(tmp_path)
+        config, store = _make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
         epoch = VerifyEpoch(
@@ -117,9 +174,17 @@ class TestVerifyFixTasks:
             verify_timeout_seconds=1800,
             verify_timeout_grace_seconds=5.0,
         )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=epoch,
+        )
 
         created, did_create = create_or_reuse_verify_fix_task(
             store,
+            config,
             impl_task=impl,
             based_on_task=improve,
             verify_epoch=epoch,
@@ -127,6 +192,7 @@ class TestVerifyFixTasks:
         )
         reused, reused_create = create_or_reuse_verify_fix_task(
             store,
+            config,
             impl_task=impl,
             based_on_task=improve,
             verify_epoch=epoch,
@@ -141,7 +207,7 @@ class TestVerifyFixTasks:
         assert created.based_on == improve.id
 
     def test_create_or_reuse_verify_fix_task_creates_new_lane_for_new_epoch(self, tmp_path: Path) -> None:
-        _config, store = _make_store(tmp_path)
+        config, store = _make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
         rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
         first_epoch = VerifyEpoch(
@@ -158,9 +224,26 @@ class TestVerifyFixTasks:
             verify_timeout_seconds=1800,
             verify_timeout_grace_seconds=5.0,
         )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=rebase,
+            epoch=first_epoch,
+            output="first failure\n",
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=rebase,
+            epoch=second_epoch,
+            output="second failure\n",
+        )
 
         first, first_created = create_or_reuse_verify_fix_task(
             store,
+            config,
             impl_task=impl,
             based_on_task=rebase,
             verify_epoch=first_epoch,
@@ -168,6 +251,7 @@ class TestVerifyFixTasks:
         )
         second, second_created = create_or_reuse_verify_fix_task(
             store,
+            config,
             impl_task=impl,
             based_on_task=rebase,
             verify_epoch=second_epoch,
@@ -179,6 +263,71 @@ class TestVerifyFixTasks:
         assert second.id != first.id
         assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=first_epoch).id == first.id
         assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=second_epoch).id == second.id
+
+    def test_create_or_reuse_verify_fix_task_fails_closed_without_matching_failed_evidence(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+
+        with pytest.raises(VerifyFixContextError, match="no current failed verify evidence"):
+            create_or_reuse_verify_fix_task(
+                store,
+                config,
+                impl_task=impl,
+                based_on_task=improve,
+                verify_epoch=epoch,
+                trigger_source="advance",
+            )
+
+    def test_resolve_verify_fix_context_formats_failed_verify_evidence(self, tmp_path: Path) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        artifact_path = _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=epoch,
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+        )
+
+        context = resolve_verify_fix_context(
+            store,
+            config,
+            impl_task=impl,
+            verify_epoch=epoch,
+        )
+        rendered = format_verify_fix_context(context)
+
+        assert context.artifact_path == artifact_path
+        assert "- Status: `failed`" in rendered
+        assert "- Exit status: `1`" in rendered
+        assert "- Command: `./bin/tests`" in rendered
+        assert "- Working directory: " in rendered
+        assert "- Reviewed branch: `feature/test`" in rendered
+        assert "- Reviewed head: `deadbeef`" in rendered
+        assert "- Reviewed base/default SHA: `base-sha`" in rendered
+        assert "- Failure: pytest failed" in rendered
+        assert f"- Output artifact path: `{artifact_path}`" in rendered
+        assert "AssertionError: expected green" in rendered
 
 
 # ---------------------------------------------------------------------------
