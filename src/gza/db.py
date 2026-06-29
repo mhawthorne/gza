@@ -5235,6 +5235,7 @@ class SqliteTaskStore:
                         completed_at = NULL,
                         failure_reason = NULL,
                         completion_reason = NULL,
+                        drop_reason = NULL,
                         running_pid = ?
                     WHERE project_id = ? AND id = ? AND status = 'pending'
                     """,

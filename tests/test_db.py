@@ -4772,6 +4772,26 @@ class TestFailureReasonTracking:
         assert retrieved is not None
         assert retrieved.drop_reason == "Superseded by follow-up"
 
+    def test_try_mark_in_progress_clears_stale_drop_reason(self, tmp_path: Path) -> None:
+        """Claiming a pending task should clear stale drop_reason metadata."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        task = store.add(prompt="Pending task")
+        task.drop_reason = "Superseded by follow-up"
+        store.update(task)
+
+        assert task.id is not None
+        claim = store.try_mark_in_progress(task.id, 12345)
+
+        assert claim.task is not None
+        assert claim.task.status == "in_progress"
+        assert claim.task.drop_reason is None
+
+        retrieved = store.get(task.id)
+        assert retrieved is not None
+        assert retrieved.drop_reason is None
+
     def test_migration_v10_to_v11_adds_failure_reason_column(self, tmp_path: Path):
         """Migration from v10 to v11 adds failure_reason column and backfills failed tasks."""
         import sqlite3
