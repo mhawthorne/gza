@@ -2100,7 +2100,7 @@ def test_improve_give_up_reports_automatic_recovery_disabled(tmp_path: Path) -> 
     attention = resolve_execution_needs_attention(impl, result)
     assert attention is not None
     assert attention.task.id == impl.id
-    assert attention.action["subject_task_id"] == impl.id
+    assert attention.action["subject_task_id"] == failed.id
 
 
 @pytest.mark.parametrize("trigger_source", ["manual", "watch"])

@@ -30,6 +30,7 @@ _REASON_CLASS_BY_ATTENTION_REASON = cast(
     {
         WATCH_NO_PROGRESS_BACKSTOP_REASON: "backstop",
         RETRY_LIMIT_REACHED_ATTENTION_REASON: "retry-limit",
+        "retryable-provider-error": "retry-limit",
         RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON: "reconcile",
     },
 )

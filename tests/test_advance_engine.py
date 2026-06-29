@@ -4661,6 +4661,120 @@ def test_failed_improve_recovery_next_step_keeps_fix_for_completed_impl(tmp_path
     )
 
 
+def test_failed_improve_retry_limit_retryable_recovery_next_step_uses_unstick(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/completed-retryable-rearm",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "WORKER_DIED"
+    failed_improve.completed_at = datetime(2026, 5, 15, 11, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    action = {
+        "type": "needs_discussion",
+        "description": "Improve automatic recovery stops here; retry limit reached",
+        "needs_attention_reason": "retry-limit-reached",
+        "subject_task_id": failed_improve.id,
+    }
+
+    assert needs_attention_recommended_next_step(store, failed_improve, action) == (
+        f"Recommended next step: uv run gza unstick {impl.id} --reason retry-limit --run"
+    )
+
+
+def test_failed_improve_retryable_provider_error_next_step_uses_unstick(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/provider-error-rearm",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_improve.completed_at = datetime(2026, 5, 15, 11, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    action = {
+        "type": "needs_discussion",
+        "description": "Improve automatic recovery stops here; retryable provider error",
+        "needs_attention_reason": "retryable-provider-error",
+        "subject_task_id": failed_improve.id,
+    }
+
+    assert needs_attention_recommended_next_step(store, failed_improve, action) == (
+        f"Recommended next step: uv run gza unstick {impl.id} --reason retry-limit --run"
+    )
+
+
+def test_failed_improve_retry_limit_manual_failure_keeps_fix_for_completed_impl(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/manual-fix-handoff",
+        when=datetime(2026, 5, 15, 9, 0, tzinfo=UTC),
+    )
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 5, 15, 10, 0, tzinfo=UTC)
+    store.update(review)
+
+    failed_improve = store.add(
+        "Failed improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=review.id,
+    )
+    assert failed_improve.id is not None
+    failed_improve.status = "failed"
+    failed_improve.failure_reason = "TEST_FAILURE"
+    failed_improve.completed_at = datetime(2026, 5, 15, 11, 0, tzinfo=UTC)
+    store.update(failed_improve)
+
+    action = {
+        "type": "needs_discussion",
+        "description": "Improve automatic recovery stops here; retry limit reached",
+        "needs_attention_reason": "retry-limit-reached",
+        "subject_task_id": failed_improve.id,
+    }
+
+    assert needs_attention_recommended_next_step(store, failed_improve, action) == (
+        f"Recommended next step: uv run gza fix {impl.id}"
+    )
+
+
 def test_failed_review_terminal_skip_subjects_owning_implementation(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

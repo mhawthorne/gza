@@ -633,7 +633,7 @@ is a spec change. The accompanying human message is free text.
 | `main-integration-verify-red` | needs_discussion | §8 local target verify failed after target HEAD changed; halt further merges until it is green again |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
 | `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted or terminal manual-review recovery stop |
-| `retryable-provider-error` | HumanParked | §7 fresh retry consumed for a retryable provider failure; hand off completed implementations to `gza fix` |
+| `retryable-provider-error` | HumanParked | §7 fresh retry consumed for a retryable provider failure; completed implementations with retryable terminal failures recommend `uv run gza unstick <owner-id> --reason retry-limit` (optionally `--run`) |
 | `recovery-ambiguous` | HumanParked | §7 recovery situation ambiguous |
 | `manual-failure-reason` † | HumanParked | §7 failure flagged for manual handling |
 | `newer-recovery-descendant-needs-attention` † | HumanParked | §7 newer unresolved recovery descendant |
@@ -647,12 +647,13 @@ Primary lifecycle code MUST attach `needs_attention_reason` explicitly via
 `needs-discussion` and `max-improve-attempts-reached` remain accepted legacy compatibility
 fallback slugs, but new rules MUST NOT rely on bare action-type fallback to produce them.
 `manual-review-required` is not a recovery parked reason code; recovery paths use
-`retry-limit-reached` and `retryable-provider-error`, while any operator-facing
-manual-review distinction is carried by the parked state, action type, human message, and
-the shared `gza fix` handoff wording on CLI attention surfaces. That handoff applies only
-when the resolved implementation already reached `completed`; if the implementation never
-completed and is merely parked/failed, operators must be directed to retry or
-re-implement instead of creating a fix task.
+`retry-limit-reached` and `retryable-provider-error`. CLI attention surfaces MUST route
+completed implementations with retryable terminal failures to the shared rearm handoff
+(`uv run gza unstick <owner-id> --reason retry-limit`, optionally `--run`), while the
+shared `gza fix` handoff remains reserved for review/content churn and completed-
+implementation failed recovery whose terminal failure category is not retryable. If the
+implementation never completed and is merely parked/failed, operators must be directed to
+retry or re-implement instead of creating a fix task.
 
 Manual operator semantics for `uv run gza unstick` are intentionally narrow. The
 command may target parked owners with reason class `backstop`

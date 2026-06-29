@@ -218,6 +218,14 @@ its stored action.
 
 - Operator wording MUST distinguish **moot terminal no-work** from **terminal no-work but
   resumable failed work**, and MUST distinguish `empty` from `redundant` labels.
+- For failed-recovery parks on a completed implementation, operator wording MUST inspect the
+  terminal failed task's classified failure category. `retry-limit-reached` and
+  `retryable-provider-error` with `classify_failure_reason(...) == "retryable"` are rearm
+  cases, not content-rescue cases: they MUST recommend the parked-task rearm path (`uv run
+  gza unstick <owner-id> --reason retry-limit`, optionally `--run`), not `uv run gza fix`.
+  `gza fix` remains reserved for genuine content/review churn such as
+  `review-max-cycles-reached` and completed-implementation failed recovery whose terminal
+  failure category is not retryable.
 - `iterate` MUST check the shared recovery predicate before printing an `empty` /
   `redundant` terminal message, and MUST NOT print that terminal for a pending resume row
   with a continuable session (see §4).

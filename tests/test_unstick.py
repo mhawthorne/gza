@@ -305,6 +305,45 @@ def test_discover_parked_tasks_includes_retry_limit_owner_row(tmp_path: Path) ->
     assert candidates[0].reason_class == "retry-limit"
 
 
+def test_discover_parked_tasks_maps_retryable_provider_error_to_retry_limit_rearm(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    impl, retry, owner_row = _make_retry_limit_owner(
+        store,
+        prompt="Retryable provider error owner",
+        branch="feature/retryable-provider-error",
+    )
+    owner_row = LineageOwnerRow(
+        owner_task=owner_row.owner_task,
+        members=owner_row.members,
+        tree=owner_row.tree,
+        lineage_status=owner_row.lineage_status,
+        next_action={
+            "type": "skip",
+            "description": "automatic recovery stops here; retryable provider error",
+            "needs_attention_reason": "retryable-provider-error",
+            "subject_task_id": retry.id,
+        },
+        next_action_reason=owner_row.next_action_reason,
+        unresolved_tasks=owner_row.unresolved_tasks,
+        unresolved_leaf_summary=owner_row.unresolved_leaf_summary,
+    )
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        candidates, stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert stale_cleared == 0
+    assert len(candidates) == 1
+    assert candidates[0].owner_task.id == impl.id
+    assert candidates[0].subject_task.id == retry.id
+    assert candidates[0].reason_class == "retry-limit"
+
+
 def test_discover_parked_tasks_includes_real_retry_limit_failed_owner_row(tmp_path: Path) -> None:
     setup_config(tmp_path)
     (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "max_resume_attempts: 1\n")

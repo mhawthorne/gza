@@ -218,6 +218,42 @@ def test_off_topic_verify_contract_is_indexed_and_cross_linked() -> None:
     assert "fail closed" in contract_flat
 
 
+def test_retryable_failed_recovery_handoff_stays_aligned_across_specs() -> None:
+    """Lifecycle specs and operator docs must agree on rearm-vs-fix guidance for retryable recovery parks."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    recovery = (repo_root / "specs" / "behavior" / "recovery.md").read_text()
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+    recovery_flat = " ".join(recovery.split())
+    config_flat = " ".join(config_docs.split())
+
+    shared_unstick_snippet = (
+        "uv run gza unstick <owner-id> --reason retry-limit"
+    )
+    shared_fix_reservation = "`gza fix`"
+    lifecycle_churn_clause = "review/content churn"
+    recovery_churn_clause = "content/review churn"
+    shared_non_retryable_clause = "terminal failure category is not retryable"
+    config_churn_clause = "review/content churn"
+    retry_or_reimplement_clause = "retry or re-implement instead"
+
+    assert shared_unstick_snippet in lifecycle_flat
+    assert shared_unstick_snippet in recovery_flat
+    assert shared_unstick_snippet in config_flat
+    assert shared_fix_reservation in lifecycle_flat
+    assert shared_fix_reservation in recovery_flat
+    assert shared_fix_reservation in config_flat
+    assert lifecycle_churn_clause in lifecycle_flat
+    assert recovery_churn_clause in recovery_flat
+    assert config_churn_clause in config_flat
+    assert shared_non_retryable_clause in lifecycle_flat
+    assert shared_non_retryable_clause in recovery_flat
+    assert shared_non_retryable_clause in config_flat
+    assert retry_or_reimplement_clause in lifecycle_flat
+    assert retry_or_reimplement_clause in config_flat
+
+
 def test_deferred_conflict_rebase_contract_is_encoded_in_behavior_specs() -> None:
     """The behavior specs should preserve deferred rebase ownership and narrow stale-review semantics."""
     repo_root = Path(__file__).resolve().parents[1]

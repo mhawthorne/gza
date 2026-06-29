@@ -156,7 +156,6 @@ from .advance_engine import (
     determine_next_action,
     format_needs_attention_entry_for_display,
     needs_attention_recommended_next_step,
-    needs_attention_recommends_fix,
     resolve_closing_review_action,
     resolve_subject_task,
 )
@@ -374,7 +373,6 @@ def _print_iterate_failed_recovery_attention(
     store: SqliteTaskStore,
     failed_task: DbTask,
     decision: FailedRecoveryDecision,
-    fix_task_id: str,
     max_resume_attempts: int,
 ) -> int | None:
     attention_result = build_failed_recovery_needs_attention_result(
@@ -392,8 +390,9 @@ def _print_iterate_failed_recovery_attention(
         f"{NEEDS_ATTENTION_LABEL}: "
         f"{format_needs_attention_entry_for_display(attention.task, action=attention.action, prefix=len(attention.task.id or '') + 4)}"
     )
-    if needs_attention_recommends_fix(attention.action):
-        print(f"Recommended next step: uv run gza fix {fix_task_id}")
+    next_step = needs_attention_recommended_next_step(store, attention.task, attention.action)
+    if next_step is not None:
+        print(next_step)
     return 3
 
 
@@ -6540,7 +6539,6 @@ def _cmd_iterate_plan(
                         store=store,
                         failed_task=blocked_task,
                         decision=resume_blocked_decision,
-                        fix_task_id=plan_task_id,
                         max_resume_attempts=effective_max_resume_attempts,
                     )
                     if exit_code is not None:
@@ -6566,7 +6564,6 @@ def _cmd_iterate_plan(
                         store=store,
                         failed_task=plan_task,
                         decision=terminal_skip_decision,
-                        fix_task_id=plan_task_id,
                         max_resume_attempts=effective_max_resume_attempts,
                     )
                     if exit_code is not None:
@@ -6595,7 +6592,6 @@ def _cmd_iterate_plan(
                         store=store,
                         failed_task=plan_task,
                         decision=terminal_skip_decision,
-                        fix_task_id=plan_task_id,
                         max_resume_attempts=effective_max_resume_attempts,
                     )
                     if exit_code is not None:

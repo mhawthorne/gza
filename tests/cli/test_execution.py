@@ -9703,7 +9703,8 @@ class TestIterateCommand:
         attention = resolve_execution_needs_attention(impl, result)
         assert attention is not None
         assert attention.task.id == impl.id
-        assert attention.action["subject_task_id"] == impl.id
+        assert result.failed_improve is not None
+        assert attention.action["subject_task_id"] == result.failed_improve.id
         return self._format_expected_attention_line(attention.task, attention.action)
 
     def _expected_failed_recovery_attention_line(
@@ -10592,7 +10593,8 @@ class TestIterateCommand:
         assert "reason=retry-limit-reached" in output
         assert output.count("Needs attention:") == 1
         assert f"Resume of {failed_plan.id} failed" not in output
-        assert f"Recommended next step: uv run gza fix {failed_plan.id}" in output
+        assert f"Recommended next step: uv run gza fix {failed_plan.id}" not in output
+        assert "Recommended next step: retry or re-implement instead." in output
 
     def test_failed_held_plan_iterate_resume_preserves_hold_and_stops_for_human(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -16158,6 +16160,80 @@ class TestIterateCommand:
         assert "Needs attention:" in output
         assert "reason=retry-limit-reached" in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
+        assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
+
+    def test_background_auto_iterate_retryable_improve_park_recommends_unstick(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+
+        review = store.add("Review", task_type="review", depends_on=impl.id)
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime.now(UTC)
+        store.update(review)
+        assert review.id is not None
+
+        first = store.add("Improve 1", task_type="improve", based_on=impl.id, depends_on=review.id)
+        first.status = "failed"
+        first.failure_reason = "INFRASTRUCTURE_ERROR"
+        first.session_id = "improve-session"
+        store.update(first)
+
+        failed_retry = store.add("Improve 2", task_type="improve", based_on=first.id, depends_on=review.id)
+        failed_retry.status = "failed"
+        failed_retry.failure_reason = "WORKER_DIED"
+        failed_retry.session_id = first.session_id
+        store.update(failed_retry)
+
+        config = Config.load(tmp_path)
+        config.max_resume_attempts = 1
+        config.max_review_cycles = 3
+        config.require_review_before_merge = True
+        config.advance_create_reviews = True
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=True,
+            background=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution.determine_next_action",
+                return_value={"type": "improve", "description": "Create improve task", "review_task": review},
+            ),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        spawn_background.assert_not_called()
+        assert "Next action: improve" in output
+        assert "Needs attention:" in output
+        assert "reason=retry-limit-reached" in output
+        assert f"Recommended next step: uv run gza fix {impl.id}" not in output
+        assert f"Recommended next step: uv run gza unstick {impl.id} --reason retry-limit --run" in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
     def test_background_iterate_disabled_improve_recovery_surfaces_before_spawn(

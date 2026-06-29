@@ -74,7 +74,7 @@ Anchor classes on the **reason strings the system already emits** — `next_acti
 | **verify-unreproducible** | `improve-no-op` where verify can't be reproduced; subprocess/unit timeouts | auto-merge-enabler |
 | **review-no-exit** | `review-max-cycles-reached`, `watch-no-progress-backstop`, reviewer-is-wrong with no loop exit | loop-exit / recovery |
 | **rebase/reconcile-manual** | `rebase-failed-needs-manual-resolution`, `merge-source-needs-manual-resolution` | auto-merge-enabler |
-| **retry-limit-reached** | `retry-limit-reached` | usually *downstream* of another class — attribute to the real cause |
+| **retry-limit-reached** | `retry-limit-reached` / `retryable-provider-error` | usually *downstream* of another class — attribute to the real cause; retryable infra deaths should usually be re-armed, not handed to `gza fix` |
 | **manual-unknown** | `manual-failure-reason UNKNOWN` / `TEST_FAILURE` | per-task diagnosis; cluster only if common |
 | **moot** | `merge-unit-merged` / `merge-unit-empty` / `merge-unit-redundant` | not systemic — hand to `/gza-task-triage` to drop |
 

@@ -170,6 +170,12 @@ FAILED_RECOVERY_FIX_HANDOFF_NEEDS_ATTENTION_REASONS = frozenset(
         "retryable-provider-error",
     }
 )
+FAILED_RECOVERY_REARM_RECOMMENDATION_NEEDS_ATTENTION_REASONS = frozenset(
+    {
+        "retry-limit-reached",
+        "retryable-provider-error",
+    }
+)
 FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP = (
     "Recommended next step: retry or re-implement instead. "
     "`uv run gza fix` only applies after a completed implementation."
@@ -3207,10 +3213,51 @@ def is_needs_attention_action(action: Mapping[str, Any]) -> bool:
     return get_needs_attention_reason(action) is not None
 
 
-def needs_attention_recommends_fix(action: Mapping[str, Any]) -> bool:
-    """Return True when the operator handoff for this attention state is `gza fix`."""
+def _resolve_needs_attention_subject_task(
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: Mapping[str, Any],
+) -> DbTask:
+    subject_task_id = get_action_subject_task_id(action)
+    if isinstance(subject_task_id, str) and subject_task_id and subject_task_id != task.id:
+        subject_task = store.get(subject_task_id)
+        if subject_task is not None:
+            return subject_task
+    return task
+
+
+def _resolve_failed_recovery_fix_task_id(
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: Mapping[str, Any],
+) -> str | None:
     reason = get_needs_attention_reason(action)
-    return reason in FIX_HANDOFF_NEEDS_ATTENTION_REASONS
+    if reason is None or task.id is None:
+        return None
+    impl_task, resolve_error = resolve_impl_task(store, task.id)
+    resolved_impl = impl_task if resolve_error is None and impl_task is not None else None
+    if reason == "review-max-cycles-reached":
+        return resolved_impl.id if resolved_impl is not None and resolved_impl.id is not None else task.id
+    if reason not in FAILED_RECOVERY_FIX_HANDOFF_NEEDS_ATTENTION_REASONS:
+        return None
+    if resolved_impl is None or resolved_impl.status != "completed" or resolved_impl.id is None:
+        return None
+    failed_task = _resolve_needs_attention_subject_task(store, task, action)
+    if (
+        reason in FAILED_RECOVERY_REARM_RECOMMENDATION_NEEDS_ATTENTION_REASONS
+        and classify_failure_reason(failed_task.failure_reason or "UNKNOWN") == "retryable"
+    ):
+        return None
+    return resolved_impl.id
+
+
+def needs_attention_recommends_fix(
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: Mapping[str, Any],
+) -> bool:
+    """Return True when the operator handoff for this attention state is `gza fix`."""
+    return _resolve_failed_recovery_fix_task_id(store, task, action) is not None
 
 
 def needs_attention_recommended_next_step(
@@ -3222,15 +3269,22 @@ def needs_attention_recommended_next_step(
     reason = get_needs_attention_reason(action)
     if reason is None or task.id is None:
         return None
-    impl_task, resolve_error = resolve_impl_task(store, task.id)
-    resolved_impl = impl_task if resolve_error is None and impl_task is not None else None
-    if reason == "review-max-cycles-reached":
-        fix_task_id = resolved_impl.id if resolved_impl is not None and resolved_impl.id is not None else task.id
+    fix_task_id = _resolve_failed_recovery_fix_task_id(store, task, action)
+    if fix_task_id is not None:
         return f"Recommended next step: uv run gza fix {fix_task_id}"
     if reason not in FAILED_RECOVERY_FIX_HANDOFF_NEEDS_ATTENTION_REASONS:
         return None
-    if resolved_impl is not None and resolved_impl.status == "completed" and resolved_impl.id is not None:
-        return f"Recommended next step: uv run gza fix {resolved_impl.id}"
+    if reason in FAILED_RECOVERY_REARM_RECOMMENDATION_NEEDS_ATTENTION_REASONS:
+        impl_task, resolve_error = resolve_impl_task(store, task.id)
+        resolved_impl = impl_task if resolve_error is None and impl_task is not None else None
+        failed_task = _resolve_needs_attention_subject_task(store, task, action)
+        if (
+            resolved_impl is not None
+            and resolved_impl.status == "completed"
+            and resolved_impl.id is not None
+            and classify_failure_reason(failed_task.failure_reason or "UNKNOWN") == "retryable"
+        ):
+            return f"Recommended next step: uv run gza unstick {resolved_impl.id} --reason retry-limit --run"
     return FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP
 
 
