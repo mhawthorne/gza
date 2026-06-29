@@ -15,7 +15,7 @@ from .artifacts import prepare_command_output_artifact, store_command_output_art
 from .config import Config
 from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
-from .lineage import resolve_impl_task
+from .lineage import resolve_impl_task, walk_based_on_descendants
 from .prompts import PromptBuilder
 from .rebase_diff import parse_rebase_diff_provenance
 from .review_scope import (
@@ -131,6 +131,11 @@ class VerifyFixContext:
     source: str
     source_task_id: str | None
     source_task_type: str | None
+
+
+_VERIFY_FIX_CODE_CHANGING_TASK_TYPES = frozenset(
+    {"implement", "improve", "verify_fix", "fix", "rebase"}
+)
 
 
 def _known_derived_suffixes_for_review(store: SqliteTaskStore, impl_task: Task) -> set[str]:
@@ -264,6 +269,115 @@ def resolve_latest_failed_verify_epoch(
             f"head={evidence.epoch.reviewed_head_sha} command={evidence.epoch.verify_command!r}."
         )
     return evidence.epoch
+
+
+def _verify_fix_representation_recency(task: Task) -> tuple[datetime, str]:
+    return (
+        task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+        task.id or "",
+    )
+
+
+def _verify_fix_lineage_tasks(store: SqliteTaskStore, impl_task: Task) -> list[Task]:
+    if impl_task.id is None:
+        return []
+
+    tasks_by_id: dict[str, Task] = {}
+
+    def _remember(task: Task) -> None:
+        if task.id is not None:
+            tasks_by_id[task.id] = task
+
+    _remember(impl_task)
+    for descendant in walk_based_on_descendants(store, impl_task):
+        _remember(descendant)
+    return list(tasks_by_id.values())
+
+
+def _verify_fix_task_branch_and_head(
+    store: SqliteTaskStore,
+    task: Task,
+) -> tuple[str | None, str | None]:
+    branch = task.branch
+    head_sha: str | None = None
+    if task.id is not None:
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is not None:
+            if branch is None:
+                branch = unit.source_branch
+            head_sha = unit.head_sha
+    return branch, head_sha
+
+
+def resolve_verify_fix_representative_task(
+    store: SqliteTaskStore,
+    *,
+    impl_task: Task,
+    verify_epoch: VerifyEpoch,
+) -> Task:
+    """Resolve the current code-changing representative for a failed verify epoch."""
+    if impl_task.id is None:
+        raise VerifyFixContextError("verify_fix requires a persisted implementation owner task")
+
+    lookup = latest_verify_result_for_epoch(store, impl_task, current_epoch=verify_epoch)
+    if lookup.result is None or lookup.source is None or not lookup.is_current:
+        raise VerifyFixContextError(
+            f"verify_fix for {impl_task.id} has no current failed verify evidence for "
+            f"branch={verify_epoch.reviewed_branch} head={verify_epoch.reviewed_head_sha} "
+            f"command={verify_epoch.verify_command!r}. Re-run or persist the failing verify result first."
+        )
+    if lookup.result.status != "failed":
+        raise VerifyFixContextError(
+            f"verify_fix for {impl_task.id} requires failed verify evidence, but the latest matching result is {lookup.result.status!r}"
+        )
+
+    lineage_tasks = [
+        task
+        for task in _verify_fix_lineage_tasks(store, impl_task)
+        if task.task_type in _VERIFY_FIX_CODE_CHANGING_TASK_TYPES
+    ]
+    source_task_id = lookup.result.source_task_id
+    if source_task_id is not None:
+        for task in lineage_tasks:
+            if task.id == source_task_id:
+                return task
+    matching_candidates: list[Task] = []
+    for task in lineage_tasks:
+        task_branch, task_head_sha = _verify_fix_task_branch_and_head(store, task)
+        if (
+            task_branch == verify_epoch.reviewed_branch
+            and task_head_sha == verify_epoch.reviewed_head_sha
+        ):
+            matching_candidates.append(task)
+    if not matching_candidates:
+        source_task_id_display = lookup.result.source_task_id or "(unknown)"
+        source_task_type = lookup.result.source_task_type or "(unknown)"
+        raise VerifyFixContextError(
+            f"verify_fix for {impl_task.id} could not prove the current implementation-lineage representative "
+            f"for failed verify head {verify_epoch.reviewed_head_sha} on branch {verify_epoch.reviewed_branch!r}. "
+            f"Persisted evidence source: {source_task_id_display} ({source_task_type}). "
+            "Expected a completed same-branch code-changing lineage task with matching branch/head provenance."
+        )
+
+    representative = max(matching_candidates, key=_verify_fix_representation_recency)
+    ambiguous_newer = [
+        task
+        for task in lineage_tasks
+        if (
+            task.id != representative.id
+            and _verify_fix_task_branch_and_head(store, task)[0] == verify_epoch.reviewed_branch
+            and _verify_fix_representation_recency(task) > _verify_fix_representation_recency(representative)
+            and _verify_fix_task_branch_and_head(store, task)[1] is None
+        )
+    ]
+    if ambiguous_newer:
+        ambiguous_ids = ", ".join(task.id or "(unsaved)" for task in ambiguous_newer)
+        raise VerifyFixContextError(
+            f"verify_fix for {impl_task.id} could not prove the current implementation-lineage representative "
+            f"for failed verify head {verify_epoch.reviewed_head_sha} because newer same-branch code-changing "
+            f"tasks are missing head provenance: {ambiguous_ids}."
+        )
+    return representative
 
 
 def resolve_verify_fix_context(
@@ -464,6 +578,17 @@ def create_or_reuse_verify_fix_task(
         raise ValueError(
             f"Cannot create verify_fix for implementation {impl_task.id} from based_on task {based_on_task.id} "
             f"because it resolves to implementation {based_on_impl.id}."
+        )
+    representative = resolve_verify_fix_representative_task(
+        store,
+        impl_task=impl_task,
+        verify_epoch=verify_epoch,
+    )
+    if based_on_task.id != representative.id:
+        raise ValueError(
+            f"Cannot create verify_fix for implementation {impl_task.id} from based_on task {based_on_task.id} "
+            f"because the current failed verify epoch is represented by task {representative.id}. "
+            f"Rerun with --based-on {representative.id} --same-branch."
         )
 
     existing = find_existing_verify_fix_task(

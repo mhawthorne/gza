@@ -381,6 +381,162 @@ def test_cmd_add_rejects_verify_fix_when_latest_failed_evidence_is_stale(tmp_pat
     assert [task.task_type for task in store.get_pending()] == ["implement", "improve"]
 
 
+def test_cmd_add_rejects_verify_fix_when_based_on_is_not_current_failed_head_representative(
+    tmp_path: Path, capsys
+) -> None:
+    _write_config(tmp_path)
+    store = _load_store(tmp_path)
+    impl = store.add("Implement the plan", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/test"
+    store.update(impl)
+    improve = store.add("Improve the plan", task_type="improve", based_on=impl.id, same_branch=True)
+    improve.status = "completed"
+    improve.branch = "feature/test"
+    improve.has_commits = True
+    improve.completed_at = datetime(2026, 6, 29, 12, 1, tzinfo=UTC)
+    store.update(improve)
+    rebase = store.add("Rebase the plan", task_type="rebase", based_on=improve.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.branch = "feature/test"
+    rebase.has_commits = True
+    rebase.completed_at = datetime(2026, 6, 29, 12, 2, tzinfo=UTC)
+    store.update(rebase)
+    epoch = VerifyEpoch(
+        reviewed_branch="feature/test",
+        reviewed_head_sha="deadbeef",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=300,
+        verify_timeout_grace_seconds=5.0,
+    )
+    assert improve.id is not None
+    assert rebase.id is not None
+    _seed_failed_verify_evidence(
+        project_dir=tmp_path,
+        store=store,
+        impl_id=impl.id,
+        source_task_id=rebase.id,
+        epoch=epoch,
+    )
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        prompt=None,
+        prompt_file=None,
+        edit=False,
+        type="verify_fix",
+        explore=False,
+        depends_on=None,
+        based_on=improve.id,
+        review=False,
+        hold_for_review=False,
+        create_pr=False,
+        same_branch=True,
+        spec=None,
+        review_scope=None,
+        branch_type=None,
+        model=None,
+        provider=None,
+        skip_learnings=False,
+        next=False,
+        tags=None,
+    )
+
+    class _Git:
+        def __init__(self, _project_dir: Path) -> None:
+            pass
+
+        def rev_parse_if_exists(self, ref: str) -> str:
+            assert ref == "feature/test"
+            return "deadbeef"
+
+    with patch("gza.cli.execution.Git", _Git):
+        rc = cmd_add(args)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert f"current failed verify epoch is represented by task {rebase.id}" in out
+    assert f"Rerun with --based-on {rebase.id} --same-branch." in out
+    assert [task.task_type for task in store.get_pending()] == ["implement"]
+
+
+def test_cmd_add_accepts_verify_fix_when_based_on_matches_current_failed_head_representative(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    store = _load_store(tmp_path)
+    impl = store.add("Implement the plan", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/test"
+    store.update(impl)
+    improve = store.add("Improve the plan", task_type="improve", based_on=impl.id, same_branch=True)
+    improve.status = "completed"
+    improve.branch = "feature/test"
+    improve.has_commits = True
+    improve.completed_at = datetime(2026, 6, 29, 12, 1, tzinfo=UTC)
+    store.update(improve)
+    rebase = store.add("Rebase the plan", task_type="rebase", based_on=improve.id, same_branch=True)
+    rebase.status = "completed"
+    rebase.branch = "feature/test"
+    rebase.has_commits = True
+    rebase.completed_at = datetime(2026, 6, 29, 12, 2, tzinfo=UTC)
+    store.update(rebase)
+    epoch = VerifyEpoch(
+        reviewed_branch="feature/test",
+        reviewed_head_sha="deadbeef",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=300,
+        verify_timeout_grace_seconds=5.0,
+    )
+    assert rebase.id is not None
+    _seed_failed_verify_evidence(
+        project_dir=tmp_path,
+        store=store,
+        impl_id=impl.id,
+        source_task_id=rebase.id,
+        epoch=epoch,
+    )
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        prompt=None,
+        prompt_file=None,
+        edit=False,
+        type="verify_fix",
+        explore=False,
+        depends_on=None,
+        based_on=rebase.id,
+        review=False,
+        hold_for_review=False,
+        create_pr=False,
+        same_branch=True,
+        spec=None,
+        review_scope=None,
+        branch_type=None,
+        model=None,
+        provider=None,
+        skip_learnings=False,
+        next=False,
+        tags=None,
+    )
+
+    class _Git:
+        def __init__(self, _project_dir: Path) -> None:
+            pass
+
+        def rev_parse_if_exists(self, ref: str) -> str:
+            assert ref == "feature/test"
+            return "deadbeef"
+
+    with patch("gza.cli.execution.Git", _Git), patch("gza.cli.execution.set_task_urgency", return_value=True):
+        rc = cmd_add(args)
+
+    assert rc == 0
+    verify_fix = next(task for task in store.get_pending() if task.task_type == "verify_fix")
+    assert verify_fix.based_on == rebase.id
+    assert verify_fix.same_branch is True
+
+
 def test_cmd_add_rejects_plan_review_without_plan_source_dependency(tmp_path: Path, capsys) -> None:
     _write_config(tmp_path)
 
