@@ -132,6 +132,79 @@ def _mock_unmerged_git() -> Git:
     return _MockUnmergedGit()
 
 
+def _seed_owner_verify_evidence(
+    tmp_path: Path,
+    *,
+    prompt: str,
+    branch: str,
+    term: str,
+    verify_status: str = "passed",
+    verify_failure: str | None = None,
+    reviewed_head_sha: str = "a" * 40,
+) -> tuple[Task, Task]:
+    config_path = tmp_path / "gza.yaml"
+    config_text = config_path.read_text(encoding="utf-8")
+    if "verify_command:" not in config_text:
+        config_path.write_text(config_text + "verify_command: ./bin/tests\n", encoding="utf-8")
+
+    store = make_store(tmp_path)
+    impl = store.add(prompt, task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    impl.branch = branch
+    store.update(impl)
+
+    review = store.add("Review canonical verify owner", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 29, 12, 5, tzinfo=UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    stored = store_command_output_artifact(
+        store,
+        review,
+        config,
+        kind="verify_command_output",
+        producer="review_verify",
+        label="verify_command",
+        output=f"{term} verify output\n",
+        command="./bin/tests",
+        status=verify_status,
+        exit_status="0" if verify_status == "passed" else "7",
+        head_sha=reviewed_head_sha,
+        metadata={
+            "reviewed_branch": branch,
+            "reviewed_base_sha": "base-1",
+            "working_directory": f"/tmp/{term}-verify",
+        },
+        created_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status=verify_status,
+            exit_status="0" if verify_status == "passed" else "7",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha="base-1",
+            working_directory=f"/tmp/{term}-verify",
+            failure=verify_failure,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        output_artifact_path=stored.path,
+        producer="review_verify",
+    )
+    return impl, review
+
+
 class _FastUnmergedGit:
     def __init__(self) -> None:
         self._current_branch = "main"
@@ -1724,6 +1797,63 @@ class TestHistoryCommand:
         assert f"id: {task.id}" in result.stdout
         assert "model: claude-opus-4-8" in result.stdout
 
+    def test_history_fields_render_owner_verify_evidence_from_canonical_artifact(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="history verify needle",
+            branch="feature/history-verify",
+            term="history",
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza(
+                "history",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert f"id: {impl.id}" in result.stdout
+        assert "verify_status: passed" in result.stdout
+        assert "verify_source: owner_artifact" in result.stdout
+        assert "verify_current: True" in result.stdout
+
+    def test_history_fields_keep_owner_verify_evidence_when_git_probe_is_unavailable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="history probe unavailable needle",
+            branch="feature/history-verify-probe-unavailable",
+            term="history-probe",
+            verify_status="failed",
+            verify_failure="git probe unavailable",
+        )
+
+        with patch("gza.cli.query.Git", side_effect=GitError("boom")):
+            result = invoke_gza(
+                "history",
+                "--json",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        payload = {row["id"]: row for row in json.loads(result.stdout)}
+        assert payload[impl.id] == {
+            "id": impl.id,
+            "verify_status": "failed",
+            "verify_source": "owner_artifact",
+            "verify_current": False,
+        }
+
     def test_history_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)
         make_store(tmp_path).add("history unknown field", task_type="implement")
@@ -2884,6 +3014,64 @@ class TestSearchCommand:
 
         assert result.returncode == 0
         assert result.stdout.strip() == task.id
+
+    def test_search_fields_render_owner_verify_evidence_from_canonical_artifact(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="needle search verify prompt",
+            branch="feature/search-verify",
+            term="needle search",
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza(
+                "search",
+                "needle search",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert f"id: {impl.id}" in result.stdout
+        assert "verify_status: passed" in result.stdout
+        assert "verify_source: owner_artifact" in result.stdout
+        assert "verify_current: True" in result.stdout
+
+    def test_search_json_fields_render_owner_verify_evidence_from_canonical_artifact(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="needle search json prompt",
+            branch="feature/search-verify-json",
+            term="needle search json",
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza(
+                "search",
+                "needle search json",
+                "--json",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [
+            {
+                "id": impl.id,
+                "verify_status": "passed",
+                "verify_source": "owner_artifact",
+                "verify_current": True,
+            }
+        ]
 
     def test_search_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)

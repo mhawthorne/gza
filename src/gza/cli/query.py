@@ -433,6 +433,21 @@ def _plan_review_detail(
     return verdict, manifest_detail
 
 
+def _load_optional_query_git_context(config: Config) -> tuple[Git | None, str | None]:
+    """Best-effort git context for query projections that can tolerate stale verify evidence."""
+    try:
+        git = Git(config.project_dir)
+        return git, git.default_branch()
+    except GitError:
+        return None, None
+
+
+def _query_git_cache_scope(git: Git | None) -> contextlib.AbstractContextManager[Git | None]:
+    if git is not None and hasattr(git, "cached"):
+        return git.cached()
+    return contextlib.nullcontext(git)
+
+
 def _resolve_show_lifecycle_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
     """Return the lineage task whose lifecycle best represents the unit of work."""
     from ..recovery_engine import resolve_recovery_planning_task
@@ -1058,7 +1073,13 @@ def cmd_history(args: argparse.Namespace) -> int:
             ),
             presentation=_TaskPresentationSpec(mode="json" if use_json else "blocks"),
         )
-        all_rows = tuple(row for row in service.run(query).rows if isinstance(row, _TaskRow))
+        git, target_branch = _load_optional_query_git_context(config)
+        with _query_git_cache_scope(git):
+            all_rows = tuple(
+                row
+                for row in service.run(query, config=config, git=git, target_branch=target_branch).rows
+                if isinstance(row, _TaskRow)
+            )
         rows_by_id = {row.task.id: row for row in all_rows if row.task.id is not None}
         ordered_rows = tuple(rows_by_id[task_id] for task_id in selected_ids if task_id in rows_by_id)
         result = _TaskQueryResult(query=query, rows=ordered_rows)
@@ -1467,7 +1488,9 @@ def cmd_search(args: argparse.Namespace) -> int:
             ),
             presentation=_TaskPresentationSpec(mode="json" if use_json else "blocks"),
         )
-    result = service.run(query)
+    git, target_branch = _load_optional_query_git_context(config)
+    with _query_git_cache_scope(git):
+        result = service.run(query, config=config, git=git, target_branch=target_branch)
     matches = [row.task for row in result.rows if isinstance(row, _TaskRow)]
 
     if use_json:
