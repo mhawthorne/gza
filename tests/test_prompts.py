@@ -308,6 +308,85 @@ class TestPromptBuilderBuild:
         assert f"- Output artifact path: `{output_artifact.path}`" in prompt
         assert "AssertionError: expected green" in prompt
 
+    def test_build_verify_fix_prompt_includes_failed_verify_context_when_epoch_timeout_is_unset(
+        self, tmp_path: Path
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+        )
+        output_artifact = store_command_output_artifact(
+            store,
+            improve,
+            config,
+            kind="verify_command_output",
+            producer="test",
+            label="verify_command_output",
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            head_sha="deadbeef",
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "command": "./bin/tests",
+                "status": "failed",
+                "exit_status": "1",
+                "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+                "reviewed_branch": "feature/test",
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "base-sha",
+                "working_directory": str(tmp_path / "worktrees" / "verify"),
+                "failure": "pytest failed",
+            },
+        )()
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=improve,
+            result=result,
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+            output_artifact_id=output_artifact.id,
+            output_artifact_task_id=improve.id,
+            output_artifact_path=output_artifact.path,
+            producer="test",
+        )
+        task, created = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+
+        prompt = PromptBuilder().build(task, config, store, summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"))
+
+        assert created is True
+        assert "## verify_fix failed verify context" in prompt
+        assert "## verify_fix evidence status" not in prompt
+        assert "AssertionError: expected green" in prompt
+
     def test_build_verify_fix_prompt_fail_closed_when_evidence_missing(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)

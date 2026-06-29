@@ -63,6 +63,16 @@ class VerifyGateLookup:
 
 
 @dataclass(frozen=True)
+class LatestVerifyEvidence:
+    """Latest persisted verify evidence paired with its original epoch identity."""
+
+    result: VerifyGateResult
+    epoch: VerifyEpoch
+    source: Literal["owner_artifact", "legacy_review"]
+    has_owner_artifact: bool
+
+
+@dataclass(frozen=True)
 class VerifyReadModel:
     """Operator-facing verify read model shared across query and inspect paths."""
 
@@ -274,6 +284,56 @@ def latest_verify_result_for_epoch(
         result=latest_legacy,
         source="legacy_review" if latest_legacy is not None else None,
         is_current=False,
+        has_owner_artifact=False,
+    )
+
+
+def latest_verify_evidence_for_owner(
+    store: SqliteTaskStore,
+    owner_task: Task,
+) -> LatestVerifyEvidence | None:
+    """Return the latest persisted verify evidence and its original epoch identity."""
+    if owner_task.id is None:
+        return None
+
+    owner_artifacts = store.list_artifacts(owner_task.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    if owner_artifacts:
+        for artifact in owner_artifacts:
+            metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+            if metadata is None or metadata.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
+                continue
+            result = _artifact_verify_result(metadata)
+            epoch = _artifact_verify_epoch(metadata)
+            if result is None or epoch is None:
+                continue
+            return LatestVerifyEvidence(
+                result=result,
+                epoch=epoch,
+                source="owner_artifact",
+                has_owner_artifact=True,
+            )
+        return None
+
+    latest_review = store.get_latest_review(owner_task.id)
+    if latest_review is None:
+        return None
+    legacy_result = _task_verify_result(latest_review)
+    if legacy_result is None:
+        return None
+    timeout_seconds = getattr(latest_review, "review_verify_timeout_seconds", None)
+    timeout_grace_seconds = getattr(latest_review, "review_verify_timeout_grace_seconds", None)
+    return LatestVerifyEvidence(
+        result=legacy_result,
+        epoch=_result_epoch(
+            legacy_result,
+            verify_timeout_seconds=timeout_seconds if isinstance(timeout_seconds, int) else None,
+            verify_timeout_grace_seconds=(
+                float(timeout_grace_seconds)
+                if isinstance(timeout_grace_seconds, (int, float)) and not isinstance(timeout_grace_seconds, bool)
+                else None
+            ),
+        ),
+        source="legacy_review",
         has_owner_artifact=False,
     )
 

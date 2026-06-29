@@ -24,7 +24,11 @@ from .review_scope import (
     resolve_review_scope_for_impl,
 )
 from .review_verdict import ReviewFinding
-from .review_verify_state import VerifyEpoch, latest_verify_result_for_epoch
+from .review_verify_state import (
+    VerifyEpoch,
+    latest_verify_evidence_for_owner,
+    latest_verify_result_for_epoch,
+)
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -206,8 +210,8 @@ def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:
     timeout_raw = match.group("timeout")
     grace_raw = match.group("grace")
     try:
-        timeout_seconds = int(timeout_raw)
-        grace_seconds = float(grace_raw)
+        timeout_seconds = None if timeout_raw == "unset" else int(timeout_raw)
+        grace_seconds = None if grace_raw == "unset" else float(grace_raw)
     except ValueError:
         return None
     return (
@@ -220,6 +224,26 @@ def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:
             verify_timeout_grace_seconds=grace_seconds,
         ),
     )
+
+
+def resolve_latest_failed_verify_epoch(
+    store: SqliteTaskStore,
+    impl_task: Task,
+) -> VerifyEpoch:
+    """Return the latest failed verify epoch persisted for an implementation owner."""
+    evidence = latest_verify_evidence_for_owner(store, impl_task)
+    impl_task_id = impl_task.id or "(unsaved)"
+    if evidence is None:
+        raise VerifyFixContextError(
+            f"verify_fix manual creation for {impl_task_id} requires persisted verify evidence. "
+            "Run or persist the failing verify result first."
+        )
+    if evidence.result.status != "failed":
+        raise VerifyFixContextError(
+            f"verify_fix manual creation for {impl_task_id} requires failed verify evidence, "
+            f"but the latest persisted result is {evidence.result.status!r}."
+        )
+    return evidence.epoch
 
 
 def resolve_verify_fix_context(

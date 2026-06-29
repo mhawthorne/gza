@@ -86,7 +86,12 @@ from ..recovery_engine import (
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
-from ..review_tasks import build_review_blocker_dispute_metadata, create_spec_coherence_review_task
+from ..review_tasks import (
+    build_review_blocker_dispute_metadata,
+    create_or_reuse_verify_fix_task,
+    create_spec_coherence_review_task,
+    resolve_latest_failed_verify_epoch,
+)
 from ..review_verdict import get_review_report
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
@@ -2427,6 +2432,44 @@ def cmd_add(args: argparse.Namespace) -> int:
                 f"(implement/improve/verify_fix/fix/rebase). {err}"
             )
             return 1
+        based_on_task = store.get(based_on)
+        assert based_on_task is not None
+        if hasattr(args, "prompt_file") and args.prompt_file is not None:
+            print(
+                "Error: verify_fix manual creation derives its prompt from the latest failed verify evidence. "
+                "Omit --prompt-file and rerun with --based-on <implementation-lineage-task-id> --same-branch."
+            )
+            return 1
+        if args.edit or args.prompt:
+            print(
+                "Error: verify_fix manual creation derives its prompt from the latest failed verify evidence. "
+                "Omit custom prompt text/--edit and rerun with --based-on <implementation-lineage-task-id> --same-branch."
+            )
+            return 1
+        try:
+            verify_epoch = resolve_latest_failed_verify_epoch(store, impl_owner)
+            task, created = create_or_reuse_verify_fix_task(
+                store,
+                config,
+                impl_task=impl_owner,
+                based_on_task=based_on_task,
+                verify_epoch=verify_epoch,
+                trigger_source="manual",
+                model=model,
+                provider=provider,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        except DuplicateActiveChildError as exc:
+            print(format_duplicate_active_child_message(exc))
+            return 1
+        if mark_next:
+            assert task.id is not None
+            set_task_urgency(store, task.id, urgent=True)
+        status_verb = "Added" if created else "Reused"
+        print(f"✓ {status_verb} task {task.id}")
+        return 0
 
     if task_type == "implement":
         held_plan_error = _validate_new_implement_source_not_held_for_review(
