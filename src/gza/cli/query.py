@@ -79,6 +79,7 @@ from ..query import (
 )
 from ..review_verify_state import (
     VerifyReadModel,
+    owner_task_verify_epoch,
     read_verify_output_excerpt,
     resolve_verify_owner_task,
     resolve_verify_read_model,
@@ -4406,6 +4407,134 @@ def _render_verify_markdown(read_model: VerifyReadModel | None, *, config: Confi
     return "\n".join(lines)
 
 
+def _resolve_show_verify_read_model(
+    task: DbTask,
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+) -> VerifyReadModel | None:
+    verify_owner = resolve_verify_owner_task(store, task) if task.task_type == "review" else _resolve_lineage_owner_task(store, task)
+    if task.task_type == "review":
+        current_epoch = review_task_verify_epoch(task, config)
+    else:
+        try:
+            git = Git(config.project_dir)
+        except (GitError, OSError):
+            git = None
+        current_epoch = owner_task_verify_epoch(verify_owner, config, git)
+    return resolve_verify_read_model(
+        store,
+        task,
+        owner_task=verify_owner,
+        current_epoch=current_epoch,
+    )
+
+
+def _render_show_verify_section(
+    *,
+    task: DbTask,
+    config: Config,
+    store: SqliteTaskStore,
+    colors: dict[str, str],
+    metadata_only: bool,
+    full_mode: bool,
+) -> None:
+    verify_read_model = _resolve_show_verify_read_model(task, config=config, store=store) if task.id is not None else None
+    latest_verify_artifact = (
+        _resolve_latest_task_artifact(store, config, task.id, kind="verify_command_output")
+        if task.task_type == "review" and task.id is not None
+        else None
+    )
+    verify_markdown = _render_verify_markdown(verify_read_model, config=config)
+    verify_artifact_path = (
+        verify_output_artifact_path(verify_read_model) if verify_read_model is not None else None
+    )
+    if verify_read_model is None and latest_verify_artifact is None and verify_markdown is None:
+        return
+
+    c = colors
+    console.print(
+        f"[{c['label']}]Verify Status:[/{c['label']}] "
+        f"[{c['value']}]{getattr(getattr(verify_read_model, 'result', None), 'status', None) or 'unknown'}[/{c['value']}]"
+    )
+    verify_result = getattr(verify_read_model, "result", None)
+    if verify_result is not None and verify_result.exit_status:
+        console.print(
+            f"[{c['label']}]Verify Exit:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.exit_status}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.captured_at:
+        console.print(
+            f"[{c['label']}]Verify At:[/{c['label']}] "
+            f"[{c['value']}]{_format_show_utc_timestamp(verify_result.captured_at)}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.reviewed_branch:
+        console.print(
+            f"[{c['label']}]Verify Branch:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.reviewed_branch}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.reviewed_head_sha:
+        console.print(
+            f"[{c['label']}]Verify Head:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.reviewed_head_sha}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.reviewed_base_sha:
+        console.print(
+            f"[{c['label']}]Verify Base:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.reviewed_base_sha}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.working_directory:
+        console.print(
+            f"[{c['label']}]Verify Cwd:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.working_directory}[/{c['value']}]"
+        )
+    if verify_artifact_path is None and latest_verify_artifact is not None:
+        verify_artifact_path = latest_verify_artifact.artifact.path
+    if verify_artifact_path:
+        verify_artifact_text = verify_artifact_path
+        if latest_verify_artifact is not None and latest_verify_artifact.invalid_path_error is not None:
+            verify_artifact_text = f"{verify_artifact_text} (invalid path)"
+        else:
+            try:
+                resolved_verify_artifact = resolve_artifact_path(config.project_dir, verify_artifact_path)
+            except InvalidArtifactPathError:
+                verify_artifact_text = f"{verify_artifact_text} (invalid path)"
+            else:
+                if not resolved_verify_artifact.exists():
+                    verify_artifact_text = f"{verify_artifact_text} (missing)"
+        console.print(
+            f"[{c['label']}]Verify Artifact:[/{c['label']}] "
+            f"[{c['value']}]{verify_artifact_text}[/{c['value']}]"
+        )
+    if verify_result is not None and verify_result.failure:
+        console.print(
+            f"[{c['label']}]Verify Failure:[/{c['label']}] "
+            f"[{c['value']}]{verify_result.failure}[/{c['value']}]"
+        )
+
+    if not metadata_only and verify_markdown:
+        console.print()
+        console.print(f"[{c['label']}]Verify Result:[/{c['label']}]")
+        console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+        verify_lines = verify_markdown.splitlines()
+        if not full_mode and len(verify_lines) > 30:
+            truncated = "\n".join(verify_lines[:20])
+            remainder = len(verify_lines) - 20
+            console.print(truncated)
+            console.print(
+                f"[{c['section']}](... truncated, {remainder} more lines — use `gza show {task.id} --full` to see all)[/{c['section']}]"
+            )
+        else:
+            console.print(verify_markdown)
+        console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
+        console.print()
+
+
+def _format_show_utc_timestamp(value: datetime) -> str:
+    ts = value.astimezone(UTC) if value.tzinfo is not None else value
+    return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
+
 def _cmd_show_output(
     task: DbTask,
     args: argparse.Namespace,
@@ -4420,10 +4549,6 @@ def _cmd_show_output(
     c = SHOW_COLORS
 
     status_color = _show_status_color(task, c)
-
-    def _format_utc_timestamp(value: datetime) -> str:
-        ts = value.astimezone(UTC) if value.tzinfo is not None else value
-        return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
     console.print(f"[{c['heading']}]Task {task.id}[/{c['heading']}]")
     console.print(f"[{c['section']}]{'=' * 50}[/{c['section']}]")
@@ -4540,84 +4665,14 @@ def _cmd_show_output(
             score = get_review_score(config, task)
         if score is not None:
             console.print(f"[{c['label']}]Score:[/{c['label']}] [{c['value']}]{score}/100[/{c['value']}]")
-        verify_read_model = (
-            resolve_verify_read_model(
-                store,
-                task,
-                owner_task=resolve_verify_owner_task(store, task),
-                current_epoch=review_task_verify_epoch(task, config),
-            )
-            if task.id is not None
-            else None
-        )
-        latest_verify_artifact = (
-            _resolve_latest_task_artifact(store, config, task.id, kind="verify_command_output")
-            if task.id is not None
-            else None
-        )
-        verify_markdown = _render_verify_markdown(verify_read_model, config=config)
-        verify_artifact_path = (
-            verify_output_artifact_path(verify_read_model) if verify_read_model is not None else None
-        )
-        if verify_read_model is not None or latest_verify_artifact or verify_markdown:
-            console.print(
-                f"[{c['label']}]Review Verify Status:[/{c['label']}] "
-                f"[{c['value']}]{getattr(getattr(verify_read_model, 'result', None), 'status', None) or 'unknown'}[/{c['value']}]"
-            )
-            verify_result = getattr(verify_read_model, "result", None)
-            if verify_result is not None and verify_result.exit_status:
-                console.print(
-                    f"[{c['label']}]Review Verify Exit:[/{c['label']}] "
-                    f"[{c['value']}]{verify_result.exit_status}[/{c['value']}]"
-                )
-            if verify_result is not None and verify_result.captured_at:
-                console.print(
-                    f"[{c['label']}]Review Verify At:[/{c['label']}] "
-                    f"[{c['value']}]{_format_utc_timestamp(verify_result.captured_at)}[/{c['value']}]"
-                )
-            if verify_result is not None and verify_result.reviewed_branch:
-                console.print(
-                    f"[{c['label']}]Review Verify Branch:[/{c['label']}] "
-                    f"[{c['value']}]{verify_result.reviewed_branch}[/{c['value']}]"
-                )
-            if verify_result is not None and verify_result.reviewed_head_sha:
-                console.print(
-                    f"[{c['label']}]Review Verify Head:[/{c['label']}] "
-                    f"[{c['value']}]{verify_result.reviewed_head_sha}[/{c['value']}]"
-                )
-            if verify_result is not None and verify_result.reviewed_base_sha:
-                console.print(
-                    f"[{c['label']}]Review Verify Base:[/{c['label']}] "
-                    f"[{c['value']}]{verify_result.reviewed_base_sha}[/{c['value']}]"
-                )
-            if verify_result is not None and verify_result.working_directory:
-                console.print(
-                    f"[{c['label']}]Review Verify Cwd:[/{c['label']}] "
-                    f"[{c['value']}]{verify_result.working_directory}[/{c['value']}]"
-                )
-            if verify_artifact_path is None and latest_verify_artifact is not None:
-                verify_artifact_path = latest_verify_artifact.artifact.path
-            if verify_artifact_path:
-                verify_artifact_text = verify_artifact_path
-                if latest_verify_artifact is not None and latest_verify_artifact.invalid_path_error is not None:
-                    verify_artifact_text = f"{verify_artifact_text} (invalid path)"
-                else:
-                    try:
-                        resolved_verify_artifact = resolve_artifact_path(config.project_dir, verify_artifact_path)
-                    except InvalidArtifactPathError:
-                        verify_artifact_text = f"{verify_artifact_text} (invalid path)"
-                    else:
-                        if not resolved_verify_artifact.exists():
-                            verify_artifact_text = f"{verify_artifact_text} (missing)"
-                console.print(
-                    f"[{c['label']}]Review Verify Artifact:[/{c['label']}] "
-                    f"[{c['value']}]{verify_artifact_text}[/{c['value']}]"
-                )
-            if verify_result is not None and verify_result.failure:
-                console.print(
-                    f"[{c['label']}]Review Verify Failure:[/{c['label']}] "
-                    f"[{c['value']}]{verify_result.failure}[/{c['value']}]"
-                )
+    _render_show_verify_section(
+        task=task,
+        config=config,
+        store=store,
+        colors=c,
+        metadata_only=metadata_only,
+        full_mode=full_mode,
+    )
     if task.task_type == "plan_review":
         verdict, manifest_detail = _plan_review_detail(task=task, config=config, store=store)
         if verdict:
@@ -4649,21 +4704,6 @@ def _cmd_show_output(
         console.print(f"[{c['prompt']}]{task.prompt}[/{c['prompt']}]")
         console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
         console.print()
-        if task.task_type == "review" and verify_markdown:
-            console.print(f"[{c['label']}]Review Verify Result:[/{c['label']}]")
-            console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
-            review_verify_lines = verify_markdown.splitlines()
-            if not full_mode and len(review_verify_lines) > 30:
-                truncated = "\n".join(review_verify_lines[:20])
-                remainder = len(review_verify_lines) - 20
-                console.print(truncated)
-                console.print(
-                    f"[{c['section']}](... truncated, {remainder} more lines — use `gza show {task.id} --full` to see all)[/{c['section']}]"
-                )
-            else:
-                console.print(verify_markdown)
-            console.print(f"[{c['section']}]{'-' * 50}[/{c['section']}]")
-            console.print()
     if task.id is not None:
         comments = store.get_comments(task.id)
         if comments:
@@ -4675,12 +4715,12 @@ def _cmd_show_output(
                     f"source={comment.source}",
                     f"kind={comment.kind}",
                     f"state={state}",
-                    f"created={_format_utc_timestamp(comment.created_at)}",
+                    f"created={_format_show_utc_timestamp(comment.created_at)}",
                 ]
                 if comment.author:
                     meta_parts.append(f"author={comment.author}")
                 if comment.resolved_at is not None:
-                    meta_parts.append(f"resolved={_format_utc_timestamp(comment.resolved_at)}")
+                    meta_parts.append(f"resolved={_format_show_utc_timestamp(comment.resolved_at)}")
                 meta = ", ".join(meta_parts)
                 console.print(f"  [{c['stats']}]({meta})[/{c['stats']}] {comment.content}")
             console.print()

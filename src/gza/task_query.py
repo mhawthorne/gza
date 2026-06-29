@@ -470,6 +470,7 @@ class TaskQueryService:
                     task,
                     query,
                     config=config,
+                    git=git,
                     target_branch=target_branch,
                     now=projection_now,
                 )
@@ -824,6 +825,7 @@ class TaskQueryService:
         query: TaskQuery,
         *,
         config: Any | None,
+        git: Any | None,
         target_branch: str | None,
         now: datetime,
     ) -> TaskRow:
@@ -847,12 +849,18 @@ class TaskQueryService:
         if task.task_type == "review":
             review_verdict = task.output_content
         verify_read_model = None
-        if config is not None and task.task_type == "review":
+        if config is not None:
+            verify_owner = resolve_verify_owner_task(self._store, task) if task.task_type == "review" else branch_owner
+            current_epoch = (
+                review_task_verify_epoch(task, config)
+                if task.task_type == "review"
+                else owner_task_verify_epoch(verify_owner, config, git)
+            )
             verify_read_model = resolve_verify_read_model(
                 self._store,
                 task,
-                owner_task=resolve_verify_owner_task(self._store, task),
-                current_epoch=review_task_verify_epoch(task, config),
+                owner_task=verify_owner,
+                current_epoch=current_epoch,
             )
 
         values: dict[str, object] = {

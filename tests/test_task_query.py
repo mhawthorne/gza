@@ -341,7 +341,7 @@ def test_incomplete_preset_projects_verify_only_noop_recovery_without_persisting
     assert projected.values["next_action_noop_improve_kind"] == "verify_only"
 
 
-def test_history_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Path) -> None:
+def test_task_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Path) -> None:
     store = _store(tmp_path)
     config = Config(
         project_dir=tmp_path,
@@ -353,6 +353,8 @@ def test_history_projection_verify_fields_use_canonical_owner_artifact(tmp_path:
 
     impl = store.add("Implement query verify owner", task_type="implement")
     assert impl.id is not None
+    impl.branch = "feature/query-verify"
+    store.update(impl)
 
     review = store.add("Review query verify owner", task_type="review", depends_on=impl.id)
     assert review.id is not None
@@ -362,7 +364,7 @@ def test_history_projection_verify_fields_use_canonical_owner_artifact(tmp_path:
     review.review_verify_status = "failed"
     review.review_verify_exit_status = "9"
     review.review_verify_captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
-    review.review_verify_branch = "feature/query-verify"
+    review.review_verify_branch = impl.branch
     review.review_verify_head_sha = "head-1"
     store.update(review)
 
@@ -376,7 +378,7 @@ def test_history_projection_verify_fields_use_canonical_owner_artifact(tmp_path:
             status="passed",
             exit_status="0",
             captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
-            reviewed_branch="feature/query-verify",
+            reviewed_branch=impl.branch,
             reviewed_head_sha="head-1",
             reviewed_base_sha="base-1",
             working_directory="/tmp/verify-owner",
@@ -392,20 +394,20 @@ def test_history_projection_verify_fields_use_canonical_owner_artifact(tmp_path:
         TaskQuery(
             scope="tasks",
             limit=None,
-            task_types=("review",),
+            task_types=("implement",),
             projection=ProjectionSpec(
-                fields=("id", "verify_status", "verify_exit_status", "verify_source", "verify_current"),
+                fields=("id", "verify_status", "verify_source", "verify_current"),
             ),
             presentation=PresentationSpec(mode="json"),
         ),
         config=config,
+        git=SimpleNamespace(rev_parse_if_exists=lambda ref: "head-1" if ref == impl.branch else None),
     )
 
     assert len(result.rows) == 1
     row = result.rows[0]
     assert isinstance(row, TaskRow)
     assert row.values["verify_status"] == "passed"
-    assert row.values["verify_exit_status"] == "0"
     assert row.values["verify_source"] == "owner_artifact"
     assert row.values["verify_current"] is True
 
