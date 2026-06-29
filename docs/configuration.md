@@ -1899,25 +1899,29 @@ uv run gza behavior-monitor [options]
 
 `uv run gza behavior-monitor` is a separate host-side cadence loop, not part of `gza watch` slot filling. Each pass creates one `internal` check task tagged `behavior-monitor` plus the filing tag, runs `/gza-behavior-check` through the existing non-code runner path, reads the required `## Machine-readable findings` appendix from the generated report, and files deduplicated follow-up tasks into the shared DB. The monitor uses a SQLite-backed per-project lease so only one conformance pass runs at a time, and the internal check task is excluded from normal pending pickup and watch slot accounting.
 
+This is intentionally a cadence-based whole-system conformance check, not a per-merge gate. The behavior check can surface historical or unrelated divergence anywhere in the codebase, so running it before every merge would block unrelated work. Instead, the monitor keeps re-checking the whole behavior-spec set on a schedule and files follow-up tasks into the normal queue.
+
 By default the monitor files only confirmed `DIVERGES` findings. It maps `code bug` recommendations to `implement` tasks tagged `behavior-code-bug`, `spec gap` recommendations to `implement` tasks tagged `behavior-spec-gap` plus `specs-behavior`, and `ambiguous` recommendations to `plan` tasks tagged `behavior-ambiguous` plus `specs-behavior`. Repeated passes dedupe against active linked tasks, while a merged or dropped linked task plus a reappearing fingerprint creates a new-generation follow-up task whose prompt notes the prior linked task and new generation. Findings beyond the per-pass cap are logged as suppressed and deferred to later monitor passes instead of flooding the queue, but still count as observed for absent-resolution so present findings are not falsely resolved.
 
 The `behavior_monitor` config block supports these discoverable keys directly:
 
-- `behavior_monitor.enabled`: turn the host-side monitor on or off for operator defaults. When false, `uv run gza behavior-monitor` exits non-zero unless `--force` is supplied.
-- `behavior_monitor.interval_seconds`: default sleep interval for looping monitor runs.
-- `behavior_monitor.tag`: default filing tag applied to the internal check task and any filed follow-up tasks.
-- `behavior_monitor.max_new_tasks_per_cycle`: maximum number of new follow-up tasks filed in one monitor pass.
-- `behavior_monitor.check_timeout_seconds`: timeout budget for the internal `/gza-behavior-check` task.
-- `behavior_monitor.file_undetermined`: when true, also file investigation tasks for `UNDETERMINED` findings.
+- `behavior_monitor.enabled`: defaults to `true`. The monitor ships enabled by default so the load-bearing conformance loop exists as soon as the feature lands. When false, `uv run gza behavior-monitor` exits non-zero unless `--force` is supplied.
+- `behavior_monitor.interval_seconds`: default sleep interval for looping monitor runs. Default: `14400` seconds (4 hours).
+- `behavior_monitor.tag`: default filing tag applied to the internal check task and any filed follow-up tasks. Default: `behavior-conformance`.
+- `behavior_monitor.max_new_tasks_per_cycle`: maximum number of new follow-up tasks filed in one monitor pass. Default: `5`.
+- `behavior_monitor.check_timeout_seconds`: timeout budget for the internal `/gza-behavior-check` task. Default: `3600`.
+- `behavior_monitor.file_undetermined`: when true, also file investigation tasks for `UNDETERMINED` findings. Default: `false`.
 
 ### spec-coherence gate
 
-When `spec_coherence.enabled=true`, lifecycle inspects the current merge diff for paths matching `spec_coherence.paths`. If the branch touches any configured behavior-spec path, advance creates or reuses a same-lineage review task with structured `review_scope` metadata for `spec-coherence` that captures the reviewed head and exact changed behavior-spec paths, plus a prompt that runs `/gza-spec-coherence`. A current `APPROVED` coherence review lets lifecycle continue only when that persisted scope still matches the current branch head and changed-path set; `CHANGES_REQUESTED` routes through the normal improve loop; `NEEDS_DISCUSSION` parks the branch with `reason=spec-coherence-needs-discussion`; and a later matching spec edit invalidates the prior approval and requires a fresh coherence review.
+When `spec_coherence.enabled=true`, lifecycle inspects the current merge diff for paths matching `spec_coherence.paths`. If the branch touches any configured behavior-spec path, advance creates or reuses a same-lineage review task with structured `review_scope` metadata for `spec-coherence` that captures the reviewed head and exact changed behavior-spec paths, plus a prompt that runs `/gza-spec-coherence`. This is a hard merge gate for behavior-spec edits: lifecycle does not allow the branch to merge until a current coherence review approves the changed spec set. A current `APPROVED` coherence review lets lifecycle continue only when that persisted scope still matches the current branch head and changed-path set; `CHANGES_REQUESTED` routes through the normal improve loop; `NEEDS_DISCUSSION` parks the branch with `reason=spec-coherence-needs-discussion`; and a later matching spec edit invalidates the prior approval and requires a fresh coherence review.
+
+This gate is intentionally branch-scoped authoring validation, not whole-system conformance. `gza-spec-coherence` checks whether the changed behavior specs are plain, coherent, non-overlapping, and correctly owned. That is narrow enough to be enforced on every merge that edits `specs/behavior/**`, unlike the cadence-based behavior monitor above.
 
 The `spec_coherence` config block supports these discoverable keys directly:
 
-- `spec_coherence.enabled`: enable or disable the automatic branch-scoped behavior-spec coherence gate.
-- `spec_coherence.paths`: repo-relative glob patterns that trigger the coherence gate when the branch diff touches them.
+- `spec_coherence.enabled`: enable or disable the automatic branch-scoped behavior-spec coherence gate. Default: `true`.
+- `spec_coherence.paths`: repo-relative glob patterns that trigger the coherence gate when the branch diff touches them. Default: `specs/behavior/**`.
 
 ### iterate
 

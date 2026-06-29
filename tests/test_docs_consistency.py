@@ -416,6 +416,8 @@ def test_configuration_docs_include_behavior_monitor_command() -> None:
     assert "`--dry-run` | Run the behavior check and parse findings without filing" in config_content
     assert "SQLite-backed per-project lease" in config_content
     assert "excluded from normal pending pickup and watch slot accounting" in normalized
+    assert "cadence-based whole-system conformance check" in normalized
+    assert "behavior_monitor.enabled`: defaults to `true`" in config_content
 
 
 def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
@@ -1523,6 +1525,23 @@ def test_skills_docs_describe_spec_coherence_as_behavior_spec_set_gate() -> None
     assert "structured `review_scope` metadata for `spec-coherence`" in config_content
     assert "reviewed head and exact changed behavior-spec paths" in config_content
     assert "`spec_coherence.paths`" in config_content
+    assert "hard merge gate for behavior-spec edits" in config_content
+    assert "Default: `true`." in config_content
+
+
+def test_internal_docs_explain_behavior_monitor_vs_spec_coherence_split() -> None:
+    """Internal docs index should include the design-rationale note for the split checks."""
+    repo_root = Path(__file__).resolve().parents[1]
+    internal_index = (repo_root / "docs" / "internal" / "README.md").read_text()
+    rationale_doc = (
+        repo_root / "docs" / "internal" / "behavior-conformance-vs-spec-coherence.md"
+    ).read_text()
+
+    assert "behavior-conformance-vs-spec-coherence.md" in internal_index
+    assert "cadence-based while behavior-spec coherence is a branch-scoped merge gate" in internal_index
+    assert "behavior-monitor" in rationale_doc
+    assert "spec-coherence" in rationale_doc
+    assert "Do not collapse them into one gate." in rationale_doc
 
 
 def test_lineage_spec_and_operator_docs_define_stale_unmerged_sweep_contract() -> None:

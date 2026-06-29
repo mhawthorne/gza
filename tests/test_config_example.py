@@ -7,6 +7,14 @@ from gza.config_examples import render_config_example
 from gza.config_schema import CONFIG_KEY_REGISTRY, ConfigKeySpec
 
 
+def _extract_commented_section(rendered: str, key: str) -> str:
+    start = rendered.index(key)
+    next_section = rendered.find("\n# ---", start + 1)
+    if next_section == -1:
+        next_section = len(rendered)
+    return rendered[start:next_section]
+
+
 def test_committed_config_examples_match_generated_registry_output() -> None:
     # DELIBERATE exception to AGENTS.md "No config-value pinning":
     # these files are generated artifacts, and lockstep failure is the intended
@@ -181,3 +189,29 @@ def test_full_config_example_groups_behavior_monitor_under_lifecycle() -> None:
     assert lifecycle_start < behavior_index < review_start
     _, other_header, other_section = rendered.partition("# --- Other ---")
     assert not other_header or behavior_key not in other_section
+
+
+def test_full_config_example_groups_spec_coherence_under_other() -> None:
+    rendered = render_config_example()
+
+    other_start = rendered.index("# --- Other ---")
+    coherence_key = "# spec_coherence:"
+
+    coherence_index = rendered.index(coherence_key)
+
+    assert other_start < coherence_index
+
+
+def test_config_examples_include_behavior_monitor_and_spec_coherence_defaults() -> None:
+    rendered = render_config_example()
+    rendered_local = render_config_example(local=True)
+
+    for content in (rendered, rendered_local):
+        behavior_monitor = _extract_commented_section(content, "# behavior_monitor:")
+        spec_coherence = _extract_commented_section(content, "# spec_coherence:")
+
+        assert "#   enabled: true" in behavior_monitor
+        assert "#   interval_seconds: 14400" in behavior_monitor
+        assert "#   max_new_tasks_per_cycle: 5" in behavior_monitor
+        assert "#   enabled: true" in spec_coherence
+        assert '#     - "specs/behavior/**"' in spec_coherence

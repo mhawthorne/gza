@@ -11,6 +11,7 @@ Linked from `AGENTS.md` so these are reachable in one hop instead of by grep.
 - [task-vs-agent-context.md](task-vs-agent-context.md) — what the host (task context) vs the agent sandbox can access; **the agent has no network and no `origin/*` refs**.
 - [worktree-lifecycle.md](worktree-lifecycle.md) — how task worktrees are created and cleaned up.
 - [color-theme-architecture.md](color-theme-architecture.md) — how themes and colors are resolved and applied.
+- [behavior-conformance-vs-spec-coherence.md](behavior-conformance-vs-spec-coherence.md) — why whole-system behavior conformance is cadence-based while behavior-spec coherence is a branch-scoped merge gate.
 
 ## Workflows
 
