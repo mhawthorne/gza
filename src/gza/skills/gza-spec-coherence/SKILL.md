@@ -8,15 +8,15 @@ public: true
 
 # Behavior spec coherence check
 
-Check the **behavior spec set itself** in `specs/behavior/` for coherence, ownership
-boundaries, and plain-language discipline.
+Review the **behavior spec set itself** in `specs/behavior/` for authoring quality:
+coherence, ownership boundaries, atomic normative text, and plain-language discipline.
 
 This skill is blind to authorship. The behavior spec is a shared artifact that both humans
 and agents edit, so you judge the text only: **never who wrote it**.
 
 ## The one thing that makes this skill different
 
-This is neither a code conformance check nor a feature-spec freshness review:
+This is neither an implementation conformance check nor a feature-spec freshness review:
 
 | | `gza-spec-review-all` | `gza-behavior-check` | `gza-spec-coherence` (this skill) |
 |---|---|---|---|
@@ -38,12 +38,15 @@ Each finding cites file + section and says concretely what to change.
 ## Inputs (optional scope)
 
 - **No argument** — review the full `specs/behavior/` set.
-- **One or more changed files** — review those files *against the rest of the set*.
+- **One or more changed files** under `specs/behavior/**` — review those files *against the
+  rest of the set*.
 - **A directory/pattern** under `specs/behavior/` — review matching files, but still load
   the owning files needed to judge overlap and references.
 
 If the caller provides a change list, do **not** limit yourself to those files alone:
 coherence findings often live at the boundary between the changed file and its owner.
+Primary findings should still be about the changed behavior-spec files unless an owning
+file must change to resolve a duplicate-ownership problem.
 
 ## What to flag
 
@@ -55,10 +58,17 @@ coherence findings often live at the boundary between the changed file and its o
 3. **Verbose normative clauses** — RFC-2119 clauses (`MUST`, `MUST NOT`, `SHALL`,
    `SHOULD`, `MAY`) that can be said more plainly. Report the exact clause and give a
    tighter rewrite.
-4. **Broken or missing cross-references** — links, anchors, or ownership references that
+4. **Non-atomic normative clauses** — one sentence bundles multiple requirements, mixes
+   contract with rationale, or hides the real requirement inside a long paragraph. Split
+   it into plain, atomic requirements.
+5. **Broken or missing cross-references** — links, anchors, or ownership references that
    do not resolve or that should exist but do not.
-5. **RFC-2119 keyword misuse** — normative weight where the sentence is really context or
+6. **RFC-2119 keyword misuse** — normative weight where the sentence is really context or
    rationale, or soft prose where a real requirement needs an explicit `MUST` / `MUST NOT`.
+7. **Open questions presented as contract** — unresolved decisions are written like settled
+   behavior instead of being marked explicitly as open questions, assumptions, or future work.
+8. **Implementation details in normative text** — code-path, file-layout, or operational
+   mechanics appear in contract text instead of a clearly marked `Implementation note`.
 
 ## Process
 
@@ -83,6 +93,7 @@ For each file, ask:
 - Does it restate shared vocabulary or invariants instead of linking back to the owner?
 - Does it introduce a second "authoritative" explanation of the same decision?
 - Does it rely on an implied ownership boundary that the text never states?
+- Does it restate behavior that belongs in `00-overview.md` instead of cross-referencing it?
 
 Treat `00-overview.md` as the default owner of shared vocabulary and system-wide
 invariants unless another file explicitly owns a narrower concept.
@@ -117,6 +128,8 @@ Walk every normative clause in scope and classify it:
   formatting, or obvious restatement
 - **Underweighted** — the sentence describes a contract requirement but lacks clear
   normative force
+- **Non-atomic** — one clause packs multiple independent requirements or mixes requirement,
+  rationale, and implementation detail
 - **Verbose** — the requirement is real, but the clause is longer than needed
 
 For every **verbose** clause, quote the clause, then propose a tighter rewrite in plainer
@@ -125,7 +138,18 @@ words that preserves the same requirement.
 Prefer simple English over legalistic prose. Shorter is better when the requirement stays
 equally precise.
 
-### Step 5 — Write the report
+### Step 5 — Separate contract, open questions, and implementation notes
+
+For each in-scope section, confirm:
+
+- Open questions are marked explicitly as open questions, assumptions, or future work, not
+  implied as settled contract text.
+- Implementation details stay inside clearly marked `Implementation note` blocks or
+  equivalent non-normative labeling.
+- Normative sections describe *what must hold*, not incidental details about current code
+  structure, filenames, or execution mechanics.
+
+### Step 6 — Write the report
 
 ```bash
 date +%Y%m%d%H%M%S
@@ -143,7 +167,7 @@ Write to `reviews/<timestamp>-spec-coherence.md`.
 
 ## Summary
 Files reviewed: N
-Findings: X overlap · Y restatement · Z cross-reference · A RFC-2119 misuse · B plain-language rewrites
+Findings: W overlap · X restatement · Y cross-reference · Z normative-discipline · A open-question/implementation-note issues · B plain-language rewrites
 
 ## Blockers
 ### B1
@@ -163,6 +187,10 @@ Findings: X overlap · Y restatement · Z cross-reference · A RFC-2119 misuse �
   Quote the clause, explain why it is too wordy, and propose a tighter rewrite.
 - CROSS-REFERENCE — `specs/behavior/<file>.md` §<section>
   Name the missing or broken pointer to the owning file/section and the exact fix.
+- OPEN-QUESTION — `specs/behavior/<file>.md` §<section>
+  Explain why the text reads like an implied contract and how to mark it explicitly as open.
+- IMPLEMENTATION-NOTE — `specs/behavior/<file>.md` §<section>
+  Identify implementation detail that should move under a clearly marked `Implementation note`.
 - Resolved / clean boundaries:
   - `00-overview.md` ↔ `lifecycle-engine.md`: shared vocabulary is owned once and referenced, not restated.
 
@@ -199,6 +227,12 @@ If a section has nothing to report, write `None.` under that heading instead of 
   dependent files should link, not restate.
 - **Prefer cross-reference over duplication.** If a concept is shared, move ownership to
   one file and point to it everywhere else.
+- **Normative text must be atomic.** One requirement per clause whenever possible; split
+  mixed requirement/rationale/implementation prose into separate sentences or notes.
+- **Open questions are not contracts.** If the intended behavior is undecided, mark it as
+  an open question instead of implying a settled requirement.
+- **Implementation detail belongs in clearly marked notes.** Keep implementation mechanics
+  out of the contract unless they are the behavior being specified.
 - **Plain language wins.** Keep the same normative force with fewer, clearer words.
 - **Do not invent contradictions.** Similar wording is only a finding when it creates
   duplicate ownership, conflicting authority, or unnecessary repetition.

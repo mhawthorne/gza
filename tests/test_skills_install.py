@@ -816,6 +816,8 @@ class TestSkillContentValidation:
         content = skill_file.read_text()
         normalized = " ".join(content.split())
 
+        assert "authoring quality" in content
+        assert "implementation conformance check" in content
         assert "This skill is blind to authorship." in content
         assert "never who wrote it" in content
         assert "Bash(git log:*)" not in content
@@ -823,9 +825,14 @@ class TestSkillContentValidation:
         assert "00-overview.md" in content
         assert "lifecycle-engine.md" in content
         assert "restated shared vocabulary or invariants" in normalized
+        assert "Non-atomic normative clauses" in content
         assert "Broken or missing cross-references" in content
         assert "RFC-2119 keyword misuse" in content
+        assert "Open questions presented as contract" in content
+        assert "Implementation details in normative text" in content
         assert "quote the clause, then propose a tighter rewrite" in normalized
+        assert "clearly marked `Implementation note`" in content
+        assert "Open questions are not contracts." in content
         assert "MUST NOT edit the spec or the code" in content
         assert "reviews/<timestamp>-spec-coherence.md" in content
         assert "## Blockers" in content
@@ -865,6 +872,10 @@ class TestSkillContentValidation:
         assert "## Questions / Assumptions" in installed
         assert "## Verdict" in installed
         assert "Verdict: CHANGES_REQUESTED" in installed
+        assert "authoring quality" in installed
+        assert "Open questions presented as contract" in installed
+        assert "Implementation details in normative text" in installed
+        assert "clearly marked `Implementation note`" in installed
 
     def test_gza_behavior_check_installed_skill_includes_machine_readable_findings_appendix(
         self, tmp_path: Path

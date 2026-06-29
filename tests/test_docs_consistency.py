@@ -1516,6 +1516,8 @@ def test_skills_docs_describe_spec_coherence_as_behavior_spec_set_gate() -> None
     assert "Lifecycle also uses this skill automatically" in skills_content
     assert "not against the code" in skills_content
     assert "repeated vocabulary or invariants that should cross-reference `00-overview.md`" in skills_content
+    assert "open questions that read like implied contract" in skills_content
+    assert "clearly marked `Implementation note` sections" in skills_content
     assert "reviews/<timestamp>-spec-coherence.md" in skills_content
     assert "### spec-coherence gate" in config_content
     assert "structured `review_scope` metadata for `spec-coherence`" in config_content
