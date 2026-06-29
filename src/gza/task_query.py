@@ -17,7 +17,6 @@ from .review_verify_state import (
     owner_task_verify_epoch,
     resolve_verify_owner_task,
     resolve_verify_read_model,
-    review_task_verify_epoch,
 )
 
 QueryScope = Literal["tasks", "lineages"]
@@ -851,11 +850,7 @@ class TaskQueryService:
         verify_read_model = None
         if config is not None:
             verify_owner = resolve_verify_owner_task(self._store, task) if task.task_type == "review" else branch_owner
-            current_epoch = (
-                review_task_verify_epoch(task, config)
-                if task.task_type == "review"
-                else owner_task_verify_epoch(verify_owner, config, git)
-            )
+            current_epoch = owner_task_verify_epoch(verify_owner, config, git)
             verify_read_model = resolve_verify_read_model(
                 self._store,
                 task,

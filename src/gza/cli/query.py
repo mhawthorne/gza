@@ -83,7 +83,6 @@ from ..review_verify_state import (
     read_verify_output_excerpt,
     resolve_verify_owner_task,
     resolve_verify_read_model,
-    review_task_verify_epoch,
     verify_output_artifact_path,
 )
 from ..runner import _get_task_output, get_effective_config_for_task, write_log_entry
@@ -4414,14 +4413,11 @@ def _resolve_show_verify_read_model(
     store: SqliteTaskStore,
 ) -> VerifyReadModel | None:
     verify_owner = resolve_verify_owner_task(store, task) if task.task_type == "review" else _resolve_lineage_owner_task(store, task)
-    if task.task_type == "review":
-        current_epoch = review_task_verify_epoch(task, config)
-    else:
-        try:
-            git = Git(config.project_dir)
-        except (GitError, OSError):
-            git = None
-        current_epoch = owner_task_verify_epoch(verify_owner, config, git)
+    try:
+        git = Git(config.project_dir)
+    except (GitError, OSError):
+        git = None
+    current_epoch = owner_task_verify_epoch(verify_owner, config, git)
     return resolve_verify_read_model(
         store,
         task,
@@ -4462,6 +4458,12 @@ def _render_show_verify_section(
         console.print(
             f"[{c['label']}]Verify Exit:[/{c['label']}] "
             f"[{c['value']}]{verify_result.exit_status}[/{c['value']}]"
+        )
+    if verify_read_model is not None:
+        verify_current = "yes" if verify_read_model.is_current else "no"
+        console.print(
+            f"[{c['label']}]Verify Current:[/{c['label']}] "
+            f"[{c['value']}]{verify_current}[/{c['value']}]"
         )
     if verify_result is not None and verify_result.captured_at:
         console.print(

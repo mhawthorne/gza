@@ -5931,6 +5931,103 @@ class TestShowCommand:
         assert "legacy verify markdown" in result.stdout
         assert "Review Verify" not in result.stdout
 
+    def test_show_review_marks_owner_verify_stale_after_owner_head_moves(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/review-show-stale"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_verify_command = "./bin/tests"
+        review.review_verify_status = "passed"
+        review.review_verify_exit_status = "0"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "old-head"
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="stale owner artifact output\n",
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            head_sha="old-head",
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="old-head",
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        git = _mock_unmerged_git()
+        git.rev_parse_if_exists = MagicMock(
+            side_effect=lambda ref: "new-head" if ref == impl.branch else ("b" * 40 if ref == "main" else "a" * 40)
+        )
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(review.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Current: no" in output
+        assert "Verify Head:" in output
+        assert "old-head" in output
+        assert "new-head" not in output
+        assert stored.path in output
+
     def test_show_metadata_only_marks_missing_artifacts(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)

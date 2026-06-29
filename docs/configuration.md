@@ -1083,7 +1083,7 @@ When review data is present, `gza show` also includes:
 - `Score: <N>/100` when a derived `review_score` is available.
 
 When persisted verify evidence is available, `gza show` also includes neutral verify-state fields for the latest owner-attached `verify_gate_result` artifact when present, or a legacy review fallback when canonical owner data is absent. The rendered block may therefore appear on implementation/lineage tasks as well as review tasks, and a failed freshness probe still shows the latest stored evidence as stale rather than suppressing it entirely.
-- `Verify Status`, `Verify Exit`, `Verify At`, `Verify Branch`, `Verify Head`, `Verify Base`, `Verify Cwd`, `Verify Failure`, and the persisted `## verify_command result` section from the shared verify read model.
+- `Verify Status`, `Verify Exit`, `Verify Current`, `Verify At`, `Verify Branch`, `Verify Head`, `Verify Base`, `Verify Cwd`, `Verify Failure`, and the persisted `## verify_command result` section from the shared verify read model.
 - `Verify Artifact: <path>` showing the canonical `verify_command_output` artifact path when known, with invalid or missing-file markers preserved.
 - `Artifacts:` listing every stored task artifact with missing-file visibility.
 
