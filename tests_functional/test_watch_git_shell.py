@@ -117,6 +117,15 @@ def _corrupt_linked_worktree_commondir_for_probe_failure(
     pytest.fail("corrupt linked-worktree commondir did not break `git worktree list --porcelain`")
 
 
+def _is_expected_linked_worktree_probe_failure(stderr: str) -> bool:
+    accepted_variants = (
+        ("not a git repository",),
+        ("invalid commondir",),
+        ("Invalid path '/gza-git'", "No such file or directory"),
+    )
+    return any(all(fragment in stderr for fragment in variant) for variant in accepted_variants)
+
+
 def test_execute_merge_action_marks_already_merged_task_without_error(tmp_path) -> None:
     store, git, task, _wt = setup_git_repo_with_task_branch(
         tmp_path,
@@ -436,14 +445,7 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     )
     assert corrupt_value.startswith("/gza-git/common")
     assert broken_probe.returncode != 0
-    assert (
-        "not a git repository" in broken_probe.stderr
-        or "invalid commondir" in broken_probe.stderr
-        # Older git (e.g. host 2.41) reports the container-only commondir path as an
-        # invalid path rather than a missing repo; production recognizes this marker too
-        # (see recovery_engine._REBASE_INFRA_LOG_MARKERS).
-        or "invalid path '/gza-git'" in broken_probe.stderr.lower()
-    )
+    assert _is_expected_linked_worktree_probe_failure(broken_probe.stderr)
 
     args = argparse.Namespace(
         project_dir=project_dir,
