@@ -31,6 +31,7 @@ from gza.rebase_diff import RebaseDiffBaseline
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_clearance import VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
+from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.runner import (
@@ -13705,6 +13706,7 @@ class TestExtractedRunInnerHelpers:
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "abc1234",
             "timeout_seconds": 120,
+            "timeout_grace_seconds": 9.0,
             "tree_fingerprint": None,
             "working_directory": None,
         }
@@ -19826,6 +19828,7 @@ class TestProviderPromptSanitization:
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
             "timeout_seconds": 120,
+            "timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
             "tree_fingerprint": failed_fingerprint,
             "working_directory": refreshed.review_verify_cwd,
         }
@@ -19917,9 +19920,21 @@ class TestProviderPromptSanitization:
             "reviewed_branch": impl.branch,
             "reviewed_head_sha": "deadbeef",
             "timeout_seconds": 120,
+            "timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
             "tree_fingerprint": None,
             "working_directory": refreshed.review_verify_cwd,
         }
+        gate_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        assert len(gate_artifacts) == 1
+        assert gate_artifacts[0].status == "passed"
+        assert gate_artifacts[0].metadata["verify_epoch"] == {
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "verify_command": "printf 'all good\\n'",
+            "verify_timeout_seconds": 120,
+            "verify_timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+        }
+        assert gate_artifacts[0].metadata["source_task_id"] == task.id
 
     def test_fresh_review_failing_verify_artifact_preserves_pytest_tail_beyond_prompt_trim(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -20286,6 +20301,7 @@ class TestProviderPromptSanitization:
             "scope": "services/foo",
             "skip_reason": None,
             "timeout_seconds": 120,
+            "timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
             "working_directory": "services/foo",
         }
         assert (tmp_path / artifacts_by_scope["services/foo"].path).read_text(encoding="utf-8") == (
@@ -20305,6 +20321,7 @@ class TestProviderPromptSanitization:
             "scope": "libs/bar",
             "skip_reason": None,
             "timeout_seconds": 120,
+            "timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
             "working_directory": "libs/bar",
         }
         assert (tmp_path / artifacts_by_scope["libs/bar"].path).read_text(encoding="utf-8") == (
