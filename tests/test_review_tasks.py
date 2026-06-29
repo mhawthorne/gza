@@ -283,6 +283,85 @@ class TestVerifyFixTasks:
         assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=first_epoch).id == first.id
         assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=second_epoch).id == second.id
 
+    def test_create_or_reuse_verify_fix_task_rejects_stale_older_based_on_when_later_rebase_owns_failed_head(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        store.mark_completed(improve, branch="feature/test", has_commits=True, head_sha="older-head")
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=improve.id, same_branch=True)
+        store.mark_completed(rebase, branch="feature/test", has_commits=True, head_sha="deadbeef")
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=rebase,
+            epoch=epoch,
+        )
+
+        with pytest.raises(ValueError, match=f"current failed verify epoch is represented by task {rebase.id}"):
+            create_or_reuse_verify_fix_task(
+                store,
+                config,
+                impl_task=impl,
+                based_on_task=improve,
+                verify_epoch=epoch,
+                trigger_source="manual",
+            )
+
+        assert [task.task_type for task in store.get_pending()] == ["implement"]
+
+    def test_create_or_reuse_verify_fix_task_accepts_resolved_current_representative(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        store.mark_completed(improve, branch="feature/test", has_commits=True, head_sha="older-head")
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=improve.id, same_branch=True)
+        store.mark_completed(rebase, branch="feature/test", has_commits=True, head_sha="deadbeef")
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=rebase,
+            epoch=epoch,
+        )
+
+        created, did_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=rebase,
+            verify_epoch=epoch,
+            trigger_source="manual",
+        )
+
+        assert did_create is True
+        assert created.based_on == rebase.id
+        assert created.task_type == "verify_fix"
+
     def test_create_or_reuse_verify_fix_task_fails_closed_without_matching_failed_evidence(
         self, tmp_path: Path
     ) -> None:
