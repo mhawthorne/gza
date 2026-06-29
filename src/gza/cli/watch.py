@@ -60,6 +60,7 @@ from ..lineage_query import (
 from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    MAIN_INTEGRATION_VERIFY_TAG,
     MainIntegrationVerifyCheck,
     MainIntegrationVerifyRemediation,
     check_main_integration_verify,
@@ -273,7 +274,7 @@ def _watch_skip_message(task: DbTask, action: dict) -> str:
 
 def _main_verify_remediation_tags(tags: tuple[str, ...] | None) -> tuple[str, ...]:
     scope_tags = tuple(tags or ())
-    return tuple(dict.fromkeys(("system", *scope_tags)))
+    return tuple(dict.fromkeys(("system", MAIN_INTEGRATION_VERIFY_TAG, *scope_tags)))
 
 
 def _merge_main_verify_remediation_tags(

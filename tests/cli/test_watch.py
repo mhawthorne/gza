@@ -107,6 +107,7 @@ from gza.git_health import (
     load_git_health_state,
 )
 from gza.lineage_query import LineageOwnerRow
+from gza.main_integration_verify import MAIN_INTEGRATION_VERIFY_TAG
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
@@ -8383,7 +8384,7 @@ def test_watch_cycle_flaky_main_verify_files_one_deflake_task_and_keeps_merging(
     assert remediation_task.status == "pending"
     assert remediation_task.urgent is True
     assert remediation_task.queue_position == 1
-    assert set(remediation_task.tags or ()) == {"system", "202606-recovery"}
+    assert set(remediation_task.tags or ()) == {"system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"}
     assert "De-flake local main integration verify phase `functional`" in remediation_task.prompt
     assert "Failure signature: phase:functional" in remediation_task.prompt
     assert "Tree fingerprint: fp-functional-a" in remediation_task.prompt
@@ -8491,7 +8492,7 @@ def test_watch_cycle_reuses_failed_flaky_main_verify_remediation_as_pending_fron
     assert remediation_task.status == "pending"
     assert remediation_task.urgent is True
     assert remediation_task.queue_position == 1
-    assert set(remediation_task.tags or ()) == {"system", "202606-recovery"}
+    assert set(remediation_task.tags or ()) == {"system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"}
     assert [candidate.id for candidate in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         remediation_task.id,
         blocker.id,
@@ -8893,7 +8894,13 @@ def test_watch_cycle_main_verify_remediation_reuses_existing_concrete_task_when_
     assert updated.id == remediation_task.id
     assert updated.urgent is True
     assert updated.queue_position == 1
-    assert set(updated.tags or ()) == {"system", "202606-recovery", "legacy-recovery", "triaged"}
+    assert set(updated.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "202606-recovery",
+        "legacy-recovery",
+        "triaged",
+    }
     assert "Tree fingerprint: unavailable" in updated.prompt
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         updated.id,
@@ -8999,7 +9006,7 @@ def test_watch_cycle_main_verify_remediation_keeps_unknown_task_and_creates_conc
     created = concrete_tasks[0]
     assert created.urgent is True
     assert created.queue_position == 1
-    assert set(created.tags or ()) == {"system", "202606-recovery"}
+    assert set(created.tags or ()) == {"system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"}
     assert "Tree fingerprint: fp-new" in created.prompt
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         created.id,
@@ -9121,7 +9128,12 @@ def test_watch_cycle_main_verify_remediation_prefers_exact_fingerprint_over_unkn
     assert updated_exact is not None
     assert updated_exact.urgent is True
     assert updated_exact.queue_position == 1
-    assert set(updated_exact.tags or ()) == {"system", "202606-recovery", "exact-recovery"}
+    assert set(updated_exact.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "202606-recovery",
+        "exact-recovery",
+    }
     assert "Tree fingerprint: fp-new" in updated_exact.prompt
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         updated_exact.id,
@@ -9316,7 +9328,13 @@ def test_watch_cycle_reuses_failed_deterministic_main_verify_remediation_as_pend
     assert updated.status == "pending"
     assert updated.urgent is True
     assert updated.queue_position == 1
-    assert set(updated.tags or ()) == {"system", "202606-recovery", "legacy-recovery", "triaged"}
+    assert set(updated.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "202606-recovery",
+        "legacy-recovery",
+        "triaged",
+    }
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         updated.id,
         blocker.id,
@@ -9411,7 +9429,13 @@ def test_watch_cycle_reused_main_verify_remediation_inherits_active_scope_tags(t
     updated = remediation_tasks[0]
     assert updated.id == remediation_task.id
     assert updated.urgent is True
-    assert set(updated.tags or ()) == {"system", "202606-recovery", "legacy-recovery", "triaged"}
+    assert set(updated.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "202606-recovery",
+        "legacy-recovery",
+        "triaged",
+    }
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         updated.id,
         blocker.id,

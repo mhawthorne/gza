@@ -119,7 +119,9 @@ Each watch cycle MUST execute these phases in order:
    remediation task MUST still bump it to the front of the runnable queue. If the current
    bounded rerun evidence changes the required remediation kind for that same identity
    (for example `deflake` to `fix`), watch MUST rewrite the reused task so its prompt and
-   purpose match the current classification before queue-bumping it.
+   purpose match the current classification before queue-bumping it. Reused or newly
+   created remediation tasks in this lane MUST also carry the distinctive tag
+   `system-main-verify` in addition to `system` and inherited watch scope tags.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
 4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has

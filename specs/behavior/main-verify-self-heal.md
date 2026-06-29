@@ -114,6 +114,9 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
+- Reused or newly created remediation tasks for this gate MUST carry the distinctive tag
+  `system-main-verify` in addition to the inherited `system` and scope tags so operators
+  can filter main-verify state rows and remediation work together.
 
 That repair path MUST itself be bounded. It MUST NOT silently freeze the merge lane
 without either making bounded repair attempts or surfacing a human-required condition.
