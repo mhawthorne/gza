@@ -44,6 +44,7 @@ from gza.review_tasks import (
     format_verify_fix_context,
     parse_verify_fix_prompt,
     persist_off_topic_verify_clearance,
+    resolve_latest_failed_verify_epoch,
     resolve_verify_fix_context,
 )
 from gza.review_verdict import ReviewFinding
@@ -305,6 +306,107 @@ class TestVerifyFixTasks:
                 verify_epoch=epoch,
                 trigger_source="advance",
             )
+
+    def test_resolve_latest_failed_verify_epoch_requires_current_owner_epoch(self, tmp_path: Path) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=epoch,
+        )
+
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+
+        assert resolve_latest_failed_verify_epoch(store, config, impl, git) == epoch
+
+    def test_resolve_latest_failed_verify_epoch_rejects_stale_owner_epoch(self, tmp_path: Path) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        stale_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="old-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=stale_epoch,
+        )
+
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "new-head"
+
+        with pytest.raises(VerifyFixContextError, match="latest persisted failure is stale"):
+            resolve_latest_failed_verify_epoch(store, config, impl, git)
+
+    def test_create_or_reuse_verify_fix_task_rejects_based_on_task_from_other_lineage(self, tmp_path: Path) -> None:
+        config, store = _make_store(tmp_path)
+        impl_a = store.add("Implement feature A", task_type="implement")
+        assert impl_a.id is not None
+        improve_a = store.add("Improve feature A", task_type="improve", based_on=impl_a.id, same_branch=True)
+        impl_b = store.add("Implement feature B", task_type="implement")
+        assert impl_b.id is not None
+        improve_b = store.add("Improve feature B", task_type="improve", based_on=impl_b.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/a",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl_a,
+            source_task=improve_a,
+            epoch=epoch,
+        )
+
+        with pytest.raises(ValueError, match="resolves to implementation"):
+            create_or_reuse_verify_fix_task(
+                store,
+                config,
+                impl_task=impl_a,
+                based_on_task=improve_b,
+                verify_epoch=epoch,
+                trigger_source="advance",
+            )
+
+        assert [task.task_type for task in store.get_pending()] == [
+            "implement",
+            "improve",
+            "implement",
+            "improve",
+        ]
 
     def test_resolve_verify_fix_context_formats_failed_verify_evidence(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)

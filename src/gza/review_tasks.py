@@ -28,6 +28,8 @@ from .review_verify_state import (
     VerifyEpoch,
     latest_verify_evidence_for_owner,
     latest_verify_result_for_epoch,
+    owner_task_verify_epoch,
+    verify_epoch_matches,
 )
 from .task_slug import (
     extract_task_id_suffix,
@@ -228,7 +230,9 @@ def parse_verify_fix_prompt(prompt: str) -> tuple[str, VerifyEpoch] | None:
 
 def resolve_latest_failed_verify_epoch(
     store: SqliteTaskStore,
+    config: Config,
     impl_task: Task,
+    git: Any,
 ) -> VerifyEpoch:
     """Return the latest failed verify epoch persisted for an implementation owner."""
     evidence = latest_verify_evidence_for_owner(store, impl_task)
@@ -242,6 +246,22 @@ def resolve_latest_failed_verify_epoch(
         raise VerifyFixContextError(
             f"verify_fix manual creation for {impl_task_id} requires failed verify evidence, "
             f"but the latest persisted result is {evidence.result.status!r}."
+        )
+    current_epoch = owner_task_verify_epoch(impl_task, config, git)
+    if current_epoch is None:
+        raise VerifyFixContextError(
+            f"verify_fix manual creation for {impl_task_id} could not resolve the current verify epoch "
+            "from the implementation branch/head and verify command settings. "
+            "Re-run verify or fix branch provenance before creating a verify_fix task."
+        )
+    if not verify_epoch_matches(expected=current_epoch, candidate=evidence.epoch):
+        raise VerifyFixContextError(
+            f"verify_fix manual creation for {impl_task_id} requires failed verify evidence for the current "
+            "implementation branch/head/command/timeout identity, but the latest persisted failure is stale. "
+            f"Current: branch={current_epoch.reviewed_branch} head={current_epoch.reviewed_head_sha} "
+            f"command={current_epoch.verify_command!r}. "
+            f"Latest failed evidence: branch={evidence.epoch.reviewed_branch} "
+            f"head={evidence.epoch.reviewed_head_sha} command={evidence.epoch.verify_command!r}."
         )
     return evidence.epoch
 
@@ -435,6 +455,16 @@ def create_or_reuse_verify_fix_task(
         raise ValueError("Cannot create verify_fix for implementation without an ID.")
     if based_on_task.id is None:
         raise ValueError("Cannot create verify_fix without a based_on task ID.")
+    based_on_impl, based_on_error = resolve_impl_task(store, based_on_task.id)
+    if based_on_impl is None:
+        raise ValueError(
+            f"Cannot create verify_fix from based_on task {based_on_task.id}: {based_on_error}"
+        )
+    if based_on_impl.id != impl_task.id:
+        raise ValueError(
+            f"Cannot create verify_fix for implementation {impl_task.id} from based_on task {based_on_task.id} "
+            f"because it resolves to implementation {based_on_impl.id}."
+        )
 
     existing = find_existing_verify_fix_task(
         store,

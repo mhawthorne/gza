@@ -87,12 +87,14 @@ from ..recovery_engine import (
     resolve_recovery_planning_task,
 )
 from ..review_tasks import (
+    VerifyFixContextError,
     build_review_blocker_dispute_metadata,
     create_or_reuse_verify_fix_task,
     create_spec_coherence_review_task,
     resolve_latest_failed_verify_epoch,
 )
 from ..review_verdict import get_review_report
+from ..review_verify_state import owner_task_verify_epoch
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     RunInvocationContext,
@@ -2447,7 +2449,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             )
             return 1
         try:
-            verify_epoch = resolve_latest_failed_verify_epoch(store, impl_owner)
+            git = Git(config.project_dir)
+            verify_epoch = resolve_latest_failed_verify_epoch(store, config, impl_owner, git)
             task, created = create_or_reuse_verify_fix_task(
                 store,
                 config,
@@ -2458,6 +2461,20 @@ def cmd_add(args: argparse.Namespace) -> int:
                 model=model,
                 provider=provider,
             )
+        except VerifyFixContextError as exc:
+            current_epoch = owner_task_verify_epoch(impl_owner, config, git)
+            print(f"Error: {exc}")
+            if current_epoch is None:
+                print(
+                    "Action: verify_fix manual creation is blocked until the current implementation "
+                    "verify epoch can be resolved from branch/head provenance."
+                )
+            else:
+                print(
+                    "Action: rerun the failing verify gate on the current implementation head so the "
+                    "persisted failed evidence matches the live verify epoch, then retry."
+                )
+            return 1
         except ValueError as exc:
             print(f"Error: {exc}")
             return 1

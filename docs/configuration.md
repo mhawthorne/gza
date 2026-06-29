@@ -2198,7 +2198,7 @@ Gza supports several task types, each with distinct behavior:
 | `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
-| `verify_fix` | Address a failing verify epoch on the implementation branch; manual creation requires `--based-on <implementation-lineage-task>` plus `--same-branch`, derives the prompt from the latest failed verify evidence, and rejects custom prompt text / `--edit` / `--prompt-file` | Code changes on same branch |
+| `verify_fix` | Address a failing verify epoch on the implementation branch; manual creation requires `--based-on <implementation-lineage-task>` plus `--same-branch`, derives the prompt from the latest failed verify evidence, rejects custom prompt text / `--edit` / `--prompt-file`, and fails closed unless that failed evidence matches the current implementation branch/head/verify-command epoch | Code changes on same branch |
 | `fix` | Rescue stuck implementation lifecycle or repeated review regressions | Code changes on implementation branch |
 | `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
 
