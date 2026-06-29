@@ -1563,6 +1563,21 @@ def test_lineage_spec_and_operator_docs_define_stale_unmerged_sweep_contract() -
     assert "proof error aborts the command before mutation" in config_docs
 
 
+def test_verify_surface_docs_describe_neutral_owner_and_projection_fields() -> None:
+    """Operator docs should describe the neutral verify surface, not review-only wording."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+
+    assert "latest owner-attached `verify_gate_result` artifact" in config_docs
+    assert "implementation/lineage tasks as well as review tasks" in config_docs
+    assert "failed freshness probe still shows the latest stored evidence as stale" in config_docs
+    assert "verify_status" in config_docs
+    assert "verify_source" in config_docs
+    assert "verify_current" in config_docs
+    assert "verify_has_owner_artifact" in config_docs
+    assert "Review-verify audit fields" not in config_docs
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

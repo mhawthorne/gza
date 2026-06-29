@@ -976,7 +976,7 @@ class TaskQueryService:
                     ).id
 
         verify_read_model = None
-        if config is not None and git is not None:
+        if config is not None:
             verify_read_model = resolve_verify_read_model(
                 self._store,
                 owner,

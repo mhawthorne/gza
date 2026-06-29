@@ -5814,6 +5814,94 @@ class TestShowCommand:
         assert "owner artifact output" in output
         assert "Review Verify" not in output
 
+    def test_show_implement_keeps_latest_owner_verify_evidence_when_git_probe_fails(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/owner-verify-show-git-error"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        store.update(review)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="stored owner output survives git failure\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            head_sha="a" * 40,
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="failed",
+                exit_status="7",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure="git unavailable",
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        with patch("gza.cli.query.Git", side_effect=GitError("boom")):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Status:" in output
+        assert "failed" in output
+        assert "Verify Artifact:" in output
+        assert stored.path in output
+        assert "stored owner output survives git failure" in output
+        assert "Verify Failure:" in output
+        assert "git unavailable" in output
+
     def test_show_review_keeps_neutral_legacy_verify_fallback(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)

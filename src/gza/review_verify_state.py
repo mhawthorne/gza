@@ -145,6 +145,15 @@ def _result_epoch(
     )
 
 
+def _legacy_result_epoch(result: VerifyGateResult) -> VerifyEpoch:
+    """Build legacy review freshness identity without projecting current config metadata."""
+    return _result_epoch(
+        result,
+        verify_timeout_seconds=None,
+        verify_timeout_grace_seconds=None,
+    )
+
+
 def _coerce_optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -212,7 +221,7 @@ def latest_verify_result_for_epoch(
     store: SqliteTaskStore,
     owner_task: Task,
     *,
-    current_epoch: VerifyEpoch,
+    current_epoch: VerifyEpoch | None,
 ) -> VerifyGateLookup:
     """Return the latest verify result for ``current_epoch`` with legacy fallback."""
     if owner_task.id is None:
@@ -231,7 +240,7 @@ def latest_verify_result_for_epoch(
                 continue
             if latest_result is None:
                 latest_result = result
-            if verify_epoch_matches(expected=current_epoch, candidate=epoch):
+            if current_epoch is not None and verify_epoch_matches(expected=current_epoch, candidate=epoch):
                 return VerifyGateLookup(
                     result=result,
                     source="owner_artifact",
@@ -252,12 +261,8 @@ def latest_verify_result_for_epoch(
             continue
         if latest_legacy is None:
             latest_legacy = legacy
-        legacy_epoch = _result_epoch(
-            legacy,
-            verify_timeout_seconds=current_epoch.verify_timeout_seconds,
-            verify_timeout_grace_seconds=current_epoch.verify_timeout_grace_seconds,
-        )
-        if verify_epoch_matches(expected=current_epoch, candidate=legacy_epoch):
+        legacy_epoch = _legacy_result_epoch(legacy)
+        if current_epoch is not None and verify_epoch_matches(expected=current_epoch, candidate=legacy_epoch):
             return VerifyGateLookup(
                 result=legacy,
                 source="legacy_review",
@@ -341,8 +346,6 @@ def resolve_verify_read_model(
 ) -> VerifyReadModel | None:
     """Resolve the shared operator-facing verify read model for one task surface."""
     owner = owner_task or resolve_verify_owner_task(store, task)
-    if current_epoch is None:
-        return None
 
     lookup = latest_verify_result_for_epoch(store, owner, current_epoch=current_epoch)
     if lookup.result is None or lookup.source is None:

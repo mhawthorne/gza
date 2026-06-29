@@ -412,6 +412,190 @@ def test_task_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Pa
     assert row.values["verify_current"] is True
 
 
+def test_task_projection_keeps_latest_owner_verify_fields_when_git_probe_unavailable(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+
+    impl = store.add("Implement query verify stale fallback", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/query-verify-stale"
+    store.update(impl)
+
+    review = store.add("Review query verify stale fallback", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch="feature/query-verify-stale",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/verify-owner",
+            failure="git probe unavailable",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="tasks",
+            limit=None,
+            task_types=("implement",),
+            projection=ProjectionSpec(
+                fields=("id", "verify_status", "verify_source", "verify_current", "verify_failure"),
+            ),
+            presentation=PresentationSpec(mode="json"),
+        ),
+        config=config,
+        git=None,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert isinstance(row, TaskRow)
+    assert row.values["verify_status"] == "failed"
+    assert row.values["verify_source"] == "owner_artifact"
+    assert row.values["verify_current"] is False
+    assert row.values["verify_failure"] == "git probe unavailable"
+
+
+def test_task_projection_marks_legacy_verify_stale_without_persisted_timeout_identity(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+
+    impl = store.add("Implement legacy query verify", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/legacy-query-verify"
+    store.update(impl)
+
+    review = store.add("Review legacy query verify", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    review.review_verify_command = "./bin/tests"
+    review.review_verify_status = "passed"
+    review.review_verify_exit_status = "0"
+    review.review_verify_captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "head-1"
+    review.review_verify_base_sha = "base-1"
+    review.review_verify_cwd = "/tmp/legacy-verify-owner"
+    store.update(review)
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="tasks",
+            limit=None,
+            task_types=("implement",),
+            projection=ProjectionSpec(
+                fields=("id", "verify_status", "verify_source", "verify_current"),
+            ),
+            presentation=PresentationSpec(mode="json"),
+        ),
+        config=config,
+        git=SimpleNamespace(rev_parse_if_exists=lambda ref: "head-1" if ref == impl.branch else None),
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert isinstance(row, TaskRow)
+    assert row.values["verify_status"] == "passed"
+    assert row.values["verify_source"] == "legacy_review"
+    assert row.values["verify_current"] is False
+
+
+def test_incomplete_projection_keeps_latest_owner_verify_fields_when_git_probe_unavailable(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+
+    impl = store.add("Implement lineage verify stale fallback", task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.completed_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    impl.failure_reason = "TEST_FAILURE"
+    impl.branch = "feature/lineage-verify-stale"
+    store.update(impl)
+
+    review = store.add("Review lineage verify stale fallback", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch="feature/lineage-verify-stale",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/verify-owner",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    service = TaskQueryService(store)
+    query = replace(
+        TaskQueryPresets.incomplete(limit=None),
+        projection=ProjectionSpec(fields=("id", "verify_status", "verify_source", "verify_current")),
+        presentation=PresentationSpec(mode="json"),
+    )
+    result = service.run(
+        query,
+        config=config,
+        git=None,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.values["verify_status"] == "passed"
+    assert row.values["verify_source"] == "owner_artifact"
+    assert row.values["verify_current"] is False
+
+
 def test_incomplete_query_uses_one_read_session_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = _store(tmp_path)
     failed = store.add("failed impl", task_type="implement")

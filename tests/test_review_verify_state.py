@@ -129,11 +129,40 @@ def test_latest_verify_result_for_epoch_falls_back_to_legacy_review_when_owner_a
     captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
     _seed_legacy_review(store, impl_id=impl.id, captured_at=captured_at)
 
-    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch())
+    lookup = latest_verify_result_for_epoch(
+        store,
+        impl,
+        current_epoch=make_verify_epoch(
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+        ),
+    )
 
     assert lookup.source == "legacy_review"
     assert lookup.has_owner_artifact is False
     assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.captured_at == captured_at
+
+
+def test_latest_verify_result_for_epoch_marks_legacy_review_stale_without_persisted_timeout_identity(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement legacy timeout drift", task_type="implement")
+    assert impl.id is not None
+
+    captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    _seed_legacy_review(store, impl_id=impl.id, captured_at=captured_at)
+
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch())
+
+    assert lookup.source == "legacy_review"
+    assert lookup.has_owner_artifact is False
+    assert lookup.is_current is False
     assert lookup.result is not None
     assert lookup.result.captured_at == captured_at
 
@@ -216,3 +245,44 @@ def test_resolve_verify_read_model_prefers_owner_artifact_for_review_surface(tmp
     assert read_model.result.status == "passed"
     assert read_model.result.exit_status == "0"
     assert read_model.legacy_markdown is None
+
+
+def test_resolve_verify_read_model_returns_latest_owner_artifact_when_current_epoch_unavailable(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement missing git freshness probe", task_type="implement")
+    assert impl.id is not None
+
+    review = store.add("Review missing git freshness probe", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    read_model = resolve_verify_read_model(
+        store,
+        impl,
+        owner_task=impl,
+        current_epoch=None,
+    )
+
+    assert read_model is not None
+    assert read_model.source == "owner_artifact"
+    assert read_model.is_current is False
+    assert read_model.has_owner_artifact is True
+    assert read_model.result.status == "passed"

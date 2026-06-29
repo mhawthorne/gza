@@ -1078,10 +1078,14 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 - `Provider: <provider>` and `Model: <full-model-id>` from the stored execution record (`-` when unset)
 
-For completed `review` tasks, `gza show` also includes:
+When review data is present, `gza show` also includes:
 - `Verdict: <APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION|...>` when parseable from review output.
 - `Score: <N>/100` when a derived `review_score` is available.
-- Review-verify audit fields when autonomous review verification ran, including status, exit status, capture time, branch/head/base provenance, working directory, the persisted `## verify_command result` section, the latest `verify_command_output` artifact path, and an `Artifacts:` list covering every stored task artifact with missing-file visibility.
+
+When persisted verify evidence is available, `gza show` also includes neutral verify-state fields for the latest owner-attached `verify_gate_result` artifact when present, or a legacy review fallback when canonical owner data is absent. The rendered block may therefore appear on implementation/lineage tasks as well as review tasks, and a failed freshness probe still shows the latest stored evidence as stale rather than suppressing it entirely.
+- `Verify Status`, `Verify Exit`, `Verify At`, `Verify Branch`, `Verify Head`, `Verify Base`, `Verify Cwd`, `Verify Failure`, and the persisted `## verify_command result` section from the shared verify read model.
+- `Verify Artifact: <path>` showing the canonical `verify_command_output` artifact path when known, with invalid or missing-file markers preserved.
+- `Artifacts:` listing every stored task artifact with missing-file visibility.
 
 ### artifact
 
@@ -1331,6 +1335,8 @@ Positive and negative filters on the same field are applied in order: include ma
 
 Default human output also shows each task's stored execution model. Projection/JSON output supports `model` (and `provider`) fields, so `gza history --fields id,status,model` and `gza history --json` include them directly.
 
+History/search/incomplete projection output also supports the neutral verify fields: `verify_status`, `verify_exit_status`, `verify_captured_at`, `verify_branch`, `verify_head_sha`, `verify_base_sha`, `verify_working_directory`, `verify_failure`, `verify_artifact_path`, `verify_source`, `verify_current`, and `verify_has_owner_artifact`. `verify_source` is `owner_artifact` for canonical owner evidence and `legacy_review` for compatibility fallback; `verify_current` reports whether that evidence matches the current verify epoch, and `verify_has_owner_artifact` tells you whether canonical owner evidence exists even when the visible row is stale.
+
 ### incomplete
 
 Show unresolved task lineages that still need attention.
@@ -1359,6 +1365,8 @@ Use `gza incomplete` for unresolved lineage triage. Use the more specific comman
 Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review` (preferred; `--auto-implement` also works). Those held-plan rows now carry `reason=awaiting-human-review`. If an approved plan review has partial implement descendants but no durable materialization record, lifecycle now parks with `reason=plan-review-materialization-repair-needed` instead of silently treating the partial prefix as complete. Needs-attention rows now carry an explicit subject task, so `gza incomplete` roots attention rows at the plan/explore/implementation the operator should inspect instead of inferring that identity from lineage ownership alone. If older or malformed action data is missing that subject, the shared resolver falls back conservatively and emits a warning instead of silently re-inferring identity.
 
 `uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
+
+The explicit `verify_*` projection fields have the same meanings here as in `history`: they surface the latest canonical owner verify evidence when available, otherwise the latest legacy review fallback, with `verify_current=false` when freshness cannot be proven for the current epoch.
 
 Default text output stays to one wrapped line per lineage: the owner prompt is reduced to its first non-empty line and truncated, and `| unresolved: ...` appears only when multiple unresolved tasks remain for the same owner, summarized as task IDs plus failure/completion status.
 
@@ -1405,6 +1413,8 @@ gza search <term> [options]
 
 Text output ends with a summary footer such as `Showing results 1-9 out of 55`.
 Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
+
+Like `history`, `search` projection and JSON output expose the neutral `verify_*` fields. They report the latest shared verify read-model evidence for each row, plus freshness/provenance via `verify_source`, `verify_current`, and `verify_has_owner_artifact`.
 ### checkout
 
 Checkout a task's branch, removing any stale worktree if needed.
