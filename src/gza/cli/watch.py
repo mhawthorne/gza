@@ -89,6 +89,7 @@ from ..recovery_transients import (
     compute_transient_recovery_backoff_seconds,
 )
 from ..source_followup import collect_non_dropped_implement_source_ids
+from ..status_ops import apply_manual_task_status
 from ..sync_ops import reconcile_task_branch_merge_truth
 from ..task_query import (
     ScopedTagScopeGap,
@@ -632,6 +633,114 @@ def _maybe_file_main_verify_remediation(
         "REMEDY",
         f"{result.task.id}: {result.outcome} {remediation.kind} remediation for {phase}; moved to queue position 1",
     )
+
+
+def _resolve_merged_main_verify_remediation_task(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    display_task: DbTask,
+) -> DbTask | None:
+    candidate_ids: list[str] = []
+
+    def add_candidate(candidate: DbTask | None) -> None:
+        if candidate is None or candidate.id is None or candidate.id in candidate_ids:
+            return
+        candidate_ids.append(candidate.id)
+
+    add_candidate(task)
+    add_candidate(display_task)
+    for subject in (task, display_task):
+        if subject.id is None:
+            continue
+        unit = store.resolve_merge_unit_for_task(subject.id)
+        if unit is None:
+            continue
+        add_candidate(store.resolve_merge_unit_owner_task(unit))
+        for attached in store.list_tasks_for_merge_unit(unit.id):
+            add_candidate(attached)
+
+    for task_id in candidate_ids:
+        candidate = store.get(task_id)
+        if candidate is None:
+            continue
+        if candidate.trigger_source == MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
+            return candidate
+    return None
+
+
+def _handle_post_merge_main_verify_remediation_verdict(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    task: DbTask,
+    display_task: DbTask,
+    check: MainIntegrationVerifyCheck,
+) -> None:
+    remediation_task = _resolve_merged_main_verify_remediation_task(
+        store=store,
+        task=task,
+        display_task=display_task,
+    )
+    if remediation_task is None or remediation_task.id is None:
+        return
+
+    merged_identity = _main_verify_remediation_identity_from_prompt(remediation_task.prompt)
+    if merged_identity is None:
+        return
+
+    current_remediation = getattr(check, "remediation", None)
+    current_identity = (
+        _main_verify_remediation_identity(current_remediation) if current_remediation is not None else None
+    )
+    same_identity = current_identity is not None and _main_verify_remediation_identity_matches(
+        merged_identity,
+        current_identity,
+    )
+    head_sha = getattr(check.state, "head_sha", None)
+
+    if check.merges_halted and current_remediation is not None and same_identity:
+        apply_manual_task_status(
+            config=config,
+            store=store,
+            task=remediation_task,
+            status="dropped",
+            reason="main verify remained red after merged remediation; attempt consumed",
+        )
+        attempt_state = store.record_main_verify_remediation_consumed_attempt(
+            signature=merged_identity.signature,
+            tree_fingerprint=merged_identity.tree_fingerprint,
+            task_id=remediation_task.id,
+            last_observed_head_sha=head_sha,
+            last_observed_failure=current_remediation.failure,
+        )
+        consumed_count = attempt_state.consumed_attempt_count if attempt_state is not None else 0
+        attempt_budget = config.watch.main_verify_remediation_max_attempts
+        phase = current_remediation.failing_phase or current_remediation.signature
+        fingerprint_label = current_remediation.tree_fingerprint or "unavailable"
+        log.emit(
+            "REMEDY",
+            f"{remediation_task.id}: post-merge verify still red for {phase} on {fingerprint_label}; "
+            f"dropped remediation attempt {consumed_count}/{attempt_budget}",
+        )
+        return
+
+    clear_detail = None
+    if not check.merges_halted:
+        clear_detail = "post-merge verify green; cleared active remediation state"
+    elif current_remediation is not None:
+        clear_detail = "post-merge verify red for a different remediation identity; cleared active state"
+    else:
+        clear_detail = "post-merge verify red without remediation identity; cleared active state"
+
+    store.clear_main_verify_remediation_active_task(
+        signature=merged_identity.signature,
+        tree_fingerprint=merged_identity.tree_fingerprint,
+        last_observed_head_sha=head_sha,
+        last_observed_failure=current_remediation.failure if current_remediation is not None else None,
+    )
+    log.emit("REMEDY", f"{remediation_task.id}: {clear_detail}")
 
 
 def _maybe_repair_target_already_merged_skip(
@@ -4504,6 +4613,14 @@ def _run_cycle(
                             reason="watch-post-merge",
                             red_reruns=2,
                         ),
+                    )
+                    _handle_post_merge_main_verify_remediation_verdict(
+                        config=config,
+                        store=store,
+                        log=log,
+                        task=task,
+                        display_task=display_task,
+                        check=main_verify,
                     )
                     _maybe_file_main_verify_remediation(
                         dry_run=dry_run,
