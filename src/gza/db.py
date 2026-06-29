@@ -38,6 +38,8 @@ def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(cmd)
 
 __all__ = [
+    "BehaviorCheckFinding",
+    "BehaviorCheckRun",
     "DB_UNSET",
     "DuplicateActiveChildError",
     "KNOWN_FAILURE_REASONS",
@@ -70,6 +72,7 @@ __all__ = [
     "resolve_task_id",
     "task_id_numeric_key",
     "task_owns_merge_status",
+    "behavior_check_finding_fingerprint",
 ]
 
 StoreOpenMode = Literal["readwrite", "query_only"]
@@ -314,6 +317,46 @@ def _normalize_tags(tags: Iterable[str] | None) -> tuple[str, ...]:
     return tuple(sorted(normalized))
 
 
+def _normalize_behavior_finding_text(value: str, *, lowercase: bool = False) -> str:
+    """Normalize behavior-finding identity text for fingerprint stability."""
+    normalized = " ".join(value.split()).strip()
+    return normalized.casefold() if lowercase else normalized
+
+
+def _normalize_behavior_finding_summary(summary: str) -> str:
+    """Normalize summary text while scrubbing churn-prone code line references."""
+    without_line_numbers = re.sub(r"([A-Za-z0-9_./-]+):\d+\b", r"\1", summary)
+    return _normalize_behavior_finding_text(without_line_numbers)
+
+
+def behavior_check_finding_fingerprint(
+    *,
+    check_name: str,
+    assertion_id: str,
+    recommendation: str,
+    summary: str,
+    spec_file: str,
+    spec_section: str,
+) -> str:
+    """Compute the stable fingerprint for one behavior-check finding."""
+    normalized_summary = _normalize_behavior_finding_summary(summary)
+    normalized_spec_file = _normalize_behavior_finding_text(spec_file.replace("\\", "/"), lowercase=True)
+    normalized_spec_section = _normalize_behavior_finding_text(spec_section, lowercase=True)
+    payload = json.dumps(
+        [
+            check_name,
+            assertion_id,
+            recommendation,
+            normalized_summary,
+            normalized_spec_file,
+            normalized_spec_section,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
 def task_owns_merge_status(task: "Task") -> bool:
     """Return whether this task row owns persisted merge state.
 
@@ -331,6 +374,8 @@ MERGE_UNIT_INACTIVE_TOMBSTONE_STATES: frozenset[str] = frozenset({"dropped", "su
 MERGE_UNIT_ACTIVE_STATES: frozenset[str] = (
     MERGE_UNIT_ACTIONABLE_STATES | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
 )
+BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_STATUSES: frozenset[str] = frozenset({"dropped"})
+BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_MERGE_STATUSES: frozenset[str] = frozenset({"merged"})
 
 
 def merge_unit_state_is_inactive_tombstone(state: str | None) -> bool:
@@ -831,6 +876,33 @@ class ParkedTaskRearmState:
     last_auto_attempt_target_sha: str | None = None
 
 
+@dataclass(frozen=True)
+class BehaviorCheckRun:
+    """Canonical metadata for one behavior-check pass."""
+
+    check_name: str
+    successful: bool
+    completed_at: datetime
+    report_path: str | None = None
+
+
+@dataclass(frozen=True)
+class BehaviorCheckFinding:
+    """Persisted dedupe state for one behavior-check finding fingerprint."""
+
+    check_name: str
+    fingerprint: str
+    assertion_id: str
+    recommendation: str
+    summary: str
+    first_seen: datetime
+    last_seen: datetime
+    last_report_path: str | None = None
+    linked_task_id: str | None = None
+    state: str = "open"
+    generation: int = 1
+
+
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
@@ -858,6 +930,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
     "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
+    "behavior_check_findings": ("first_seen", "last_seen"),
     "parked_task_rearms": ("manual_rearmed_at", "last_auto_attempt_at"),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
@@ -1245,8 +1318,29 @@ MIGRATION_V59_TO_V60 = """
 ALTER TABLE tasks ADD COLUMN drop_reason TEXT;
 """
 
+# Migration from v60 to v61: behavior-check finding dedupe persistence
+MIGRATION_V60_TO_V61 = """
+CREATE TABLE IF NOT EXISTS behavior_check_findings (
+    project_id TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    assertion_id TEXT NOT NULL,
+    recommendation TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    last_report_path TEXT,
+    linked_task_id TEXT,
+    state TEXT NOT NULL DEFAULT 'open',
+    generation INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(project_id, check_name, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_behavior_check_findings_project_state
+    ON behavior_check_findings(project_id, check_name, state, last_seen);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 60
+SCHEMA_VERSION = 61
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -2038,7 +2132,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2371,6 +2465,16 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         if not _table_has_column(conn, "tasks", "drop_reason"):
             raise RuntimeError(
                 "Auto-migration to v60 incomplete: missing required column tasks.drop_reason"
+            )
+    if target_version >= 61:
+        if not _table_exists(conn, "behavior_check_findings"):
+            raise RuntimeError(
+                "Auto-migration to v61 incomplete: missing required table behavior_check_findings"
+            )
+        if not _index_exists(conn, "idx_behavior_check_findings_project_state"):
+            raise RuntimeError(
+                "Auto-migration to v61 incomplete: missing required index "
+                "idx_behavior_check_findings_project_state"
             )
 
 
@@ -2810,6 +2914,57 @@ def _ensure_required_auto_migration_artifacts(
                     "Schema integrity check failed while repairing required column "
                     f"parked_task_rearms.{column_name}: use a writable database."
                 ) from exc
+    if target_version >= 61:
+        if not _table_exists(conn, "behavior_check_findings"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS behavior_check_findings (
+                        project_id TEXT NOT NULL,
+                        check_name TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        assertion_id TEXT NOT NULL,
+                        recommendation TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        first_seen TEXT NOT NULL,
+                        last_seen TEXT NOT NULL,
+                        last_report_path TEXT,
+                        linked_task_id TEXT,
+                        state TEXT NOT NULL DEFAULT 'open',
+                        generation INTEGER NOT NULL DEFAULT 1,
+                        PRIMARY KEY(project_id, check_name, fingerprint)
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table behavior_check_findings; "
+                        "use a writable database to complete migration to v61, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "behavior_check_findings: use a writable database."
+                ) from exc
+        if not _index_exists(conn, "idx_behavior_check_findings_project_state"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_behavior_check_findings_project_state
+                        ON behavior_check_findings(project_id, check_name, state, last_seen)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required index "
+                        "idx_behavior_check_findings_project_state; use a writable database "
+                        "to complete migration to v61, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_behavior_check_findings_project_state: use a writable database."
+                ) from exc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -3061,6 +3216,24 @@ CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task
     ON merge_unit_tasks(project_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_unit_role
     ON merge_unit_tasks(project_id, merge_unit_id, role);
+
+CREATE TABLE IF NOT EXISTS behavior_check_findings (
+    project_id TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    assertion_id TEXT NOT NULL,
+    recommendation TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    last_report_path TEXT,
+    linked_task_id TEXT,
+    state TEXT NOT NULL DEFAULT 'open',
+    generation INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(project_id, check_name, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_behavior_check_findings_project_state
+    ON behavior_check_findings(project_id, check_name, state, last_seen);
 """
 
 # Migration from v1 to v2
@@ -3368,6 +3541,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (58, MIGRATION_V57_TO_V58),
     (59, MIGRATION_V58_TO_V59),
     (60, MIGRATION_V59_TO_V60),
+    (61, MIGRATION_V60_TO_V61),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3624,6 +3798,13 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "task_artifacts")
 
+    def supports_behavior_check_findings(self) -> bool:
+        """Return whether behavior-check finding storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("behavior_check_findings", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "behavior_check_findings")
+
     def default_merge_target(self, *, strict: bool = False) -> str:
         """Resolve the default merge target branch for stored merge units.
 
@@ -3808,6 +3989,7 @@ class SqliteTaskStore:
             "watch_progress_observations",
             "watch_recovery_backoffs",
             "parked_task_rearms",
+            "behavior_check_findings",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -4182,6 +4364,12 @@ class SqliteTaskStore:
             return _SessionSqliteConnectionProxy(self._read_session_conn)
         return self._open_connection(close_on_exit=True)
 
+    def _require_write_connection(self) -> sqlite3.Connection:
+        """Return a writable connection, refusing read-session proxy reuse."""
+        if self._read_session_conn is not None:
+            raise RuntimeError("write methods must not run inside an active read_session")
+        return cast(sqlite3.Connection, self._connect())
+
     def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
         """Convert a database row to a Task."""
         keys = row.keys()
@@ -4386,6 +4574,28 @@ class SqliteTaskStore:
             kind=row["kind"] if "kind" in keys else TASK_COMMENT_KIND_FEEDBACK,
             created_at=created_at,
             resolved_at=_parse_db_timestamp(row["resolved_at"]),
+        )
+
+    def _row_to_behavior_check_finding(self, row: sqlite3.Row | None) -> BehaviorCheckFinding | None:
+        """Convert a database row to a BehaviorCheckFinding."""
+        if row is None:
+            return None
+        first_seen = _parse_db_timestamp(row["first_seen"])
+        last_seen = _parse_db_timestamp(row["last_seen"])
+        assert first_seen is not None
+        assert last_seen is not None
+        return BehaviorCheckFinding(
+            check_name=str(row["check_name"]),
+            fingerprint=str(row["fingerprint"]),
+            assertion_id=str(row["assertion_id"]),
+            recommendation=str(row["recommendation"]),
+            summary=str(row["summary"]),
+            first_seen=first_seen,
+            last_seen=last_seen,
+            last_report_path=str(row["last_report_path"]) if row["last_report_path"] is not None else None,
+            linked_task_id=str(row["linked_task_id"]) if row["linked_task_id"] is not None else None,
+            state=str(row["state"]),
+            generation=int(row["generation"]),
         )
 
     # === Task CRUD ===
@@ -5890,6 +6100,365 @@ class SqliteTaskStore:
                     (self._project_id, task_id, artifact_id),
                 ).fetchone()
         return self._row_to_task_artifact(row)
+
+    def record_behavior_check_run(
+        self,
+        *,
+        check_name: str,
+        successful: bool,
+        completed_at: datetime | None = None,
+        report_path: str | None = None,
+    ) -> BehaviorCheckRun:
+        """Return canonical run metadata for one behavior-check pass.
+
+        Stage 2 keeps the durable state on finding rows. The pass helper still
+        normalizes timestamps and keeps callers on a single write-path API.
+        """
+        return BehaviorCheckRun(
+            check_name=check_name,
+            successful=successful,
+            completed_at=completed_at or datetime.now(UTC),
+            report_path=report_path,
+        )
+
+    def get_open_behavior_finding(
+        self,
+        *,
+        check_name: str,
+        assertion_id: str,
+        recommendation: str,
+        summary: str,
+        spec_file: str,
+        spec_section: str,
+    ) -> BehaviorCheckFinding | None:
+        """Fetch an unresolved finding for the canonical fingerprint."""
+        if not self.supports_behavior_check_findings():
+            return None
+        fingerprint = behavior_check_finding_fingerprint(
+            check_name=check_name,
+            assertion_id=assertion_id,
+            recommendation=recommendation,
+            summary=summary,
+            spec_file=spec_file,
+            spec_section=spec_section,
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                  AND state != 'resolved'
+                """,
+                (self._project_id, check_name, fingerprint),
+            ).fetchone()
+        return self._row_to_behavior_check_finding(row)
+
+    def get_dedupable_behavior_finding(
+        self,
+        *,
+        check_name: str,
+        assertion_id: str,
+        recommendation: str,
+        summary: str,
+        spec_file: str,
+        spec_section: str,
+    ) -> BehaviorCheckFinding | None:
+        """Fetch an unresolved finding only when its linked task is still actionable.
+
+        Callers that want to dedupe before filing a follow-up task should use this
+        helper. Findings linked to merged or dropped tasks are treated as recurrence
+        candidates and therefore do not dedupe the new filing pass.
+        """
+        if not self.supports_behavior_check_findings():
+            return None
+        fingerprint = behavior_check_finding_fingerprint(
+            check_name=check_name,
+            assertion_id=assertion_id,
+            recommendation=recommendation,
+            summary=summary,
+            spec_file=spec_file,
+            spec_section=spec_section,
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                  AND state != 'resolved'
+                """,
+                (self._project_id, check_name, fingerprint),
+            ).fetchone()
+            if row is None:
+                return None
+            if self._behavior_finding_row_needs_recurrence(conn, row):
+                return None
+        return self._row_to_behavior_check_finding(row)
+
+    def _behavior_finding_linked_task_is_terminal(
+        self,
+        conn: sqlite3.Connection,
+        linked_task_id: str | None,
+    ) -> bool:
+        """Return whether the finding's linked task already landed or was dropped."""
+        if linked_task_id is None:
+            return False
+        row = conn.execute(
+            """
+            SELECT status, merge_status
+            FROM tasks
+            WHERE project_id = ?
+              AND id = ?
+            """,
+            (self._project_id, linked_task_id),
+        ).fetchone()
+        if row is None:
+            return False
+        status = str(row["status"])
+        merge_status = str(row["merge_status"]) if row["merge_status"] is not None else None
+        return (
+            status in BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_STATUSES
+            or merge_status in BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_MERGE_STATUSES
+        )
+
+    def _behavior_finding_row_needs_recurrence(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> bool:
+        """Return whether the next observation should start a new finding generation."""
+        return str(row["state"]) == "resolved" or self._behavior_finding_linked_task_is_terminal(
+            conn,
+            str(row["linked_task_id"]) if row["linked_task_id"] is not None else None,
+        )
+
+    def upsert_behavior_finding(
+        self,
+        *,
+        check_name: str,
+        assertion_id: str,
+        recommendation: str,
+        summary: str,
+        spec_file: str,
+        spec_section: str,
+        seen_at: datetime | None = None,
+        report_path: str | None = None,
+        linked_task_id: str | None = None,
+    ) -> BehaviorCheckFinding:
+        """Insert or refresh one behavior-check finding row."""
+        if not self.supports_behavior_check_findings():
+            raise RuntimeError("behavior-check findings are not available on this database")
+        fingerprint = behavior_check_finding_fingerprint(
+            check_name=check_name,
+            assertion_id=assertion_id,
+            recommendation=recommendation,
+            summary=summary,
+            spec_file=spec_file,
+            spec_section=spec_section,
+        )
+        normalized_summary = _normalize_behavior_finding_summary(summary)
+        seen_at_text = _format_db_timestamp(seen_at or datetime.now(UTC))
+        assert seen_at_text is not None
+        conn = self._require_write_connection()
+        try:
+            conn.execute("BEGIN")
+            existing_row = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                """,
+                (self._project_id, check_name, fingerprint),
+            ).fetchone()
+            if existing_row is None:
+                conn.execute(
+                    """
+                    INSERT INTO behavior_check_findings(
+                        project_id,
+                        check_name,
+                        fingerprint,
+                        assertion_id,
+                        recommendation,
+                        summary,
+                        first_seen,
+                        last_seen,
+                        last_report_path,
+                        linked_task_id,
+                        state,
+                        generation
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', 1)
+                    """,
+                    (
+                        self._project_id,
+                        check_name,
+                        fingerprint,
+                        assertion_id,
+                        recommendation,
+                        normalized_summary,
+                        seen_at_text,
+                        seen_at_text,
+                        report_path,
+                        linked_task_id,
+                    ),
+                )
+            else:
+                if self._behavior_finding_row_needs_recurrence(conn, existing_row):
+                    next_generation = int(existing_row["generation"]) + 1
+                    conn.execute(
+                        """
+                        UPDATE behavior_check_findings
+                        SET assertion_id = ?,
+                            recommendation = ?,
+                            summary = ?,
+                            first_seen = ?,
+                            last_seen = ?,
+                            last_report_path = ?,
+                            linked_task_id = ?,
+                            state = 'open',
+                            generation = ?
+                        WHERE project_id = ?
+                          AND check_name = ?
+                          AND fingerprint = ?
+                        """,
+                        (
+                            assertion_id,
+                            recommendation,
+                            normalized_summary,
+                            seen_at_text,
+                            seen_at_text,
+                            report_path,
+                            linked_task_id,
+                            next_generation,
+                            self._project_id,
+                            check_name,
+                            fingerprint,
+                        ),
+                    )
+                else:
+                    current_linked_task_id = (
+                        linked_task_id if linked_task_id is not None else existing_row["linked_task_id"]
+                    )
+                    conn.execute(
+                        """
+                        UPDATE behavior_check_findings
+                        SET assertion_id = ?,
+                            recommendation = ?,
+                            summary = ?,
+                            last_seen = ?,
+                            last_report_path = ?,
+                            linked_task_id = ?,
+                            state = 'open'
+                        WHERE project_id = ?
+                          AND check_name = ?
+                          AND fingerprint = ?
+                        """,
+                        (
+                            assertion_id,
+                            recommendation,
+                            normalized_summary,
+                            seen_at_text,
+                            report_path,
+                            current_linked_task_id,
+                            self._project_id,
+                            check_name,
+                            fingerprint,
+                        ),
+                    )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                """,
+                (self._project_id, check_name, fingerprint),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        finding = self._row_to_behavior_check_finding(row)
+        assert finding is not None
+        return finding
+
+    def resolve_absent_behavior_findings(
+        self,
+        *,
+        run: BehaviorCheckRun,
+        seen_fingerprints: Iterable[str],
+    ) -> list[BehaviorCheckFinding]:
+        """Advance absent findings toward resolution after a successful run.
+
+        Rows move `open -> absent -> resolved` on consecutive successful cycles
+        where the fingerprint is not observed. Failed or unparseable runs must
+        skip this helper.
+        """
+        if not self.supports_behavior_check_findings() or not run.successful:
+            return []
+        seen = {fingerprint for fingerprint in seen_fingerprints}
+        conn = self._require_write_connection()
+        try:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND state != 'resolved'
+                """,
+                (self._project_id, run.check_name),
+            ).fetchall()
+            resolved_rows: list[sqlite3.Row] = []
+            for row in rows:
+                fingerprint = str(row["fingerprint"])
+                if fingerprint in seen:
+                    continue
+                next_state = "absent" if str(row["state"]) == "open" else "resolved"
+                conn.execute(
+                    """
+                    UPDATE behavior_check_findings
+                    SET state = ?
+                    WHERE project_id = ?
+                      AND check_name = ?
+                      AND fingerprint = ?
+                    """,
+                    (next_state, self._project_id, run.check_name, fingerprint),
+                )
+                updated = conn.execute(
+                    """
+                    SELECT *
+                    FROM behavior_check_findings
+                    WHERE project_id = ?
+                      AND check_name = ?
+                      AND fingerprint = ?
+                    """,
+                    (self._project_id, run.check_name, fingerprint),
+                ).fetchone()
+                if updated is not None:
+                    resolved_rows.append(updated)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return [
+            finding
+            for row in resolved_rows
+            if (finding := self._row_to_behavior_check_finding(row)) is not None
+        ]
 
     def list_watch_progress_observations(
         self,

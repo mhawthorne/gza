@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from gza.db import (
+    BehaviorCheckRun,
     DB_UNSET,
     SCHEMA_VERSION,
     DuplicateActiveChildError,
@@ -30,6 +31,7 @@ from gza.db import (
     _ClosingSqliteConnection,
     _is_readonly_operational_error,
     _is_readonly_snapshot_operational_error,
+    behavior_check_finding_fingerprint,
     check_migration_status,
     import_legacy_local_db,
     merge_unit_legacy_state,
@@ -85,6 +87,69 @@ def test_is_readonly_snapshot_operational_error_accepts_snapshot_variants() -> N
     )
     assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("disk I/O error"))
     assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("database is locked"))
+
+
+def test_behavior_check_fingerprint_ignores_line_number_churn() -> None:
+    original = behavior_check_finding_fingerprint(
+        check_name="gza-behavior-check",
+        assertion_id="LE-SEC6-IMPROVE-CHAIN",
+        recommendation="code bug",
+        summary="Improve chain queries must follow review link (src/gza/runner.py:123)",
+        spec_file="specs/behavior/lifecycle-engine.md",
+        spec_section="Section 6",
+    )
+    moved_line = behavior_check_finding_fingerprint(
+        check_name="gza-behavior-check",
+        assertion_id="LE-SEC6-IMPROVE-CHAIN",
+        recommendation="code bug",
+        summary="Improve chain queries must follow review link (src/gza/runner.py:999)",
+        spec_file="specs/behavior/lifecycle-engine.md",
+        spec_section="Section 6",
+    )
+
+    assert original == moved_line
+
+
+def test_behavior_check_fingerprint_changes_when_assertion_id_changes() -> None:
+    original = behavior_check_finding_fingerprint(
+        check_name="gza-behavior-check",
+        assertion_id="LE-SEC6-IMPROVE-CHAIN",
+        recommendation="code bug",
+        summary="Improve chain queries must follow review link",
+        spec_file="specs/behavior/lifecycle-engine.md",
+        spec_section="Section 6",
+    )
+    changed_assertion = behavior_check_finding_fingerprint(
+        check_name="gza-behavior-check",
+        assertion_id="LE-SEC7-IMPROVE-CHAIN",
+        recommendation="code bug",
+        summary="Improve chain queries must follow review link",
+        spec_file="specs/behavior/lifecycle-engine.md",
+        spec_section="Section 6",
+    )
+
+    assert original != changed_assertion
+
+
+def test_behavior_check_fingerprint_separates_distinct_field_tuples() -> None:
+    first = behavior_check_finding_fingerprint(
+        check_name="ab",
+        assertion_id="c",
+        recommendation="d",
+        summary="e",
+        spec_file="f",
+        spec_section="g",
+    )
+    second = behavior_check_finding_fingerprint(
+        check_name="a",
+        assertion_id="bc",
+        recommendation="d",
+        summary="e",
+        spec_file="f",
+        spec_section="g",
+    )
+
+    assert first != second
 
 
 def test_set_task_changed_diff_persists_and_rebase_wrapper_still_works(tmp_path: Path) -> None:
@@ -10318,6 +10383,35 @@ class TestSharedDbIsolationAndImportGating:
         assert "last_auto_attempt_at" in columns
         assert "last_auto_attempt_target_sha" in columns
 
+    def test_auto_migration_v60_to_v61_adds_behavior_check_findings_table(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_behavior_check_findings_project_state")
+            conn.execute("DROP TABLE IF EXISTS behavior_check_findings")
+            conn.execute("UPDATE schema_version SET version = 60")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            indexes = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+            }
+
+        assert version == SCHEMA_VERSION
+        assert "behavior_check_findings" in tables
+        assert "idx_behavior_check_findings_project_state" in indexes
+
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
 
@@ -10459,6 +10553,260 @@ class TestSharedDbIsolationAndImportGating:
         assert second.last_auto_attempt_at is not None
         assert second.last_auto_attempt_at >= first.last_auto_attempt_at
         assert second.last_auto_attempt_target_sha == "def456"
+
+    def test_behavior_check_finding_helpers_keep_active_linked_tasks_dedupable(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        linked_task = store.add("Behavior regression", task_type="implement")
+        assert linked_task.id is not None
+
+        first_seen = datetime(2026, 6, 29, 8, 0, tzinfo=UTC)
+        finding = store.upsert_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary="Improve chain queries must follow review link (src/gza/runner.py:123)",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+            seen_at=first_seen,
+            report_path="reviews/20260629080000-behavior-check.md",
+            linked_task_id=linked_task.id,
+        )
+
+        assert finding.first_seen == first_seen
+        assert finding.last_seen == first_seen
+        assert finding.state == "open"
+        assert finding.linked_task_id == linked_task.id
+        assert finding.generation == 1
+
+        reloaded = store.get_dedupable_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary="Improve chain queries must follow review link (src/gza/runner.py:999)",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+        )
+        assert reloaded is not None
+        assert reloaded.fingerprint == finding.fingerprint
+
+        second_seen = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+        refreshed = store.upsert_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary=" Improve chain queries must follow review link   (src/gza/runner.py:999) ",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+            seen_at=second_seen,
+            report_path="reviews/20260629120000-behavior-check.md",
+        )
+
+        assert refreshed.first_seen == first_seen
+        assert refreshed.last_seen == second_seen
+        assert refreshed.last_report_path == "reviews/20260629120000-behavior-check.md"
+        assert refreshed.linked_task_id == linked_task.id
+        assert refreshed.state == "open"
+        assert refreshed.generation == 1
+
+        first_absent = store.resolve_absent_behavior_findings(
+            run=BehaviorCheckRun(
+                check_name="gza-behavior-check",
+                successful=True,
+                completed_at=datetime(2026, 6, 29, 16, 0, tzinfo=UTC),
+                report_path="reviews/20260629160000-behavior-check.md",
+            ),
+            seen_fingerprints=(),
+        )
+        assert len(first_absent) == 1
+        assert first_absent[0].state == "absent"
+
+        second_absent = store.resolve_absent_behavior_findings(
+            run=BehaviorCheckRun(
+                check_name="gza-behavior-check",
+                successful=True,
+                completed_at=datetime(2026, 6, 29, 20, 0, tzinfo=UTC),
+                report_path="reviews/20260629200000-behavior-check.md",
+            ),
+            seen_fingerprints=(),
+        )
+        assert len(second_absent) == 1
+        assert second_absent[0].state == "resolved"
+        assert (
+            store.get_open_behavior_finding(
+                check_name="gza-behavior-check",
+                assertion_id="LE-SEC6-IMPROVE-CHAIN",
+                recommendation="code bug",
+                summary="Improve chain queries must follow review link (src/gza/runner.py:321)",
+                spec_file="specs/behavior/lifecycle-engine.md",
+                spec_section="Section 6",
+            )
+            is None
+        )
+
+        reopened = store.upsert_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary="Improve chain queries must follow review link (src/gza/runner.py:321)",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+            seen_at=datetime(2026, 6, 30, 8, 0, tzinfo=UTC),
+            report_path="reviews/20260630080000-behavior-check.md",
+        )
+        assert reopened.state == "open"
+        assert reopened.first_seen == datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+        assert reopened.last_seen == datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+        assert reopened.generation == 2
+        assert reopened.linked_task_id is None
+
+    @pytest.mark.parametrize("terminal_kind", ["merged", "dropped"])
+    def test_behavior_check_finding_terminal_linked_task_recurrence_starts_new_generation(
+        self, tmp_path: Path, terminal_kind: str
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        original_task = store.add("Original behavior regression", task_type="implement")
+        replacement_task = store.add("Replacement behavior regression", task_type="implement")
+        assert original_task.id is not None
+        assert replacement_task.id is not None
+
+        first_seen = datetime(2026, 6, 29, 8, 0, tzinfo=UTC)
+        initial = store.upsert_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary="Improve chain queries must follow review link",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+            seen_at=first_seen,
+            report_path="reviews/20260629080000-behavior-check.md",
+            linked_task_id=original_task.id,
+        )
+
+        assert initial.generation == 1
+        assert (
+            store.get_dedupable_behavior_finding(
+                check_name="gza-behavior-check",
+                assertion_id="LE-SEC6-IMPROVE-CHAIN",
+                recommendation="code bug",
+                summary="Improve chain queries must follow review link",
+                spec_file="specs/behavior/lifecycle-engine.md",
+                spec_section="Section 6",
+            )
+            is not None
+        )
+
+        if terminal_kind == "merged":
+            original_task.status = "completed"
+            original_task.completed_at = datetime(2026, 6, 29, 9, 0, tzinfo=UTC)
+            original_task.merge_status = "merged"
+            original_task.merged_at = datetime(2026, 6, 29, 9, 5, tzinfo=UTC)
+            store.update(original_task)
+        else:
+            original_task.status = "dropped"
+            original_task.completed_at = datetime(2026, 6, 29, 9, 0, tzinfo=UTC)
+            original_task.drop_reason = "operator dropped stale recurrence"
+            store.update(original_task)
+
+        assert (
+            store.get_dedupable_behavior_finding(
+                check_name="gza-behavior-check",
+                assertion_id="LE-SEC6-IMPROVE-CHAIN",
+                recommendation="code bug",
+                summary="Improve chain queries must follow review link",
+                spec_file="specs/behavior/lifecycle-engine.md",
+                spec_section="Section 6",
+            )
+            is None
+        )
+        still_open = store.get_open_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary="Improve chain queries must follow review link",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+        )
+        assert still_open is not None
+        assert still_open.linked_task_id == original_task.id
+        assert still_open.generation == 1
+
+        recurring_seen = datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+        recurring = store.upsert_behavior_finding(
+            check_name="gza-behavior-check",
+            assertion_id="LE-SEC6-IMPROVE-CHAIN",
+            recommendation="code bug",
+            summary="Improve chain queries must follow review link",
+            spec_file="specs/behavior/lifecycle-engine.md",
+            spec_section="Section 6",
+            seen_at=recurring_seen,
+            report_path="reviews/20260630080000-behavior-check.md",
+            linked_task_id=replacement_task.id,
+        )
+
+        assert recurring.generation == 2
+        assert recurring.first_seen == recurring_seen
+        assert recurring.last_seen == recurring_seen
+        assert recurring.state == "open"
+        assert recurring.linked_task_id == replacement_task.id
+
+    def test_behavior_check_finding_upsert_keeps_distinct_naive_concat_collisions_separate(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.upsert_behavior_finding(
+            check_name="ab",
+            assertion_id="c",
+            recommendation="d",
+            summary="e",
+            spec_file="f",
+            spec_section="g",
+            seen_at=datetime(2026, 6, 29, 8, 0, tzinfo=UTC),
+            report_path="reviews/20260629080000-behavior-check.md",
+        )
+        second = store.upsert_behavior_finding(
+            check_name="a",
+            assertion_id="bc",
+            recommendation="d",
+            summary="e",
+            spec_file="f",
+            spec_section="g",
+            seen_at=datetime(2026, 6, 29, 9, 0, tzinfo=UTC),
+            report_path="reviews/20260629090000-behavior-check.md",
+        )
+
+        assert first.fingerprint != second.fingerprint
+        assert first.check_name == "ab"
+        assert second.check_name == "a"
+        assert first.assertion_id == "c"
+        assert second.assertion_id == "bc"
+        assert (
+            store.get_open_behavior_finding(
+                check_name="ab",
+                assertion_id="c",
+                recommendation="d",
+                summary="e",
+                spec_file="f",
+                spec_section="g",
+            )
+            is not None
+        )
+        assert (
+            store.get_open_behavior_finding(
+                check_name="a",
+                assertion_id="bc",
+                recommendation="d",
+                summary="e",
+                spec_file="f",
+                spec_section="g",
+            )
+            is not None
+        )
 
     def test_query_only_open_pre_v56_missing_watch_recovery_backoffs_degrades_safely(
         self, tmp_path: Path
