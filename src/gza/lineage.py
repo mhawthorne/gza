@@ -172,7 +172,7 @@ def resolve_impl_task(
     store: SqliteTaskStore,
     task_id: str,
 ) -> tuple[Task, None] | tuple[None, str]:
-    """Resolve implement/review/improve/fix IDs to the owning implementation task."""
+    """Resolve implement/review/improve/verify_fix/fix IDs to the owning implementation task."""
     task = store.get(task_id)
     if not task:
         return None, f"Task {task_id} not found"
@@ -180,15 +180,19 @@ def resolve_impl_task(
     if task.task_type == "implement":
         return task, None
 
-    if task.task_type in {"improve", "fix"}:
-        label = "Improve" if task.task_type == "improve" else "Fix"
+    if task.task_type in {"improve", "verify_fix", "fix"}:
+        label = {
+            "improve": "Improve",
+            "verify_fix": "Verify-fix",
+            "fix": "Fix",
+        }[task.task_type]
         if not task.based_on:
             return None, f"{label} task {task.id} has no based_on implementation task"
         parent = store.get(task.based_on)
         if parent is None:
             return None, f"{label} task {task.id} points to task {task.based_on}, which was not found"
         seen: set[str] = set()
-        while parent.task_type in {"improve", "fix"}:
+        while parent.task_type in {"improve", "verify_fix", "fix"}:
             if parent.id is None:
                 return None, f"{label} task {task.id} points to an invalid retry ancestor"
             if parent.id in seen:

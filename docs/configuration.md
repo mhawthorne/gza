@@ -438,7 +438,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`
+Valid task types: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal`
 
 The generic task-type routing keys apply to plan-review work the same way they apply to existing task types:
 `task_providers.plan_review`, `task_types.plan_review`, and `providers.<provider>.task_types.plan_review` route and shape `plan_review`; `plan_improve` uses the corresponding `plan_improve` keys.
@@ -1315,7 +1315,7 @@ gza history [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal` |
 | `--type-not TYPE` | Exclude the given task type |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
@@ -1348,7 +1348,7 @@ gza incomplete [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N unresolved rows (default: 5; use `0` for all) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal` |
 | `--days N` | Show only unresolved rows from the last N days |
 | `--date-field FIELD` | Date field for `--days`: `created`, `completed`, or `effective` (default: `effective`) |
 | `--tag TAG` | Only show unresolved lineage owners matching tag filters (repeatable) |
@@ -2198,6 +2198,7 @@ Gza supports several task types, each with distinct behavior:
 | `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
+| `verify_fix` | Address a failing verify epoch on the implementation branch | Code changes on same branch |
 | `fix` | Rescue stuck implementation lifecycle or repeated review regressions | Code changes on implementation branch |
 | `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
 

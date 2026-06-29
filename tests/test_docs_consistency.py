@@ -98,7 +98,7 @@ def test_docs_task_type_use_internal_not_learn() -> None:
     learnings_content = (docs_root / "internal" / "learnings.md").read_text()
 
     # configuration.md should list internal in task type filters
-    assert "explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`" in config_content
+    assert "explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal`" in config_content
 
     # learnings doc should describe internal task mechanics
     assert "skip_learnings=True" in learnings_content
@@ -943,7 +943,7 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "gza comment <task_id> <text> [options]",
         "### fix",
         "gza fix <task_id> [options]",
-        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
+        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal` |",
         "| `--status-not STATUS` | Exclude the given status |",
         "| `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |",
     ]

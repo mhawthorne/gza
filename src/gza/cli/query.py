@@ -1238,7 +1238,7 @@ def cmd_history(args: argparse.Namespace) -> int:
         else:
             parent_label = ""
 
-        if compact_child and task.task_type in {"review", "improve", "plan_review", "plan_improve"}:
+        if compact_child and task.task_type in {"review", "improve", "verify_fix", "plan_review", "plan_improve"}:
             compact_parts = [f"{type_label}{merge_label}{parent_label}"]
             if task.task_type == "review":
                 verdict = get_review_verdict(config, task)
@@ -4598,7 +4598,7 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Completion Reason:[/{c['label']}] [{c['value']}]{task.completion_reason}[/{c['value']}]")
     if task.drop_reason:
         console.print(f"[{c['label']}]Drop Reason:[/{c['label']}] [{c['value']}]{task.drop_reason}[/{c['value']}]")
-    if task.task_type in {"rebase", "improve"}:
+    if task.task_type in {"rebase", "improve", "verify_fix"}:
         console.print(
             f"[{c['label']}]Changed Diff:[/{c['label']}] "
             f"[{c['value']}]{_format_changed_diff_label(task.changed_diff)}[/{c['value']}]"

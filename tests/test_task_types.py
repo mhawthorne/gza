@@ -27,11 +27,12 @@ def _load_store(project_dir: Path) -> SqliteTaskStore:
     )
 
 
-def test_cmd_add_accepts_well_formed_plan_review_and_plan_improve_task_types(tmp_path: Path) -> None:
+def test_cmd_add_accepts_well_formed_plan_review_plan_improve_and_verify_fix_task_types(tmp_path: Path) -> None:
     _write_config(tmp_path)
     store = _load_store(tmp_path)
     source_plan = store.add("Draft the plan", task_type="plan")
     source_review = store.add("Review the plan", task_type="plan_review", depends_on=source_plan.id)
+    source_impl = store.add("Implement the plan", task_type="implement")
 
     args_by_type = {
         "plan_review": argparse.Namespace(
@@ -78,16 +79,45 @@ def test_cmd_add_accepts_well_formed_plan_review_and_plan_improve_task_types(tmp
             next=True,
             tags=None,
         ),
+        "verify_fix": argparse.Namespace(
+            project_dir=tmp_path,
+            prompt="verify_fix prompt",
+            prompt_file=None,
+            edit=False,
+            type="verify_fix",
+            explore=False,
+            depends_on=None,
+            based_on=source_impl.id,
+            review=False,
+            hold_for_review=False,
+            create_pr=False,
+            same_branch=True,
+            spec=None,
+            review_scope=None,
+            branch_type=None,
+            model=None,
+            provider=None,
+            skip_learnings=False,
+            next=True,
+            tags=None,
+        ),
     }
 
-    for task_type in ("plan_review", "plan_improve"):
+    for task_type in ("plan_review", "plan_improve", "verify_fix"):
         with patch("gza.cli.execution.set_task_urgency", return_value=True):
             rc = cmd_add(args_by_type[task_type])
 
         assert rc == 0
 
     pending = store.get_pending()
-    assert [task.task_type for task in pending] == ["plan", "plan_review", "plan_review", "plan_improve"]
+    assert [task.task_type for task in pending] == [
+        "plan",
+        "plan_review",
+        "implement",
+        "plan_review",
+        "plan_improve",
+        "verify_fix",
+    ]
 
 
 def test_cmd_add_rejects_plan_review_without_plan_source_dependency(tmp_path: Path, capsys) -> None:
@@ -161,7 +191,7 @@ def test_cmd_add_rejects_plan_improve_without_matching_plan_review_dependency(
     assert "must be based on the same plan source" in capsys.readouterr().out
 
 
-def test_query_history_filters_accept_plan_review_and_plan_improve(tmp_path: Path) -> None:
+def test_query_history_filters_accept_plan_review_plan_improve_and_verify_fix(tmp_path: Path) -> None:
     _write_config(tmp_path)
     store = _load_store(tmp_path)
 
@@ -171,12 +201,17 @@ def test_query_history_filters_accept_plan_review_and_plan_improve(tmp_path: Pat
     improve_task = store.add("Revise the plan", task_type="plan_improve")
     improve_task.status = "completed"
     store.update(improve_task)
+    verify_fix_task = store.add("Fix verify", task_type="verify_fix")
+    verify_fix_task.status = "completed"
+    store.update(verify_fix_task)
 
     review_rows = query_history(store, HistoryFilter(limit=None, task_type="plan_review"))
     improve_rows = query_history(store, HistoryFilter(limit=None, task_type="plan_improve"))
+    verify_fix_rows = query_history(store, HistoryFilter(limit=None, task_type="verify_fix"))
 
     assert [task.task_type for task in review_rows] == ["plan_review"]
     assert [task.task_type for task in improve_rows] == ["plan_improve"]
+    assert [task.task_type for task in verify_fix_rows] == ["verify_fix"]
 
 
 def test_query_filter_flags_include_new_plan_review_task_types() -> None:
@@ -192,3 +227,4 @@ def test_query_filter_flags_include_new_plan_review_task_types() -> None:
     for dest in ("type", "type_not"):
         assert "plan_review" in choices_by_dest[dest]
         assert "plan_improve" in choices_by_dest[dest]
+        assert "verify_fix" in choices_by_dest[dest]

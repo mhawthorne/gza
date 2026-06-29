@@ -2599,7 +2599,7 @@ def get_task_output_paths(
     if not task.slug:
         return None, None
 
-    if task.task_type in ("task", "implement", "improve", "fix", "rebase"):
+    if task.task_type in ("task", "implement", "improve", "verify_fix", "fix", "rebase"):
         summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
     elif task.task_type == "explore":
         report_path = project_dir / DEFAULT_REPORT_DIR / f"{task.slug}.md"
@@ -8853,7 +8853,7 @@ def _run_inner(
             interaction_mode=interaction_mode,
         )
 
-    # Code tasks (implement/improve) require git
+    # Code tasks (implement/improve/verify_fix/fix/rebase) require git
     assert git is not None, "git is required for code tasks"
     log_file = ensure_task_log_path(config, store, task)
     try:

@@ -3311,7 +3311,7 @@ class TestMergeStatus:
         assert needs_merge_status_migration(store) is False
 
     def test_same_branch_followups_share_one_merge_unit(self, tmp_path: Path) -> None:
-        """Same-branch improve/fix/review rows attach to the existing merge unit."""
+        """Same-branch improve/verify_fix/fix/review rows attach to the existing merge unit."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3324,16 +3324,20 @@ class TestMergeStatus:
         store.update(review)
         improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
         store.mark_completed(improve, has_commits=True, branch="feature/impl")
+        verify_fix = store.add("Verify fix feature", task_type="verify_fix", based_on=improve.id, same_branch=True)
+        store.mark_completed(verify_fix, has_commits=True, branch="feature/impl")
 
         impl_unit = store.resolve_merge_unit_for_task(impl.id)
         review_unit = store.resolve_merge_unit_for_task(review.id)
         improve_unit = store.resolve_merge_unit_for_task(improve.id)
+        verify_fix_unit = store.resolve_merge_unit_for_task(verify_fix.id)
         assert impl_unit is not None
         assert review_unit is not None
         assert improve_unit is not None
-        assert impl_unit.id == review_unit.id == improve_unit.id
+        assert verify_fix_unit is not None
+        assert impl_unit.id == review_unit.id == improve_unit.id == verify_fix_unit.id
         attached_ids = {task.id for task in store.list_tasks_for_merge_unit(impl_unit.id)}
-        assert attached_ids == {impl.id, review.id, improve.id}
+        assert attached_ids == {impl.id, review.id, improve.id, verify_fix.id}
 
     def test_mark_completed_without_explicit_target_raises_when_project_default_branch_fails(
         self,

@@ -22,6 +22,7 @@ from .review_scope import (
     resolve_review_scope_for_impl,
 )
 from .review_verdict import ReviewFinding
+from .review_verify_state import VerifyEpoch
 from .task_slug import (
     extract_task_id_suffix,
     get_base_task_slug,
@@ -150,6 +151,84 @@ def build_auto_review_prompt(
             return f"review {slug}"
 
     return f"Review task {impl_task.id}"
+
+
+def build_verify_fix_prompt(impl_task_id: str, verify_epoch: VerifyEpoch) -> str:
+    """Build the stable prompt used to key one verify_fix lane per verify epoch."""
+    return PromptBuilder().verify_fix_task_prompt(
+        impl_task_id,
+        reviewed_branch=verify_epoch.reviewed_branch,
+        reviewed_head_sha=verify_epoch.reviewed_head_sha,
+        verify_command=verify_epoch.verify_command,
+        verify_timeout_seconds=verify_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=verify_epoch.verify_timeout_grace_seconds,
+    )
+
+
+def find_existing_verify_fix_task(
+    store: SqliteTaskStore,
+    *,
+    impl_task_id: str,
+    verify_epoch: VerifyEpoch,
+) -> Task | None:
+    """Return the latest non-dropped verify_fix task for the given verify epoch."""
+    expected_prompt = build_verify_fix_prompt(impl_task_id, verify_epoch)
+    candidates = [
+        task
+        for task in store.get_verify_fix_tasks_by_root(impl_task_id)
+        if task.prompt == expected_prompt and task.status != "dropped"
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda task: (
+            task.created_at or datetime.min.replace(tzinfo=UTC),
+            task.id or "",
+        ),
+    )
+
+
+def create_or_reuse_verify_fix_task(
+    store: SqliteTaskStore,
+    *,
+    impl_task: Task,
+    based_on_task: Task,
+    verify_epoch: VerifyEpoch,
+    trigger_source: str,
+    model: str | None = None,
+    provider: str | None = None,
+) -> tuple[Task, bool]:
+    """Create or reuse one same-branch verify_fix lane for the given verify epoch."""
+    if impl_task.id is None:
+        raise ValueError("Cannot create verify_fix for implementation without an ID.")
+    if based_on_task.id is None:
+        raise ValueError("Cannot create verify_fix without a based_on task ID.")
+
+    existing = find_existing_verify_fix_task(
+        store,
+        impl_task_id=impl_task.id,
+        verify_epoch=verify_epoch,
+    )
+    if existing is not None:
+        return existing, False
+
+    created = store.add(
+        prompt=build_verify_fix_prompt(impl_task.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=based_on_task.id,
+        same_branch=True,
+        tags=resolve_derived_task_tags(impl_task),
+        review_scope=(
+            resolved_scope.summary
+            if (resolved_scope := resolve_review_scope_for_impl(store, impl_task)) is not None
+            else None
+        ),
+        model=model,
+        provider=provider,
+        trigger_source=trigger_source,
+    )
+    return created, True
 
 
 def create_review_task(

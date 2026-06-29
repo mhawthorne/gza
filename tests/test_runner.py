@@ -154,11 +154,11 @@ class TestGetTaskOutputPaths:
         return task
 
     def test_code_task_types_return_summary_path(self, tmp_path: Path):
-        """Code task types (task, implement, improve, fix, rebase) return a summary_path."""
+        """Code task types (task, implement, improve, verify_fix, fix, rebase) return a summary_path."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        for task_type in ("task", "implement", "improve", "fix", "rebase"):
+        for task_type in ("task", "implement", "improve", "verify_fix", "fix", "rebase"):
             task = self._make_task(store, task_type)
             report_path, summary_path = get_task_output_paths(task, tmp_path)
             assert summary_path is not None, f"{task_type} should have summary_path"

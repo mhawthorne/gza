@@ -485,6 +485,8 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
             return False
         if task.task_type == "improve":
             return task.based_on is not None
+        if task.task_type == "verify_fix":
+            return task.based_on is not None or bool(task.same_branch)
         if task.task_type == "review":
             return True
         if task.task_type == "rebase":

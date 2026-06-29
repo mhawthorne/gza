@@ -22,10 +22,12 @@ from gza.review_tasks import (
     build_review_blocker_adjudication_prompt,
     build_review_blocker_adjudication_prompt_prefix,
     build_auto_review_prompt,
+    build_verify_fix_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
     create_spec_coherence_review_task,
+    create_or_reuse_verify_fix_task,
     create_review_task,
     create_resolution_review_task,
     extract_deferred_blocker_prompt_parts,
@@ -35,10 +37,12 @@ from gza.review_tasks import (
     find_existing_deferred_blocker_task,
     find_existing_followup_task,
     find_existing_review_blocker_adjudication_task,
+    find_existing_verify_fix_task,
     format_blocker_finding_context,
     format_followup_finding_context,
     persist_off_topic_verify_clearance,
 )
+from gza.review_verify_state import VerifyEpoch
 from gza.review_verdict import ReviewFinding
 
 
@@ -82,6 +86,99 @@ class TestDuplicateReviewError:
     def test_is_value_error(self):
         err = DuplicateReviewError(_task())
         assert isinstance(err, ValueError)
+
+
+class TestVerifyFixTasks:
+    def test_build_verify_fix_prompt_keys_on_epoch(self) -> None:
+        prompt = build_verify_fix_prompt(
+            "gza-101",
+            VerifyEpoch(
+                reviewed_branch="feature/test",
+                reviewed_head_sha="deadbeef",
+                verify_command="./bin/tests",
+                verify_timeout_seconds=1800,
+                verify_timeout_grace_seconds=5.0,
+            ),
+        )
+
+        assert prompt == (
+            "Fix verify failures for task gza-101 "
+            "[branch=feature/test head=deadbeef command=./bin/tests timeout=1800 grace=5.0]"
+        )
+
+    def test_create_or_reuse_verify_fix_task_reuses_same_epoch(self, tmp_path: Path) -> None:
+        _config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+
+        created, did_create = create_or_reuse_verify_fix_task(
+            store,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+        reused, reused_create = create_or_reuse_verify_fix_task(
+            store,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+
+        assert did_create is True
+        assert reused_create is False
+        assert reused.id == created.id
+        assert created.task_type == "verify_fix"
+        assert created.same_branch is True
+        assert created.based_on == improve.id
+
+    def test_create_or_reuse_verify_fix_task_creates_new_lane_for_new_epoch(self, tmp_path: Path) -> None:
+        _config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        first_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        second_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="feedface",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+
+        first, first_created = create_or_reuse_verify_fix_task(
+            store,
+            impl_task=impl,
+            based_on_task=rebase,
+            verify_epoch=first_epoch,
+            trigger_source="advance",
+        )
+        second, second_created = create_or_reuse_verify_fix_task(
+            store,
+            impl_task=impl,
+            based_on_task=rebase,
+            verify_epoch=second_epoch,
+            trigger_source="advance",
+        )
+
+        assert first_created is True
+        assert second_created is True
+        assert second.id != first.id
+        assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=first_epoch).id == first.id
+        assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=second_epoch).id == second.id
 
 
 # ---------------------------------------------------------------------------

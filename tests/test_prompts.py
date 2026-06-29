@@ -200,6 +200,25 @@ class TestPromptBuilderBuild:
         _assert_contains_all_clauses(result, IMPROVE_DISPUTE_CONTRACT_CLAUSES)
         _assert_contains_all_clauses(result, IMPROVE_ATOMIC_CLOSURE_CONTRACT_CLAUSES)
 
+    def test_build_verify_fix_type_with_summary(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Fix verify epoch", task_type="verify_fix")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.inner_verify_command = ""
+
+        summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
+        result = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert "This is a `verify_fix` task." in result
+        assert "same-branch contributor task" in result
+        assert "Do not weaken guardrails to make the verify pass." in result
+        assert str(summary_path) in result
+        assert "Required final verify command: `./bin/tests`" in result
+
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
         self, tmp_path: Path
     ):

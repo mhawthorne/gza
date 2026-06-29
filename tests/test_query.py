@@ -44,6 +44,12 @@ class TestClassifyChildRelationship:
 
         assert _classify_child_relationship(parent, child) == "rebase"
 
+    def test_verify_fix_child_of_same_branch_parent_is_labeled_verify_fix(self):
+        parent = _make_task(id="gza-1", task_type="improve")
+        child = _make_task(id="gza-2", task_type="verify_fix", based_on="gza-1", same_branch=True)
+
+        assert _classify_child_relationship(parent, child) == "verify_fix"
+
     def test_explicit_resume_recovery_origin_wins_over_session_heuristic(self):
         parent = _make_task(id="gza-1", task_type="implement", session_id=None)
         child = _make_task(
