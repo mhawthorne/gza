@@ -1014,6 +1014,11 @@ def _execute_recover_verify_only_noop_review(
                 markdown=markdown,
                 project_results=project_results,
                 producer="advance_verify_only_noop_recovery",
+                artifact_task=task,
+                metadata={
+                    "timeout_seconds": timeout_seconds,
+                    "timeout_grace_seconds": timeout_grace_seconds,
+                },
             )
 
         live_head_after = context.git.rev_parse_if_exists(task.branch)

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from gza.artifacts import store_command_output_artifact
 from gza.db import SqliteTaskStore, Task
+from gza.git import GitError
 
 if TYPE_CHECKING:
     from gza.config import Config
@@ -308,7 +309,10 @@ def owner_task_verify_epoch(task: Task, config: object | None, git: object | Non
     rev_parse = getattr(git, "rev_parse_if_exists", None)
     if not callable(rev_parse):
         return None
-    head_sha = rev_parse(branch)
+    try:
+        head_sha = rev_parse(branch)
+    except (GitError, OSError, RuntimeError, ValueError):
+        return None
     if not isinstance(head_sha, str) or not head_sha:
         return None
     timeout_seconds = getattr(config, "autonomous_verify_timeout_seconds", None)

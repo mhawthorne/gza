@@ -50,6 +50,11 @@ from gza.plan_review_materialization import (
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_tasks import OffTopicVerifyPersistenceError
+from gza.review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
+    latest_verify_result_for_epoch,
+    owner_task_verify_epoch,
+)
 from gza.review_verdict import ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
 
@@ -685,6 +690,7 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     refreshed_impl = store.get(impl.id)
     refreshed_improve = store.get(improve.id)
     artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
+    verify_gate_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
 
     assert result.status == "success"
     assert result.success_message.startswith("Fresh verify passed")
@@ -696,6 +702,18 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     assert artifacts[0].metadata is not None
     assert artifacts[0].metadata["clearance_kind"] == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND
     assert artifacts[0].metadata["review_task_id"] == review.id
+    assert len(verify_gate_artifacts) == 1
+    assert store.list_artifacts(improve.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_impl,
+        current_epoch=owner_task_verify_epoch(refreshed_impl, config, git),
+    )
+    assert lookup.source == "owner_artifact"
+    assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.reviewed_head_sha == "same-head"
 
 
 def test_recover_verify_only_noop_review_failed_verify_returns_attention(tmp_path: Path) -> None:
@@ -1197,7 +1215,7 @@ def test_recover_verify_only_noop_review_clearance_persistence_failure_returns_s
     refreshed_impl = store.get(impl.id)
     refreshed_improve = store.get(improve.id)
     clearance_artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
-    verify_artifacts = store.list_artifacts(improve.id, kind="verify_command_output")
+    verify_artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
 
     assert result.status == "error"
     assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
@@ -1211,6 +1229,7 @@ def test_recover_verify_only_noop_review_clearance_persistence_failure_returns_s
     assert refreshed_improve.review_verify_status == "passed"
     assert clearance_artifacts == []
     assert len(verify_artifacts) == 1
+    assert store.list_artifacts(improve.id, kind="verify_command_output") == []
     parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
     assert len(parked) == 1
     assert parked[0].metadata["outcome_kind"] == "clearance_persistence_failure"

@@ -13,6 +13,7 @@ import gza.recovery_engine as recovery_engine
 from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
+from gza.git import GitError
 from gza.review_verify_state import persist_verify_gate_artifact
 from gza.db import SqliteTaskStore
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
@@ -679,6 +680,77 @@ def test_task_projection_keeps_latest_owner_verify_fields_when_git_probe_unavail
     assert row.values["verify_failure"] == "git probe unavailable"
 
 
+def test_task_projection_keeps_latest_owner_verify_fields_when_branch_probe_raises(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+
+    impl = store.add("Implement query verify probe exception", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/query-verify-probe-exception"
+    store.update(impl)
+
+    review = store.add("Review query verify probe exception", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/verify-owner",
+            failure="git probe unavailable",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    class _RaisingGit:
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref == impl.branch:
+                raise GitError("probe blew up")
+            return None
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="tasks",
+            limit=None,
+            task_types=("implement",),
+            projection=ProjectionSpec(
+                fields=("id", "verify_status", "verify_source", "verify_current", "verify_failure"),
+            ),
+            presentation=PresentationSpec(mode="json"),
+        ),
+        config=config,
+        git=_RaisingGit(),
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert isinstance(row, TaskRow)
+    assert row.values["verify_status"] == "failed"
+    assert row.values["verify_source"] == "owner_artifact"
+    assert row.values["verify_current"] is False
+    assert row.values["verify_failure"] == "git probe unavailable"
+
+
 def test_task_projection_marks_legacy_verify_stale_without_persisted_timeout_identity(
     tmp_path: Path,
 ) -> None:
@@ -789,6 +861,77 @@ def test_incomplete_projection_keeps_latest_owner_verify_fields_when_git_probe_u
         query,
         config=config,
         git=None,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.values["verify_status"] == "passed"
+    assert row.values["verify_source"] == "owner_artifact"
+    assert row.values["verify_current"] is False
+
+
+def test_incomplete_projection_keeps_latest_owner_verify_fields_when_branch_probe_raises(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+
+    impl = store.add("Implement lineage verify probe exception", task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.completed_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    impl.failure_reason = "TEST_FAILURE"
+    impl.branch = "feature/lineage-verify-probe-exception"
+    store.update(impl)
+
+    review = store.add("Review lineage verify probe exception", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/verify-owner",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    class _RaisingGit:
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref == impl.branch:
+                raise GitError("probe blew up")
+            return None
+
+    service = TaskQueryService(store)
+    query = replace(
+        TaskQueryPresets.incomplete(limit=None),
+        projection=ProjectionSpec(fields=("id", "verify_status", "verify_source", "verify_current")),
+        presentation=PresentationSpec(mode="json"),
+    )
+    result = service.run(
+        query,
+        config=config,
+        git=_RaisingGit(),
     )
 
     assert len(result.rows) == 1
