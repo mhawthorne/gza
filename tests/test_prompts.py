@@ -1,7 +1,7 @@
 """Tests for the PromptBuilder class in gza.prompts."""
 
-from datetime import UTC, datetime
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 

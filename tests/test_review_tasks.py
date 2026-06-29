@@ -13,40 +13,41 @@ from gza.db import SqliteTaskStore
 from gza.db import Task
 from gza.review_scope import parse_spec_coherence_review_scope
 from gza.review_tasks import (
-    DuplicateReviewError,
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+    DuplicateReviewError,
     VerifyFixContextError,
+    build_auto_review_prompt,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
     build_spec_coherence_review_prompt,
     build_review_blocker_adjudication_prompt,
     build_review_blocker_adjudication_prompt_prefix,
-    build_auto_review_prompt,
     build_verify_fix_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
     create_spec_coherence_review_task,
     create_or_reuse_verify_fix_task,
-    create_review_task,
     create_resolution_review_task,
+    create_review_task,
     extract_deferred_blocker_prompt_parts,
     extract_followup_prompt_parts,
-    extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_dispute_identity,
-    format_verify_fix_context,
+    extract_review_blocker_adjudication_dispute_reference,
     find_existing_deferred_blocker_task,
     find_existing_followup_task,
     find_existing_review_blocker_adjudication_task,
     find_existing_verify_fix_task,
     format_blocker_finding_context,
     format_followup_finding_context,
+    format_verify_fix_context,
+    parse_verify_fix_prompt,
     persist_off_topic_verify_clearance,
     resolve_verify_fix_context,
 )
-from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 from gza.review_verdict import ReviewFinding
+from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 
 
 def _task(**overrides) -> Task:
@@ -162,6 +163,23 @@ class TestVerifyFixTasks:
             "Fix verify failures for task gza-101 "
             "[branch=feature/test head=deadbeef command=./bin/tests timeout=1800 grace=5.0]"
         )
+
+    def test_build_verify_fix_prompt_round_trips_unset_timeout_and_grace(self) -> None:
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+        )
+
+        prompt = build_verify_fix_prompt("gza-101", epoch)
+
+        assert prompt == (
+            "Fix verify failures for task gza-101 "
+            "[branch=feature/test head=deadbeef command=./bin/tests timeout=unset grace=unset]"
+        )
+        assert parse_verify_fix_prompt(prompt) == ("gza-101", epoch)
 
     def test_create_or_reuse_verify_fix_task_reuses_same_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
@@ -821,7 +839,7 @@ def test_persist_off_topic_verify_clearance_creates_new_investigation_when_only_
         "traceback_paths": ["tests/cli/test_query.py"],
     }
     signature_key = hashlib.sha256(
-        f"{failing_node['nodeid']}\n{failing_node['assertion_signature']}".encode("utf-8")
+        f"{failing_node['nodeid']}\n{failing_node['assertion_signature']}".encode()
     ).hexdigest()
     store_command_output_artifact(
         store,

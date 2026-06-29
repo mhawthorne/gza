@@ -314,28 +314,17 @@ def latest_verify_evidence_for_owner(
             )
         return None
 
-    latest_review = store.get_latest_review(owner_task.id)
-    if latest_review is None:
-        return None
-    legacy_result = _task_verify_result(latest_review)
-    if legacy_result is None:
-        return None
-    timeout_seconds = getattr(latest_review, "review_verify_timeout_seconds", None)
-    timeout_grace_seconds = getattr(latest_review, "review_verify_timeout_grace_seconds", None)
-    return LatestVerifyEvidence(
-        result=legacy_result,
-        epoch=_result_epoch(
-            legacy_result,
-            verify_timeout_seconds=timeout_seconds if isinstance(timeout_seconds, int) else None,
-            verify_timeout_grace_seconds=(
-                float(timeout_grace_seconds)
-                if isinstance(timeout_grace_seconds, (int, float)) and not isinstance(timeout_grace_seconds, bool)
-                else None
-            ),
-        ),
-        source="legacy_review",
-        has_owner_artifact=False,
-    )
+    for review in store.get_reviews_for_task(owner_task.id):
+        legacy = _task_verify_result(review)
+        if legacy is None:
+            continue
+        return LatestVerifyEvidence(
+            result=legacy,
+            epoch=_legacy_result_epoch(legacy),
+            source="legacy_review",
+            has_owner_artifact=False,
+        )
+    return None
 
 
 def review_task_verify_epoch(task: Task, config: object | None) -> VerifyEpoch | None:
