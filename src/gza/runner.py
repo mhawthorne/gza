@@ -166,6 +166,7 @@ from .review_verdict import (
 from .review_verify_state import (
     persist_verify_gate_artifact,
     refresh_preserved_rebase_review_verify_heads,
+    resolve_verify_owner_task,
 )
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
@@ -3307,11 +3308,7 @@ def _resolve_verify_gate_owner_task(
     """Return the canonical task that should own neutral verify-gate evidence."""
     if artifact_task is not None:
         return artifact_task
-    if task.task_type == "review" and task.depends_on:
-        impl_task = store.get(task.depends_on)
-        if impl_task is not None:
-            return impl_task
-    return task
+    return resolve_verify_owner_task(store, task)
 
 
 def _persist_review_verify_result(

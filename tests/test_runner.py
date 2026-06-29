@@ -58,6 +58,7 @@ from gza.runner import (
     _build_context_from_chain,
     _build_review_improve_lineage_context,
     _build_timeout_resume_context,
+    _capture_review_verify_result,
     _capture_noop_improve_review_verify_result,
     _check_dependency_merge_precondition,
     _complete_code_task,
@@ -20144,6 +20145,56 @@ class TestProviderPromptSanitization:
         assert refreshed.review_verify_head_sha == "deadbeef"
         assert refreshed.review_verify_base_sha == "cafebabe"
         assert refreshed.review_verify_branch == impl.branch
+
+    def test_capture_review_verify_result_persists_owner_artifact_for_based_on_only_review(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        review = store.add(prompt="Review feature X", task_type="review", based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        store.update(review)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            working_directory=str(tmp_path / "worktrees" / "review"),
+            output="verify passed\n",
+        )
+
+        _capture_review_verify_result(
+            config,
+            store,
+            review,
+            result,
+            markdown="## verify_command result\n\n- Status: passed",
+        )
+
+        owner_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        review_artifacts = store.list_artifacts(review.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+
+        assert len(owner_artifacts) == 1
+        assert review_artifacts == []
+        assert owner_artifacts[0].metadata is not None
+        assert owner_artifacts[0].metadata["source_task_id"] == review.id
 
     def test_cross_project_review_artifact_persists_per_project_verify_phase_results(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
