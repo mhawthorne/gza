@@ -75,6 +75,8 @@ Gza reads configuration from three YAML layers:
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
 | `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, dispatch_start_timeout: 2}` | Defaults for `gza watch` loop behavior |
+| `behavior_monitor` | Dict | `{enabled: true, interval_seconds: 14400, tag: behavior-conformance, max_new_tasks_per_cycle: 5, check_timeout_seconds: 3600, file_undetermined: false}` | Defaults for the host-side behavior conformance monitor cadence, filing tag, and per-pass safety cap |
+| `spec_coherence` | Dict | `{enabled: true, paths: [specs/behavior/**]}` | Branch-scoped behavior-spec coherence gate settings for diffs that touch behavior-spec files |
 | `quiet_period_seconds` | Integer | `300` | Seconds a newly created task stays in the Quiet lane of `gza queue` / `gza next` before rejoining normal pending display order; current releases still do not change worker pickup eligibility, and `0` disables the quiet lane |
 | `learnings_window` | Integer | `25` | Number of recent completed tasks to include in the learnings update prompt |
 | `learnings_interval` | Integer | `5` | Auto-update learnings every N completed tasks; set to `0` to disable auto-updates |
@@ -111,7 +113,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `advance_off_topic_verify_unblock`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `quiet_period_seconds`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `behavior_monitor`, `spec_coherence`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `advance_off_topic_verify_unblock`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `quiet_period_seconds`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -1876,6 +1878,46 @@ Without `--force`, `uv run gza main-verify` is an inspect-first operator check. 
 With `--force`, `uv run gza main-verify --force` bypasses checkpoint reuse and runs the gate again against the current local-target tree. The forced path uses the same bounded red-rerun classification as watch: a red that turns green on rerun is treated as flaky, the checkpoint is refreshed to green, and the merge halt clears without requiring a direct commit to main. A red that stays red leaves behind fresh red evidence and exits `1`.
 
 This command is the operator escape hatch for a wedged or stale main-verify halt. Watch still owns the automatic remediation lane: when watch confirms a flaky or deterministic red, it creates or reuses the corresponding remediation task, deduplicated by failure signature plus tree fingerprint when that fingerprint is available from the bounded rerun evidence, tagged `system-main-verify` alongside `system` and any active watch scope tags, and bumped to the front of the runnable queue. If the tree fingerprint is unavailable, watch falls back to signature-only reuse for that remediation task.
+
+### behavior-monitor
+
+Run the host-side behavior conformance monitor on the live project checkout and DB.
+
+```bash
+uv run gza behavior-monitor [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--once` | Run one monitor pass and exit |
+| `--interval SECONDS` | Loop sleep interval in seconds when not using `--once` (default: `behavior_monitor.interval_seconds` or `14400`) |
+| `--tag TAG` | Override the filing tag for auto-filed follow-up tasks (default: `behavior_monitor.tag` or `behavior-conformance`) |
+| `--max-new-tasks N` | Per-pass cap on newly filed follow-up tasks (default: `behavior_monitor.max_new_tasks_per_cycle` or `5`) |
+| `--check-timeout SECONDS` | Timeout budget for one behavior-check pass (default: `behavior_monitor.check_timeout_seconds` or `3600`) |
+| `--dry-run` | Run the behavior check and parse findings without filing follow-up tasks or persisting finding-state updates |
+| `--force` | Run even when `behavior_monitor.enabled=false` |
+
+`uv run gza behavior-monitor` is a separate host-side cadence loop, not part of `gza watch` slot filling. Each pass creates one `internal` check task tagged `behavior-monitor` plus the filing tag, runs `/gza-behavior-check` through the existing non-code runner path, reads the required `## Machine-readable findings` appendix from the generated report, and files deduplicated follow-up tasks into the shared DB. The monitor uses a SQLite-backed per-project lease so only one conformance pass runs at a time, and the internal check task is excluded from normal pending pickup and watch slot accounting.
+
+By default the monitor files only confirmed `DIVERGES` findings. It maps `code bug` recommendations to `implement` tasks tagged `behavior-code-bug`, `spec gap` recommendations to `implement` tasks tagged `behavior-spec-gap` plus `specs-behavior`, and `ambiguous` recommendations to `plan` tasks tagged `behavior-ambiguous` plus `specs-behavior`. Repeated passes dedupe against active linked tasks, while a merged or dropped linked task plus a reappearing fingerprint creates a new-generation follow-up task whose prompt notes the prior linked task and new generation. Findings beyond the per-pass cap are logged as suppressed and deferred to later monitor passes instead of flooding the queue, but still count as observed for absent-resolution so present findings are not falsely resolved.
+
+The `behavior_monitor` config block supports these discoverable keys directly:
+
+- `behavior_monitor.enabled`: turn the host-side monitor on or off for operator defaults. When false, `uv run gza behavior-monitor` exits non-zero unless `--force` is supplied.
+- `behavior_monitor.interval_seconds`: default sleep interval for looping monitor runs.
+- `behavior_monitor.tag`: default filing tag applied to the internal check task and any filed follow-up tasks.
+- `behavior_monitor.max_new_tasks_per_cycle`: maximum number of new follow-up tasks filed in one monitor pass.
+- `behavior_monitor.check_timeout_seconds`: timeout budget for the internal `/gza-behavior-check` task.
+- `behavior_monitor.file_undetermined`: when true, also file investigation tasks for `UNDETERMINED` findings.
+
+### spec-coherence gate
+
+When `spec_coherence.enabled=true`, lifecycle inspects the current merge diff for paths matching `spec_coherence.paths`. If the branch touches any configured behavior-spec path, advance creates or reuses a same-lineage review task with structured `review_scope` metadata for `spec-coherence` that captures the reviewed head and exact changed behavior-spec paths, plus a prompt that runs `/gza-spec-coherence`. A current `APPROVED` coherence review lets lifecycle continue only when that persisted scope still matches the current branch head and changed-path set; `CHANGES_REQUESTED` routes through the normal improve loop; `NEEDS_DISCUSSION` parks the branch with `reason=spec-coherence-needs-discussion`; and a later matching spec edit invalidates the prior approval and requires a fresh coherence review.
+
+The `spec_coherence` config block supports these discoverable keys directly:
+
+- `spec_coherence.enabled`: enable or disable the automatic branch-scoped behavior-spec coherence gate.
+- `spec_coherence.paths`: repo-relative glob patterns that trigger the coherence gate when the branch diff touches them.
 
 ### iterate
 

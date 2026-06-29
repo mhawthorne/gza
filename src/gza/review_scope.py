@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -27,6 +28,17 @@ _RESOLUTION_REVIEW_OPTIONAL_FIELDS = (
 _RESOLUTION_REVIEW_ALLOWED_FIELDS = frozenset(
     _RESOLUTION_REVIEW_REQUIRED_FIELDS + _RESOLUTION_REVIEW_OPTIONAL_FIELDS
 )
+_SPEC_COHERENCE_REVIEW_MODE_RE = re.compile(r"^Review mode:\s*spec-coherence\s*$", re.MULTILINE)
+_SPEC_COHERENCE_REVIEW_FIELD_RE = re.compile(
+    r"^(Implementation task|Reviewed head SHA|Changed behavior-spec paths JSON):\s*(.*?)\s*$",
+    re.MULTILINE,
+)
+_SPEC_COHERENCE_REVIEW_REQUIRED_FIELDS = (
+    "Implementation task",
+    "Reviewed head SHA",
+    "Changed behavior-spec paths JSON",
+)
+_SPEC_COHERENCE_REVIEW_ALLOWED_FIELDS = frozenset(_SPEC_COHERENCE_REVIEW_REQUIRED_FIELDS)
 
 _SLICE_HEADER_RE = re.compile(
     r"^Implement\s+plan\s+(?P<plan_id>\S+),\s*slice\s+(?P<slice_label>.+?)(?::\s*(?P<summary>.+))?$",
@@ -57,9 +69,23 @@ class ResolutionReviewScope:
     pre_rebase_merge_base_sha: str | None = None
 
 
+@dataclass(frozen=True)
+class SpecCoherenceReviewScope:
+    """Parsed structured metadata for a spec-coherence review."""
+
+    implementation_task_id: str
+    reviewed_head_sha: str
+    changed_paths: tuple[str, ...]
+
+
 def declares_resolution_review_mode(scope: str | None) -> bool:
     """Return whether scope text claims to be resolution-review metadata."""
     return bool(scope and _RESOLUTION_REVIEW_MODE_RE.search(scope))
+
+
+def declares_spec_coherence_review_mode(scope: str | None) -> bool:
+    """Return whether scope text claims to be spec-coherence review metadata."""
+    return bool(scope and _SPEC_COHERENCE_REVIEW_MODE_RE.search(scope))
 
 
 def build_resolution_review_scope(
@@ -153,6 +179,92 @@ def parse_resolution_review_scope(scope: str | None) -> ResolutionReviewScope | 
         pre_rebase_head_sha=fields.get("pre_rebase_head_sha") or None,
         pre_rebase_target_sha=fields.get("pre_rebase_target_sha") or None,
         pre_rebase_merge_base_sha=fields.get("pre_rebase_merge_base_sha") or None,
+    )
+
+
+def build_spec_coherence_review_scope(
+    *,
+    implementation_task_id: str,
+    reviewed_head_sha: str,
+    changed_paths: tuple[str, ...],
+) -> str:
+    """Build persisted structured scope text for a spec-coherence review."""
+    normalized_paths = tuple(path.strip() for path in changed_paths if path.strip())
+    if not implementation_task_id.strip():
+        raise ValueError("spec coherence review scope requires an implementation task id")
+    if not reviewed_head_sha.strip():
+        raise ValueError("spec coherence review scope requires a reviewed head SHA")
+    if not normalized_paths:
+        raise ValueError("spec coherence review scope requires changed behavior-spec paths")
+    return "\n".join(
+        (
+            "Review mode: spec-coherence",
+            f"Implementation task: {implementation_task_id}",
+            f"Reviewed head SHA: {reviewed_head_sha}",
+            f"Changed behavior-spec paths JSON: {json.dumps(normalized_paths)}",
+            "",
+            "Review only the changed behavior-spec paths listed above against the rest of the behavior-spec set.",
+        )
+    )
+
+
+def parse_spec_coherence_review_scope(scope: str | None) -> SpecCoherenceReviewScope | None:
+    """Parse persisted structured metadata from spec-coherence review scope text."""
+    if not declares_spec_coherence_review_mode(scope):
+        return None
+    assert scope is not None
+    lines = scope.splitlines()
+    mode_index = next(
+        (
+            index
+            for index, raw_line in enumerate(lines)
+            if raw_line.strip() == "Review mode: spec-coherence"
+        ),
+        None,
+    )
+    if mode_index is None:
+        raise ValueError("spec coherence review metadata header is malformed")
+
+    raw_fields: dict[str, str] = {}
+    for raw_line in lines[mode_index + 1 :]:
+        line = raw_line.strip()
+        if not line:
+            break
+        match = _SPEC_COHERENCE_REVIEW_FIELD_RE.match(line)
+        if match is None:
+            raise ValueError(f"spec coherence review metadata line is malformed: {line}")
+        field_name, field_value = match.groups()
+        if field_name not in _SPEC_COHERENCE_REVIEW_ALLOWED_FIELDS:
+            raise ValueError(f"unexpected spec coherence review metadata field: {field_name}")
+        if field_name in raw_fields:
+            raise ValueError(f"duplicate spec coherence review metadata field: {field_name}")
+        raw_fields[field_name] = field_value.strip()
+
+    missing_fields = [
+        field for field in _SPEC_COHERENCE_REVIEW_REQUIRED_FIELDS if not raw_fields.get(field)
+    ]
+    if missing_fields:
+        raise ValueError(
+            "spec coherence review metadata is missing required fields: "
+            + ", ".join(missing_fields)
+        )
+    paths_json = raw_fields["Changed behavior-spec paths JSON"]
+    try:
+        parsed_paths = json.loads(paths_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("spec coherence review paths JSON is malformed") from exc
+    if not isinstance(parsed_paths, list):
+        raise ValueError("spec coherence review paths JSON must decode to a list")
+    normalized_paths = tuple(
+        path.strip() for path in parsed_paths if isinstance(path, str) and path.strip()
+    )
+    if len(normalized_paths) != len(parsed_paths) or not normalized_paths:
+        raise ValueError("spec coherence review paths JSON must contain only non-empty strings")
+
+    return SpecCoherenceReviewScope(
+        implementation_task_id=raw_fields["Implementation task"],
+        reviewed_head_sha=raw_fields["Reviewed head SHA"],
+        changed_paths=normalized_paths,
     )
 
 

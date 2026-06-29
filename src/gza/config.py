@@ -127,6 +127,14 @@ DEFAULT_RECOMMEND_REBASE_BEHIND_COMMITS = 1
 DEFAULT_LEARNINGS_WINDOW = 25
 DEFAULT_LEARNINGS_INTERVAL = 5
 DEFAULT_LEARNINGS_MAX_ITEMS = 50
+DEFAULT_BEHAVIOR_MONITOR_ENABLED = True
+DEFAULT_BEHAVIOR_MONITOR_INTERVAL_SECONDS = 14400
+DEFAULT_BEHAVIOR_MONITOR_TAG = "behavior-conformance"
+DEFAULT_BEHAVIOR_MONITOR_MAX_NEW_TASKS_PER_CYCLE = 5
+DEFAULT_BEHAVIOR_MONITOR_CHECK_TIMEOUT_SECONDS = 3600
+DEFAULT_BEHAVIOR_MONITOR_FILE_UNDETERMINED = False
+DEFAULT_SPEC_COHERENCE_ENABLED = True
+DEFAULT_SPEC_COHERENCE_PATHS = ("specs/behavior/**",)
 VALID_CONFIG_FIELDS = {
     "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
     "docker_startup_timeout",
@@ -150,7 +158,7 @@ VALID_CONFIG_FIELDS = {
     "code_task_diff_timeout_medium_minutes", "code_task_diff_timeout_large_minutes",
     "code_task_diff_timeout_cap_minutes",
     "recommend_rebase_behind_commits", "tmux", "learnings_window",
-    "learnings_interval", "learnings_max_items", "theme", "colors", "no_color",
+    "learnings_interval", "learnings_max_items", "behavior_monitor", "spec_coherence", "theme", "colors", "no_color",
 }
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
@@ -269,6 +277,18 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "code_task_diff_timeout_large_minutes": None,
     "code_task_diff_timeout_cap_minutes": None,
     "recommend_rebase_behind_commits": None,
+    "behavior_monitor": {
+        "enabled": None,
+        "interval_seconds": None,
+        "tag": None,
+        "max_new_tasks_per_cycle": None,
+        "check_timeout_seconds": None,
+        "file_undetermined": None,
+    },
+    "spec_coherence": {
+        "enabled": None,
+        "paths": None,
+    },
     "theme": None,
     "no_color": None,
     "colors": {
@@ -387,6 +407,18 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "learnings_window": None,
     "learnings_interval": None,
     "learnings_max_items": None,
+    "behavior_monitor": {
+        "enabled": None,
+        "interval_seconds": None,
+        "tag": None,
+        "max_new_tasks_per_cycle": None,
+        "check_timeout_seconds": None,
+        "file_undetermined": None,
+    },
+    "spec_coherence": {
+        "enabled": None,
+        "paths": None,
+    },
     "theme": None,
     "no_color": None,
     "colors": {
@@ -994,6 +1026,26 @@ class WatchConfig:
 
 
 @dataclass
+class BehaviorMonitorConfig:
+    """Configuration for the host-side behavior conformance monitor."""
+
+    enabled: bool = DEFAULT_BEHAVIOR_MONITOR_ENABLED
+    interval_seconds: int = DEFAULT_BEHAVIOR_MONITOR_INTERVAL_SECONDS
+    tag: str = DEFAULT_BEHAVIOR_MONITOR_TAG
+    max_new_tasks_per_cycle: int = DEFAULT_BEHAVIOR_MONITOR_MAX_NEW_TASKS_PER_CYCLE
+    check_timeout_seconds: int = DEFAULT_BEHAVIOR_MONITOR_CHECK_TIMEOUT_SECONDS
+    file_undetermined: bool = DEFAULT_BEHAVIOR_MONITOR_FILE_UNDETERMINED
+
+
+@dataclass
+class SpecCoherenceConfig:
+    """Configuration for the behavior-spec coherence merge gate."""
+
+    enabled: bool = DEFAULT_SPEC_COHERENCE_ENABLED
+    paths: tuple[str, ...] = DEFAULT_SPEC_COHERENCE_PATHS
+
+
+@dataclass
 class BranchStrategy:
     """Configuration for branch naming strategy."""
     pattern: str
@@ -1078,6 +1130,8 @@ class Config:
     merge_squash_threshold: int = DEFAULT_MERGE_SQUASH_THRESHOLD
     main_checkout_isolate: bool = DEFAULT_MAIN_CHECKOUT_ISOLATE
     watch: WatchConfig = field(default_factory=WatchConfig)
+    behavior_monitor: BehaviorMonitorConfig = field(default_factory=BehaviorMonitorConfig)
+    spec_coherence: SpecCoherenceConfig = field(default_factory=SpecCoherenceConfig)
     iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
     quiet_period_seconds: int = DEFAULT_QUIET_PERIOD_SECONDS
@@ -2342,6 +2396,87 @@ class Config:
         if learnings_max_items < 1:
             raise ConfigError("learnings_max_items must be a positive integer")
 
+        behavior_monitor_data = data.get("behavior_monitor") or {}
+        if not isinstance(behavior_monitor_data, dict):
+            raise ConfigError("'behavior_monitor' must be a dictionary")
+        enabled = behavior_monitor_data.get("enabled", DEFAULT_BEHAVIOR_MONITOR_ENABLED)
+        if not isinstance(enabled, bool):
+            raise ConfigError("'behavior_monitor.enabled' must be a boolean (true/false)")
+        interval_seconds = _load_strict_int_field(
+            behavior_monitor_data,
+            "interval_seconds",
+            DEFAULT_BEHAVIOR_MONITOR_INTERVAL_SECONDS,
+        )
+        if interval_seconds < 1:
+            raise ConfigError("'behavior_monitor.interval_seconds' must be a positive integer")
+        max_new_tasks_per_cycle = _load_strict_int_field(
+            behavior_monitor_data,
+            "max_new_tasks_per_cycle",
+            DEFAULT_BEHAVIOR_MONITOR_MAX_NEW_TASKS_PER_CYCLE,
+        )
+        if max_new_tasks_per_cycle < 0:
+            raise ConfigError("'behavior_monitor.max_new_tasks_per_cycle' must be a non-negative integer")
+        check_timeout_seconds = _load_strict_int_field(
+            behavior_monitor_data,
+            "check_timeout_seconds",
+            DEFAULT_BEHAVIOR_MONITOR_CHECK_TIMEOUT_SECONDS,
+        )
+        if check_timeout_seconds < 1:
+            raise ConfigError("'behavior_monitor.check_timeout_seconds' must be a positive integer")
+        file_undetermined = behavior_monitor_data.get(
+            "file_undetermined",
+            DEFAULT_BEHAVIOR_MONITOR_FILE_UNDETERMINED,
+        )
+        if not isinstance(file_undetermined, bool):
+            raise ConfigError("'behavior_monitor.file_undetermined' must be a boolean (true/false)")
+        tag = _validate_optional_string_field(
+            behavior_monitor_data.get("tag"),
+            "behavior_monitor.tag",
+            default=DEFAULT_BEHAVIOR_MONITOR_TAG,
+        ).strip()
+        if not tag:
+            raise ConfigError("'behavior_monitor.tag' must not be empty")
+        behavior_monitor_config = BehaviorMonitorConfig(
+            enabled=enabled,
+            interval_seconds=interval_seconds,
+            tag=tag,
+            max_new_tasks_per_cycle=max_new_tasks_per_cycle,
+            check_timeout_seconds=check_timeout_seconds,
+            file_undetermined=file_undetermined,
+        )
+
+        spec_coherence_data = data.get("spec_coherence") or {}
+        if not isinstance(spec_coherence_data, dict):
+            raise ConfigError("'spec_coherence' must be a dictionary")
+        spec_coherence_enabled = spec_coherence_data.get(
+            "enabled",
+            DEFAULT_SPEC_COHERENCE_ENABLED,
+        )
+        if not isinstance(spec_coherence_enabled, bool):
+            raise ConfigError("'spec_coherence.enabled' must be a boolean (true/false)")
+        raw_spec_coherence_paths = spec_coherence_data.get(
+            "paths",
+            list(DEFAULT_SPEC_COHERENCE_PATHS),
+        )
+        if not isinstance(raw_spec_coherence_paths, list):
+            raise ConfigError("'spec_coherence.paths' must be a list of path patterns")
+        spec_coherence_paths: list[str] = []
+        for index, raw_pattern in enumerate(raw_spec_coherence_paths, start=1):
+            if not isinstance(raw_pattern, str):
+                raise ConfigError(
+                    f"'spec_coherence.paths[{index}]' must be a string path pattern"
+                )
+            normalized_pattern = raw_pattern.strip()
+            if not normalized_pattern:
+                raise ConfigError(f"'spec_coherence.paths[{index}]' must not be empty")
+            spec_coherence_paths.append(normalized_pattern)
+        if not spec_coherence_paths:
+            raise ConfigError("'spec_coherence.paths' must include at least one path pattern")
+        spec_coherence_config = SpecCoherenceConfig(
+            enabled=spec_coherence_enabled,
+            paths=tuple(spec_coherence_paths),
+        )
+
         # Parse tmux configuration
         tmux_data = data.get("tmux") or {}
         if not isinstance(tmux_data, dict):
@@ -2474,6 +2609,8 @@ class Config:
             plan_slice_target_timeout_minutes=plan_slice_target_timeout_minutes,
             max_failed_closing_review_retries=max_failed_closing_review_retries,
             watch=watch_config,
+            behavior_monitor=behavior_monitor_config,
+            spec_coherence=spec_coherence_config,
             iterate_max_iterations=iterate_max_iterations,
             interactive_worktree_dir=interactive_worktree_dir,
             merge_squash_threshold=merge_squash_threshold,

@@ -259,6 +259,40 @@ def _setup_retry_limit_parked_lineage(tmp_path: Path) -> tuple[object, Config, D
     return store, config, impl, exhausted_improve
 
 
+def test_behavior_monitor_internal_task_does_not_consume_watch_slots(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    internal = store.add(
+        "Behavior monitor check",
+        task_type="internal",
+        tags=("behavior-monitor", "behavior-conformance"),
+        skip_learnings=True,
+    )
+    assert internal.id is not None
+    internal.status = "in_progress"
+    internal.started_at = datetime.now(UTC)
+    internal.running_pid = os.getpid()
+    store.update(internal)
+
+    with patch("gza.cli.watch._analyze_watch_cycle", return_value=_empty_scoped_watch_plan().analysis):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=0,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+        )
+
+    assert plan.running == 0
+    assert plan.running_task_ids == ()
+    assert plan.slots == 1
+
+
 def _seed_watch_lifecycle_summary_fixture(tmp_path: Path) -> tuple[object, object]:
     setup_config(tmp_path)
     store = make_store(tmp_path)

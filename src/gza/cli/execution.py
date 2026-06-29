@@ -86,7 +86,7 @@ from ..recovery_engine import (
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
-from ..review_tasks import build_review_blocker_dispute_metadata
+from ..review_tasks import build_review_blocker_dispute_metadata, create_spec_coherence_review_task
 from ..review_verdict import get_review_report
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
@@ -5908,7 +5908,31 @@ def _cmd_iterate_impl(
                     break
                 permit_for_review: LaunchPermit | None = permit_candidate
                 try:
-                    created_review_task = _create_review_task(store, impl_task, trigger_source="manual")
+                    if action.get("review_mode") == "spec_coherence":
+                        raw_head_sha = action.get("review_head_sha")
+                        if not isinstance(raw_head_sha, str) or not raw_head_sha.strip():
+                            raise ValueError("missing behavior-spec coherence reviewed head SHA")
+                        raw_paths = action.get("review_changed_paths")
+                        if not isinstance(raw_paths, (tuple, list)):
+                            raise ValueError("missing behavior-spec coherence changed paths")
+                        changed_paths = tuple(
+                            str(path).strip() for path in raw_paths if str(path).strip()
+                        )
+                        if not changed_paths:
+                            raise ValueError("missing behavior-spec coherence changed paths")
+                        created_review_task = create_spec_coherence_review_task(
+                            store,
+                            impl_task,
+                            reviewed_head_sha=raw_head_sha.strip(),
+                            changed_paths=changed_paths,
+                            trigger_source="manual",
+                        )
+                    else:
+                        created_review_task = _create_review_task(
+                            store,
+                            impl_task,
+                            trigger_source="manual",
+                        )
                 except DuplicateReviewError as e:
                     if isinstance(permit_for_review, LaunchPermit):
                         permit_for_review.release()

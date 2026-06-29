@@ -242,6 +242,26 @@
 # Default: true
 # advance_create_reviews: true
 
+# behavior_monitor:
+#   Timeout budget for one behavior-check monitor pass.
+#   Default: 3600
+#   check_timeout_seconds: 3600
+#   Enable the host-side behavior conformance monitor command by default.
+#   Default: true
+#   enabled: true
+#   Whether the monitor files follow-up investigation tasks for UNDETERMINED results.
+#   Default: false
+#   file_undetermined: false
+#   Default poll interval for looping `gza behavior-monitor` runs.
+#   Default: 14400
+#   interval_seconds: 14400
+#   Per-pass cap on newly filed behavior-conformance follow-up tasks.
+#   Default: 5
+#   max_new_tasks_per_cycle: 5
+#   Default filing tag applied to monitor-created follow-up tasks.
+#   Default: behavior-conformance
+#   tag: behavior-conformance
+
 # Default iteration budget for `gza iterate`.
 # Default: 3
 # iterate_max_iterations: 3
@@ -416,3 +436,13 @@
 # (`watch.batch` if configured, otherwise `5`).
 # Default: effective watch batch or 5
 # max_concurrent: 5
+
+# spec_coherence:
+#   Require the behavior-spec coherence gate for branches whose merge diff touches configured spec
+#   paths.
+#   Default: true
+#   enabled: true
+#   Repo-relative path patterns that trigger the behavior-spec coherence merge gate.
+#   Default: ["specs/behavior/**"]
+#   paths:
+#     - "specs/behavior/**"

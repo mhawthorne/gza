@@ -405,6 +405,19 @@ def test_configuration_docs_include_main_verify_escape_hatch() -> None:
     assert "Watch still owns the automatic remediation lane" in normalized
 
 
+def test_configuration_docs_include_behavior_monitor_command() -> None:
+    """Canonical command docs should describe the host-side behavior monitor."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
+    normalized = " ".join(config_content.split())
+
+    assert "### behavior-monitor" in config_content
+    assert "uv run gza behavior-monitor [options]" in config_content
+    assert "`--dry-run` | Run the behavior check and parse findings without filing" in config_content
+    assert "SQLite-backed per-project lease" in config_content
+    assert "excluded from normal pending pickup and watch slot accounting" in normalized
+
+
 def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
     """Behavior-check instructions should define a stable namespace for the red-main contract."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -1496,12 +1509,18 @@ def test_skills_docs_describe_spec_coherence_as_behavior_spec_set_gate() -> None
     """Operator docs should describe the new behavior-spec coherence gate accurately."""
     repo_root = Path(__file__).resolve().parents[1]
     skills_content = (repo_root / "docs" / "skills.md").read_text()
+    config_content = (repo_root / "docs" / "configuration.md").read_text()
 
     assert "## gza-spec-coherence" in skills_content
     assert "author-side gate on `specs/behavior/**`" in skills_content
+    assert "Lifecycle also uses this skill automatically" in skills_content
     assert "not against the code" in skills_content
     assert "repeated vocabulary or invariants that should cross-reference `00-overview.md`" in skills_content
     assert "reviews/<timestamp>-spec-coherence.md" in skills_content
+    assert "### spec-coherence gate" in config_content
+    assert "structured `review_scope` metadata for `spec-coherence`" in config_content
+    assert "reviewed head and exact changed behavior-spec paths" in config_content
+    assert "`spec_coherence.paths`" in config_content
 
 
 def test_lineage_spec_and_operator_docs_define_stale_unmerged_sweep_contract() -> None:

@@ -4,10 +4,13 @@ import pytest
 
 from gza.db import SqliteTaskStore
 from gza.review_scope import (
+    build_spec_coherence_review_scope,
     build_resolution_review_scope,
+    declares_spec_coherence_review_mode,
     declares_resolution_review_mode,
     extract_review_scope_from_prompt,
     get_latest_review_scope_comment_for_impl,
+    parse_spec_coherence_review_scope,
     parse_resolution_review_scope,
     resolve_review_scope_for_impl,
 )
@@ -136,6 +139,55 @@ def test_declares_resolution_review_mode_detects_header_without_parsing() -> Non
         "Review mode: resolution\nImplementation task: gza-10\n"
     )
     assert not declares_resolution_review_mode("Review only the parser slice.")
+
+
+def test_spec_coherence_review_scope_round_trips() -> None:
+    scope = build_spec_coherence_review_scope(
+        implementation_task_id="gza-7392",
+        reviewed_head_sha="head123",
+        changed_paths=(
+            "specs/behavior/lifecycle-engine.md",
+            "specs/behavior/watch.md",
+        ),
+    )
+
+    parsed = parse_spec_coherence_review_scope(scope)
+
+    assert parsed is not None
+    assert parsed.implementation_task_id == "gza-7392"
+    assert parsed.reviewed_head_sha == "head123"
+    assert parsed.changed_paths == (
+        "specs/behavior/lifecycle-engine.md",
+        "specs/behavior/watch.md",
+    )
+
+
+def test_declares_spec_coherence_review_mode_detects_header_without_parsing() -> None:
+    assert declares_spec_coherence_review_mode(
+        "Review mode: spec-coherence\nImplementation task: gza-7392\n"
+    )
+    assert not declares_spec_coherence_review_mode("spec-coherence")
+
+
+def test_spec_coherence_review_scope_parser_rejects_missing_required_fields() -> None:
+    with pytest.raises(ValueError, match="missing required fields"):
+        parse_spec_coherence_review_scope(
+            "Review mode: spec-coherence\nImplementation task: gza-7392\n"
+        )
+
+
+def test_spec_coherence_review_scope_parser_rejects_malformed_paths_json() -> None:
+    with pytest.raises(ValueError, match="paths JSON is malformed"):
+        parse_spec_coherence_review_scope(
+            "\n".join(
+                (
+                    "Review mode: spec-coherence",
+                    "Implementation task: gza-7392",
+                    "Reviewed head SHA: head123",
+                    "Changed behavior-spec paths JSON: [oops]",
+                )
+            )
+        )
 
 
 def test_resolution_review_scope_parser_rejects_missing_required_fields() -> None:

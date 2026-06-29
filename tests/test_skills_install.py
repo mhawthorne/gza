@@ -828,6 +828,43 @@ class TestSkillContentValidation:
         assert "quote the clause, then propose a tighter rewrite" in normalized
         assert "MUST NOT edit the spec or the code" in content
         assert "reviews/<timestamp>-spec-coherence.md" in content
+        assert "## Blockers" in content
+        assert "## Follow-Ups" in content
+        assert "## Questions / Assumptions" in content
+        assert "## Verdict" in content
+        assert "Verdict: CHANGES_REQUESTED" in content
+        assert "`APPROVED`" in content
+        assert "`CHANGES_REQUESTED`" in content
+        assert "`NEEDS_DISCUSSION`" in content
+
+    def test_gza_spec_coherence_installed_skill_requires_standard_review_verdict_contract(
+        self, tmp_path: Path
+    ) -> None:
+        """Installed gza-spec-coherence skill should preserve the standard review verdict contract."""
+        from gza.skills_utils import get_skills_source_path
+
+        setup_config(tmp_path)
+
+        result = invoke_gza(
+            "skills-install",
+            "--target",
+            "claude",
+            "gza-spec-coherence",
+            "--project",
+            str(tmp_path),
+        )
+        assert result.returncode == 0
+
+        installed = (tmp_path / ".claude" / "skills" / "gza-spec-coherence" / "SKILL.md").read_text()
+        bundled = (get_skills_source_path() / "gza-spec-coherence" / "SKILL.md").read_text()
+
+        assert installed == bundled
+        assert "## Summary" in installed
+        assert "## Blockers" in installed
+        assert "## Follow-Ups" in installed
+        assert "## Questions / Assumptions" in installed
+        assert "## Verdict" in installed
+        assert "Verdict: CHANGES_REQUESTED" in installed
 
     def test_gza_behavior_check_installed_skill_includes_machine_readable_findings_appendix(
         self, tmp_path: Path

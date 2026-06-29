@@ -21,6 +21,7 @@ from gza.advance_engine import (
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli._common import _create_retry_task, _materialize_plan_review_slices, resolve_improve_action
 from gza.cli.advance_executor import (
+    _prepare_spec_coherence_review_action,
     _prepare_resolution_review_action,
     _WORKER_ACTIONS,
     ITERATE_ROUTABLE_ACTIONS,
@@ -3774,3 +3775,35 @@ def test_reconcile_branch_divergence_local_target_conflict_returns_needs_attenti
     assert attention.task.id == impl.id
     assert attention.action["subject_task_id"] == impl.id
     assert attention.action["needs_attention_reason"] == "reconcile-needs-manual-resolution"
+
+
+def test_prepare_spec_coherence_review_action_creates_after_ordinary_review_completed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Update behavior spec", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/spec-coherence-executor")
+    store.update(impl)
+
+    ordinary_review = store.add("Ordinary review", task_type="review", depends_on=impl.id)
+    assert ordinary_review.id is not None
+    _mark_completed(ordinary_review)
+    store.update(ordinary_review)
+
+    result = _prepare_spec_coherence_review_action(
+        store,
+        impl,
+        {
+            "review_mode": "spec_coherence",
+            "review_head_sha": "head123",
+            "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+        },
+        trigger_source="advance",
+    )
+
+    assert result.status == "created"
+    assert result.review_task is not None
+    assert "Review mode: spec-coherence" in (result.review_task.review_scope or "")
+    assert "Reviewed head SHA: head123" in (result.review_task.review_scope or "")
+    assert "`## Verdict`" in result.review_task.prompt

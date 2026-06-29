@@ -152,6 +152,30 @@ def test_behavior_check_fingerprint_separates_distinct_field_tuples() -> None:
     assert first != second
 
 
+def test_project_lease_can_be_released_and_reacquired(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    first = store.try_acquire_project_lease(
+        lease_name="behavior-monitor",
+        owner_pid=os.getpid(),
+        owner_token="first-token",
+    )
+    assert first is not None
+    second = store.try_acquire_project_lease(
+        lease_name="behavior-monitor",
+        owner_pid=os.getpid(),
+        owner_token="second-token",
+    )
+    assert second is None
+    assert store.release_project_lease(lease_name="behavior-monitor", owner_token="first-token") is True
+    reacquired = store.try_acquire_project_lease(
+        lease_name="behavior-monitor",
+        owner_pid=os.getpid(),
+        owner_token="second-token",
+    )
+    assert reacquired is not None
+
+
 def test_set_task_changed_diff_persists_and_rebase_wrapper_still_works(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path)

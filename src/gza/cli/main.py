@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from ..behavior_monitor import cmd_behavior_monitor
 from ..config import (
     KNOWN_PROVIDERS,
     Config,
@@ -1158,6 +1159,49 @@ def main() -> int:
         "--force",
         action="store_true",
         help="Force a fresh local main verify run now, rerun reds to classify flakes, and clear a stale halt if the rerun goes green",
+    )
+
+    behavior_monitor_parser = subparsers.add_parser(
+        "behavior-monitor",
+        help="Run the host-side behavior conformance monitor against the live project DB",
+        description="Run the host-side behavior conformance monitor against the live project DB.",
+    )
+    add_common_args(behavior_monitor_parser)
+    behavior_monitor_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one monitor pass and exit",
+    )
+    behavior_monitor_parser.add_argument(
+        "--interval",
+        type=_parse_non_negative_int,
+        help="Loop sleep interval in seconds when not using --once",
+    )
+    behavior_monitor_parser.add_argument(
+        "--tag",
+        help="Override the filing tag applied to auto-filed follow-up tasks",
+    )
+    behavior_monitor_parser.add_argument(
+        "--max-new-tasks",
+        dest="max_new_tasks",
+        type=_parse_non_negative_int,
+        help="Per-pass cap on newly filed follow-up tasks",
+    )
+    behavior_monitor_parser.add_argument(
+        "--check-timeout",
+        dest="check_timeout",
+        type=_parse_non_negative_int,
+        help="Timeout budget in seconds for one behavior-check pass",
+    )
+    behavior_monitor_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the behavior check and parse findings without filing follow-up tasks or persisting finding state",
+    )
+    behavior_monitor_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run even when config.behavior_monitor.enabled=false",
     )
 
     flaky_parser = subparsers.add_parser(
@@ -3129,6 +3173,8 @@ def main() -> int:
             return cmd_watch(args)
         elif args.command == "main-verify":
             return cmd_main_verify(args)
+        elif args.command == "behavior-monitor":
+            return cmd_behavior_monitor(args)
         elif args.command == "flaky":
             if getattr(args, "flaky_action", None) == "reproduce":
                 return cmd_flaky_reproduce(args)

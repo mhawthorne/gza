@@ -120,6 +120,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "max_failed_closing_review_retries",
             "iterate_max_iterations",
             "watch",
+            "behavior_monitor",
         ),
     ),
     _Section(

@@ -11,18 +11,21 @@ from gza.artifacts import store_command_output_artifact
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.db import Task
+from gza.review_scope import parse_spec_coherence_review_scope
 from gza.review_tasks import (
     DuplicateReviewError,
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
+    build_spec_coherence_review_prompt,
     build_review_blocker_adjudication_prompt,
     build_review_blocker_adjudication_prompt_prefix,
     build_auto_review_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
+    create_spec_coherence_review_task,
     create_review_task,
     create_resolution_review_task,
     extract_deferred_blocker_prompt_parts,
@@ -138,6 +141,47 @@ class TestBuildAutoReviewPrompt:
         task = _task(slug="20260410-1234-impl-db-impl-migration")
         result = build_auto_review_prompt(task, known_task_id_suffixes={"1234"})
         assert result == "review db-impl-migration"
+
+
+def test_build_spec_coherence_review_prompt_requires_standard_review_sections() -> None:
+    prompt = build_spec_coherence_review_prompt(
+        _task(id="gza-7392"),
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+
+    assert "Run /gza-spec-coherence for implementation task gza-7392." in prompt
+    assert "`## Summary`" in prompt
+    assert "`## Blockers`" in prompt
+    assert "`## Follow-Ups`" in prompt
+    assert "`## Questions / Assumptions`" in prompt
+    assert "`## Verdict`" in prompt
+    assert "`APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_DISCUSSION`" in prompt
+    assert "write `None.`" in prompt
+
+
+def test_create_spec_coherence_review_task_sets_scope_and_prompt_contract(tmp_path: Path) -> None:
+    _config, store = _make_store(tmp_path)
+    impl = store.add("Update behavior spec", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    store.update(impl)
+
+    review = create_spec_coherence_review_task(
+        store,
+        impl,
+        reviewed_head_sha="head123",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+        trigger_source="advance",
+    )
+
+    persisted = store.get(review.id)
+    assert persisted is not None
+    scope = parse_spec_coherence_review_scope(persisted.review_scope)
+    assert scope is not None
+    assert scope.implementation_task_id == impl.id
+    assert scope.reviewed_head_sha == "head123"
+    assert scope.changed_paths == ("specs/behavior/lifecycle-engine.md",)
+    assert "`## Verdict`" in persisted.prompt
 
     def test_slug_preserves_semantic_impl_subject_api2(self):
         task = _task(slug="20260410-1234-impl-api2-impl-refresh")

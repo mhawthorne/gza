@@ -37,6 +37,7 @@ from ..review_tasks import (
     OffTopicVerifyPersistenceError,
     build_review_blocker_dispute_metadata,
     create_resolution_review_task,
+    create_spec_coherence_review_task,
     persist_review_clearance_artifact,
 )
 from ..runner import (
@@ -249,6 +250,61 @@ def _prepare_resolution_review_action(
         status="created",
         review_task=review_task,
         message=f"Created resolution review task {review_task.id}",
+    )
+
+
+def _prepare_spec_coherence_review_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    action: dict[str, Any],
+    *,
+    trigger_source: str,
+) -> CreateReviewActionResult:
+    raw_head_sha = action.get("review_head_sha")
+    if not isinstance(raw_head_sha, str) or not raw_head_sha.strip():
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message="SKIP: missing behavior-spec coherence reviewed head SHA",
+        )
+    raw_paths = action.get("review_changed_paths")
+    if not isinstance(raw_paths, (tuple, list)):
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message="SKIP: missing behavior-spec coherence changed paths",
+        )
+    changed_paths = tuple(str(path).strip() for path in raw_paths if str(path).strip())
+    if not changed_paths:
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message="SKIP: missing behavior-spec coherence changed paths",
+        )
+    try:
+        review_task = create_spec_coherence_review_task(
+            store,
+            task,
+            reviewed_head_sha=raw_head_sha.strip(),
+            changed_paths=changed_paths,
+            trigger_source=trigger_source,
+        )
+    except DuplicateReviewError as exc:
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=exc.active_review,
+            message=f"SKIP: review {exc.active_review.id} is already {exc.active_review.status}",
+        )
+    except ValueError as exc:
+        return _InlineCreateReviewActionResult(
+            status="skip",
+            review_task=None,
+            message=f"SKIP: {exc}",
+        )
+    return _InlineCreateReviewActionResult(
+        status="created",
+        review_task=review_task,
+        message=f"Created behavior-spec coherence review task {review_task.id}",
     )
 def build_improve_needs_attention_result(
     *,
@@ -1389,6 +1445,13 @@ def execute_advance_action(
             return blocked
         if action.get("review_mode") == "resolution":
             create_result = _prepare_resolution_review_action(
+                context.store,
+                task,
+                action,
+                trigger_source=context.trigger_source,
+            )
+        elif action.get("review_mode") == "spec_coherence":
+            create_result = _prepare_spec_coherence_review_action(
                 context.store,
                 task,
                 action,

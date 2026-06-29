@@ -513,6 +513,17 @@ def _coerce_quiet_seconds(value: object) -> int:
         return 0
 
 
+def _pid_is_alive(pid: int | None) -> bool:
+    """Return whether ``pid`` currently refers to a live local process."""
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def _normalize_db_comparable_value(column: str, value: object) -> object:
     """Normalize DB values before equality checks that include timestamp text."""
     if column in _DB_TIMESTAMP_COLUMN_NAMES:
@@ -903,6 +914,28 @@ class BehaviorCheckFinding:
     generation: int = 1
 
 
+@dataclass(frozen=True)
+class BehaviorCheckFindingObservationPlan:
+    """Pre-filing classification for one observed behavior-check finding."""
+
+    fingerprint: str
+    existing_finding: BehaviorCheckFinding | None
+    dedupable_finding: BehaviorCheckFinding | None
+    should_create_followup: bool
+    next_generation: int
+    prior_linked_task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectLease:
+    """One durable project-scoped lease row."""
+
+    lease_name: str
+    owner_pid: int
+    owner_token: str
+    acquired_at: datetime
+
+
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects": ("created_at", "last_seen_at"),
     "tasks": (
@@ -932,6 +965,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
     "behavior_check_findings": ("first_seen", "last_seen"),
     "parked_task_rearms": ("manual_rearmed_at", "last_auto_attempt_at"),
+    "project_leases": ("acquired_at",),
 }
 _DB_TIMESTAMP_COLUMN_NAMES: frozenset[str] = frozenset(
     column for columns in _DB_TIMESTAMP_COLUMNS.values() for column in columns
@@ -1337,10 +1371,31 @@ CREATE TABLE IF NOT EXISTS behavior_check_findings (
 );
 CREATE INDEX IF NOT EXISTS idx_behavior_check_findings_project_state
     ON behavior_check_findings(project_id, check_name, state, last_seen);
+
+CREATE TABLE IF NOT EXISTS project_leases (
+    project_id TEXT NOT NULL,
+    lease_name TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_token TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, lease_name)
+);
+"""
+
+# Migration from v61 to v62: project-scoped SQLite leases
+MIGRATION_V61_TO_V62 = """
+CREATE TABLE IF NOT EXISTS project_leases (
+    project_id TEXT NOT NULL,
+    lease_name TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_token TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, lease_name)
+);
 """
 
 # Schema version for migrations
-SCHEMA_VERSION = 61
+SCHEMA_VERSION = 62
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -2132,7 +2187,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2476,6 +2531,10 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 "Auto-migration to v61 incomplete: missing required index "
                 "idx_behavior_check_findings_project_state"
             )
+    if target_version >= 62 and not _table_exists(conn, "project_leases"):
+        raise RuntimeError(
+            "Auto-migration to v62 incomplete: missing required table project_leases"
+        )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -2965,6 +3024,30 @@ def _ensure_required_auto_migration_artifacts(
                     "Schema integrity check failed while repairing required index "
                     "idx_behavior_check_findings_project_state: use a writable database."
                 ) from exc
+    if target_version >= 62 and not _table_exists(conn, "project_leases"):
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_leases (
+                    project_id TEXT NOT NULL,
+                    lease_name TEXT NOT NULL,
+                    owner_pid INTEGER NOT NULL,
+                    owner_token TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, lease_name)
+                )
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            if _is_readonly_snapshot_operational_error(exc):
+                raise SchemaIntegrityError(
+                    "Query-only DB open detected missing required table project_leases; "
+                    "use a writable database to complete migration to v62, then retry."
+                ) from exc
+            raise SchemaIntegrityError(
+                "Schema integrity check failed while repairing required table "
+                "project_leases: use a writable database."
+            ) from exc
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -3542,6 +3625,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (59, MIGRATION_V58_TO_V59),
     (60, MIGRATION_V59_TO_V60),
     (61, MIGRATION_V60_TO_V61),
+    (62, MIGRATION_V61_TO_V62),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3804,6 +3888,13 @@ class SqliteTaskStore:
             return self._query_only_table_exists.get("behavior_check_findings", False)
         with self._connect() as conn:
             return _table_exists(conn, "behavior_check_findings")
+
+    def supports_project_leases(self) -> bool:
+        """Return whether project-scoped lease storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("project_leases", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "project_leases")
 
     def default_merge_target(self, *, strict: bool = False) -> str:
         """Resolve the default merge target branch for stored merge units.
@@ -4596,6 +4687,19 @@ class SqliteTaskStore:
             linked_task_id=str(row["linked_task_id"]) if row["linked_task_id"] is not None else None,
             state=str(row["state"]),
             generation=int(row["generation"]),
+        )
+
+    def _row_to_project_lease(self, row: sqlite3.Row | None) -> ProjectLease | None:
+        """Convert a database row to a ProjectLease."""
+        if row is None:
+            return None
+        acquired_at = _parse_db_timestamp(row["acquired_at"])
+        assert acquired_at is not None
+        return ProjectLease(
+            lease_name=str(row["lease_name"]),
+            owner_pid=int(row["owner_pid"]),
+            owner_token=str(row["owner_token"]),
+            acquired_at=acquired_at,
         )
 
     # === Task CRUD ===
@@ -6172,8 +6276,42 @@ class SqliteTaskStore:
         helper. Findings linked to merged or dropped tasks are treated as recurrence
         candidates and therefore do not dedupe the new filing pass.
         """
+        return self.plan_behavior_finding_observation(
+            check_name=check_name,
+            assertion_id=assertion_id,
+            recommendation=recommendation,
+            summary=summary,
+            spec_file=spec_file,
+            spec_section=spec_section,
+        ).dedupable_finding
+
+    def plan_behavior_finding_observation(
+        self,
+        *,
+        check_name: str,
+        assertion_id: str,
+        recommendation: str,
+        summary: str,
+        spec_file: str,
+        spec_section: str,
+    ) -> BehaviorCheckFindingObservationPlan:
+        """Classify an observed finding before filing or refreshing state."""
         if not self.supports_behavior_check_findings():
-            return None
+            fingerprint = behavior_check_finding_fingerprint(
+                check_name=check_name,
+                assertion_id=assertion_id,
+                recommendation=recommendation,
+                summary=summary,
+                spec_file=spec_file,
+                spec_section=spec_section,
+            )
+            return BehaviorCheckFindingObservationPlan(
+                fingerprint=fingerprint,
+                existing_finding=None,
+                dedupable_finding=None,
+                should_create_followup=True,
+                next_generation=1,
+            )
         fingerprint = behavior_check_finding_fingerprint(
             check_name=check_name,
             assertion_id=assertion_id,
@@ -6190,15 +6328,36 @@ class SqliteTaskStore:
                 WHERE project_id = ?
                   AND check_name = ?
                   AND fingerprint = ?
-                  AND state != 'resolved'
                 """,
                 (self._project_id, check_name, fingerprint),
             ).fetchone()
             if row is None:
-                return None
+                return BehaviorCheckFindingObservationPlan(
+                    fingerprint=fingerprint,
+                    existing_finding=None,
+                    dedupable_finding=None,
+                    should_create_followup=True,
+                    next_generation=1,
+                )
+            existing = self._row_to_behavior_check_finding(row)
+            assert existing is not None
             if self._behavior_finding_row_needs_recurrence(conn, row):
-                return None
-        return self._row_to_behavior_check_finding(row)
+                return BehaviorCheckFindingObservationPlan(
+                    fingerprint=fingerprint,
+                    existing_finding=existing,
+                    dedupable_finding=None,
+                    should_create_followup=True,
+                    next_generation=existing.generation + 1,
+                    prior_linked_task_id=existing.linked_task_id,
+                )
+            return BehaviorCheckFindingObservationPlan(
+                fingerprint=fingerprint,
+                existing_finding=existing,
+                dedupable_finding=existing if existing.state != "resolved" else None,
+                should_create_followup=False,
+                next_generation=existing.generation,
+                prior_linked_task_id=existing.linked_task_id,
+            )
 
     def _behavior_finding_linked_task_is_terminal(
         self,
@@ -6392,6 +6551,92 @@ class SqliteTaskStore:
         assert finding is not None
         return finding
 
+    def observe_behavior_finding(
+        self,
+        *,
+        check_name: str,
+        assertion_id: str,
+        recommendation: str,
+        summary: str,
+        spec_file: str,
+        spec_section: str,
+        seen_at: datetime | None = None,
+        report_path: str | None = None,
+    ) -> BehaviorCheckFinding | None:
+        """Refresh an existing finding as observed without creating a new generation."""
+        if not self.supports_behavior_check_findings():
+            return None
+        fingerprint = behavior_check_finding_fingerprint(
+            check_name=check_name,
+            assertion_id=assertion_id,
+            recommendation=recommendation,
+            summary=summary,
+            spec_file=spec_file,
+            spec_section=spec_section,
+        )
+        normalized_summary = _normalize_behavior_finding_summary(summary)
+        seen_at_text = _format_db_timestamp(seen_at or datetime.now(UTC))
+        assert seen_at_text is not None
+        conn = self._require_write_connection()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                """,
+                (self._project_id, check_name, fingerprint),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            conn.execute(
+                """
+                UPDATE behavior_check_findings
+                SET assertion_id = ?,
+                    recommendation = ?,
+                    summary = ?,
+                    last_seen = ?,
+                    last_report_path = ?,
+                    state = 'open'
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                """,
+                (
+                    assertion_id,
+                    recommendation,
+                    normalized_summary,
+                    seen_at_text,
+                    report_path,
+                    self._project_id,
+                    check_name,
+                    fingerprint,
+                ),
+            )
+            updated = conn.execute(
+                """
+                SELECT *
+                FROM behavior_check_findings
+                WHERE project_id = ?
+                  AND check_name = ?
+                  AND fingerprint = ?
+                """,
+                (self._project_id, check_name, fingerprint),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        finding = self._row_to_behavior_check_finding(updated)
+        assert finding is not None
+        return finding
+
     def resolve_absent_behavior_findings(
         self,
         *,
@@ -6459,6 +6704,98 @@ class SqliteTaskStore:
             for row in resolved_rows
             if (finding := self._row_to_behavior_check_finding(row)) is not None
         ]
+
+    def try_acquire_project_lease(
+        self,
+        *,
+        lease_name: str,
+        owner_pid: int,
+        owner_token: str,
+        acquired_at: datetime | None = None,
+    ) -> ProjectLease | None:
+        """Acquire a project-scoped lease, stealing only from dead owners."""
+        if not self.supports_project_leases():
+            raise RuntimeError("project leases are not available on this database")
+        acquired_at_text = _format_db_timestamp(acquired_at or datetime.now(UTC))
+        assert acquired_at_text is not None
+        conn = self._require_write_connection()
+        try:
+            conn.execute("BEGIN")
+            existing = conn.execute(
+                """
+                SELECT *
+                FROM project_leases
+                WHERE project_id = ?
+                  AND lease_name = ?
+                """,
+                (self._project_id, lease_name),
+            ).fetchone()
+            if existing is not None and _pid_is_alive(int(existing["owner_pid"])):
+                conn.rollback()
+                return None
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO project_leases(project_id, lease_name, owner_pid, owner_token, acquired_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (self._project_id, lease_name, owner_pid, owner_token, acquired_at_text),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE project_leases
+                    SET owner_pid = ?, owner_token = ?, acquired_at = ?
+                    WHERE project_id = ?
+                      AND lease_name = ?
+                    """,
+                    (owner_pid, owner_token, acquired_at_text, self._project_id, lease_name),
+                )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM project_leases
+                WHERE project_id = ?
+                  AND lease_name = ?
+                """,
+                (self._project_id, lease_name),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self._row_to_project_lease(row)
+
+    def release_project_lease(
+        self,
+        *,
+        lease_name: str,
+        owner_token: str,
+    ) -> bool:
+        """Release a project-scoped lease only when still owned by ``owner_token``."""
+        if not self.supports_project_leases():
+            raise RuntimeError("project leases are not available on this database")
+        conn = self._require_write_connection()
+        try:
+            conn.execute("BEGIN")
+            cur = conn.execute(
+                """
+                DELETE FROM project_leases
+                WHERE project_id = ?
+                  AND lease_name = ?
+                  AND owner_token = ?
+                """,
+                (self._project_id, lease_name, owner_token),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def list_watch_progress_observations(
         self,

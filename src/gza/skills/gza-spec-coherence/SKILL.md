@@ -145,38 +145,49 @@ Write to `reviews/<timestamp>-spec-coherence.md`.
 Files reviewed: N
 Findings: X overlap · Y restatement · Z cross-reference · A RFC-2119 misuse · B plain-language rewrites
 
-## Findings
-
-### OVERLAP — specs/behavior/lifecycle-engine.md §Shared model
+## Blockers
+### B1
+**Finding:** OVERLAP — `specs/behavior/lifecycle-engine.md` §Shared model
 **Conflicts with:** `specs/behavior/00-overview.md` §Vocabulary / §Core invariants
 **Problem:** Restates shared vocabulary and invariants that `00-overview.md` already owns.
 **What to change:** Replace the restated definitions with a brief cross-reference to
 `00-overview.md`, and keep only engine-specific material here.
 
-### PLAIN-LANGUAGE — specs/behavior/<file>.md §<section>
-**Clause:** "<original clause>"
-**Why it is too wordy:** <short reason>
-**Tighter rewrite:** "<shorter clause>"
-
-### RFC-2119 — specs/behavior/<file>.md §<section>
+### B2
+**Finding:** RFC-2119 — `specs/behavior/<file>.md` §<section>
 **Problem:** Uses `MUST` for rationale / omits `MUST` where the sentence is contract.
 **What to change:** <concrete rewrite guidance>
 
-### CROSS-REFERENCE — specs/behavior/<file>.md §<section>
-**Problem:** Missing or broken pointer to the owning file/section.
-**What to change:** <exact link or ownership reference to add/fix>
+## Follow-Ups
+- PLAIN-LANGUAGE — `specs/behavior/<file>.md` §<section>
+  Quote the clause, explain why it is too wordy, and propose a tighter rewrite.
+- CROSS-REFERENCE — `specs/behavior/<file>.md` §<section>
+  Name the missing or broken pointer to the owning file/section and the exact fix.
+- Resolved / clean boundaries:
+  - `00-overview.md` ↔ `lifecycle-engine.md`: shared vocabulary is owned once and referenced, not restated.
 
-## Resolved / clean boundaries
+## Questions / Assumptions
+- None.
 
-| File or boundary | Evidence |
-|------------------|----------|
-| `00-overview.md` ↔ `lifecycle-engine.md` | Shared vocabulary is owned once and referenced, not restated |
-
-## Recommendations
-1. Fix authoritative overlap first; duplicate ownership makes every later edit risky.
-2. Replace repeated shared rules with cross-references to the owning file.
-3. Tighten long normative clauses only after ownership is clear, so you do not rewrite two copies.
+## Verdict
+Verdict: CHANGES_REQUESTED
 ```
+
+The report **must** use this standard review shape exactly:
+
+- `## Summary`
+- `## Blockers`
+- `## Follow-Ups`
+- `## Questions / Assumptions`
+- `## Verdict`
+
+The final verdict must be exactly one of:
+
+- `APPROVED`
+- `CHANGES_REQUESTED`
+- `NEEDS_DISCUSSION`
+
+If a section has nothing to report, write `None.` under that heading instead of omitting it.
 
 ## Rules
 

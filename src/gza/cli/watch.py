@@ -21,10 +21,11 @@ from .. import colors as _colors, lineage
 from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
 from ..canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canonical_checkout_invariant
 from ..concurrency import (
+    ConcurrencySnapshot,
     LaunchPermit,
     MaxConcurrentTasksError,
     _collect_live_running_state as _shared_collect_live_running_state,
-    get_concurrency_snapshot,
+    get_concurrency_snapshot as _shared_get_concurrency_snapshot,
     launch_permit,
     release_task_launch_permit,
     reserve_task_launch_permit,
@@ -2117,7 +2118,53 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
 
 def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str], int]:
     live_pids, running_task_ids, anonymous_worker_count = _shared_collect_live_running_state(config, store)
-    return live_pids, list(running_task_ids), anonymous_worker_count
+    hidden_internal_pids: set[int] = set()
+    visible_task_ids: list[str] = []
+    for task_id in running_task_ids:
+        task = store.get(task_id)
+        if task is not None and task.task_type == "internal" and "behavior-monitor" in task.tags:
+            if task.running_pid is not None:
+                hidden_internal_pids.add(task.running_pid)
+            continue
+        visible_task_ids.append(task_id)
+    filtered_live_pids = {pid for pid in live_pids if pid not in hidden_internal_pids}
+    return filtered_live_pids, visible_task_ids, anonymous_worker_count
+
+
+def get_concurrency_snapshot(
+    config: Config,
+    store: SqliteTaskStore,
+    *,
+    current_pid: int | None = None,
+    cleanup_stale: bool = True,
+) -> ConcurrencySnapshot:
+    """Return watch-local occupancy while hiding behavior-monitor internal work."""
+    snapshot = _shared_get_concurrency_snapshot(
+        config,
+        store,
+        current_pid=current_pid,
+        cleanup_stale=cleanup_stale,
+    )
+    hidden_internal_pids: set[int] = set()
+    visible_task_ids: list[str] = []
+    for task_id in snapshot.running_task_ids:
+        task = store.get(task_id)
+        if task is not None and task.task_type == "internal" and "behavior-monitor" in task.tags:
+            if task.running_pid is not None:
+                hidden_internal_pids.add(task.running_pid)
+            continue
+        visible_task_ids.append(task_id)
+    filtered_live_pids = frozenset(pid for pid in snapshot.live_pids if pid not in hidden_internal_pids)
+    running = len(filtered_live_pids)
+    return ConcurrencySnapshot(
+        limit=snapshot.limit,
+        running=running,
+        available=max(0, snapshot.limit - running),
+        live_pids=filtered_live_pids,
+        running_task_ids=tuple(visible_task_ids),
+        anonymous_worker_count=snapshot.anonymous_worker_count,
+        current_pid_counted=bool(current_pid and current_pid in filtered_live_pids),
+    )
 
 
 def _format_wake_message(
@@ -3533,7 +3580,7 @@ def _build_watch_cycle_plan(
     scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> _WatchCyclePlan:
     snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
-    running_task_ids = tuple(snapshot.running_task_ids)
+    running_task_ids = snapshot.running_task_ids
     pending_count = 0 if scoped_owner_ids is not None else len(_pending_runnable_tasks(store, tags=tags, any_tag=any_tag))
     blocked_pending_count = (
         0
@@ -3547,7 +3594,7 @@ def _build_watch_cycle_plan(
         )
     )
     running = snapshot.running
-    effective_batch = min(batch, snapshot.limit)
+    effective_batch = min(batch, config.max_concurrent)
     slots = max(0, effective_batch - running)
     git = Git(config.project_dir)
     analysis = _analyze_watch_cycle(

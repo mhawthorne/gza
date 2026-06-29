@@ -152,6 +152,7 @@ class TestHelpOutput:
         advance_help = invoke_gza("advance", "--help", "--project", str(tmp_path))
         watch_help = invoke_gza("watch", "--help", "--project", str(tmp_path))
         main_verify_help = invoke_gza("main-verify", "--help", "--project", str(tmp_path))
+        behavior_monitor_help = invoke_gza("behavior-monitor", "--help", "--project", str(tmp_path))
 
         assert next_help.returncode == 0
         assert "recovery, lifecycle, and pending lanes separately" in next_help.stdout
@@ -167,6 +168,10 @@ class TestHelpOutput:
         assert "run recovery, lifecycle, and pending pickup" in watch_help.stdout
         assert main_verify_help.returncode == 0
         assert "Force a fresh local main verify run now" in main_verify_help.stdout
+        assert behavior_monitor_help.returncode == 0
+        assert "host-side behavior conformance monitor" in behavior_monitor_help.stdout
+        assert "--dry-run" in behavior_monitor_help.stdout
+        assert "--force" in behavior_monitor_help.stdout
 
     def test_retry_help_describes_no_docker_for_background_and_immediate_runs(self, tmp_path: Path) -> None:
         setup_config(tmp_path)

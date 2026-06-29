@@ -48,7 +48,7 @@ from gza.plan_review_materialization import (
 )
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
-from gza.review_scope import build_resolution_review_scope
+from gza.review_scope import build_resolution_review_scope, build_spec_coherence_review_scope
 from gza.review_tasks import OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.review_verify_state import refresh_preserved_rebase_review_verify_heads
@@ -9950,7 +9950,6 @@ def test_noop_improve_limit_surfaces_branch_tip_probe_failure_and_skips_verify_a
     assert action["probe_warning"] == ctx.noop_improve_verify_probe_warning
     assert "branch-head probe failed" in action["description"]
     assert "verify-only auto-clear could not be validated" in action["description"]
-    assert git.name_status_calls == []
 
 
 def test_verify_only_noop_recovery_requires_successful_current_head_probe(tmp_path: Path) -> None:
@@ -14365,6 +14364,13 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         has_non_dropped_implement_descendant=False,
         auto_implement_enabled=False,
         merge_source_warning="feature branch diverged",
+        spec_coherence_required=False,
+        spec_coherence_changed_paths=(),
+        spec_coherence_inspection_error=None,
+        spec_coherence_active_review=None,
+        spec_coherence_latest_completed_review=None,
+        spec_coherence_review_verdict=None,
+        spec_coherence_review_current=False,
         strict_scope_inspection_error="fatal: bad revision",
         post_merge_rebase_state=SimpleNamespace(
             already_merged=False,
@@ -14467,10 +14473,13 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "plan_review_manual_creation_required",
         "plan_review_needs_discussion",
         "explore_needs_followup_decision",
-        "merge_source_needs_manual_resolution",
-        "strict_project_scope_unverified",
-        "strict_project_scope_violation",
-        "conflict_rebase_failure_circuit_breaker",
+            "merge_source_needs_manual_resolution",
+            "strict_project_scope_unverified",
+                "strict_project_scope_violation",
+                "spec_coherence_diff_unverified",
+                "spec_coherence_needs_discussion",
+                "spec_coherence_unknown_verdict",
+                "conflict_rebase_failure_circuit_breaker",
         "conflict_rebase_failed",
         "conflict_rebase_completed_but_still_blocked",
             "already_rebased_but_lineage_incomplete",
@@ -15333,6 +15342,482 @@ def test_mergeable_behind_branch_keeps_review_flow(tmp_path: Path) -> None:
 
     assert action["type"] == "create_review"
     assert classify_advance_action(action) == "actionable"
+
+
+def test_spec_coherence_touch_creates_coherence_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-create",
+        when=datetime(2026, 6, 1, 10, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "create-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "spec_coherence"
+    assert action["review_head_sha"] == "create-head"
+    assert action["review_changed_paths"] == ("specs/behavior/lifecycle-engine.md",)
+
+
+def test_spec_coherence_diff_inspection_failure_parks_before_merge(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.enforce_project_scope = False
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-diff-error",
+        when=datetime(2026, 6, 1, 11, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "diff-error-head"},
+        name_status_error_by_range={f"main...{impl.branch}": RuntimeError("diff inspection failed")},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "spec-coherence-diff-unverified"
+    assert "diff inspection failed" in action["description"]
+
+
+def test_spec_coherence_spec_diff_with_head_probe_warning_parks_before_merge(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.enforce_project_scope = False
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-head-warning",
+        when=datetime(2026, 6, 1, 11, 30, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+        rev_parse_errors={impl.branch: RuntimeError("head probe failed")},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "spec-coherence-diff-unverified"
+    assert "head probe failed" in action["description"]
+
+
+def test_spec_coherence_touch_reuses_pending_coherence_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-reuse",
+        when=datetime(2026, 6, 2, 10, 0, tzinfo=UTC),
+    )
+    review = store.add("Run /gza-spec-coherence", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.review_scope = "spec-coherence"
+    review.status = "pending"
+    store.update(review)
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "reuse-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "run_review"
+    assert action["review_task"].id == review.id
+
+
+def test_spec_coherence_stale_approval_after_later_spec_edit_creates_refresh_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-stale",
+        when=datetime(2026, 6, 3, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 3, 11, 0, tzinfo=UTC))
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="new-head",
+        changed_paths=("specs/behavior/other.md",),
+    )
+    review.review_verify_head_sha = "new-head"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "new-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "spec_coherence"
+
+
+def test_spec_coherence_approved_review_without_structured_scope_refreshes_instead_of_merging(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-missing-scope",
+        when=datetime(2026, 6, 3, 12, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 3, 13, 0, tzinfo=UTC))
+    review.review_scope = "spec-coherence"
+    review.review_verify_head_sha = "approved-head"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "approved-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "spec_coherence"
+
+
+def test_spec_coherence_approved_branch_can_continue(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-approved",
+        when=datetime(2026, 6, 4, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 4, 11, 0, tzinfo=UTC))
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="approved-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    review.review_verify_head_sha = "approved-head"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "approved-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "merge"
+
+
+def test_spec_coherence_changes_requested_routes_through_improve(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-changes",
+        when=datetime(2026, 6, 5, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 5, 11, 0, tzinfo=UTC))
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="changes-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    review.review_verify_head_sha = "changes-head"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "changes-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "improve"
+    assert action["review_task"].id == review.id
+
+
+def test_spec_coherence_needs_discussion_parks_with_stable_reason(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-discussion",
+        when=datetime(2026, 6, 6, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 6, 11, 0, tzinfo=UTC))
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="discussion-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    review.review_verify_head_sha = "discussion-head"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(
+            verdict="NEEDS_DISCUSSION",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "discussion-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "spec-coherence-needs-discussion"
+
+
+def test_spec_coherence_unknown_verdict_parks_with_stable_reason(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-unknown",
+        when=datetime(2026, 6, 6, 12, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 6, 13, 0, tzinfo=UTC))
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="unknown-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    review.review_verify_head_sha = "unknown-head"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, task: ParsedReviewReport(
+            verdict=None,
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "unknown-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "spec-coherence-unknown-verdict"
+    assert action["review_task"].id == review.id
+
+
+def test_spec_coherence_pending_ordinary_review_runs_before_create(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-pending-ordinary",
+        when=datetime(2026, 6, 6, 14, 0, tzinfo=UTC),
+    )
+    review = store.add("Run ordinary review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "pending"
+    store.update(review)
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "pending-ordinary-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "run_review"
+    assert action["review_task"].id == review.id
+    assert "before creating the behavior-spec coherence review" in action["description"]
+
+
+def test_spec_coherence_in_progress_ordinary_review_waits_before_create(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-running-ordinary",
+        when=datetime(2026, 6, 6, 15, 0, tzinfo=UTC),
+    )
+    review = store.add("Run ordinary review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "in_progress"
+    store.update(review)
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "running-ordinary-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "wait_review"
+    assert action["review_task"].id == review.id
+    assert "before creating the behavior-spec coherence review" in action["description"]
+
+
+def test_spec_coherence_creates_review_after_ordinary_review_completes(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-after-ordinary",
+        when=datetime(2026, 6, 6, 16, 0, tzinfo=UTC),
+    )
+    review = store.add("Run ordinary review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 6, 17, 0, tzinfo=UTC)
+    store.update(review)
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "after-ordinary-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "spec_coherence"
+    assert action["review_changed_paths"] == ("specs/behavior/lifecycle-engine.md",)
+
+
+def test_non_spec_branch_bypasses_spec_coherence_gate(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/non-spec-branch",
+        when=datetime(2026, 6, 7, 10, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/config.py\n"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "merge"
+
+
+def test_non_spec_branch_with_head_probe_warning_bypasses_spec_coherence_gate(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/non-spec-head-warning",
+        when=datetime(2026, 6, 7, 10, 30, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={f"main...{impl.branch}": "M\tsrc/gza/config.py\n"},
+        rev_parse_errors={impl.branch: RuntimeError("head probe failed")},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "merge"
 
 
 def test_stale_conflicting_branch_only_emits_needs_rebase_when_selected_for_merge(tmp_path: Path) -> None:

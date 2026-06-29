@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -67,8 +68,14 @@ from gza.review_clearance import (
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
     is_verify_only_noop_review_clearance_status,
 )
-from gza.review_scope import ResolutionReviewScope, parse_resolution_review_scope
+from gza.review_scope import (
+    ResolutionReviewScope,
+    declares_spec_coherence_review_mode,
+    parse_resolution_review_scope,
+    parse_spec_coherence_review_scope,
+)
 from gza.review_tasks import (
+    SPEC_COHERENCE_REVIEW_SCOPE,
     build_review_blocker_dispute_metadata,
     find_existing_review_blocker_adjudication_task,
     persist_off_topic_verify_clearance,
@@ -342,6 +349,14 @@ class AdvanceContext:
     post_merge_rebase_state: PostMergeRebaseState | None = None
     merge_state: str | None = None
     can_merge: bool = True
+    spec_coherence_required: bool = False
+    spec_coherence_changed_paths: tuple[str, ...] = ()
+    spec_coherence_current_head_sha: str | None = None
+    spec_coherence_inspection_error: str | None = None
+    spec_coherence_active_review: DbTask | None = None
+    spec_coherence_latest_completed_review: DbTask | None = None
+    spec_coherence_review_verdict: str | None = None
+    spec_coherence_review_current: bool = False
     strict_scope_violation_paths: tuple[str, ...] = ()
     strict_scope_inspection_error: str | None = None
     rebase_pending_or_running: DbTask | None = None
@@ -447,6 +462,15 @@ class StrictScopeInspection:
     """Resolved strict-scope inspection state for advance-time gating."""
 
     violation_paths: tuple[str, ...] = ()
+    inspection_error: str | None = None
+
+
+@dataclass(frozen=True)
+class SpecCoherenceInspection:
+    """Resolved behavior-spec coherence gate state for one branch."""
+
+    required: bool = False
+    changed_paths: tuple[str, ...] = ()
     inspection_error: str | None = None
 
 
@@ -2782,6 +2806,53 @@ def _resolve_strict_scope_inspection(
     )
 
 
+def _matches_spec_coherence_path(path: str, patterns: tuple[str, ...]) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    return any(fnmatchcase(normalized, pattern) for pattern in patterns)
+
+
+def _resolve_spec_coherence_inspection(
+    config: Any,
+    git: Any,
+    task: DbTask,
+    *,
+    merge_source_ref: str | None,
+    target_branch: str,
+) -> SpecCoherenceInspection:
+    """Return whether the branch diff triggers the behavior-spec coherence gate."""
+    spec_config = getattr(config, "spec_coherence", None)
+    if not getattr(spec_config, "enabled", False):
+        return SpecCoherenceInspection()
+    patterns = tuple(getattr(spec_config, "paths", ()) or ())
+    if not patterns or task.task_type != "implement" or not merge_source_ref:
+        return SpecCoherenceInspection()
+
+    revision_range = f"{target_branch}...{merge_source_ref}"
+    try:
+        name_status_output = git.get_diff_name_status(revision_range, check=True)
+    except Exception as exc:
+        detail = " ".join(str(exc).split())
+        _LOG.warning(
+            "Failed to inspect branch diff for spec coherence (%s): %s",
+            revision_range,
+            detail,
+        )
+        return SpecCoherenceInspection(required=True, inspection_error=detail)
+
+    parsed_name_status = parse_name_status_project_paths(name_status_output or "")
+    if not parsed_name_status.changed_paths:
+        return SpecCoherenceInspection()
+
+    matched_paths = tuple(
+        path
+        for path in parsed_name_status.changed_paths
+        if _matches_spec_coherence_path(path, patterns)
+    )
+    if not matched_paths:
+        return SpecCoherenceInspection()
+    return SpecCoherenceInspection(required=True, changed_paths=matched_paths)
+
+
 def _strict_scope_violation_action(ctx: AdvanceContext) -> dict[str, Any]:
     violation_paths = tuple(getattr(ctx, "strict_scope_violation_paths", ()))
     paths = ", ".join(violation_paths)
@@ -4227,6 +4298,50 @@ def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> 
     return None
 
 
+def _spec_coherence_reviews(reviews: list[DbTask] | None) -> list[DbTask]:
+    return [
+        review
+        for review in (reviews or [])
+        if (review.review_scope or "").strip() == SPEC_COHERENCE_REVIEW_SCOPE
+        or declares_spec_coherence_review_mode(review.review_scope)
+    ]
+
+
+def _latest_completed_spec_coherence_review(
+    reviews: list[DbTask] | None,
+) -> DbTask | None:
+    completed = [review for review in _spec_coherence_reviews(reviews) if review.status == "completed"]
+    return completed[0] if completed else None
+
+
+def _active_spec_coherence_review(reviews: list[DbTask] | None) -> DbTask | None:
+    active = [review for review in _spec_coherence_reviews(reviews) if review.status in {"pending", "in_progress"}]
+    return _select_active_review(active)
+
+
+def _spec_coherence_review_is_current(
+    *,
+    review: DbTask | None,
+    current_head_sha: str | None,
+    current_changed_paths: tuple[str, ...],
+) -> bool:
+    if review is None:
+        return False
+    if not current_head_sha:
+        return False
+    try:
+        metadata = parse_spec_coherence_review_scope(review.review_scope)
+    except ValueError:
+        return False
+    if metadata is None:
+        return False
+    return (
+        review.review_verify_head_sha == current_head_sha
+        and metadata.reviewed_head_sha == current_head_sha
+        and metadata.changed_paths == current_changed_paths
+    )
+
+
 def _is_implementation_owned_lineage(ctx: AdvanceContext) -> bool:
     """Whether this lineage inherits merge review gating from an implementation root."""
     return (ctx.review_root_task or ctx.task).task_type == "implement"
@@ -4326,6 +4441,77 @@ def _review_freshness_probe_failed(ctx: AdvanceContext) -> bool:
     if ctx.active_review is not None:
         return False
     return True
+
+
+def _spec_coherence_gate_required(ctx: AdvanceContext) -> bool:
+    return bool(ctx.spec_coherence_required)
+
+
+def _spec_coherence_gate_currently_approved(ctx: AdvanceContext) -> bool:
+    return (
+        ctx.spec_coherence_required
+        and ctx.spec_coherence_latest_completed_review is not None
+        and ctx.spec_coherence_current_head_sha is not None
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_review_verdict == "APPROVED"
+    )
+
+
+def _spec_coherence_gate_needs_attention(ctx: AdvanceContext) -> dict[str, Any]:
+    detail = getattr(ctx, "spec_coherence_inspection_error", None) or "unknown diff inspection failure"
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                "SKIP: behavior-spec coherence gate could not verify the current branch diff. "
+                f"Inspection error: {detail}"
+            ),
+        },
+        reason="spec-coherence-diff-unverified",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _spec_coherence_needs_discussion_action(ctx: AdvanceContext) -> dict[str, Any]:
+    verdict = getattr(ctx, "spec_coherence_review_verdict", None)
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: behavior-spec coherence review verdict is "
+                f"{verdict or 'unknown'}; manual discussion is required"
+            ),
+            "review_task": getattr(ctx, "spec_coherence_latest_completed_review", None),
+        },
+        reason="spec-coherence-needs-discussion",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _spec_coherence_unknown_verdict_action(ctx: AdvanceContext) -> dict[str, Any]:
+    verdict = getattr(ctx, "spec_coherence_review_verdict", None)
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                "SKIP: behavior-spec coherence review verdict is unknown or unparseable"
+                f" ({verdict or 'missing'}); manual discussion is required"
+            ),
+            "review_task": getattr(ctx, "spec_coherence_latest_completed_review", None),
+        },
+        reason="spec-coherence-unknown-verdict",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _spec_coherence_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
+    return {
+        "type": "create_review",
+        "description": "Create behavior-spec coherence review",
+        "review_mode": "spec_coherence",
+        "review_head_sha": getattr(ctx, "spec_coherence_current_head_sha", None),
+        "review_changed_paths": getattr(ctx, "spec_coherence_changed_paths", ()),
+    }
 
 
 def _closing_review_invariant_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -4530,6 +4716,37 @@ def _resolve_pre_closing_review_git_context(
         or merge_state_is_terminal_for_lifecycle(merge_state)
         or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
     )
+    current_impl_head_sha: str | None = None
+    current_impl_head_probe_warning: str | None = None
+    if (
+        strict_scope_inspection.inspection_error is not None
+        or strict_scope_inspection.violation_paths
+        or post_merge_rebase_state.already_merged
+        or merge_state_is_terminal_for_lifecycle(merge_state)
+        or not can_merge
+    ):
+        spec_coherence_inspection = SpecCoherenceInspection()
+    else:
+        if getattr(getattr(config, "spec_coherence", None), "enabled", False):
+            current_impl_head_sha, current_impl_head_probe_warning = _resolve_current_review_head_state()
+        spec_coherence_inspection = _resolve_spec_coherence_inspection(
+            config,
+            git,
+            review_root_task,
+            merge_source_ref=merge_source.ref,
+            target_branch=target_branch,
+        )
+        if spec_coherence_inspection.required:
+            if current_impl_head_probe_warning is not None:
+                spec_coherence_inspection = replace(
+                    spec_coherence_inspection,
+                    inspection_error=current_impl_head_probe_warning,
+                )
+            elif current_impl_head_sha is None:
+                spec_coherence_inspection = replace(
+                    spec_coherence_inspection,
+                    inspection_error="could not resolve current implementation head for spec coherence gate",
+                )
     rebase_root_task = review_root_task if review_root_task.task_type == "implement" else task
     assert rebase_root_task.id is not None
     rebase_children = _get_same_branch_rebase_descendants_for_root(store, rebase_root_task)
@@ -4565,6 +4782,20 @@ def _resolve_pre_closing_review_git_context(
     current_review_head_probe_warning: str | None = None
     if ctx.latest_completed_review is not None and latest_reviewed_head_sha is not None:
         current_review_head_sha, current_review_head_probe_warning = _resolve_current_review_head_state()
+
+    spec_coherence_active_review = _active_spec_coherence_review(ctx.reviews)
+    spec_coherence_latest_completed_review = _latest_completed_spec_coherence_review(ctx.reviews)
+    spec_coherence_review_verdict: str | None = None
+    if spec_coherence_latest_completed_review is not None:
+        spec_coherence_review_verdict = get_review_report(
+            Path(config.project_dir),
+            spec_coherence_latest_completed_review,
+        ).verdict
+    spec_coherence_review_current = _spec_coherence_review_is_current(
+        review=spec_coherence_latest_completed_review,
+        current_head_sha=current_impl_head_sha,
+        current_changed_paths=spec_coherence_inspection.changed_paths,
+    )
     if (
         latest_completed_rebase is not None
         and ctx.latest_completed_review is not None
@@ -4696,6 +4927,18 @@ def _resolve_pre_closing_review_git_context(
         post_merge_rebase_state=post_merge_rebase_state,
         merge_state=merge_state,
         can_merge=can_merge,
+        spec_coherence_required=spec_coherence_inspection.required,
+        spec_coherence_changed_paths=spec_coherence_inspection.changed_paths,
+        spec_coherence_current_head_sha=current_impl_head_sha,
+        spec_coherence_inspection_error=(
+            current_impl_head_probe_warning
+            if current_impl_head_probe_warning is not None
+            else spec_coherence_inspection.inspection_error
+        ),
+        spec_coherence_active_review=spec_coherence_active_review,
+        spec_coherence_latest_completed_review=spec_coherence_latest_completed_review,
+        spec_coherence_review_verdict=spec_coherence_review_verdict,
+        spec_coherence_review_current=spec_coherence_review_current,
         strict_scope_violation_paths=strict_scope_inspection.violation_paths,
         strict_scope_inspection_error=strict_scope_inspection.inspection_error,
         rebase_pending_or_running=rebase_pending_or_running,
@@ -5535,6 +5778,128 @@ ADVANCE_RULES: list[AdvanceRule] = [
         name="strict_project_scope_violation",
         matches=lambda ctx: bool(ctx.strict_scope_violation_paths),
         action=_strict_scope_violation_action,
+    ),
+    AdvanceRule(
+        name="spec_coherence_diff_unverified",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx) and ctx.spec_coherence_inspection_error is not None,
+        action=_spec_coherence_gate_needs_attention,
+    ),
+    AdvanceRule(
+        name="spec_coherence_run_pending_review",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and not _spec_coherence_gate_currently_approved(ctx)
+        and ctx.spec_coherence_active_review is not None
+        and ctx.spec_coherence_active_review.status == "pending",
+        action=lambda ctx: {
+            "type": "run_review",
+            "description": f"Run pending behavior-spec coherence review {_task_id(ctx.spec_coherence_active_review)}",
+            "review_task": ctx.spec_coherence_active_review,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_wait_review",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and not _spec_coherence_gate_currently_approved(ctx)
+        and ctx.spec_coherence_active_review is not None
+        and ctx.spec_coherence_active_review.status == "in_progress",
+        action=lambda ctx: {
+            "type": "wait_review",
+            "description": f"SKIP: behavior-spec coherence review {_task_id(ctx.spec_coherence_active_review)} is in_progress",
+            "review_task": ctx.spec_coherence_active_review,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_wait_improve",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+        and ctx.active_improve_running is not None,
+        action=lambda ctx: {
+            "type": "wait_improve",
+            "description": f"SKIP: improve task {_task_id(ctx.active_improve_running)} is in_progress",
+            "improve_task": ctx.active_improve_running,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_run_pending_improve",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+        and ctx.active_improve_pending is not None,
+        action=lambda ctx: {
+            "type": "run_improve",
+            "description": f"Spawn worker for pending improve {_task_id(ctx.active_improve_pending)}",
+            "improve_task": ctx.active_improve_pending,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_create_improve",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED",
+        action=lambda ctx: {
+            "type": "improve",
+            "description": "Create improve task (behavior-spec coherence review CHANGES_REQUESTED)",
+            "review_task": ctx.spec_coherence_latest_completed_review,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_needs_discussion",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_review_verdict == "NEEDS_DISCUSSION",
+        action=_spec_coherence_needs_discussion_action,
+    ),
+    AdvanceRule(
+        name="spec_coherence_unknown_verdict",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_latest_completed_review is not None
+        and ctx.spec_coherence_review_verdict not in {
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "NEEDS_DISCUSSION",
+        },
+        action=_spec_coherence_unknown_verdict_action,
+    ),
+    AdvanceRule(
+        name="spec_coherence_run_pending_ordinary_review",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and not _spec_coherence_gate_currently_approved(ctx)
+        and ctx.spec_coherence_active_review is None
+        and ctx.active_review is not None
+        and ctx.active_review.status == "pending",
+        action=lambda ctx: {
+            "type": "run_review",
+            "description": (
+                f"Run pending review {_task_id(ctx.active_review)} before creating the "
+                "behavior-spec coherence review"
+            ),
+            "review_task": ctx.active_review,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_wait_ordinary_review",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and not _spec_coherence_gate_currently_approved(ctx)
+        and ctx.spec_coherence_active_review is None
+        and ctx.active_review is not None
+        and ctx.active_review.status == "in_progress",
+        action=lambda ctx: {
+            "type": "wait_review",
+            "description": (
+                f"SKIP: review {_task_id(ctx.active_review)} is in_progress before creating the "
+                "behavior-spec coherence review"
+            ),
+            "review_task": ctx.active_review,
+        },
+    ),
+    AdvanceRule(
+        name="spec_coherence_create_review",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and not _spec_coherence_gate_currently_approved(ctx)
+        and ctx.spec_coherence_active_review is None,
+        action=_spec_coherence_create_review_action,
     ),
     AdvanceRule(
         name="conflict_rebase_running",

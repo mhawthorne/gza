@@ -16,7 +16,11 @@ from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
 from .prompts import PromptBuilder
 from .rebase_diff import parse_rebase_diff_provenance
-from .review_scope import build_resolution_review_scope, resolve_review_scope_for_impl
+from .review_scope import (
+    build_resolution_review_scope,
+    build_spec_coherence_review_scope,
+    resolve_review_scope_for_impl,
+)
 from .review_verdict import ReviewFinding
 from .task_slug import (
     extract_task_id_suffix,
@@ -56,6 +60,7 @@ _DISPUTE_SOURCE_TASK_ID_RE = re.compile(r"^Dispute source task:\s*(\S+)\s*$", re
 
 OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND = "off_topic_verify_investigation"
 OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES = frozenset({"pending", "in_progress"})
+SPEC_COHERENCE_REVIEW_SCOPE = "spec-coherence"
 
 
 class DuplicateReviewError(ValueError):
@@ -196,6 +201,87 @@ def create_review_task(
         based_on=impl_task.id,
         enforce_single_active_sibling=True,
         review_scope=resolved_scope.summary if resolved_scope is not None else None,
+        model=model,
+        provider=provider,
+        trigger_source=trigger_source,
+    )
+    impl_unit = store.resolve_merge_unit_for_task(impl_task.id)
+    if impl_unit is not None:
+        store.get_or_create_merge_unit_for_task(review_task)
+    return review_task
+
+
+def build_spec_coherence_review_prompt(
+    impl_task: Task,
+    *,
+    changed_paths: Iterable[str],
+) -> str:
+    """Build the behavior-spec coherence review prompt for one implementation branch."""
+    scope_lines = "\n".join(f"- `{path}`" for path in changed_paths)
+    return (
+        f"Run /gza-spec-coherence for implementation task {impl_task.id}.\n\n"
+        "This is the branch-scoped behavior-spec coherence gate.\n"
+        "Review only the branch diff under the configured behavior-spec paths against the rest of the behavior-spec set.\n\n"
+        "Write the report using the standard review output contract:\n"
+        "- `## Summary`\n"
+        "- `## Blockers`\n"
+        "- `## Follow-Ups`\n"
+        "- `## Questions / Assumptions`\n"
+        "- `## Verdict`\n"
+        "The final verdict must be exactly one of `APPROVED`, `CHANGES_REQUESTED`, or `NEEDS_DISCUSSION`.\n"
+        "Do not omit empty sections; write `None.` when a section has no entries.\n\n"
+        "Changed behavior-spec paths in scope:\n"
+        f"{scope_lines}\n"
+    )
+
+
+def create_spec_coherence_review_task(
+    store: SqliteTaskStore,
+    impl_task: Task,
+    *,
+    reviewed_head_sha: str,
+    changed_paths: Iterable[str],
+    trigger_source: str,
+    model: str | None = None,
+    provider: str | None = None,
+) -> Task:
+    """Create the dedicated behavior-spec coherence review task for an implementation."""
+    if impl_task.task_type != "implement":
+        raise ValueError(
+            f"Task {impl_task.id} is a {impl_task.task_type} task. Expected an implementation task."
+        )
+    if impl_task.status != "completed":
+        raise ValueError(
+            f"Task {impl_task.id} is {impl_task.status}. Can only review completed tasks."
+        )
+    if impl_task.id is None:
+        raise ValueError("Cannot create review for task without an ID.")
+
+    normalized_head_sha = reviewed_head_sha.strip()
+    if not normalized_head_sha:
+        raise ValueError("Spec coherence review requires the current reviewed head SHA.")
+
+    changed = tuple(dict.fromkeys(path.strip() for path in changed_paths if str(path).strip()))
+    if not changed:
+        raise ValueError("Spec coherence review requires at least one changed behavior-spec path.")
+
+    existing_reviews = store.get_reviews_for_task(impl_task.id)
+    active_reviews = [r for r in existing_reviews if r.status in ("pending", "in_progress")]
+    if active_reviews:
+        raise DuplicateReviewError(active_reviews[0])
+
+    review_task = store.add(
+        prompt=build_spec_coherence_review_prompt(impl_task, changed_paths=changed),
+        task_type="review",
+        depends_on=impl_task.id,
+        tags=resolve_derived_task_tags(impl_task),
+        based_on=impl_task.id,
+        enforce_single_active_sibling=True,
+        review_scope=build_spec_coherence_review_scope(
+            implementation_task_id=impl_task.id,
+            reviewed_head_sha=normalized_head_sha,
+            changed_paths=changed,
+        ),
         model=model,
         provider=provider,
         trigger_source=trigger_source,
