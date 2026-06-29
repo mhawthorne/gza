@@ -13,6 +13,7 @@ import gza.recovery_engine as recovery_engine
 from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.db import SqliteTaskStore
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
 from gza.query import TaskLineageNode
@@ -338,6 +339,75 @@ def test_incomplete_preset_projects_verify_only_noop_recovery_without_persisting
 
     assert projected.values["next_action"] == "needs_discussion"
     assert projected.values["next_action_noop_improve_kind"] == "verify_only"
+
+
+def test_history_projection_verify_fields_use_canonical_owner_artifact(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+
+    impl = store.add("Implement query verify owner", task_type="implement")
+    assert impl.id is not None
+
+    review = store.add("Review query verify owner", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    review.review_verify_command = "./bin/tests"
+    review.review_verify_status = "failed"
+    review.review_verify_exit_status = "9"
+    review.review_verify_captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    review.review_verify_branch = "feature/query-verify"
+    review.review_verify_head_sha = "head-1"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch="feature/query-verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/verify-owner",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    service = TaskQueryService(store)
+    result = service.run(
+        TaskQuery(
+            scope="tasks",
+            limit=None,
+            task_types=("review",),
+            projection=ProjectionSpec(
+                fields=("id", "verify_status", "verify_exit_status", "verify_source", "verify_current"),
+            ),
+            presentation=PresentationSpec(mode="json"),
+        ),
+        config=config,
+    )
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert isinstance(row, TaskRow)
+    assert row.values["verify_status"] == "passed"
+    assert row.values["verify_exit_status"] == "0"
+    assert row.values["verify_source"] == "owner_artifact"
+    assert row.values["verify_current"] is True
 
 
 def test_incomplete_query_uses_one_read_session_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

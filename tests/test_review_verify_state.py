@@ -11,6 +11,8 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     make_verify_epoch,
     persist_verify_gate_artifact,
+    resolve_verify_read_model,
+    review_task_verify_epoch,
 )
 
 
@@ -168,3 +170,49 @@ def test_latest_verify_result_for_epoch_does_not_fallback_to_legacy_when_owner_a
     assert lookup.is_current is False
     assert lookup.result is not None
     assert lookup.result.reviewed_head_sha == "old-head"
+
+
+def test_resolve_verify_read_model_prefers_owner_artifact_for_review_surface(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement canonical verify owner", task_type="implement")
+    assert impl.id is not None
+
+    review = store.add("Review canonical owner artifact", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.review_verify_command = "./bin/tests"
+    review.review_verify_status = "failed"
+    review.review_verify_exit_status = "7"
+    review.review_verify_captured_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    review.review_verify_branch = "feature/verify"
+    review.review_verify_head_sha = "head-1"
+    review.review_verify_markdown = "legacy markdown"
+    store.update(review)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    read_model = resolve_verify_read_model(
+        store,
+        review,
+        owner_task=impl,
+        current_epoch=review_task_verify_epoch(review, config),
+    )
+
+    assert read_model is not None
+    assert read_model.source == "owner_artifact"
+    assert read_model.result.status == "passed"
+    assert read_model.result.exit_status == "0"
+    assert read_model.legacy_markdown is None

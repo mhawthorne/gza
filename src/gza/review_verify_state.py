@@ -1,10 +1,11 @@
-"""Shared helpers for persisted review verify provenance."""
+"""Shared helpers for persisted and rendered verify-gate provenance."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from gza.artifacts import store_command_output_artifact
@@ -58,6 +59,20 @@ class VerifyGateLookup:
     source: Literal["owner_artifact", "legacy_review"] | None
     is_current: bool
     has_owner_artifact: bool
+
+
+@dataclass(frozen=True)
+class VerifyReadModel:
+    """Operator-facing verify read model shared across query and inspect paths."""
+
+    result: VerifyGateResult
+    source: Literal["owner_artifact", "legacy_review"]
+    is_current: bool
+    has_owner_artifact: bool
+    owner_task_id: str | None
+    source_task_id: str | None
+    source_task_type: str | None
+    legacy_markdown: str | None = None
 
 
 def normalized_verify_command(command: str | None) -> str | None:
@@ -255,6 +270,134 @@ def latest_verify_result_for_epoch(
         is_current=False,
         has_owner_artifact=False,
     )
+
+
+def review_task_verify_epoch(task: Task, config: object | None) -> VerifyEpoch | None:
+    """Build a canonical verify epoch from persisted review-era verify fields."""
+    if task.task_type != "review":
+        return None
+    command = normalized_verify_command(task.review_verify_command)
+    if command is None:
+        return None
+    timeout_seconds = getattr(config, "autonomous_verify_timeout_seconds", None)
+    timeout_grace_seconds = getattr(config, "review_verify_timeout_grace_seconds", None)
+    return make_verify_epoch(
+        reviewed_branch=task.review_verify_branch,
+        reviewed_head_sha=task.review_verify_head_sha,
+        verify_command=command,
+        verify_timeout_seconds=timeout_seconds if isinstance(timeout_seconds, int) else None,
+        verify_timeout_grace_seconds=(
+            float(timeout_grace_seconds)
+            if isinstance(timeout_grace_seconds, (int, float)) and not isinstance(timeout_grace_seconds, bool)
+            else None
+        ),
+    )
+
+
+def owner_task_verify_epoch(task: Task, config: object | None, git: object | None) -> VerifyEpoch | None:
+    """Build the current canonical verify epoch for an implementation owner."""
+    branch = task.branch
+    command = normalized_verify_command(getattr(config, "verify_command", None))
+    if not branch or command is None or git is None:
+        return None
+    rev_parse = getattr(git, "rev_parse_if_exists", None)
+    if not callable(rev_parse):
+        return None
+    head_sha = rev_parse(branch)
+    if not isinstance(head_sha, str) or not head_sha:
+        return None
+    timeout_seconds = getattr(config, "autonomous_verify_timeout_seconds", None)
+    timeout_grace_seconds = getattr(config, "review_verify_timeout_grace_seconds", None)
+    return make_verify_epoch(
+        reviewed_branch=branch,
+        reviewed_head_sha=head_sha,
+        verify_command=command,
+        verify_timeout_seconds=timeout_seconds if isinstance(timeout_seconds, int) else None,
+        verify_timeout_grace_seconds=(
+            float(timeout_grace_seconds)
+            if isinstance(timeout_grace_seconds, (int, float)) and not isinstance(timeout_grace_seconds, bool)
+            else None
+        ),
+    )
+
+
+def resolve_verify_owner_task(store: SqliteTaskStore, task: Task) -> Task:
+    """Resolve the canonical owner row for verify evidence attached to ``task``."""
+    if task.task_type == "review":
+        for related_id in (task.depends_on, task.based_on):
+            if isinstance(related_id, str):
+                owner = store.get(related_id)
+                if owner is not None:
+                    return owner
+    return task
+
+
+def resolve_verify_read_model(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    owner_task: Task | None = None,
+    current_epoch: VerifyEpoch | None,
+) -> VerifyReadModel | None:
+    """Resolve the shared operator-facing verify read model for one task surface."""
+    owner = owner_task or resolve_verify_owner_task(store, task)
+    if current_epoch is None:
+        return None
+
+    lookup = latest_verify_result_for_epoch(store, owner, current_epoch=current_epoch)
+    if lookup.result is None or lookup.source is None:
+        return None
+
+    legacy_markdown: str | None = None
+    if lookup.source == "legacy_review" and lookup.result.source_task_id:
+        source_task = store.get(lookup.result.source_task_id)
+        if source_task is not None:
+            legacy_markdown = source_task.review_verify_markdown
+
+    return VerifyReadModel(
+        result=lookup.result,
+        source=lookup.source,
+        is_current=lookup.is_current,
+        has_owner_artifact=lookup.has_owner_artifact,
+        owner_task_id=owner.id,
+        source_task_id=lookup.result.source_task_id,
+        source_task_type=lookup.result.source_task_type,
+        legacy_markdown=legacy_markdown,
+    )
+
+
+def verify_output_artifact_path(read_model: VerifyReadModel) -> str | None:
+    """Return the canonical captured output artifact path for one verify read model."""
+    return read_model.result.output_artifact_path
+
+
+def read_verify_output_excerpt(
+    project_dir: Path,
+    read_model: VerifyReadModel,
+    *,
+    max_lines: int = 20,
+    max_chars: int = 4000,
+) -> str | None:
+    """Read a bounded text excerpt from the canonical verify output artifact, if present."""
+    from gza.artifact_paths import InvalidArtifactPathError, resolve_artifact_path
+
+    artifact_path = verify_output_artifact_path(read_model)
+    if not artifact_path:
+        return None
+    try:
+        resolved_path = resolve_artifact_path(project_dir, artifact_path)
+    except InvalidArtifactPathError:
+        return None
+    if not resolved_path.exists():
+        return None
+    content = resolved_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not content:
+        return None
+    lines = content.splitlines()
+    excerpt = "\n".join(lines[:max_lines])
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip()
+    return excerpt
 
 
 def persist_verify_gate_artifact(

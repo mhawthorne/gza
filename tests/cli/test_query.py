@@ -12,6 +12,7 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,6 +31,7 @@ from gza.db import Task
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
 
@@ -5633,8 +5635,8 @@ class TestShowCommand:
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
-    def test_show_displays_review_verify_evidence(self, tmp_path: Path):
-        """Show should surface persisted review verify audit fields and stored markdown."""
+    def test_show_displays_review_verify_evidence_from_canonical_helper(self, tmp_path: Path):
+        """Show should render review verify details through the canonical helper path."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
@@ -5645,22 +5647,15 @@ class TestShowCommand:
         task = store.add("Review feature", task_type="review", depends_on=impl.id)
         task.slug = "20260605-review-feature"
         task.status = "completed"
+        task.review_verify_command = "./bin/tests"
         task.review_verify_status = "failed"
         task.review_verify_exit_status = "7"
         task.review_verify_branch = impl.branch
         task.review_verify_head_sha = "deadbeef"
         task.review_verify_base_sha = "cafebabe"
         task.review_verify_cwd = "/tmp/worktrees/20260605-review-feature-review"
-        task.review_verify_markdown = (
-            "## verify_command result\n\n"
-            "- Command: `./bin/tests`\n"
-            "- Status: failed\n"
-            "- Exit status: 7\n"
-            "- Working directory: `/tmp/worktrees/20260605-review-feature-review`\n"
-            "- Failure: verify failed\n\n"
-            "Failing output (trimmed):\n"
-            "```text\nmypy failed\n```"
-        )
+        task.review_verify_markdown = "legacy markdown should not win when canonical owner evidence exists"
+        task.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
         store.update(task)
         config = Config.load(tmp_path)
         stored = store_command_output_artifact(
@@ -5680,15 +5675,35 @@ class TestShowCommand:
                 "reviewed_base_sha": "cafebabe",
                 "working_directory": task.review_verify_cwd,
             },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
         )
-        task.review_verify_artifact_file = stored.path
-        store.update(task)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=task,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
 
         result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Review Verify Status:" in result.stdout
-        assert "failed" in result.stdout
+        assert "passed" in result.stdout
         assert "Review Verify Exit:" in result.stdout
         assert "Review Verify Branch:" in result.stdout
         assert "Review Verify Head:" in result.stdout
@@ -5701,6 +5716,8 @@ class TestShowCommand:
         assert "Review Verify Result:" in result.stdout
         assert "## verify_command result" in result.stdout
         assert "mypy failed" in result.stdout
+        assert "legacy markdown should not win" not in result.stdout
+        assert "/tmp/canonical-verify-worktree" in result.stdout
 
     def test_show_metadata_only_marks_missing_artifacts(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
