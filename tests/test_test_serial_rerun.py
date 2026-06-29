@@ -166,6 +166,16 @@ def test_main_rejects_invalid_env_values(monkeypatch: pytest.MonkeyPatch, capsys
     assert "GZA_UNIT_RERUN_CAP must be a positive integer" in capsys.readouterr().err
 
 
+def test_main_defaults_to_unit_suite_when_no_pytest_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_unit_phase = Mock(return_value=0)
+    monkeypatch.setattr(test_serial_rerun, "run_unit_phase", run_unit_phase)
+
+    exit_code = test_serial_rerun.main([])
+
+    assert exit_code == 0
+    assert run_unit_phase.call_args.args[0] == ["tests/", "-q"]
+
+
 def test_main_honors_disable_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GZA_UNIT_SERIAL_RERUN", "0")
     run_unit_phase = Mock(return_value=0)
@@ -217,3 +227,23 @@ def test_functional_main_honors_functional_disable_switch(monkeypatch: pytest.Mo
 
     assert exit_code == 0
     assert run_functional_phase.call_args.kwargs["rerun_enabled"] is False
+
+
+def test_functional_main_defaults_to_functional_suite_when_no_pytest_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_functional_phase = Mock(return_value=0)
+    monkeypatch.setattr(test_functional_rerun, "run_functional_phase", run_functional_phase)
+
+    exit_code = test_functional_rerun.main([])
+
+    assert exit_code == 0
+    assert run_functional_phase.call_args.args[0] == ["tests_functional/", "-q"]
+
+
+def test_functional_main_help_reports_functional_default(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        test_functional_rerun.main(["--help"])
+
+    assert excinfo.value.code == 0
+    assert "Defaults to 'tests_functional/ -q'." in capsys.readouterr().out

@@ -26,6 +26,11 @@ class _LaneConfig:
     rerun_cap_env: str
     rerun_enabled_env: str
     description: str
+    default_pytest_args: tuple[str, ...]
+
+    @property
+    def default_pytest_args_text(self) -> str:
+        return " ".join(self.default_pytest_args)
 
 
 _UNIT_LANE = _LaneConfig(
@@ -34,6 +39,7 @@ _UNIT_LANE = _LaneConfig(
     rerun_cap_env="GZA_UNIT_RERUN_CAP",
     rerun_enabled_env="GZA_UNIT_SERIAL_RERUN",
     description="Run the unit pytest lane with a guarded serial rerun bridge.",
+    default_pytest_args=("tests/", "-q"),
 )
 _FUNCTIONAL_LANE = _LaneConfig(
     phase_name="functional",
@@ -41,6 +47,7 @@ _FUNCTIONAL_LANE = _LaneConfig(
     rerun_cap_env="GZA_FUNCTIONAL_RERUN_CAP",
     rerun_enabled_env="GZA_FUNCTIONAL_SERIAL_RERUN",
     description="Run the functional pytest lane with a guarded serial rerun bridge.",
+    default_pytest_args=("tests_functional/", "-q"),
 )
 
 
@@ -238,15 +245,15 @@ def _parse_args(argv: list[str], *, lane: _LaneConfig) -> argparse.Namespace:
     parser.add_argument(
         "pytest_args",
         nargs=argparse.REMAINDER,
-        help="Additional pytest args after '--'. Defaults to 'tests/ -q'.",
+        help=f"Additional pytest args after '--'. Defaults to '{lane.default_pytest_args_text}'.",
     )
     return parser.parse_args(argv)
 
 
-def _default_pytest_args(extra_args: list[str]) -> list[str]:
+def _default_pytest_args(extra_args: list[str], *, lane: _LaneConfig) -> list[str]:
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
-    return extra_args or ["tests/", "-q"]
+    return extra_args or list(lane.default_pytest_args)
 
 
 def _main_for_lane(
@@ -263,7 +270,7 @@ def _main_for_lane(
         _warn(str(exc))
         return 2
     return run_phase(
-        _default_pytest_args(args.pytest_args),
+        _default_pytest_args(args.pytest_args, lane=lane),
         cap=cap,
         rerun_enabled=rerun_enabled,
         emit_summary=args.summary,
