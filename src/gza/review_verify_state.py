@@ -469,6 +469,8 @@ def persist_verify_gate_artifact(
     output_artifact_task_id: str | None = None,
     output_artifact_path: str | None = None,
     producer: str,
+    provenance: dict[str, Any] | None = None,
+    aggregate_details: dict[str, Any] | None = None,
 ) -> None:
     """Persist canonical owner-attached verify-gate evidence."""
     if owner_task.id is None:
@@ -507,6 +509,10 @@ def persist_verify_gate_artifact(
         "output_artifact_task_id": output_artifact_task_id,
         "output_artifact_path": output_artifact_path,
     }
+    if provenance is not None:
+        payload["provenance"] = provenance
+    if aggregate_details is not None:
+        payload["aggregate_details"] = aggregate_details
     store_command_output_artifact(
         store,
         owner_task,

@@ -95,6 +95,90 @@ def test_latest_verify_result_for_epoch_prefers_current_owner_artifact(tmp_path:
     assert len(store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)) == 1
 
 
+def test_persist_verify_gate_artifact_stores_provenance_and_cross_project_aggregate_details(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement verify gate owner", task_type="implement")
+    assert impl.id is not None
+    review = store.add("Review owner artifact", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        _config(tmp_path),
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+        provenance={
+            "command_identity": "./bin/tests",
+            "reviewed_branch": "feature/verify",
+            "reviewed_head_sha": "head-1",
+            "reviewed_base_sha": "base-1",
+            "working_directory": "/tmp/worktree",
+            "config_identity": {
+                "verify_command": "./bin/tests",
+                "verify_timeout_seconds": 120,
+                "verify_timeout_grace_seconds": 5.0,
+                "cross_project": True,
+            },
+        },
+        aggregate_details={
+            "affected_scope_count": 2,
+            "runnable_count": 2,
+            "passed_count": 1,
+            "failed_count": 1,
+            "unavailable_count": 0,
+            "skipped_count": 0,
+            "scopes": [
+                {
+                    "scope": "services/foo",
+                    "working_directory": "services/foo",
+                    "status": "passed",
+                    "exit_status": "0",
+                    "command_identity": "./bin/foo-verify",
+                    "reviewed_branch": "feature/verify",
+                    "reviewed_head_sha": "head-1",
+                    "reviewed_base_sha": "base-1",
+                    "skip_reason": None,
+                },
+                {
+                    "scope": "libs/bar",
+                    "working_directory": "libs/bar",
+                    "status": "failed",
+                    "exit_status": "7",
+                    "command_identity": "./bin/bar-verify",
+                    "reviewed_branch": "feature/verify",
+                    "reviewed_head_sha": "head-1",
+                    "reviewed_base_sha": "base-1",
+                    "skip_reason": None,
+                },
+            ],
+        },
+    )
+
+    artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+    assert artifact.metadata is not None
+    assert artifact.metadata["provenance"] == {
+        "command_identity": "./bin/tests",
+        "reviewed_branch": "feature/verify",
+        "reviewed_head_sha": "head-1",
+        "reviewed_base_sha": "base-1",
+        "working_directory": "/tmp/worktree",
+        "config_identity": {
+            "verify_command": "./bin/tests",
+            "verify_timeout_seconds": 120,
+            "verify_timeout_grace_seconds": 5.0,
+            "cross_project": True,
+        },
+    }
+    assert artifact.metadata["aggregate_details"]["failed_count"] == 1
+    assert artifact.metadata["aggregate_details"]["scopes"][1]["scope"] == "libs/bar"
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch())
+    assert lookup.is_current is True
+    assert lookup.source == "owner_artifact"
+
+
 def test_latest_verify_result_for_epoch_marks_canonical_owner_artifact_stale(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     impl = store.add("Implement stale canonical verify", task_type="implement")

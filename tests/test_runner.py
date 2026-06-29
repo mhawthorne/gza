@@ -19936,6 +19936,19 @@ class TestProviderPromptSanitization:
             "verify_timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
         }
         assert gate_artifacts[0].metadata["source_task_id"] == task.id
+        assert gate_artifacts[0].metadata["provenance"] == {
+            "command_identity": "printf 'all good\\n'",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "reviewed_base_sha": None,
+            "working_directory": refreshed.review_verify_cwd,
+            "config_identity": {
+                "verify_command": "printf 'all good\\n'",
+                "verify_timeout_seconds": 120,
+                "verify_timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+                "cross_project": False,
+            },
+        }
 
     def test_fresh_review_failing_verify_artifact_preserves_pytest_tail_beyond_prompt_trim(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -20380,6 +20393,53 @@ class TestProviderPromptSanitization:
             f"tree_fingerprint={failed_fingerprint}\n"
             "bar failed"
         )
+        gate_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        assert len(gate_artifacts) == 1
+        assert gate_artifacts[0].metadata["provenance"] == {
+            "command_identity": "(per-project verify_command)",
+            "reviewed_branch": impl.branch,
+            "reviewed_head_sha": "deadbeef",
+            "reviewed_base_sha": "cafebabe",
+            "working_directory": "(per-project; see artifact)",
+            "config_identity": {
+                "verify_command": "(per-project verify_command)",
+                "verify_timeout_seconds": 120,
+                "verify_timeout_grace_seconds": REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+                "cross_project": True,
+            },
+        }
+        assert gate_artifacts[0].metadata["aggregate_details"] == {
+            "affected_scope_count": 2,
+            "runnable_count": 2,
+            "passed_count": 1,
+            "failed_count": 1,
+            "unavailable_count": 0,
+            "skipped_count": 0,
+            "scopes": [
+                {
+                    "scope": "services/foo",
+                    "working_directory": "services/foo",
+                    "status": "passed",
+                    "exit_status": "0",
+                    "command_identity": "./bin/foo-verify",
+                    "reviewed_branch": impl.branch,
+                    "reviewed_head_sha": "deadbeef",
+                    "reviewed_base_sha": "cafebabe",
+                    "skip_reason": None,
+                },
+                {
+                    "scope": "libs/bar",
+                    "working_directory": "libs/bar",
+                    "status": "failed",
+                    "exit_status": "7",
+                    "command_identity": "./bin/bar-verify",
+                    "reviewed_branch": impl.branch,
+                    "reviewed_head_sha": "deadbeef",
+                    "reviewed_base_sha": "cafebabe",
+                    "skip_reason": None,
+                },
+            ],
+        }
 
     def test_cross_project_review_persists_unavailable_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
