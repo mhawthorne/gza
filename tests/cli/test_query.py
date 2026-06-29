@@ -5635,8 +5635,8 @@ class TestShowCommand:
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
-    def test_show_displays_review_verify_evidence_from_canonical_helper(self, tmp_path: Path):
-        """Show should render review verify details through the canonical helper path."""
+    def test_show_displays_neutral_verify_evidence_from_canonical_helper(self, tmp_path: Path):
+        """Show should render canonical verify details with neutral operator-facing labels."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
@@ -5702,22 +5702,146 @@ class TestShowCommand:
         result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Review Verify Status:" in result.stdout
+        assert "Verify Status:" in result.stdout
         assert "passed" in result.stdout
-        assert "Review Verify Exit:" in result.stdout
-        assert "Review Verify Branch:" in result.stdout
-        assert "Review Verify Head:" in result.stdout
-        assert "Review Verify Base:" in result.stdout
-        assert "Review Verify Cwd:" in result.stdout
-        assert "Review Verify Artifact:" in result.stdout
+        assert "Verify Exit:" in result.stdout
+        assert "Verify Branch:" in result.stdout
+        assert "Verify Head:" in result.stdout
+        assert "Verify Base:" in result.stdout
+        assert "Verify Cwd:" in result.stdout
+        assert "Verify Artifact:" in result.stdout
         assert "Artifacts:" in result.stdout
         assert stored.path in result.stdout
-        assert f"Review Verify Artifact: {stored.path}" in result.stdout
-        assert "Review Verify Result:" in result.stdout
+        assert f"Verify Artifact: {stored.path}" in result.stdout
+        assert "Verify Result:" in result.stdout
+        assert "Review Verify" not in result.stdout
         assert "## verify_command result" in result.stdout
         assert "mypy failed" in result.stdout
         assert "legacy markdown should not win" not in result.stdout
         assert "/tmp/canonical-verify-worktree" in result.stdout
+
+    def test_show_implement_displays_owner_verify_evidence_from_canonical_helper(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/owner-verify-show"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_verify_command = "./bin/tests"
+        review.review_verify_status = "failed"
+        review.review_verify_exit_status = "7"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "a" * 40
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
+        store.update(review)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="owner artifact output\n",
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            head_sha="a" * 40,
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        git = _mock_unmerged_git()
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Status:" in output
+        assert "Verify Artifact:" in output
+        assert "Verify Result:" in output
+        assert stored.path in output
+        assert "owner artifact output" in output
+        assert "Review Verify" not in output
+
+    def test_show_review_keeps_neutral_legacy_verify_fallback(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_verify_command = "./bin/tests"
+        review.review_verify_status = "failed"
+        review.review_verify_exit_status = "7"
+        review.review_verify_branch = "feature/legacy-review-verify"
+        review.review_verify_head_sha = "deadbeef"
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_cwd = "/tmp/legacy-review-verify"
+        review.review_verify_markdown = "legacy verify markdown"
+        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Verify Status:" in result.stdout
+        assert "Verify Exit:" in result.stdout
+        assert "Verify Result:" in result.stdout
+        assert "legacy verify markdown" in result.stdout
+        assert "Review Verify" not in result.stdout
 
     def test_show_metadata_only_marks_missing_artifacts(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -5744,7 +5868,7 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Artifacts:" in result.stdout
         assert stored.path in result.stdout
-        assert "Review Verify Artifact:" in result.stdout
+        assert "Verify Artifact:" in result.stdout
         assert "missing" in result.stdout
 
     def test_artifact_command_prints_latest_content_and_path(self, tmp_path: Path) -> None:
@@ -5975,7 +6099,7 @@ class TestShowCommand:
         assert str(tmp_path / newer.path) not in path_result.stdout
 
         assert show_result.returncode == 0
-        assert f"Review Verify Artifact:" in show_result.stdout
+        assert "Verify Artifact:" in show_result.stdout
         assert newer.path in show_result.stdout
         assert older.path in show_result.stdout
 
@@ -6060,7 +6184,7 @@ class TestShowCommand:
         assert newer.path in result.stdout
         assert "skipped" in result.stdout
         assert "missing" in result.stdout
-        assert "Review Verify Artifact:" in result.stdout
+        assert "Verify Artifact:" in result.stdout
         assert newer.path in result.stdout
 
     def test_show_warns_and_reads_when_readonly_db_is_missing_task_comments(self, tmp_path: Path):
