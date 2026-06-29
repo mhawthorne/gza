@@ -54,6 +54,7 @@ from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
     latest_verify_result_for_epoch,
     owner_task_verify_epoch,
+    persist_verify_gate_artifact,
 )
 from gza.review_verdict import ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
@@ -2344,6 +2345,170 @@ def test_execute_advance_action_rejects_retired_noop_verify_action(tmp_path: Pat
 
     assert result.status == "unsupported"
     assert result.message == "unsupported action: verify_" "noop_improve_then_review"
+
+
+def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify gate", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-gate")
+    store.update(impl)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda _ref: "head-1",
+        worktree_add_existing=lambda *_args, **_kwargs: None,
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=tmp_path / "tmp-worktree",
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: "base-1" if ref in {"main", "origin/main"} else "head-1",
+    )
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.cli.advance_executor._run_lifecycle_verify",
+            return_value=SimpleNamespace(
+                markdown="verify markdown",
+                aggregate_result=verify_result,
+                project_results=(),
+            ),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": impl,
+            },
+            context=context,
+        )
+
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_impl,
+        current_epoch=owner_task_verify_epoch(refreshed_impl, config, git),
+    )
+    assert result.status == "success"
+    assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.status == "passed"
+
+
+def test_verify_gate_execution_blocks_current_red_evidence_without_rerun(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement red verify gate", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/red-verify-gate")
+    store.update(impl)
+    review = store.add("Review red verify gate", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="failed",
+            exit_status="7",
+            captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda _ref: "head-1",
+        worktree_add_existing=lambda *_args, **_kwargs: pytest.fail("worktree should not be prepared"),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "verify_gate",
+                "description": "SKIP: current verify gate is red; merge is blocked",
+                "verify_gate_phase": "pre_merge",
+                "verify_owner_task": impl,
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-gate-blocked"
+    assert "current verify gate is red" in result.message
 
 
 def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) -> None:

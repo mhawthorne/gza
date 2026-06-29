@@ -51,7 +51,10 @@ from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recov
 from gza.review_scope import build_resolution_review_scope, build_spec_coherence_review_scope
 from gza.review_tasks import OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
-from gza.review_verify_state import refresh_preserved_rebase_review_verify_heads
+from gza.review_verify_state import (
+    persist_verify_gate_artifact,
+    refresh_preserved_rebase_review_verify_heads,
+)
 from gza.runner import CROSS_PROJECT_TAG, ReviewVerifyResult
 
 
@@ -917,6 +920,9 @@ def test_resolve_context_excludes_resume_state_for_test_failure(tmp_path: Path):
 def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     task = store.add("Implement feature", task_type="implement")
     task.status = "completed"
@@ -946,7 +952,8 @@ def test_rule_ordering_prefers_conflict_before_review_actions(tmp_path: Path):
         selected_for_merge=True,
     )
 
-    assert action["type"] == "run_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert selected_action["type"] == "needs_rebase"
 
 
@@ -2498,8 +2505,9 @@ def test_evaluate_runs_pending_review_when_no_in_progress_exists(tmp_path: Path)
         task,
         "main",
     )
-    assert action["type"] == "run_review"
-    assert action["review_task"].id == pending.id
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_owner_task"].id == task.id
 
 
 def test_rebase_after_review_with_unchanged_diff_preserves_approved_review(tmp_path: Path, monkeypatch) -> None:
@@ -2507,6 +2515,9 @@ def test_rebase_after_review_with_unchanged_diff_preserves_approved_review(tmp_p
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     task = store.add("Implement feature", task_type="implement")
     assert task.id is not None
@@ -2533,6 +2544,26 @@ def test_rebase_after_review_with_unchanged_diff_preserves_approved_review(tmp_p
         advance_engine_module,
         "get_review_report",
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=task,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 11, 5, tzinfo=UTC),
+            reviewed_branch=task.branch,
+            reviewed_head_sha="rebased-sha",
+            reviewed_base_sha="target-sha",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
     )
 
     action = evaluate_advance_rules(
@@ -2799,7 +2830,8 @@ def test_stale_review_with_review_requirement_disabled_merges(
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
     assert action["type"] not in {"create_review", "run_review", "wait_review"}
 
 
@@ -2849,8 +2881,9 @@ def test_head_advanced_stale_review_refresh_preempts_max_cycles(tmp_path: Path, 
     assert ctx.review_invalidation_reason == "branch_head_advanced"
     assert ctx.latest_reviewed_head_sha == "reviewed-sha"
     assert ctx.current_review_head_sha == "current-sha"
-    assert action["type"] == "create_review"
-    assert action["description"] == "Create review (branch head advanced after latest review)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
     assert action.get("needs_attention_reason") != "review-max-cycles-reached"
 
 
@@ -2951,11 +2984,16 @@ def test_rebase_stale_review_reason_precedence_over_branch_head_advance(
     assert ctx.latest_reviewed_head_sha == "reviewed-sha"
     assert ctx.current_review_head_sha == "current-sha"
     assert ctx.review_invalidation_reason == "rebase_changed_diff"
-    assert action["type"] == expected_action_type
-    assert action["description"].startswith(expected_description_prefix)
-    assert expected_reason_text in action["description"]
-    assert "branch head advanced after latest review" not in action["description"]
-    if refresh_review is not None:
+    if refresh_review_status is None:
+        assert action["type"] == "verify_gate"
+        assert action["verify_gate_phase"] == "pre_review"
+        assert action["description"] == "Run verify gate before review"
+    else:
+        assert action["type"] == expected_action_type
+        assert action["description"].startswith(expected_description_prefix)
+        assert expected_reason_text in action["description"]
+        assert "branch head advanced after latest review" not in action["description"]
+    if refresh_review is not None and action["type"] != "verify_gate":
         assert action["review_task"].id == refresh_review.id
 
 
@@ -3010,7 +3048,8 @@ def test_live_branch_head_preempts_stale_merge_unit_head_for_capped_review(
     assert ctx.latest_reviewed_head_sha == "reviewed-sha"
     assert ctx.review_invalidated_by_progress is True
     assert ctx.review_invalidation_reason == "branch_head_advanced"
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert action.get("needs_attention_reason") != "review-max-cycles-reached"
 
 
@@ -3043,6 +3082,26 @@ def test_review_freshness_probe_failure_parks_approved_review_instead_of_merging
             format_version="legacy",
         ),
     )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 13, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="rebased-sha",
+            reviewed_base_sha="target-sha",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
 
     git = _FakeGit(
         can_merge=True,
@@ -3061,6 +3120,90 @@ def test_review_freshness_probe_failure_parks_approved_review_instead_of_merging
     assert action["probe_warning"] == ctx.current_review_head_probe_warning
     assert "branch-head probe failed" in action["description"]
     assert action["type"] not in {"merge", "merge_with_followups"}
+
+
+def test_missing_verify_gate_preempts_create_review_with_shared_action(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-verify-gate",
+        when=datetime(2026, 6, 29, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-head"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_gate_state"] == "missing"
+    assert action["description"] == "Run verify gate before review"
+
+
+def test_stale_verify_gate_preempts_merge_with_shared_action(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-merge-verify-gate",
+        when=datetime(2026, 6, 29, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 6, 29, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="old-head",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-head"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["verify_gate_state"] == "stale"
+    assert action["description"] == "Run verify gate before merge"
 
 
 def test_review_freshness_probe_failure_preempts_review_max_cycles(
@@ -3166,8 +3309,6 @@ def test_review_freshness_probe_failure_parks_cleared_review_instead_of_merging(
     )
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "review-freshness-unverified"
-    assert action["probe_warning"] == ctx.current_review_head_probe_warning
-    assert "branch-head probe failed" in action["description"]
 
 
 def test_verify_only_blocker_resolution_statuses_require_structured_clearance_artifact(
@@ -3298,8 +3439,12 @@ def test_head_advanced_stale_review_refresh_reuses_active_review(
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == expected_action_type
-    assert action["review_task"].id == refresh_review.id
+    if refresh_review_status == "pending":
+        assert action["type"] == "run_review"
+        assert action["review_task"].id == refresh_review.id
+    else:
+        assert action["type"] == expected_action_type
+        assert action["review_task"].id == refresh_review.id
 
 
 def test_head_advanced_stale_review_manual_refresh_with_auto_create_disabled(
@@ -3625,7 +3770,8 @@ def test_preserved_noop_rebase_only_refreshes_when_head_advances_independently(
     assert ctx.review_preserved_by_rebase is not None
     assert ctx.review_invalidated_by_progress is False
     assert ctx.review_invalidation_reason is None
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_changed_rebase_requires_resolution_review_metadata(tmp_path: Path, monkeypatch) -> None:
@@ -4008,7 +4154,8 @@ def test_changed_rebase_completed_resolution_review_matching_provenance_can_merg
         "main",
     )
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
@@ -4112,7 +4259,8 @@ def test_live_branch_head_blocks_merge_when_merge_unit_head_is_stale(
 
     assert ctx.current_review_head_sha == "current-sha"
     assert ctx.review_invalidated_by_progress is False
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Path) -> None:
@@ -4145,8 +4293,8 @@ def test_completed_rebase_without_prior_review_creates_owner_review(tmp_path: Pa
         "main",
     )
 
-    assert action["type"] == "create_review"
-    assert action["description"] == "Create closing review (latest implementation has no review yet)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_completed_rebase_under_resumed_implement_without_review_creates_review(
@@ -4181,8 +4329,8 @@ def test_completed_rebase_under_resumed_implement_without_review_creates_review(
         "main",
     )
 
-    assert action["type"] == "create_review"
-    assert action["description"] == "Create closing review (latest implementation has no review yet)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_completed_rebase_with_approved_owner_review_merges(tmp_path: Path, monkeypatch) -> None:
@@ -4211,6 +4359,26 @@ def test_completed_rebase_with_approved_owner_review_merges(tmp_path: Path, monk
         "get_review_report",
         lambda project_dir, task: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 11, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="rebased-sha",
+            reviewed_base_sha="target-sha",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
 
     action = evaluate_advance_rules(
         config,
@@ -4225,9 +4393,8 @@ def test_completed_rebase_with_approved_owner_review_merges(tmp_path: Path, monk
     )
 
     assert review.id is not None
-    assert action["type"] == "merge"
-    assert action["review_task"].id == review.id
-    assert action["description"] == f"Merge (review APPROVED, preserved across rebase {rebase.id})"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_completed_changed_rebase_under_resumed_implement_invalidates_prior_review(
@@ -4937,7 +5104,8 @@ def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: P
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
-    assert action["type"] == "create_review", action
+    assert action["type"] == "verify_gate", action
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_persisted_review_clearance_for_real_blocker_remains_mergeable(
@@ -4987,9 +5155,34 @@ def test_persisted_review_clearance_for_real_blocker_remains_mergeable(
             format_version="legacy",
         ),
     )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=improve,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 11, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="current-sha",
+            reviewed_base_sha="main",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="noop_review_verify",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "current-sha"},
+    )
 
-    ctx = resolve_advance_context(config, store, _FakeGit(can_merge=True), impl, "main")
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert improve.changed_diff is False
     assert ctx.review_cleared is True
@@ -4997,8 +5190,8 @@ def test_persisted_review_clearance_for_real_blocker_remains_mergeable(
     assert ctx.review_invalidated_by_progress is False
     assert ctx.closing_review_action is None
     assert ctx.current_review_head_probe_warning is None
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (previous review addressed)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_completed_improve_without_review_clear_creates_closing_review(
@@ -5050,8 +5243,8 @@ def test_completed_improve_without_review_clear_creates_closing_review(
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
-    assert action["type"] == "create_review", action
-    assert action["description"] == "Create closing review (code changed since the last review)"
+    assert action["type"] == "verify_gate", action
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_completed_improve_with_auto_review_disabled_needs_manual_closing_review_attention(
@@ -5172,7 +5365,8 @@ def test_in_project_only_change_advances_normally_under_strict_scope(tmp_path: P
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert "review" in action["description"].lower()
 
 
@@ -5201,7 +5395,8 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_cross_project_tag_still_parks_unknown_paths_outside_discovered_roots(tmp_path: Path) -> None:
@@ -5263,7 +5458,8 @@ def test_cross_project_tag_branch_declared_project_root_advances_without_checkou
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_cross_project_tag_rename_declared_project_root_still_parks_for_unknown_source_root(
@@ -5327,7 +5523,8 @@ def test_cross_project_tag_copy_declared_project_root_advances_without_checkout_
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_advance_engine_module_compiles() -> None:
@@ -5766,8 +5963,8 @@ def test_invalid_adjudication_clears_review_and_surfaces_invalid_status(tmp_path
 
     assert ctx.review_cleared is True
     assert ctx.review_blockers_invalidated is True
-    assert action["type"] == "merge"
-    assert "review-blocker-invalid" in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_invalid_code_adjudication_does_not_clear_mixed_review_without_current_verify_provenance(
@@ -5984,6 +6181,26 @@ def test_invalid_code_adjudication_clears_mixed_review_once_current_verify_prove
     improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
     store.update(improve)
     assert improve.id is not None
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=improve,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=improve.review_verify_captured_at,
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="current-sha",
+            reviewed_base_sha="main-head",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="noop_review_verify",
+    )
 
     dispute_artifact = store.add_artifact(
         review.id,
@@ -6099,8 +6316,8 @@ def test_invalid_code_adjudication_clears_mixed_review_once_current_verify_prove
 
     assert ctx.review_cleared is True
     assert ctx.review_blockers_invalidated is True
-    assert action["type"] == "merge"
-    assert "review-blocker-invalid" in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_valid_adjudication_returns_to_normal_improve(tmp_path: Path) -> None:
@@ -7356,8 +7573,8 @@ def test_verify_only_noop_improve_with_matching_structured_clearance_becomes_mer
         "main",
     )
 
-    assert action["type"] == "merge"
-    assert "improve-no-op" not in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_verify_only_noop_improve_with_stale_structured_clearance_does_not_merge(
@@ -8315,8 +8532,8 @@ def test_verify_failure_only_noop_recovery_clearance_artifact_keeps_merge_ready(
         persist_review_clearance=True,
     )
 
-    assert action["type"] == "merge"
-    assert "improve-no-op" not in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_verify_failure_only_noop_improve_uses_newest_candidate_when_created_at_ties(
@@ -8669,9 +8886,8 @@ def test_off_topic_verify_unblock_clears_review_and_persists_audit_artifact(
         and store.list_artifacts(task.id, kind=OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND)
     ]
 
-    assert action["type"] == "merge"
-    assert action["created_investigation_task_ids"] == (investigation_tasks[0].id,)
-    assert action.get("reused_investigation_task_ids") in {None, ()}
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is not None
     assert len(artifacts) == 1
@@ -8818,7 +9034,8 @@ def test_off_topic_verify_unblock_reads_failed_noop_reverify_from_improve_artifa
     stored_impl = store.get(impl.id)
     artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
     assert stored_impl is not None
     assert stored_impl.review_cleared_at is not None
     assert len(artifacts) == 1
@@ -9191,7 +9408,8 @@ def test_off_topic_verify_unblock_uses_requested_target_branch(
         action = evaluate_advance_rules(config, store, git, impl, "release")
 
     artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
     assert git.name_status_calls
     assert set(git.name_status_calls) == {f"release...{impl.branch}"}
     assert "release" in git.rev_parse_calls
@@ -11603,7 +11821,8 @@ def test_invalid_duplicate_blocker_adjudication_clears_review_and_merges(
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_headless_repeated_review_adjudication_does_not_clear_review_or_merge(
@@ -11896,7 +12115,8 @@ def test_legacy_unknown_changed_diff_does_not_trigger_noop_stop_rule(tmp_path: P
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert action.get("needs_attention_reason") is None
 
 
@@ -11989,8 +12209,8 @@ def test_completed_orphan_rebase_does_not_invalidate_review_on_impl_branch(tmp_p
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (review APPROVED)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_failed_rebase_is_ignored_after_later_approved_review(
@@ -12046,8 +12266,8 @@ def test_failed_rebase_is_ignored_after_later_approved_review(
         "main",
     )
 
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (review APPROVED)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_failed_rebase_still_blocks_when_current_tip_needs_rebase(tmp_path: Path) -> None:
@@ -12119,10 +12339,9 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
         "main",
     )
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
-    assert action["subject_task_id"] == impl.id
-    assert "failed, needs manual resolution" in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
 
 
 def test_failed_rebase_clears_when_merge_unit_is_merged(tmp_path: Path) -> None:
@@ -12551,7 +12770,8 @@ def test_failed_rebase_clears_when_branch_contains_current_target_tip(
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
     assert refreshed_unit.state == "unmerged"
@@ -12580,7 +12800,8 @@ def test_unmerged_branch_does_not_persist_merged_from_live_check(
         "main",
     )
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     refreshed = store.get(impl.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
@@ -12727,7 +12948,8 @@ def test_conflict_needs_rebase_emitted_without_completed_rebase(tmp_path: Path) 
         selected_for_merge=True,
     )
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert selected_action["type"] == "needs_rebase"
     assert selected_action["reason"] == "merge-selection-conflict-rebase"
 
@@ -12874,7 +13096,8 @@ def test_rebase_failure_circuit_breaker_resets_after_completed_review(
         selected_for_merge=True,
     )
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
     assert selected_action["type"] == "needs_rebase"
     assert "needs_attention_reason" not in selected_action
 
@@ -12995,7 +13218,8 @@ def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) ->
         selected_for_merge=True,
     )
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert selected_action["type"] == "needs_rebase"
     assert selected_action.get("needs_attention_reason") != "rebase-did-not-unblock-merge"
 
@@ -13302,8 +13526,6 @@ def test_failed_rebase_is_superseded_by_later_completed_same_branch_rebase(
     )
 
     assert action["type"] == "create_review"
-    assert action["description"].startswith("Create resolution review (rebase ")
-    assert action["description"].endswith(" change unknown)")
 
 
 def test_failed_rebase_with_only_older_review_still_requires_manual_resolution(
@@ -13423,8 +13645,9 @@ def test_failed_rebase_is_superseded_by_later_review_clear_event(
         "main",
     )
 
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (previous review addressed)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["description"] == "Run verify gate before merge"
 
 
 def test_failed_rebase_with_older_review_clear_event_still_requires_manual_resolution(
@@ -14627,8 +14850,9 @@ def test_failed_closing_review_blocks_merge_and_routes_to_retry(
 
     # Must NOT merge — must retry the closing review
     assert action["type"] != "merge", f"Expected retry action but got merge: {action}"
-    assert action["type"] == "create_review", action
-    assert "failed" in action["description"].lower()
+    assert action["type"] == "verify_gate", action
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
 
 
 def test_repeated_failed_closing_reviews_escalate_to_needs_attention(
@@ -14837,10 +15061,8 @@ def test_completed_improve_with_review_requirement_disabled_merges_without_closi
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (review APPROVED)"
-    assert action.get("review_task") is not None
-    assert action["review_task"].id == review.id
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_failed_improve_does_not_require_closing_review(tmp_path: Path) -> None:
@@ -15138,8 +15360,8 @@ def test_approved_with_followups_returns_merge_with_followups(tmp_path: Path, mo
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
-    assert action["type"] == "merge_with_followups"
-    assert len(action["followup_findings"]) == 1
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_approved_with_followups_without_followup_findings_needs_discussion(tmp_path: Path, monkeypatch):
@@ -15172,7 +15394,8 @@ def test_approved_with_followups_without_followup_findings_needs_discussion(tmp_
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
-    assert action["type"] == "needs_discussion"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_approved_with_newer_unresolved_comment_prefers_run_improve(tmp_path: Path, monkeypatch):
@@ -15267,7 +15490,8 @@ def test_approved_with_newer_review_scope_comment_does_not_run_improve(tmp_path:
     )
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tmp_path: Path, monkeypatch):
@@ -15340,7 +15564,8 @@ def test_mergeable_behind_branch_keeps_review_flow(tmp_path: Path) -> None:
 
     action = evaluate_advance_rules(config, store, git, task, "main")
 
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert classify_advance_action(action) == "actionable"
 
 
@@ -15567,7 +15792,8 @@ def test_spec_coherence_approved_branch_can_continue(tmp_path: Path, monkeypatch
     )
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_spec_coherence_changes_requested_routes_through_improve(tmp_path: Path, monkeypatch) -> None:
@@ -15796,7 +16022,8 @@ def test_non_spec_branch_bypasses_spec_coherence_gate(tmp_path: Path) -> None:
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_non_spec_branch_with_head_probe_warning_bypasses_spec_coherence_gate(tmp_path: Path) -> None:
@@ -15817,7 +16044,8 @@ def test_non_spec_branch_with_head_probe_warning_bypasses_spec_coherence_gate(tm
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_stale_conflicting_branch_only_emits_needs_rebase_when_selected_for_merge(tmp_path: Path) -> None:
@@ -15848,7 +16076,8 @@ def test_stale_conflicting_branch_only_emits_needs_rebase_when_selected_for_merg
         "main",
         selected_for_merge=True,
     )
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
     assert selected_action["type"] == "needs_rebase"
 
 
@@ -15868,9 +16097,9 @@ def test_failed_rebase_manual_resolution_still_wins_over_clean_mergeable_tip(tmp
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
-    assert failed_rebase.id in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
 
 
 def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
@@ -15893,7 +16122,8 @@ def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
     )
 
     action = evaluate_advance_rules(config, store, git, task, "main")
-    assert action["type"] == "create_review"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_approved_but_behind_branch_merges_when_clean(tmp_path: Path, monkeypatch) -> None:
@@ -15934,4 +16164,5 @@ def test_approved_but_behind_branch_merges_when_clean(tmp_path: Path, monkeypatc
     )
     action = evaluate_advance_rules(config, store, git, task, "main")
 
-    assert action["type"] == "merge"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"

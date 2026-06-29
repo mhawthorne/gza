@@ -93,6 +93,10 @@ from gza.review_verdict import (
     is_verify_timeout_only_review,
     summarize_review_blockers,
 )
+from gza.review_verify_state import (
+    VerifyGateDecision,
+    resolve_verify_gate_decision,
+)
 from gza.runner import (
     CROSS_PROJECT_TAG,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
@@ -374,6 +378,7 @@ class AdvanceContext:
     current_review_head_sha: str | None = None
     current_review_head_probe_warning: str | None = None
     latest_reviewed_head_sha: str | None = None
+    verify_gate_decision: VerifyGateDecision | None = None
 
     reviews: list[DbTask] | None = None
     review_root_task: DbTask | None = None
@@ -4391,6 +4396,71 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
+def has_current_passing_verify_for_merge(ctx: AdvanceContext) -> bool:
+    """Return whether canonical verify evidence currently permits merge."""
+    if not _is_implementation_owned_lineage(ctx):
+        return True
+    decision = ctx.verify_gate_decision
+    return decision is not None and decision.state == "passed"
+
+
+def _verify_gate_owner_task(ctx: AdvanceContext) -> DbTask | None:
+    if not _is_implementation_owned_lineage(ctx):
+        return None
+    return ctx.review_root_task
+
+
+def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if ctx.selected_for_merge and not ctx.can_merge:
+        return False
+    action = ctx.closing_review_action
+    if action is None:
+        return False
+    if action.get("type") not in {"create_review", "run_review"}:
+        return False
+    if action.get("type") == "create_review" and not ctx.create_reviews:
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    return decision is not None and decision.state != "passed"
+
+
+def _verify_gate_blocks_merge(ctx: AdvanceContext) -> bool:
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not execution_status_allows_merge(ctx):
+        return False
+    if not has_valid_review_for_merge(ctx):
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    return decision is not None and decision.state != "passed"
+
+
+def _verify_gate_action(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]:
+    decision = getattr(ctx, "verify_gate_decision", None)
+    if decision is None:
+        return {
+            "type": "skip",
+            "description": "SKIP: verify gate context unavailable",
+        }
+    owner_task = _verify_gate_owner_task(ctx)
+    description_suffix = "review" if phase == "pre_review" else "merge"
+    if decision.state in {"missing", "stale"}:
+        description = f"Run verify gate before {description_suffix}"
+    elif decision.state == "failed":
+        description = f"SKIP: current verify gate is red; {description_suffix} is blocked"
+    else:
+        description = f"SKIP: current verify gate is unavailable; {description_suffix} is blocked"
+    return {
+        "type": "verify_gate",
+        "description": description,
+        "verify_gate_phase": phase,
+        "verify_gate_state": decision.state,
+        "verify_owner_task": owner_task,
+    }
+
+
 def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:
     """Whether a closing-review action should preempt later merge fallback rules."""
     if ctx.closing_review_action is None:
@@ -5273,6 +5343,17 @@ def resolve_advance_context(
         target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
     )
+    verify_owner_task = _verify_gate_owner_task(ctx)
+    if verify_owner_task is not None:
+        ctx = replace(
+            ctx,
+            verify_gate_decision=resolve_verify_gate_decision(
+                store,
+                verify_owner_task,
+                config=config,
+                git=git,
+            ),
+        )
     if _resolve_db_known_wait_action(ctx) is not None or _matches_rule_before_closing_review_invariant(ctx):
         return ctx
     return _resolve_post_closing_review_git_context(
@@ -6003,6 +6084,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
         ),
     ),
     AdvanceRule(
+        name="pre_review_verify_gate",
+        matches=_verify_gate_blocks_closing_review,
+        action=lambda ctx: _verify_gate_action(ctx, phase="pre_review"),
+    ),
+    AdvanceRule(
         name="stale_review_wait_review",
         matches=lambda ctx: (
             _stale_review_refresh_required(ctx)
@@ -6141,6 +6227,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             ),
             "review_task": ctx.latest_completed_review,
         },
+    ),
+    AdvanceRule(
+        name="pre_merge_verify_gate",
+        matches=_verify_gate_blocks_merge,
+        action=lambda ctx: _verify_gate_action(ctx, phase="pre_merge"),
     ),
     AdvanceRule(
         name="review_approved_with_followups",

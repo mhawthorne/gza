@@ -12,8 +12,10 @@ from gza.review_verify_state import (
     make_verify_epoch,
     owner_task_verify_epoch,
     persist_verify_gate_artifact,
+    resolve_verify_gate_decision,
     resolve_verify_read_model,
     review_task_verify_epoch,
+    task_has_current_passing_verify_evidence,
 )
 from gza.git import GitError
 
@@ -301,6 +303,66 @@ def test_owner_task_verify_epoch_returns_none_when_branch_probe_raises(tmp_path:
     git = SimpleNamespace(rev_parse_if_exists=lambda _ref: (_ for _ in ()).throw(GitError("boom")))
 
     assert owner_task_verify_epoch(impl, config, git) is None
+
+
+def test_resolve_verify_gate_decision_marks_current_failed_owner_artifact_red(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify gate decision", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/verify"
+    store.update(impl)
+    review = store.add("Review verify gate decision", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    git = SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1")
+    decision = resolve_verify_gate_decision(store, impl, config=config, git=git)
+
+    assert decision.state == "failed"
+    assert task_has_current_passing_verify_evidence(store, impl, config=config, git=git) is False
+
+
+def test_resolve_verify_gate_decision_marks_missing_current_verify_state(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement missing verify gate decision", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/verify"
+    store.update(impl)
+
+    git = SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1")
+    decision = resolve_verify_gate_decision(store, impl, config=config, git=git)
+
+    assert decision.state == "missing"
+    assert task_has_current_passing_verify_evidence(store, impl, config=config, git=git) is False
 
 
 def test_resolve_verify_read_model_prefers_owner_artifact_for_review_surface(tmp_path: Path) -> None:

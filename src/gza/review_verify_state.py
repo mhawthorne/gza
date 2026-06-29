@@ -86,6 +86,16 @@ class VerifyReadModel:
     legacy_markdown: str | None = None
 
 
+@dataclass(frozen=True)
+class VerifyGateDecision:
+    """Canonical lifecycle verify readiness for one implementation owner."""
+
+    owner_task_id: str | None
+    current_epoch: VerifyEpoch | None
+    lookup: VerifyGateLookup
+    state: Literal["passed", "missing", "stale", "failed", "unavailable"]
+
+
 def normalized_verify_command(command: str | None) -> str | None:
     """Return the stable verify command identity used for freshness matching."""
     if not isinstance(command, str):
@@ -377,6 +387,52 @@ def owner_task_verify_epoch(task: Task, config: object | None, git: object | Non
             else None
         ),
     )
+
+
+def resolve_verify_gate_decision(
+    store: SqliteTaskStore,
+    owner_task: Task,
+    *,
+    config: object | None,
+    git: object | None,
+) -> VerifyGateDecision:
+    """Return the canonical lifecycle verify readiness for one implementation owner."""
+    current_epoch = owner_task_verify_epoch(owner_task, config, git)
+    lookup = latest_verify_result_for_epoch(store, owner_task, current_epoch=current_epoch)
+
+    if lookup.result is None:
+        state: Literal["passed", "missing", "stale", "failed", "unavailable"] = "missing"
+    elif not lookup.is_current:
+        state = "stale"
+    elif lookup.result.status == "passed":
+        state = "passed"
+    elif lookup.result.status == "unavailable":
+        state = "unavailable"
+    else:
+        state = "failed"
+
+    return VerifyGateDecision(
+        owner_task_id=owner_task.id,
+        current_epoch=current_epoch,
+        lookup=lookup,
+        state=state,
+    )
+
+
+def task_has_current_passing_verify_evidence(
+    store: SqliteTaskStore,
+    owner_task: Task,
+    *,
+    config: object | None,
+    git: object | None,
+) -> bool:
+    """Return whether canonical verify evidence is current and passing."""
+    return resolve_verify_gate_decision(
+        store,
+        owner_task,
+        config=config,
+        git=git,
+    ).state == "passed"
 
 
 def resolve_verify_owner_task(store: SqliteTaskStore, task: Task) -> Task:
