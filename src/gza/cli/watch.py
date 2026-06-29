@@ -5971,7 +5971,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         pending_first_cycle_plan: _WatchCyclePlan | None = None
         preview_cycle_open = False
 
-        def _preview_initial_cycle_and_confirm() -> bool:
+        def _preview_initial_cycle_and_confirm() -> int | None:
             nonlocal needs_initial_preview, pending_first_cycle_plan, preview_cycle_open
             preview_result, preview_plan = _preview_initial_watch_cycle(
                 config=config,
@@ -5991,7 +5991,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
             needs_initial_preview = False
             if preview_result.work_done:
+                if not sys.stdout.isatty():
+                    log.end_cycle()
+                    print(
+                        "watch: stdout is not a terminal, so the initial confirmation "
+                        "prompt cannot be shown. Re-run with -y to auto-confirm.",
+                        file=sys.stderr,
+                    )
+                    return 1
                 try:
+                    sys.stdout.flush()
                     answer = input("\nProceed? [y/N] ").strip().lower()
                 except EOFError:
                     answer = ""
@@ -6000,13 +6009,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 if answer not in ("y", "yes"):
                     log.end_cycle()
                     print("Aborted.")
-                    return False
+                    return 0
                 pending_first_cycle_plan = preview_plan
                 preview_cycle_open = True
-                return True
+                return None
 
             log.end_cycle()
-            return True
+            return None
 
         if resumed_reexec:
             log.emit(
@@ -6091,8 +6100,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 git_health_hold_active = False
 
             if needs_initial_preview:
-                if not _preview_initial_cycle_and_confirm():
-                    return 0
+                preview_abort_code = _preview_initial_cycle_and_confirm()
+                if preview_abort_code is not None:
+                    return preview_abort_code
                 continue
 
             pre_cycle_snapshot = _task_snapshot(store)

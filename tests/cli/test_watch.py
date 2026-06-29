@@ -20303,12 +20303,15 @@ def test_cmd_watch_first_start_preserves_confirmation_prompt(tmp_path: Path) -> 
     with (
         patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)) as run_cycle,
         patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush") as flush_mock,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
     ):
         rc = cmd_watch(args)
 
     assert rc == 0
     assert run_cycle.call_count == 1
+    flush_mock.assert_called_once_with()
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
 
@@ -20345,6 +20348,8 @@ def test_cmd_watch_confirmed_first_start_computes_snapshot_once(tmp_path: Path) 
         patch("gza.cli.watch.get_concurrency_snapshot", wraps=watch_module.get_concurrency_snapshot) as snapshot_mock,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("builtins.input", return_value="y") as input_mock,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush") as flush_mock,
         patch("gza.cli.watch.signal.signal", side_effect=register_signal),
         patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
     ):
@@ -20354,6 +20359,7 @@ def test_cmd_watch_confirmed_first_start_computes_snapshot_once(tmp_path: Path) 
     assert rc == 128 + signal.SIGTERM
     assert snapshot_mock.call_count == 1
     assert log_text.count(" WAKE ") == 1
+    flush_mock.assert_called_once_with()
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
 
@@ -20396,6 +20402,39 @@ def test_cmd_watch_yes_runs_exactly_one_cycle(tmp_path: Path) -> None:
     input_mock.assert_not_called()
 
 
+def test_cmd_watch_non_tty_first_start_aborts_with_guidance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup_config(tmp_path)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=False,
+        resumed_reexec=False,
+    )
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)) as run_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=False),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert run_cycle.call_count == 1
+    assert "stdout is not a terminal" in captured.err
+    assert "Re-run with -y to auto-confirm." in captured.err
+    input_mock.assert_not_called()
+
+
 def test_cmd_watch_declining_first_start_aborts_without_dispatch_mutations(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -20420,6 +20459,8 @@ def test_cmd_watch_declining_first_start_aborts_without_dispatch_mutations(tmp_p
         patch("gza.cli.watch.get_concurrency_snapshot", wraps=watch_module.get_concurrency_snapshot) as snapshot_mock,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush") as flush_mock,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
     ):
         rc = cmd_watch(args)
@@ -20437,6 +20478,7 @@ def test_cmd_watch_declining_first_start_aborts_without_dispatch_mutations(tmp_p
     assert " DONE " not in log_text
     assert GIT_HEALTH_PROMPT not in log_text
     spawn_iterate.assert_not_called()
+    flush_mock.assert_called_once_with()
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
 
@@ -23096,12 +23138,15 @@ def test_cmd_watch_first_start_green_probe_clears_prior_git_health_alert_before_
             return_value=(SimpleNamespace(work_done=True), None),
         ) as preview_cycle,
         patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush") as flush_mock,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
     ):
         rc = cmd_watch(args)
 
     assert rc == 0
     preview_cycle.assert_called_once()
+    flush_mock.assert_called_once_with()
     input_mock.assert_called_once()
     assert current_git_health_alert(store) is None
     state = load_git_health_state(store)
@@ -24286,10 +24331,14 @@ def test_cmd_watch_does_not_swallow_keyboard_interrupt_during_confirmation(tmp_p
     with (
         patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)),
         patch("builtins.input", side_effect=KeyboardInterrupt),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush") as flush_mock,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: signal.SIG_DFL),
     ):
         with pytest.raises(KeyboardInterrupt):
             cmd_watch(args)
+
+    flush_mock.assert_called_once_with()
 
 
 def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:

@@ -1124,7 +1124,7 @@ def main() -> int:
     watch_parser.add_argument(
         "-y", "--yes",
         action="store_true",
-        help="Skip confirmation prompt before the first watch pass",
+        help="Skip confirmation prompt before the first watch pass; required when stdout is not a terminal",
     )
     watch_parser.add_argument(
         "--resumed-reexec",
