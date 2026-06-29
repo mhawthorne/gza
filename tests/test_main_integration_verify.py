@@ -4,6 +4,7 @@ import json
 import platform
 import sys
 from datetime import UTC, datetime
+from typing import Literal
 from unittest.mock import MagicMock, patch
 
 from gza.config import Config
@@ -32,8 +33,15 @@ def _linux_container_identity() -> MainIntegrationVerifyEnvironmentIdentity:
 
 
 def _current_host_identity() -> MainIntegrationVerifyEnvironmentIdentity:
+    return _current_identity(runner_class="host")
+
+
+def _current_identity(
+    *,
+    runner_class: Literal["host", "container"],
+) -> MainIntegrationVerifyEnvironmentIdentity:
     return MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
+        runner_class=runner_class,
         platform_system=platform.system(),
         platform_machine=platform.machine(),
         python_executable=sys.executable,
@@ -165,7 +173,7 @@ def test_check_main_integration_verify_treats_environment_identity_mismatch_as_s
         verify_exit_status="0",
         failure="",
         alert_message="",
-        environment_identity=_linux_container_identity(),
+        environment_identity=_current_identity(runner_class="container"),
     )
 
     config = MagicMock(spec=Config)
@@ -215,6 +223,63 @@ def test_check_main_integration_verify_treats_environment_identity_mismatch_as_s
     run_verify.assert_called_once()
     assert check.performed_verify is True
     assert check.state.environment_identity == _current_host_identity()
+
+
+def test_check_main_integration_verify_persists_container_runner_class(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified"]),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test-container-runner-class",
+            runner_class="container",
+        )
+
+    persisted = load_main_integration_verify_state(store)
+
+    assert check.performed_verify is True
+    assert check.state.environment_identity == _current_identity(runner_class="container")
+    assert persisted is not None
+    assert persisted.environment_identity == _current_identity(runner_class="container")
 
 
 def test_check_candidate_integration_verify_pass_returns_structured_evidence_without_persisting_main_state(
@@ -276,6 +341,46 @@ def test_check_candidate_integration_verify_pass_returns_structured_evidence_wit
     assert check.evidence.verify_status == "passed"
     assert check.evidence.failing_phase is None
     assert load_main_integration_verify_state(store) is None
+
+
+def test_check_candidate_integration_verify_returns_container_runner_class(tmp_path) -> None:
+    setup_config(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+
+    fingerprint = "b" * 64
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        output=f"gza-verify phase=passed name=unit duration_seconds=3.25 tree_fingerprint={fingerprint}",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=fingerprint),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
+    ):
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-container",
+            runner_class="container",
+        )
+
+    assert check.classification == "pass"
+    assert check.evidence.environment_identity == _current_identity(runner_class="container")
 
 
 def test_check_candidate_integration_verify_red_rerun_classifies_flake(tmp_path) -> None:

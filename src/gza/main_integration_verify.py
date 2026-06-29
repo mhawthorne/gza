@@ -339,9 +339,12 @@ def _normalized_verify_command(config: Config) -> str:
     return config.verify_command.strip() if isinstance(config.verify_command, str) else ""
 
 
-def _current_verify_environment_identity() -> MainIntegrationVerifyEnvironmentIdentity:
+def _current_verify_environment_identity(
+    *,
+    runner_class: Literal["host", "container"],
+) -> MainIntegrationVerifyEnvironmentIdentity:
     return MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
+        runner_class=runner_class,
         platform_system=platform.system(),
         platform_machine=platform.machine(),
         python_executable=sys.executable,
@@ -349,7 +352,11 @@ def _current_verify_environment_identity() -> MainIntegrationVerifyEnvironmentId
     )
 
 
-def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
+def _current_gate_identity(
+    config: Config,
+    *,
+    runner_class: Literal["host", "container"],
+) -> MainIntegrationVerifyGateIdentity:
     verify_command = _normalized_verify_command(config)
     gate_enabled = bool(verify_command)
     if not gate_enabled:
@@ -367,7 +374,7 @@ def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
         verify_command=verify_command,
         verify_timeout_seconds=timeout_seconds,
         verify_timeout_grace_seconds=timeout_grace_seconds,
-        environment_identity=_current_verify_environment_identity(),
+        environment_identity=_current_verify_environment_identity(runner_class=runner_class),
     )
 
 
@@ -517,12 +524,13 @@ def run_main_integration_verify(
     git: Git,
     *,
     reason: str,
+    runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyState:
     """Run the configured verify gate against the current local target checkout."""
     task = ensure_main_integration_verify_task(store)
     captured_at = datetime.now(UTC)
     head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
-    gate = _current_gate_identity(config)
+    gate = _current_gate_identity(config, runner_class=runner_class)
     verify_command = gate.verify_command or ""
     gate_enabled = gate.gate_enabled
 
@@ -653,10 +661,17 @@ def _run_main_integration_verify_with_red_reruns(
     *,
     reason: str,
     red_reruns: int,
+    runner_class: Literal["host", "container"] = "host",
     prior_red_state: MainIntegrationVerifyState | None = None,
 ) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
     state, remediation, verify_runs = _run_integration_verify_with_red_reruns(
-        lambda run_reason: run_main_integration_verify(config, store, git, reason=run_reason),
+        lambda run_reason: run_main_integration_verify(
+            config,
+            store,
+            git,
+            reason=run_reason,
+            runner_class=runner_class,
+        ),
         reason=reason,
         red_reruns=red_reruns,
         prior_red_state=prior_red_state,
@@ -672,11 +687,12 @@ def check_main_integration_verify(
     reason: str,
     force: bool = False,
     red_reruns: int = 0,
+    runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyCheck:
     """Reuse or refresh local-main verify state for the current tree and gate identity."""
     current_tree_fingerprint = _compute_tree_fingerprint(git)
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
-    current_gate = _current_gate_identity(config)
+    current_gate = _current_gate_identity(config, runner_class=runner_class)
     state = load_main_integration_verify_state(store)
     checkpoint_is_current = state is not None and _checkpoint_is_current(
         state,
@@ -708,6 +724,7 @@ def check_main_integration_verify(
         git,
         reason=reason,
         red_reruns=red_reruns,
+        runner_class=runner_class,
         prior_red_state=state if checkpoint_is_current else None,
     )
     return MainIntegrationVerifyCheck(
@@ -729,12 +746,13 @@ def run_candidate_integration_verify(
     git: Git,
     *,
     reason: str,
+    runner_class: Literal["host", "container"] = "host",
 ) -> CandidateIntegrationVerifyEvidence:
     """Run the configured verify gate against an exact candidate checkout."""
     del reason
     captured_at = datetime.now(UTC)
     head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
-    gate = _current_gate_identity(config)
+    gate = _current_gate_identity(config, runner_class=runner_class)
     verify_command = gate.verify_command or ""
     gate_enabled = gate.gate_enabled
     current_branch = git.current_branch()
@@ -807,10 +825,16 @@ def check_candidate_integration_verify(
     *,
     reason: str,
     red_reruns: int = 0,
+    runner_class: Literal["host", "container"] = "host",
 ) -> CandidateIntegrationVerifyCheck:
     """Run candidate integration verify for an exact checkout without touching main state."""
     evidence, remediation, verify_runs = _run_integration_verify_with_red_reruns(
-        lambda run_reason: run_candidate_integration_verify(config, git, reason=run_reason),
+        lambda run_reason: run_candidate_integration_verify(
+            config,
+            git,
+            reason=run_reason,
+            runner_class=runner_class,
+        ),
         reason=reason,
         red_reruns=red_reruns,
     )
@@ -829,6 +853,8 @@ def current_main_integration_verify_alert(
     store: SqliteTaskStore,
     git: Git,
     config: Config,
+    *,
+    runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyState | None:
     """Return the current red-main alert when it still matches the live local tree."""
     state = load_main_integration_verify_state(store)
@@ -837,7 +863,7 @@ def current_main_integration_verify_alert(
         gate_enabled=state.gate_enabled,
     ):
         return None
-    if not _gate_identity_matches(state, _current_gate_identity(config)):
+    if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
         return None
     default_branch = git.default_branch()
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists(default_branch))
