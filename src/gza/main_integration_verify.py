@@ -443,6 +443,18 @@ def _gate_identity_matches(
     )
 
 
+def _gate_configuration_matches(
+    state: MainIntegrationVerifyState,
+    current_gate: MainIntegrationVerifyGateIdentity,
+) -> bool:
+    return (
+        state.gate_enabled == current_gate.gate_enabled
+        and state.verify_command == current_gate.verify_command
+        and state.verify_timeout_seconds == current_gate.verify_timeout_seconds
+        and state.verify_timeout_grace_seconds == current_gate.verify_timeout_grace_seconds
+    )
+
+
 def _environment_identity_matches(
     persisted: MainIntegrationVerifyEnvironmentIdentity | None,
     current: MainIntegrationVerifyEnvironmentIdentity,
@@ -522,6 +534,7 @@ def persist_main_integration_verify_alert_message(
         verify_command=state.verify_command,
         verify_timeout_seconds=state.verify_timeout_seconds,
         verify_timeout_grace_seconds=state.verify_timeout_grace_seconds,
+        environment_identity=getattr(state, "environment_identity", None),
         tree_fingerprint=state.tree_fingerprint,
         head_sha=state.head_sha,
         failing_phase=state.failing_phase,
@@ -920,7 +933,7 @@ def current_main_integration_verify_alert(
         gate_enabled=state.gate_enabled,
     ):
         return None
-    if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
+    if not _gate_configuration_matches(state, _current_gate_identity(config, runner_class=runner_class)):
         return None
     default_branch = git.default_branch()
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists(default_branch))
