@@ -503,7 +503,7 @@ inner_verify_command: ./bin/tests --quick
 - When `inner_verify_command` is unset, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
 - Autonomous review verification is separate and remains bounded by `autonomous_verify_timeout_seconds`.
 - When autonomous review verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
-- Local-target integration verify reuses green checkpoints until the tree fingerprint or verify-gate identity changes. The configured-gate identity includes the verify environment identity recorded with the checkpoint, so a checkpoint from a different environment, or an older checkpoint that lacks that identity, is treated as stale. Failed/unavailable checkpoints are rerun after `main_integration_verify_red_ttl_minutes` even on the same tree.
+- Local-target integration verify reuses green checkpoints until the tree fingerprint or verify-gate identity changes. The configured-gate identity includes the verify environment identity recorded with the checkpoint, using stable semantic runtime fields like runner class, platform system/machine, and Python implementation/version instead of an exact interpreter path, so a checkpoint from a different environment, or an older checkpoint that lacks that identity, is treated as stale. Failed/unavailable checkpoints are rerun after `main_integration_verify_red_ttl_minutes` even on the same tree.
 
 ---
 

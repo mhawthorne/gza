@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePath
 from typing import Any, Literal, cast
 
 from .config import Config
@@ -92,17 +93,22 @@ class MainIntegrationVerifyEnvironmentIdentity:
     runner_class: Literal["host", "container"]
     platform_system: str
     platform_machine: str
-    python_executable: str
+    python_implementation: str | None
     python_version: str
+    python_executable_family: str | None = None
 
     def to_payload(self) -> dict[str, str]:
-        return {
+        payload = {
             "runner_class": self.runner_class,
             "platform_system": self.platform_system,
             "platform_machine": self.platform_machine,
-            "python_executable": self.python_executable,
             "python_version": self.python_version,
         }
+        if self.python_implementation is not None:
+            payload["python_implementation"] = self.python_implementation
+        if self.python_executable_family is not None:
+            payload["python_executable_family"] = self.python_executable_family
+        return payload
 
     @classmethod
     def from_payload(cls, payload: object) -> MainIntegrationVerifyEnvironmentIdentity | None:
@@ -111,28 +117,43 @@ class MainIntegrationVerifyEnvironmentIdentity:
         runner_class = payload.get("runner_class")
         platform_system = payload.get("platform_system")
         platform_machine = payload.get("platform_machine")
-        python_executable = payload.get("python_executable")
+        python_implementation = payload.get("python_implementation")
+        python_executable_family = payload.get("python_executable_family")
         python_version = payload.get("python_version")
         if runner_class not in {"host", "container"}:
             return None
         if not all(isinstance(value, str) and value for value in (
             platform_system,
             platform_machine,
-            python_executable,
             python_version,
         )):
             return None
+        if python_implementation is not None and not isinstance(python_implementation, str):
+            return None
+        if python_executable_family is not None and not isinstance(python_executable_family, str):
+            return None
+        if python_implementation == "":
+            python_implementation = None
+        if python_executable_family == "":
+            python_executable_family = None
+        if python_executable_family is None:
+            legacy_python_executable = payload.get("python_executable")
+            if isinstance(legacy_python_executable, str) and legacy_python_executable:
+                python_executable_family = _normalize_python_executable_family(
+                    legacy_python_executable
+                )
         typed_runner_class = cast(Literal["host", "container"], runner_class)
         typed_platform_system = cast(str, platform_system)
         typed_platform_machine = cast(str, platform_machine)
-        typed_python_executable = cast(str, python_executable)
+        typed_python_implementation = cast(str | None, python_implementation)
         typed_python_version = cast(str, python_version)
         return cls(
             runner_class=typed_runner_class,
             platform_system=typed_platform_system,
             platform_machine=typed_platform_machine,
-            python_executable=typed_python_executable,
+            python_implementation=typed_python_implementation,
             python_version=typed_python_version,
+            python_executable_family=python_executable_family,
         )
 
 
@@ -339,6 +360,11 @@ def _normalized_verify_command(config: Config) -> str:
     return config.verify_command.strip() if isinstance(config.verify_command, str) else ""
 
 
+def _normalize_python_executable_family(executable: str) -> str | None:
+    normalized = PurePath(executable.strip()).name.lower()
+    return normalized or None
+
+
 def _current_verify_environment_identity(
     *,
     runner_class: Literal["host", "container"],
@@ -347,7 +373,7 @@ def _current_verify_environment_identity(
         runner_class=runner_class,
         platform_system=platform.system(),
         platform_machine=platform.machine(),
-        python_executable=sys.executable,
+        python_implementation=platform.python_implementation(),
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
     )
 
@@ -409,9 +435,40 @@ def _gate_identity_matches(
         and state.verify_timeout_grace_seconds == current_gate.verify_timeout_grace_seconds
         and (
             current_gate.environment_identity is None
-            or state.environment_identity == current_gate.environment_identity
+            or _environment_identity_matches(
+                state.environment_identity,
+                current_gate.environment_identity,
+            )
         )
     )
+
+
+def _environment_identity_matches(
+    persisted: MainIntegrationVerifyEnvironmentIdentity | None,
+    current: MainIntegrationVerifyEnvironmentIdentity,
+) -> bool:
+    if persisted is None:
+        return False
+    if (
+        persisted.runner_class != current.runner_class
+        or persisted.platform_system != current.platform_system
+        or persisted.platform_machine != current.platform_machine
+        or persisted.python_version != current.python_version
+    ):
+        return False
+    if (
+        persisted.python_implementation is not None
+        and current.python_implementation is not None
+        and persisted.python_implementation != current.python_implementation
+    ):
+        return False
+    if (
+        persisted.python_executable_family is not None
+        and current.python_executable_family is not None
+        and persisted.python_executable_family != current.python_executable_family
+    ):
+        return False
+    return True
 
 
 def _persist_main_integration_verify_payload(

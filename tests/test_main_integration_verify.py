@@ -27,7 +27,7 @@ def _linux_container_identity() -> MainIntegrationVerifyEnvironmentIdentity:
         runner_class="container",
         platform_system="Linux",
         platform_machine="x86_64",
-        python_executable="/usr/bin/python3",
+        python_implementation="CPython",
         python_version="3.12",
     )
 
@@ -39,13 +39,15 @@ def _current_host_identity() -> MainIntegrationVerifyEnvironmentIdentity:
 def _current_identity(
     *,
     runner_class: Literal["host", "container"],
+    python_executable_family: str | None = None,
 ) -> MainIntegrationVerifyEnvironmentIdentity:
     return MainIntegrationVerifyEnvironmentIdentity(
         runner_class=runner_class,
         platform_system=platform.system(),
         platform_machine=platform.machine(),
-        python_executable=sys.executable,
+        python_implementation=platform.python_implementation(),
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+        python_executable_family=python_executable_family,
     )
 
 
@@ -101,6 +103,52 @@ def test_load_main_integration_verify_state_round_trips_environment_identity(tmp
 
     assert state is not None
     assert state.environment_identity == identity
+
+
+def test_load_main_integration_verify_state_accepts_legacy_python_executable_payload(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    python_executable_family = f"python{python_version}"
+    task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.review_verify_command = "./bin/tests"
+    task.review_verify_status = "passed"
+    task.review_verify_exit_status = "0"
+    task.review_verify_head_sha = "abc123"
+    task.output_content = json.dumps(
+        {
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": {
+                "runner_class": "host",
+                "platform_system": platform.system(),
+                "platform_machine": platform.machine(),
+                "python_executable": f"/tmp/worktree/.venv/bin/{python_executable_family}",
+                "python_version": python_version,
+            },
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp-verified",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+
+    assert state is not None
+    assert state.environment_identity == MainIntegrationVerifyEnvironmentIdentity(
+        runner_class="host",
+        platform_system=platform.system(),
+        platform_machine=platform.machine(),
+        python_implementation=None,
+        python_version=python_version,
+        python_executable_family=python_executable_family,
+    )
 
 
 def test_check_main_integration_verify_treats_missing_environment_identity_as_stale(tmp_path) -> None:
@@ -225,6 +273,55 @@ def test_check_main_integration_verify_treats_environment_identity_mismatch_as_s
     assert check.state.environment_identity == _current_host_identity()
 
 
+def test_check_main_integration_verify_reuses_checkpoint_when_only_python_path_differs(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    legacy_same_runtime_identity = MainIntegrationVerifyEnvironmentIdentity(
+        runner_class="host",
+        platform_system=platform.system(),
+        platform_machine=platform.machine(),
+        python_implementation=None,
+        python_version=python_version,
+        python_executable_family=f"python{python_version}",
+    )
+    _seed_main_verify_task(
+        store,
+        verify_status="passed",
+        verify_exit_status="0",
+        failure="",
+        alert_message="",
+        environment_identity=legacy_same_runtime_identity,
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test-same-runtime-different-python-path",
+        )
+
+    run_verify.assert_not_called()
+    assert check.performed_verify is False
+    assert check.is_current is True
+    assert check.state.environment_identity == legacy_same_runtime_identity
+
+
 def test_check_main_integration_verify_persists_container_runner_class(tmp_path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -280,6 +377,15 @@ def test_check_main_integration_verify_persists_container_runner_class(tmp_path)
     assert check.state.environment_identity == _current_identity(runner_class="container")
     assert persisted is not None
     assert persisted.environment_identity == _current_identity(runner_class="container")
+    payload = json.loads(persisted.task.output_content or "{}")
+    assert payload["environment_identity"] == {
+        "runner_class": "container",
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "python_implementation": platform.python_implementation(),
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
+    assert "python_executable" not in payload["environment_identity"]
 
 
 def test_check_candidate_integration_verify_pass_returns_structured_evidence_without_persisting_main_state(
