@@ -174,3 +174,15 @@ def test_main_honors_disable_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert exit_code == 0
     assert run_unit_phase.call_args.kwargs["rerun_enabled"] is False
+
+
+def test_main_routes_functional_phase_through_functional_env_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GZA_FUNCTIONAL_SERIAL_RERUN", "0")
+    run_functional_phase = Mock(return_value=0)
+    monkeypatch.setattr(test_serial_rerun, "run_functional_phase", run_functional_phase)
+
+    exit_code = test_serial_rerun.main(["--phase", "functional", "--", "tests_functional/", "-n", "2"])
+
+    assert exit_code == 0
+    assert run_functional_phase.call_args.args[0] == ["tests_functional/", "-n", "2"]
+    assert run_functional_phase.call_args.kwargs["rerun_enabled"] is False

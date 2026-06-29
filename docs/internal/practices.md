@@ -155,6 +155,12 @@ bridge with `GZA_UNIT_SERIAL_RERUN=0` when debugging suspected parallel-only
 real failures. Treat the `unit-rerun: PARALLEL-ONLY FAILURE (passed serially)`
 lines as a real signal to follow up, not as noise to suppress.
 
+The functional lane uses the same guarded bridge via `./bin/test-functional`
+with its own knobs: `GZA_FUNCTIONAL_RERUN_CAP` and
+`GZA_FUNCTIONAL_SERIAL_RERUN`. Keep that bridge equally narrow and fail-closed:
+it exists only to stabilize bounded xdist-only functional flakes without
+masking collection errors, internal pytest errors, or broad failure sets.
+
 ## Gitignored derived artifacts are not review blockers
 
 `.claude/skills/` is installed per-worktree by `gza skills-install` from the

@@ -86,6 +86,23 @@ known xdist contention artifacts, not a replacement for the durable per-test
 budgeting work. `GZA_UNIT_SERIAL_RERUN=0` disables the bridge for operator
 triage, and `GZA_UNIT_RERUN_CAP` keeps broad failure sets fail-closed.
 
+## Functional parallel-only rerun bridge
+
+The functional verify lane now uses the same guarded bridge through
+`./bin/test-functional`, but keeps separate operator controls:
+
+- the parallel xdist pass still runs first, preserving the normal
+  `tests_functional/` worker grouping, durations, and hang-guard settings;
+- if that pass fails only because a bounded set of per-test node IDs failed,
+  the harness reruns just those node IDs serially and logs each
+  `functional-rerun: PARALLEL-ONLY FAILURE (passed serially)` line;
+- collection errors, internal errors, unattributable exits, or failure sets
+  over `GZA_FUNCTIONAL_RERUN_CAP` fail immediately without masking.
+
+This keeps `./bin/tests` green for bounded parallel-only functional flakes
+while preserving fail-closed behavior for real failures. Operators can disable
+the functional bridge with `GZA_FUNCTIONAL_SERIAL_RERUN=0` during triage.
+
 ## Unit-suite per-test guards
 
 The unit suite now separates two concerns that used to be conflated by one
