@@ -20,8 +20,9 @@ advance_mode: iterate
 
 watch:
   batch: 2
-  poll: 60 
+  poll: 60
   no_activity_timeout: 120
+  no_progress_cycles: 2
   
 #provider: claude
 #model: claude-sonnet-4-6
