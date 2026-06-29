@@ -1129,16 +1129,21 @@ def _should_complete_as_verified_empty_noop(
     exit_code: int,
     error_type: str | None,
     empty_turn: bool,
-    merge_state: str | None,
+    commits_ahead: int,
     log_file: Path,
     worktree_git: Git,
 ) -> bool:
     """Return whether a no-change run is a proven successful empty no-op."""
     if exit_code != 0 or error_type is not None or empty_turn:
         return False
-    if merge_state != "empty":
+    if commits_ahead != 0:
         return False
     return _has_trustworthy_green_verify_evidence_for_current_tree(log_file, worktree_git)
+
+
+def _verified_empty_noop_terminal_merge_state(*, has_commits: bool | None) -> str:
+    """Classify a verified no-op branch as empty vs redundant."""
+    return "redundant" if has_commits else "empty"
 
 
 def _record_pr_publication_note(
@@ -7879,6 +7884,7 @@ def _complete_code_task(
             and no new commits should be created by the runner.
     """
     complete_as_verified_empty_noop = False
+    verified_empty_noop_terminal_merge_state: str | None = None
     if skip_commit:
         has_uncommitted = False
     else:
@@ -8029,10 +8035,14 @@ def _complete_code_task(
                         exit_code=exit_code,
                         error_type=error_type,
                         empty_turn=empty_turn,
-                        merge_state=merge_state,
+                        commits_ahead=commits_ahead,
                         log_file=log_file,
                         worktree_git=worktree_git,
                     )
+                    if complete_as_verified_empty_noop:
+                        verified_empty_noop_terminal_merge_state = (
+                            _verified_empty_noop_terminal_merge_state(has_commits=task.has_commits)
+                        )
                     if merge_state in {"empty", "redundant"}:
                         unit = store.get_or_create_merge_unit_for_task(task)
                         if unit is not None and unit.state != merge_state:
@@ -8218,7 +8228,7 @@ def _complete_code_task(
         head_sha=head_sha,
         base_sha=base_sha,
         has_commits=not complete_as_verified_empty_noop,
-        terminal_merge_state="empty" if complete_as_verified_empty_noop else None,
+        terminal_merge_state=verified_empty_noop_terminal_merge_state,
         completion_reason=(
             VERIFIED_EMPTY_NOOP_COMPLETION_REASON if complete_as_verified_empty_noop else None
         ),

@@ -10135,6 +10135,92 @@ class TestExtractedRunInnerHelpers:
         assert [candidate.id for candidate in store.get_pending_pickup()] == [downstream.id]
         assert store.is_task_blocked(downstream) == (False, None, None)
 
+    def test_complete_code_task_marks_verified_empty_noop_completed_when_merge_probe_is_unclassifiable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement already-satisfied no-op", task_type="implement")
+        task.slug = "20260629-verified-empty-noop-unknown-probe"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        passed_fingerprint = "d" * 64
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "timestamp": "2026-06-29T00:00:00+00:00",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests --quick",
+                        "aggregated_output": (
+                            "gza-verify phase=passed name=pytest duration_seconds=1.25 "
+                            f"tree_fingerprint={passed_fingerprint}\n"
+                        ),
+                        "exit_code": 0,
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "test/branch": "deadbeef",
+            "main": "cafebabe",
+        }.get(ref)
+
+        with (
+            patch("gza.runner.resolve_task_merge_state_for_target", return_value=None),
+            patch("gza.runner._compute_tree_fingerprint", return_value=passed_fingerprint),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=10, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+        assert refreshed.completion_reason == "VERIFIED_EMPTY_NOOP"
+        assert refreshed.has_commits is False
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "empty"
+
+        ops_entries = [
+            json.loads(line)
+            for line in ops_log_path_for(log_file).read_text().splitlines()
+            if line.strip()
+        ]
+        outcome_entry = next(entry for entry in ops_entries if entry.get("subtype") == "outcome")
+        assert outcome_entry["message"] == "Outcome: completed (moot: no unique commits vs target)"
+        assert outcome_entry["completion_reason"] == "VERIFIED_EMPTY_NOOP"
+        assert "failure_reason" not in outcome_entry
+
     def test_complete_code_task_classifies_capacity_no_change_run_as_provider_unavailable(
         self,
         tmp_path: Path,
@@ -10474,7 +10560,7 @@ class TestExtractedRunInnerHelpers:
         assert decision.action == "resume"
         assert decision.reason_code == "TERMINAL_NO_WORK"
 
-    def test_complete_code_task_keeps_genuinely_unclassifiable_no_change_run_unknown(
+    def test_complete_code_task_keeps_unverified_unclassifiable_no_change_run_unknown(
         self,
         tmp_path: Path,
     ) -> None:
@@ -10519,6 +10605,83 @@ class TestExtractedRunInnerHelpers:
         decision = decide_failed_task_recovery(store, refreshed, max_recovery_attempts=1)
         assert decision.action == "skip"
         assert decision.reason_code == "manual_failure_reason"
+
+    def test_complete_code_task_marks_verified_empty_noop_redundant_when_branch_previously_had_commits(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement already-landed change", task_type="implement")
+        task.slug = "20260629-verified-redundant-noop"
+        task.has_commits = True
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        passed_fingerprint = "e" * 64
+        log_file.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "timestamp": "2026-06-29T00:00:00+00:00",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "./bin/tests --quick",
+                        "aggregated_output": (
+                            "gza-verify phase=passed name=pytest duration_seconds=1.25 "
+                            f"tree_fingerprint={passed_fingerprint}\n"
+                        ),
+                        "exit_code": 0,
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.count_commits_ahead.return_value = 0
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "test/redundant-branch": "deadbeef",
+            "main": "cafebabe",
+        }.get(ref)
+
+        with (
+            patch("gza.runner.resolve_task_merge_state_for_target", return_value=None),
+            patch("gza.runner._compute_tree_fingerprint", return_value=passed_fingerprint),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "test/redundant-branch",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.01),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=tmp_path / "worktree-summary.md",
+                summary_path=tmp_path / ".gza" / "summaries" / f"{task.slug}.md",
+                summary_dir=tmp_path / ".gza" / "summaries",
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+        assert refreshed.completion_reason == "VERIFIED_EMPTY_NOOP"
+        assert refreshed.has_commits is False
+
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "redundant"
 
     def test_complete_code_task_logs_warning_when_no_work_merge_probe_fails(
         self,
