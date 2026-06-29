@@ -1109,12 +1109,13 @@ class TestLocalConfigOverrides:
         self,
         tmp_path: Path,
     ) -> None:
-        """gza config --json should expose watch dispatch/no-progress settings with source attribution."""
+        """gza config --json should expose watch remediation/dispatch/no-progress settings with sources."""
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
             "watch:\n"
             "  no_progress_cycles: 4\n"
+            "  main_verify_remediation_max_attempts: 5\n"
         )
         (tmp_path / "gza.local.yaml").write_text(
             "watch:\n"
@@ -1132,6 +1133,8 @@ class TestLocalConfigOverrides:
         payload = json.loads(result.stdout)
         assert payload["effective"]["watch"]["no_progress_cycles"] == 4
         assert payload["sources"]["watch.no_progress_cycles"] == "base"
+        assert payload["effective"]["watch"]["main_verify_remediation_max_attempts"] == 5
+        assert payload["sources"]["watch.main_verify_remediation_max_attempts"] == "base"
         assert payload["effective"]["watch"]["dispatch_start_timeout"] == 7
         assert payload["sources"]["watch.dispatch_start_timeout"] == "local"
 
@@ -1660,6 +1663,8 @@ class TestLocalConfigOverrides:
             "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch."
             in result.stdout
         )
+        assert "watch.main_verify_remediation_max_attempts" in result.stdout
+        assert "Maximum consumed automatic remediation attempts" in result.stdout
 
     def test_config_keys_json_emits_valid_machine_readable_registry(self, tmp_path: Path):
         """`gza config keys --json` should emit a full machine-readable registry payload."""
@@ -1692,6 +1697,7 @@ class TestLocalConfigOverrides:
         assert keyed_entries["watch.recovery_slots"]["type"] == "int"
         assert keyed_entries["watch.restart_failed_batch"]["type"] == "int"
         assert keyed_entries["watch.no_activity_timeout"]["type"] == "int"
+        assert keyed_entries["watch.main_verify_remediation_max_attempts"]["type"] == "int"
         assert keyed_entries["max_concurrent"]["type"] == "int"
         assert keyed_entries["max_concurrent"]["default"] == "effective watch batch or 5"
         assert "Default concurrent worker target" in keyed_entries["watch.batch"]["description"]
@@ -1699,6 +1705,8 @@ class TestLocalConfigOverrides:
         assert "pending-only" in keyed_entries["watch.recovery_slots"]["description"]
         assert "Deprecated alias" in keyed_entries["watch.restart_failed_batch"]["description"]
         assert "silent registered worker for a pending or in-progress task" in keyed_entries["watch.no_activity_timeout"]["description"]
+        assert keyed_entries["watch.main_verify_remediation_max_attempts"]["default"] == 2
+        assert "requires human intervention" in keyed_entries["watch.main_verify_remediation_max_attempts"]["description"]
         assert "effective watch batch" in keyed_entries["max_concurrent"]["description"]
         assert "including `--batch`" in keyed_entries["max_concurrent"]["description"]
         assert "other commands keep the loaded fallback" in keyed_entries["max_concurrent"]["description"]
@@ -4501,6 +4509,7 @@ class TestWatchConfigValidation:
             ("transient_recovery_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
             ("no_progress_cycles", "bad"),
+            ("main_verify_remediation_max_attempts", "bad"),
             ("no_activity_timeout", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
@@ -4524,6 +4533,7 @@ class TestWatchConfigValidation:
             "transient_recovery_backoff_max",
             "failure_halt_after",
             "no_progress_cycles",
+            "main_verify_remediation_max_attempts",
             "no_activity_timeout",
             "poll",
             "max_idle",
@@ -4551,6 +4561,7 @@ class TestWatchConfigValidation:
             "  transient_recovery_backoff_max: 1200\n"
             "  failure_halt_after: 6\n"
             "  no_progress_cycles: 4\n"
+            "  main_verify_remediation_max_attempts: 5\n"
             "  no_activity_timeout: 75\n"
             "  poll: 45\n"
             "  max_idle: 180\n"
@@ -4563,6 +4574,7 @@ class TestWatchConfigValidation:
         assert config.watch.transient_recovery_backoff_max == 1200
         assert config.watch.failure_halt_after == 6
         assert config.watch.no_progress_cycles == 4
+        assert config.watch.main_verify_remediation_max_attempts == 5
         assert config.watch.no_activity_timeout == 75
         assert config.watch.poll == 45
         assert config.watch.max_idle == 180
@@ -4907,6 +4919,7 @@ class TestWatchConfigValidation:
             ("failure_backoff_max", "bad"),
             ("transient_recovery_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
+            ("main_verify_remediation_max_attempts", "bad"),
             ("no_activity_timeout", "bad"),
             ("poll", "bad"),
             ("max_idle", "bad"),
@@ -4930,6 +4943,7 @@ class TestWatchConfigValidation:
             "failure_backoff_max",
             "transient_recovery_backoff_max",
             "failure_halt_after",
+            "main_verify_remediation_max_attempts",
             "no_activity_timeout",
             "poll",
             "max_idle",

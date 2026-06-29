@@ -18,6 +18,7 @@ from gza.db import (
     DB_UNSET,
     SCHEMA_VERSION,
     DuplicateActiveChildError,
+    MainVerifyRemediationAttemptState,
     ManualMigrationRequired,
     MergeTargetResolutionError,
     NewTaskParams,
@@ -31,6 +32,7 @@ from gza.db import (
     _ClosingSqliteConnection,
     _is_readonly_operational_error,
     _is_readonly_snapshot_operational_error,
+    _supports_main_verify_remediation_attempts_table,
     behavior_check_finding_fingerprint,
     check_migration_status,
     import_legacy_local_db,
@@ -8030,6 +8032,99 @@ def _drop_watch_recovery_backoffs_column(db_path: Path, column_name: str) -> Non
     conn.close()
 
 
+def _drop_main_verify_remediation_attempts_column(db_path: Path, column_name: str) -> None:
+    """Rebuild main_verify_remediation_attempts without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "ALTER TABLE main_verify_remediation_attempts RENAME TO main_verify_remediation_attempts_old"
+    )
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(main_verify_remediation_attempts_old)")]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(main_verify_remediation_attempts_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(name for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE main_verify_remediation_attempts ({', '.join(col_defs)})")
+    conn.execute(
+        "INSERT INTO main_verify_remediation_attempts "
+        f"({cols_str}) SELECT {cols_str} FROM main_verify_remediation_attempts_old"
+    )
+    conn.execute("DROP TABLE main_verify_remediation_attempts_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_active_task "
+        "ON main_verify_remediation_attempts(project_id, active_task_id)"
+    )
+    if "updated_at" in kept_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_updated_at "
+            "ON main_verify_remediation_attempts(project_id, updated_at)"
+        )
+    conn.commit()
+    conn.close()
+
+
+def _drop_main_verify_remediation_consumed_task_ids_column(db_path: Path, column_name: str) -> None:
+    """Rebuild main_verify_remediation_consumed_task_ids without a specific column."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "ALTER TABLE main_verify_remediation_consumed_task_ids "
+        "RENAME TO main_verify_remediation_consumed_task_ids_old"
+    )
+    cols = [
+        row[1]
+        for row in conn.execute("PRAGMA table_info(main_verify_remediation_consumed_task_ids_old)")
+    ]
+    kept_cols = [c for c in cols if c != column_name]
+    cols_str = ", ".join(kept_cols)
+    col_defs = []
+    pragma_rows = list(conn.execute("PRAGMA table_info(main_verify_remediation_consumed_task_ids_old)"))
+    pk_cols = [(row[5], row[1]) for row in pragma_rows if row[1] != column_name and row[5]]
+    has_composite_pk = len(pk_cols) > 1
+    for row in pragma_rows:
+        if row[1] == column_name:
+            continue
+        name, typ, notnull, dflt, pk = row[1], row[2], row[3], row[4], row[5]
+        parts = [name, typ]
+        if pk and not has_composite_pk:
+            parts.append("PRIMARY KEY")
+        if notnull and not pk:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            parts.append(f"DEFAULT {dflt}")
+        col_defs.append(" ".join(parts))
+    if has_composite_pk:
+        ordered_pk = ", ".join(name for _, name in sorted(pk_cols, key=lambda item: item[0]))
+        col_defs.append(f"PRIMARY KEY({ordered_pk})")
+    conn.execute(f"CREATE TABLE main_verify_remediation_consumed_task_ids ({', '.join(col_defs)})")
+    conn.execute(
+        "INSERT INTO main_verify_remediation_consumed_task_ids "
+        f"({cols_str}) SELECT {cols_str} FROM main_verify_remediation_consumed_task_ids_old"
+    )
+    conn.execute("DROP TABLE main_verify_remediation_consumed_task_ids_old")
+    conn.commit()
+    conn.close()
+
+
 def _drop_parked_task_rearms_columns(db_path: Path, column_names: set[str]) -> None:
     """Rebuild parked_task_rearms without specific columns."""
     import sqlite3
@@ -10456,6 +10551,115 @@ class TestSharedDbIsolationAndImportGating:
         assert "behavior_check_findings" in tables
         assert "idx_behavior_check_findings_project_state" in indexes
 
+    def test_auto_migration_v62_to_v64_adds_main_verify_remediation_tables(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_main_verify_remediation_attempts_active_task")
+            conn.execute("DROP INDEX IF EXISTS idx_main_verify_remediation_attempts_updated_at")
+            conn.execute("DROP TABLE IF EXISTS main_verify_remediation_consumed_task_ids")
+            conn.execute("DROP TABLE IF EXISTS main_verify_remediation_attempts")
+            conn.execute("UPDATE schema_version SET version = 62")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            indexes = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+            }
+
+        assert version == SCHEMA_VERSION
+        assert "main_verify_remediation_attempts" in tables
+        assert "main_verify_remediation_consumed_task_ids" in tables
+        assert "idx_main_verify_remediation_attempts_active_task" in indexes
+        assert "idx_main_verify_remediation_attempts_updated_at" in indexes
+
+    def test_readwrite_open_rejects_incomplete_main_verify_remediation_attempts_schema(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_main_verify_remediation_attempts_column(db_path, "updated_at")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            assert _supports_main_verify_remediation_attempts_table(conn) is False
+
+        with pytest.raises(
+            SchemaIntegrityError,
+            match=(
+                "main_verify_remediation_attempts: missing required column updated_at"
+            ),
+        ):
+            SqliteTaskStore(db_path, prefix="gza")
+
+    def test_readwrite_open_rejects_incomplete_main_verify_remediation_consumed_task_ids_schema(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_main_verify_remediation_consumed_task_ids_column(db_path, "consumed_at")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            assert _supports_main_verify_remediation_attempts_table(conn) is False
+
+        with pytest.raises(
+            SchemaIntegrityError,
+            match=(
+                "main_verify_remediation_consumed_task_ids: missing required column consumed_at"
+            ),
+        ):
+            SqliteTaskStore(db_path, prefix="gza")
+
+    def test_auto_migration_v63_to_v64_backfills_last_consumed_task_id_for_dedup(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+        initial = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="abc123",
+            last_observed_failure="still red after merge",
+        )
+
+        assert initial is not None
+        assert initial.consumed_attempt_count == 1
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS main_verify_remediation_consumed_task_ids")
+            conn.execute("UPDATE schema_version SET version = 63")
+            conn.commit()
+
+        migrated_store = SqliteTaskStore(db_path, prefix="gza")
+        duplicate = migrated_store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="def456",
+            last_observed_failure="duplicate observe after migration",
+        )
+
+        assert duplicate is not None
+        assert duplicate.consumed_attempt_count == 1
+        assert duplicate.last_consumed_task_id == "gza-100"
+
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
 
@@ -10597,6 +10801,471 @@ class TestSharedDbIsolationAndImportGating:
         assert second.last_auto_attempt_at is not None
         assert second.last_auto_attempt_at >= first.last_auto_attempt_at
         assert second.last_auto_attempt_target_sha == "def456"
+
+    def test_main_verify_remediation_attempt_round_trip_and_sentinel_support(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id="gza-100",
+            last_observed_head_sha="abc123",
+            last_observed_failure="verify remained red",
+        )
+
+        assert first == MainVerifyRemediationAttemptState(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            consumed_attempt_count=0,
+            active_task_id="gza-100",
+            exhausted_at=None,
+            last_consumed_task_id=None,
+            last_observed_head_sha="abc123",
+            last_observed_failure="verify remained red",
+            updated_at=first.updated_at,
+        )
+        assert first is not None
+        assert first.updated_at is not None
+
+        consumed = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id="gza-100",
+            last_observed_head_sha="def456",
+            last_observed_failure="still red after merge",
+        )
+
+        assert consumed is not None
+        assert consumed.tree_fingerprint is None
+        assert consumed.consumed_attempt_count == 1
+        assert consumed.active_task_id is None
+        assert consumed.last_consumed_task_id == "gza-100"
+        assert consumed.last_observed_head_sha == "def456"
+        assert consumed.last_observed_failure == "still red after merge"
+        assert consumed.updated_at is not None
+
+        exhausted = store.mark_main_verify_remediation_exhausted(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            last_observed_head_sha="ghi789",
+            last_observed_failure="budget exhausted",
+        )
+
+        assert exhausted is not None
+        assert exhausted.consumed_attempt_count == 1
+        assert exhausted.exhausted_at is not None
+        assert exhausted.last_observed_head_sha == "ghi789"
+        assert exhausted.last_observed_failure == "budget exhausted"
+        assert store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint=None,
+        ) == exhausted
+
+    def test_main_verify_remediation_exhausted_clears_active_task_and_preserves_counter(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        active = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="abc123",
+            last_observed_failure="verify remained red",
+        )
+
+        assert active is not None
+        consumed = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-099",
+            last_observed_head_sha="def456",
+            last_observed_failure="still red after merge",
+        )
+
+        assert consumed is not None
+        reactivated = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="ghi789",
+            last_observed_failure="new remediation attempt active",
+        )
+
+        assert reactivated is not None
+        assert reactivated.consumed_attempt_count == 1
+        assert reactivated.active_task_id == "gza-101"
+
+        exhausted = store.mark_main_verify_remediation_exhausted(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            last_observed_head_sha="jkl012",
+            last_observed_failure="budget exhausted",
+        )
+
+        assert exhausted is not None
+        assert exhausted.consumed_attempt_count == 1
+        assert exhausted.active_task_id is None
+        assert exhausted.exhausted_at is not None
+        assert exhausted.last_consumed_task_id == "gza-099"
+        assert exhausted.last_observed_head_sha == "jkl012"
+        assert exhausted.last_observed_failure == "budget exhausted"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == exhausted
+        assert persisted is not None
+        assert persisted.consumed_attempt_count == 1
+        assert persisted.active_task_id is None
+        assert persisted.exhausted_at is not None
+
+    def test_main_verify_remediation_active_task_clears_exhausted_state(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        exhausted = store.mark_main_verify_remediation_exhausted(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            last_observed_head_sha="abc123",
+            last_observed_failure="budget exhausted",
+        )
+
+        assert exhausted is not None
+        assert exhausted.exhausted_at is not None
+        reactivated = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="def456",
+            last_observed_failure="human reset opened a new remediation",
+        )
+
+        assert reactivated is not None
+        assert reactivated.active_task_id == "gza-101"
+        assert reactivated.exhausted_at is None
+        assert reactivated.last_observed_head_sha == "def456"
+        assert reactivated.last_observed_failure == "human reset opened a new remediation"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == reactivated
+        assert persisted is not None
+        assert persisted.active_task_id == "gza-101"
+        assert persisted.exhausted_at is None
+
+    def test_main_verify_remediation_clear_active_task_preserves_counter(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+        )
+        cleared = store.clear_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            last_observed_head_sha="abc123",
+            last_observed_failure="verify green after rerun",
+        )
+
+        assert cleared is not None
+        assert cleared.tree_fingerprint == "fp-functional-a"
+        assert cleared.consumed_attempt_count == 1
+        assert cleared.active_task_id is None
+        assert cleared.last_observed_head_sha == "abc123"
+        assert cleared.last_observed_failure == "verify green after rerun"
+
+    def test_main_verify_remediation_consumed_attempt_is_idempotent_for_same_task(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="abc123",
+            last_observed_failure="still red after merge",
+        )
+
+        assert first is not None
+        assert first.consumed_attempt_count == 1
+        assert first.active_task_id is None
+        assert first.last_consumed_task_id == "gza-100"
+
+        duplicate = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="def456",
+            last_observed_failure="duplicate observe after restart",
+        )
+
+        assert duplicate is not None
+        assert duplicate.consumed_attempt_count == 1
+        assert duplicate.active_task_id is None
+        assert duplicate.last_consumed_task_id == "gza-100"
+        assert duplicate.last_observed_head_sha == "def456"
+        assert duplicate.last_observed_failure == "duplicate observe after restart"
+
+        persisted_duplicate = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted_duplicate == duplicate
+        assert persisted_duplicate is not None
+        assert persisted_duplicate.consumed_attempt_count == 1
+
+        later = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="ghi789",
+            last_observed_failure="later remediation also failed",
+        )
+
+        assert later is not None
+        assert later.consumed_attempt_count == 2
+        assert later.active_task_id is None
+        assert later.last_consumed_task_id == "gza-101"
+
+        persisted_later = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted_later == later
+        assert persisted_later is not None
+        assert persisted_later.consumed_attempt_count == 2
+
+    def test_main_verify_remediation_consumed_attempt_is_idempotent_for_non_adjacent_duplicate_task(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="abc123",
+            last_observed_failure="first remediation still red after merge",
+        )
+        second = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="def456",
+            last_observed_failure="second remediation still red after merge",
+        )
+        duplicate_first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="ghi789",
+            last_observed_failure="duplicate observe after restart",
+        )
+
+        assert first is not None
+        assert second is not None
+        assert duplicate_first is not None
+        assert first.consumed_attempt_count == 1
+        assert second.consumed_attempt_count == 2
+        assert duplicate_first.consumed_attempt_count == 2
+        assert duplicate_first.active_task_id is None
+        assert duplicate_first.last_consumed_task_id == "gza-101"
+        assert duplicate_first.last_observed_head_sha == "ghi789"
+        assert duplicate_first.last_observed_failure == "duplicate observe after restart"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == duplicate_first
+        assert persisted is not None
+        assert persisted.consumed_attempt_count == 2
+        assert persisted.last_consumed_task_id == "gza-101"
+
+    def test_main_verify_remediation_duplicate_old_consume_preserves_newer_active_task(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="abc123",
+            last_observed_failure="first remediation still red after merge",
+        )
+        active = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="def456",
+            last_observed_failure="new remediation attempt active",
+        )
+        duplicate_first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="ghi789",
+            last_observed_failure="duplicate observe after restart",
+        )
+
+        assert first is not None
+        assert active is not None
+        assert duplicate_first is not None
+        assert first.consumed_attempt_count == 1
+        assert active.active_task_id == "gza-101"
+        assert duplicate_first.consumed_attempt_count == 1
+        assert duplicate_first.active_task_id == "gza-101"
+        assert duplicate_first.last_consumed_task_id == "gza-100"
+        assert duplicate_first.last_observed_head_sha == "ghi789"
+        assert duplicate_first.last_observed_failure == "duplicate observe after restart"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == duplicate_first
+        assert persisted is not None
+        assert persisted.consumed_attempt_count == 1
+        assert persisted.active_task_id == "gza-101"
+        assert persisted.last_consumed_task_id == "gza-100"
+
+    def test_main_verify_remediation_fresh_old_consume_preserves_newer_active_task(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first_active = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="abc123",
+            last_observed_failure="new remediation attempt active",
+        )
+        consumed_older = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-100",
+            last_observed_head_sha="def456",
+            last_observed_failure="older remediation still red after merge",
+        )
+
+        assert first_active is not None
+        assert consumed_older is not None
+        assert first_active.active_task_id == "gza-101"
+        assert consumed_older.consumed_attempt_count == 1
+        assert consumed_older.active_task_id == "gza-101"
+        assert consumed_older.last_consumed_task_id == "gza-100"
+        assert consumed_older.last_observed_head_sha == "def456"
+        assert consumed_older.last_observed_failure == "older remediation still red after merge"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == consumed_older
+        assert persisted is not None
+        assert persisted.consumed_attempt_count == 1
+        assert persisted.active_task_id == "gza-101"
+        assert persisted.last_consumed_task_id == "gza-100"
+
+    def test_main_verify_remediation_unknown_provenance_consume_clears_active_task(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        active = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="abc123",
+            last_observed_failure="new remediation attempt active",
+        )
+        consumed_unknown = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id=None,
+            last_observed_head_sha="def456",
+            last_observed_failure="still red after unknown merge",
+        )
+
+        assert active is not None
+        assert consumed_unknown is not None
+        assert active.active_task_id == "gza-101"
+        assert consumed_unknown.consumed_attempt_count == 1
+        assert consumed_unknown.active_task_id is None
+        assert consumed_unknown.last_consumed_task_id is None
+        assert consumed_unknown.last_observed_head_sha == "def456"
+        assert consumed_unknown.last_observed_failure == "still red after unknown merge"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == consumed_unknown
+        assert persisted is not None
+        assert persisted.consumed_attempt_count == 1
+        assert persisted.active_task_id is None
+
+    def test_main_verify_remediation_consumed_attempt_none_task_id_always_increments(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id=None,
+            last_observed_head_sha="abc123",
+            last_observed_failure="still red after unknown merge",
+        )
+        second = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id=None,
+            last_observed_head_sha="def456",
+            last_observed_failure="still red after another unknown merge",
+        )
+
+        assert first is not None
+        assert second is not None
+        assert first.consumed_attempt_count == 1
+        assert second.consumed_attempt_count == 2
+        assert second.last_consumed_task_id is None
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == second
+        assert persisted is not None
+        assert persisted.consumed_attempt_count == 2
 
     def test_behavior_check_finding_helpers_keep_active_linked_tasks_dedupable(
         self, tmp_path: Path
@@ -10944,6 +11613,102 @@ class TestSharedDbIsolationAndImportGating:
         assert backoff is None
         assert any(
             "incomplete watch_recovery_backoffs schema" in warning
+            for warning in query_store.startup_warnings()
+        )
+
+    def test_query_only_open_pre_v63_missing_main_verify_remediation_attempts_degrades_safely(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_main_verify_remediation_attempts_active_task")
+            conn.execute("DROP INDEX IF EXISTS idx_main_verify_remediation_attempts_updated_at")
+            conn.execute("DROP TABLE IF EXISTS main_verify_remediation_consumed_task_ids")
+            conn.execute("DROP TABLE IF EXISTS main_verify_remediation_attempts")
+            conn.execute("UPDATE schema_version SET version = 62")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            supported = query_store.supports_main_verify_remediation_attempts()
+            state = query_store.get_main_verify_remediation_attempt_state(
+                signature="phase:functional",
+                tree_fingerprint=None,
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert supported is False
+        assert state is None
+        assert any(
+            "missing required main_verify remediation attempt table" in warning
+            for warning in query_store.startup_warnings()
+        )
+
+    def test_query_only_open_pre_v63_incomplete_main_verify_remediation_attempts_warns_and_degrades(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_main_verify_remediation_attempts_column(db_path, "updated_at")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 62")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            supported = query_store.supports_main_verify_remediation_attempts()
+            state = query_store.get_main_verify_remediation_attempt_state(
+                signature="phase:functional",
+                tree_fingerprint="fp-functional-a",
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert supported is False
+        assert state is None
+        assert any(
+            "incomplete main_verify remediation attempt schema" in warning
+            for warning in query_store.startup_warnings()
+        )
+
+    def test_query_only_open_pre_v64_missing_consumed_task_id_table_warns_and_degrades(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP TABLE IF EXISTS main_verify_remediation_consumed_task_ids")
+            conn.execute("UPDATE schema_version SET version = 63")
+            conn.commit()
+
+        db_path.chmod(0o444)
+        try:
+            query_store = SqliteTaskStore(db_path, prefix="gza", open_mode="query_only")
+            supported = query_store.supports_main_verify_remediation_attempts()
+            state = query_store.get_main_verify_remediation_attempt_state(
+                signature="phase:functional",
+                tree_fingerprint="fp-functional-a",
+            )
+        finally:
+            db_path.chmod(0o644)
+
+        assert supported is False
+        assert state is None
+        assert any(
+            "missing required main_verify remediation attempt table" in warning
             for warning in query_store.startup_warnings()
         )
 

@@ -1835,6 +1835,9 @@ def _config_to_effective_dict(config: Config) -> dict:
             "failure_halt_after": config.watch.failure_halt_after,
             "no_progress_cycles": config.watch.no_progress_cycles,
             "dispatch_start_timeout": config.watch.dispatch_start_timeout,
+            "main_verify_remediation_max_attempts": (
+                config.watch.main_verify_remediation_max_attempts
+            ),
             "parked_auto_rearm": {
                 "enabled": config.watch.parked_auto_rearm.enabled,
                 "budget": config.watch.parked_auto_rearm.budget,

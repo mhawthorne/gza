@@ -98,6 +98,7 @@ DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX = 1800
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
 DEFAULT_WATCH_DISPATCH_START_TIMEOUT = 2
+DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS = 2
 DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED = False
 DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET = 2
 DEFAULT_WATCH_PARKED_AUTO_REARM_COOLDOWN_HOURS = 12
@@ -252,6 +253,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "failure_halt_after": None,
         "no_progress_cycles": None,
         "dispatch_start_timeout": None,
+        "main_verify_remediation_max_attempts": None,
         "parked_auto_rearm": {
             "enabled": None,
             "budget": None,
@@ -375,6 +377,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "failure_backoff_max": None,
         "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
+        "main_verify_remediation_max_attempts": None,
     },
     "iterate_max_iterations": None,
     "max_resume_attempts": None,
@@ -1022,6 +1025,7 @@ class WatchConfig:
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
     no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
     dispatch_start_timeout: int = DEFAULT_WATCH_DISPATCH_START_TIMEOUT
+    main_verify_remediation_max_attempts: int = DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS
     parked_auto_rearm: ParkedAutoRearmConfig = field(default_factory=ParkedAutoRearmConfig)
 
 
@@ -2226,6 +2230,15 @@ class Config:
         )
         if watch_dispatch_start_timeout is None:
             raise ConfigError("watch.dispatch_start_timeout must be a positive integer")
+        watch_main_verify_remediation_max_attempts = _validate_positive_int_field(
+            watch_data.get(
+                "main_verify_remediation_max_attempts",
+                DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS,
+            ),
+            "watch.main_verify_remediation_max_attempts",
+        )
+        if watch_main_verify_remediation_max_attempts is None:
+            raise ConfigError("watch.main_verify_remediation_max_attempts must be a positive integer")
         parked_auto_rearm_data = watch_data.get("parked_auto_rearm", {})
         if parked_auto_rearm_data is None:
             parked_auto_rearm_data = {}
@@ -2271,6 +2284,7 @@ class Config:
             failure_halt_after=watch_failure_halt_after,
             no_progress_cycles=watch_no_progress_cycles,
             dispatch_start_timeout=watch_dispatch_start_timeout,
+            main_verify_remediation_max_attempts=watch_main_verify_remediation_max_attempts,
             parked_auto_rearm=ParkedAutoRearmConfig(
                 enabled=parked_auto_rearm_enabled,
                 budget=parked_auto_rearm_budget,
@@ -2953,6 +2967,12 @@ class Config:
                     _validate_positive_int_field(
                         watch_data["dispatch_start_timeout"],
                         "watch.dispatch_start_timeout",
+                        errors=errors,
+                    )
+                if "main_verify_remediation_max_attempts" in watch_data:
+                    _validate_positive_int_field(
+                        watch_data["main_verify_remediation_max_attempts"],
+                        "watch.main_verify_remediation_max_attempts",
                         errors=errors,
                     )
                 if "parked_auto_rearm" in watch_data:

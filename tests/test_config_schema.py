@@ -11,6 +11,7 @@ from gza.config import (
     ConfigError,
     DEFAULT_QUIET_PERIOD_SECONDS,
     DEFAULT_WATCH_DISPATCH_START_TIMEOUT,
+    DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS,
 )
 from gza.config_schema import (
     CONFIG_KEY_REGISTRY,
@@ -160,6 +161,31 @@ def test_config_load_defaults_watch_dispatch_start_timeout(tmp_path) -> None:
     config = Config.load(tmp_path)
 
     assert config.watch.dispatch_start_timeout == DEFAULT_WATCH_DISPATCH_START_TIMEOUT
+
+
+def test_config_load_defaults_watch_main_verify_remediation_max_attempts(tmp_path) -> None:
+    """watch.main_verify_remediation_max_attempts should default when omitted."""
+    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+
+    config = Config.load(tmp_path)
+
+    assert (
+        config.watch.main_verify_remediation_max_attempts
+        == DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS
+    )
+
+
+def test_config_load_parses_watch_main_verify_remediation_max_attempts(tmp_path) -> None:
+    """watch.main_verify_remediation_max_attempts should round-trip through Config.load."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "watch:\n"
+        "  main_verify_remediation_max_attempts: 4\n"
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.watch.main_verify_remediation_max_attempts == 4
 
 
 def test_config_load_parses_watch_dispatch_start_timeout(tmp_path) -> None:

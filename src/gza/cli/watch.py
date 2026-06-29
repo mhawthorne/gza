@@ -65,6 +65,7 @@ from ..main_integration_verify import (
     MainIntegrationVerifyCheck,
     MainIntegrationVerifyRemediation,
     check_main_integration_verify,
+    persist_main_integration_verify_alert_message,
 )
 from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_label
@@ -285,6 +286,18 @@ def _merge_main_verify_remediation_tags(
     return tuple(dict.fromkeys((*_main_verify_remediation_tags(scope_tags), *(existing_tags or ()))))
 
 
+@dataclass(frozen=True)
+class _MainVerifyRemediationIdentity:
+    signature: str
+    tree_fingerprint: str | None
+
+
+@dataclass(frozen=True)
+class _MainVerifyRemediationEnsureResult:
+    task: DbTask | None
+    outcome: Literal["created", "reused", "exhausted"]
+
+
 def _main_verify_remediation_prompt(
     remediation: MainIntegrationVerifyRemediation,
     *,
@@ -322,27 +335,111 @@ def _main_verify_remediation_prompt(
     return "\n".join(body)
 
 
+def _main_verify_remediation_identity(
+    remediation: MainIntegrationVerifyRemediation,
+) -> _MainVerifyRemediationIdentity:
+    return _MainVerifyRemediationIdentity(
+        signature=remediation.signature,
+        tree_fingerprint=remediation.tree_fingerprint,
+    )
+
+
+def _main_verify_remediation_identity_from_prompt(
+    prompt: str,
+) -> _MainVerifyRemediationIdentity | None:
+    signature = _main_verify_remediation_signature_from_prompt(prompt)
+    if signature is None:
+        return None
+    return _MainVerifyRemediationIdentity(
+        signature=signature,
+        tree_fingerprint=_main_verify_remediation_tree_fingerprint_from_prompt(prompt),
+    )
+
+
+def _main_verify_remediation_identity_matches(
+    existing: _MainVerifyRemediationIdentity,
+    requested: _MainVerifyRemediationIdentity,
+) -> bool:
+    if existing.signature != requested.signature:
+        return False
+    if requested.tree_fingerprint is None:
+        return True
+    return existing.tree_fingerprint == requested.tree_fingerprint
+
+
+def _main_verify_remediation_is_still_unmerged(
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> bool:
+    if task.id is None:
+        return task.merge_status != "merged"
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is not None:
+        return effective_no_work_merge_state(task, merge_unit.state) not in {"merged", "empty", "redundant"}
+    return task.merge_status != "merged"
+
+
+def _main_verify_remediation_task_is_reusable(
+    store: SqliteTaskStore,
+    task: DbTask,
+) -> bool:
+    if task.task_type != "implement":
+        return False
+    if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
+        return False
+    if task.status in {"pending", "in_progress", "failed"}:
+        return True
+    if task.status in {"completed", "unmerged"}:
+        return _main_verify_remediation_is_still_unmerged(store, task)
+    return False
+
+
+def _find_legacy_open_main_verify_remediation_task(
+    store: SqliteTaskStore,
+    *,
+    identity: _MainVerifyRemediationIdentity,
+) -> DbTask | None:
+    for task in store.get_all():
+        if not _main_verify_remediation_task_is_reusable(store, task):
+            continue
+        existing_identity = _main_verify_remediation_identity_from_prompt(task.prompt)
+        if existing_identity is None:
+            continue
+        if _main_verify_remediation_identity_matches(existing_identity, identity):
+            return task
+    return None
+
+
 def _find_open_main_verify_remediation_task(
     store: SqliteTaskStore,
     *,
     signature: str,
     tree_fingerprint: str | None,
 ) -> DbTask | None:
-    for task in store.get_all():
-        if task.task_type != "implement":
-            continue
-        if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
-            continue
-        if task.status in {"completed", "dropped"}:
-            continue
-        if _main_verify_remediation_signature_from_prompt(task.prompt) != signature:
-            continue
-        existing_tree_fingerprint = _main_verify_remediation_tree_fingerprint_from_prompt(task.prompt)
-        if tree_fingerprint is None:
-            return task
-        if existing_tree_fingerprint == tree_fingerprint:
-            return task
-    return None
+    identity = _MainVerifyRemediationIdentity(
+        signature=signature,
+        tree_fingerprint=tree_fingerprint,
+    )
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature=identity.signature,
+        tree_fingerprint=identity.tree_fingerprint,
+    )
+    active_task_id = attempt_state.active_task_id if attempt_state is not None else None
+    if active_task_id:
+        active_task = store.get(active_task_id)
+        if active_task is not None and _main_verify_remediation_task_is_reusable(store, active_task):
+            active_identity = _main_verify_remediation_identity_from_prompt(active_task.prompt)
+            if active_identity is not None and _main_verify_remediation_identity_matches(active_identity, identity):
+                return active_task
+
+    legacy_task = _find_legacy_open_main_verify_remediation_task(store, identity=identity)
+    if legacy_task is not None and legacy_task.id is not None:
+        store.record_main_verify_remediation_active_task(
+            signature=identity.signature,
+            tree_fingerprint=identity.tree_fingerprint,
+            task_id=legacy_task.id,
+        )
+    return legacy_task
 
 
 def _main_verify_remediation_kind_from_prompt(prompt: str) -> str | None:
@@ -404,16 +501,18 @@ def _queue_main_verify_remediation_task(
 
 def _ensure_main_verify_remediation_task(
     *,
+    config: Config,
     store: SqliteTaskStore,
     remediation: MainIntegrationVerifyRemediation,
     state,
     tags: tuple[str, ...] | None,
     any_tag: bool,
-) -> tuple[DbTask, bool]:
+) -> _MainVerifyRemediationEnsureResult:
+    identity = _main_verify_remediation_identity(remediation)
     existing = _find_open_main_verify_remediation_task(
         store,
-        signature=remediation.signature,
-        tree_fingerprint=remediation.tree_fingerprint,
+        signature=identity.signature,
+        tree_fingerprint=identity.tree_fingerprint,
     )
     if existing is not None:
         desired_prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
@@ -432,7 +531,31 @@ def _ensure_main_verify_remediation_task(
             tags=tags,
             any_tag=any_tag,
         )
-        return existing, False
+        if existing.id is not None:
+            store.record_main_verify_remediation_active_task(
+                signature=identity.signature,
+                tree_fingerprint=identity.tree_fingerprint,
+                task_id=existing.id,
+                last_observed_head_sha=state.head_sha,
+                last_observed_failure=remediation.failure,
+            )
+        return _MainVerifyRemediationEnsureResult(task=existing, outcome="reused")
+
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature=identity.signature,
+        tree_fingerprint=identity.tree_fingerprint,
+    )
+    if (
+        attempt_state is not None
+        and attempt_state.consumed_attempt_count >= config.watch.main_verify_remediation_max_attempts
+    ):
+        store.mark_main_verify_remediation_exhausted(
+            signature=identity.signature,
+            tree_fingerprint=identity.tree_fingerprint,
+            last_observed_head_sha=state.head_sha,
+            last_observed_failure=remediation.failure,
+        )
+        return _MainVerifyRemediationEnsureResult(task=None, outcome="exhausted")
 
     task = store.add(
         _main_verify_remediation_prompt(remediation, head_sha=state.head_sha),
@@ -447,12 +570,21 @@ def _ensure_main_verify_remediation_task(
         tags=tags,
         any_tag=any_tag,
     )
-    return task, True
+    if task.id is not None:
+        store.record_main_verify_remediation_active_task(
+            signature=identity.signature,
+            tree_fingerprint=identity.tree_fingerprint,
+            task_id=task.id,
+            last_observed_head_sha=state.head_sha,
+            last_observed_failure=remediation.failure,
+        )
+    return _MainVerifyRemediationEnsureResult(task=task, outcome="created")
 
 
 def _maybe_file_main_verify_remediation(
     *,
     dry_run: bool,
+    config: Config,
     store: SqliteTaskStore,
     tags: tuple[str, ...] | None,
     any_tag: bool,
@@ -462,7 +594,8 @@ def _maybe_file_main_verify_remediation(
     remediation = getattr(check, "remediation", None)
     if remediation is None or dry_run:
         return
-    task, created_now = _ensure_main_verify_remediation_task(
+    result = _ensure_main_verify_remediation_task(
+        config=config,
         store=store,
         remediation=remediation,
         state=check.state,
@@ -470,10 +603,34 @@ def _maybe_file_main_verify_remediation(
         any_tag=any_tag,
     )
     phase = remediation.failing_phase or remediation.signature
-    verb = "created" if created_now else "reused"
+    fingerprint_label = remediation.tree_fingerprint or "unavailable"
+    if result.outcome == "exhausted":
+        attempts = config.watch.main_verify_remediation_max_attempts
+        base_message = check.state.alert_message or "main verify is red; merges halted"
+        message = (
+            f"{base_message}; automatic remediation exhausted after {attempts}/{attempts} "
+            f"attempts for {phase} on {fingerprint_label}; human intervention required"
+        )
+        persisted_state = persist_main_integration_verify_alert_message(
+            store,
+            state=check.state,
+            alert_message=message,
+        )
+        if persisted_state.task.id is not None:
+            log.emit_attention(
+                attention_key=f"main-integration-verify:{persisted_state.task.id}:{MAIN_INTEGRATION_VERIFY_REASON}",
+                message=message,
+            )
+        log.emit(
+            "REMEDY",
+            f"automatic remediation exhausted after {attempts}/{attempts} attempts for "
+            f"{phase} on {fingerprint_label}",
+        )
+        return
+    assert result.task is not None
     log.emit(
         "REMEDY",
-        f"{task.id}: {verb} {remediation.kind} remediation for {phase}; moved to queue position 1",
+        f"{result.task.id}: {result.outcome} {remediation.kind} remediation for {phase}; moved to queue position 1",
     )
 
 
@@ -4138,6 +4295,7 @@ def _run_cycle(
         )
         _maybe_file_main_verify_remediation(
             dry_run=dry_run,
+            config=config,
             store=store,
             tags=tags,
             any_tag=any_tag,
@@ -4349,6 +4507,7 @@ def _run_cycle(
                     )
                     _maybe_file_main_verify_remediation(
                         dry_run=dry_run,
+                        config=config,
                         store=store,
                         tags=tags,
                         any_tag=any_tag,

@@ -57,6 +57,7 @@ __all__ = [
     "MergeUnit",
     "WatchProgressObservation",
     "WatchRecoveryBackoff",
+    "MainVerifyRemediationAttemptState",
     "ParkedTaskRearmState",
     "TaskComment",
     "TaskStats",
@@ -122,6 +123,26 @@ KNOWN_EXECUTION_MODES = {
 }
 
 _FAILURE_MARKER_RE = re.compile(r"\[GZA_FAILURE:(\w+)\]")
+MAIN_VERIFY_TREE_FINGERPRINT_UNAVAILABLE = "<unavailable>"
+_MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "signature",
+    "tree_fingerprint",
+    "consumed_attempt_count",
+    "active_task_id",
+    "exhausted_at",
+    "last_consumed_task_id",
+    "last_observed_head_sha",
+    "last_observed_failure",
+    "updated_at",
+)
+_MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "signature",
+    "tree_fingerprint",
+    "task_id",
+    "consumed_at",
+)
 
 # Legacy base36 alphabet used only by v25 migration helpers.
 _B36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -513,6 +534,11 @@ def _coerce_quiet_seconds(value: object) -> int:
         return 0
 
 
+def _normalize_main_verify_tree_fingerprint(tree_fingerprint: str | None) -> str:
+    """Persist a stable sentinel when main-verify fingerprint evidence is unavailable."""
+    return tree_fingerprint if tree_fingerprint is not None else MAIN_VERIFY_TREE_FINGERPRINT_UNAVAILABLE
+
+
 def _pid_is_alive(pid: int | None) -> bool:
     """Return whether ``pid`` currently refers to a live local process."""
     if pid is None or pid <= 0:
@@ -873,6 +899,21 @@ class WatchRecoveryBackoff:
 
 
 @dataclass(frozen=True)
+class MainVerifyRemediationAttemptState:
+    """Persisted attempt ledger for one main-verify remediation identity."""
+
+    signature: str
+    tree_fingerprint: str | None = None
+    consumed_attempt_count: int = 0
+    active_task_id: str | None = None
+    exhausted_at: datetime | None = None
+    last_consumed_task_id: str | None = None
+    last_observed_head_sha: str | None = None
+    last_observed_failure: str | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class ParkedTaskRearmState:
     """Persisted manual rearm epoch for one parked subject/reason pair."""
 
@@ -963,6 +1004,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
     "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
+    "main_verify_remediation_attempts": ("exhausted_at", "updated_at"),
     "behavior_check_findings": ("first_seen", "last_seen"),
     "parked_task_rearms": ("manual_rearmed_at", "last_auto_attempt_at"),
     "project_leases": ("acquired_at",),
@@ -1394,8 +1436,56 @@ CREATE TABLE IF NOT EXISTS project_leases (
 );
 """
 
+# Migration from v62 to v63: durable main-verify remediation attempt ledger
+MIGRATION_V62_TO_V63 = """
+CREATE TABLE IF NOT EXISTS main_verify_remediation_attempts (
+    project_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    tree_fingerprint TEXT NOT NULL,
+    consumed_attempt_count INTEGER NOT NULL DEFAULT 0,
+    active_task_id TEXT,
+    exhausted_at TEXT,
+    last_consumed_task_id TEXT,
+    last_observed_head_sha TEXT,
+    last_observed_failure TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, signature, tree_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_active_task
+    ON main_verify_remediation_attempts(project_id, active_task_id);
+CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_updated_at
+    ON main_verify_remediation_attempts(project_id, updated_at);
+"""
+
+# Migration from v63 to v64: durable consumed remediation task-id dedupe ledger
+MIGRATION_V63_TO_V64 = """
+CREATE TABLE IF NOT EXISTS main_verify_remediation_consumed_task_ids (
+    project_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    tree_fingerprint TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    consumed_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, signature, tree_fingerprint, task_id)
+);
+INSERT OR IGNORE INTO main_verify_remediation_consumed_task_ids(
+    project_id,
+    signature,
+    tree_fingerprint,
+    task_id,
+    consumed_at
+)
+SELECT
+    project_id,
+    signature,
+    tree_fingerprint,
+    last_consumed_task_id,
+    updated_at
+FROM main_verify_remediation_attempts
+WHERE last_consumed_task_id IS NOT NULL;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 62
+SCHEMA_VERSION = 64
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -2116,6 +2206,12 @@ _QUERY_ONLY_REQUIRED_WATCH_RECOVERY_BACKOFF_COLUMNS: tuple[str, ...] = (
     "next_retry_at",
     "updated_at",
 )
+_QUERY_ONLY_REQUIRED_MAIN_VERIFY_REMEDIATION_ATTEMPT_COLUMNS: tuple[str, ...] = (
+    _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS
+)
+_QUERY_ONLY_REQUIRED_MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_ID_COLUMNS: tuple[str, ...] = (
+    _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS
+)
 _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS: tuple[str, ...] = (
     "project_id",
     "subject_kind",
@@ -2187,7 +2283,7 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62}
+    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64}
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2213,6 +2309,24 @@ _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
     """Return required columns missing from a table."""
     return [column for column in required_columns if not _table_has_column(conn, table, column)]
+
+
+def _supports_main_verify_remediation_attempts_table(conn: sqlite3.Connection) -> bool:
+    """Return True when the remediation ledger exists with the full required schema."""
+    return (
+        _table_exists(conn, "main_verify_remediation_attempts")
+        and not _missing_required_columns(
+            conn,
+            "main_verify_remediation_attempts",
+            _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS,
+        )
+        and _table_exists(conn, "main_verify_remediation_consumed_task_ids")
+        and not _missing_required_columns(
+            conn,
+            "main_verify_remediation_consumed_task_ids",
+            _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS,
+        )
+    )
 
 
 def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
@@ -2437,6 +2551,8 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         57: ("tasks", "last_edited_at"),
         58: ("parked_task_rearms", "manual_rearmed_at"),
         59: ("parked_task_rearms", "last_auto_attempt_target_sha"),
+        63: ("main_verify_remediation_attempts", "updated_at"),
+        64: ("main_verify_remediation_consumed_task_ids", "consumed_at"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -2535,6 +2651,46 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         raise RuntimeError(
             "Auto-migration to v62 incomplete: missing required table project_leases"
         )
+    if target_version >= 63:
+        if not _table_exists(conn, "main_verify_remediation_attempts"):
+            raise RuntimeError(
+                "Auto-migration to v63 incomplete: missing required table main_verify_remediation_attempts"
+            )
+        missing_columns = _missing_required_columns(
+            conn,
+            "main_verify_remediation_attempts",
+            _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS,
+        )
+        if missing_columns:
+            raise RuntimeError(
+                "Auto-migration to v63 incomplete: missing required column "
+                f"main_verify_remediation_attempts.{missing_columns[0]}"
+            )
+        for index_name in (
+            "idx_main_verify_remediation_attempts_active_task",
+            "idx_main_verify_remediation_attempts_updated_at",
+        ):
+            if not _index_exists(conn, index_name):
+                raise RuntimeError(
+                    "Auto-migration to v63 incomplete: missing required index "
+                    f"{index_name}"
+                )
+    if target_version >= 64:
+        if not _table_exists(conn, "main_verify_remediation_consumed_task_ids"):
+            raise RuntimeError(
+                "Auto-migration to v64 incomplete: missing required table "
+                "main_verify_remediation_consumed_task_ids"
+            )
+        missing_columns = _missing_required_columns(
+            conn,
+            "main_verify_remediation_consumed_task_ids",
+            _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS,
+        )
+        if missing_columns:
+            raise RuntimeError(
+                "Auto-migration to v64 incomplete: missing required column "
+                f"main_verify_remediation_consumed_task_ids.{missing_columns[0]}"
+            )
 
 
 def _ensure_required_auto_migration_artifacts(
@@ -3048,6 +3204,133 @@ def _ensure_required_auto_migration_artifacts(
                 "Schema integrity check failed while repairing required table "
                 "project_leases: use a writable database."
             ) from exc
+    if target_version >= 63:
+        if not _table_exists(conn, "main_verify_remediation_attempts"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS main_verify_remediation_attempts (
+                        project_id TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        tree_fingerprint TEXT NOT NULL,
+                        consumed_attempt_count INTEGER NOT NULL DEFAULT 0,
+                        active_task_id TEXT,
+                        exhausted_at TEXT,
+                        last_consumed_task_id TEXT,
+                        last_observed_head_sha TEXT,
+                        last_observed_failure TEXT,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, signature, tree_fingerprint)
+                    )
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table main_verify_remediation_attempts; "
+                        "use a writable database to complete migration to v63, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "main_verify_remediation_attempts: use a writable database."
+                ) from exc
+        missing_columns = _missing_required_columns(
+            conn,
+            "main_verify_remediation_attempts",
+            _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS,
+        )
+        if missing_columns:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed for required table "
+                "main_verify_remediation_attempts: missing required column "
+                f"{missing_columns[0]}. Use a writable database to repair the v63 schema."
+            )
+        for index_name, create_sql in (
+            (
+                "idx_main_verify_remediation_attempts_active_task",
+                """
+                CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_active_task
+                    ON main_verify_remediation_attempts(project_id, active_task_id)
+                """,
+            ),
+            (
+                "idx_main_verify_remediation_attempts_updated_at",
+                """
+                CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_updated_at
+                    ON main_verify_remediation_attempts(project_id, updated_at)
+                """,
+            ),
+        ):
+            if _index_exists(conn, index_name):
+                continue
+            try:
+                conn.execute(create_sql)
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        f"Query-only DB open detected missing required index {index_name}; "
+                        "use a writable database to complete migration to v63, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    f"{index_name}: use a writable database."
+                ) from exc
+    if target_version >= 64:
+        if not _table_exists(conn, "main_verify_remediation_consumed_task_ids"):
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS main_verify_remediation_consumed_task_ids (
+                        project_id TEXT NOT NULL,
+                        signature TEXT NOT NULL,
+                        tree_fingerprint TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        consumed_at TEXT NOT NULL,
+                        PRIMARY KEY(project_id, signature, tree_fingerprint, task_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO main_verify_remediation_consumed_task_ids(
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        task_id,
+                        consumed_at
+                    )
+                    SELECT
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        last_consumed_task_id,
+                        updated_at
+                    FROM main_verify_remediation_attempts
+                    WHERE last_consumed_task_id IS NOT NULL
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if _is_readonly_snapshot_operational_error(exc):
+                    raise SchemaIntegrityError(
+                        "Query-only DB open detected missing required table "
+                        "main_verify_remediation_consumed_task_ids; use a writable database "
+                        "to complete migration to v64, then retry."
+                    ) from exc
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required table "
+                    "main_verify_remediation_consumed_task_ids: use a writable database."
+                ) from exc
+        missing_columns = _missing_required_columns(
+            conn,
+            "main_verify_remediation_consumed_task_ids",
+            _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS,
+        )
+        if missing_columns:
+            raise SchemaIntegrityError(
+                "Schema integrity check failed for required table "
+                "main_verify_remediation_consumed_task_ids: missing required column "
+                f"{missing_columns[0]}. Use a writable database to repair the v64 schema."
+            )
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -3317,6 +3600,33 @@ CREATE TABLE IF NOT EXISTS behavior_check_findings (
 );
 CREATE INDEX IF NOT EXISTS idx_behavior_check_findings_project_state
     ON behavior_check_findings(project_id, check_name, state, last_seen);
+
+CREATE TABLE IF NOT EXISTS main_verify_remediation_attempts (
+    project_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    tree_fingerprint TEXT NOT NULL,
+    consumed_attempt_count INTEGER NOT NULL DEFAULT 0,
+    active_task_id TEXT,
+    exhausted_at TEXT,
+    last_consumed_task_id TEXT,
+    last_observed_head_sha TEXT,
+    last_observed_failure TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, signature, tree_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_active_task
+    ON main_verify_remediation_attempts(project_id, active_task_id);
+CREATE INDEX IF NOT EXISTS idx_main_verify_remediation_attempts_updated_at
+    ON main_verify_remediation_attempts(project_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS main_verify_remediation_consumed_task_ids (
+    project_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    tree_fingerprint TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    consumed_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, signature, tree_fingerprint, task_id)
+);
 """
 
 # Migration from v1 to v2
@@ -3626,6 +3936,8 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (60, MIGRATION_V59_TO_V60),
     (61, MIGRATION_V60_TO_V61),
     (62, MIGRATION_V61_TO_V62),
+    (63, MIGRATION_V62_TO_V63),
+    (64, MIGRATION_V63_TO_V64),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -3868,6 +4180,13 @@ class SqliteTaskStore:
         with self._connect() as conn:
             return _table_exists(conn, "watch_recovery_backoffs")
 
+    def supports_main_verify_remediation_attempts(self) -> bool:
+        """Return whether durable main-verify remediation attempt storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_supports_main_verify_remediation_attempts()
+        with self._connect() as conn:
+            return _supports_main_verify_remediation_attempts_table(conn)
+
     def supports_parked_task_rearms(self) -> bool:
         """Return whether durable parked-task manual rearm storage is available."""
         if self._open_mode == "query_only":
@@ -4079,6 +4398,8 @@ class SqliteTaskStore:
             "task_artifacts",
             "watch_progress_observations",
             "watch_recovery_backoffs",
+            "main_verify_remediation_attempts",
+            "main_verify_remediation_consumed_task_ids",
             "parked_task_rearms",
             "behavior_check_findings",
         )
@@ -4205,6 +4526,21 @@ class SqliteTaskStore:
                     "Query-only DB open detected missing required table watch_recovery_backoffs; "
                     "watch transient-recovery cooldowns will be unavailable."
                 )
+        if not self._query_only_supports_main_verify_remediation_attempts():
+            attempts_exists = self._query_only_table_exists.get("main_verify_remediation_attempts", False)
+            consumed_ids_exists = self._query_only_table_exists.get(
+                "main_verify_remediation_consumed_task_ids", False
+            )
+            if attempts_exists and consumed_ids_exists:
+                self._startup_warnings.append(
+                    "Query-only DB open detected incomplete main_verify remediation attempt schema; "
+                    "main-verify remediation attempt state will be unavailable."
+                )
+            else:
+                self._startup_warnings.append(
+                    "Query-only DB open detected missing required main_verify remediation attempt table; "
+                    "main-verify remediation attempt state will be unavailable."
+                )
         if not self._query_only_supports_parked_task_rearms():
             if self._query_only_table_exists.get("parked_task_rearms", False):
                 self._startup_warnings.append(
@@ -4280,6 +4616,23 @@ class SqliteTaskStore:
         return self._query_only_table_exists.get("watch_recovery_backoffs", False) and all(
             self._query_only_has_column("watch_recovery_backoffs", column)
             for column in _QUERY_ONLY_REQUIRED_WATCH_RECOVERY_BACKOFF_COLUMNS
+        )
+
+    def _query_only_supports_main_verify_remediation_attempts(self) -> bool:
+        """Return True when query-only reads can safely use main-verify remediation attempt artifacts."""
+        if self._open_mode != "query_only":
+            return True
+        return (
+            self._query_only_table_exists.get("main_verify_remediation_attempts", False)
+            and all(
+                self._query_only_has_column("main_verify_remediation_attempts", column)
+                for column in _QUERY_ONLY_REQUIRED_MAIN_VERIFY_REMEDIATION_ATTEMPT_COLUMNS
+            )
+            and self._query_only_table_exists.get("main_verify_remediation_consumed_task_ids", False)
+            and all(
+                self._query_only_has_column("main_verify_remediation_consumed_task_ids", column)
+                for column in _QUERY_ONLY_REQUIRED_MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_ID_COLUMNS
+            )
         )
 
     def _query_only_supports_parked_task_rearms(self) -> bool:
@@ -5853,6 +6206,35 @@ class SqliteTaskStore:
             updated_at=_parse_db_timestamp(row["updated_at"]),
         )
 
+    def _row_to_main_verify_remediation_attempt_state(
+        self,
+        row: sqlite3.Row | None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        if row is None:
+            return None
+        tree_fingerprint = str(row["tree_fingerprint"])
+        return MainVerifyRemediationAttemptState(
+            signature=str(row["signature"]),
+            tree_fingerprint=(
+                None if tree_fingerprint == MAIN_VERIFY_TREE_FINGERPRINT_UNAVAILABLE else tree_fingerprint
+            ),
+            consumed_attempt_count=(
+                int(row["consumed_attempt_count"]) if row["consumed_attempt_count"] is not None else 0
+            ),
+            active_task_id=str(row["active_task_id"]) if row["active_task_id"] is not None else None,
+            exhausted_at=_parse_db_timestamp(row["exhausted_at"]),
+            last_consumed_task_id=(
+                str(row["last_consumed_task_id"]) if row["last_consumed_task_id"] is not None else None
+            ),
+            last_observed_head_sha=(
+                str(row["last_observed_head_sha"]) if row["last_observed_head_sha"] is not None else None
+            ),
+            last_observed_failure=(
+                str(row["last_observed_failure"]) if row["last_observed_failure"] is not None else None
+            ),
+            updated_at=_parse_db_timestamp(row["updated_at"]),
+        )
+
     def _row_to_parked_task_rearm(self, row: sqlite3.Row | None) -> ParkedTaskRearmState | None:
         if row is None:
             return None
@@ -7009,6 +7391,277 @@ class SqliteTaskStore:
                     updated_at,
                 ),
             )
+
+    def get_main_verify_remediation_attempt_state(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Fetch one persisted main-verify remediation attempt row."""
+        if not self.supports_main_verify_remediation_attempts():
+            return None
+        normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+        return self._row_to_main_verify_remediation_attempt_state(row)
+
+    def record_main_verify_remediation_active_task(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        task_id: str | None,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Persist or refresh the active remediation task pointer for one failure identity."""
+        if not self.supports_main_verify_remediation_attempts():
+            return None
+        normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
+        updated_at = _format_db_timestamp(datetime.now(UTC))
+        assert updated_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO main_verify_remediation_attempts(
+                    project_id,
+                    signature,
+                    tree_fingerprint,
+                    consumed_attempt_count,
+                    active_task_id,
+                    exhausted_at,
+                    last_consumed_task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 0, ?, NULL, NULL, ?, ?, ?)
+                ON CONFLICT(project_id, signature, tree_fingerprint)
+                DO UPDATE SET
+                    active_task_id = excluded.active_task_id,
+                    exhausted_at = CASE
+                        WHEN excluded.active_task_id IS NULL
+                            THEN main_verify_remediation_attempts.exhausted_at
+                        ELSE NULL
+                    END,
+                    last_observed_head_sha = excluded.last_observed_head_sha,
+                    last_observed_failure = excluded.last_observed_failure,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self._project_id,
+                    signature,
+                    normalized_fingerprint,
+                    task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+        return self._row_to_main_verify_remediation_attempt_state(row)
+
+    def clear_main_verify_remediation_active_task(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Clear the active remediation task pointer for one failure identity."""
+        return self.record_main_verify_remediation_active_task(
+            signature=signature,
+            tree_fingerprint=tree_fingerprint,
+            task_id=None,
+            last_observed_head_sha=last_observed_head_sha,
+            last_observed_failure=last_observed_failure,
+        )
+
+    def record_main_verify_remediation_consumed_attempt(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        task_id: str | None,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Increment the consumed-attempt counter for one failure identity.
+
+        Re-observing the same concrete consumed ``task_id`` is idempotent. A
+        ``None`` task_id is treated as unknown provenance and always consumes a
+        fresh attempt so distinct unknown-task consumes cannot collapse; that
+        branch also clears any active pointer explicitly because provenance is
+        unknown.
+        """
+        if not self.supports_main_verify_remediation_attempts():
+            return None
+        normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
+        updated_at = _format_db_timestamp(datetime.now(UTC))
+        assert updated_at is not None
+        increment = 1
+        with self._connect() as conn:
+            if task_id is not None:
+                inserted = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO main_verify_remediation_consumed_task_ids(
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        task_id,
+                        consumed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._project_id,
+                        signature,
+                        normalized_fingerprint,
+                        task_id,
+                        updated_at,
+                    ),
+                )
+                increment = 1 if inserted.rowcount > 0 else 0
+            conn.execute(
+                """
+                INSERT INTO main_verify_remediation_attempts(
+                    project_id,
+                    signature,
+                    tree_fingerprint,
+                    consumed_attempt_count,
+                    active_task_id,
+                    exhausted_at,
+                    last_consumed_task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                ON CONFLICT(project_id, signature, tree_fingerprint)
+                DO UPDATE SET
+                    consumed_attempt_count = (
+                        main_verify_remediation_attempts.consumed_attempt_count
+                        + excluded.consumed_attempt_count
+                    ),
+                    active_task_id = CASE
+                        WHEN excluded.last_consumed_task_id IS NULL
+                            AND excluded.consumed_attempt_count > 0
+                            THEN NULL
+                        WHEN main_verify_remediation_attempts.active_task_id = excluded.last_consumed_task_id
+                            THEN NULL
+                        ELSE main_verify_remediation_attempts.active_task_id
+                    END,
+                    last_consumed_task_id = CASE
+                        WHEN excluded.consumed_attempt_count > 0
+                            THEN excluded.last_consumed_task_id
+                        ELSE main_verify_remediation_attempts.last_consumed_task_id
+                    END,
+                    last_observed_head_sha = excluded.last_observed_head_sha,
+                    last_observed_failure = excluded.last_observed_failure,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self._project_id,
+                    signature,
+                    normalized_fingerprint,
+                    increment,
+                    task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+        return self._row_to_main_verify_remediation_attempt_state(row)
+
+    def mark_main_verify_remediation_exhausted(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Persist the exhaustion marker for one failure identity."""
+        if not self.supports_main_verify_remediation_attempts():
+            return None
+        normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
+        exhausted_at = _format_db_timestamp(datetime.now(UTC))
+        assert exhausted_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO main_verify_remediation_attempts(
+                    project_id,
+                    signature,
+                    tree_fingerprint,
+                    consumed_attempt_count,
+                    active_task_id,
+                    exhausted_at,
+                    last_consumed_task_id,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 0, NULL, ?, NULL, ?, ?, ?)
+                ON CONFLICT(project_id, signature, tree_fingerprint)
+                DO UPDATE SET
+                    active_task_id = NULL,
+                    exhausted_at = excluded.exhausted_at,
+                    last_observed_head_sha = excluded.last_observed_head_sha,
+                    last_observed_failure = excluded.last_observed_failure,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self._project_id,
+                    signature,
+                    normalized_fingerprint,
+                    exhausted_at,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    exhausted_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+        return self._row_to_main_verify_remediation_attempt_state(row)
 
     def get_parked_task_rearm(
         self,

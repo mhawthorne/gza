@@ -378,6 +378,10 @@ project_name: my-project
 #   Exit `gza watch` after this many consecutive non-auto-resumable failures.
 #   Default: 10
 #   failure_halt_after: 10
+#   Maximum consumed automatic remediation attempts for one main-verify failure identity before
+#   watch stops filing more and requires human intervention.
+#   Default: 2
+#   main_verify_remediation_max_attempts: 2
 #   Idle timeout seconds for `gza watch` loop exit.
 #   Default: null
 #   max_idle: null

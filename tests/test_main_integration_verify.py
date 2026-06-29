@@ -9,6 +9,8 @@ from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     check_main_integration_verify,
     current_main_integration_verify_alert,
+    load_main_integration_verify_state,
+    persist_main_integration_verify_alert_message,
 )
 from gza.runner import _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
@@ -135,6 +137,46 @@ def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_
     assert alert.alert_message == (
         "main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"
     )
+
+
+def test_persist_main_integration_verify_alert_message_preserves_existing_identity_fields(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+
+    updated = persist_main_integration_verify_alert_message(
+        store,
+        state=state,
+        alert_message=(
+            "main verify RED at `abc123` - merges halted; phase `unit` failing; "
+            "automatic remediation exhausted after 2/2 attempts for unit on fp-verified; "
+            "human intervention required"
+        ),
+    )
+
+    assert updated.task.id == task_id
+    assert updated.verify_command == "./bin/tests"
+    assert updated.verify_timeout_seconds == 120
+    assert updated.verify_timeout_grace_seconds == 5.0
+    assert updated.tree_fingerprint == "fp-verified"
+    assert updated.head_sha == "abc123"
+    assert updated.failing_phase == "unit"
+    assert "automatic remediation exhausted after 2/2 attempts" in (updated.alert_message or "")
+    reloaded = load_main_integration_verify_state(store)
+    assert reloaded is not None
+    assert reloaded.alert_message == updated.alert_message
+    assert reloaded.tree_fingerprint == "fp-verified"
+    assert reloaded.head_sha == "abc123"
 
 
 def test_check_main_integration_verify_reuses_same_tree_green_checkpoint_without_rerun(tmp_path) -> None:

@@ -239,6 +239,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("watch.failure_halt_after", "int | null", 10, "Exit `gza watch` after this many consecutive non-auto-resumable failures."),
     ConfigKeySpec("watch.no_progress_cycles", "int", 3, "Repeated unchanged watch-action cycles before the subject is parked for manual attention."),
     ConfigKeySpec("watch.dispatch_start_timeout", "int", 2, "Bounded seconds `gza watch` waits for selected work to reach a live running state before treating the dispatch as undispatched and moving on."),
+    ConfigKeySpec("watch.main_verify_remediation_max_attempts", "int", 2, "Maximum consumed automatic remediation attempts for one main-verify failure identity before watch stops filing more and requires human intervention."),
     ConfigKeySpec("watch.parked_auto_rearm.enabled", "bool", False, "Enable the watch-owned blind parked auto-rearm phase for eligible parked owner/reason pairs."),
     ConfigKeySpec("watch.parked_auto_rearm.budget", "int", 2, "Maximum blind auto-rearm attempts `gza watch` may spend per parked subject/reason pair before leaving it parked."),
     ConfigKeySpec("watch.parked_auto_rearm.cooldown_hours", "int", 12, "Cooldown window between blind parked auto-rearm attempts for the same subject/reason pair."),

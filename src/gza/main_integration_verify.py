@@ -332,6 +332,32 @@ def _persist_main_integration_verify_payload(
     store.update(task)
 
 
+def persist_main_integration_verify_alert_message(
+    store: SqliteTaskStore,
+    *,
+    state: MainIntegrationVerifyState,
+    alert_message: str,
+) -> MainIntegrationVerifyState:
+    """Persist a replacement durable alert message while preserving verify identity."""
+    captured_at = state.captured_at or state.task.completed_at or datetime.now(UTC)
+    _persist_main_integration_verify_payload(
+        store,
+        state.task,
+        gate_enabled=state.gate_enabled,
+        verify_command=state.verify_command,
+        verify_timeout_seconds=state.verify_timeout_seconds,
+        verify_timeout_grace_seconds=state.verify_timeout_grace_seconds,
+        tree_fingerprint=state.tree_fingerprint,
+        head_sha=state.head_sha,
+        failing_phase=state.failing_phase,
+        alert_message=alert_message,
+        captured_at=captured_at,
+    )
+    refreshed = load_main_integration_verify_state(store)
+    assert refreshed is not None
+    return refreshed
+
+
 def _coerce_result_to_freshness_unavailable(
     result,
 ) -> Any:
