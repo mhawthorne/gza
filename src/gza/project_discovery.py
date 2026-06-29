@@ -24,6 +24,7 @@ class RepoProjectConfig:
     project_dir: Path
     scope_root: Path
     verify_command: str
+    unit_verify_command: str
     inner_verify_command: str
 
 
@@ -191,6 +192,7 @@ def discover_repo_project_configs(
                 project_dir=project_dir,
                 scope_root=scope_root if str(scope_root) else Path("."),
                 verify_command=project_config.verify_command.strip(),
+                unit_verify_command=project_config.unit_verify_command.strip(),
                 inner_verify_command=project_config.inner_verify_command.strip(),
             )
         )

@@ -1848,6 +1848,7 @@ def _config_to_effective_dict(config: Config) -> dict:
         "reasoning_effort": config.reasoning_effort,
         "chat_text_display_length": config.chat_text_display_length,
         "verify_command": config.verify_command,
+        "unit_verify_command": config.unit_verify_command,
         "inner_verify_command": config.inner_verify_command,
         "claude": {
             "fetch_auth_token_from_keychain": config.claude.fetch_auth_token_from_keychain,

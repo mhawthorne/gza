@@ -1624,6 +1624,33 @@ class TestVerifyCommandConfig:
         config = Config.load(tmp_path)
         assert config.inner_verify_command == "./bin/tests --quick"
 
+    def test_unit_verify_command_loaded_from_yaml(self, tmp_path: Path):
+        """Test that unit_verify_command is loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "unit_verify_command: './bin/tests --unit'\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.unit_verify_command == "./bin/tests --unit"
+
+    def test_unit_verify_command_load_rejects_non_string(self, tmp_path: Path):
+        """Config.load should reject malformed unit verify commands at runtime."""
+        from gza.config import Config, ConfigError
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "unit_verify_command:\n"
+            "  - bad\n"
+        )
+
+        with pytest.raises(ConfigError, match="'unit_verify_command' must be a string"):
+            Config.load(tmp_path)
+
     def test_inner_verify_command_load_rejects_non_string(self, tmp_path: Path):
         """Config.load should reject malformed inner verify commands at runtime."""
         from gza.config import Config, ConfigError
@@ -1706,6 +1733,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run mypy src/ && uv run pytest tests/ -x -q"
+        config.unit_verify_command = ""
         config.inner_verify_command = "./bin/tests --quick"
 
         result = PromptBuilder().build(task, config, store)
@@ -1723,6 +1751,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/ -x -q"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
@@ -1739,6 +1768,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
@@ -1760,7 +1790,7 @@ class TestVerifyCommandInjection:
         sibling_dir.mkdir(parents=True)
         skipped_dir.mkdir(parents=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: foo\nverify_command: ./bin/foo-verify\ninner_verify_command: ./bin/foo-quick\n"
+            "project_name: foo\nverify_command: ./bin/foo-verify\nunit_verify_command: ./bin/foo-unit\ninner_verify_command: ./bin/foo-quick\n"
         )
         (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
         (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
@@ -1769,6 +1799,7 @@ class TestVerifyCommandInjection:
             project_dir=project_dir,
             project_name="foo",
             verify_command="./bin/foo-verify",
+            unit_verify_command="./bin/foo-unit",
             inner_verify_command="./bin/foo-quick",
         )
         config._project_boundary_cache = type(
@@ -1781,6 +1812,7 @@ class TestVerifyCommandInjection:
 
         assert "Cross-project verification policy:" in result
         assert "Project `services/foo` final verify: `./bin/foo-verify`" in result
+        assert "preferred unit verify: `./bin/foo-unit`" in result
         assert "Project `libs/bar` final verify: `./bin/bar-verify`" in result
         assert "Project `apps/baz` has no `verify_command`" in result
 
@@ -1793,6 +1825,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = ""
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
@@ -1808,6 +1841,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
@@ -1824,6 +1858,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
@@ -1840,6 +1875,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
@@ -1856,14 +1892,15 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "make test"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
 
         assert "`make test`" in result
 
-    def test_inner_verify_command_is_injected_when_configured(self, tmp_path: Path):
-        """Configured inner verify commands should appear in code-task prompts."""
+    def test_inner_verify_command_is_used_when_unit_verify_is_unset(self, tmp_path: Path):
+        """Code-task prompts should fall back to inner verify when unit verify is unset."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement feature", task_type="implement")
@@ -1871,6 +1908,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "./bin/tests"
+        config.unit_verify_command = ""
         config.inner_verify_command = "./bin/tests --quick -- tests/test_runner.py::test_case"
 
         result = PromptBuilder().build(task, config, store)
@@ -1878,6 +1916,40 @@ class TestVerifyCommandInjection:
         assert "Preferred inner-loop verify command" in result
         assert "./bin/tests --quick -- tests/test_runner.py::test_case" in result
         assert "Required final verify command: `./bin/tests`" in result
+
+    def test_unit_verify_command_takes_precedence_over_inner_verify(self, tmp_path: Path):
+        """Code-task prompts should prefer unit verify over inner verify when both exist."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.unit_verify_command = "./bin/tests --unit"
+        config.inner_verify_command = "./bin/tests --quick"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Preferred unit verify command: `./bin/tests --unit`" in result
+        assert "Preferred inner-loop verify command" not in result
+        assert "./bin/tests --quick" not in result
+
+    def test_prompt_falls_back_to_targeted_checks_when_no_unit_or_inner_verify_is_configured(self, tmp_path: Path):
+        """Code-task prompts should fall back to AGENTS/project guidance when no fast verify command is configured."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.unit_verify_command = ""
+        config.inner_verify_command = ""
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "No inner-loop command is configured; use targeted tests/lint/type checks for the files you changed." in result
 
     def test_prompt_builder_rejects_non_string_inner_verify_command(self, tmp_path: Path):
         """Prompt construction must not silently treat malformed inner verify config as unset."""
@@ -1888,7 +1960,23 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "./bin/tests"
+        config.unit_verify_command = ""
         config.inner_verify_command = ["bad"]
 
         with pytest.raises(TypeError, match=r"config\.inner_verify_command must be a string"):
+            PromptBuilder().build(task, config, store)
+
+    def test_prompt_builder_rejects_non_string_unit_verify_command(self, tmp_path: Path):
+        """Prompt construction must not silently treat malformed unit verify config as unset."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.unit_verify_command = ["bad"]
+        config.inner_verify_command = ""
+
+        with pytest.raises(TypeError, match=r"config\.unit_verify_command must be a string"):
             PromptBuilder().build(task, config, store)

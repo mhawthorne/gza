@@ -69,6 +69,11 @@
 # Default: 10
 # timeout_minutes: 10
 
+# Optional preferred unit-scope verification command for code tasks; when unset, prompts fall back
+# to `inner_verify_command`, then targeted checks.
+# Default: ""
+# unit_verify_command: ""
+
 # Run providers in Docker.
 # Default: true
 # use_docker: true

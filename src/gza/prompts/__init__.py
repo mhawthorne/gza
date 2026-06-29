@@ -56,7 +56,9 @@ def _cross_project_verify_instructions(task: Task, config: Config) -> str:
         scope = "." if project.scope_root == Path(".") else project.scope_root.as_posix()
         if project.verify_command:
             line = f"- Project `{scope}` final verify: `{project.verify_command}`"
-            if project.inner_verify_command:
+            if project.unit_verify_command:
+                line += f" (preferred unit verify: `{project.unit_verify_command}`)"
+            elif project.inner_verify_command:
                 line += f" (inner-loop: `{project.inner_verify_command}`)"
         else:
             line = f"- Project `{scope}` has no `verify_command`; affected changes there must be reported as skipped verification."
@@ -67,6 +69,7 @@ def _cross_project_verify_instructions(task: Task, config: Config) -> str:
 def _code_task_verify_instructions(task: Task, config: Config) -> str:
     """Build the code-task verification policy block for prompts."""
     final_command = _get_optional_verify_command(config, "verify_command")
+    unit_command = _get_optional_verify_command(config, "unit_verify_command")
     inner_command = _get_optional_verify_command(config, "inner_verify_command")
     if not final_command:
         return _cross_project_verify_instructions(task, config)
@@ -75,7 +78,9 @@ def _code_task_verify_instructions(task: Task, config: Config) -> str:
         "Verification policy for this code task:",
         "- During editing, use fast verification instead of rerunning the full final suite after every change.",
     ]
-    if inner_command:
+    if unit_command:
+        lines.append(f"- Preferred unit verify command: `{unit_command}`")
+    elif inner_command:
         lines.append(f"- Preferred inner-loop verify command: `{inner_command}`")
     else:
         lines.append("- No inner-loop command is configured; use targeted tests/lint/type checks for the files you changed.")

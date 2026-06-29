@@ -109,6 +109,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         60,
         "Seconds to wait for Docker daemon startup or wake-up before treating Docker as unavailable.",
     ),
+    ConfigKeySpec(
+        "unit_verify_command",
+        "str",
+        "",
+        "Optional preferred unit-scope verification command for code tasks; when unset, prompts fall back to `inner_verify_command`, then targeted checks.",
+    ),
     ConfigKeySpec("inner_verify_command", "str", "", "Optional fast inner-loop verification command for code tasks; `verify_command` remains the required final gate."),
     ConfigKeySpec("interactive_worktree_dir", "str", "", "Base path for interactive worktree operations."),
     ConfigKeySpec("iterate_max_iterations", "int", 3, "Default iteration budget for `gza iterate`."),
