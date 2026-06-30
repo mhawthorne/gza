@@ -15,7 +15,7 @@ from .config import Config
 from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
 from .prompts import PromptBuilder
-from .rebase_diff import parse_rebase_diff_provenance
+from .rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from .review_scope import (
     build_resolution_review_scope,
     build_spec_coherence_review_scope,
@@ -316,13 +316,52 @@ def create_resolution_review_task(
     if not resolved_head_sha or not resolved_target_sha:
         raise ValueError("Resolution review requires resolved head and target SHAs.")
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
-    if provenance is None or not provenance.resolved_head_sha or not provenance.resolved_target_sha:
-        raise ValueError("Resolution review requires persisted rebase provenance with resolved head and target SHAs.")
-    if (
-        resolved_head_sha != provenance.resolved_head_sha
-        or resolved_target_sha != provenance.resolved_target_sha
-    ):
+    if provenance is None:
+        baseline = RebaseDiffBaseline(
+            old_tip=None,
+            target_at_start=None,
+            merge_base_at_start=None,
+            recovered=True,
+        )
+        rebase_task.review_scope = build_rebase_diff_provenance(
+            baseline=baseline,
+            resolved_head_sha=resolved_head_sha,
+            resolved_target_sha=resolved_target_sha,
+        )
+        store.update(rebase_task)
+        provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+        if provenance is None:
+            raise ValueError("Resolution review requires persisted rebase provenance.")
+    persisted_head_sha = provenance.resolved_head_sha
+    persisted_target_sha = provenance.resolved_target_sha
+    if persisted_head_sha and resolved_head_sha != persisted_head_sha:
         raise ValueError("Resolution review metadata must match the completed rebase provenance.")
+    if persisted_target_sha and resolved_target_sha != persisted_target_sha:
+        raise ValueError("Resolution review metadata must match the completed rebase provenance.")
+    if not persisted_head_sha or not persisted_target_sha:
+        baseline = RebaseDiffBaseline(
+            old_tip=provenance.old_tip,
+            target_at_start=provenance.target_at_start,
+            merge_base_at_start=provenance.merge_base_at_start,
+            recovered=provenance.recovered,
+        )
+        rebase_task.review_scope = build_rebase_diff_provenance(
+            baseline=baseline,
+            resolved_head_sha=persisted_head_sha or resolved_head_sha,
+            resolved_target_sha=persisted_target_sha or resolved_target_sha,
+        )
+        store.update(rebase_task)
+        provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+        if provenance is None:
+            raise ValueError("Resolution review requires persisted rebase provenance.")
+    if provenance.resolved_head_sha != (persisted_head_sha or resolved_head_sha):
+        raise ValueError("Resolution review metadata must match the completed rebase provenance.")
+    if provenance.resolved_target_sha != (persisted_target_sha or resolved_target_sha):
+        raise ValueError("Resolution review metadata must match the completed rebase provenance.")
+    persisted_head_sha = provenance.resolved_head_sha
+    persisted_target_sha = provenance.resolved_target_sha
+    if not persisted_head_sha or not persisted_target_sha:
+        raise ValueError("Resolution review requires persisted rebase provenance with resolved head and target SHAs.")
 
     review_task = create_review_task(
         store,
@@ -335,8 +374,8 @@ def create_resolution_review_task(
     review_task.review_scope = build_resolution_review_scope(
         implementation_task_id=impl_task.id,
         rebase_task_id=rebase_task.id,
-        resolved_head_sha=provenance.resolved_head_sha,
-        resolved_target_sha=provenance.resolved_target_sha,
+        resolved_head_sha=persisted_head_sha,
+        resolved_target_sha=persisted_target_sha,
         pre_rebase_head_sha=provenance.old_tip,
         pre_rebase_target_sha=provenance.target_at_start,
         pre_rebase_merge_base_sha=provenance.merge_base_at_start,

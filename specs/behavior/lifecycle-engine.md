@@ -255,10 +255,14 @@ closed and be treated as changed.
   (park for a manual review refresh before merge).
 - Missing `review_verify_head_sha` evidence MUST fail closed for freshness: the engine
   MUST NOT infer stale branch-head advancement from absence alone.
-- If lifecycle cannot parse or validate the persisted metadata that defines a required
-  resolution review, it MUST fail closed and park the lineage with
-  `resolution-review-metadata-invalid`. It MUST NOT silently preserve the old approval,
-  and it MUST NOT silently widen that refresh into a generic whole-task review.
+- If persisted metadata for a required resolution review is missing the resolved post-rebase
+  head/target SHAs, lifecycle MUST first try to re-derive those SHAs from the live rebase
+  branch head and the current merge target, then proceed with a resolution-scoped review
+  using the reconstructed values.
+- If lifecycle still cannot resolve or validate the metadata that defines a required
+  resolution review after that re-derivation attempt, it MUST fail closed and park the
+  lineage with `resolution-review-metadata-invalid`. It MUST NOT silently preserve the old
+  approval, and it MUST NOT silently widen that refresh into a generic whole-task review.
 - Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
 - `max_review_cycles` MUST count only completed review/improve cycles inside the current
   durable-progress epoch. The epoch resets only when persisted evidence shows a new
@@ -621,7 +625,7 @@ is a spec change. The accompanying human message is free text.
 | `branch-already-rebased-lineage-incomplete` | needs_discussion | §4 branch contains target tip, lineage unresolved |
 | `stale-review-needs-manual-refresh` | needs_discussion | §5 code-changing stale review requires a manual refresh or manual resolution review, `advance_create_reviews` off |
 | `review-freshness-unverified` | needs_discussion | §5 live branch-head probe failed while checking whether a code-changing event made the latest completed review stale |
-| `resolution-review-metadata-invalid` | needs_discussion | §5 required resolution-review metadata is missing, malformed, or inconsistent |
+| `resolution-review-metadata-invalid` | needs_discussion | §5 required resolution-review metadata is still missing, malformed, or inconsistent after live SHA re-derivation |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
 | `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no current in-improve passing verify evidence clearing the verify-only review |
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound when current in-improve passing verify evidence did not clear the verify-only review |

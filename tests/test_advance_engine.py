@@ -4376,7 +4376,7 @@ def test_changed_rebase_resolution_review_action_uses_persisted_rebase_target_af
     assert action["resolution_target_sha"] == "target-at-rebase"
 
 
-def test_changed_rebase_with_missing_persisted_provenance_requires_resolution_metadata_attention(
+def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_review_shas(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -4424,8 +4424,11 @@ def test_changed_rebase_with_missing_persisted_provenance_requires_resolution_me
         "main",
     )
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "resolution"
+    assert action["resolution_rebase_task_id"] == rebase.id
+    assert action["resolution_head_sha"] == "rebased-head"
+    assert action["resolution_target_sha"] == "target-now"
 
 
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):

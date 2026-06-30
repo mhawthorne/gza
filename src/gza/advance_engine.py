@@ -321,9 +321,11 @@ class AdvanceContext:
     """Resolved task state used by advance rules."""
 
     store: SqliteTaskStore
+    git: Any
     task: DbTask
     task_type: str
     has_branch: bool
+    target_branch: str
 
     requires_review: bool
     create_reviews: bool
@@ -2340,19 +2342,27 @@ def _resolution_review_metadata_invalid_action(ctx: AdvanceContext) -> dict[str,
     )
 
 
-def _resolve_planned_resolution_review_metadata(ctx: AdvanceContext) -> tuple[str | None, str | None, str | None]:
-    """Resolve the metadata required to create a new resolution review."""
-    rebase_task = ctx.review_invalidated_by_rebase
+def _resolve_resolution_review_metadata_shas(
+    ctx: AdvanceContext,
+    *,
+    rebase_task: DbTask | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve resolution-review head/target SHAs from provenance or live refs."""
     if rebase_task is None or rebase_task.id is None:
         return None, None, None
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
-    if (
-        provenance is None
-        or not provenance.resolved_head_sha
-        or not provenance.resolved_target_sha
-    ):
-        return rebase_task.id, None, None
-    return rebase_task.id, provenance.resolved_head_sha, provenance.resolved_target_sha
+    resolved_head_sha = provenance.resolved_head_sha if provenance is not None else None
+    if not resolved_head_sha:
+        resolved_head_sha = _resolve_branch_head_sha(ctx.git, rebase_task.branch).head_sha
+    resolved_target_sha = provenance.resolved_target_sha if provenance is not None else None
+    if not resolved_target_sha:
+        resolved_target_sha = _resolve_branch_head_sha(ctx.git, ctx.target_branch).head_sha
+    return rebase_task.id, resolved_head_sha, resolved_target_sha
+
+
+def _resolve_planned_resolution_review_metadata(ctx: AdvanceContext) -> tuple[str | None, str | None, str | None]:
+    """Resolve the metadata required to create a new resolution review."""
+    return _resolve_resolution_review_metadata_shas(ctx, rebase_task=ctx.review_invalidated_by_rebase)
 
 
 def _planned_resolution_review_metadata_is_valid(ctx: AdvanceContext) -> bool:
@@ -2386,23 +2396,23 @@ def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
 def _resolution_review_metadata_matches_context(
     metadata: ResolutionReviewScope | None,
     *,
+    ctx: AdvanceContext,
     impl_task: DbTask,
     rebase_task: DbTask | None,
 ) -> bool:
     if metadata is None or impl_task.id is None or rebase_task is None or rebase_task.id is None:
         return False
-    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
-    if (
-        provenance is None
-        or not provenance.resolved_head_sha
-        or not provenance.resolved_target_sha
-    ):
+    _, resolved_head_sha, resolved_target_sha = _resolve_resolution_review_metadata_shas(
+        ctx,
+        rebase_task=rebase_task,
+    )
+    if not resolved_head_sha or not resolved_target_sha:
         return False
     return (
         metadata.implementation_task_id == impl_task.id
         and metadata.rebase_task_id == rebase_task.id
-        and metadata.resolved_head_sha == provenance.resolved_head_sha
-        and metadata.resolved_target_sha == provenance.resolved_target_sha
+        and metadata.resolved_head_sha == resolved_head_sha
+        and metadata.resolved_target_sha == resolved_target_sha
     )
 
 
@@ -4590,7 +4600,9 @@ def _build_base_advance_context(
     *,
     config: Any,
     store: SqliteTaskStore,
+    git: Any,
     task: DbTask,
+    target_branch: str,
     has_branch: bool,
     effective_max_noop_improves: int,
     effective_max_resume: int,
@@ -4608,9 +4620,11 @@ def _build_base_advance_context(
     """Build the DB-known portion of advance context shared by cheap and full paths."""
     return AdvanceContext(
         store=store,
+        git=git,
         task=task,
         task_type=task.task_type,
         has_branch=has_branch,
+        target_branch=target_branch,
         requires_review=config.require_review_before_merge,
         create_reviews=config.advance_create_reviews,
         max_review_cycles=config.max_review_cycles,
@@ -4833,6 +4847,7 @@ def _resolve_pre_closing_review_git_context(
         else:
             if not _resolution_review_metadata_matches_context(
                 resolution_review_metadata,
+                ctx=ctx,
                 impl_task=review_root_task,
                 rebase_task=latest_completed_rebase,
             ):
@@ -4852,6 +4867,7 @@ def _resolve_pre_closing_review_git_context(
         else:
             if not _resolution_review_metadata_matches_context(
                 resolution_review_metadata,
+                ctx=ctx,
                 impl_task=review_root_task,
                 rebase_task=latest_completed_rebase,
             ):
@@ -4882,6 +4898,7 @@ def _resolve_pre_closing_review_git_context(
         else:
             if not _resolution_review_metadata_matches_context(
                 resolution_review_metadata,
+                ctx=ctx,
                 impl_task=review_root_task,
                 rebase_task=latest_completed_rebase,
             ):
@@ -5121,7 +5138,9 @@ def resolve_advance_context(
         base_ctx = _build_base_advance_context(
             config=config,
             store=store,
+            git=git,
             task=task,
+            target_branch=target_branch,
             has_branch=bool(task.branch),
             effective_max_noop_improves=effective_max_noop_improves,
             effective_max_resume=effective_max_resume,
@@ -5145,22 +5164,24 @@ def resolve_advance_context(
     if not task.branch:
         return replace(
             _build_base_advance_context(
-            config=config,
-            store=store,
-            task=task,
-            has_branch=False,
-            effective_max_noop_improves=effective_max_noop_improves,
-            effective_max_resume=effective_max_resume,
-            auto_implement_enabled=auto_implement_enabled,
-            failed_recovery_decision=failed_recovery_decision,
-            failed_recovery_attention_reason=failed_recovery_attention_reason,
-            has_implementation_followup=has_implementation_followup,
-            active_plan_child=active_plan_child,
-            active_implement_child=active_implement_child,
-            has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
-            is_resumable_failed=is_resumable_failed,
-            has_resume_children=has_resume_children,
-            resume_chain_depth=resume_chain_depth,
+                config=config,
+                store=store,
+                git=git,
+                task=task,
+                target_branch=target_branch,
+                has_branch=False,
+                effective_max_noop_improves=effective_max_noop_improves,
+                effective_max_resume=effective_max_resume,
+                auto_implement_enabled=auto_implement_enabled,
+                failed_recovery_decision=failed_recovery_decision,
+                failed_recovery_attention_reason=failed_recovery_attention_reason,
+                has_implementation_followup=has_implementation_followup,
+                active_plan_child=active_plan_child,
+                active_implement_child=active_implement_child,
+                has_non_dropped_plan_or_implement_descendant=has_non_dropped_plan_or_implement_descendant,
+                is_resumable_failed=is_resumable_failed,
+                has_resume_children=has_resume_children,
+                resume_chain_depth=resume_chain_depth,
             ),
             selected_for_merge=selected_for_merge,
         )
@@ -5212,7 +5233,9 @@ def resolve_advance_context(
     ctx = _build_base_advance_context(
         config=config,
         store=store,
+        git=git,
         task=task,
+        target_branch=target_branch,
         has_branch=True,
         effective_max_noop_improves=effective_max_noop_improves,
         effective_max_resume=effective_max_resume,
