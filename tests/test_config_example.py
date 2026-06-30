@@ -191,15 +191,18 @@ def test_full_config_example_groups_behavior_monitor_under_lifecycle() -> None:
     assert not other_header or behavior_key not in other_section
 
 
-def test_full_config_example_groups_spec_coherence_under_other() -> None:
+def test_full_config_example_groups_spec_coherence_under_lifecycle() -> None:
     rendered = render_config_example()
 
-    other_start = rendered.index("# --- Other ---")
+    lifecycle_start = rendered.index("# --- Lifecycle ---")
+    review_start = rendered.index("# --- Review ---")
     coherence_key = "# spec_coherence:"
 
     coherence_index = rendered.index(coherence_key)
 
-    assert other_start < coherence_index
+    assert lifecycle_start < coherence_index < review_start
+    _, other_header, other_section = rendered.partition("# --- Other ---")
+    assert not other_header or coherence_key not in other_section
 
 
 def test_config_examples_include_behavior_monitor_and_spec_coherence_defaults() -> None:

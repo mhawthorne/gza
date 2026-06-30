@@ -361,6 +361,16 @@ project_name: my-project
 # Default: true
 # require_review_before_merge: true
 
+# spec_coherence:
+#   Require the behavior-spec coherence gate for branches whose merge diff touches configured spec
+#   paths.
+#   Default: true
+#   enabled: true
+#   Repo-relative path patterns that trigger the behavior-spec coherence merge gate.
+#   Default: ["specs/behavior/**"]
+#   paths:
+#     - "specs/behavior/**"
+
 # watch:
 #   Default concurrent worker target for `gza watch`.
 #   Default: 2
@@ -499,13 +509,3 @@ project_name: my-project
 # (`watch.batch` if configured, otherwise `5`).
 # Default: effective watch batch or 5
 # max_concurrent: 5
-
-# spec_coherence:
-#   Require the behavior-spec coherence gate for branches whose merge diff touches configured spec
-#   paths.
-#   Default: true
-#   enabled: true
-#   Repo-relative path patterns that trigger the behavior-spec coherence merge gate.
-#   Default: ["specs/behavior/**"]
-#   paths:
-#     - "specs/behavior/**"

@@ -121,6 +121,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "iterate_max_iterations",
             "watch",
             "behavior_monitor",
+            "spec_coherence",
         ),
     ),
     _Section(
