@@ -51,9 +51,10 @@ def _collect_sqlite_connect_call_sites(repo_root: Path) -> list[_ConnectCallSite
     src_root = repo_root / "src" / "gza"
     call_sites: list[_ConnectCallSite] = []
     for path in sorted(src_root.rglob("*.py")):
+        source = path.read_text()
         relative_path = path.relative_to(repo_root)
         visitor = _SqliteConnectVisitor(relative_path)
-        visitor.visit(ast.parse(path.read_text(), filename=str(relative_path)))
+        visitor.visit(ast.parse(source, filename=str(relative_path)))
         call_sites.extend(visitor.call_sites)
     return call_sites
 
@@ -87,3 +88,23 @@ def test_production_sqlite_connect_call_sites_stay_within_allowlist() -> None:
     ]
     assert runner_backup_calls, "Expected runner backup sqlite3.connect allowlist entry to exist."
 
+
+def test_collect_sqlite_connect_call_sites_detects_whitespace_around_attribute_access(
+    tmp_path: Path,
+) -> None:
+    src_root = tmp_path / "src" / "gza"
+    src_root.mkdir(parents=True)
+    module_path = src_root / "sample.py"
+    module_path.write_text(
+        "import sqlite3\n\n"
+        "def disallowed_connect() -> None:\n"
+        "    sqlite3 . connect(':memory:')\n"
+    )
+
+    assert _collect_sqlite_connect_call_sites(tmp_path) == [
+        _ConnectCallSite(
+            path="src/gza/sample.py",
+            lineno=4,
+            function="disallowed_connect",
+        )
+    ]
