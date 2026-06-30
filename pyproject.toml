@@ -82,7 +82,7 @@ dev = [
     "mypy>=1.0",
     "types-PyYAML>=6.0",
     "ruff>=0.9",
-    "ty>=0.0.1a1,<0.1",
+    "ty>=0.0.52,<0.1",
 ]
 
 [tool.ruff]

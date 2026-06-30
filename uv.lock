@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.11"
 
 [options]
-exclude-newer = "2026-06-23T17:00:07.544758Z"
+exclude-newer = "2026-06-23T18:50:21.131664Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -291,7 +291,7 @@ dev = [
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.0" },
     { name = "ruff", specifier = ">=0.9" },
-    { name = "ty", specifier = ">=0.0.1a1,<0.1" },
+    { name = "ty", specifier = ">=0.0.52,<0.1" },
     { name = "types-pyyaml", specifier = ">=6.0" },
 ]
 
