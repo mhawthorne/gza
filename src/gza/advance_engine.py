@@ -49,7 +49,7 @@ from gza.project_discovery import (
 )
 from gza.query import (
     get_code_changing_descendants_for_root,
-    get_reviews_for_root,
+    get_implementation_review_evidence,
     resolve_lineage_root,
     resolve_same_branch_lineage_root,
 )
@@ -4015,7 +4015,7 @@ def _resolve_review_state(
     SiblingReviewAttentionCandidate | None,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
-    reviews = get_reviews_for_root(store, task)
+    reviews = get_implementation_review_evidence(store, task)
     active_review = _select_active_review(reviews)
     completed_reviews = [r for r in reviews if r.status == "completed"]
     latest_completed_review = completed_reviews[0] if completed_reviews else None

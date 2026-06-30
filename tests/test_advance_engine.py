@@ -14634,6 +14634,86 @@ def test_failed_closing_review_blocks_merge_and_routes_to_retry(
     assert "failed" in action["description"].lower()
 
 
+def test_completed_recovered_closing_review_counts_as_review_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/recovered-closing-review",
+        when=datetime(2026, 5, 2, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 2, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 2, 11, 0, tzinfo=UTC),
+    )
+
+    failed_closing = store.add(
+        "Closing review",
+        task_type="review",
+        based_on=impl.id,
+        depends_on=impl.id,
+    )
+    assert failed_closing.id is not None
+    failed_closing.status = "failed"
+    failed_closing.completed_at = datetime(2026, 5, 2, 12, 0, tzinfo=UTC)
+    store.update(failed_closing)
+
+    recovered_completed_review = store.add(
+        failed_closing.prompt,
+        task_type="review",
+        based_on=failed_closing.id,
+        depends_on=failed_closing.depends_on,
+        recovery_origin="retry",
+    )
+    assert recovered_completed_review.id is not None
+    recovered_completed_review.status = "completed"
+    recovered_completed_review.completed_at = datetime(2026, 5, 2, 13, 0, tzinfo=UTC)
+    recovered_completed_review.report_file = f"reviews/{recovered_completed_review.id}.md"
+    store.update(recovered_completed_review)
+
+    manual_followup = store.add(
+        "Manual review follow-up",
+        task_type="review",
+        based_on=failed_closing.id,
+        depends_on=failed_closing.depends_on,
+        recovery_origin="manual",
+    )
+    assert manual_followup.id is not None
+    manual_followup.status = "completed"
+    manual_followup.completed_at = datetime(2026, 5, 2, 14, 0, tzinfo=UTC)
+    manual_followup.report_file = f"reviews/{manual_followup.id}.md"
+    store.update(manual_followup)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, review: ParsedReviewReport(
+            verdict="APPROVED" if review.id == recovered_completed_review.id else "CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+
+    assert action["type"] == "merge", action
+    assert action.get("review_task") is not None
+    assert action["review_task"].id == recovered_completed_review.id
+    assert action["review_task"].id != manual_followup.id
+    assert action["type"] != "create_review"
+    assert improve.id is not None
+    assert action.get("closing_review_action") is None
+
+
 def test_repeated_failed_closing_reviews_escalate_to_needs_attention(
     tmp_path: Path,
 ) -> None:

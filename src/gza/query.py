@@ -31,6 +31,14 @@ from gza.task_query import (
 from gza.task_slug import get_base_task_slug as _get_base_task_slug, get_task_slug as _get_task_slug_from_task_id
 
 
+def _review_sort_key(review: Task) -> tuple[bool, datetime]:
+    """Return the legacy completed-first/newest ordering key for review lists."""
+    return (
+        review.completed_at is not None,
+        review.completed_at or datetime.min.replace(tzinfo=UTC),
+    )
+
+
 @dataclass
 class HistoryFilter:
     """Query parameters for task history. Designed for promotion to gza.api.v0."""
@@ -493,7 +501,17 @@ def get_base_task_slug(task: Task) -> str | None:
 
 
 def get_reviews_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Get reviews for a root task, including same-merge-unit branchless reviews."""
+    """Get review evidence for an implementation root.
+
+    Evidence includes direct implementation-linked reviews, merge-unit attached
+    reviews, and review recovery descendants whose based_on chain stays on
+    automatic review recovery edges. Manual same-type follow-ups do not count.
+    """
+    return get_implementation_review_evidence(store, root_task)
+
+
+def get_implementation_review_evidence(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Return implementation review evidence, including recovered review descendants."""
     if root_task.id is None:
         return []
 
@@ -509,12 +527,28 @@ def get_reviews_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
                 reviews_by_id.setdefault(task.id, task)
 
     if reviews_by_id:
+        from gza.recovery_engine import classify_recovery_row
+
+        queue = list(reviews_by_id.values())
+        seen_ids = set(reviews_by_id)
+        while queue:
+            review = queue.pop(0)
+            if review.id is None:
+                continue
+            children = store.get_based_on_children(review.id)
+            if not isinstance(children, list | tuple):
+                continue
+            for child in children:
+                if child.task_type != "review" or child.id is None or child.id in seen_ids:
+                    continue
+                if classify_recovery_row(store, child) not in {"resume", "retry"}:
+                    continue
+                seen_ids.add(child.id)
+                reviews_by_id[child.id] = child
+                queue.append(child)
         return sorted(
             reviews_by_id.values(),
-            key=lambda review: (
-                review.completed_at is not None,
-                review.completed_at or datetime.min.replace(tzinfo=UTC),
-            ),
+            key=_review_sort_key,
             reverse=True,
         )
 

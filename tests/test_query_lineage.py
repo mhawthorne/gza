@@ -1,9 +1,10 @@
 """Tests for gza.query lineage helpers."""
 
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from gza.db import Task
+from gza.db import SqliteTaskStore, Task
 from gza.query import (
     _lineage_child_sort_key,
     build_ancestor_forest,
@@ -165,6 +166,67 @@ class TestGetReviewsForRoot:
         root = _make_task(id=1, slug="20260305-my-feature")
         result = get_reviews_for_root(store, root)
         assert result == []
+
+    def test_includes_review_recovery_descendants_but_not_manual_followups(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("implement root", task_type="implement")
+        assert impl.id is not None
+
+        linked_review = store.add(
+            "Review implementation",
+            task_type="review",
+            based_on=impl.id,
+            depends_on=impl.id,
+        )
+        assert linked_review.id is not None
+        linked_review.status = "completed"
+        linked_review.completed_at = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+        store.update(linked_review)
+
+        failed_recovery = store.add(
+            linked_review.prompt,
+            task_type="review",
+            based_on=linked_review.id,
+            depends_on=linked_review.depends_on,
+            recovery_origin="retry",
+        )
+        assert failed_recovery.id is not None
+        failed_recovery.status = "failed"
+        failed_recovery.completed_at = datetime(2026, 6, 1, 11, 0, tzinfo=UTC)
+        store.update(failed_recovery)
+
+        completed_recovery = store.add(
+            failed_recovery.prompt,
+            task_type="review",
+            based_on=failed_recovery.id,
+            depends_on=failed_recovery.depends_on,
+            recovery_origin="retry",
+        )
+        assert completed_recovery.id is not None
+        completed_recovery.status = "completed"
+        completed_recovery.completed_at = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+        store.update(completed_recovery)
+
+        manual_followup = store.add(
+            "Manual review follow-up",
+            task_type="review",
+            based_on=linked_review.id,
+            depends_on=linked_review.depends_on,
+            recovery_origin="manual",
+        )
+        assert manual_followup.id is not None
+        manual_followup.status = "completed"
+        manual_followup.completed_at = datetime(2026, 6, 1, 13, 0, tzinfo=UTC)
+        store.update(manual_followup)
+
+        result = get_reviews_for_root(store, impl)
+
+        assert [review.id for review in result] == [
+            completed_recovery.id,
+            failed_recovery.id,
+            linked_review.id,
+        ]
 
 
 # ---------------------------------------------------------------------------
