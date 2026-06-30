@@ -1,5 +1,4 @@
 .env
-*.lock
 *.pyc
 __pycache__/
 src/gza/_version.py
