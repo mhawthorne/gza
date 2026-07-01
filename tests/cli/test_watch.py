@@ -30,8 +30,15 @@ from gza.branch_publication import BranchPublicationState, persist_branch_public
 from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 from gza.cli._recovery_lane import collect_recovery_lane_entries
+from gza.cli.advance_engine import (
+    PARK_REASON_IMPROVE_NO_OP,
+    PARK_REASON_RETRY_LIMIT_REACHED,
+    PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
+    PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
+    PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
+    WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS,
+)
 from gza.cli.advance_executor import AdvanceActionExecutionResult, execute_advance_action as real_execute_advance_action
-from gza.concurrency import launch_permit
 from gza.cli.git_ops import (
     _execute_merge_action,
     _MergeSingleTaskResult,
@@ -40,7 +47,6 @@ from gza.cli.git_ops import (
     _ResolvedMergeSubject,
     ensure_watch_main_checkout,
 )
-from gza.db import DuplicateActiveChildError
 from gza.cli.watch import (
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
     SCOPED_WATCH_COMPLETE_MESSAGE,
@@ -89,17 +95,9 @@ from gza.cli.watch import (
     allocate_watch_slots,
     cmd_watch,
 )
-from gza.concurrency import MaxConcurrentTasksError
-from gza.cli.advance_engine import (
-    PARK_REASON_IMPROVE_NO_OP,
-    PARK_REASON_RETRY_LIMIT_REACHED,
-    PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
-    PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
-    PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
-    WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS,
-)
+from gza.concurrency import MaxConcurrentTasksError, launch_permit
 from gza.config import Config
-from gza.db import Task, Task as DbTask, WatchProgressObservation, WatchRecoveryBackoff
+from gza.db import DuplicateActiveChildError, Task, Task as DbTask, WatchProgressObservation, WatchRecoveryBackoff
 from gza.dispatch_preview import (
     DispatchPreview,
     DispatchPreviewEntry,
@@ -8812,6 +8810,23 @@ def test_watch_cycle_deterministic_main_verify_halts_and_files_fix_task(tmp_path
     assert "Failure signature: phase:functional" in remediation_task.prompt
     assert "Tree fingerprint: fp-functional-a" in remediation_task.prompt
     assert "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing" in log_path.read_text()
+
+
+def test_main_verify_remediation_prompt_for_ruff_fix_includes_verify_requirements() -> None:
+    remediation = SimpleNamespace(
+        kind="fix",
+        signature="phase:ruff",
+        tree_fingerprint="1ac8c470be117631351182a75100b577947bf73007936b819df7a9413d25b289",
+        failing_phase="ruff",
+        failure="verify_command failed twice",
+    )
+
+    prompt = watch_module._main_verify_remediation_prompt(remediation, head_sha="0cd6b17f7704")
+
+    assert prompt.startswith("Fix local main integration verify phase `ruff`")
+    assert "Failure signature: phase:ruff" in prompt
+    assert "Observed main HEAD: 0cd6b17f7704" in prompt
+    assert "- rerun the project verify gate after the fix" in prompt
 
 
 @pytest.mark.parametrize(
