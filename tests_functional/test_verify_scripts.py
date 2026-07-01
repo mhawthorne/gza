@@ -342,9 +342,10 @@ def test_quick_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
     assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=failed name=ruff duration_seconds=" in result.stdout
     assert "gza-verify phase=start name=checks" not in result.stdout
-    tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert "ruff check src/gza/" in tool_invocations
-    assert "python -m checks" not in tool_invocations
+    assert tool_log.read_text(encoding="utf-8").splitlines() == [
+        "python -m gza.tools.verify_phase ruff -- ruff check src/gza/",
+        "ruff check src/gza/",
+    ]
 
 
 @pytest.mark.timeout(30, method="signal")
