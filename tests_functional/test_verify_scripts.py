@@ -330,7 +330,7 @@ def test_quick_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
 
     venv_bin = fixture_root / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
-    _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_real_venv_python(venv_bin / "python")
     _write_fake_ruff_failure(venv_bin / "ruff", tool_log)
 
     env = os.environ.copy()
@@ -348,10 +348,7 @@ def test_quick_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
     assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=failed name=ruff duration_seconds=" in result.stdout
     assert "gza-verify phase=start name=checks" not in result.stdout
-    assert tool_log.read_text(encoding="utf-8").splitlines() == [
-        "python -m gza.tools.verify_phase ruff -- ruff check src/gza/",
-        "ruff check src/gza/",
-    ]
+    assert tool_log.read_text(encoding="utf-8").splitlines() == ["ruff check src/gza/"]
 
 
 @pytest.mark.timeout(30, method="signal")

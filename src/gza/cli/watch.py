@@ -19,8 +19,14 @@ from typing import Any, Literal, TypeVar, cast
 from rich.text import Text
 
 from .. import colors as _colors, lineage
-from ..advance_engine import _resolve_and_persist_post_merge_rebase_state, _resolve_current_merge_source
-from ..canonical_checkout import CANONICAL_CHECKOUT_ATTENTION_REASON, check_canonical_checkout_invariant
+from ..advance_engine import (
+    _resolve_and_persist_post_merge_rebase_state,
+    _resolve_current_merge_source,
+)
+from ..canonical_checkout import (
+    CANONICAL_CHECKOUT_ATTENTION_REASON,
+    check_canonical_checkout_invariant,
+)
 from ..concurrency import (
     ConcurrencySnapshot,
     LaunchPermit,
@@ -52,7 +58,10 @@ from ..dispatch_preview import (
 )
 from ..git import Git, GitError, resolve_ref_if_possible
 from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
-from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_is_complete_for_lifecycle
+from ..lifecycle_completion import (
+    merge_state_is_terminal_for_lifecycle,
+    task_is_complete_for_lifecycle,
+)
 from ..lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
@@ -68,7 +77,10 @@ from ..main_integration_verify import (
     check_main_integration_verify,
     persist_main_integration_verify_alert_message,
 )
-from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
+from ..merge_state import (
+    effective_no_work_merge_state,
+    resolve_task_merge_state_for_target,
+)
 from ..operator_state import blocked_dependency_label
 from ..pickup import (
     effective_edit_time,
