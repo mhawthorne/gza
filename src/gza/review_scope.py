@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from .db import TASK_COMMENT_KIND_REVIEW_SCOPE, SqliteTaskStore, Task, TaskComment
 from .lineage import get_plan_for_task
@@ -45,6 +46,13 @@ _SLICE_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 _SECTION_RE = re.compile(r"^##\s+(?P<title>[^\n]+)\n", re.MULTILINE)
+_PLAN_REVIEW_PROVENANCE_FIELD_RE = re.compile(
+    r"^- (?P<field>Plan source|Plan review|Slice):\s*(?P<value>.*?)\s*$"
+)
+_PLAN_REVIEW_SLICE_VALUE_RE = re.compile(r"^(?P<slice_id>\S+)(?:\s+\(.*\))?$")
+
+
+ImplementSliceIdentityKind = Literal["plan_review_slice", "review_scope_fallback"]
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,34 @@ class SpecCoherenceReviewScope:
     implementation_task_id: str
     reviewed_head_sha: str
     changed_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PlanReviewSliceProvenance:
+    """Structured provenance embedded in materialized plan-review slice prompts."""
+
+    plan_source_task_id: str
+    plan_review_task_id: str
+    slice_id: str
+
+
+@dataclass(frozen=True)
+class PlanReviewSliceProvenanceParseResult:
+    """Parsed materialized slice provenance, including invalid-block detection."""
+
+    provenance: PlanReviewSliceProvenance | None
+    has_provenance_block: bool
+
+
+@dataclass(frozen=True)
+class ImplementSliceIdentity:
+    """Conservative same-slice identity for failed implement-attempt reads."""
+
+    kind: ImplementSliceIdentityKind
+    review_scope: str
+    plan_source_task_id: str | None = None
+    plan_review_task_id: str | None = None
+    slice_id: str | None = None
 
 
 def declares_resolution_review_mode(scope: str | None) -> bool:
@@ -273,6 +309,119 @@ def _normalize_scope_text(text: str | None) -> str | None:
         return None
     normalized = text.strip()
     return normalized or None
+
+
+def normalize_review_scope_identity_text(text: str | None) -> str | None:
+    """Return conservative normalized scope text for same-slice identity matching."""
+    normalized = _normalize_scope_text(text)
+    if normalized is None:
+        return None
+    collapsed = re.sub(r"\s+", " ", normalized)
+    return collapsed or None
+
+
+def parse_plan_review_slice_provenance_result(
+    prompt: str | None,
+) -> PlanReviewSliceProvenanceParseResult:
+    """Parse structured slice provenance and distinguish absence from invalid metadata."""
+    if prompt is None:
+        return PlanReviewSliceProvenanceParseResult(
+            provenance=None,
+            has_provenance_block=False,
+        )
+    lines = prompt.splitlines()
+    provenance_indices = [
+        index for index, raw_line in enumerate(lines) if raw_line.strip() == "Provenance:"
+    ]
+    if not provenance_indices:
+        return PlanReviewSliceProvenanceParseResult(
+            provenance=None,
+            has_provenance_block=False,
+        )
+    if len(provenance_indices) != 1:
+        return PlanReviewSliceProvenanceParseResult(
+            provenance=None,
+            has_provenance_block=True,
+        )
+
+    raw_fields: dict[str, str] = {}
+    provenance_index = provenance_indices[0]
+    for raw_line in lines[provenance_index + 1 :]:
+        line = raw_line.strip()
+        if not line:
+            break
+        match = _PLAN_REVIEW_PROVENANCE_FIELD_RE.match(line)
+        if match is None:
+            return PlanReviewSliceProvenanceParseResult(
+                provenance=None,
+                has_provenance_block=True,
+            )
+        field_name = match.group("field")
+        field_value = match.group("value").strip()
+        if not field_value or field_name in raw_fields:
+            return PlanReviewSliceProvenanceParseResult(
+                provenance=None,
+                has_provenance_block=True,
+            )
+        raw_fields[field_name] = field_value
+
+    if set(raw_fields) != {"Plan source", "Plan review", "Slice"}:
+        return PlanReviewSliceProvenanceParseResult(
+            provenance=None,
+            has_provenance_block=True,
+        )
+    slice_match = _PLAN_REVIEW_SLICE_VALUE_RE.match(raw_fields["Slice"])
+    if slice_match is None:
+        return PlanReviewSliceProvenanceParseResult(
+            provenance=None,
+            has_provenance_block=True,
+        )
+    slice_id = slice_match.group("slice_id").strip()
+    if not slice_id:
+        return PlanReviewSliceProvenanceParseResult(
+            provenance=None,
+            has_provenance_block=True,
+        )
+    return PlanReviewSliceProvenanceParseResult(
+        provenance=PlanReviewSliceProvenance(
+            plan_source_task_id=raw_fields["Plan source"],
+            plan_review_task_id=raw_fields["Plan review"],
+            slice_id=slice_id,
+        ),
+        has_provenance_block=True,
+    )
+
+
+def parse_plan_review_slice_provenance(prompt: str | None) -> PlanReviewSliceProvenance | None:
+    """Parse structured slice provenance from a materialized implement prompt."""
+    return parse_plan_review_slice_provenance_result(prompt).provenance
+
+
+def resolve_implement_slice_identity(
+    *,
+    prompt: str | None,
+    review_scope: str | None,
+) -> ImplementSliceIdentity | None:
+    """Resolve the shared same-slice identity for an implement task, or fail closed."""
+    normalized_review_scope = normalize_review_scope_identity_text(review_scope)
+    if normalized_review_scope is None:
+        return None
+    provenance_result = parse_plan_review_slice_provenance_result(prompt)
+    provenance = provenance_result.provenance
+    if provenance is not None:
+        return ImplementSliceIdentity(
+            kind="plan_review_slice",
+            review_scope=normalized_review_scope,
+            plan_source_task_id=provenance.plan_source_task_id,
+            plan_review_task_id=provenance.plan_review_task_id,
+            slice_id=provenance.slice_id,
+        )
+    if provenance_result.has_provenance_block:
+        return None
+    return ImplementSliceIdentity(
+        kind="review_scope_fallback",
+        review_scope=normalized_review_scope,
+    )
 
 
 def _extract_markdown_section(prompt: str, title: str) -> str | None:

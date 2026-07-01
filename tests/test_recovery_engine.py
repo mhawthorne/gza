@@ -23,6 +23,7 @@ from gza.recovery_engine import (
     decide_failed_task_recovery,
     empty_task_requires_recovery,
     get_completed_recovery_descendant,
+    get_completed_same_slice_sibling_attempt,
     get_completed_sibling_recovery,
     get_failed_recovery_needs_attention_reason,
     get_recovery_chain_root_task_id,
@@ -124,6 +125,78 @@ def _attach_historical_merge_unit(
             )
         store.dual_write_legacy_merge_status(unit.id)
     return unit
+
+
+def _plan_review_slice_prompt(*, plan_id: str, review_id: str, slice_id: str, title: str = "Slice title") -> str:
+    return "\n".join(
+        (
+            f"Implement approved plan-review slice {slice_id}: {title}",
+            "",
+            "Provenance:",
+            f"- Plan source: {plan_id}",
+            f"- Plan review: {review_id}",
+            f"- Slice: {slice_id} ({title})",
+            "",
+            "Slice prompt:",
+            "Implement the slice.",
+            "",
+            "Scope:",
+            "- Do the slice work.",
+        )
+    )
+
+
+def _plan_review_slice_prompt_missing_review(
+    *,
+    plan_id: str,
+    slice_id: str,
+    title: str = "Slice title",
+) -> str:
+    return "\n".join(
+        (
+            f"Implement approved plan-review slice {slice_id}: {title}",
+            "",
+            "Provenance:",
+            f"- Plan source: {plan_id}",
+            f"- Slice: {slice_id} ({title})",
+            "",
+            "Slice prompt:",
+            "Implement the slice.",
+            "",
+            "Scope:",
+            "- Do the slice work.",
+        )
+    )
+
+
+def _plan_review_slice_prompt_duplicate_provenance(
+    *,
+    plan_id: str,
+    review_id: str,
+    slice_id: str,
+    title: str = "Slice title",
+) -> str:
+    valid_block = (
+        "Provenance:",
+        f"- Plan source: {plan_id}",
+        f"- Plan review: {review_id}",
+        f"- Slice: {slice_id} ({title})",
+    )
+    return "\n".join(
+        (
+            f"Implement approved plan-review slice {slice_id}: {title}",
+            "",
+            *valid_block,
+            "",
+            *valid_block,
+            "",
+            "Slice prompt:",
+            "Implement the slice.",
+            "",
+            "Scope:",
+            "- Do the slice work.",
+        )
+    )
 
 
 class _StubMergeGit:
@@ -4099,6 +4172,292 @@ def test_list_failed_tasks_for_recovery_uses_indexed_lineage_without_store_walks
     monkeypatch.setattr(store, "get_lineage_children", _unexpected_store_lineage_read)
 
     assert list_failed_tasks_for_recovery(store, read_context=read_context) == []
+
+
+def test_get_completed_same_slice_sibling_attempt_uses_materialized_slice_provenance_and_indexed_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="  Review   only  the  parser   slice. ",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    landed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.branch = "feature/same-slice-landed"
+    landed.has_commits = True
+    landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(landed)
+    landed_unit = store.create_merge_unit(
+        source_branch=landed.branch,
+        target_branch="main",
+        owner_task_id=landed.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(landed.id, landed_unit.id, "owner")
+
+    store_match = get_completed_same_slice_sibling_attempt(store, failed)
+    assert store_match is not None
+    assert store_match.id == landed.id
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == []
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.action == "skip"
+    assert decision.reason_code == "same_slice_sibling_landed"
+    assert decision.recovery_task_id == landed.id
+    assert should_hide_failed_recovery_decision(decision) is True
+
+    read_context = _read_context_for_store(store)
+
+    def _unexpected_store_lookup(*_args, **_kwargs):
+        raise AssertionError("indexed same-slice sibling checks should use RecoveryReadContext")
+
+    monkeypatch.setattr(store, "get_based_on_children_by_type", _unexpected_store_lookup)
+    monkeypatch.setattr(store, "resolve_merge_unit_for_task", _unexpected_store_lookup)
+
+    indexed_match = get_completed_same_slice_sibling_attempt(store, failed, read_context=read_context)
+    assert indexed_match is not None
+    assert indexed_match.id == landed.id
+    assert [task.id for task in list_failed_tasks_for_recovery(store, read_context=read_context)] == []
+
+
+def test_get_completed_same_slice_sibling_attempt_falls_back_to_normalized_review_scope(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    assert plan.id is not None
+
+    failed = store.add(
+        "Implement parser fallback slice",
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="  Review   only the parser   slice. ",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    landed = store.add(
+        "Implement parser fallback slice",
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.merge_status = "merged"
+    landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(landed)
+
+    match = get_completed_same_slice_sibling_attempt(store, failed)
+    assert match is not None
+    assert match.id == landed.id
+
+
+@pytest.mark.parametrize(
+    "failed_prompt_builder",
+    (
+        lambda *, plan_id, review_id, slice_id: _plan_review_slice_prompt_missing_review(
+            plan_id=plan_id,
+            slice_id=slice_id,
+        ),
+        _plan_review_slice_prompt_duplicate_provenance,
+    ),
+)
+def test_get_completed_same_slice_sibling_attempt_fails_closed_for_invalid_materialized_provenance(
+    tmp_path: Path,
+    failed_prompt_builder,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        failed_prompt_builder(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    landed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.merge_status = "merged"
+    landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(landed)
+
+    assert get_completed_same_slice_sibling_attempt(store, failed) is None
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code != "same_slice_sibling_landed"
+    assert decision.recovery_task_id is None
+
+
+def test_get_completed_same_slice_sibling_attempt_keeps_different_slice_visible(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    different_slice = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S2"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert different_slice.id is not None
+    different_slice.status = "completed"
+    different_slice.merge_status = "merged"
+    different_slice.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(different_slice)
+
+    assert get_completed_same_slice_sibling_attempt(store, failed) is None
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    assert decide_failed_task_recovery(store, failed, max_recovery_attempts=1).reason_code != "same_slice_sibling_landed"
+
+
+def test_get_completed_same_slice_sibling_attempt_requires_lifecycle_complete_merge_state(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    incomplete_landed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert incomplete_landed.id is not None
+    incomplete_landed.status = "completed"
+    incomplete_landed.has_commits = True
+    incomplete_landed.merge_status = "unmerged"
+    incomplete_landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(incomplete_landed)
+
+    assert get_completed_same_slice_sibling_attempt(store, failed) is None
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+@pytest.mark.parametrize("sibling_has_commits", (False, None))
+def test_get_completed_same_slice_sibling_attempt_requires_terminal_merge_proof_even_without_commits(
+    tmp_path: Path,
+    sibling_has_commits: bool | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    insufficient_proof = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert insufficient_proof.id is not None
+    insufficient_proof.status = "completed"
+    insufficient_proof.has_commits = sibling_has_commits
+    insufficient_proof.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(insufficient_proof)
+
+    assert get_completed_same_slice_sibling_attempt(store, failed) is None
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code != "same_slice_sibling_landed"
+    assert decision.recovery_task_id is None
 
 
 def test_list_failed_tasks_for_recovery_memoizes_lineage_tree_by_root_per_pass(

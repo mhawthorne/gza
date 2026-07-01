@@ -24,7 +24,7 @@ from .failed_task_ordering import sort_failed_tasks
 from .failure_policy import is_resumable_failure_reason
 from .failure_reasons import is_readonly_db_failure
 from .git import Git, GitError
-from .lifecycle_completion import task_is_complete_for_lifecycle
+from .lifecycle_completion import merge_state_is_terminal_for_lifecycle, task_is_complete_for_lifecycle
 from .log_paths import ops_log_path_for
 from .merge_state import classify_branch_merge_state_for_target, resolve_task_merge_state_for_target
 from .operator_state import (
@@ -33,6 +33,7 @@ from .operator_state import (
     effective_no_work_merge_state,
 )
 from .recovery_read_context import RecoveryReadContext
+from .review_scope import resolve_implement_slice_identity
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,7 @@ def should_hide_failed_recovery_decision(decision: FailedRecoveryDecision) -> bo
     return decision.action == "skip" and decision.reason_code in {
         "merge_unit_superseded",
         "resolved_by_merged_target",
+        "same_slice_sibling_landed",
         "merge_unit_empty",
         "merge_unit_redundant",
         "terminal_no_work_recovery_already_resolved",
@@ -437,6 +439,8 @@ def _classify_empty_task_recovery_state(
         return "resolved"
     if get_completed_sibling_recovery(store, task, read_context=read_context) is not None:
         return "resolved"
+    if get_completed_same_slice_sibling_attempt(store, task, read_context=read_context) is not None:
+        return "resolved"
     resolved_merge_context = merge_context or _load_merge_context(_project_dir_for_store(store))
     if _is_resolved_by_landed_lineage(store, task, merge_context=resolved_merge_context, read_context=read_context):
         return "resolved"
@@ -502,6 +506,43 @@ def _task_is_complete_recovery_outcome(
         task,
         merge_state=_task_merge_state_for_recovery(store, task, read_context=read_context),
     )
+
+
+def _task_has_explicit_terminal_merge_proof_for_same_slice_helper(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
+    if task.status not in {"completed", "unmerged"}:
+        return False
+    if task.id is not None:
+        unit = (
+            read_context.resolve_merge_unit_for_task(task.id)
+            if read_context is not None
+            else store.resolve_merge_unit_for_task(task.id)
+        )
+        if unit is not None and merge_unit_is_active(unit):
+            return effective_no_work_merge_state(task, unit.state) in {"merged", "empty", "redundant"}
+    return merge_state_is_terminal_for_lifecycle(task.merge_status)
+
+
+def _failed_task_has_active_nonterminal_merge_unit(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> bool:
+    if task.id is None:
+        return False
+    unit = (
+        read_context.resolve_merge_unit_for_task(task.id)
+        if read_context is not None
+        else store.resolve_merge_unit_for_task(task.id)
+    )
+    if unit is None or not merge_unit_is_active(unit):
+        return False
+    return effective_no_work_merge_state(task, unit.state) in {"unmerged", "blocked", "stale"}
 
 
 def _is_resumable_timeout_implementation(task: DbTask) -> bool:
@@ -774,6 +815,57 @@ def get_completed_sibling_recovery(
         ).completed_terminal_descendant
         if completed_descendant is not None:
             candidates.append(completed_descendant)
+
+    if not candidates:
+        return None
+    return max(candidates, key=_descendant_sort_key)
+
+
+def get_completed_same_slice_sibling_attempt(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask | None:
+    """Return the newest lifecycle-complete same-slice implement sibling, if provable."""
+    if (
+        task.id is None
+        or task.status != "failed"
+        or task.task_type != "implement"
+        or task.based_on is None
+        or _failed_task_has_active_nonterminal_merge_unit(store, task, read_context=read_context)
+    ):
+        return None
+
+    task_identity = resolve_implement_slice_identity(
+        prompt=task.prompt,
+        review_scope=task.review_scope,
+    )
+    if task_identity is None:
+        return None
+
+    siblings = (
+        read_context.get_based_on_children_by_type(task.based_on, task.task_type)
+        if read_context is not None
+        else store.get_based_on_children_by_type(task.based_on, task.task_type)
+    )
+    candidates: list[DbTask] = []
+    for sibling in siblings:
+        if sibling.id is None or sibling.id == task.id or sibling.status == "dropped":
+            continue
+        sibling_identity = resolve_implement_slice_identity(
+            prompt=sibling.prompt,
+            review_scope=sibling.review_scope,
+        )
+        if sibling_identity != task_identity:
+            continue
+        if not _task_has_explicit_terminal_merge_proof_for_same_slice_helper(
+            store,
+            sibling,
+            read_context=read_context,
+        ):
+            continue
+        candidates.append(sibling)
 
     if not candidates:
         return None
@@ -1285,6 +1377,11 @@ def list_failed_tasks_for_recovery(
     failed = [
         task
         for task in failed
+        if get_completed_same_slice_sibling_attempt(store, task, read_context=read_context) is None
+    ]
+    failed = [
+        task
+        for task in failed
         if _failed_task_requires_operator_recovery(
             store,
             task,
@@ -1738,6 +1835,21 @@ def decide_failed_task_recovery(
             reason_text="target implementation already merged",
             attempt_index=attempt_index,
             attempt_limit=attempt_limit,
+        )
+
+    same_slice_sibling = get_completed_same_slice_sibling_attempt(
+        store,
+        task,
+        read_context=read_context,
+    )
+    if same_slice_sibling is not None and same_slice_sibling.id is not None:
+        return _skip_decision(
+            task_id=task_id,
+            reason_code="same_slice_sibling_landed",
+            reason_text=f"same-slice sibling attempt {same_slice_sibling.id} already landed",
+            attempt_index=attempt_index,
+            attempt_limit=attempt_limit,
+            recovery_task_id=same_slice_sibling.id,
         )
 
     if reason == "PREREQUISITE_UNMERGED":

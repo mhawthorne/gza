@@ -219,6 +219,25 @@ def _set_task_created_at(store: SqliteTaskStore, task_id: str, *, when: datetime
         )
 
 
+def _plan_review_slice_prompt(*, plan_id: str, review_id: str, slice_id: str, title: str = "Slice title") -> str:
+    return "\n".join(
+        (
+            f"Implement approved plan-review slice {slice_id}: {title}",
+            "",
+            "Provenance:",
+            f"- Plan source: {plan_id}",
+            f"- Plan review: {review_id}",
+            f"- Slice: {slice_id} ({title})",
+            "",
+            "Slice prompt:",
+            "Implement the slice.",
+            "",
+            "Scope:",
+            "- Do the slice work.",
+        )
+    )
+
+
 def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp_path: Path) -> None:
     store, tag, owner_id, rebase_id = _build_tag_filtered_merge_unit_case(tmp_path)
     config = Config.load(tmp_path)
@@ -3343,6 +3362,210 @@ def test_query_lineage_owner_rows_hides_terminal_owner_for_self_owned_failed_lea
     )
 
     assert not rows
+
+
+def test_query_lineage_owner_rows_hides_failed_same_slice_leaf_resolved_by_landed_sibling(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    landed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.branch = "feature/lineage-same-slice-landed"
+    landed.has_commits = True
+    landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(landed)
+    landed_unit = store.create_merge_unit(
+        source_branch=landed.branch,
+        target_branch="main",
+        owner_task_id=landed.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(landed.id, landed_unit.id, "owner")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    unresolved_ids = {
+        task.id
+        for row in rows
+        for task in row.unresolved_tasks
+        if task.id is not None
+    }
+    assert failed.id not in failed_leaf_ids
+    assert failed.id not in unresolved_ids
+
+
+@pytest.mark.parametrize("sibling_has_commits", (False, None))
+def test_query_lineage_owner_rows_keeps_failed_same_slice_leaf_visible_without_terminal_merge_proof(
+    tmp_path: Path,
+    sibling_has_commits: bool | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    insufficient_proof = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert insufficient_proof.id is not None
+    insufficient_proof.status = "completed"
+    insufficient_proof.has_commits = sibling_has_commits
+    insufficient_proof.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(insufficient_proof)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    unresolved_ids = {
+        task.id
+        for row in rows
+        for task in row.unresolved_tasks
+        if task.id is not None
+    }
+    assert failed.id in failed_leaf_ids
+    assert failed.id in unresolved_ids
+
+
+def test_query_lineage_owner_rows_keeps_failed_same_slice_leaf_with_active_unmerged_unit_visible(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/lineage-same-slice-live"
+    failed.has_commits = True
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+    live_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, live_unit.id, "owner")
+
+    landed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.branch = "feature/lineage-same-slice-landed-live"
+    landed.has_commits = True
+    landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(landed)
+    landed_unit = store.create_merge_unit(
+        source_branch=landed.branch,
+        target_branch="main",
+        owner_task_id=landed.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(landed.id, landed_unit.id, "owner")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    unresolved_ids = {
+        task.id
+        for row in rows
+        for task in row.unresolved_tasks
+        if task.id is not None
+    }
+    assert failed.id in failed_leaf_ids
+    assert failed.id in unresolved_ids
 
 
 def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_sibling(

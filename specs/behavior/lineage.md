@@ -184,6 +184,31 @@ and L2 can find it:
 *Implementation note: `cli/_common.py` resume/retry creation sets `based_on=original_task.id`
 plus `recovery_origin`.*
 
+### L4a — Same-slice implement-attempt resolution
+
+Materialized `implement` siblings for one approved plan-review slice are one logical
+slice-attempt set for failed-leaf resolution even when different attempts live on
+different branches or one failed before branch setup.
+
+- **Same-slice identity is metadata-driven.** Shared lineage/recovery reads MUST identify
+  same-slice implement attempts from the persisted task graph plus conservative slice
+  metadata: the shared parent `based_on` edge, normalized non-empty `review_scope`, and
+  structured plan-review slice provenance when the materialized prompt carries it. They
+  MUST NOT key this identity from branch names, merge-unit ids, task-id sequencing, or
+  other git-derived heuristics.
+- **Landed sibling suppresses redundant failed attempts.** When a failed `implement`
+  attempt has a same-slice sibling whose lifecycle state is authoritatively terminal
+  `merged`, `empty`, or `redundant`, shared failed-task recovery selection and owner-row
+  reads MUST treat the failed attempt as resolved detail rather than as a separate stuck
+  row, unless that failed attempt still has its own active nonterminal merge unit proving
+  unique unmerged work remains.
+- **Different slices stay distinct.** Different slice ids under the same plan parent, or
+  follow-up implementations under the same parent without matching conservative identity
+  proof, MUST NOT match.
+- **Ambiguity fails closed.** Missing, malformed, conflicting, or otherwise ambiguous
+  slice-identity evidence MUST keep the failed attempt visible for ordinary recovery
+  handling.
+
 ### L5 — Stale unmerged sweep
 
 Operators MAY run a conservative stale-unmerged sweep to drop abandoned never-merged work

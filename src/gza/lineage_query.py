@@ -1238,6 +1238,7 @@ def _query_lineage_owner_rows_with_context(
         build_merge_context_from_git,
         decide_failed_task_recovery,
         get_completed_recovery_descendant,
+        get_completed_same_slice_sibling_attempt,
         get_completed_sibling_recovery,
         list_failed_tasks_for_recovery,
     )
@@ -1370,6 +1371,14 @@ def _query_lineage_owner_rows_with_context(
                 completed_sibling_recovery = get_completed_sibling_recovery(store, task, read_context=read_context)
                 if completed_sibling_recovery is not None:
                     recovery_completed_by_failed_id[task.id] = completed_sibling_recovery
+                    continue
+                completed_same_slice_sibling = get_completed_same_slice_sibling_attempt(
+                    store,
+                    task,
+                    read_context=read_context,
+                )
+                if completed_same_slice_sibling is not None:
+                    recovery_completed_by_failed_id[task.id] = completed_same_slice_sibling
                     continue
                 keep_failed_leaf_visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
                     failed_task=task,

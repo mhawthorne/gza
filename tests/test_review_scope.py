@@ -10,8 +10,12 @@ from gza.review_scope import (
     declares_resolution_review_mode,
     extract_review_scope_from_prompt,
     get_latest_review_scope_comment_for_impl,
+    normalize_review_scope_identity_text,
     parse_spec_coherence_review_scope,
+    parse_plan_review_slice_provenance,
+    parse_plan_review_slice_provenance_result,
     parse_resolution_review_scope,
+    resolve_implement_slice_identity,
     resolve_review_scope_for_impl,
 )
 
@@ -211,3 +215,145 @@ def test_resolution_review_scope_parser_rejects_duplicate_fields() -> None:
                 )
             )
         )
+
+
+def test_parse_plan_review_slice_provenance_accepts_materialized_prompt_shape() -> None:
+    prompt = "\n".join(
+        (
+            "Implement approved plan-review slice S1: Materialize prompts",
+            "",
+            "Provenance:",
+            "- Plan source: gza-7161",
+            "- Plan review: gza-7482",
+            "- Slice: S1 (Materialize prompts)",
+            "",
+            "Slice prompt:",
+            "Do the work.",
+        )
+    )
+
+    parsed = parse_plan_review_slice_provenance(prompt)
+
+    assert parsed is not None
+    assert parsed.plan_source_task_id == "gza-7161"
+    assert parsed.plan_review_task_id == "gza-7482"
+    assert parsed.slice_id == "S1"
+
+
+def test_parse_plan_review_slice_provenance_result_distinguishes_absent_from_invalid_block() -> None:
+    absent = parse_plan_review_slice_provenance_result("Implement the parser slice.")
+    invalid = parse_plan_review_slice_provenance_result(
+        "\n".join(
+            (
+                "Implement approved plan-review slice S1: Materialize prompts",
+                "",
+                "Provenance:",
+                "- Plan source: gza-7161",
+                "- Slice: S1 (Materialize prompts)",
+                "",
+                "Slice prompt:",
+                "Do the work.",
+            )
+        )
+    )
+
+    assert absent.provenance is None
+    assert absent.has_provenance_block is False
+    assert invalid.provenance is None
+    assert invalid.has_provenance_block is True
+
+
+def test_resolve_implement_slice_identity_uses_plan_review_provenance_when_present() -> None:
+    identity = resolve_implement_slice_identity(
+        prompt="\n".join(
+            (
+                "Implement approved plan-review slice S1: Materialize prompts",
+                "",
+                "Provenance:",
+                "- Plan source: gza-7161",
+                "- Plan review: gza-7482",
+                "- Slice: S1 (Materialize prompts)",
+                "",
+                "Slice prompt:",
+                "Do the work.",
+            )
+        ),
+        review_scope="  Review   only  the   prompt layer. \n\n Keep merge logic out. ",
+    )
+
+    assert identity is not None
+    assert identity.kind == "plan_review_slice"
+    assert identity.plan_source_task_id == "gza-7161"
+    assert identity.plan_review_task_id == "gza-7482"
+    assert identity.slice_id == "S1"
+    assert identity.review_scope == "Review only the prompt layer. Keep merge logic out."
+
+
+def test_resolve_implement_slice_identity_falls_back_to_normalized_review_scope_without_provenance() -> None:
+    identity = resolve_implement_slice_identity(
+        prompt="Implement the parser slice.",
+        review_scope="  Review   only  the   parser   slice.  ",
+    )
+
+    assert identity is not None
+    assert identity.kind == "review_scope_fallback"
+    assert identity.review_scope == "Review only the parser slice."
+    assert identity.slice_id is None
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    (
+        "\n".join(
+            (
+                "Implement approved plan-review slice S1: Materialize prompts",
+                "",
+                "Provenance:",
+                "- Plan source: gza-7161",
+                "- Slice: S1 (Materialize prompts)",
+                "",
+                "Slice prompt:",
+                "Do the work.",
+            )
+        ),
+        "\n".join(
+            (
+                "Implement approved plan-review slice S1: Materialize prompts",
+                "",
+                "Provenance:",
+                "- Plan source: gza-7161",
+                "- Plan review: gza-7482",
+                "- Slice: S1 (Materialize prompts)",
+                "",
+                "Provenance:",
+                "- Plan source: gza-7161",
+                "- Plan review: gza-7482",
+                "- Slice: S1 (Materialize prompts)",
+                "",
+                "Slice prompt:",
+                "Do the work.",
+            )
+        ),
+    ),
+)
+def test_resolve_implement_slice_identity_fails_closed_for_invalid_materialized_provenance(
+    prompt: str,
+) -> None:
+    assert (
+        resolve_implement_slice_identity(
+            prompt=prompt,
+            review_scope="Review only the prompt layer.",
+        )
+        is None
+    )
+
+
+def test_resolve_implement_slice_identity_fails_closed_for_empty_review_scope() -> None:
+    assert normalize_review_scope_identity_text(" \n\t ") is None
+    assert (
+        resolve_implement_slice_identity(
+            prompt="Implement approved plan-review slice S1: Materialize prompts",
+            review_scope=" \n\t ",
+        )
+        is None
+    )
