@@ -52,6 +52,8 @@ def _collect_sqlite_connect_call_sites(repo_root: Path) -> list[_ConnectCallSite
     call_sites: list[_ConnectCallSite] = []
     for path in sorted(src_root.rglob("*.py")):
         source = path.read_text()
+        if "sqlite3" not in source or "connect" not in source:
+            continue
         relative_path = path.relative_to(repo_root)
         visitor = _SqliteConnectVisitor(relative_path)
         visitor.visit(ast.parse(source, filename=str(relative_path)))
