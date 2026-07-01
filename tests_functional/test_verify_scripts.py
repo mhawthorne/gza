@@ -117,6 +117,13 @@ def _current_env_tool(name: str) -> str:
     return resolved
 
 
+def _watch_module_ruff_command(repo_root: Path) -> list[str]:
+    ruff_bin = repo_root / ".venv" / "bin" / "ruff"
+    if ruff_bin.is_file() and os.access(ruff_bin, os.X_OK):
+        return [str(ruff_bin), "check", "src/gza/cli/watch.py"]
+    return ["uv", "run", "ruff", "check", "src/gza/cli/watch.py"]
+
+
 @pytest.mark.timeout(30, method="signal")
 def test_full_verify_defaults_to_ci_parity_xdist_worker_count_on_high_core_machine(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
@@ -353,9 +360,7 @@ def test_verify_phase_ruff_passes_for_watch_cli_module_on_real_repo() -> None:
             "gza.tools.verify_phase",
             "ruff",
             "--",
-            _current_env_tool("ruff"),
-            "check",
-            "src/gza/cli/watch.py",
+            *_watch_module_ruff_command(repo_root),
         ],
         cwd=repo_root,
         env=env,
@@ -371,3 +376,18 @@ def test_verify_phase_ruff_passes_for_watch_cli_module_on_real_repo() -> None:
         result.stdout,
     )
     assert match is not None, result.stdout
+
+
+def test_watch_module_ruff_command_matches_bin_tests_modes(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    venv_bin = repo_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+
+    ruff_bin = venv_bin / "ruff"
+    ruff_bin.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    ruff_bin.chmod(0o755)
+
+    assert _watch_module_ruff_command(repo_root) == [str(ruff_bin), "check", "src/gza/cli/watch.py"]
+
+    ruff_bin.chmod(0o644)
+    assert _watch_module_ruff_command(repo_root) == ["uv", "run", "ruff", "check", "src/gza/cli/watch.py"]

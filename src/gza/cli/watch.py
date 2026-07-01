@@ -5551,9 +5551,7 @@ def _run_cycle(
                         f"{owner_id}: blind auto-rearm cleared "
                         f"{auto_rearm_decision.candidate.attention_reason}"
                     ),
-                    dedupe_key=(
-                        f"blind-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}"
-                    ),
+                    dedupe_key=f"blind-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}",
                 )
                 work_done = True
         if auto_rearm_result.rearmed_owner_ids:
