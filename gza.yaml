@@ -6,6 +6,9 @@ verify_command: './bin/tests'
 autonomous_verify_timeout_seconds: 300
 docker_setup_command: 'uv sync'
 
+spec_coherence:
+  enabled: false
+
 branch_strategy: date_slug
 
 max_steps: 100
