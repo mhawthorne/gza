@@ -6,7 +6,7 @@ Sizing and sequencing requirements:
 - Every approved slice must fit one implement task budget. Treat `{plan_slice_target_timeout_minutes}` minutes as the target maximum per slice.
 - If you cannot honestly keep every slice within that budget, do not approve the plan.
 - V1 slicing is linear or single-immediate-predecessor only. `depends_on_slices` may contain at most one earlier slice ID.
-- If a slice continues work on a prior slice branch, set `based_on_slice` to that same earlier slice ID and make `depends_on_slices` exactly `["that-slice-id"]`.
+- If a slice directly builds on an earlier slice, set `based_on_slice` to that same earlier slice ID and make `depends_on_slices` exactly `["that-slice-id"]`. This records the strongest prerequisite relationship; materialization still creates a distinct implement task/branch per slice.
 - If a slice only needs ordering, keep `based_on_slice` as `null` and use `depends_on_slices` with the earlier slice ID.
 - If `max_plan_slices` is not `unset`, keep the slice count at or below `{max_plan_slices}`.
 

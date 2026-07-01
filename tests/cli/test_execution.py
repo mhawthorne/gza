@@ -6567,8 +6567,8 @@ class TestImplementCommand:
         assert created[0].depends_on is None
         assert "Implement foundation slice." in created[0].prompt
         assert created[1].depends_on == created[0].id
-        assert created[1].based_on == created[0].id
-        assert created[1].same_branch is True
+        assert created[1].based_on == plan_task.id
+        assert created[1].same_branch is False
         assert "Implement follow-up slice." in created[1].prompt
         assert "Created implement task" in result.stdout
 

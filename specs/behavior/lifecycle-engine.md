@@ -89,6 +89,10 @@ and default to **off**.
   with no implementation follow-up MUST enter automated `plan_review` first when
   `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
   then materialize bounded implementation slices only after an approved valid manifest.
+  Approved-slice materialization MUST create one `implement` task per slice as a distinct
+  merge unit on its own branch. Cross-slice ordering is expressed with `depends_on`;
+  materialization MUST NOT reuse `same_branch=True` to stack distinct slices onto one
+  branch or merge unit.
   Unambiguous integer-like persisted `schema_version` representations such as string `"1"`
   and float `1.0` MUST be normalized through the shared manifest validator and MAY proceed
   through approved-manifest materialization. If an approved manifest instead fails

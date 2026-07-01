@@ -2172,7 +2172,7 @@ def test_execute_repair_plan_slice_materialization_skips_stale_overlap_when_full
         task_specs[1].prompt,
         task_type="implement",
         depends_on=partial.id,
-        based_on=partial.id,
+        based_on=plan.id,
         same_branch=task_specs[1].same_branch,
         trigger_source="plan-review",
         tags=task_specs[1].tags,

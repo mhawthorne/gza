@@ -359,7 +359,6 @@ def test_load_materialized_plan_slice_set_reuses_legacy_manual_materialization_w
     assert loaded is not None
     assert [task.id for task in loaded] == [task.id for task in created_tasks]
 
-
 def test_inspect_plan_review_materialization_for_repair_reuses_existing_valid_complete_artifact(
     tmp_path: Path,
 ) -> None:
@@ -490,9 +489,7 @@ def test_inspect_plan_review_materialization_for_repair_blocks_on_ambiguous_same
     assert inspection.reusable_tasks is None
     assert inspection.blocked_reason is not None
     assert expected_reason in inspection.blocked_reason
-
-
-def test_build_plan_review_slice_task_specs_maps_linear_dependencies_and_branch_continuation(
+def test_build_plan_review_slice_task_specs_maps_linear_dependencies_without_branch_sharing(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -520,8 +517,8 @@ def test_build_plan_review_slice_task_specs_maps_linear_dependencies_and_branch_
     assert task_specs[0].review_scope == "Parser only."
     assert task_specs[0].trigger_source == "plan-review"
     assert task_specs[1].depends_on == "__new_task_idx__:0"
-    assert task_specs[1].based_on == "__new_task_idx__:0"
-    assert task_specs[1].same_branch is True
+    assert task_specs[1].based_on == plan.id
+    assert task_specs[1].same_branch is False
     assert task_specs[1].create_review is True
 
 
@@ -556,3 +553,58 @@ def test_build_plan_review_slice_task_specs_keeps_independent_ordered_slice_on_p
     assert task_specs[1].depends_on == "__new_task_idx__:0"
     assert task_specs[1].based_on == plan.id
     assert task_specs[1].same_branch is False
+
+
+def test_materialized_plan_review_slices_attach_to_distinct_merge_units_per_branch(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+    manifest = _validated_manifest(plan.id)
+    assert manifest is not None
+
+    created_tasks = store.add_tasks_with_artifact_atomic(
+        tasks=build_plan_review_slice_task_specs(
+            plan_source_task=plan,
+            review_task=review,
+            manifest=manifest,
+            trigger_source="plan-review",
+            require_review_before_merge=True,
+        ),
+        artifact_task_id=review.id,
+        artifact_kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+        artifact_label="plan_review_materialization",
+        artifact_path=".gza/artifacts/materialized.txt",
+        artifact_byte_size=0,
+        artifact_sha256="",
+        artifact_metadata_builder=lambda tasks: {
+            "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+            "review_task_id": review.id,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "manifest_digest": plan_review_manifest_digest(manifest),
+            "task_ids": [task.id for task in tasks if task.id is not None],
+        },
+    )
+
+    assert len(created_tasks) == 2
+    first, second = created_tasks
+    first.branch = "feature/plan-slice-s1"
+    first.has_commits = True
+    second.branch = "feature/plan-slice-s2"
+    second.has_commits = True
+    store.update(first)
+    store.update(second)
+
+    first_unit = store.get_or_create_merge_unit_for_task(first)
+    second_unit = store.get_or_create_merge_unit_for_task(second)
+
+    assert first_unit is not None
+    assert second_unit is not None
+    assert first_unit.id != second_unit.id
+    assert first_unit.source_branch == first.branch
+    assert second_unit.source_branch == second.branch

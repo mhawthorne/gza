@@ -55,10 +55,6 @@ def build_plan_review_slice_task_specs(
             depends_on_task_id = f"__new_task_idx__:{slice_task_index_by_id[slice_manifest.depends_on_slices[0]]}"
 
         based_on_task_id = plan_source_task.id
-        same_branch = False
-        if slice_manifest.based_on_slice is not None:
-            based_on_task_id = f"__new_task_idx__:{slice_task_index_by_id[slice_manifest.based_on_slice]}"
-            same_branch = True
 
         prompt = _build_plan_review_slice_prompt(
             plan_source_task_id=plan_source_task.id,
@@ -72,7 +68,7 @@ def build_plan_review_slice_task_specs(
                 task_type="implement",
                 depends_on=depends_on_task_id,
                 based_on=based_on_task_id,
-                same_branch=same_branch,
+                same_branch=False,
                 tags=tuple(dict.fromkeys((*plan_source_task.tags, *slice_manifest.tags))),
                 review_scope=slice_manifest.review_scope,
                 create_review=require_review_before_merge,

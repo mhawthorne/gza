@@ -4460,6 +4460,60 @@ def test_get_completed_same_slice_sibling_attempt_requires_terminal_merge_proof_
     assert decision.recovery_task_id is None
 
 
+def test_list_failed_tasks_for_recovery_keeps_later_plan_slice_with_its_own_branch_after_earlier_slice_merges(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    merged_slice = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert merged_slice.id is not None
+    merged_slice.status = "completed"
+    merged_slice.branch = "feature/slice-s1"
+    merged_slice.has_commits = True
+    merged_slice.completed_at = datetime(2026, 6, 30, 8, 0, tzinfo=UTC)
+    store.update(merged_slice)
+    merged_unit = store.create_merge_unit(
+        source_branch=merged_slice.branch,
+        target_branch="main",
+        owner_task_id=merged_slice.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(merged_slice.id, merged_unit.id, "owner")
+
+    failed_later_slice = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S2"),
+        task_type="implement",
+        based_on=plan.id,
+        depends_on=merged_slice.id,
+        review_scope="Review only the executor slice.",
+    )
+    assert failed_later_slice.id is not None
+    failed_later_slice.status = "failed"
+    failed_later_slice.failure_reason = "PROVIDER_UNAVAILABLE"
+    failed_later_slice.branch = "feature/slice-s2"
+    failed_later_slice.has_commits = False
+    failed_later_slice.completed_at = datetime(2026, 6, 30, 9, 0, tzinfo=UTC)
+    store.update(failed_later_slice)
+
+    assert _is_resolved_by_landed_lineage(
+        store,
+        failed_later_slice,
+        merge_context=_MergeContext(git=_StubMergeGit(default_branch="main"), default_branch="main"),
+    ) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed_later_slice.id]
+
+
 def test_list_failed_tasks_for_recovery_memoizes_lineage_tree_by_root_per_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True)
@@ -12,6 +13,9 @@ class _ConnectCallSite:
     path: str
     lineno: int
     function: str | None
+
+
+_SQLITE_CONNECT_CANDIDATE_PATTERN = re.compile(r"\bsqlite3\s*\.\s*connect\b")
 
 
 class _SqliteConnectVisitor(ast.NodeVisitor):
@@ -47,12 +51,16 @@ class _SqliteConnectVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _source_may_contain_sqlite_connect(source: str) -> bool:
+    return bool(_SQLITE_CONNECT_CANDIDATE_PATTERN.search(source))
+
+
 def _collect_sqlite_connect_call_sites(repo_root: Path) -> list[_ConnectCallSite]:
     src_root = repo_root / "src" / "gza"
     call_sites: list[_ConnectCallSite] = []
     for path in sorted(src_root.rglob("*.py")):
         source = path.read_text()
-        if "sqlite3" not in source or "connect" not in source:
+        if not _source_may_contain_sqlite_connect(source):
             continue
         relative_path = path.relative_to(repo_root)
         visitor = _SqliteConnectVisitor(relative_path)
@@ -108,5 +116,24 @@ def test_collect_sqlite_connect_call_sites_detects_whitespace_around_attribute_a
             path="src/gza/sample.py",
             lineno=4,
             function="disallowed_connect",
+        )
+    ]
+
+
+def test_collect_sqlite_connect_call_sites_skips_non_candidate_modules(tmp_path: Path) -> None:
+    src_root = tmp_path / "src" / "gza"
+    src_root.mkdir(parents=True)
+    (src_root / "ignored.py").write_text("def broken_syntax(:\n")
+    (src_root / "sample.py").write_text(
+        "import sqlite3\n\n"
+        "def allowed_connect() -> None:\n"
+        "    sqlite3.connect(':memory:')\n"
+    )
+
+    assert _collect_sqlite_connect_call_sites(tmp_path) == [
+        _ConnectCallSite(
+            path="src/gza/sample.py",
+            lineno=4,
+            function="allowed_connect",
         )
     ]
