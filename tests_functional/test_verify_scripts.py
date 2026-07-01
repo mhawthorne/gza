@@ -52,7 +52,6 @@ def _write_fake_passthrough_tool(path: Path, log_path: Path, name: str) -> None:
         f"printf '{name} %s\\n' \"$*\" >> {str(log_path)!r}\n",
     )
 
-
 def _write_fake_ruff_failure(path: Path, log_path: Path, *, exit_code: int = 1) -> None:
     _make_executable(
         path,
@@ -131,11 +130,15 @@ def _repo_ruff_command(repo_root: Path) -> list[str]:
     return ["uv", "run", "ruff"]
 
 
+def _verify_ruff_targets() -> list[str]:
+    return ["src/gza/", "tests/test_main_integration_verify.py"]
+
+
 def _full_verify_ruff_command(repo_root: Path) -> list[str]:
     ruff_bin = repo_root / ".venv" / "bin" / "ruff"
     if ruff_bin.is_file() and os.access(ruff_bin, os.X_OK):
-        return [str(ruff_bin), "check", "src/gza/"]
-    return ["uv", "run", "ruff", "check", "src/gza/"]
+        return [str(ruff_bin), "check", *_verify_ruff_targets()]
+    return ["uv", "run", "ruff", "check", *_verify_ruff_targets()]
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -249,7 +252,10 @@ def test_full_verify_falls_back_to_uv_for_test_latency_without_project_venv(tmp_
     assert result.returncode == 0, result.stderr
     assert "use_venv=0" in result.stdout
     uv_invocations = uv_log.read_text(encoding="utf-8")
-    assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
+    assert (
+        "uv run python -m gza.tools.verify_phase ruff -- "
+        "uv run ruff check src/gza/ tests/test_main_integration_verify.py"
+    ) in uv_invocations
     assert "uv run python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in uv_invocations
     assert "uv run python -m gza.tools.verify_phase functional -- uv run pytest tests_functional/ -n 7 --dist loadscope -x --durations=25 -o faulthandler_timeout=60" in uv_invocations
 
@@ -356,7 +362,9 @@ def test_quick_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
     assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=failed name=ruff duration_seconds=" in result.stdout
     assert "gza-verify phase=start name=checks" not in result.stdout
-    assert tool_log.read_text(encoding="utf-8").splitlines() == ["ruff check src/gza/"]
+    assert tool_log.read_text(encoding="utf-8").splitlines() == [
+        "ruff check src/gza/ tests/test_main_integration_verify.py"
+    ]
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -418,7 +426,46 @@ def test_quick_verify_falls_back_to_uv_run_ruff_without_project_venv(tmp_path: P
     assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
     uv_invocations = uv_log.read_text(encoding="utf-8")
-    assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
+    assert (
+        "uv run python -m gza.tools.verify_phase ruff -- "
+        "uv run ruff check src/gza/ tests/test_main_integration_verify.py"
+    ) in uv_invocations
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_full_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    tool_log = fixture_root / "tool.log"
+
+    venv_bin = fixture_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_fake_ruff_failure(venv_bin / "ruff", tool_log)
+    for tool_name in ("ty", "mypy", "pytest"):
+        _write_fake_passthrough_tool(venv_bin / tool_name, tool_log, tool_name)
+    _write_fake_passthrough_tool(fixture_root / "bin" / "test-unit", tool_log, "test-unit")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    result = subprocess.run(
+        ["bash", "bin/tests"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert result.returncode == 1
+    assert "gza-verify phase=start name=ruff" in result.stdout
+    assert "gza-verify phase=failed name=ruff duration_seconds=" in result.stdout
+    assert "gza-verify phase=start name=ty" not in result.stdout
+    assert "gza-verify phase=start name=unit" not in result.stdout
+    tool_invocations = tool_log.read_text(encoding="utf-8")
+    assert "ruff check src/gza/ tests/test_main_integration_verify.py" in tool_invocations
+    assert "ty check src/gza/" not in tool_invocations
+    assert "test-unit --summary -- tests/" not in tool_invocations
 
 
 @pytest.mark.functional
@@ -460,10 +507,22 @@ def test_full_verify_ruff_command_matches_bin_tests_modes(tmp_path: Path) -> Non
     ruff_bin.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     ruff_bin.chmod(0o755)
 
-    assert _full_verify_ruff_command(repo_root) == [str(ruff_bin), "check", "src/gza/"]
+    assert _full_verify_ruff_command(repo_root) == [
+        str(ruff_bin),
+        "check",
+        "src/gza/",
+        "tests/test_main_integration_verify.py",
+    ]
 
     ruff_bin.chmod(0o644)
-    assert _full_verify_ruff_command(repo_root) == ["uv", "run", "ruff", "check", "src/gza/"]
+    assert _full_verify_ruff_command(repo_root) == [
+        "uv",
+        "run",
+        "ruff",
+        "check",
+        "src/gza/",
+        "tests/test_main_integration_verify.py",
+    ]
 
 
 @pytest.mark.timeout(30, method="signal")

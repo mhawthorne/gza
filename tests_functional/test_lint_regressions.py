@@ -33,6 +33,21 @@ def test_watch_cli_module_passes_ruff_gate(tmp_path: Path) -> None:
 
 
 @pytest.mark.timeout(30, method="signal")
+def test_main_integration_verify_unit_test_passes_ruff_gate(tmp_path: Path) -> None:
+    del tmp_path
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [str(_venv_tool(repo_root, "ruff")), "check", "tests/test_main_integration_verify.py"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.timeout(30, method="signal")
 def test_watch_cli_module_passes_mypy_gate(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()

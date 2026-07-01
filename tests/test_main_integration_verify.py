@@ -7,7 +7,6 @@ from gza.artifacts import store_command_output_artifact
 from gza.cli.watch import _main_verify_remediation_prompt
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.cli.watch import _main_verify_remediation_prompt
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     _build_main_integration_verify_remediation,
@@ -20,7 +19,15 @@ from gza.runner import _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
 
 
-def _seed_main_verify_task(store: SqliteTaskStore, *, verify_status: str, verify_exit_status: str, failure: str, alert_message: str) -> str:
+def _seed_main_verify_task(
+    store: SqliteTaskStore,
+    *,
+    verify_status: str,
+    verify_exit_status: str,
+    failure: str,
+    alert_message: str,
+    failing_phase: str = "unit",
+) -> str:
     task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
     assert task.id is not None
     task.status = "completed"
@@ -33,7 +40,7 @@ def _seed_main_verify_task(store: SqliteTaskStore, *, verify_status: str, verify
     task.output_content = (
         '{"alert_message":"'
         + alert_message
-        + '","captured_at":"2026-06-23T00:00:00+00:00","failing_phase":"unit","gate_enabled":true,'
+        + f'","captured_at":"2026-06-23T00:00:00+00:00","failing_phase":"{failing_phase}","gate_enabled":true,'
         '"head_sha":"abc123","tree_fingerprint":"fp-verified","verify_command":"./bin/tests",'
         '"verify_timeout_grace_seconds":5.0,"verify_timeout_seconds":120}'
     )
@@ -277,6 +284,59 @@ def test_build_main_integration_verify_remediation_omits_missing_artifact_eviden
     assert remediation.verify_excerpt is None
     prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
     assert "Verify artifact:" not in prompt
+
+
+def test_build_main_integration_verify_remediation_preserves_ruff_failure_excerpt_without_pytest_ids(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `ruff` failing",
+        failing_phase="ruff",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    artifact = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify ruff",
+        output="\n".join(
+            [
+                "gza-verify phase=start name=ruff",
+                "src/gza/main_integration_verify.py:19:1: F401 [*] imported but unused",
+                "Found 1 error.",
+                "gza-verify phase=failed name=ruff duration_seconds=0.42 tree_fingerprint=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
+    task.review_verify_artifact_file = artifact.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.signature == "phase:ruff"
+    assert remediation.failing_phase == "ruff"
+    assert remediation.artifact_path == artifact.path
+    assert remediation.failing_test_ids == ()
+    assert remediation.verify_excerpt is not None
+    assert "src/gza/main_integration_verify.py:19:1: F401 [*] imported but unused" in remediation.verify_excerpt
+    assert "gza-verify phase=failed name=ruff duration_seconds=0.42" in remediation.verify_excerpt
 
 
 def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint_is_unavailable(tmp_path) -> None:
@@ -786,6 +846,88 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_
     assert check.remediation.signature == "phase:functional"
     assert check.remediation.tree_fingerprint == "fp-live"
     assert check.remediation.failing_phase == "functional"
+
+
+def test_check_main_integration_verify_watch_red_rerun_classifies_deterministic_ruff_red(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    first_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output=(
+            "gza-verify phase=start name=ruff\n"
+            "src/gza/main_integration_verify.py:19:1: F401 [*] imported but unused\n"
+            "gza-verify phase=failed name=ruff duration_seconds=0.25"
+        ),
+    )
+    second_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed again",
+        output=(
+            "gza-verify phase=start name=ruff\n"
+            "src/gza/main_integration_verify.py:19:1: F401 [*] imported but unused\n"
+            "gza-verify phase=failed name=ruff duration_seconds=0.20"
+        ),
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-live", "fp-live", "fp-live", "fp-live"]),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=[first_red, second_red]) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=1,
+        )
+
+    assert run_verify.call_count == 2
+    assert check.performed_verify is True
+    assert check.verify_runs == 2
+    assert check.merges_halted is True
+    assert check.state.verify_status == "failed"
+    assert check.remediation is not None
+    assert check.remediation.kind == "fix"
+    assert check.remediation.signature == "phase:ruff"
+    assert check.remediation.tree_fingerprint == "fp-live"
+    assert check.remediation.failing_phase == "ruff"
+    assert check.remediation.failure == "verify_command failed again"
 
 
 def test_check_main_integration_verify_deterministic_red_uses_confirmed_current_failure_metadata(tmp_path) -> None:

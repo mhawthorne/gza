@@ -11,6 +11,7 @@ QUICK_MODE=0
 TARGET_ARGS=()
 USE_VENV=0
 VERIFY_PHASE_CMD=()
+RUFF_TARGETS=(src/gza/ tests/test_main_integration_verify.py)
 
 usage() {
     echo "Usage: $0 [--quick [-- <pytest-target> ...]] [-i|--integration]" >&2
@@ -60,10 +61,10 @@ if [[ "$QUICK_MODE" -eq 1 ]]; then
     fi
 
     if [[ "$USE_VENV" -eq 1 ]]; then
-        run_phase ruff ruff check src/gza/
+        run_phase ruff ruff check "${RUFF_TARGETS[@]}"
         run_phase checks python -m checks
     else
-        run_phase ruff uv run ruff check src/gza/
+        run_phase ruff uv run ruff check "${RUFF_TARGETS[@]}"
         run_phase checks uv run python -m checks
     fi
     if [[ "${#TARGET_ARGS[@]}" -gt 0 ]]; then
@@ -83,12 +84,12 @@ if [[ "${#TARGET_ARGS[@]}" -gt 0 ]]; then
 fi
 
 if [[ "$USE_VENV" -eq 1 ]]; then
-    run_phase ruff ruff check src/gza/
+    run_phase ruff ruff check "${RUFF_TARGETS[@]}"
     run_phase ty ty check src/gza/
     run_phase mypy mypy src/gza/
     run_phase checks python -m checks
 else
-    run_phase ruff uv run ruff check src/gza/
+    run_phase ruff uv run ruff check "${RUFF_TARGETS[@]}"
     run_phase ty uv run ty check src/gza/
     run_phase mypy uv run mypy src/gza/
     run_phase checks uv run python -m checks
