@@ -156,6 +156,8 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 | Current implementation branch / merge-unit head differs from the latest completed review's recorded reviewed head SHA AND both SHAs are known AND `advance_create_reviews=true` | `create_review` — durable branch progress made the latest review stale |
 | Either stale-review condition above AND `advance_create_reviews=false` | `needs_discussion` — park and require a manual review refresh before merge |
 
+When a required post-rebase refresh review already exists but its persisted resolution metadata is blank, ordinary, or otherwise inconsistent with the authoritative rebase context, lifecycle first re-derives the canonical resolved head/target SHAs from the completed rebase and live refs, rewrites the review row with structured resolution metadata, and then continues through the normal review/merge path. Rows that still claim malformed resolution metadata after that deterministic repair attempt remain fail-closed and park with `resolution-review-metadata-invalid`.
+
 ### 6. Review state (when reviews exist)
 
 #### 6a. Review was cleared (improve task ran after review)

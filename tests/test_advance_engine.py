@@ -48,7 +48,11 @@ from gza.plan_review_materialization import (
 )
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
-from gza.review_scope import build_resolution_review_scope, build_spec_coherence_review_scope
+from gza.review_scope import (
+    build_resolution_review_scope,
+    build_spec_coherence_review_scope,
+    parse_resolution_review_scope,
+)
 from gza.review_tasks import OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.review_verify_state import refresh_preserved_rebase_review_verify_heads
@@ -602,6 +606,22 @@ def _resolution_review_scope_for(
         resolved_head_sha=resolved_head_sha,
         resolved_target_sha=resolved_target_sha,
     )
+
+
+def _assert_resolution_review_scope_matches_context(
+    scope_text: str | None,
+    *,
+    impl: DbTask,
+    rebase: DbTask,
+    resolved_head_sha: str = "rebased-sha",
+    resolved_target_sha: str = "target-sha",
+) -> None:
+    parsed = parse_resolution_review_scope(scope_text)
+    assert parsed is not None
+    assert parsed.implementation_task_id == impl.id
+    assert parsed.rebase_task_id == rebase.id
+    assert parsed.resolved_head_sha == resolved_head_sha
+    assert parsed.resolved_target_sha == resolved_target_sha
 
 
 def _make_failed_owner_with_completed_resume_descendant(
@@ -3090,7 +3110,7 @@ def test_stale_refresh_review_with_auto_review_disabled_needs_manual_refresh(
         when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
     )
     _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
-    _add_completed_rebase(
+    rebase = _add_completed_rebase(
         store,
         impl,
         when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
@@ -3120,9 +3140,12 @@ def test_stale_refresh_review_with_auto_review_disabled_needs_manual_refresh(
         "main",
     )
 
+    repaired_review = store.get(refresh_review.id)
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
     assert action["type"] == "needs_discussion"
-    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["description"] == "SKIP: review must be refreshed before merge"
+    assert action["needs_attention_reason"] == "stale-review-needs-manual-refresh"
     assert action["subject_task_id"] == impl.id
 
 
@@ -4059,6 +4082,77 @@ def test_changed_rebase_requires_resolution_review_metadata(tmp_path: Path, monk
     assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 
 
+@pytest.mark.parametrize(
+    ("refresh_review_status", "expected_action_type"),
+    [("pending", "run_review"), ("in_progress", "wait_review")],
+)
+def test_changed_rebase_active_review_after_rebase_with_empty_scope_is_repaired(
+    tmp_path: Path,
+    monkeypatch,
+    refresh_review_status: str,
+    expected_action_type: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/rebase-resolution-active-repair-{refresh_review_status}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    refresh_review = store.add(
+        "Refresh review missing scope metadata",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    refresh_review.status = refresh_review_status
+    refresh_review.created_at = datetime(2026, 5, 10, 12, 30, tzinfo=UTC)
+    refresh_review.review_scope = None
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    repaired_review = store.get(refresh_review.id)
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert action["type"] == expected_action_type
+    assert action["review_task"].id == refresh_review.id
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
 @pytest.mark.parametrize("refresh_review_status", ["pending", "in_progress"])
 @pytest.mark.parametrize(
     ("resolved_head_sha", "resolved_target_sha"),
@@ -4132,10 +4226,12 @@ def test_changed_rebase_active_resolution_review_metadata_must_match_provenance(
         "main",
     )
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
-    assert action["subject_task_id"] == impl.id
-    assert action["type"] not in {"run_review", "wait_review"}
+    repaired_review = store.get(refresh_review.id)
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert action["type"] == ("run_review" if refresh_review_status == "pending" else "wait_review")
+    assert action["review_task"].id == refresh_review.id
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 @pytest.mark.parametrize(
@@ -4206,15 +4302,8 @@ def test_changed_rebase_active_resolution_review_metadata_matching_provenance_is
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
-@pytest.mark.parametrize(
-    "review_scope",
-    [
-        "ordinary full review",
-        "Review mode: resolution\nImplementation task: gza-1\n",
-        None,
-    ],
-)
-def test_changed_rebase_completed_review_after_rebase_requires_valid_resolution_metadata(
+@pytest.mark.parametrize("review_scope", ["ordinary full review", None])
+def test_changed_rebase_completed_passing_review_after_rebase_repairs_missing_resolution_metadata(
     tmp_path: Path,
     monkeypatch,
     review_scope: str | None,
@@ -4263,10 +4352,11 @@ def test_changed_rebase_completed_review_after_rebase_requires_valid_resolution_
         "main",
     )
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
-    assert action["subject_task_id"] == impl.id
-    assert action["type"] != "merge"
+    repaired_review = store.get(review.id)
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert action["type"] == "merge"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 @pytest.mark.parametrize(
@@ -4331,10 +4421,67 @@ def test_changed_rebase_completed_resolution_review_metadata_must_match_provenan
         "main",
     )
 
+    repaired_review = store.get(review.id)
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert action["type"] == "merge"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_completed_review_with_malformed_resolution_header_still_parks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-completed-malformed",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = "Review mode: resolution\nImplementation task: gza-1\n"
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    persisted_review = store.get(review.id)
+    assert persisted_review is not None
+    assert persisted_review.review_scope == "Review mode: resolution\nImplementation task: gza-1\n"
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
     assert action["subject_task_id"] == impl.id
-    assert action["type"] != "merge"
 
 
 def test_changed_rebase_completed_resolution_review_matching_provenance_can_merge(

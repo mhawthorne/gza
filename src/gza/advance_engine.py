@@ -72,6 +72,8 @@ from gza.review_clearance import (
 )
 from gza.review_scope import (
     ResolutionReviewScope,
+    build_resolution_review_scope,
+    declares_resolution_review_mode,
     declares_spec_coherence_review_mode,
     parse_resolution_review_scope,
     parse_spec_coherence_review_scope,
@@ -2426,6 +2428,89 @@ def _resolution_review_metadata_matches_context(
         and metadata.rebase_task_id == rebase_task.id
         and metadata.resolved_head_sha == resolved_head_sha
         and metadata.resolved_target_sha == resolved_target_sha
+    )
+
+
+def _resolution_review_can_be_repaired_from_context(
+    *,
+    review_task: DbTask,
+    rebase_task: DbTask | None,
+) -> bool:
+    if rebase_task is None or rebase_task.completed_at is None:
+        return False
+    return _task_event_time(review_task) > _normalize_time(rebase_task.completed_at)
+
+
+def _repair_resolution_review_scope_from_context(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    ctx: AdvanceContext,
+    impl_task: DbTask,
+    rebase_task: DbTask | None,
+) -> ResolutionReviewScope | None:
+    if impl_task.id is None or rebase_task is None or rebase_task.id is None:
+        return None
+    _, resolved_head_sha, resolved_target_sha = _resolve_resolution_review_metadata_shas(
+        ctx,
+        rebase_task=rebase_task,
+    )
+    if not resolved_head_sha or not resolved_target_sha:
+        return None
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    rebuilt_scope = build_resolution_review_scope(
+        implementation_task_id=impl_task.id,
+        rebase_task_id=rebase_task.id,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+        pre_rebase_head_sha=provenance.old_tip if provenance is not None else None,
+        pre_rebase_target_sha=provenance.target_at_start if provenance is not None else None,
+        pre_rebase_merge_base_sha=provenance.merge_base_at_start if provenance is not None else None,
+    )
+    if review_task.review_scope != rebuilt_scope:
+        review_task.review_scope = rebuilt_scope
+        store.update(review_task)
+    return parse_resolution_review_scope(review_task.review_scope)
+
+
+def _resolve_valid_resolution_review_metadata(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    ctx: AdvanceContext,
+    impl_task: DbTask,
+    rebase_task: DbTask | None,
+) -> ResolutionReviewScope | None:
+    scope_text = review_task.review_scope
+    try:
+        metadata = parse_resolution_review_scope(scope_text)
+    except ValueError:
+        metadata = None
+        parse_failed = True
+    else:
+        parse_failed = False
+    if _resolution_review_metadata_matches_context(
+        metadata,
+        ctx=ctx,
+        impl_task=impl_task,
+        rebase_task=rebase_task,
+    ):
+        return metadata
+    if not _resolution_review_can_be_repaired_from_context(
+        review_task=review_task,
+        rebase_task=rebase_task,
+    ):
+        return None
+    if declares_spec_coherence_review_mode(scope_text):
+        return None
+    if parse_failed and declares_resolution_review_mode(scope_text):
+        return None
+    return _repair_resolution_review_scope_from_context(
+        store,
+        review_task=review_task,
+        ctx=ctx,
+        impl_task=impl_task,
+        rebase_task=rebase_task,
     )
 
 
@@ -5122,18 +5207,15 @@ def _resolve_pre_closing_review_git_context(
             review_invalidation_reason = "branch_head_advanced"
 
     if resolution_review_required and ctx.active_review is not None:
-        try:
-            resolution_review_metadata = parse_resolution_review_scope(ctx.active_review.review_scope)
-        except ValueError:
+        resolution_review_metadata = _resolve_valid_resolution_review_metadata(
+            store,
+            review_task=ctx.active_review,
+            ctx=ctx,
+            impl_task=review_root_task,
+            rebase_task=latest_completed_rebase,
+        )
+        if resolution_review_metadata is None:
             resolution_review_metadata_invalid = True
-        else:
-            if not _resolution_review_metadata_matches_context(
-                resolution_review_metadata,
-                ctx=ctx,
-                impl_task=review_root_task,
-                rebase_task=latest_completed_rebase,
-            ):
-                resolution_review_metadata_invalid = True
     elif (
         resolution_review_required
         and ctx.latest_completed_review is not None
@@ -5142,18 +5224,15 @@ def _resolve_pre_closing_review_git_context(
         and latest_completed_rebase.completed_at is not None
         and ctx.latest_completed_review.completed_at > latest_completed_rebase.completed_at
     ):
-        try:
-            resolution_review_metadata = parse_resolution_review_scope(ctx.latest_completed_review.review_scope)
-        except ValueError:
+        resolution_review_metadata = _resolve_valid_resolution_review_metadata(
+            store,
+            review_task=ctx.latest_completed_review,
+            ctx=ctx,
+            impl_task=review_root_task,
+            rebase_task=latest_completed_rebase,
+        )
+        if resolution_review_metadata is None:
             resolution_review_metadata_invalid = True
-        else:
-            if not _resolution_review_metadata_matches_context(
-                resolution_review_metadata,
-                ctx=ctx,
-                impl_task=review_root_task,
-                rebase_task=latest_completed_rebase,
-            ):
-                resolution_review_metadata_invalid = True
     elif resolution_review_required and not _planned_resolution_review_metadata_is_valid(
         replace(
             ctx,
@@ -5173,18 +5252,15 @@ def _resolve_pre_closing_review_git_context(
         and latest_completed_rebase.completed_at is not None
         and ctx.latest_completed_review.completed_at > latest_completed_rebase.completed_at
     ):
-        try:
-            resolution_review_metadata = parse_resolution_review_scope(ctx.latest_completed_review.review_scope)
-        except ValueError:
+        resolution_review_metadata = _resolve_valid_resolution_review_metadata(
+            store,
+            review_task=ctx.latest_completed_review,
+            ctx=ctx,
+            impl_task=review_root_task,
+            rebase_task=latest_completed_rebase,
+        )
+        if resolution_review_metadata is None:
             resolution_review_metadata_invalid = True
-        else:
-            if not _resolution_review_metadata_matches_context(
-                resolution_review_metadata,
-                ctx=ctx,
-                impl_task=review_root_task,
-                rebase_task=latest_completed_rebase,
-            ):
-                resolution_review_metadata_invalid = True
 
     if (
         ctx.review_verdict == "CHANGES_REQUESTED"
