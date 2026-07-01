@@ -1972,7 +1972,7 @@ need to break out promptly from a long or blocked watch pass.
 | Option | Description |
 |--------|-------------|
 | `--batch N` | Target concurrent workers, capped by `max_concurrent` (default: `watch.batch` or `2`; when `max_concurrent` is unset, an explicitly configured `watch.batch` also becomes the global cap, otherwise the fallback global cap remains `5`) |
-| failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown using `watch.failure_backoff_initial` and `watch.failure_backoff_max`, and exits when `watch.failure_halt_after` is reached |
+| failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown for the failing owner unit using `watch.failure_backoff_initial` and `watch.failure_backoff_max`; unrelated units remain dispatchable, and `watch.failure_halt_after` applies only when distinct failing units reach the configured threshold |
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
 | `--max-idle SECS` | Exit after consecutive idle watch-loop time (default: `watch.max_idle`, no limit when unset) |
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |

@@ -347,12 +347,17 @@ When the installed `gza` package fingerprint changes while watch is running:
 - This lane is distinct from the system-precondition hold/resume path in section 2.
   Required-Docker unavailability is a supervisor hold condition, not a task failure.
 - Newly observed failures that the shared recovery policy does not auto-resume/retry MUST
-  increment the watch failure streak.
-- The sleep before starting more work MUST use the configured exponential backoff policy
-  (`watch.failure_backoff_initial`, `watch.failure_backoff_max`).
-- When `watch.failure_halt_after` is reached, watch MUST stop for human intervention
-  instead of continuing to launch more work.
-- A nonzero failure streak and each backoff/halt decision MUST be operator-visible.
+  increment the failure streak for that failing lineage owner / merge unit, not a single
+  process-global streak.
+- The configured exponential backoff policy (`watch.failure_backoff_initial`,
+  `watch.failure_backoff_max`) MUST quarantine only the failing owner. Backoff on owner A
+  MUST NOT block dispatch of runnable work from owners B, C, and so on in the same or a
+  later cycle.
+- `watch.failure_halt_after` MUST be keyed to fleet-wide failure, not repeated failures on
+  one owner alone. A single poisoned owner MAY keep its own escalating streak/backoff
+  without halting the whole watch process.
+- A nonzero per-owner failure streak and each quarantine/halt decision MUST be
+  operator-visible and MUST name the affected owner.
 - Watch MUST reuse the shared bounded recovery policy; it MUST NOT invent a different
   resume/retry/manual boundary from `advance` or `iterate`.
 

@@ -59,6 +59,7 @@ from gza.cli.watch import (
     _find_open_main_verify_remediation_tasks,
     _format_elapsed,
     _format_wake_message,
+    _active_failure_backoff_owner_ids,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
     _MainVerifyRemediationIdentity,
@@ -66,8 +67,10 @@ from gza.cli.watch import (
     _maybe_finalize_watch_no_progress_for_background_action,
     _maybe_park_watch_no_progress,
     _maybe_repair_target_already_merged_skip,
+    _OwnerFailureBackoffState,
     _maybe_skip_watch_no_progress_for_transient_terminal,
     _query_owner_rows_with_context,
+    _record_failure_backoff_updates,
     _resolve_watch_attention_display_task,
     _retire_duplicate_main_verify_remediation_tasks,
     _run_cycle,
@@ -23752,6 +23755,186 @@ def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:
     assert _compute_failure_backoff_seconds(config, 4) == 300
 
 
+def test_owner_failure_backoff_streaks_are_tracked_per_unit(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
+    now = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+
+    halted = _record_failure_backoff_updates(
+        config=config,
+        store=make_store(tmp_path),
+        failures=[
+            watch_module._ObservedFailure(
+                task_id="gza-101",
+                owner_task_id="gza-owner-a",
+                task_type="implement",
+                reason="WORKER_DIED",
+            )
+        ],
+        failure_backoffs=failure_backoffs,
+        log=log,
+        now=now,
+    )
+
+    assert halted is False
+    assert failure_backoffs["gza-owner-a"].streak == 1
+    assert failure_backoffs["gza-owner-a"].backoff_until == now + timedelta(seconds=60)
+
+    halted = _record_failure_backoff_updates(
+        config=config,
+        store=make_store(tmp_path),
+        failures=[
+            watch_module._ObservedFailure(
+                task_id="gza-102",
+                owner_task_id="gza-owner-a",
+                task_type="implement",
+                reason="TIMEOUT",
+            )
+        ],
+        failure_backoffs=failure_backoffs,
+        log=log,
+        now=now + timedelta(minutes=2),
+    )
+
+    assert halted is False
+    assert failure_backoffs["gza-owner-a"].streak == 2
+    assert failure_backoffs["gza-owner-a"].backoff_until == now + timedelta(minutes=4)
+    assert "gza-owner-b" not in failure_backoffs
+    assert _active_failure_backoff_owner_ids(failure_backoffs, now=now + timedelta(minutes=2, seconds=30)) == {
+        "gza-owner-a"
+    }
+    assert _active_failure_backoff_owner_ids(failure_backoffs, now=now + timedelta(minutes=4, seconds=1)) == set()
+
+
+def test_owner_failure_halt_requires_distinct_units(tmp_path: Path) -> None:
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 2\n"
+    )
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
+    store = make_store(tmp_path)
+    now = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+
+    assert (
+        _record_failure_backoff_updates(
+            config=config,
+            store=store,
+            failures=[
+                watch_module._ObservedFailure(
+                    task_id="gza-201",
+                    owner_task_id="gza-owner-a",
+                    task_type="implement",
+                    reason="WORKER_DIED",
+                )
+            ],
+            failure_backoffs=failure_backoffs,
+            log=log,
+            now=now,
+        )
+        is False
+    )
+    assert (
+        _record_failure_backoff_updates(
+            config=config,
+            store=store,
+            failures=[
+                watch_module._ObservedFailure(
+                    task_id="gza-202",
+                    owner_task_id="gza-owner-a",
+                    task_type="implement",
+                    reason="TIMEOUT",
+                )
+            ],
+            failure_backoffs=failure_backoffs,
+            log=log,
+            now=now + timedelta(minutes=2),
+        )
+        is False
+    )
+    assert (
+        _record_failure_backoff_updates(
+            config=config,
+            store=store,
+            failures=[
+                watch_module._ObservedFailure(
+                    task_id="gza-203",
+                    owner_task_id="gza-owner-b",
+                    task_type="plan",
+                    reason="UNKNOWN",
+                )
+            ],
+            failure_backoffs=failure_backoffs,
+            log=log,
+            now=now + timedelta(minutes=3),
+        )
+        is True
+    )
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "gza-owner-a" in log_text
+    assert "gza-owner-b" in log_text
+    assert "failure halt threshold reached (2 failing unit(s) >= 2" in log_text
+
+
+def test_run_cycle_excludes_backed_off_owner_and_starts_unrelated_pending(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner_a = store.add("Poisoned unit", task_type="plan")
+    owner_b = store.add("Healthy unit", task_type="plan")
+    assert owner_a.id is not None
+    assert owner_b.id is not None
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    started: list[str] = []
+
+    def fake_spawn_worker(_args, _config, task_id=None, quiet=False, prepared_task=None, **_kwargs):
+        del quiet
+        assert task_id is not None
+        task = prepared_task if prepared_task is not None else store.get(task_id)
+        assert task is not None
+        task.status = "in_progress"
+        task.started_at = datetime.now(UTC)
+        store.update(task)
+        started.append(str(task_id))
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_worker),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            quiet=True,
+            log=log,
+            excluded_owner_ids=frozenset({str(owner_a.id)}),
+        )
+
+    assert result.work_done is True
+    assert started == [str(owner_b.id)]
+    assert store.get(str(owner_a.id)).status == "pending"
+    assert store.get(str(owner_b.id)).status == "in_progress"
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f"{owner_b.id} plan" in log_text
+    assert str(owner_a.id) not in started
+
+
 def test_system_can_run_tasks_skips_docker_probe_when_not_required(tmp_path: Path) -> None:
     config = Config(project_dir=tmp_path, project_name="test-project", use_docker=False)
 
@@ -24495,8 +24678,8 @@ def test_task_snapshot_hides_synthetic_git_health_internal_task(tmp_path: Path) 
     assert str(synthetic.id) not in snapshot
 
 
-def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
-    """watch should log explicit cooldowns after consecutive non-auto-resumable failures."""
+def test_cmd_watch_logs_owner_backoff_without_global_sleep(tmp_path: Path) -> None:
+    """watch should quarantine only the failing owner and keep the loop on poll cadence."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\n"
@@ -24509,7 +24692,9 @@ def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
     )
     store = make_store(tmp_path)
     task = store.add("Pending plan", task_type="plan")
+    unrelated = store.add("Unrelated pending plan", task_type="plan")
     assert task.id is not None
+    assert unrelated.id is not None
 
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -24524,34 +24709,56 @@ def test_cmd_watch_logs_and_sleeps_for_failure_backoff(tmp_path: Path) -> None:
     )
 
     snapshots = [
-        {str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None}},
-        {str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None}},
-        {str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"}},
-        {str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"}},
-        {str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"}},
+        {
+            str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+            str(unrelated.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+            str(unrelated.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+            str(unrelated.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+            str(unrelated.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
+        {
+            str(task.id): {"status": "failed", "task_type": "plan", "failure_reason": "UNKNOWN"},
+            str(unrelated.id): {"status": "pending", "task_type": "plan", "failure_reason": None},
+        },
     ]
     cycle_results = [
-        _CycleResult(True, 0, 1),
+        _CycleResult(True, 0, 2),
         _CycleResult(False, 0, 1),
     ]
     sleeps: list[int] = []
+    observed_exclusions: list[frozenset[str]] = []
 
     def fake_sleep(seconds: int, _stop_requested) -> None:
         sleeps.append(seconds)
 
+    def fake_run_cycle(**kwargs):
+        observed_exclusions.append(kwargs["excluded_owner_ids"])
+        return cycle_results.pop(0)
+
     with (
         patch("gza.cli.watch._task_snapshot", side_effect=snapshots),
-        patch("gza.cli.watch._run_cycle", side_effect=cycle_results),
+        patch("gza.cli.watch._run_cycle", side_effect=fake_run_cycle),
         patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
     ):
         rc = cmd_watch(args)
 
     assert rc == 0
-    assert sleeps == [60]
+    assert sleeps == [5]
+    assert observed_exclusions == [frozenset(), frozenset({str(task.id)})]
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "BACKOFF" in log_text
-    assert "sleeping 60s before starting more work" in log_text
+    assert f"{task.id}: sleeping unit 60s before retrying more work" in log_text
+    assert "other units remain dispatchable" in log_text
 
 
 def test_cmd_watch_restart_failed_does_not_backoff_for_actionable_review_recovery(tmp_path: Path) -> None:
@@ -24871,10 +25078,10 @@ def test_cmd_watch_max_resume_attempts_zero_disables_default_auto_resume(tmp_pat
 
     assert rc == 0
     assert run_cycle.call_args_list[0].kwargs["max_recovery_attempts"] == 0
-    assert sleeps == [60]
+    assert sleeps == []
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "BACKOFF" in log_text
-    assert f"{task.id}=MAX_TURNS" in log_text
+    assert f"{task.id}: sleeping unit 60s before retrying more work" in log_text
 
 
 def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None:
@@ -24947,9 +25154,9 @@ def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None
         rc = cmd_watch(args)
 
     assert rc == 0
-    assert sleeps == [60]
+    assert sleeps == [5]
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert "failure halt threshold reached" in log_text
+    assert "failure halt threshold reached (2 failing unit(s) >= 2" in log_text
 
 
 def test_cmd_watch_quiet_suppresses_worker_stdout_and_still_logs_events(
