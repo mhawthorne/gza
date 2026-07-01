@@ -48,6 +48,13 @@ gza = "gza.cli:main"
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+# Supply-chain safety: never install a package released in the last 7 days.
+# Committed here (not just in a global ~/.config/uv/uv.toml) so containers/agents
+# that re-resolve dependencies enforce the same cooldown. The resolved window is
+# recorded in uv.lock's [options]; refresh deliberately with `uv lock --upgrade`.
+exclude-newer = "7 days"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/gza"]
 include = ["src/gza/skills/**/*", "src/gza/prompts/templates/**/*", "src/gza/gza.yaml.example", "src/gza/gza.local.yaml.example"]
@@ -55,9 +62,6 @@ include = ["src/gza/skills/**/*", "src/gza/prompts/templates/**/*", "src/gza/gza
 [tool.hatch.version]
 source = "vcs"
 fallback-version = "0.1.0.dev0"
-
-[tool.uv]
-exclude-newer = "2026-06-23T19:16:01.859087Z"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "tests_functional"]
