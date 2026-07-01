@@ -1,6 +1,7 @@
 """Tests for branch-scoped sync operations."""
 
 from datetime import UTC, datetime, timedelta
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 from gza.db import SqliteTaskStore
@@ -22,6 +23,7 @@ from gza.sync_ops import (
     build_unmerged_branch_cohorts,
     reconcile_branch_merge_truth,
     reconcile_task_branch_merge_truth,
+    revalidate_terminal_no_work_merge_units,
     sync_branch_cohorts,
 )
 
@@ -2130,6 +2132,61 @@ def test_reconcile_task_branch_merge_truth_persists_preserved_empty_when_ref_una
     assert refreshed_unit.merged_at is None
 
 
+def test_revalidate_terminal_no_work_merge_units_restores_recorded_head_diff_to_unmerged(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/false-redundant-heal")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="recorded-head-sha")
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    git = Mock()
+    git.cached.return_value = nullcontext()
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "recorded-head-sha": "recorded-head-sha",
+    }.get(ref)
+    git.is_patch_equivalent_commit_present_on_target.return_value = False
+
+    results = revalidate_terminal_no_work_merge_units(store, git)
+
+    assert len(results) == 1
+    assert results[0].merge_status == "unmerged"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "unmerged"
+
+
+def test_revalidate_terminal_no_work_merge_units_leaves_unresolvable_recorded_head_unchanged(
+    tmp_path,
+    caplog,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/gced-head")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="missing-recorded-head")
+    store.set_merge_unit_state(unit.id, "empty")
+
+    git = Mock()
+    git.cached.return_value = nullcontext()
+    git.rev_parse_if_exists.return_value = None
+
+    with caplog.at_level("WARNING"):
+        results = revalidate_terminal_no_work_merge_units(store, git)
+
+    assert len(results) == 1
+    assert results[0].merge_status == "empty"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "empty"
+    assert "recorded head 'missing-recorded-head' is unavailable" in caplog.text
+
+
 def test_git_reconcile_update_drops_merge_source_for_empty_result() -> None:
     update = _git_reconcile_update(
         BranchSyncResult(
@@ -2142,6 +2199,48 @@ def test_git_reconcile_update_drops_merge_source_for_empty_result() -> None:
 
     assert update.merge_status == "empty"
     assert update.merge_source is _UNSET
+
+
+def test_sync_branch_cohorts_runs_terminal_no_work_revalidation_before_reconciling_requested_cohorts(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    healthy = _completed_branch_task(store, "Healthy task", "feature/healthy")
+    stranded = _completed_branch_task(store, "Stranded task", "feature/stranded")
+    assert stranded.id is not None
+    stranded_unit = store.get_or_create_merge_unit_for_task(stranded)
+    assert stranded_unit is not None
+    store.refresh_merge_unit_head(stranded_unit.id, head_sha="recorded-head-sha")
+    store.set_merge_unit_state(stranded_unit.id, "redundant")
+
+    git = Mock()
+    git.cached.return_value = nullcontext()
+    git.default_branch.return_value = "main"
+    git.branch_exists.side_effect = lambda ref: ref == "feature/healthy"
+    git.is_merged.return_value = False
+    git.get_diff_numstat.return_value = "1\t1\thealthy.txt\n"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "recorded-head-sha": "recorded-head-sha",
+        "feature/healthy": "healthy-head",
+        "main": "main-head",
+    }.get(ref)
+    git.is_patch_equivalent_commit_present_on_target.side_effect = lambda commit, target: (
+        False if (commit, target) == ("recorded-head-sha", "main") else None
+    )
+
+    results, partial = sync_branch_cohorts(
+        store,
+        git,
+        [BranchCohort(branch=healthy.branch, tasks=(healthy,))],
+        include_git=True,
+        include_pr=False,
+        dry_run=False,
+        fetch_remote=False,
+    )
+
+    assert partial is False
+    assert results[0].merge_status == "unmerged"
+    refreshed_unit = store.get_merge_unit(stranded_unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
 
 
 def test_git_reconcile_update_drops_merge_source_for_redundant_result() -> None:

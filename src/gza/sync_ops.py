@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -19,10 +21,15 @@ from .db import (
 )
 from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
 from .github import GitHub, GitHubError, PullRequestDetails, is_github_repo_unsupported_error
-from .merge_state import classify_branch_merge_state_for_target, classify_proven_merged_state
+from .merge_state import (
+    classify_branch_merge_state_for_target,
+    classify_proven_merged_state,
+    recorded_head_has_remaining_net_diff,
+)
 
 _UNSET = object()
 DEFAULT_SYNC_CACHE_SECONDS = 300
+_LOG = logging.getLogger(__name__)
 
 PrLookupSource = Literal["cached", "discovered"]
 SyncProgressCallback = Callable[[str], None]
@@ -475,6 +482,85 @@ def reconcile_branch_merge_truth(
     return results
 
 
+def revalidate_terminal_no_work_merge_units(
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    progress: SyncProgressCallback | None = None,
+) -> tuple[BranchSyncResult, ...]:
+    """Re-validate terminal no-work merge units against their recorded head SHA.
+
+    This is a fail-closed healing pass for legacy false `empty`/`redundant`
+    classifications. It only flips a unit back to `unmerged` when the recorded
+    head positively proves that at least one patch is still missing from the
+    unit's own target branch.
+    """
+    if not store.supports_merge_units():
+        return ()
+
+    candidates = [
+        unit
+        for unit in store.list_active_merge_units(states=("empty", "redundant"))
+        if isinstance(unit.head_sha, str) and unit.head_sha
+    ]
+    if not candidates:
+        return ()
+
+    _emit_progress(
+        progress,
+        f"Re-validating {len(candidates)} terminal no-work merge unit(s) against recorded head SHAs",
+    )
+    results: list[BranchSyncResult] = []
+    cached = getattr(git, "cached", None)
+    cache_scope = cached() if callable(cached) else nullcontext()
+    with cache_scope:
+        for unit in candidates:
+            tasks = tuple(store.list_tasks_for_merge_unit(unit.id))
+            result = BranchSyncResult(
+                branch=unit.source_branch,
+                task_ids=tuple(task.id for task in tasks if task.id is not None),
+                merge_status=unit.state,
+                head_sha=unit.head_sha,
+                base_sha=unit.base_sha,
+                reconciled=True,
+            )
+            results.append(result)
+
+            recorded_head_sha = unit.head_sha
+            assert isinstance(recorded_head_sha, str) and recorded_head_sha
+            recorded_head = resolve_ref_if_possible(git, recorded_head_sha)
+            if recorded_head.sha is None:
+                warning = (
+                    f"merge unit {unit.id}: recorded head {recorded_head_sha!r} is unavailable; "
+                    f"leaving terminal {unit.state!r} state unchanged"
+                )
+                result.warnings.append(warning)
+                _LOG.warning(warning)
+                continue
+
+            remaining_net_diff = recorded_head_has_remaining_net_diff(
+                git,
+                recorded_head_sha,
+                unit.target_branch,
+                on_warning=result.warnings.append,
+            )
+            if remaining_net_diff is True:
+                store.set_merge_unit_state(unit.id, "unmerged")
+                result.merge_status = "unmerged"
+                result.actions.append("revalidated recorded head and restored unit to unmerged")
+                continue
+            if remaining_net_diff is None:
+                warning = (
+                    f"merge unit {unit.id}: could not prove recorded-head patch presence for "
+                    f"{recorded_head_sha!r} against {unit.target_branch!r}; "
+                    f"leaving terminal {unit.state!r} state unchanged"
+                )
+                result.warnings.append(warning)
+                _LOG.warning(warning)
+
+    return tuple(results)
+
+
 @dataclass
 class _BranchPersistenceUpdate:
     merge_status: str | None | object = _UNSET
@@ -831,6 +917,8 @@ def reconcile_task_branch_merge_truth(
     persist: bool = True,
 ) -> BranchSyncResult:
     """Task-scoped wrapper that expands to a cohort and reconciles git merge truth."""
+    if persist:
+        revalidate_terminal_no_work_merge_units(store, git)
     cohort, preliminary = build_task_branch_cohort(store, task_id)
     if preliminary is not None:
         return preliminary
@@ -868,6 +956,8 @@ def sync_branch_cohorts(
 ) -> tuple[list[BranchSyncResult], bool]:
     """Reconcile branch cohorts against git and optional GitHub state."""
     partial_failure = False
+    if include_git and not dry_run:
+        revalidate_terminal_no_work_merge_units(store, git, progress=progress)
     default_branch = git.default_branch()
     results_by_index, eligible_indices, eligible_cohorts = _partition_target_mismatch_cohorts(
         store,

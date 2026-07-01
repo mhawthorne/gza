@@ -257,6 +257,32 @@ def _recorded_head_patch_is_present_on_target(
         return None
 
 
+def recorded_head_has_remaining_net_diff(
+    git: Any,
+    recorded_head_sha: str,
+    target_branch: str,
+    *,
+    on_warning: Callable[[str], None] | None = None,
+) -> bool | None:
+    """Return whether recorded-head patches are still missing from ``target_branch``.
+
+    This is the fail-closed recorded-head proof used to distinguish stale source-ref
+    no-work classifications from real landed/no-work outcomes. ``False`` means the
+    full patch set reachable from ``recorded_head_sha`` is already represented on the
+    target; ``True`` means at least one patch is still missing; ``None`` means the
+    proof could not be established.
+    """
+    head_patch_present = _recorded_head_patch_is_present_on_target(
+        git,
+        recorded_head_sha,
+        target_branch,
+        on_warning=on_warning,
+    )
+    if head_patch_present is None:
+        return None
+    return not head_patch_present
+
+
 def _terminal_source_ref_head_guard(
     *,
     git: Any,
@@ -281,13 +307,13 @@ def _terminal_source_ref_head_guard(
     if contains_recorded_head is True:
         return None
 
-    head_patch_present = _recorded_head_patch_is_present_on_target(
+    remaining_net_diff = recorded_head_has_remaining_net_diff(
         git,
         recorded_head_sha,
         target_branch,
         on_warning=on_warning,
     )
-    if head_patch_present is False:
+    if remaining_net_diff is True:
         return BranchMergeClassification(
             state="unmerged",
             reason="recorded-head-has-net-diff",
@@ -296,7 +322,7 @@ def _terminal_source_ref_head_guard(
             source_sha=source_sha,
             target_sha=target_sha,
         )
-    if head_patch_present is None:
+    if remaining_net_diff is None:
         return BranchMergeClassification(
             state="unknown",
             reason="recorded-head-diff-unavailable",

@@ -512,6 +512,13 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `redundant`, is terminal moot: it MUST NOT create, run, wait on, or require a review,
   and it MUST remain absent from actionable `unmerged` and lifecycle-`incomplete`
   surfaces.
+- Canonical host-side reconciliation MUST still re-validate stored terminal `empty` /
+  `redundant` merge units that retain a recorded `head_sha` against that **recorded
+  head SHA** and the unit's own target branch. If recorded-head patch proof positively
+  shows missing work, the unit MUST be restored to `unmerged` so normal lifecycle
+  progress resumes. If recorded-head proof is unavailable (for example the commit is no
+  longer resolvable), reconciliation MUST leave the terminal state unchanged and log the
+  degraded proof. This healing pass MUST be idempotent and fail closed.
 - Reviews all cleared/addressed, with no newer rebase or closing-review requirement
   invalidating that state → `merge`.
 - A non-implementation unit, or a unit that does not require review → `merge`.
