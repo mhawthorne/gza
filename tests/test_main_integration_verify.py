@@ -3,10 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+from gza.artifacts import store_command_output_artifact
+from gza.cli.watch import _main_verify_remediation_prompt
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.cli.watch import _main_verify_remediation_prompt
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    _build_main_integration_verify_remediation,
     check_main_integration_verify,
     current_main_integration_verify_alert,
     load_main_integration_verify_state,
@@ -35,6 +39,244 @@ def _seed_main_verify_task(store: SqliteTaskStore, *, verify_status: str, verify
     )
     store.update(task)
     return task.id
+
+
+def test_build_main_integration_verify_remediation_uses_preferred_verify_artifact_and_bounded_excerpt(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    older = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify older",
+        output="\n".join(
+            [
+                *(f"noise line {index}" for index in range(20)),
+                "WORKER_DIED subprocess boundary failure",
+                "=========================== short test summary info ============================",
+                "FAILED tests/test_alpha.py::test_one - AssertionError: boom",
+                "FAILED tests/test_beta.py::test_two - RuntimeError: kaboom",
+                "============================== 2 failed in 0.20s ==============================",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    newer = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify newer",
+        output="FAILED tests/test_newer.py::test_latest - AssertionError: newer",
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
+    task.review_verify_artifact_file = older.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path == older.path
+    assert remediation.artifact_path != newer.path
+    assert remediation.failing_test_ids == (
+        "tests/test_alpha.py::test_one",
+        "tests/test_beta.py::test_two",
+    )
+    assert remediation.verify_excerpt is not None
+    assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
+    assert "FAILED tests/test_alpha.py::test_one - AssertionError: boom" in remediation.verify_excerpt
+    assert "noise line 0" not in remediation.verify_excerpt
+    assert len(remediation.verify_excerpt.splitlines()) <= 24
+
+
+def test_build_main_integration_verify_remediation_falls_back_to_newest_verify_artifact(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    older = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify older",
+        output="older failure output",
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    newer = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify newer",
+        output="newest failure output",
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
+    task.review_verify_artifact_file = older.path + ".missing"
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path == newer.path
+    assert remediation.failing_test_ids == ()
+    assert remediation.verify_excerpt == "newest failure output"
+
+
+def test_build_main_integration_verify_remediation_skips_unreadable_preferred_artifact_for_newer_readable_evidence(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    preferred = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify preferred",
+        output="FAILED tests/test_old.py::test_preferred - AssertionError: old",
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    newer = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify newer",
+        output="\n".join(
+            [
+                "WORKER_DIED subprocess boundary failure",
+                "=========================== short test summary info ============================",
+                "FAILED tests/test_newer.py::test_latest - AssertionError: newer",
+                "============================== 1 failed in 0.20s ==============================",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
+    (tmp_path / preferred.path).unlink()
+    task.review_verify_artifact_file = preferred.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path == newer.path
+    assert remediation.failing_test_ids == ("tests/test_newer.py::test_latest",)
+    assert remediation.verify_excerpt is not None
+    assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
+
+
+def test_build_main_integration_verify_remediation_omits_missing_artifact_evidence_and_prompt_line(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    older = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify older",
+        output="FAILED tests/test_old.py::test_old - AssertionError: old",
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    newer = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify newer",
+        output="FAILED tests/test_newer.py::test_latest - AssertionError: newer",
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
+    (tmp_path / older.path).unlink()
+    (tmp_path / newer.path).unlink()
+    task.review_verify_artifact_file = older.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path is None
+    assert remediation.failing_test_ids == ()
+    assert remediation.verify_excerpt is None
+    prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
+    assert "Verify artifact:" not in prompt
 
 
 def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint_is_unavailable(tmp_path) -> None:

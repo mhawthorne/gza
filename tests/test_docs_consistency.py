@@ -163,8 +163,11 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "A merge stall MUST NOT convert into a launch stall." in contract
     assert "The shared no-progress backstop MUST count only actually executed unchanged actions." in contract
     assert "Remediation task dedup is by failure identity" in contract
-    assert "failure signature plus the exact local-target tree fingerprint" in contract
-    assert "fall back to signature-only reuse" in contract
+    assert "the normalized failure signature only" in contract
+    assert "different, newly available, stale, or unavailable fingerprint MUST reuse" in contract_flat
+    assert "readable and yields content-bearing output" in contract
+    assert "first readable content-bearing one" in contract
+    assert "content-bearing verify artifact exists, it MUST omit the artifact reference" in contract
     assert "There MUST be a first-class operator command that forces a fresh local-target verify run" in contract
     assert "Future behavior-check findings against this area MUST classify implementation drift" in contract_flat
 
@@ -338,23 +341,24 @@ def test_off_topic_verify_lifecycle_wording_stays_reconciled_with_focused_contra
     assert "The lifecycle policy knob `advance_off_topic_verify_unblock` MUST exist and MUST default to **off**." in contract_flat
 
 
-def test_main_verify_remediation_identity_docs_match_fingerprint_aware_runtime_contract() -> None:
-    """Specs and operator docs should describe fingerprint-aware remediation dedup consistently."""
+def test_main_verify_remediation_identity_docs_match_signature_only_runtime_contract() -> None:
+    """Specs and operator docs should describe signature-only remediation dedup consistently."""
     repo_root = Path(__file__).resolve().parents[1]
     contract = (repo_root / "specs" / "behavior" / "main-verify-self-heal.md").read_text()
+    contract_flat = " ".join(contract.split())
     supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
+    supervisor_flat = " ".join(supervisor.split())
     config_docs = (repo_root / "docs" / "configuration.md").read_text()
 
-    assert "failure signature plus the exact local-target tree fingerprint" in contract
-    assert "fall back to signature-only reuse" in contract
+    assert "the normalized failure signature only" in contract
+    assert "different, newly available, stale, or unavailable fingerprint MUST reuse" in contract_flat
 
-    assert "dedup is by failure identity: failure" in supervisor
-    assert "signature plus exact local-target tree fingerprint" in supervisor
-    assert "If the tree fingerprint is unavailable, watch MUST" in supervisor
-    assert "fall back to signature-only reuse" in supervisor
+    assert "dedup is by failure identity: normalized" in supervisor
+    assert "failure signature only" in supervisor
+    assert "fingerprint changes, becomes available later, or is unavailable" in supervisor_flat
 
-    assert "deduplicated by failure signature plus tree fingerprint" in config_docs
-    assert "If the tree fingerprint is unavailable, watch falls back to signature-only reuse" in config_docs
+    assert "deduplicated by failure signature only" in config_docs
+    assert "fingerprint churn does not create a second open remediation row" in config_docs
     assert "main-integration-verify-red" in supervisor
     assert "S7 — Watch owns bounded stateful work creation." in supervisor
     assert "advance` MAY surface the red-main condition from the shared state" in supervisor

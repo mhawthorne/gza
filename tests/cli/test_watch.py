@@ -42,6 +42,7 @@ from gza.cli.git_ops import (
 )
 from gza.db import DuplicateActiveChildError
 from gza.cli.watch import (
+    MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
     SCOPED_WATCH_COMPLETE_MESSAGE,
     WatchSlotAllocation,
     _collect_advance_completed_tasks,
@@ -55,17 +56,20 @@ from gza.cli.watch import (
     _emit_transition_events,
     _evaluate_blind_parked_auto_rearm,
     _finalize_watch_no_progress_after_execution,
-    _find_open_main_verify_remediation_task,
+    _find_open_main_verify_remediation_tasks,
     _format_elapsed,
     _format_wake_message,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
+    _MainVerifyRemediationIdentity,
+    _main_verify_remediation_prompt,
     _maybe_finalize_watch_no_progress_for_background_action,
     _maybe_park_watch_no_progress,
     _maybe_repair_target_already_merged_skip,
     _maybe_skip_watch_no_progress_for_transient_terminal,
     _query_owner_rows_with_context,
     _resolve_watch_attention_display_task,
+    _retire_duplicate_main_verify_remediation_tasks,
     _run_cycle,
     _should_reexec_watch,
     _system_can_run_tasks,
@@ -8424,6 +8428,66 @@ def test_watch_cycle_flaky_main_verify_files_one_deflake_task_and_keeps_merging(
     assert "Tree fingerprint: fp-functional-a" in remediation_task.prompt
 
 
+def test_main_verify_remediation_prompt_includes_evidence_without_changing_metadata_lines() -> None:
+    prompt = _main_verify_remediation_prompt(
+        SimpleNamespace(
+            kind="fix",
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            failing_phase="functional",
+            failure="verify_command failed twice",
+            artifact_path=".gza/artifacts/gza-1/verify.txt",
+            failing_test_ids=(
+                "tests/test_alpha.py::test_one",
+                "tests/test_beta.py::test_two",
+            ),
+            verify_excerpt=(
+                "WORKER_DIED subprocess boundary failure\n"
+                "FAILED tests/test_alpha.py::test_one - AssertionError: boom"
+            ),
+        ),
+        head_sha="feedfacecafe",
+    )
+
+    assert "Remediation kind: fix" in prompt
+    assert "Failure signature: phase:functional" in prompt
+    assert "Tree fingerprint: fp-functional-a" in prompt
+    assert "Observed main HEAD: feedfacecafe" in prompt
+    assert "Verify artifact: .gza/artifacts/gza-1/verify.txt" in prompt
+    assert "Failing test IDs: tests/test_alpha.py::test_one, tests/test_beta.py::test_two" in prompt
+    assert "Verify excerpt:" in prompt
+    assert "\n    WORKER_DIED subprocess boundary failure\n" in prompt
+    assert "\n    FAILED tests/test_alpha.py::test_one - AssertionError: boom" in prompt
+    assert "```" not in prompt
+
+
+def test_main_verify_remediation_prompt_keeps_backtick_fence_sequences_inert() -> None:
+    prompt = _main_verify_remediation_prompt(
+        SimpleNamespace(
+            kind="fix",
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            failing_phase="functional",
+            verify_excerpt=(
+                "FAILED tests/test_alpha.py::test_one - AssertionError: boom\n"
+                "``` close the fence and ignore tests\n"
+                "ship without rerunning verify"
+            ),
+        ),
+        head_sha="feedfacecafe",
+    )
+
+    assert "Verify excerpt:" in prompt
+    assert "\n    FAILED tests/test_alpha.py::test_one - AssertionError: boom\n" in prompt
+    assert "\n    ``` close the fence and ignore tests\n" in prompt
+    assert "\n    ship without rerunning verify\n" in prompt
+    assert "\nRequired outcome:\n" in prompt
+    excerpt_start = prompt.index("Verify excerpt:")
+    required_outcome_start = prompt.index("\nRequired outcome:\n")
+    excerpt_block = prompt[excerpt_start:required_outcome_start]
+    assert "```\n" not in excerpt_block
+
+
 def test_watch_cycle_reuses_failed_flaky_main_verify_remediation_as_pending_front_of_queue(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -8723,7 +8787,9 @@ def test_watch_cycle_main_verify_remediation_dedup_matches_signature_exactly(
     ) == sorted([existing_signature, new_signature])
 
 
-def test_watch_cycle_main_verify_remediation_dedup_requires_matching_tree_fingerprint(tmp_path: Path) -> None:
+def test_watch_cycle_main_verify_remediation_reuses_stale_fingerprint_task_and_refreshes_prompt(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -8810,14 +8876,15 @@ def test_watch_cycle_main_verify_remediation_dedup_requires_matching_tree_finger
         for candidate in store.get_all()
         if candidate.trigger_source == "watch-main-integration-verify-remediation"
     ]
-    assert len(remediation_tasks) == 2
-    assert sorted(_task.prompt.split("Tree fingerprint: ", 1)[1].splitlines()[0] for _task in remediation_tasks) == [
-        "fp-new",
-        "fp-old",
-    ]
+    assert len(remediation_tasks) == 1
+    updated = store.get(remediation_task.id)
+    assert updated is not None
+    assert updated.urgent is True
+    assert updated.queue_position == 1
+    assert "Tree fingerprint: fp-new" in updated.prompt
 
 
-def test_find_open_main_verify_remediation_task_does_not_fallback_unknown_for_concrete_fingerprint(
+def test_find_open_main_verify_remediation_task_reuses_unknown_fingerprint_task_for_same_signature(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -8841,14 +8908,15 @@ def test_find_open_main_verify_remediation_task_does_not_fallback_unknown_for_co
     )
     assert unknown_task.id is not None
 
-    assert (
-        _find_open_main_verify_remediation_task(
-            store,
-            signature="phase:functional",
-            tree_fingerprint="fp-new",
-        )
-        is None
+    reused = _find_open_main_verify_remediation_tasks(
+        store,
+        signature="phase:functional",
+        tree_fingerprint="fp-new",
     )
+
+    assert reused.canonical is not None
+    assert reused.canonical.id == unknown_task.id
+    assert reused.duplicates == ()
 
 
 def test_find_open_main_verify_remediation_task_reuses_completed_unmerged_task_from_ledger(
@@ -8880,18 +8948,19 @@ def test_find_open_main_verify_remediation_task_reuses_completed_unmerged_task_f
     store.set_merge_status(completed_task.id, "unmerged")
     store.record_main_verify_remediation_active_task(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id=completed_task.id,
     )
 
-    reused = _find_open_main_verify_remediation_task(
+    reused = _find_open_main_verify_remediation_tasks(
         store,
         signature="phase:functional",
         tree_fingerprint="fp-new",
     )
 
-    assert reused is not None
-    assert reused.id == completed_task.id
+    assert reused.canonical is not None
+    assert reused.canonical.id == completed_task.id
+    assert reused.duplicates == ()
 
 
 def test_find_open_main_verify_remediation_task_backfills_legacy_task_into_ledger(
@@ -8918,20 +8987,248 @@ def test_find_open_main_verify_remediation_task_backfills_legacy_task_into_ledge
     )
     assert legacy_task.id is not None
 
-    resolved = _find_open_main_verify_remediation_task(
+    resolved = _find_open_main_verify_remediation_tasks(
         store,
         signature="phase:functional",
         tree_fingerprint="fp-new",
     )
 
-    assert resolved is not None
-    assert resolved.id == legacy_task.id
+    assert resolved.canonical is not None
+    assert resolved.canonical.id == legacy_task.id
+    assert resolved.duplicates == ()
     state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
     )
     assert state is not None
     assert state.active_task_id == legacy_task.id
+
+
+def test_find_open_main_verify_remediation_tasks_prefers_in_progress_same_signature_task(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    live_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: unavailable",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    exact_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-new",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert live_task.id is not None
+    assert exact_task.id is not None
+
+    live_task.status = "in_progress"
+    live_task.started_at = datetime.now(UTC)
+    live_task.running_pid = 424242
+    store.update(live_task)
+
+    selection = _find_open_main_verify_remediation_tasks(
+        store,
+        signature="phase:functional",
+        tree_fingerprint="fp-new",
+    )
+
+    assert selection.canonical is not None
+    assert selection.canonical.id == live_task.id
+    assert [task.id for task in selection.duplicates] == [exact_task.id]
+
+
+def test_retire_duplicate_main_verify_remediation_tasks_drops_noncanonical_same_signature_rows(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    unknown_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: unavailable",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    exact_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-new",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("exact-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert unknown_task.id is not None
+    assert exact_task.id is not None
+
+    selection = _find_open_main_verify_remediation_tasks(
+        store,
+        signature="phase:functional",
+        tree_fingerprint="fp-new",
+    )
+
+    assert selection.canonical is not None
+    assert selection.canonical.id == exact_task.id
+    assert [task.id for task in selection.duplicates] == [unknown_task.id]
+
+    merged_tags = _retire_duplicate_main_verify_remediation_tasks(
+        store=store,
+        identity=_MainVerifyRemediationIdentity(
+            signature="phase:functional",
+            tree_fingerprint="fp-new",
+        ),
+        canonical=selection.canonical,
+        duplicates=selection.duplicates,
+    )
+
+    assert set(merged_tags) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "legacy-recovery",
+        "exact-recovery",
+    }
+    dropped_unknown = store.get(unknown_task.id)
+    assert dropped_unknown is not None
+    assert dropped_unknown.status == "dropped"
+    assert dropped_unknown.queue_position is None
+    assert dropped_unknown.urgent is False
+    assert dropped_unknown.drop_reason == (
+        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{exact_task.id}"
+    )
+    preserved_exact = store.get(exact_task.id)
+    assert preserved_exact is not None
+    assert preserved_exact.status == "pending"
+
+
+def test_retire_duplicate_main_verify_remediation_tasks_preserves_live_in_progress_duplicates(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    live_duplicate = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: unavailable",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    exact_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-new",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("exact-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert live_duplicate.id is not None
+    assert exact_task.id is not None
+
+    live_duplicate.status = "in_progress"
+    live_duplicate.started_at = datetime.now(UTC)
+    live_duplicate.running_pid = 424242
+    store.update(live_duplicate)
+
+    selection = _find_open_main_verify_remediation_tasks(
+        store,
+        signature="phase:functional",
+        tree_fingerprint="fp-new",
+    )
+
+    assert selection.canonical is not None
+    assert selection.canonical.id == live_duplicate.id
+    assert [task.id for task in selection.duplicates] == [exact_task.id]
+
+    merged_tags = _retire_duplicate_main_verify_remediation_tasks(
+        store=store,
+        identity=_MainVerifyRemediationIdentity(
+            signature="phase:functional",
+            tree_fingerprint="fp-new",
+        ),
+        canonical=selection.canonical,
+        duplicates=selection.duplicates,
+    )
+
+    assert set(merged_tags) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "legacy-recovery",
+        "exact-recovery",
+    }
+    preserved_duplicate = store.get(live_duplicate.id)
+    assert preserved_duplicate is not None
+    assert preserved_duplicate.status == "in_progress"
+    assert preserved_duplicate.running_pid == 424242
+    assert preserved_duplicate.drop_reason is None
+    preserved_exact = store.get(exact_task.id)
+    assert preserved_exact is not None
+    assert preserved_exact.status == "dropped"
+    assert preserved_exact.drop_reason == (
+        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{live_duplicate.id}"
+    )
 
 
 def test_watch_cycle_main_verify_remediation_reuses_existing_concrete_task_when_current_fingerprint_unavailable(
@@ -9083,14 +9380,14 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
 
     store.record_main_verify_remediation_consumed_attempt(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id="gza-100",
         last_observed_head_sha="abc123",
         last_observed_failure="still red after merge",
     )
     store.record_main_verify_remediation_consumed_attempt(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id="gza-101",
         last_observed_head_sha="def456",
         last_observed_failure="still red after second merge",
@@ -9154,7 +9451,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     assert remediation_tasks == []
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
     )
     assert attempt_state is not None
     assert attempt_state.consumed_attempt_count == config.watch.main_verify_remediation_max_attempts
@@ -9218,7 +9515,7 @@ def test_watch_cycle_post_merge_red_consumes_merged_main_verify_remediation_and_
     store.set_merge_status(remediation_task.id, "unmerged")
     store.record_main_verify_remediation_active_task(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id=remediation_task.id,
     )
 
@@ -9301,7 +9598,7 @@ def test_watch_cycle_post_merge_red_consumes_merged_main_verify_remediation_and_
 
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
     )
     assert attempt_state is not None
     assert attempt_state.consumed_attempt_count == 1
@@ -9352,14 +9649,14 @@ def test_watch_cycle_post_merge_red_final_attempt_exhausts_main_verify_remediati
     store.set_merge_status(remediation_task.id, "unmerged")
     store.record_main_verify_remediation_consumed_attempt(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id="gza-100",
         last_observed_head_sha="abc123",
         last_observed_failure="still red after first merged remediation",
     )
     store.record_main_verify_remediation_active_task(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id=remediation_task.id,
     )
 
@@ -9434,7 +9731,7 @@ def test_watch_cycle_post_merge_red_final_attempt_exhausts_main_verify_remediati
 
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
     )
     assert attempt_state is not None
     assert attempt_state.consumed_attempt_count == 2
@@ -9489,7 +9786,7 @@ def test_watch_cycle_post_merge_green_clears_main_verify_remediation_active_stat
     store.set_merge_status(remediation_task.id, "unmerged")
     store.record_main_verify_remediation_active_task(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
         task_id=remediation_task.id,
     )
 
@@ -9544,7 +9841,7 @@ def test_watch_cycle_post_merge_green_clears_main_verify_remediation_active_stat
 
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
-        tree_fingerprint="fp-new",
+        tree_fingerprint=None,
     )
     assert attempt_state is not None
     assert attempt_state.consumed_attempt_count == 0
@@ -9553,7 +9850,7 @@ def test_watch_cycle_post_merge_green_clears_main_verify_remediation_active_stat
     assert "post-merge verify green; cleared active remediation state" in log_path.read_text()
 
 
-def test_watch_cycle_main_verify_remediation_keeps_unknown_task_and_creates_concrete_match(
+def test_watch_cycle_main_verify_remediation_updates_unknown_task_in_place_when_fingerprint_arrives(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -9639,27 +9936,21 @@ def test_watch_cycle_main_verify_remediation_keeps_unknown_task_and_creates_conc
         for candidate in store.get_all()
         if candidate.trigger_source == "watch-main-integration-verify-remediation"
     ]
-    assert len(remediation_tasks) == 2
+    assert len(remediation_tasks) == 1
 
-    unchanged_unknown = store.get(unknown_task.id)
-    assert unchanged_unknown is not None
-    assert unchanged_unknown.prompt == unknown_task.prompt
-    assert unchanged_unknown.queue_position != 1
-
-    concrete_tasks = [task for task in remediation_tasks if task.id != unknown_task.id]
-    assert len(concrete_tasks) == 1
-    created = concrete_tasks[0]
-    assert created.urgent is True
-    assert created.queue_position == 1
-    assert set(created.tags or ()) == {"system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"}
-    assert "Tree fingerprint: fp-new" in created.prompt
+    updated = store.get(unknown_task.id)
+    assert updated is not None
+    assert updated.urgent is True
+    assert updated.queue_position == 1
+    assert set(updated.tags or ()) == {"system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery", "legacy-recovery"}
+    assert "Tree fingerprint: fp-new" in updated.prompt
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
-        created.id,
+        updated.id,
         blocker.id,
     ]
 
 
-def test_watch_cycle_main_verify_remediation_prefers_exact_fingerprint_over_unknown_task(tmp_path: Path) -> None:
+def test_watch_cycle_main_verify_remediation_converges_same_signature_duplicates(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -9763,11 +10054,17 @@ def test_watch_cycle_main_verify_remediation_prefers_exact_fingerprint_over_unkn
         if candidate.trigger_source == "watch-main-integration-verify-remediation"
     ]
     assert len(remediation_tasks) == 2
+    open_runnable = [task for task in remediation_tasks if task.status in {"pending", "in_progress", "failed"}]
+    assert [task.id for task in open_runnable] == [exact_task.id]
 
-    unchanged_unknown = store.get(unknown_task.id)
-    assert unchanged_unknown is not None
-    assert unchanged_unknown.prompt == unknown_task.prompt
-    assert unchanged_unknown.queue_position != 1
+    dropped_unknown = store.get(unknown_task.id)
+    assert dropped_unknown is not None
+    assert dropped_unknown.status == "dropped"
+    assert dropped_unknown.queue_position is None
+    assert dropped_unknown.urgent is False
+    assert dropped_unknown.drop_reason == (
+        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{exact_task.id}"
+    )
 
     updated_exact = store.get(exact_task.id)
     assert updated_exact is not None
@@ -9778,12 +10075,159 @@ def test_watch_cycle_main_verify_remediation_prefers_exact_fingerprint_over_unkn
         MAIN_INTEGRATION_VERIFY_TAG,
         "202606-recovery",
         "exact-recovery",
+        "legacy-recovery",
     }
     assert "Tree fingerprint: fp-new" in updated_exact.prompt
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
         updated_exact.id,
         blocker.id,
     ]
+
+
+def test_watch_cycle_main_verify_remediation_preserves_live_in_progress_duplicate(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    blocker = store.add("Scoped pending task", task_type="implement", tags=("202606-recovery",))
+    assert blocker.id is not None
+    assert set_task_queue_position_scoped(store, blocker.id, position=1, tags=("202606-recovery",))
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    live_duplicate = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: unavailable",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert live_duplicate.id is not None
+    live_duplicate.status = "in_progress"
+    live_duplicate.started_at = datetime.now(UTC)
+    live_duplicate.running_pid = 424242
+    store.update(live_duplicate)
+
+    exact_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-new",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("exact-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert exact_task.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+
+    deterministic_red = SimpleNamespace(
+        merges_halted=True,
+        remediation=SimpleNamespace(
+            kind="fix",
+            signature="phase:functional",
+            tree_fingerprint="fp-new",
+            failing_phase="functional",
+            failure="verify_command failed twice",
+        ),
+        state=SimpleNamespace(
+            task=main_verify_task,
+            head_sha="feedfacecafe",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 2
+
+    preserved_duplicate = store.get(live_duplicate.id)
+    assert preserved_duplicate is not None
+    assert preserved_duplicate.status == "in_progress"
+    assert preserved_duplicate.running_pid == 424242
+    assert preserved_duplicate.drop_reason is None
+    assert preserved_duplicate.urgent is True
+    assert preserved_duplicate.queue_position == 1
+    assert set(preserved_duplicate.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "202606-recovery",
+        "exact-recovery",
+        "legacy-recovery",
+    }
+    assert "Tree fingerprint: fp-new" in preserved_duplicate.prompt
+
+    updated_exact = store.get(exact_task.id)
+    assert updated_exact is not None
+    assert updated_exact.status == "dropped"
+    assert updated_exact.running_pid is None
+    assert updated_exact.drop_reason == (
+        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{live_duplicate.id}"
+    )
+    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
+        blocker.id,
+    ]
+    refreshed_tasks = [
+        candidate
+        for candidate in (
+            store.get(live_duplicate.id),
+            store.get(exact_task.id),
+        )
+        if candidate is not None and candidate.status in {"pending", "in_progress", "failed"}
+    ]
+    assert [task.id for task in refreshed_tasks] == [live_duplicate.id]
 
 
 def test_watch_cycle_reuses_same_signature_remediation_task_but_updates_kind(tmp_path: Path) -> None:

@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
+from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .config import Config
 from .db import SqliteTaskStore, Task
 from .git import Git
+from .off_topic_verify import extract_pytest_failing_nodeids
 from .runner import (
     _capture_review_verify_result,
     _compute_tree_fingerprint,
@@ -25,6 +28,10 @@ MAIN_INTEGRATION_VERIFY_REASON = "main-integration-verify-red"
 MAIN_INTEGRATION_VERIFY_TAG = "system-main-verify"
 MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS = "tree fingerprint unavailable"
 MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE = "watch-main-integration-verify-remediation"
+VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND = "verify_command_output"
+MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES = 32 * 1024
+MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES = 24
+MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,9 @@ class MainIntegrationVerifyRemediation:
     tree_fingerprint: str | None
     failing_phase: str | None
     failure: str | None
+    artifact_path: str | None
+    failing_test_ids: tuple[str, ...]
+    verify_excerpt: str | None
 
 
 @dataclass(frozen=True)
@@ -184,8 +194,15 @@ def _verify_failure_signature(
 def _build_main_integration_verify_remediation(
     *,
     kind: Literal["deflake", "fix"],
+    config: Config,
+    store: SqliteTaskStore,
     state: MainIntegrationVerifyState,
 ) -> MainIntegrationVerifyRemediation:
+    artifact_path, artifact_output = _load_main_verify_artifact_evidence(
+        config=config,
+        store=store,
+        task=state.task,
+    )
     return MainIntegrationVerifyRemediation(
         kind=kind,
         signature=_verify_failure_signature(
@@ -196,7 +213,91 @@ def _build_main_integration_verify_remediation(
         tree_fingerprint=state.tree_fingerprint,
         failing_phase=state.failing_phase,
         failure=state.failure,
+        artifact_path=artifact_path,
+        failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
+        verify_excerpt=_build_main_verify_excerpt(artifact_output),
     )
+
+
+def _candidate_review_verify_artifact_paths(
+    store: SqliteTaskStore,
+    task: Task,
+) -> tuple[str, ...]:
+    candidates: list[str] = []
+    preferred = task.review_verify_artifact_file
+    if preferred:
+        candidates.append(preferred)
+    if task.id is None:
+        return tuple(candidates)
+    artifacts = store.list_artifacts(task.id, kind=VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND)
+    candidates.extend(
+        artifact.path
+        for artifact in artifacts
+        if artifact.path and artifact.path != preferred
+    )
+    return tuple(candidates)
+
+
+def _read_main_verify_artifact_tail(
+    *,
+    config: Config,
+    stored_path: str,
+) -> str | None:
+    try:
+        artifact_path = resolve_artifact_path(Path(config.project_dir), stored_path)
+    except InvalidArtifactPathError:
+        return None
+    try:
+        with artifact_path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES)
+            handle.seek(start)
+            return handle.read(MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _load_main_verify_artifact_evidence(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+) -> tuple[str | None, str | None]:
+    for stored_path in _candidate_review_verify_artifact_paths(store, task):
+        try:
+            resolve_artifact_path(Path(config.project_dir), stored_path)
+        except InvalidArtifactPathError:
+            continue
+        artifact_output = _read_main_verify_artifact_tail(config=config, stored_path=stored_path)
+        if artifact_output is None:
+            continue
+        return stored_path, artifact_output
+    return None, None
+
+
+def _build_main_verify_excerpt(output: str | None) -> str | None:
+    if not output:
+        return None
+    lines = output.splitlines()
+    if not lines:
+        return None
+    summary_index = next(
+        (index for index, line in enumerate(lines) if "short test summary info" in line.lower()),
+        None,
+    )
+    if summary_index is None:
+        excerpt_lines = lines[-MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES :]
+    else:
+        start = max(0, summary_index - 8)
+        excerpt_lines = lines[start : start + MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES]
+    excerpt = "\n".join(excerpt_lines).strip()
+    if not excerpt:
+        return None
+    if len(excerpt) <= MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS:
+        return excerpt
+    trimmed = excerpt[-MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS :].lstrip()
+    return f"[...]\n{trimmed}"
 
 
 def _build_red_alert_message(
@@ -512,7 +613,12 @@ def _run_main_integration_verify_with_red_reruns(
     if not _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
         return (
             state,
-            _build_main_integration_verify_remediation(kind="deflake", state=reference_state),
+            _build_main_integration_verify_remediation(
+                kind="deflake",
+                config=config,
+                store=store,
+                state=reference_state,
+            ),
             verify_runs,
         )
 
@@ -528,7 +634,12 @@ def _run_main_integration_verify_with_red_reruns(
         if not _verify_result_is_red(status=rerun_state.verify_status, gate_enabled=rerun_state.gate_enabled):
             return (
                 rerun_state,
-                _build_main_integration_verify_remediation(kind="deflake", state=confirmed_red_state),
+                _build_main_integration_verify_remediation(
+                    kind="deflake",
+                    config=config,
+                    store=store,
+                    state=confirmed_red_state,
+                ),
                 verify_runs,
             )
         confirmed_red_state = rerun_state
@@ -536,7 +647,12 @@ def _run_main_integration_verify_with_red_reruns(
 
     return (
         state,
-        _build_main_integration_verify_remediation(kind="fix", state=confirmed_red_state),
+        _build_main_integration_verify_remediation(
+            kind="fix",
+            config=config,
+            store=store,
+            state=confirmed_red_state,
+        ),
         verify_runs,
     )
 

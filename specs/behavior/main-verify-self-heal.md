@@ -100,23 +100,32 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   exactly one open remediation task for that failure identity that aims to fix the
   failing phase or gate.
 - Remediation task dedup is by failure identity, not by watch cycle. That identity is
-  the failure signature plus the exact local-target tree fingerprint from the bounded
-  rerun evidence. Re-observing the same unresolved signature on the same fingerprint
-  MUST reuse the existing open remediation task instead of filing another copy. If the
-  current bounded rerun evidence changes the required remediation kind for that same
-  identity, the reused task MUST be updated so its prompt still matches the current
-  classification.
-- If the current bounded rerun evidence cannot produce a tree fingerprint, the
-  supervisor MUST fall back to signature-only reuse for that remediation task because
-  exact-tree identity is unavailable. A later observation with a concrete fingerprint MAY
-  create a distinct remediation task for that same signature if its fingerprint does not
-  match the fallback task's unknown identity.
+  the normalized failure signature only. The exact local-target tree fingerprint from
+  the bounded rerun evidence remains prompt context and freshness evidence, but it MUST
+  NOT decide whether the supervisor creates a new remediation row. Re-observing the
+  same unresolved signature with a different, newly available, stale, or unavailable
+  fingerprint MUST reuse the existing open remediation task instead of filing another
+  copy. If the current bounded rerun evidence changes the required remediation kind,
+  fingerprint context, or other prompt evidence for that same signature, the reused
+  task MUST be updated in place so its prompt still matches the current classification.
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
 - Reused or newly created remediation tasks for this gate MUST carry the distinctive tag
   `system-main-verify` in addition to the inherited `system` and scope tags so operators
   can filter main-verify state rows and remediation work together.
+- Reused or newly created remediation tasks for this gate MUST include bounded rerun
+  evidence in the prompt: the failure signature, the observed tree fingerprint context,
+  a persisted verify artifact reference only when the referenced artifact file is still
+  readable and yields content-bearing output, parsed failing pytest node IDs when
+  available from existing verify evidence, and a trimmed verify-output excerpt. If the
+  preferred persisted artifact reference is missing, unreadable, invalid, empty, or
+  whitespace-only, the supervisor MUST keep scanning newer `verify_command_output`
+  artifacts newest-first and use the first readable content-bearing one; if no
+  content-bearing verify artifact exists, it MUST omit the artifact reference, parsed
+  node IDs, and excerpt instead of surfacing stale prompt evidence.
+  The prompt MUST keep that evidence bounded and deterministic; it MUST NOT embed an
+  unbounded verify log.
 
 That repair path MUST itself be bounded. It MUST NOT silently freeze the merge lane
 without either making bounded repair attempts or surfacing a human-required condition.

@@ -112,15 +112,16 @@ Each watch cycle MUST execute these phases in order:
    configured for the project, that is an explicit no-gate
    exception: watch MAY record an `unavailable` checkpoint with
    `exit_status="not configured"` but MUST NOT halt merges or emit red-main attention for it.
-   For this supervisor-owned remediation lane, dedup is by failure identity: failure
-   signature plus exact local-target tree fingerprint when that fingerprint is available
-   from the bounded rerun evidence. If the tree fingerprint is unavailable, watch MUST
-   fall back to signature-only reuse for that remediation task. Reusing an existing open
-   remediation task MUST still bump it to the front of the runnable queue. If the current
-   bounded rerun evidence changes the required remediation kind for that same identity
-   (for example `deflake` to `fix`), watch MUST rewrite the reused task so its prompt and
-   purpose match the current classification before queue-bumping it. Reused or newly
-   created remediation tasks in this lane MUST also carry the distinctive tag
+   For this supervisor-owned remediation lane, dedup is by failure identity: normalized
+   failure signature only. The exact local-target tree fingerprint from bounded rerun
+   evidence remains prompt context, but watch MUST reuse one open remediation task for
+   that signature even when the fingerprint changes, becomes available later, or is
+   unavailable on one observation. Reusing an existing open remediation task MUST still
+   bump it to the front of the runnable queue. If the current bounded rerun evidence
+   changes the required remediation kind for that same identity (for example `deflake`
+   to `fix`) or improves the fingerprint/evidence context, watch MUST rewrite the reused
+   task so its prompt and purpose match the current classification before queue-bumping
+   it. Reused or newly created remediation tasks in this lane MUST also carry the distinctive tag
    `system-main-verify` in addition to `system` and inherited watch scope tags.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
