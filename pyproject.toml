@@ -56,6 +56,9 @@ include = ["src/gza/skills/**/*", "src/gza/prompts/templates/**/*", "src/gza/gza
 source = "vcs"
 fallback-version = "0.1.0.dev0"
 
+[tool.uv]
+exclude-newer = "2026-06-23T19:16:01.859087Z"
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "tests_functional"]
 addopts = "-x"
