@@ -39,6 +39,16 @@ class ConcurrencySnapshot:
     running_task_ids: tuple[str, ...]
     anonymous_worker_count: int
     current_pid_counted: bool
+    starting_worker_count: int = 0
+
+
+@dataclass(frozen=True)
+class _LiveRunningState:
+    live_pids: frozenset[int]
+    live_active_task_pids: frozenset[int]
+    running_task_ids: tuple[str, ...]
+    anonymous_worker_count: int
+    starting_worker_count: int = 0
 
 
 class MaxConcurrentTasksError(RuntimeError):
@@ -103,11 +113,12 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
-def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], tuple[str, ...], int]:
+def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) -> _LiveRunningState:
     registry = WorkerRegistry(config.workers_path)
     live_pids: set[int] = set()
     live_task_ids: set[str] = set()
     live_active_task_pids: set[int] = set()
+    live_starting_task_pids: set[int] = set()
     active_task_statuses = {
         str(task.id): task.status
         for task in store.get_in_progress()
@@ -127,12 +138,17 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
                 task_status = task.status if task is not None else None
                 if task_status is not None:
                     active_task_statuses[task_id] = task_status
-            if task_status not in {"pending", "in_progress"}:
+            if task_status == "in_progress":
+                if worker.pid > 0:
+                    live_active_task_pids.add(worker.pid)
+                live_task_ids.add(task_id)
                 continue
-            if worker.pid > 0:
-                live_active_task_pids.add(worker.pid)
-            live_task_ids.add(task_id)
-            continue
+            if task_status == "pending":
+                if worker.pid > 0:
+                    live_starting_task_pids.add(worker.pid)
+                continue
+            if task_status is not None:
+                continue
 
     for task in store.get_in_progress():
         pid = task.running_pid
@@ -145,8 +161,25 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
             live_task_ids.add(str(task.id))
 
     running_task_ids = tuple(sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id)))
-    anonymous_worker_count = len(live_pids - live_active_task_pids)
-    return live_pids, running_task_ids, anonymous_worker_count
+    starting_worker_count = len(live_starting_task_pids - live_active_task_pids)
+    anonymous_worker_count = len(live_pids - live_active_task_pids - live_starting_task_pids)
+    return _LiveRunningState(
+        live_pids=frozenset(live_pids),
+        live_active_task_pids=frozenset(live_active_task_pids),
+        running_task_ids=running_task_ids,
+        anonymous_worker_count=anonymous_worker_count,
+        starting_worker_count=starting_worker_count,
+    )
+
+
+def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], tuple[str, ...], int, int]:
+    details = _collect_live_running_state_details(config, store)
+    return (
+        set(details.live_pids),
+        details.running_task_ids,
+        details.anonymous_worker_count,
+        details.starting_worker_count,
+    )
 
 
 def _best_effort_stale_cleanup(config: Config) -> None:
@@ -166,18 +199,19 @@ def get_concurrency_snapshot(
 ) -> ConcurrencySnapshot:
     if cleanup_stale:
         _best_effort_stale_cleanup(config)
-    live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+    live_state = _collect_live_running_state_details(config, store)
     limit = config.max_concurrent
-    running = len(live_pids)
+    running = len(live_state.live_active_task_pids)
     available = max(0, limit - running)
-    counted = bool(current_pid and current_pid in live_pids)
+    counted = bool(current_pid and current_pid in live_state.live_active_task_pids)
     return ConcurrencySnapshot(
         limit=limit,
         running=running,
         available=available,
-        live_pids=frozenset(live_pids),
-        running_task_ids=running_task_ids,
-        anonymous_worker_count=anonymous_worker_count,
+        live_pids=live_state.live_pids,
+        running_task_ids=live_state.running_task_ids,
+        anonymous_worker_count=live_state.anonymous_worker_count,
+        starting_worker_count=live_state.starting_worker_count,
         current_pid_counted=counted,
     )
 

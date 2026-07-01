@@ -5,7 +5,12 @@ import time
 import pytest
 from unittest.mock import patch
 
-from gza.concurrency import MaxConcurrentTasksError, get_concurrency_snapshot, launch_permit
+from gza.concurrency import (
+    MaxConcurrentTasksError,
+    _collect_live_running_state,
+    get_concurrency_snapshot,
+    launch_permit,
+)
 from gza.config import Config
 from gza.workers import WorkerMetadata, WorkerRegistry
 from tests.cli.conftest import make_store, setup_config
@@ -131,11 +136,48 @@ def test_snapshot_counts_live_terminal_task_worker_as_anonymous_capacity(tmp_pat
     )
 
     snapshot = get_concurrency_snapshot(config, store)
-    assert snapshot.running == 1
-    assert snapshot.available == 0
+    assert snapshot.running == 0
+    assert snapshot.available == 1
     assert snapshot.live_pids == frozenset({os.getpid()})
     assert snapshot.running_task_ids == ()
     assert snapshot.anonymous_worker_count == 1
+    assert snapshot.starting_worker_count == 0
+
+
+def test_pending_live_worker_does_not_consume_running_capacity(tmp_path) -> None:
+    setup_config(tmp_path)
+    _append_config(tmp_path, "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Pending task with live worker", task_type="implement")
+    assert task.id is not None
+
+    registry = WorkerRegistry(config.workers_path)
+    registry.register(
+        WorkerMetadata(
+            worker_id=registry.generate_worker_id(),
+            task_id=task.id,
+            pid=os.getpid(),
+            status="running",
+        )
+    )
+
+    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+        config, store
+    )
+    snapshot = get_concurrency_snapshot(config, store)
+
+    assert live_pids == {os.getpid()}
+    assert running_task_ids == ()
+    assert anonymous_worker_count == 0
+    assert starting_worker_count == 1
+    assert snapshot.running == 0
+    assert snapshot.available == 1
+    assert snapshot.live_pids == frozenset({os.getpid()})
+    assert snapshot.running_task_ids == ()
+    assert snapshot.anonymous_worker_count == 0
+    assert snapshot.starting_worker_count == 1
 
 
 def test_launch_permit_allows_same_process_reentry_without_deadlock(tmp_path) -> None:

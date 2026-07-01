@@ -58,6 +58,7 @@ from gza.cli.watch import (
     _finalize_watch_no_progress_after_execution,
     _find_open_main_verify_remediation_tasks,
     _format_elapsed,
+    _format_sleep_message,
     _format_wake_message,
     _active_failure_backoff_owner_ids,
     _installed_gza_package_fingerprint,
@@ -3480,7 +3481,7 @@ def test_watch_cycle_restart_failed_manual_failure_child_does_not_block_pending_
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0)),
+        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0, 0)),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -4615,7 +4616,7 @@ def test_watch_cycle_recovery_only_running_recovery_child_keeps_pending_queue_bl
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
-        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0)),
+        patch("gza.cli.watch._collect_live_running_state", return_value=(set(), [], 0, 0)),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         first = _run_cycle(
@@ -4795,8 +4796,8 @@ def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_pat
         assert _count_live_workers(config, store) == 1
 
 
-def test_count_live_workers_counts_live_worker_for_terminal_task(tmp_path: Path) -> None:
-    """A live terminal-task worker still consumes a slot until its PID dies."""
+def test_count_live_workers_excludes_live_worker_for_terminal_task(tmp_path: Path) -> None:
+    """A live terminal-task worker is surfaced separately and does not count as running."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("Implement feature", task_type="implement")
@@ -4817,7 +4818,7 @@ def test_count_live_workers_counts_live_worker_for_terminal_task(tmp_path: Path)
         patch("gza.concurrency.WorkerRegistry", return_value=registry),
         patch("gza.concurrency._pid_alive", return_value=True),
     ):
-        assert _count_live_workers(config, store) == 1
+        assert _count_live_workers(config, store) == 0
 
 
 def test_collect_live_running_state_counts_live_terminal_task_worker_as_anonymous_capacity(
@@ -4858,11 +4859,14 @@ def test_collect_live_running_state_counts_live_terminal_task_worker_as_anonymou
         patch("gza.concurrency.WorkerRegistry", return_value=registry),
         patch("gza.concurrency._pid_alive", side_effect=lambda pid: pid == 5252),
     ):
-        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+        live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+            config, store
+        )
 
     assert live_pids == {4242, 4343, 5252}
     assert running_task_ids == [worker_task.id, pid_only_task.id]
     assert anonymous_worker_count == 1
+    assert starting_worker_count == 0
 
 
 def test_collect_live_running_state_ignores_dead_terminal_task_worker(
@@ -4885,15 +4889,18 @@ def test_collect_live_running_state_ignores_dead_terminal_task_worker(
     registry.is_running.return_value = False
 
     with patch("gza.concurrency.WorkerRegistry", return_value=registry):
-        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+        live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+            config, store
+        )
 
     assert live_pids == set()
     assert running_task_ids == []
     assert anonymous_worker_count == 0
+    assert starting_worker_count == 0
 
 
-def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_path: Path) -> None:
-    """A spawned explicit worker for a still-pending task must consume a watch slot."""
+def test_collect_live_running_state_surfaces_pending_task_worker_as_starting_capacity(tmp_path: Path) -> None:
+    """A live pending-task worker should stay visible without consuming a running slot."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -4908,11 +4915,14 @@ def test_collect_live_running_state_counts_pending_task_with_live_worker(tmp_pat
     registry.is_running.return_value = True
 
     with patch("gza.concurrency.WorkerRegistry", return_value=registry):
-        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+        live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+            config, store
+        )
 
     assert live_pids == {4242}
-    assert running_task_ids == [pending_task.id]
+    assert running_task_ids == []
     assert anonymous_worker_count == 0
+    assert starting_worker_count == 1
 
 
 def test_collect_live_running_state_counts_anonymous_live_worker(tmp_path: Path) -> None:
@@ -4928,11 +4938,14 @@ def test_collect_live_running_state_counts_anonymous_live_worker(tmp_path: Path)
     registry.is_running.return_value = True
 
     with patch("gza.concurrency.WorkerRegistry", return_value=registry):
-        live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+        live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+            config, store
+        )
 
     assert live_pids == {4242}
     assert running_task_ids == []
     assert anonymous_worker_count == 1
+    assert starting_worker_count == 0
 
 
 def test_watch_dispatch_start_state_treats_pending_task_with_live_registered_worker_as_started(
@@ -4951,7 +4964,10 @@ def test_watch_dispatch_start_state_treats_pending_task_with_live_registered_wor
     ]
     registry.is_running.return_value = True
 
-    with patch("gza.concurrency.WorkerRegistry", return_value=registry):
+    with (
+        patch("gza.concurrency.WorkerRegistry", return_value=registry),
+        patch("gza.cli.watch.WorkerRegistry", return_value=registry),
+    ):
         started, reason, refreshed = watch_module._watch_dispatch_start_state(
             config=config,
             store=store,
@@ -5078,10 +5094,10 @@ def test_watch_dispatch_start_state_leaves_unchanged_completed_task_not_started(
     assert refreshed.status == "completed"
 
 
-def test_watch_cycle_leaves_no_slots_when_terminal_task_worker_is_still_alive(
+def test_watch_cycle_allows_slots_when_terminal_task_worker_is_still_alive(
     tmp_path: Path,
 ) -> None:
-    """A live terminal-task worker must block new starts when batch=1."""
+    """A live terminal-task worker is surfaced as draining and does not block new starts."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -5117,9 +5133,10 @@ def test_watch_cycle_leaves_no_slots_when_terminal_task_worker_is_still_alive(
             log=log,
         )
 
-    assert result.work_done is False
-    assert result.running == 1
-    assert spawn_iterate.call_count == 0
+    assert result.work_done is True
+    assert result.running == 0
+    assert result.anonymous_worker_count == 1
+    assert spawn_iterate.call_count == 1
 
 
 def test_format_wake_message_includes_running_task_ids() -> None:
@@ -5130,6 +5147,30 @@ def test_format_wake_message_includes_running_task_ids() -> None:
     assert _format_wake_message(running=0, runnable_pending=2, blocked_pending=0, slots=2, running_task_ids=[]) == (
         "checking... (0 running, pending=2 runnable, blocked=0, 2 slots)"
     )
+
+
+def test_format_sleep_message_includes_draining_workers_and_cycle_start_label() -> None:
+    assert _format_sleep_message(
+        poll=300,
+        pending=20,
+        running=2,
+        confirmed_start_count=0,
+        anonymous_worker_count=1,
+    ) == "sleeping 300s (20 pending, 2 running (+1 draining))"
+    assert _format_sleep_message(
+        poll=300,
+        pending=20,
+        running=2,
+        confirmed_start_count=2,
+        anonymous_worker_count=1,
+    ) == "sleeping 300s (20 pending, 2 running (+1 draining); +2 started this pass)"
+    assert _format_sleep_message(
+        poll=300,
+        pending=20,
+        running=1,
+        confirmed_start_count=0,
+        starting_worker_count=1,
+    ) == "sleeping 300s (20 pending, 1 running (+1 starting))"
     assert _format_wake_message(
         running=2,
         runnable_pending=3,
@@ -5137,11 +5178,13 @@ def test_format_wake_message_includes_running_task_ids() -> None:
         slots=0,
         running_task_ids=["gza-42"],
         anonymous_worker_count=1,
+        starting_worker_count=1,
     ) == (
         "checking... (2 running, pending=3 runnable, blocked=0, 0 slots)\n"
         "live workers:\n"
         "- gza-42\n"
-        "- 1 worker without an active task id"
+        "- 1 worker without an active task id\n"
+        "- 1 worker starting before task activation"
     )
 
 
@@ -20965,7 +21008,6 @@ def test_watch_cycle_scoped_mode_keeps_computed_lifecycle_action_active_without_
             "gza.cli.watch.check_main_integration_verify",
             return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
         ),
-        patch("gza.cli.watch._count_live_workers", return_value=1),
         patch("gza.cli.watch.execute_advance_action") as execute_action,
     ):
         result = _run_cycle(
@@ -20982,7 +21024,7 @@ def test_watch_cycle_scoped_mode_keeps_computed_lifecycle_action_active_without_
     execute_action.assert_not_called()
     assert result.scoped_done is False
     assert result.scoped_active == 1
-    assert result.running == 1
+    assert result.running == 0
 
 
 def test_watch_cycle_scoped_dry_run_precomputed_plan_logs_owner_scope_without_global_blocked_pending(
@@ -22384,11 +22426,14 @@ def test_reexec_recovery_keeps_live_in_progress_pid_and_counts_it_running(tmp_pa
     assert refreshed.running_pid == os.getpid()
     assert refreshed.failure_reason is None
 
-    live_pids, running_task_ids, anonymous_worker_count = _collect_live_running_state(config, store)
+    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+        config, store
+    )
 
     assert os.getpid() in live_pids
     assert running_task_ids == [running.id]
     assert anonymous_worker_count == 0
+    assert starting_worker_count == 0
 
 
 def test_cmd_watch_shutdown_signal_wins_over_pending_reexec(tmp_path: Path) -> None:
@@ -25280,7 +25325,7 @@ def test_cmd_watch_uses_startup_quiet_and_emits_sleep_for_productive_and_idle_cy
     log_lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
     sleep_lines = [line for line in log_lines if line.strip() and line.split(maxsplit=2)[1] == "SLEEP"]
     assert len(sleep_lines) == 2
-    assert "sleeping 1s (0 pending, 0 running; +2 started)" in sleep_lines[0]
+    assert "sleeping 1s (0 pending, 0 running; +2 started this pass)" in sleep_lines[0]
     assert "sleeping 1s (0 pending, 0 running)" in sleep_lines[1]
 
 
@@ -25415,7 +25460,171 @@ def test_cmd_watch_counts_next_cycle_start_boundary_confirmation_in_sleep_delta(
     ]
     assert len(sleep_lines) == 2
     assert "sleeping 1s (1 pending, 0 running)" in sleep_lines[0]
-    assert "sleeping 1s (0 pending, 1 running; +1 started)" in sleep_lines[1]
+    assert "sleeping 1s (0 pending, 1 running; +1 started this pass)" in sleep_lines[1]
+
+
+def test_cmd_watch_sleep_reports_draining_worker_without_overcounting_running(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 2\n")
+    store = make_store(tmp_path)
+
+    running = store.add("Active worker", task_type="implement")
+    assert running.id is not None
+    running.status = "in_progress"
+    store.update(running)
+
+    draining = store.add("Completed drainer", task_type="plan")
+    assert draining.id is not None
+    draining.status = "completed"
+    draining.completed_at = datetime.now(UTC)
+    store.update(draining)
+
+    pending = store.add("Pending pickup", task_type="plan")
+    assert pending.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def stop_after_first_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    snapshot = watch_module.ConcurrencySnapshot(
+        limit=2,
+        running=1,
+        available=1,
+        live_pids=frozenset({111, 222}),
+        running_task_ids=(running.id,),
+        anonymous_worker_count=1,
+        current_pid_counted=False,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=SimpleNamespace(merges_halted=False)),
+        patch("gza.cli.watch._maybe_file_main_verify_remediation"),
+        patch("gza.cli.watch._emit_git_health_hold", return_value=False),
+        patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
+        patch("gza.cli.watch._collect_live_running_state", return_value=({111, 222}, [running.id], 1, 0)),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            return_value=(True, f"task {pending.id} reached running state", store.get(pending.id)),
+        ),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=stop_after_first_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert spawn_worker.call_count == 1
+
+    sleep_lines = [
+        line
+        for line in (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+        if line.strip() and len(line.split(maxsplit=2)) >= 2 and line.split(maxsplit=2)[1] == "SLEEP"
+    ]
+    assert len(sleep_lines) == 1
+    assert "1 running (+1 draining)" in sleep_lines[0]
+
+
+def test_cmd_watch_sleep_reports_pending_registered_worker_as_starting_not_running(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 2\n")
+    store = make_store(tmp_path)
+
+    running = store.add("Active worker", task_type="implement")
+    assert running.id is not None
+    running.status = "in_progress"
+    store.update(running)
+
+    pending_worker = store.add("Worker still starting", task_type="plan")
+    assert pending_worker.id is not None
+
+    pending_pickup = store.add("Pending pickup", task_type="plan")
+    assert pending_pickup.id is not None
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=2,
+        poll=1,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+    )
+
+    signal_handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def stop_after_first_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    snapshot = watch_module.ConcurrencySnapshot(
+        limit=2,
+        running=1,
+        available=1,
+        live_pids=frozenset({111, 222}),
+        running_task_ids=(running.id,),
+        anonymous_worker_count=0,
+        current_pid_counted=False,
+        starting_worker_count=1,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=SimpleNamespace(merges_halted=False)),
+        patch("gza.cli.watch._maybe_file_main_verify_remediation"),
+        patch("gza.cli.watch._emit_git_health_hold", return_value=False),
+        patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
+        patch("gza.cli.watch._collect_live_running_state", return_value=({111, 222}, [running.id], 0, 1)),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch(
+            "gza.cli.watch._wait_for_watch_dispatch_start",
+            return_value=(True, f"task {pending_pickup.id} reached running state", store.get(pending_pickup.id)),
+        ),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=stop_after_first_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert spawn_worker.call_count == 1
+
+    sleep_lines = [
+        line
+        for line in (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+        if line.strip() and len(line.split(maxsplit=2)) >= 2 and line.split(maxsplit=2)[1] == "SLEEP"
+    ]
+    assert len(sleep_lines) == 1
+    assert "1 running (+1 starting)" in sleep_lines[0]
 
 
 def test_watch_cycle_quiet_logs_start_failed_when_iterate_spawn_fails(

@@ -240,8 +240,9 @@ state to win over already-mergeable fresh code.
 The batch limit means "maintain at most N concurrent detached worker processes," not
 "spawn N workers per cycle."
 
-- `running` MUST count live detached workers, including detached-session workers that
-  outlive the current watch process.
+- `running` MUST count only task-executing live detached workers, including
+  detached-session workers that outlive the current watch process after the owned task
+  has reached `in_progress` or another equivalent confirmed execution state.
 - Live-worker accounting MUST consider both the worker registry and persisted in-progress
   task state. Either source alone is insufficient after crashes or restarts.
 - Stale or dead worker state MUST be reconciled before capacity is computed.
@@ -255,11 +256,15 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   signal when derivable, worker stage, and a short stdout/stderr tail), and MAY add a
   clearly-labelled platform hint (for example, Darwin sleep/jetsam context) when
   available. This capture is best-effort and MUST NOT itself crash reconciliation.
+- Watch capacity and sleep-slot accounting MUST exclude a `pending` task whose worker is
+  merely registered/alive but has not yet reached task-executing state. That worker is
+  still live evidence and MUST surface separately as startup/starting capacity detail
+  rather than inflating `running`, `running_task_ids`, or unavailable-slot math.
 - Query and triage surfaces that render runtime state from that reconciliation (including
-  `gza ps`) MUST treat a `pending` task with a registered `running` worker as live
-  in-flight work even when the task row has not yet stamped `running_pid` for the main
-  iterate loop. They MUST derive `stale` from reconciled worker liveness, not from the
-  task row's empty `running_pid` alone.
+  `gza ps`) MUST still treat a `pending` task with a registered `running` worker as live
+  in-flight startup work even when the task row has not yet stamped `running_pid` for the
+  main iterate loop. They MUST derive `stale` from reconciled worker liveness, not from
+  the task row's empty `running_pid` alone.
 - The effective watch worker target for a pass MUST be `min(batch, max_concurrent)`.
   When `max_concurrent` is unset, `gza watch` MUST derive the runtime cap from the
   effective watch batch for that run, including any CLI `--batch` override.
@@ -298,6 +303,8 @@ This is the process-level expression of overview invariant 1.
   MUST wait/adopt that work rather than create another child for the same step.
 - While such a `pending` task is backed by a reconciled live registered worker, operator
   runtime surfaces MUST present it as waiting/live startup work rather than `stale`.
+  For watch's slot accounting and SLEEP/WAKE summaries, that startup work is a separate
+  live `starting` bucket, not a `running` task slot.
 - A `pending` task with a registered worker that is dead/stale and also carries concrete
   exit/startup-abort evidence (for example a detached-exit lifecycle event or nonzero
   exit code) is not live existing work. Watch MUST reconcile it to `WORKER_DIED`,

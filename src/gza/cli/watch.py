@@ -2482,12 +2482,14 @@ def _resolve_watch_merge_log_event(
 
 
 def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
-    live_pids, _, _ = _collect_live_running_state(config, store)
-    return len(live_pids)
+    _, running_task_ids, _, _ = _collect_live_running_state(config, store)
+    return len(running_task_ids)
 
 
-def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str], int]:
-    live_pids, running_task_ids, anonymous_worker_count = _shared_collect_live_running_state(config, store)
+def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str], int, int]:
+    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _shared_collect_live_running_state(
+        config, store
+    )
     hidden_internal_pids: set[int] = set()
     visible_task_ids: list[str] = []
     for task_id in running_task_ids:
@@ -2498,7 +2500,7 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
             continue
         visible_task_ids.append(task_id)
     filtered_live_pids = {pid for pid in live_pids if pid not in hidden_internal_pids}
-    return filtered_live_pids, visible_task_ids, anonymous_worker_count
+    return filtered_live_pids, visible_task_ids, anonymous_worker_count, starting_worker_count
 
 
 def get_concurrency_snapshot(
@@ -2525,7 +2527,7 @@ def get_concurrency_snapshot(
             continue
         visible_task_ids.append(task_id)
     filtered_live_pids = frozenset(pid for pid in snapshot.live_pids if pid not in hidden_internal_pids)
-    running = len(filtered_live_pids)
+    running = len(visible_task_ids)
     return ConcurrencySnapshot(
         limit=snapshot.limit,
         running=running,
@@ -2534,6 +2536,7 @@ def get_concurrency_snapshot(
         running_task_ids=tuple(visible_task_ids),
         anonymous_worker_count=snapshot.anonymous_worker_count,
         current_pid_counted=bool(current_pid and current_pid in filtered_live_pids),
+        starting_worker_count=snapshot.starting_worker_count,
     )
 
 
@@ -2545,18 +2548,23 @@ def _format_wake_message(
     slots: int,
     running_task_ids: list[str],
     anonymous_worker_count: int = 0,
+    starting_worker_count: int = 0,
 ) -> str:
     message = (
         f"checking... ({running} running, pending={runnable_pending} runnable, "
         f"blocked={blocked_pending}, {slots} slots)"
     )
-    if running_task_ids or anonymous_worker_count > 0:
+    if running_task_ids or anonymous_worker_count > 0 or starting_worker_count > 0:
         worker_lines = ["live workers:"]
         worker_lines.extend(f"- {task_id}" for task_id in running_task_ids)
         if anonymous_worker_count == 1:
             worker_lines.append("- 1 worker without an active task id")
         elif anonymous_worker_count > 1:
             worker_lines.append(f"- {anonymous_worker_count} workers without active task ids")
+        if starting_worker_count == 1:
+            worker_lines.append("- 1 worker starting before task activation")
+        elif starting_worker_count > 1:
+            worker_lines.append(f"- {starting_worker_count} workers starting before task activation")
         message += "\n" + "\n".join(worker_lines)
     return message
 
@@ -2715,13 +2723,15 @@ def _watch_dispatch_start_state(
     task_before: _WatchDispatchTaskSnapshot | None = None,
 ) -> tuple[bool, str, DbTask | None]:
     task = store.get(task_id)
-    live_pids, running_task_ids, _ = _collect_live_running_state(config, store)
+    live_pids, running_task_ids, _, _ = _collect_live_running_state(config, store)
     live_registered_worker = _watch_task_has_live_registered_worker(config, task_id)
     if task_id in set(running_task_ids):
         if task is not None and task.status == "pending":
             return True, f"task {task_id} is pending with a live registered worker in preloop", task
         return True, f"task {task_id} reached running state", task
     if live_registered_worker:
+        if task is not None and task.status == "pending":
+            return True, f"task {task_id} is pending with a live registered worker in preloop", task
         return True, f"task {task_id} has a live registered worker", task
     if _watch_dispatch_has_observed_terminal_outcome(task_before=task_before, task_after=task):
         return True, f"task {task_id} reached an observable terminal outcome after dispatch", task
@@ -2844,10 +2854,19 @@ def _format_sleep_message(
     pending: int,
     running: int,
     confirmed_start_count: int,
+    anonymous_worker_count: int = 0,
+    starting_worker_count: int = 0,
 ) -> str:
     message = f"sleeping {poll}s ({pending} pending, {running} running"
+    worker_suffixes: list[str] = []
+    if anonymous_worker_count > 0:
+        worker_suffixes.append(f"+{anonymous_worker_count} draining")
+    if starting_worker_count > 0:
+        worker_suffixes.append(f"+{starting_worker_count} starting")
+    if worker_suffixes:
+        message += " (" + ", ".join(worker_suffixes) + ")"
     if confirmed_start_count > 0:
-        message += f"; +{confirmed_start_count} started"
+        message += f"; +{confirmed_start_count} started this pass"
     return message + ")"
 
 
@@ -2858,6 +2877,8 @@ class _CycleResult:
     pending: int
     scoped_done: bool | None = None
     scoped_active: int = 0
+    anonymous_worker_count: int = 0
+    starting_worker_count: int = 0
     expected_starts: dict[str, "_ExpectedStart"] = field(default_factory=dict)
     confirmed_start_count: int = 0
 
@@ -2883,6 +2904,7 @@ class _WatchCyclePlan:
     effective_batch: int
     slots: int
     analysis: "_WatchCycleAnalysis"
+    starting_worker_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -3184,7 +3206,9 @@ def _process_expected_start_boundary(
 ) -> int:
     if not expected_starts:
         return 0
-    _live_pids, running_task_ids, _anonymous_worker_count = _collect_live_running_state(config, store)
+    _live_pids, running_task_ids, _anonymous_worker_count, _starting_worker_count = _collect_live_running_state(
+        config, store
+    )
     confirmed_transition_ids = set(confirmed_start_ids)
     confirmed_running_task_ids = set(running_task_ids)
     confirmed_count = 0
@@ -3192,10 +3216,12 @@ def _process_expected_start_boundary(
         expected_start = expected_starts[task_id]
         row = snapshot.get(task_id) or {}
         status = row.get("status")
+        live_registered_worker = _watch_task_has_live_registered_worker(config, task_id)
         confirmed = (
             task_id in confirmed_transition_ids
             or status == "in_progress"
             or task_id in confirmed_running_task_ids
+            or live_registered_worker
         )
         if confirmed:
             task = store.get(task_id)
@@ -4128,6 +4154,7 @@ def _build_watch_cycle_plan(
     return _WatchCyclePlan(
         running_task_ids=running_task_ids,
         anonymous_worker_count=snapshot.anonymous_worker_count,
+        starting_worker_count=getattr(snapshot, "starting_worker_count", 0),
         pending_count=pending_count,
         blocked_pending_count=blocked_pending_count,
         running=running,
@@ -4268,6 +4295,7 @@ def _run_cycle(
     )
     running_task_ids = list(plan.running_task_ids)
     anonymous_worker_count = plan.anonymous_worker_count
+    starting_worker_count = getattr(plan, "starting_worker_count", 0)
     running_task_id_set = set(running_task_ids)
     pending_count = plan.pending_count
     blocked_pending_count = plan.blocked_pending_count
@@ -4322,6 +4350,7 @@ def _run_cycle(
                 slots=slots,
                 running_task_ids=running_task_ids,
                 anonymous_worker_count=anonymous_worker_count,
+                starting_worker_count=starting_worker_count,
             ),
         )
         scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=scoped_owner_ids)
@@ -6291,12 +6320,17 @@ def _run_cycle(
     _emit_cycle_attention_summary(log)
     if end_cycle:
         log.end_cycle()
+    _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = _collect_live_running_state(
+        config, store
+    )
     return _CycleResult(
         work_done=work_done,
-        running=_count_live_workers(config, store),
+        running=len(end_running_task_ids),
         pending=pending_count,
         scoped_done=(scoped_active == 0) if scoped_mode else None,
         scoped_active=scoped_active,
+        anonymous_worker_count=end_anonymous_worker_count,
+        starting_worker_count=end_starting_worker_count,
         expected_starts=expected_starts,
         confirmed_start_count=confirmed_start_count,
     )
@@ -6908,6 +6942,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     pending=cycle_result.pending,
                     running=cycle_result.running,
                     confirmed_start_count=cycle_result.confirmed_start_count,
+                    anonymous_worker_count=cycle_result.anonymous_worker_count,
+                    starting_worker_count=cycle_result.starting_worker_count,
                 ),
             )
             if not cycle_result.work_done:
