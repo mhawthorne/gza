@@ -106,6 +106,7 @@ def _write_fake_python(path: Path, log_path: Path) -> None:
         f"printf 'python %s\\n' \"$*\" >> {str(log_path)!r}\n",
     )
 
+
 def _current_env_tool(name: str) -> str:
     sibling_tool = Path(sys.executable).resolve().parent / name
     if sibling_tool.is_file():
@@ -128,6 +129,13 @@ def _repo_ruff_command(repo_root: Path) -> list[str]:
     if venv_bin.is_dir():
         return [str(venv_bin / "ruff")]
     return ["uv", "run", "ruff"]
+
+
+def _full_verify_ruff_command(repo_root: Path) -> list[str]:
+    ruff_bin = repo_root / ".venv" / "bin" / "ruff"
+    if ruff_bin.is_file() and os.access(ruff_bin, os.X_OK):
+        return [str(ruff_bin), "check", "src/gza/"]
+    return ["uv", "run", "ruff", "check", "src/gza/"]
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -441,3 +449,49 @@ def test_watch_module_ruff_command_matches_bin_tests_modes(tmp_path: Path) -> No
 
     ruff_bin.chmod(0o644)
     assert _watch_module_ruff_command(repo_root) == ["uv", "run", "ruff", "check", "src/gza/cli/watch.py"]
+
+
+def test_full_verify_ruff_command_matches_bin_tests_modes(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    venv_bin = repo_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+
+    ruff_bin = venv_bin / "ruff"
+    ruff_bin.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    ruff_bin.chmod(0o755)
+
+    assert _full_verify_ruff_command(repo_root) == [str(ruff_bin), "check", "src/gza/"]
+
+    ruff_bin.chmod(0o644)
+    assert _full_verify_ruff_command(repo_root) == ["uv", "run", "ruff", "check", "src/gza/"]
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_verify_phase_ruff_passes_for_full_src_tree_on_real_repo() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "gza.tools.verify_phase",
+            "ruff",
+            "--",
+            *_full_verify_ruff_command(repo_root),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "gza-verify phase=start name=ruff" in result.stdout
+    match = re.search(
+        r"gza-verify phase=passed name=ruff duration_seconds=[0-9.]+(?: tree_fingerprint=[0-9a-f]{64})?",
+        result.stdout,
+    )
+    assert match is not None, result.stdout
