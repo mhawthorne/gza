@@ -23,7 +23,7 @@ from gza.cli.config_cmds import (
 from gza.config import Config, ProviderConfig, TaskTypeConfig
 from gza.providers.base import PreflightCheckResult, RunResult
 
-from .conftest import make_store, invoke_gza, setup_config
+from .conftest import invoke_gza, make_store, setup_config
 
 
 def write_user_config(home_dir: Path, content: str) -> Path:

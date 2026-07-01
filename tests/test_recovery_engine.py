@@ -7,18 +7,16 @@ import pytest
 
 import gza.recovery_engine as recovery_engine
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
-from gza.config import Config
-from gza.config import ConfigError
+from gza.config import Config, ConfigError
 from gza.db import MergeTargetResolutionError, SqliteTaskStore, Task
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows_in_read_session
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
-from gza.recovery_read_context import RecoveryReadContext
 from gza.recovery_engine import (
-    _MergeContext,
+    FailedRecoveryDecision,
     _build_recovery_chain_snapshot,
     _is_resolved_by_landed_lineage,
-    FailedRecoveryDecision,
+    _MergeContext,
     classify_failure_reason,
     decide_failed_task_recovery,
     empty_task_requires_recovery,
@@ -35,6 +33,7 @@ from gza.recovery_engine import (
     resolve_recovery_planning_task,
     should_hide_failed_recovery_decision,
 )
+from gza.recovery_read_context import RecoveryReadContext
 from tests.cli.conftest import make_store, setup_config
 
 

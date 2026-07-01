@@ -6,8 +6,8 @@ import json
 import pytest
 
 from gza.plan_review_verdict import (
-    PlanReviewValidationError,
     SLICE_COMPLEXITIES,
+    PlanReviewValidationError,
     parse_plan_review_report,
     parse_plan_review_verdict,
     validate_plan_review_report,

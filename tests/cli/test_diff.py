@@ -5,7 +5,6 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from gza.cli.git_ops import cmd_diff
-
 from tests.cli.conftest import make_store, setup_config
 
 

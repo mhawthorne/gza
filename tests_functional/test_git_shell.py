@@ -16,10 +16,10 @@ from gza.git import Git, GitError, active_worktree_path_for_branch, cleanup_work
 from gza.review_verdict import ParsedReviewReport
 from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
 from tests.cli.conftest import make_store, setup_config
-from tests_functional.helpers.cli import run_gza_subprocess
 from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db
 from tests_functional.git_helpers import init_repo_with_remote_tracking_only_feature
+from tests_functional.helpers.cli import run_gza_subprocess
 
 
 def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:

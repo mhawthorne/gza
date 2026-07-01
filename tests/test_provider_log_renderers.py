@@ -7,7 +7,6 @@ from gza.cli.log import _LiveLogPrinter
 from gza.cli.tv import _scan_log
 from gza.providers.log_renderers import get_log_renderer
 from gza.providers.log_rendering import RenderStats
-
 from tests.cli.conftest import make_store, setup_config
 from tests.helpers.cli import invoke_gza
 

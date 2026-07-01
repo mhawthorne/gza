@@ -9,14 +9,14 @@ import gza.recovery_engine as recovery_engine
 from gza.db import MergeUnit, SqliteTaskStore, Task
 from gza.lineage_query import LineageOwnerSnapshot, is_lineage_resolved
 from gza.query import (
+    HistoryFilter,
     _classify_child_relationship,
     _resolve_effective_shared_branch_retry_head,
-    HistoryFilter,
     get_task_lineage,
     is_lineage_complete,
-    query_incomplete,
     query_history,
     query_history_with_lineage,
+    query_incomplete,
     resolve_lineage_owner_task,
 )
 

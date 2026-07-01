@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 import pytest
 
-from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
 import gza.concurrency as concurrency_module
 import gza.workers as workers_module
+from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
 from gza.pytest_timeout_diagnostics import positive_int_env, register_sigterm_faulthandler
 
 # The unit suite uses two separate guards:

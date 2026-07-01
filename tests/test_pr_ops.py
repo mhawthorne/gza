@@ -3,8 +3,8 @@
 import os
 from unittest.mock import Mock, patch
 
-from gza.config import Config
 from gza.concurrency import _PROCESS_LOCKS
+from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.git import GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails

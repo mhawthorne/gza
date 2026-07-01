@@ -3,7 +3,6 @@
 import argparse
 from datetime import UTC, datetime
 from pathlib import Path
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,7 +14,7 @@ from gza.db import SqliteTaskStore
 from gza.failure_reasons import mark_task_failed_from_cause
 from gza.git import Git
 from gza.workers import WorkerMetadata, WorkerRegistry
-from tests.cli.conftest import make_store, invoke_gza, setup_config
+from tests.cli.conftest import invoke_gza, make_store, setup_config
 
 
 def _iterate_git_runtime():

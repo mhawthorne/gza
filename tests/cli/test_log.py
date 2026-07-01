@@ -14,7 +14,7 @@ import pytest
 from gza.cli import _build_step_timeline, _format_log_entry, _LiveLogPrinter, _load_log_file_entries
 from gza.db import SqliteTaskStore
 
-from .conftest import LOG_FIXTURES_DIR, make_store, invoke_gza, setup_config
+from .conftest import LOG_FIXTURES_DIR, invoke_gza, make_store, setup_config
 
 
 class TestLogCommand:

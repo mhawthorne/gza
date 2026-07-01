@@ -8,18 +8,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 from gza.advance_engine import evaluate_advance_rules
 from gza.cli import cmd_advance
 from gza.config import Config
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
-from tests.helpers.cli import capture_background_worker_spawns
-import pytest
-
 from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
 )
+from tests.helpers.cli import capture_background_worker_spawns
 
 pytestmark = pytest.mark.integration
 

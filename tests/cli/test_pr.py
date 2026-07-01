@@ -10,7 +10,6 @@ from gza.cli.git_ops import cmd_pr
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.github import PullRequestDetails
-
 from tests.cli.conftest import make_store, setup_config, setup_db_with_tasks
 
 

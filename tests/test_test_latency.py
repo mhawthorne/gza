@@ -7,9 +7,8 @@ import signal
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
-from typing import cast
 
 import pytest
 

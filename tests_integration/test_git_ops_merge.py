@@ -1,26 +1,17 @@
 """Tests for git operations CLI commands."""
 
 
-import argparse
-import io
-import os
-import shutil
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.cli import cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
-
 from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
-    setup_db_with_tasks,
     setup_git_repo_with_task_branch,
 )
 
@@ -83,7 +74,6 @@ class TestMergeCommand:
 
     def test_merge_rebase_with_remote(self, tmp_path: Path):
         """Merge command accepts --rebase --remote together."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -167,7 +157,6 @@ class TestMergeCommand:
 
     def test_squash_merge_creates_commit(self, tmp_path: Path):
         """Squash merge creates a commit, not just staged changes."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -228,7 +217,6 @@ class TestMergeCommand:
 
     def test_squash_merge_commit_message_includes_task_info(self, tmp_path: Path):
         """Squash merge commit message includes task information."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -277,7 +265,6 @@ class TestMergeCommand:
 
     def test_branch_shows_as_merged_after_squash(self, tmp_path: Path):
         """Branch shows as merged in 'gza unmerged' after squash merge completes."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -326,15 +313,12 @@ class TestMergeCommand:
 
     def test_mark_only_preserves_branch_and_marks_merged(self, tmp_path: Path):
         """--mark-only flag sets merge_status without deleting the branch."""
-        from datetime import datetime
 
-        from gza.db import SqliteTaskStore
         from gza.git import Git
 
         setup_config(tmp_path)
         db_path = tmp_path / ".gza" / "gza.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        from gza.config import Config
         config = Config.load(tmp_path)
         store = SqliteTaskStore(db_path, prefix=config.project_prefix)
 
@@ -384,7 +368,6 @@ class TestMergeCommand:
 
     def test_mark_only_rejects_conflicting_flags(self, tmp_path: Path):
         """--mark-only flag rejects conflicting flags."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -468,7 +451,6 @@ class TestMergeCommand:
 
     def test_merge_accepts_multiple_task_ids(self, tmp_path: Path):
         """Merge command accepts multiple task IDs."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -525,7 +507,6 @@ class TestMergeCommand:
 
     def test_merge_stops_on_first_failure(self, tmp_path: Path):
         """Merge command stops on first failure and reports which tasks were merged."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -594,7 +575,6 @@ class TestMergeCommand:
 
     def test_merge_multiple_with_squash(self, tmp_path: Path):
         """Merge command with --squash flag works with multiple tasks."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -669,7 +649,6 @@ class TestMergeCommand:
 
     def test_merge_all_flag_merges_all_unmerged_tasks(self, tmp_path: Path):
         """--all flag finds and merges all unmerged done tasks."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -719,7 +698,6 @@ class TestMergeCommand:
 
     def test_merge_all_flag_no_unmerged_tasks(self, tmp_path: Path):
         """--all flag reports no tasks when all branches are already merged."""
-        from datetime import datetime
 
         from gza.git import Git
 
@@ -757,7 +735,6 @@ class TestMergeCommand:
 
     def test_merge_all_flag_skips_tasks_without_commits(self, tmp_path: Path):
         """--all flag skips tasks that have no commits (has_commits=False or None)."""
-        from datetime import datetime
 
         from gza.git import Git
 

@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import yaml
+
 from tests.helpers.cli import invoke_gza
 
 
@@ -114,8 +115,8 @@ def _finalize_manual_skill_output_like_snippet(
     clear_review_task_id: str | None = None,
     resolve_comments_task_id: str | None = None,
 ):
-    from gza.git import Git
     import gza.runner as runner
+    from gza.git import Git
 
     try:
         if created.slug is None:

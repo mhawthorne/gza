@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ast
-from functools import lru_cache
 import re
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 DEFAULT_PATHS = [Path("tests")]
@@ -323,7 +323,7 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
     return violations
 
 
-@lru_cache(maxsize=None)
+@cache
 def _find_file_violations_cached(
     test_file: Path,
     *,

@@ -22,7 +22,6 @@ from gza.db import SqliteTaskStore, Task
 from gza.git import Git, parse_diff_numstat
 from gza.review_verdict import parse_review_verdict
 
-
 ITEM_HEADER_RE = re.compile(r"^###\s+([BF])(\d+)\s*$")
 SECTION_RE = re.compile(
     r"^-?\s*(Evidence|Impact|Required fix|Recommended follow-up|Required tests|Recommended tests):\s*(.*)$"

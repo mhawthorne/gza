@@ -12,7 +12,7 @@ import pytest
 from gza.cli import tv as tv_module
 from gza.db import Task
 
-from .conftest import make_store, invoke_gza, setup_config
+from .conftest import invoke_gza, make_store, setup_config
 
 
 class _FakeLive:

@@ -11,7 +11,7 @@ from gza.cli import query as query_cli, watch as watch_cli
 from gza.console import build_console, set_config_no_color
 from gza.db import Task
 
-from .conftest import make_store, mark_orphaned, invoke_gza, setup_config
+from .conftest import invoke_gza, make_store, mark_orphaned, setup_config
 from .test_query import _FastUnmergedGit, _UnavailableGitHub
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")

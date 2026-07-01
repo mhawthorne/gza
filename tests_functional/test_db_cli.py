@@ -5,8 +5,8 @@ import sqlite3
 from pathlib import Path
 
 from gza.db import SqliteTaskStore
-from tests_functional.helpers.cli import run_gza_subprocess
 from tests.test_db import _make_v24_db, _make_v35_db_with_legacy_key_shapes
+from tests_functional.helpers.cli import run_gza_subprocess
 
 
 class TestSharedDbImportCli:

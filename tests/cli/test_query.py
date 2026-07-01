@@ -21,9 +21,13 @@ from rich.text import Text
 import gza.colors as colors
 from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
-from gza.cli import _lifecycle_actions as lifecycle_actions_cli
+from gza.cli import (
+    _lifecycle_actions as lifecycle_actions_cli,
+    _queue_render as queue_render_cli,
+    query as query_cli,
+    watch as watch_cli,
+)
 from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_position_scoped
-from gza.cli import _queue_render as queue_render_cli, query as query_cli, watch as watch_cli
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
@@ -34,9 +38,9 @@ from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
 
 from .conftest import (
+    invoke_gza,
     make_store,
     mark_orphaned,
-    invoke_gza,
     setup_config,
     setup_db_with_tasks,
 )
@@ -4707,7 +4711,7 @@ class TestQueueCommand:
             f"hint: `uv run gza edit {out_of_scope_child.id} --add-tag 202606-recovery`"
             in gap_result.stdout
         )
-        assert f"--add-tag ops`" not in gap_result.stdout
+        assert "--add-tag ops`" not in gap_result.stdout
 
     def test_next_shows_bumped_task_first(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -5958,7 +5962,7 @@ class TestShowCommand:
         assert str(tmp_path / newer.path) not in path_result.stdout
 
         assert show_result.returncode == 0
-        assert f"Review Verify Artifact:" in show_result.stdout
+        assert "Review Verify Artifact:" in show_result.stdout
         assert newer.path in show_result.stdout
         assert older.path in show_result.stdout
 
@@ -17305,7 +17309,7 @@ class TestIncompleteCommand:
 
         assert blocked_result.returncode == 0
         blocked_output = " ".join(blocked_result.stdout.split())
-        assert f"Blocked dependents:" in blocked_result.stdout
+        assert "Blocked dependents:" in blocked_result.stdout
         assert dependent.id in blocked_output
         assert f"blocked: awaiting plan review for {plan.id}" in blocked_output
         assert f"release with uv run gza implement {plan.id}" in blocked_output

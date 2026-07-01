@@ -1,12 +1,12 @@
 """Tests for database operations and task chaining."""
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import hashlib
 import json
 import os
 import sqlite3
 import stat
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -27,8 +27,8 @@ from gza.db import (
     SqliteTaskStore,
     StepRef,
     Task,
-    WatchRecoveryBackoff,
     WatchProgressObservation,
+    WatchRecoveryBackoff,
     _ClosingSqliteConnection,
     _is_readonly_operational_error,
     _is_readonly_snapshot_operational_error,

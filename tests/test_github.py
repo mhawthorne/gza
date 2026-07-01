@@ -5,7 +5,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.github import GitHub, GitHubError, GitHubLookupError, GitHubRepoUnsupportedError, PullRequest, PullRequestDetails
+from gza.github import (
+    GitHub,
+    GitHubError,
+    GitHubLookupError,
+    GitHubRepoUnsupportedError,
+    PullRequest,
+    PullRequestDetails,
+)
 
 
 class TestGitHubRun:

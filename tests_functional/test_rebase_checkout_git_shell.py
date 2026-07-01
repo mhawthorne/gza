@@ -1,7 +1,6 @@
 from pathlib import Path
 
 from gza.config import Config
-from gza.git import Git
 from gza.rebase_checkout import isolated_rebase_checkout
 from tests_functional.git_helpers import init_basic_repo
 

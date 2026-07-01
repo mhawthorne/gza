@@ -1,27 +1,15 @@
 """Tests for git operations CLI commands."""
 
 
-import argparse
-import io
-import os
-import shutil
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
-
-from gza.cli import cmd_advance
-from gza.config import Config
-from gza.db import SqliteTaskStore
 
 from tests.cli.conftest import (
     make_store,
     run_gza,
     setup_config,
-    setup_db_with_tasks,
-    setup_git_repo_with_task_branch,
 )
 
 pytestmark = pytest.mark.integration

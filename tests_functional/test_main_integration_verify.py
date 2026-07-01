@@ -1,9 +1,6 @@
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
-from tests.cli.conftest import make_store, setup_config
-from tests_functional.git_helpers import init_basic_repo
-
 from gza.config import Config
 from gza.main_integration_verify import (
     check_main_integration_verify,
@@ -11,6 +8,8 @@ from gza.main_integration_verify import (
     load_main_integration_verify_state,
 )
 from gza.runner import _make_review_verify_result
+from tests.cli.conftest import make_store, setup_config
+from tests_functional.git_helpers import init_basic_repo
 
 
 def test_configured_main_integration_verify_unavailable_halts_and_persists_alert(tmp_path) -> None:

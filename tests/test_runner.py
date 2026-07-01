@@ -14,9 +14,9 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 import pytest
 
 from gza.advance_engine import evaluate_advance_rules
-from gza.cli.advance_engine import determine_next_action
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli import _create_improve_task, _create_rebase_task
+from gza.cli.advance_engine import determine_next_action
 from gza.config import BranchStrategy, Config
 from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError, ResolvedMergeSourceRef
@@ -56,12 +56,10 @@ from gza.runner import (
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
-    _build_timeout_resume_context,
     _capture_noop_improve_review_verify_result,
     _check_dependency_merge_precondition,
     _complete_code_task,
     _compute_slug_override,
-    _compute_tree_fingerprint,
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
     _ensure_work_pr_for_completed_code_task,
@@ -82,13 +80,11 @@ from gza.runner import (
     _run_result_to_stats,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
-    _save_wip_changes,
     _select_worktree_base_ref,
     _setup_code_task_worktree,
     _slug_exists,
     _snapshot_task_db_to_worktree,
     _stage_worktree_agent_resources,
-    _write_timeout_resume_checkpoint,
     backup_database,
     build_prompt,
     generate_slug,

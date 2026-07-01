@@ -8,7 +8,6 @@ from unittest.mock import patch
 from gza.cli.git_ops import _cmd_advance_unimplemented, cmd_advance
 from gza.config import Config
 from gza.db import SqliteTaskStore
-
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -142,7 +141,7 @@ class TestAdvanceUnimplementedCommand:
 
         output = capsys.readouterr().out
         assert rc == 0
-        assert f"Created implement task" in output
+        assert "Created implement task" in output
         implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
         assert len(implement_tasks) == 1
         assert implement_tasks[0].depends_on == explore.id

@@ -39,7 +39,7 @@ def _render_tree(store: SqliteTaskStore, root: Task) -> str:
         status = task.status or "unknown"
         if task.status == "failed" and task.failure_reason:
             status = f"failed({task.failure_reason})"
-        merge = f" [merged]" if task.merge_status == "merged" else ""
+        merge = " [merged]" if task.merge_status == "merged" else ""
         first_line = (task.prompt or "").split("\n", 1)[0].strip()
         if len(first_line) > 60:
             first_line = first_line[:60] + "…"

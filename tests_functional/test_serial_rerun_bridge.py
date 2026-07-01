@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-
 _TEST_UNIT_SUBPROCESS_TIMEOUT_SECONDS = 15
 
 

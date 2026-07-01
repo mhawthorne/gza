@@ -7,13 +7,11 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
-
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.concurrency import ConcurrencySnapshot
 from gza.config import Config
-from gza.lineage_query import LineageOwnerRow, RecoveryReadContext
 from gza.git import Git
+from gza.lineage_query import LineageOwnerRow, RecoveryReadContext
 from gza.recovery_engine import _MergeContext, decide_failed_task_recovery
 from gza.unstick import UnstickOutcome
 from tests.cli.conftest import invoke_gza, make_store, setup_config

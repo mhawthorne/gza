@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 
 from gza.off_topic_verify import (
-    LocalTargetBaselinePlan,
     MAX_OFF_TOPIC_STRESS_RUNS,
+    LocalTargetBaselinePlan,
     build_failing_nodes,
     build_local_target_pytest_command,
     classify_failure_diff_scope,

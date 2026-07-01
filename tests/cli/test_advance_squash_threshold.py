@@ -10,7 +10,6 @@ import pytest
 
 from gza.cli.git_ops import cmd_advance
 from gza.config import Config, ConfigError
-
 from tests.cli.conftest import make_store, setup_config
 
 

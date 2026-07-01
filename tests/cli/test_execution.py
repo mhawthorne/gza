@@ -15,11 +15,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import gza.cli.execution as _execution_module
 from gza import recovery_engine as _recovery_engine_module
 from gza.artifacts import store_command_output_artifact
-from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline
-from gza.cli import query as query_cli_module
-import gza.cli.execution as _execution_module
+from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline, query as query_cli_module
 from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.concurrency import launch_permit
 from gza.config import Config
@@ -32,9 +31,9 @@ from gza.workers import WorkerMetadata, WorkerRegistry
 
 from .conftest import (
     get_latest_task,
+    invoke_gza,
     make_store,
     mark_orphaned,
-    invoke_gza,
     setup_config,
     setup_db_with_tasks,
 )
@@ -9845,8 +9844,6 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli.execution import cmd_iterate
-        from gza.runner import _make_review_verify_result
-        from gza.runner import _make_review_verify_result
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -9886,7 +9883,6 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli.execution import cmd_iterate
-        from gza.runner import _make_review_verify_result
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -9951,7 +9947,6 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli.execution import cmd_iterate
-        from gza.runner import _make_review_verify_result
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -9972,7 +9967,6 @@ class TestIterateCommand:
             "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
         )
         review_completed_at = datetime(2026, 6, 27, 11, 55, tzinfo=UTC)
-        verify_captured_at = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
         prior_review.completed_at = review_completed_at
         prior_review.review_verify_status = "failed"
         prior_review.review_verify_branch = impl.branch
@@ -11161,7 +11155,10 @@ class TestIterateCommand:
         from unittest.mock import patch
 
         from gza.cli.execution import cmd_iterate
-        from gza.plan_review_materialization import PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND, build_plan_review_slice_task_specs
+        from gza.plan_review_materialization import (
+            PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+            build_plan_review_slice_task_specs,
+        )
         from gza.plan_review_verdict import validate_plan_review_manifest
 
         setup_config(tmp_path)
@@ -11314,7 +11311,10 @@ class TestIterateCommand:
         from unittest.mock import patch
 
         from gza.cli.execution import cmd_iterate
-        from gza.plan_review_materialization import PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND, build_plan_review_slice_task_specs
+        from gza.plan_review_materialization import (
+            PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+            build_plan_review_slice_task_specs,
+        )
         from gza.plan_review_verdict import validate_plan_review_manifest
 
         setup_config(tmp_path)
@@ -11515,8 +11515,8 @@ class TestIterateCommand:
     ) -> None:
         import argparse
 
-        from gza.cli.execution import cmd_iterate
         from gza.cli._common import _materialize_plan_review_slices
+        from gza.cli.execution import cmd_iterate
         from gza.plan_review_verdict import get_plan_review_outcome
 
         setup_config(tmp_path)
@@ -11732,8 +11732,6 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
-        from gza.review_verdict import ReviewFinding
-        from gza.review_verdict import ReviewFinding
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -12451,7 +12449,6 @@ class TestIterateCommand:
         from unittest.mock import MagicMock, patch
 
         from gza.cli import cmd_iterate
-        from gza.review_verdict import ReviewFinding
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -15899,7 +15896,7 @@ class TestIterateCommand:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         from gza.cli.execution import cmd_iterate
         from gza.config import Config
@@ -19524,8 +19521,8 @@ class TestIterateCommand:
         import argparse
         from unittest.mock import MagicMock, patch
 
-        from gza.cli.execution import cmd_iterate
         from gza.cli._common import _create_retry_task
+        from gza.cli.execution import cmd_iterate
 
         setup_config(tmp_path)
         config_path = tmp_path / "gza.yaml"
@@ -19609,8 +19606,8 @@ class TestIterateCommand:
         import argparse
         from unittest.mock import MagicMock, patch
 
-        from gza.cli.execution import cmd_iterate
         from gza.cli._common import _create_retry_task
+        from gza.cli.execution import cmd_iterate
 
         setup_config(tmp_path)
         config_path = tmp_path / "gza.yaml"

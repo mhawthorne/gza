@@ -11,13 +11,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gza.cli.watch import _CycleResult, _run_cycle, _WatchLog, cmd_watch
 from gza.cli.git_ops import _execute_merge_action, ensure_watch_main_checkout
+from gza.cli.watch import _CycleResult, _run_cycle, _WatchLog, cmd_watch
 from gza.config import Config
 from gza.git import Git, GitError
 from gza.git_health import check_git_health as real_check_git_health, current_git_health_alert
 from tests.cli.conftest import make_store, setup_config
-
 from tests_functional.git_helpers import init_basic_repo, setup_git_repo_with_task_branch
 
 

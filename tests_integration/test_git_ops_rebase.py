@@ -4,14 +4,13 @@
 import argparse
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.log_paths import ops_log_path_for
-from gza.providers.base import RunResult
 from tests.cli.conftest import (
     make_store,
     run_gza,

@@ -14,23 +14,23 @@ import pytest
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.cli.git_ops import (
-    _execute_merge_action,
-    _MergeSingleTaskResult,
-    _remove_watch_merge_checkout,
-    _classify_rebase_git_failure,
-    _reconcile_diverged_branch_with_origin,
     SquashBranchReconcileResult,
     _build_auto_merge_args,
+    _classify_rebase_git_failure,
     _classify_squash_reconcile_push_failure,
-    ensure_watch_main_checkout,
+    _execute_merge_action,
     _merge_single_task,
+    _MergeSingleTaskResult,
     _print_squash_reconcile_result,
+    _reconcile_diverged_branch_with_origin,
     _reconcile_squash_merged_branch_with_origin,
+    _remove_watch_merge_checkout,
     _resolve_merge_subject,
     _run_task_backed_rebase,
     _tracking_ref_refresh_command,
     cmd_advance,
     cmd_rebase,
+    ensure_watch_main_checkout,
 )
 from gza.concurrency import launch_permit
 from gza.config import Config
@@ -41,7 +41,7 @@ from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
 from gza.review_verdict import ReviewFinding
 from gza.worktree_roots import managed_worktree_root_paths
 
-from .conftest import make_store, invoke_gza, setup_config
+from .conftest import invoke_gza, make_store, setup_config
 
 
 @pytest.fixture(autouse=True)

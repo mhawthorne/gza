@@ -9,29 +9,28 @@ import pytest
 
 from gza.artifacts import store_command_output_artifact
 from gza.config import Config
-from gza.db import SqliteTaskStore
-from gza.db import Task
+from gza.db import SqliteTaskStore, Task
 from gza.review_scope import parse_spec_coherence_review_scope
 from gza.review_tasks import (
-    DuplicateReviewError,
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+    DuplicateReviewError,
+    build_auto_review_prompt,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
-    build_spec_coherence_review_prompt,
     build_review_blocker_adjudication_prompt,
     build_review_blocker_adjudication_prompt_prefix,
-    build_auto_review_prompt,
+    build_spec_coherence_review_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
-    create_spec_coherence_review_task,
-    create_review_task,
     create_resolution_review_task,
+    create_review_task,
+    create_spec_coherence_review_task,
     extract_deferred_blocker_prompt_parts,
     extract_followup_prompt_parts,
-    extract_review_blocker_adjudication_dispute_reference,
     extract_review_blocker_adjudication_dispute_identity,
+    extract_review_blocker_adjudication_dispute_reference,
     find_existing_deferred_blocker_task,
     find_existing_followup_task,
     find_existing_review_blocker_adjudication_task,
@@ -687,7 +686,7 @@ def test_persist_off_topic_verify_clearance_creates_new_investigation_when_only_
         "traceback_paths": ["tests/cli/test_query.py"],
     }
     signature_key = hashlib.sha256(
-        f"{failing_node['nodeid']}\n{failing_node['assertion_signature']}".encode("utf-8")
+        f"{failing_node['nodeid']}\n{failing_node['assertion_signature']}".encode()
     ).hexdigest()
     store_command_output_artifact(
         store,

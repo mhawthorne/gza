@@ -11,7 +11,6 @@ from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionError
 from gza.git import Git, GitApplyResult
-
 from tests.cli.conftest import get_latest_task, make_store, run_gza, setup_config
 
 pytestmark = pytest.mark.integration

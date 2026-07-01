@@ -6,9 +6,9 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from gza.concurrency import _PROCESS_LOCKS
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.concurrency import _PROCESS_LOCKS
 from gza.learnings import (
     LearningsResult,
     _build_summarization_prompt,

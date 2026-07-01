@@ -468,6 +468,36 @@ def test_full_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
     assert "test-unit --summary -- tests/" not in tool_invocations
 
 
+@pytest.mark.timeout(30, method="signal")
+def test_quick_verify_runs_ruff_phase_against_src_gza_with_project_venv(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    tool_log = fixture_root / "venv-tools.log"
+
+    venv_bin = fixture_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_fake_passthrough_tool(venv_bin / "ruff", tool_log, "ruff")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    result = subprocess.run(
+        ["bash", "bin/tests", "--quick"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "gza-verify phase=start name=ruff" in result.stdout
+    assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
+    tool_invocations = tool_log.read_text(encoding="utf-8")
+    assert "python -m gza.tools.verify_phase ruff -- ruff check src/gza/" in tool_invocations
+    assert "uv run ruff check src/gza/" not in tool_invocations
+
+
 @pytest.mark.functional
 @pytest.mark.timeout(30, method="signal")
 def test_ruff_check_passes_for_watch_cli_module() -> None:
@@ -549,6 +579,7 @@ def test_verify_phase_ruff_passes_for_full_src_tree_on_real_repo() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "gza-verify phase=start name=ruff" in result.stdout
+    assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
     match = re.search(
         r"gza-verify phase=passed name=ruff duration_seconds=[0-9.]+(?: tree_fingerprint=[0-9a-f]{64})?",
         result.stdout,

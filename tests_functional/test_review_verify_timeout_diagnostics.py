@@ -15,7 +15,6 @@ import pytest
 
 from gza.runner import _run_review_verify_command
 
-
 pytestmark = [
     pytest.mark.functional,
     pytest.mark.skipif(os.name != "posix", reason="review verify descendant termination requires POSIX signals"),

@@ -6,8 +6,8 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from gza.config import Config
 from gza.concurrency import launch_permit, release_task_launch_permit, take_task_launch_permit
+from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionDraft, ExtractionError, FileDiffSummary, SourceSelection
 from gza.git import Git

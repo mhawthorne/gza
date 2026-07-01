@@ -1,13 +1,13 @@
 from pathlib import Path
 
 from gza import dependency_preconditions as dependency_preconditions_module
+from gza.cli._common import release_held_plan_source
+from gza.db import SqliteTaskStore
 from gza.dependency_preconditions import (
     dependency_readiness,
     empty_prereq_satisfies_dependency,
     get_unmerged_dependency_precondition,
 )
-from gza.cli._common import release_held_plan_source
-from gza.db import SqliteTaskStore
 from gza.lineage_query import _load_indexes
 from gza.recovery_read_context import RecoveryReadContext
 
