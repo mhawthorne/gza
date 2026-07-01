@@ -444,17 +444,6 @@ def main() -> int:
         help="Exclude tasks by status (e.g., completed, failed, unmerged)",
     )
     history_parser.add_argument(
-        "--lineage-depth",
-        type=int,
-        dest="lineage_depth",
-        default=0,
-        metavar="N",
-        help=(
-            "Render root-deduplicated lineage trees up to N levels from each "
-            "resolved root"
-        ),
-    )
-    history_parser.add_argument(
         "--date-field",
         choices=["created", "completed", "effective"],
         default="effective",
@@ -509,11 +498,6 @@ def main() -> int:
         type=_parse_non_negative_int,
         metavar="N",
         help="Show last N unresolved rows (default: 5, 0 for all)",
-    )
-    incomplete_parser.add_argument(
-        "--tree",
-        action="store_true",
-        help="Render unresolved lineages as trees instead of one-line summaries",
     )
     incomplete_parser.add_argument(
         "--type",
@@ -2813,7 +2797,7 @@ def main() -> int:
     lineage_mode.add_argument(
         "--full",
         action="store_true",
-        help="Show both ancestor and descendant lineage for the selected task",
+        help="Expand the entire merge-unit grouped tree instead of the default local window",
     )
     lineage_mode.add_argument(
         "--parents-only",
@@ -2824,6 +2808,16 @@ def main() -> int:
         "--children-only",
         action="store_true",
         help="Show only the selected task and its descendants",
+    )
+    lineage_parser.add_argument(
+        "--flat",
+        action="store_true",
+        help="Render the raw per-task tree instead of grouping tasks by merge unit",
+    )
+    lineage_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the merge-unit grouped lineage as JSON for scripting",
     )
     add_common_args(lineage_parser)
 

@@ -1970,153 +1970,6 @@ class TestHistoryCommand:
         assert "Recent task" in result.stdout
         assert "Old task" not in result.stdout
 
-    def test_history_lineage_depth(self, tmp_path: Path):
-        """--lineage-depth shows a branch-rendered tree."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        parent = store.add("Parent task")
-        parent.status = "completed"
-        parent.completed_at = datetime.now(UTC)
-        store.update(parent)
-
-        child = store.add("Child task", based_on=parent.id)
-        child.status = "completed"
-        child.completed_at = datetime.now(UTC)
-        store.update(child)
-
-        result = invoke_gza("history", "--lineage-depth", "1", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Parent task" in result.stdout
-        assert "Child task" in result.stdout
-        assert "└──" in result.stdout or "├──" in result.stdout
-
-    def test_history_lineage_depth_two(self, tmp_path: Path):
-        """--lineage-depth 2 renders all three levels of a grandparent→parent→child chain."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        grandparent = store.add("Grandparent task")
-        grandparent.status = "completed"
-        grandparent.completed_at = datetime.now(UTC)
-        store.update(grandparent)
-
-        parent = store.add("Parent task", based_on=grandparent.id)
-        parent.status = "completed"
-        parent.completed_at = datetime.now(UTC)
-        store.update(parent)
-
-        child = store.add("Child task", based_on=parent.id)
-        child.status = "completed"
-        child.completed_at = datetime.now(UTC)
-        store.update(child)
-
-        result = invoke_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        # All three levels of the chain must appear in the output
-        assert "Grandparent task" in result.stdout
-        assert "Parent task" in result.stdout
-        assert "Child task" in result.stdout
-
-    def test_history_lineage_orders_completed_root_before_pending_descendants(self, tmp_path: Path):
-        """Lineage rendering keeps ancestor-first order even when descendants are pending."""
-
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        root = store.add("Root done", task_type="implement")
-        root.status = "completed"
-        root.completed_at = datetime(2026, 3, 1, tzinfo=UTC)
-        store.update(root)
-
-        child = store.add("Child pend", task_type="implement", based_on=root.id)
-        grandchild = store.add("Gchild pend", task_type="implement", based_on=child.id)
-        assert child.id is not None
-        assert grandchild.id is not None
-
-        result = invoke_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        root_idx = result.stdout.index("Root done")
-        child_idx = result.stdout.index("Child pend")
-        grandchild_idx = result.stdout.index("Gchild pend")
-        assert root_idx < child_idx < grandchild_idx
-
-    def test_history_lineage_same_branch_children_render_compact_without_repeated_connectors(
-        self,
-        tmp_path: Path,
-    ):
-        """Same-branch review/improve children render compactly and avoid connector/status/branch bugs."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        impl = store.add("Implement root", task_type="implement")
-        impl.status = "completed"
-        impl.completed_at = datetime.now(UTC)
-        impl.branch = "20260412-impl-history-lineage"
-        impl.merge_status = "merged"
-        store.update(impl)
-        assert impl.id is not None
-
-        review = store.add(
-            "Review root",
-            task_type="review",
-            based_on=impl.id,
-            depends_on=impl.id,
-            same_branch=True,
-        )
-        review.status = "completed"
-        review.completed_at = datetime.now(UTC)
-        review.branch = impl.branch
-        review.merge_status = "unmerged"
-        review.report_file = "reviews/review.md"
-        review.output_content = "Verdict: CHANGES_REQUESTED\n\nNeeds revisions."
-        review.duration_seconds = 99
-        review.cost_usd = 0.25
-        review.model = "claude-opus-4-8"
-        store.update(review)
-        assert review.id is not None
-
-        improve = store.add(
-            "Improve root",
-            task_type="improve",
-            based_on=impl.id,
-            depends_on=review.id,
-            same_branch=True,
-        )
-        improve.status = "completed"
-        improve.completed_at = datetime.now(UTC)
-        improve.branch = impl.branch
-        improve.merge_status = "unmerged"
-        improve.report_file = "reviews/improve.md"
-        improve.duration_seconds = 111
-        improve.cost_usd = 0.33
-        store.update(improve)
-        assert improve.id is not None
-
-        result = invoke_gza("history", "--lineage-depth", "2", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert re.search(rf"completed\s+{re.escape(review.id)}", result.stdout)
-        assert re.search(rf"completed\s+{re.escape(improve.id)}", result.stdout)
-        assert f"unmerged  {review.id}" not in result.stdout
-        assert f"unmerged  {improve.id}" not in result.stdout
-        assert "verdict:" in result.stdout
-        assert "CHANGES_REQUESTED" in result.stdout
-        assert "| model: claude-opus-4-8 | stats:" in result.stdout
-        assert "| model: - | stats:" in result.stdout
-        assert "| stats:" in result.stdout
-        assert result.stdout.count("branch: ") == 1
-        assert "└──     [review]" not in result.stdout
-        assert "├──     [review]" not in result.stdout
-        assert "└──     [improve]" not in result.stdout
-        assert "├──     [improve]" not in result.stdout
-        assert "report:" not in result.stdout
-
     def test_history_last_flag(self, tmp_path: Path):
         """--last limits the number of tasks shown."""
         setup_db_with_tasks(tmp_path, [
@@ -6504,12 +6357,14 @@ class TestShowCommand:
             )
 
         output = capsys.readouterr().out
+        normalized = " ".join(output.split())
         assert exit_code == 0
+        # Review state is surfaced on the Lifecycle line.
         assert f"Lifecycle: recovered, review in_progress ({review.id})" in output
+        # The local lineage window shows this task and its immediate child.
         assert "Lineage:" in output
-        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
-        assert f"{resumed.id}[implement] [resume] completed (unmerged)" in output
-        assert f"{review.id}[review] in_progress" in output
+        assert f"{failed_root.id} implement failed (TIMEOUT)" in normalized
+        assert resumed.id in output
 
     def test_show_recovered_parent_reports_completed_and_merged_for_merged_resume(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -6574,12 +6429,13 @@ class TestShowCommand:
             )
 
         output = capsys.readouterr().out
+        normalized = " ".join(output.split())
         assert exit_code == 0
         assert "Lifecycle: recovered, completed and merged" in output
         assert "ready for review" not in output
         assert "Lineage:" in output
-        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
-        assert f"{resumed.id}[implement] [resume] completed (merged)" in output
+        assert f"{failed_root.id} implement failed (TIMEOUT)" in normalized
+        assert resumed.id in output
 
     def test_show_completed_plan_reports_terminal_lifecycle_from_merged_implement_descendant(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -6800,8 +6656,10 @@ class TestShowCommand:
 
         assert exit_code == 0
         normalized = " ".join(output.split())
-        assert "plan_review [depends]" in normalized or "plan_review [plan_review]" in normalized
-        assert "verdict: CHANGES_REQUESTED" in normalized
+        # The default local view renders the plan_review inline as a member of the
+        # plan's group, annotated with its verdict.
+        assert "plan_review" in normalized
+        assert "CHANGES_REQUESTED" in normalized
 
     def test_show_held_plan_displays_auto_implement_hold_guidance(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7394,9 +7252,12 @@ class TestShowCommand:
             result = invoke_gza("show", str(failed.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
+        normalized = " ".join(result.stdout.split())
         assert "Lineage:" in result.stdout
-        assert f"{failed.id}[implement] failed (TIMEOUT)" in result.stdout
-        assert f"{failed.id}[implement] failed (TIMEOUT) (unmerged)" not in result.stdout
+        assert f"{failed.id} implement failed (TIMEOUT)" in normalized
+        # No stale merge badge on the failed row.
+        assert "failed (TIMEOUT) [unmerged]" not in normalized
+        assert "failed (TIMEOUT) [merged]" not in normalized
 
     def test_show_completed_merged_task_omits_trivial_lifecycle_and_lineage(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7601,10 +7462,12 @@ class TestShowCommand:
                 "description": "SKIP: automatic recovery stops here; retry limit reached",
             }
         )
+        normalized = " ".join(output.split())
         assert f"Lifecycle: {expected}" in output
-        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
-        assert f"{failed_resume.id}[implement] [resume] failed (TIMEOUT)" in output
-        assert f"{failed_resume_retry_limit.id}[implement] [resume] failed (TIMEOUT)" in output
+        # The local lineage window shows this task and its immediate resume child;
+        # deeper retries are summarized by the child's descendant count.
+        assert f"{failed_root.id} implement failed (TIMEOUT)" in normalized
+        assert failed_resume.id in output
 
     def test_show_recovered_needs_attention_lifecycle_uses_failed_color(
         self, tmp_path: Path
@@ -7671,6 +7534,7 @@ class TestShowCommand:
                 ),
             ),
             patch.object(query_cli, "console", console),
+            patch.object(query_cli._lv, "console", console),
             patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
         ):
             exit_code = cmd_show(
@@ -7789,6 +7653,7 @@ class TestShowCommand:
 
         with (
             patch.object(query_cli, "console", console),
+            patch.object(query_cli._lv, "console", console),
             patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
             patch.dict("gza.cli._common._colors.LINEAGE_STATUS_COLORS", lineage_status_colors, clear=True),
         ):
@@ -7810,13 +7675,14 @@ class TestShowCommand:
         assert exit_code == 0
         assert "Status: failed" in plain
         assert "Lineage:" in plain
-        assert "\x1b[31mfailed\x1b[0m" in rendered
+        assert "\x1b[31mfailed \x1b[0m" in rendered
         assert "\x1b[31mTIMEOUT\x1b[0m" in rendered
         assert "\x1b[34min_progress\x1b[0m" in rendered
-        assert "\x1b[32mcompleted\x1b[0m" in rendered
+        # "completed" carries a trailing "[merged]" label in the same colored span.
+        assert "\x1b[32mcompleted " in rendered
         assert "\x1b[33mTIMEOUT\x1b[0m" not in rendered
         assert "\x1b[35min_progress\x1b[0m" not in rendered
-        assert "\x1b[36mcompleted\x1b[0m" not in rendered
+        assert "\x1b[36mcompleted " not in rendered
 
     def test_show_reports_lifecycle_unavailable_when_default_branch_resolution_fails(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7869,8 +7735,8 @@ class TestShowCommand:
         assert "Lifecycle: recovered, lifecycle unavailable - failed to resolve default branch: simulated default branch failure" in output
         assert "Lifecycle: recovered\n" not in output
         assert "Lineage:" in output
-        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
-        assert f"{resumed.id}[implement] [resume] completed (unmerged)" in output
+        assert f"{failed_root.id} implement failed (TIMEOUT)" in " ".join(output.split())
+        assert resumed.id in output
 
     def test_show_reports_lifecycle_unavailable_when_lifecycle_classification_fails(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -7933,8 +7799,8 @@ class TestShowCommand:
         assert exit_code == 0
         assert "Lifecycle: recovered, lifecycle unavailable - failed to classify lifecycle: simulated lifecycle classification failure" in output
         assert "Lineage:" in output
-        assert f"{failed_root.id}[implement] failed (TIMEOUT)" in output
-        assert f"{resumed.id}[implement] [resume] completed (unmerged)" in output
+        assert f"{failed_root.id} implement failed (TIMEOUT)" in " ".join(output.split())
+        assert resumed.id in output
 
     def test_show_omits_prunable_worktree_path_for_task_branch(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -8458,10 +8324,14 @@ class TestShowCommand:
 
         assert result.returncode == 0
         assert "Lineage:" in result.stdout
+        # The local window lists this task before its immediate child; the deeper
+        # grandchild is summarized by the child's descendant count, not listed.
         root_idx = result.stdout.index(f"{root.id}")
         child_idx = result.stdout.index(f"{child.id}")
-        grandchild_idx = result.stdout.index(f"{grandchild.id}")
-        assert root_idx < child_idx < grandchild_idx
+        assert root_idx < child_idx
+        assert grandchild.id not in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert "2 tasks" in normalized
 
     def test_show_depended_on_by_field(self, tmp_path: Path):
         """Show displays 'Depended on by' listing tasks that reference the displayed task."""
@@ -8480,13 +8350,13 @@ class TestShowCommand:
         result_plan = invoke_gza("show", str(plan.id), "--project", str(tmp_path))
         assert result_plan.returncode == 0
         assert "Depended on by:" in result_plan.stdout
-        assert f"{impl.id}[implement]" in result_plan.stdout
+        assert impl.id in result_plan.stdout
 
         # Show the impl: it should list review as "Depended on by"
         result_impl = invoke_gza("show", str(impl.id), "--project", str(tmp_path))
         assert result_impl.returncode == 0
         assert "Depended on by:" in result_impl.stdout
-        assert f"{review.id}[review]" in result_impl.stdout
+        assert review.id in result_impl.stdout
 
     def test_show_truncates_long_output(self, tmp_path: Path):
         """gza show truncates output >30 lines to 20 with a remainder hint."""
@@ -11174,7 +11044,6 @@ class TestUnmergedReviewStatus:
 
         normalized = " ".join(result.stdout.split())
         assert "review: reviewed [✓ approved]" in normalized
-        assert review.id in normalized
         assert "review: no review" not in normalized
         assert "review stale" not in normalized
 
@@ -11202,7 +11071,6 @@ class TestUnmergedReviewStatus:
 
         normalized = " ".join(result.stdout.split())
         assert "review: reviewed [⚠ changes requested]" in normalized
-        assert review.id in normalized
         assert "review: no review" not in normalized
         assert "review stale" not in normalized
 
@@ -11292,54 +11160,11 @@ class TestUnmergedReviewStatus:
 
         result = invoke_gza("unmerged", "--project", str(tmp_path))
         assert result.returncode == 0
+        # Lineage is now a one-line orientation summary; the owner heads the row and
+        # the review-state ("review stale") is surfaced on the review line.
         assert "lineage:" in result.stdout
         assert f"{impl.id}" in result.stdout
-        assert f"{review.id}" in result.stdout
-        assert f"{improve.id}" in result.stdout
-        assert "[implement]" in result.stdout
-        assert "[review]" in result.stdout
-        assert "[improve]" in result.stdout
         assert "review stale" in result.stdout
-
-    def test_unmerged_lineage_shows_full_canonical_tree_and_annotations(self, tmp_path: Path):
-        """Unmerged lineage uses the canonical tree and keeps node annotations."""
-        store, impl, git = setup_unmerged_env(tmp_path)
-
-        review = store.add("Review", task_type="review")
-        review.status = "completed"
-        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
-        review.depends_on = impl.id
-        review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(review)
-
-        improve = store.add("Improve", task_type="improve")
-        improve.status = "completed"
-        improve.completed_at = datetime(2026, 2, 12, 12, 0, tzinfo=UTC)
-        improve.based_on = impl.id
-        improve.depends_on = review.id
-        improve.branch = "feature/test"
-        improve.same_branch = True
-        store.update(improve)
-
-        downstream_impl = store.add("Downstream implement noise", task_type="implement")
-        downstream_impl.status = "completed"
-        downstream_impl.completed_at = datetime(2026, 2, 12, 13, 0, tzinfo=UTC)
-        downstream_impl.based_on = impl.id
-        downstream_impl.branch = "feature/test"
-        downstream_impl.same_branch = True
-        store.update(downstream_impl)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        assert "lineage:" in result.stdout
-        assert f"{impl.id}" in result.stdout
-        assert f"{review.id}" in result.stdout
-        assert f"{improve.id}" in result.stdout
-        assert f"{downstream_impl.id}" in result.stdout
-        assert "| completed |" in result.stdout
-        assert "changes_requested" in result.stdout
-        # The "← latest" annotation may wrap across lines at narrow terminal widths
-        assert "latest" in " ".join(result.stdout.split())
 
     def test_unmerged_keeps_owner_identity_while_using_latest_branch_review_summary(self, tmp_path: Path):
         """Unmerged keeps the branch owner row while summarizing the latest branch review state."""
@@ -11392,12 +11217,10 @@ class TestUnmergedReviewStatus:
         assert unmerged_result.returncode == 0
 
         unmerged_output = " ".join(unmerged_result.stdout.split())
+        # The owner heads the row and the latest branch review drives the summary;
+        # members no longer print in the (now one-line) lineage section.
         assert f"⚡ {root_impl.id}" in unmerged_output
         assert "review: reviewed [✓ approved]" in unmerged_output
-        assert root_impl.id in unmerged_output
-        assert retry_impl.id in unmerged_output
-        assert sibling_impl.id in unmerged_output
-        assert sibling_review.id in unmerged_output
 
     def test_unmerged_lineage_matches_lineage_command_root_for_retry_chain(self, tmp_path: Path):
         """Unmerged lineage keeps the same canonical root as `gza lineage` for retried implementations."""
@@ -11445,12 +11268,12 @@ class TestUnmergedReviewStatus:
 
         lineage_output = " ".join(lineage_result.stdout.split())
         unmerged_output = " ".join(unmerged_result.stdout.split())
+        # `gza lineage` shows the local window (target + ancestors + peers); unmerged
+        # keeps the owner row (its one-line summary no longer lists members).
         assert root_impl.id in lineage_output
         assert root_impl.id in unmerged_output
         assert retry_impl.id in lineage_output
-        assert retry_impl.id in unmerged_output
         assert sibling_impl.id in lineage_output
-        assert sibling_impl.id in unmerged_output
 
     def test_unmerged_keeps_owner_identity_for_retry_resume_branch_summary(self, tmp_path: Path):
         """Shared-branch retry/resume chains keep the owner row while summarizing the newest review."""
@@ -11498,10 +11321,6 @@ class TestUnmergedReviewStatus:
         normalized = " ".join(result.stdout.split())
         assert f"⚡ {root_impl.id}" in normalized
         assert "review: reviewed [✓ approved]" in normalized
-        assert root_impl.id in normalized
-        assert retry_impl.id in normalized
-        assert resumed_impl.id in normalized
-        assert resumed_review.id in normalized
         assert "⚠ changes requested" not in normalized
 
     def test_unmerged_marks_review_stale_when_newer_same_branch_implement_has_no_review(self, tmp_path: Path):
@@ -11572,7 +11391,6 @@ class TestUnmergedReviewStatus:
         normalized = " ".join(result.stdout.split())
         assert "review: reviewed [⚠ changes requested]" in normalized
         assert "review: reviewed [✓ approved]" not in normalized
-        assert newer_review.id in normalized
 
     def test_unmerged_retry_resume_uses_root_review_clear_state_for_staleness(self, tmp_path: Path):
         """Shared-branch representative should still show stale review after root clear."""
@@ -11747,34 +11565,6 @@ class TestUnmergedReviewStatus:
         assert "review stale" not in retry_block
         assert "review state cleared after last review" not in retry_block
         assert "review: review stale" in root_block
-    def test_unmerged_lineage_marks_only_latest_review_node(self, tmp_path: Path):
-        """The most recent review node is annotated with the latest marker."""
-        store, impl, git = setup_unmerged_env(tmp_path)
-
-        older_review = store.add("Older review", task_type="review")
-        older_review.status = "completed"
-        older_review.completed_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
-        older_review.depends_on = impl.id
-        older_review.output_content = "Verdict: APPROVED"
-        store.update(older_review)
-
-        latest_review = store.add("Latest review", task_type="review")
-        latest_review.status = "completed"
-        latest_review.completed_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-        latest_review.depends_on = impl.id
-        latest_review.output_content = "Verdict: CHANGES_REQUESTED"
-        store.update(latest_review)
-
-        result = invoke_gza("unmerged", "--project", str(tmp_path))
-        assert result.returncode == 0
-        # Normalize output since "← latest" may wrap across lines at narrow terminal widths
-        normalized = " ".join(result.stdout.split())
-        older_idx = normalized.index(f"{older_review.id}")
-        latest_idx = normalized.index(f"{latest_review.id}")
-        marker_idx = normalized.index("latest")
-        assert marker_idx > latest_idx
-        assert not (older_idx < marker_idx < latest_idx)
-
     def test_unmerged_prefers_latest_based_on_only_review_for_badge_and_lineage(self, tmp_path: Path):
         """Latest imported review should drive both the summary badge and lineage marker."""
         store, impl, git = setup_unmerged_env(tmp_path)
@@ -11798,12 +11588,10 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
+        # The latest imported review drives the summary badge (the lineage section is
+        # now a one-liner and no longer renders a per-review "← latest" marker).
         assert "review: reviewed [↺ approved with follow-ups]" in normalized
         assert "⚠ changes requested" not in normalized
-
-        latest_idx = normalized.index(f"{latest_review.id}")
-        latest_marker_idx = normalized.index("approved_with_followups ← latest")
-        assert latest_marker_idx > latest_idx
 
 
 class TestUnmergedSelectionBehavior:
@@ -13025,7 +12813,7 @@ class TestUnmergedUnifiedQueryOutput:
             fields="id,prompt",
         )
 
-        with patch("gza.cli.query._format_lineage", side_effect=AssertionError("lineage render should be skipped")):
+        with patch("gza.cli.lineage_view.lineage_summary_stats", side_effect=AssertionError("lineage render should be skipped")):
             result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
 
         captured = capsys.readouterr()
@@ -13830,7 +13618,7 @@ class TestUnmergedUnifiedQueryOutput:
             fields="id,prompt",
         )
 
-        with patch("gza.cli.query._format_lineage", side_effect=AssertionError("lineage render should be skipped")):
+        with patch("gza.cli.lineage_view.lineage_summary_stats", side_effect=AssertionError("lineage render should be skipped")):
             result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
 
         captured = capsys.readouterr()
@@ -13838,7 +13626,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert json.loads(captured.out) == [{"id": task.id, "prompt": "JSON output task"}]
         assert "Progress:" in captured.err
 
-    def test_unmerged_default_text_still_computes_descendants_only_lineage_text(
+    def test_unmerged_default_text_shows_lineage_summary(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -13853,16 +13641,17 @@ class TestUnmergedUnifiedQueryOutput:
             json=False,
             fields=None,
         )
-        original_format_lineage = query_cli._format_lineage
+        original_stats = query_cli._lv.lineage_summary_stats
 
         with patch("gza.cli.query.GitHub", _UnavailableGitHub):
-            with patch("gza.cli.query._format_lineage", wraps=original_format_lineage) as format_lineage:
+            with patch("gza.cli.lineage_view.lineage_summary_stats", wraps=original_stats) as summary_stats:
                 result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
 
         captured = capsys.readouterr()
         assert result == 0
-        assert format_lineage.call_count > 0
+        assert summary_stats.call_count > 0
         assert "lineage:" in captured.out
+        assert "in tree" in captured.out
         assert "Rich output task" in captured.out
 
     def test_unmerged_default_text_attaches_review_verdict_color_via_theme(self, tmp_path: Path) -> None:
@@ -14115,17 +13904,19 @@ class TestUnmergedUnifiedQueryOutput:
             target=None,
             fetch=False,
             limit=5,
-            json=False,
-            fields=None,
+            json=True,
+            fields="id,member_ids",
         )
 
         result = query_cli.cmd_unmerged(args, git=_FastUnmergedGit())
 
         captured = capsys.readouterr()
         assert result == 0
-        normalized = " ".join(captured.out.split())
-        assert normalized.count(str(review_a.id)) == 1
-        assert normalized.count(str(review_b.id)) == 1
+        # The descendants-only pruning lists each review once in member_ids (the
+        # lineage tree text is gone; member membership is the structured signal).
+        member_ids = json.loads(captured.out)[0]["member_ids"]
+        assert member_ids.count(str(review_a.id)) == 1
+        assert member_ids.count(str(review_b.id)) == 1
 
     def test_unmerged_shows_descendants_only_lineage_without_ancestors(
         self,
@@ -14673,7 +14464,9 @@ class TestLineageCommand:
         grandchild.completed_at = completed_at
         store.update(grandchild)
 
-        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
+        # Timestamps live in the per-task tree renderer (the default local view is
+        # intentionally compact and omits them).
+        result = invoke_gza("lineage", str(root.id), "--flat", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "2026-01-02 03:04:05 UTC" in result.stdout
@@ -14780,8 +14573,9 @@ class TestLineageCommand:
 
         with (
             patch.object(query_cli, "console", console),
+            patch.object(query_cli._lv, "console", console),
             patch.object(query_cli, "SHOW_COLORS_DICT", show_colors),
-            patch.object(query_cli, "get_task_status_color", return_value="yellow"),
+            patch.object(query_cli._lv, "get_task_status_color", return_value="yellow"),
         ):
             exit_code = cmd_lineage(argparse.Namespace(project_dir=tmp_path, task_id=str(task.id)))
 
@@ -14816,7 +14610,9 @@ class TestLineageCommand:
         review.completed_at = now
         store.update(review)
 
-        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
+        # --full expands the whole grouped tree so the nested review is visible
+        # (the default local view shows only immediate children with counts).
+        result = invoke_gza("lineage", str(root.id), "--full", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -15026,7 +14822,7 @@ class TestLineageCommand:
         parents_section = full.stdout.split("Children:", 1)[0]
         assert parents_section.count(child.id) == 1
 
-    def test_lineage_full_shows_parents_and_children_sections(self, tmp_path: Path) -> None:
+    def test_lineage_full_shows_whole_tree_including_ancestors(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -15052,8 +14848,8 @@ class TestLineageCommand:
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Parents:" in normalized
-        assert "Children:" in normalized
+        # --full renders the entire grouped tree rooted at the lineage root, so the
+        # ancestor plan, the implement, and its nested review are all present.
         assert plan.id in normalized
         assert impl.id in normalized
         assert review.id in normalized
@@ -15119,7 +14915,7 @@ class TestLineageCommand:
         task.num_steps_reported = 5
         store.update(task)
 
-        result = invoke_gza("lineage", str(task.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(task.id), "--flat", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "UTC" in result.stdout
@@ -15157,7 +14953,7 @@ class TestLineageCommand:
         dep.status = "pending"
         store.update(dep)
 
-        result = invoke_gza("lineage", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(impl.id), "--flat", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -15184,7 +14980,7 @@ class TestLineageCommand:
         child.completed_at = now
         store.update(child)
 
-        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--flat", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
@@ -15211,7 +15007,7 @@ class TestLineageCommand:
         child.status = "pending"
         store.update(child)
 
-        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--flat", "--project", str(tmp_path))
 
         # returncode == 0 catches MarkupError crashes
         assert result.returncode == 0
@@ -15262,7 +15058,7 @@ class TestLineageCommand:
         review.completed_at = now
         store.update(review)
 
-        result = invoke_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(plan.id), "--flat", "--project", str(tmp_path))
         assert result.returncode == 0
         output = result.stdout
 
@@ -15311,7 +15107,7 @@ class TestLineageCommand:
         rebase.completed_at = now
         store.update(rebase)
 
-        result = invoke_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(plan.id), "--flat", "--project", str(tmp_path))
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
 
@@ -15334,7 +15130,7 @@ class TestLineageCommand:
         impl.slug = "20260212-feature-improve-lineage"
         store.update(impl)
 
-        result = invoke_gza("lineage", str(impl.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(impl.id), "--flat", "--project", str(tmp_path))
         assert result.returncode == 0
         assert "feature-improve-lineage" in result.stdout
         assert "20260212-feature-improve-lineage" not in result.stdout
@@ -15368,7 +15164,7 @@ class TestLineageCommand:
         review.completed_at = now
         store.update(review)
 
-        result = invoke_gza("lineage", str(plan.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(plan.id), "--flat", "--project", str(tmp_path))
         assert result.returncode == 0
 
         lines = [line for line in result.stdout.splitlines() if line.strip()]
@@ -15440,7 +15236,7 @@ class TestLineageCommand:
         great_grandchild.completed_at = now
         store.update(great_grandchild)
 
-        result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
+        result = invoke_gza("lineage", str(root.id), "--flat", "--project", str(tmp_path))
         assert result.returncode == 0
 
         by_id = {
@@ -15459,78 +15255,6 @@ class TestLineageCommand:
 
         assert grandchild_connector_col - child_connector_col == 4
         assert great_grandchild_connector_col - grandchild_connector_col == 4
-
-    def test_lineage_tree_guides_match_show_lineage_alignment(self, tmp_path: Path):
-        """Standalone lineage tree uses the same 4-column guide alignment as show."""
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-
-        now = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
-
-        root = store.add("Root implement", task_type="implement")
-        assert root.id is not None
-        root.status = "completed"
-        root.completed_at = now
-        store.update(root)
-
-        child = store.add("Child improve", task_type="improve", based_on=root.id)
-        assert child.id is not None
-        child.status = "completed"
-        child.completed_at = now
-        store.update(child)
-
-        grandchild = store.add("Grandchild improve", task_type="improve", based_on=child.id)
-        assert grandchild.id is not None
-        grandchild.status = "completed"
-        grandchild.completed_at = now
-        store.update(grandchild)
-
-        sibling = store.add("Sibling improve", task_type="improve", based_on=child.id)
-        assert sibling.id is not None
-        sibling.status = "completed"
-        sibling.completed_at = now
-        store.update(sibling)
-
-        deep_child = store.add("Deep child", task_type="fix", based_on=grandchild.id)
-        assert deep_child.id is not None
-        deep_child.status = "completed"
-        deep_child.completed_at = now
-        store.update(deep_child)
-
-        root_sibling = store.add("Root sibling review", task_type="review", depends_on=root.id)
-        assert root_sibling.id is not None
-        root_sibling.status = "completed"
-        root_sibling.completed_at = now
-        store.update(root_sibling)
-
-        lineage_result = invoke_gza("lineage", str(root.id), "--project", str(tmp_path))
-        show_result = invoke_gza("show", str(root.id), "--project", str(tmp_path))
-
-        assert lineage_result.returncode == 0
-        assert show_result.returncode == 0
-
-        lineage_lines = {
-            match.group(1): line
-            for line in lineage_result.stdout.splitlines()
-            for match in [re.search(r"(testproject-\d+)", line)]
-            if match
-        }
-        show_lines = {
-            match.group(1): line
-            for line in show_result.stdout.splitlines()
-            for match in [re.search(r"(testproject-\d+)", line)]
-            if match
-        }
-
-        branched_task_id = next(
-            task_id for task_id, line in lineage_lines.items() if "│   ├── " in line
-        )
-
-        assert "│   ├── " in lineage_lines[branched_task_id]
-        assert "│   │   └── " in lineage_lines[deep_child.id]
-        assert lineage_lines[branched_task_id].index("├── ") == show_lines[branched_task_id].index("├── ")
-        assert lineage_lines[deep_child.id].index("└── ") == show_lines[deep_child.id].index("└── ")
-
 
 class TestPsSortKey:
     """Tests for _ps_sort_key sort-key function."""
@@ -17158,19 +16882,7 @@ class TestIncompleteCommand:
         assert self._one_line_row_id(one_line_output) == impl.id
         assert f"SKIP: improve task {improve.id} is in_progress" in one_line_output
         assert plan.prompt not in one_line_output
-
-        with patch("gza.cli.query.Git", return_value=git):
-            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
-        captured = capsys.readouterr()
-
-        assert result == 0
-        tree_output = captured.out
-        assert self._tree_root_id(tree_output) == impl.id
-        assert plan.id not in tree_output
-        assert plan.prompt not in tree_output
-        assert review.id in tree_output
-        assert improve.id in tree_output
-        assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
+        assert plan.id not in one_line_output
 
     def test_incomplete_roots_failed_rebase_lineage_at_impl_and_reports_blocker(
         self,
@@ -17223,15 +16935,6 @@ class TestIncompleteCommand:
         one_line_output = captured.out
         assert self._one_line_row_id(one_line_output) == impl.id
         assert f"rebase {rebase.id} failed, needs manual resolution" in one_line_output
-
-        with patch("gza.cli.query.Git", return_value=git):
-            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
-        captured = capsys.readouterr()
-
-        assert result == 0
-        tree_output = captured.out
-        assert self._tree_root_id(tree_output) == impl.id
-        assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
 
     def test_incomplete_completed_empty_prereq_is_not_unresolved(
         self,
@@ -17441,13 +17144,12 @@ class TestIncompleteCommand:
 
 class TestLineageOwnerParity:
     @staticmethod
-    def _incomplete_args(tmp_path: Path, *, fields: str | None, json: bool = False, tree: bool = False):
+    def _incomplete_args(tmp_path: Path, *, fields: str | None, json: bool = False):
         return argparse.Namespace(
             project_dir=tmp_path,
             last=0,
             list_fields=False,
             blocked_by_dropped=False,
-            tree=tree,
             type=None,
             days=None,
             date_field="effective",
@@ -17605,7 +17307,7 @@ class TestLineageOwnerParity:
         focus_task = tasks[focus_key]
 
         result = query_cli.cmd_lineage(
-            argparse.Namespace(project_dir=tmp_path, task_id=str(focus_task.id))
+            argparse.Namespace(project_dir=tmp_path, task_id=str(focus_task.id), flat=True)
         )
         captured = capsys.readouterr()
 
@@ -17623,7 +17325,7 @@ class TestLineageOwnerParity:
         rebase = tasks["rebase"]
 
         lineage_result = query_cli.cmd_lineage(
-            argparse.Namespace(project_dir=tmp_path, task_id=str(rebase.id))
+            argparse.Namespace(project_dir=tmp_path, task_id=str(rebase.id), flat=True)
         )
         lineage_captured = capsys.readouterr()
         assert lineage_result == 0
@@ -17666,7 +17368,7 @@ class TestLineageOwnerParity:
         review = tasks["review"]
 
         lineage_result = query_cli.cmd_lineage(
-            argparse.Namespace(project_dir=tmp_path, task_id=str(review.id))
+            argparse.Namespace(project_dir=tmp_path, task_id=str(review.id), flat=True)
         )
         lineage_captured = capsys.readouterr()
         assert lineage_result == 0
@@ -17710,7 +17412,7 @@ class TestLineageOwnerParity:
         impl_b = tasks["impl_b"]
 
         lineage_result = query_cli.cmd_lineage(
-            argparse.Namespace(project_dir=tmp_path, task_id=str(plan.id))
+            argparse.Namespace(project_dir=tmp_path, task_id=str(plan.id), flat=True)
         )
         captured = capsys.readouterr()
 
@@ -17814,7 +17516,7 @@ class TestLineageOwnerParity:
         assert json.loads(unmerged_captured.out) == [{"id": impl.id}]
 
         lineage_result = query_cli.cmd_lineage(
-            argparse.Namespace(project_dir=tmp_path, task_id=str(dropped_two.id))
+            argparse.Namespace(project_dir=tmp_path, task_id=str(dropped_two.id), flat=True)
         )
         lineage_captured = capsys.readouterr()
         assert lineage_result == 0
@@ -17956,17 +17658,6 @@ class TestLineageOwnerParity:
         assert "Create closing review (latest implementation has no review yet)" in one_line_output
         assert f"{dropped_one.id} (dropped)" not in one_line_output
         assert f"{dropped_two.id} (dropped)" not in one_line_output
-
-        with patch("gza.cli.query.Git", return_value=git):
-            result = query_cli.cmd_incomplete(self._incomplete_args(tmp_path, fields=None, tree=True))
-        captured = capsys.readouterr()
-
-        assert result == 0
-        tree_output = captured.out
-        assert self._tree_root_id(tree_output) == impl.id
-        assert self._one_line_row_id(one_line_output) == self._tree_root_id(tree_output)
-        assert f"{dropped_one.id} (dropped)" not in tree_output
-        assert f"{dropped_two.id} (dropped)" not in tree_output
 
 
 def test_cmd_next_does_not_call_load_merge_context_when_git_provided(

@@ -132,17 +132,6 @@ class TestHelpOutput:
         assert "project_id: p" in result.stdout
         assert "project_id:" not in config_path.read_text(encoding="utf-8")
 
-    def test_history_lineage_depth_help_mentions_root_deduplicated_trees(self, tmp_path):
-        """history --help should describe tree/root lineage semantics."""
-        setup_config(tmp_path)
-
-        result = invoke_gza("history", "--help", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Render root-deduplicated lineage trees up to N levels" in result.stdout
-        assert "from each resolved root" in result.stdout
-        assert "Expand lineage N levels for each matching task" not in result.stdout
-
     def test_queue_and_lifecycle_help_make_command_scope_explicit(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
 

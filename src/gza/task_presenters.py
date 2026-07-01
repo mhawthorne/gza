@@ -9,6 +9,7 @@ from typing import Literal
 import gza.colors as _colors
 from gza.console import shorten_prompt, truncate
 from gza.db import Task as DbTask
+from gza.lineage_grouping import format_lineage_summary
 from gza.query import TaskLineageNode
 from gza.task_query import (
     LineageRow,
@@ -206,14 +207,8 @@ def _render_rich(result: TaskQueryResult) -> str:
         header_prompt = _headline_prompt(str(values.get("prompt", task.prompt)))
         lines.append(f"⚡ {' '.join(header_bits)} {header_prompt}".rstrip())
 
-        tree_text = values.get("lineage_text")
-        if not isinstance(tree_text, str):
-            tree_text = _render_tree(
-                TaskQueryResult(query=result.query, rows=(row,), total_count=1)
-            )
-        if tree_text:
-            lines.append("lineage:")
-            lines.extend(tree_text.splitlines())
+        if values.get("lineage_task_count") is not None:
+            lines.append(f"lineage: {format_lineage_summary(values)}")
 
         branch = values.get("branch")
         if branch:
