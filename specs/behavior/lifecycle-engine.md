@@ -102,9 +102,17 @@ and default to **off**.
   a circuit breaker; once the failed-attempt cap is reached, the engine MUST park with
   `plan-review-repeatedly-failed` instead of spawning another review.
   If implement descendants exist for an approved manifest but the durable materialization
-  record is missing or incomplete, the engine MUST park with
-  `plan-review-materialization-repair-needed`; it MUST NOT silently treat a partial
-  prefix as a complete materialization.
+  record is missing, incomplete, or already complete while stale extra pending duplicate
+  slice descendants remain outside the recorded set, the engine MUST first attempt
+  deterministic repair when the current descendants can be proven to be an unstarted safe
+  pending subset of that same validated manifest. The matched slice `trigger_source` used
+  to prove that candidate MUST be carried into the repair action and revalidated before
+  any mutation.
+  The repair MUST either recreate one complete durable materialization record for that
+  manifest or leave the prior state unchanged and fall through to parking. The engine MUST park with
+  `plan-review-materialization-repair-needed` only when the partial materialization
+  state is ambiguous or unsafe; it MUST NOT silently treat a partial prefix as a
+  complete materialization.
   If a completed plan already has a non-dropped implement descendant but no recorded
   approved-slice materialization, `iterate` MAY still exit 0, but it MUST report a
   neutral skip such as `already_has_implement`; it MUST NOT claim the plan is already
@@ -613,7 +621,7 @@ is a spec change. The accompanying human message is free text.
 | `plan-review-unknown-verdict` | needs_discussion | §1 completed plan review verdict missing or unparseable |
 | `plan-review-repeatedly-failed` | needs_discussion | §1 failed automated plan-review attempts reached the configured cap |
 | `plan-review-max-cycles-reached` | needs_discussion | §1 `plan_review` / `plan_improve` loop hit `max_plan_review_cycles` |
-| `plan-review-materialization-repair-needed` | needs_discussion | §1 approved manifest has implement descendants without a durable complete materialization record |
+| `plan-review-materialization-repair-needed` | needs_discussion | §1 approved manifest has an ambiguous or unsafe partial materialization state that cannot be auto-repaired safely |
 | `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |
 | `project-scope-violation` | ScopeParked | §3 diff touches paths outside scope, not tagged `cross-project` |
 | `project-scope-unverified` | needs_discussion | §3 diff could not be inspected (fail closed) |

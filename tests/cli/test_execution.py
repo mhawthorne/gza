@@ -11154,15 +11154,15 @@ class TestIterateCommand:
         output = capsys.readouterr().out
         assert "Created implement task" in output
 
-    def test_plan_iterate_partial_materialization_requires_repair(
+    def test_plan_iterate_repair_plan_slice_materialization_executes_action(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
+        from unittest.mock import patch
 
         from gza.cli.execution import cmd_iterate
-        from gza.cli.advance_engine import determine_next_action
-        from gza.plan_review_materialization import build_plan_review_slice_task_specs
-        from tests.test_advance_engine import _FakeGit
+        from gza.plan_review_materialization import PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND, build_plan_review_slice_task_specs
+        from gza.plan_review_verdict import validate_plan_review_manifest
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -11179,12 +11179,23 @@ class TestIterateCommand:
         review.output_content = self._approved_plan_review_output(plan_task.id)
         store.update(review)
 
-        action = determine_next_action(Config.load(tmp_path), store, _FakeGit(can_merge=True), plan_task, "main")
-        assert action["type"] == "materialize_plan_slices"
+        materialize_action = {
+            "type": "materialize_plan_slices",
+            "plan_review_task": review,
+            "manifest": validate_plan_review_manifest(
+                json.loads(self._approved_plan_review_output(plan_task.id).split("```json\n", 1)[1].rsplit("\n```", 1)[0]),
+                markdown_verdict="APPROVED",
+                source_task_id=plan_task.id,
+                source_task_type="plan",
+                max_slice_timeout_minutes=30,
+            ),
+            "plan_source_task": plan_task,
+            "description": "materialize",
+        }
         task_specs = build_plan_review_slice_task_specs(
             plan_source_task=plan_task,
             review_task=review,
-            manifest=action["manifest"],
+            manifest=materialize_action["manifest"],
             trigger_source="manual",
             require_review_before_merge=True,
         )
@@ -11213,9 +11224,28 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        assert cmd_iterate(args) == 3
+        repair_action = {
+            "type": "repair_plan_slice_materialization",
+            "description": "Repair partial plan-review slice materialization",
+            "plan_review_task": review,
+            "plan_source_task": plan_task,
+            "manifest": materialize_action["manifest"],
+            "partial_task_ids": (partial_impl.id,),
+            "repair_trigger_source": "manual",
+        }
+
+        with patch("gza.cli.execution.determine_next_action", return_value=repair_action):
+            assert cmd_iterate(args) == 0
         output = capsys.readouterr().out
-        assert "repair or drop the partial slice set" in output
+        repaired_partial = store.get(partial_impl.id)
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement" and task.status != "dropped"]
+        assert repaired_partial is not None
+        assert repaired_partial.status == "dropped"
+        assert len(implement_tasks) == 1
+        assert "Dropped partial plan-review slices" in output
+        assert f"Created implement task {implement_tasks[0].id}" in output
+        assert "unsupported_action:repair_plan_slice_materialization" not in output
+        assert store.list_artifacts(review.id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND)
 
     def test_plan_improve_iterate_existing_implement_skips_without_duplicates(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -11277,15 +11307,15 @@ class TestIterateCommand:
         assert "Iterate complete: SKIPPED (already_has_implement)" in output
         assert "implement task already exists for this plan" in output
 
-    def test_plan_improve_iterate_partial_materialization_requires_repair(
+    def test_plan_improve_iterate_repair_plan_slice_materialization_executes_action(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
+        from unittest.mock import patch
 
-        from gza.cli.advance_engine import determine_next_action
         from gza.cli.execution import cmd_iterate
-        from gza.plan_review_materialization import build_plan_review_slice_task_specs
-        from tests.test_advance_engine import _FakeGit
+        from gza.plan_review_materialization import PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND, build_plan_review_slice_task_specs
+        from gza.plan_review_verdict import validate_plan_review_manifest
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -11316,12 +11346,21 @@ class TestIterateCommand:
         )
         store.update(revised_review)
 
-        action = determine_next_action(Config.load(tmp_path), store, _FakeGit(can_merge=True), revised_plan, "main")
-        assert action["type"] == "materialize_plan_slices"
+        manifest = validate_plan_review_manifest(
+            json.loads(
+                self._approved_plan_review_output(revised_plan.id, source_task_type="plan_improve")
+                .split("```json\n", 1)[1]
+                .rsplit("\n```", 1)[0]
+            ),
+            markdown_verdict="APPROVED",
+            source_task_id=revised_plan.id,
+            source_task_type="plan_improve",
+            max_slice_timeout_minutes=30,
+        )
         task_specs = build_plan_review_slice_task_specs(
             plan_source_task=revised_plan,
             review_task=revised_review,
-            manifest=action["manifest"],
+            manifest=manifest,
             trigger_source="manual",
             require_review_before_merge=True,
         )
@@ -11350,12 +11389,88 @@ class TestIterateCommand:
             worker_id=None,
         )
 
-        assert cmd_iterate(args) == 3
+        repair_action = {
+            "type": "repair_plan_slice_materialization",
+            "description": "Repair partial plan-review slice materialization",
+            "plan_review_task": revised_review,
+            "plan_source_task": revised_plan,
+            "manifest": manifest,
+            "partial_task_ids": (partial_impl.id,),
+            "repair_trigger_source": "manual",
+        }
+
+        with patch("gza.cli.execution.determine_next_action", return_value=repair_action):
+            assert cmd_iterate(args) == 0
         output = capsys.readouterr().out
-        implement_tasks = [task for task in store.get_all() if task.task_type == "implement"]
+        implement_tasks = [task for task in store.get_all() if task.task_type == "implement" and task.status != "dropped"]
 
         assert len(implement_tasks) == 1
-        assert "repair or drop the partial slice set" in output
+        refreshed_partial = store.get(partial_impl.id)
+        assert refreshed_partial is not None
+        assert refreshed_partial.status == "dropped"
+        assert "Dropped partial plan-review slices" in output
+        assert "unsupported_action:repair_plan_slice_materialization" not in output
+        assert store.list_artifacts(revised_review.id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND)
+
+    def test_plan_iterate_dry_run_surfaces_repair_without_unsupported_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.plan_review_verdict import validate_plan_review_manifest
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan_task = store.add("Partially materialized plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Plan review", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        manifest = validate_plan_review_manifest(
+            json.loads(self._approved_plan_review_output(plan_task.id).split("```json\n", 1)[1].rsplit("\n```", 1)[0]),
+            markdown_verdict="APPROVED",
+            source_task_id=plan_task.id,
+            source_task_type="plan",
+            max_slice_timeout_minutes=30,
+        )
+        repair_action = {
+            "type": "repair_plan_slice_materialization",
+            "description": "Repair partial plan-review slice materialization",
+            "plan_review_task": review,
+            "plan_source_task": plan_task,
+            "manifest": manifest,
+            "partial_task_ids": ("gza-9999",),
+            "repair_trigger_source": "manual",
+        }
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with patch("gza.cli.execution.determine_next_action", return_value=repair_action):
+            assert cmd_iterate(args) == 0
+
+        output = capsys.readouterr().out
+        assert f"[dry-run] Would repair partial approved plan-review slice materialization from {review.id}" in output
+        assert "unsupported_action:repair_plan_slice_materialization" not in output
 
     def test_plan_iterate_background_bypasses_impl_preflight(
         self, tmp_path: Path

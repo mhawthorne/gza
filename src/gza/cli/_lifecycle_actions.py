@@ -234,6 +234,13 @@ def _advance_action_color(action_type: str) -> str:
         "create_improve",
     }:
         return _colors.STATUS_COLORS.in_progress
-    if action_type in {"materialize_plan_slices", "create_implement", "resume", "retry", "reconcile"}:
+    if action_type in {
+        "materialize_plan_slices",
+        "repair_plan_slice_materialization",
+        "create_implement",
+        "resume",
+        "retry",
+        "reconcile",
+    }:
         return _colors.STATUS_COLORS.pending
     return _colors.default_color

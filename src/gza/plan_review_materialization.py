@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from typing import TypedDict
 
-from gza.db import NewTaskParams, SqliteTaskStore, Task
+from gza.db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from gza.plan_review_verdict import PlanReviewManifest
 
 PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND = "plan_review_materialization"
@@ -19,6 +19,14 @@ _LEGACY_PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION = 1
 class _MaterializedSliceAttributes(TypedDict):
     trigger_source: str
     create_review: bool
+
+
+@dataclass(frozen=True)
+class PlanReviewMaterializationInspection:
+    """Repair-focused view of same-pair materialization artifacts."""
+
+    reusable_tasks: list[Task] | None
+    blocked_reason: str | None = None
 
 
 def plan_review_manifest_digest(manifest: PlanReviewManifest) -> str:
@@ -184,6 +192,44 @@ def load_materialized_plan_slice_set(
     return None
 
 
+def inspect_plan_review_materialization_for_repair(
+    store: SqliteTaskStore,
+    *,
+    review_task: Task,
+    plan_source_task: Task,
+    manifest: PlanReviewManifest,
+) -> PlanReviewMaterializationInspection:
+    """Fail closed on ambiguous same-pair materialization artifacts before repair."""
+    if review_task.id is None or plan_source_task.id is None:
+        return PlanReviewMaterializationInspection(reusable_tasks=None)
+
+    same_pair_artifacts = _list_same_pair_materialization_artifacts(
+        store=store,
+        review_task=review_task,
+        plan_source_task=plan_source_task,
+    )
+    if not same_pair_artifacts:
+        return PlanReviewMaterializationInspection(reusable_tasks=None)
+
+    expected_digest = plan_review_manifest_digest(manifest)
+    reusable_tasks: list[Task] | None = None
+    for artifact in same_pair_artifacts:
+        artifact_tasks, blocked_reason = _inspect_materialization_artifact_for_repair(
+            store=store,
+            artifact=artifact,
+            review_task=review_task,
+            plan_source_task=plan_source_task,
+            manifest=manifest,
+            expected_digest=expected_digest,
+        )
+        if blocked_reason is not None:
+            return PlanReviewMaterializationInspection(reusable_tasks=None, blocked_reason=blocked_reason)
+        if artifact_tasks is not None:
+            reusable_tasks = artifact_tasks
+
+    return PlanReviewMaterializationInspection(reusable_tasks=reusable_tasks)
+
+
 def _materialized_tasks_match_manifest(
     *,
     materialized_tasks: list[Task],
@@ -232,6 +278,86 @@ def _materialized_tasks_match_manifest(
             return False
 
     return True
+
+
+def _list_same_pair_materialization_artifacts(
+    *,
+    store: SqliteTaskStore,
+    review_task: Task,
+    plan_source_task: Task,
+) -> list[TaskArtifact]:
+    assert review_task.id is not None
+    assert plan_source_task.id is not None
+
+    return sorted(
+        store.list_artifacts(review_task.id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND),
+        key=lambda candidate: candidate.created_at,
+        reverse=True,
+    )
+
+
+def _inspect_materialization_artifact_for_repair(
+    *,
+    store: SqliteTaskStore,
+    artifact: TaskArtifact,
+    review_task: Task,
+    plan_source_task: Task,
+    manifest: PlanReviewManifest,
+    expected_digest: str,
+) -> tuple[list[Task] | None, str | None]:
+    metadata = artifact.metadata
+    if not isinstance(metadata, Mapping):
+        return None, f"materialization artifact {artifact.id} has invalid metadata"
+
+    schema_version = metadata.get("schema_version")
+    if schema_version not in {
+        PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+        _LEGACY_PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+    }:
+        return None, f"materialization artifact {artifact.id} has unsupported schema version"
+    if metadata.get("review_task_id") != review_task.id:
+        return None, f"materialization artifact {artifact.id} has invalid review provenance"
+    if metadata.get("source_task_id") != plan_source_task.id:
+        return None, f"materialization artifact {artifact.id} has invalid source provenance"
+    if metadata.get("source_task_type") != plan_source_task.task_type:
+        return None, f"materialization artifact {artifact.id} has invalid source task type"
+    if metadata.get("manifest_digest") != expected_digest:
+        return None, f"materialization artifact {artifact.id} points at a different manifest digest"
+
+    task_ids = metadata.get("task_ids")
+    if not isinstance(task_ids, list) or not task_ids:
+        return None, f"materialization artifact {artifact.id} is missing complete task ids"
+    if len(task_ids) != len(manifest.slices):
+        return None, f"materialization artifact {artifact.id} has incomplete task ids"
+    if any(not isinstance(task_id, str) for task_id in task_ids):
+        return None, f"materialization artifact {artifact.id} has malformed task ids"
+    if len(set(task_ids)) != len(task_ids):
+        return None, f"materialization artifact {artifact.id} has duplicate task ids"
+
+    materialized_tasks: list[Task] = []
+    for task_id in task_ids:
+        materialized_task = store.get(task_id)
+        if materialized_task is None or materialized_task.status == "dropped":
+            return None, f"materialization artifact {artifact.id} references incomplete task ids"
+        materialized_tasks.append(materialized_task)
+
+    persisted_attributes = _resolve_materialized_slice_attributes(
+        metadata=metadata,
+        materialized_tasks=materialized_tasks,
+    )
+    if persisted_attributes is None:
+        return None, f"materialization artifact {artifact.id} has invalid slice metadata"
+    if not _materialized_tasks_match_manifest(
+        materialized_tasks=materialized_tasks,
+        manifest=manifest,
+        plan_source_task=plan_source_task,
+        review_task=review_task,
+        expected_trigger_source=persisted_attributes["trigger_source"],
+        expected_create_review=persisted_attributes["create_review"],
+    ):
+        return None, f"materialization artifact {artifact.id} no longer validates against the manifest"
+
+    return materialized_tasks, None
 
 
 def _resolve_materialized_slice_attributes(

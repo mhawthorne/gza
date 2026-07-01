@@ -90,7 +90,8 @@ Manual `implement` follow-up for a held plan is intentionally explicit. `uv run 
 | Completed non-held plan with `NEEDS_DISCUSSION` or unknown plan-review verdict | `needs_discussion` — stop for a human (`reason=plan-review-needs-discussion` or `plan-review-unknown-verdict`) |
 | Completed non-held plan with auto plan-review creation disabled | `needs_discussion` — require manual plan-review creation (`reason=plan-review-needs-manual-creation`) |
 | Completed non-held plan whose plan-review loop hit `max_plan_review_cycles` | `needs_discussion` — stop repeated plan churn (`reason=plan-review-max-cycles-reached`) |
-| Completed non-held plan with approved plan review slices partially present but no durable materialization record | `needs_discussion` — repair or drop the partial slice set before retrying (`reason=plan-review-materialization-repair-needed`) |
+| Completed non-held plan with approved plan review slices partially present, the current partial slice set is a proven safe pending subset of the validated manifest, and the durable materialization record is either missing/incomplete or already complete while stale extra pending duplicate slice descendants remain outside the recorded set | `repair_plan_slice_materialization` — revalidate the partial slice set, drop the safe pending partial rows, and rematerialize the full validated slice set through the shared guarded executor path using the same matched slice `trigger_source` that proved the repair candidate |
+| Completed non-held plan with approved plan review slices partially present, but the materialization state is ambiguous or unsafe | `needs_discussion` — stop for manual repair or drop of the partial slice set (`reason=plan-review-materialization-repair-needed`) |
 | Completed non-held plan with `require_plan_review_before_implement=false` | `create_implement` — legacy compatibility path |
 | Plan with existing implement child | `skip` — either approved slices are already materialized, or a legacy/direct implement child already exists |
 
@@ -333,6 +334,7 @@ These actions create background workers and count toward the batch limit. The so
 | `merge` | Merges the task's branch synchronously. Respects `merge_squash_threshold`. |
 | `merge_with_followups` | Creates/reuses follow-up `implement` tasks from parsed `## Follow-Ups` findings, then merges synchronously. |
 | `release_approved_plan_review` | Releases a held approved plan source by persisting `auto_implement=true`; slice materialization remains a later pass through the normal approved-manifest action. |
+| `repair_plan_slice_materialization` | Re-reads the current approved plan-review/source rows, revalidates the current partial descendant slice set against the validated manifest with the same matched slice `trigger_source` that selected the repair action, and only then drops the safe pending partial rows and rematerializes the full slice set. `advance`, `watch`, and foreground `iterate` all route through this same guarded executor path. |
 | `clear_off_topic_verify_blocker` | Clears a verify-only review blocker after audited off-topic classification, then durably creates or reuses one non-blocking investigation task per normalized failure signature before the lineage can continue toward merge. |
 
 ### Skip actions

@@ -1438,6 +1438,50 @@ def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> 
     assert "`awaiting_human` — review the plan, then run `uv run gza implement <id>`" in internal_content
 
 
+def test_plan_materialization_repair_docs_distinguish_repairable_from_ambiguous_partial_state() -> None:
+    """Workflow/spec docs should route repairable partial slice materialization through the direct repair action."""
+    repo_root = Path(__file__).resolve().parents[1]
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    workflow_plan_section = workflow.split("### 1. Plan tasks", 1)[1].split("### 2. Explore source follow-up", 1)[0]
+
+    repairable_row = (
+        "| Completed non-held plan with approved plan review slices partially present, the current partial "
+        "slice set is a proven safe pending subset of the validated manifest, and the durable "
+        "materialization record is either missing/incomplete or already complete while stale extra pending "
+        "duplicate slice descendants remain outside the recorded set | `repair_plan_slice_materialization` "
+        "— revalidate the partial slice set, drop the safe pending partial rows, and rematerialize the full "
+        "validated slice set through the shared guarded executor path using the same matched slice "
+        "`trigger_source` that proved the repair candidate |"
+    )
+    ambiguous_row = (
+        "| Completed non-held plan with approved plan review slices partially present, but the materialization "
+        "state is ambiguous or unsafe | `needs_discussion` — stop for manual repair or drop of the partial "
+        "slice set (`reason=plan-review-materialization-repair-needed`) |"
+    )
+
+    assert repairable_row in workflow_plan_section
+    assert ambiguous_row in workflow_plan_section
+
+    stale_workflow_row = (
+        "| Completed non-held plan with approved plan review slices partially present but no durable "
+        "materialization record | `needs_discussion` — repair or drop the partial slice set before "
+        "retrying (`reason=plan-review-materialization-repair-needed`) |"
+    )
+    assert stale_workflow_row not in workflow
+
+    lifecycle_flat = _normalize_whitespace(lifecycle)
+    assert "the engine MUST first attempt deterministic repair" in lifecycle_flat
+    assert (
+        "record is missing, incomplete, or already complete while stale extra pending duplicate "
+        "slice descendants remain outside the recorded set"
+    ) in lifecycle_flat
+    assert (
+        "MUST park with `plan-review-materialization-repair-needed` only when the partial "
+        "materialization state is ambiguous or unsafe"
+    ) in lifecycle_flat
+
+
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:
     """Docker config docs should explain pre-warm semantics and why first-use lazy installs race."""
     docs_root = Path(__file__).resolve().parents[1] / "docs"

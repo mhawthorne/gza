@@ -70,6 +70,7 @@ from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_error_message
+from ..plan_review_materialization import load_materialized_plan_slice_set
 from ..plan_review_verdict import PlanReviewManifest, get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
 from ..query import (
@@ -120,6 +121,7 @@ from ._common import (
     _prepare_task_for_immediate_execution,
     _prepare_task_for_reserved_launch,
     _record_preclaim_startup_failure,
+    _repair_plan_review_slice_materialization,
     _resolved_review_scope_metadata,
     _run_as_worker,
     _run_foreground,
@@ -6660,6 +6662,14 @@ def _cmd_iterate_plan(
                 else "approved plan review"
             )
             print(f"[dry-run] Would materialize approved plan-review slices from {review_label}")
+        elif initial_action_type == "repair_plan_slice_materialization":
+            plan_review_task = initial_action.get("plan_review_task")
+            review_label = (
+                plan_review_task.id
+                if isinstance(plan_review_task, DbTask) and plan_review_task.id is not None
+                else "approved plan review"
+            )
+            print(f"[dry-run] Would repair partial approved plan-review slice materialization from {review_label}")
         else:
             print(f"[dry-run] First next action: {initial_action_type} - {initial_action_description}")
         return 0
@@ -6888,6 +6898,108 @@ def _cmd_iterate_plan(
                 )
             final_status = "materialized"
             final_stop_reason = "materialized" if materialization.created else "already_materialized"
+            final_exit_code = 0
+            break
+
+        if action_type == "repair_plan_slice_materialization":
+            exec_result = execute_advance_action(
+                task=source_task,
+                action=action,
+                context=AdvanceActionExecutionContext(
+                    store=store,
+                    trigger_source="manual",
+                    dry_run=False,
+                    max_resume_attempts=effective_max_resume_attempts,
+                    use_iterate_for_create_implement=False,
+                    use_iterate_for_needs_rebase=False,
+                    prepare_task_for_background_start=lambda task, _rollback: task,
+                    prepare_create_review=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("prepare_create_review should not run for plan materialization repair")
+                    ),
+                    create_resume_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_resume_task should not run for plan materialization repair")
+                    ),
+                    create_rebase_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_rebase_task should not run for plan materialization repair")
+                    ),
+                    create_implement_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_implement_task should not run for plan materialization repair")
+                    ),
+                    spawn_worker=lambda _task, _kind: (_ for _ in ()).throw(
+                        AssertionError("spawn_worker should not run for plan materialization repair")
+                    ),
+                    spawn_resume_worker=lambda _task, _kind: (_ for _ in ()).throw(
+                        AssertionError("spawn_resume_worker should not run for plan materialization repair")
+                    ),
+                    spawn_iterate_worker=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        AssertionError("spawn_iterate_worker should not run for plan materialization repair")
+                    ),
+                    repair_plan_slice_materialization=lambda plan_task, review_task, manifest, partial_task_ids, repair_trigger_source: (
+                        _repair_plan_review_slice_materialization(
+                            config,
+                            store,
+                            plan_task,
+                            review_task,
+                            manifest,
+                            partial_task_ids=partial_task_ids,
+                            trigger_source=repair_trigger_source,
+                            require_review_before_merge=config.require_review_before_merge,
+                        )
+                    ),
+                    config=config,
+                ),
+            )
+            if exec_result.success_message:
+                print(f"  {exec_result.success_message}")
+            elif exec_result.message:
+                print(f"  {exec_result.message.removeprefix('SKIP: ')}")
+            if exec_result.status != "success":
+                final_status = "blocked"
+                final_stop_reason = exec_result.attention_reason or action_type
+                final_message = exec_result.message
+                final_exit_code = 3
+                break
+
+            action_source, review_task, manifest, manifest_error = _resolve_plan_materialization_action_inputs(
+                config=config,
+                store=store,
+                action=action,
+                fallback_source_task=source_task,
+            )
+            if action_source is None or review_task is None or manifest is None:
+                final_status = "blocked"
+                final_stop_reason = "invalid_manifest"
+                final_message = manifest_error or "approved plan review is missing materialization inputs"
+                final_exit_code = 3
+                break
+            materialized_tasks = load_materialized_plan_slice_set(
+                store,
+                review_task=review_task,
+                plan_source_task=action_source,
+                manifest=manifest,
+            ) or []
+            _emit_plan_slice_materialization(
+                PlanReviewMaterializationResult(
+                    tasks=materialized_tasks,
+                    created="Rematerialized implementation slices:" in exec_result.message,
+                ),
+                plan_source_id=action_source.id or "unknown",
+                plan_review_id=review_task.id or "unknown",
+            )
+            for task in materialized_tasks:
+                _append_iterate_summary_row(
+                    store,
+                    summary_rows,
+                    iteration_index=improve_iteration,
+                    task_type="implement",
+                    task=task,
+                )
+            final_status = "materialized"
+            final_stop_reason = (
+                "already_materialized"
+                if "Reused implementation slices:" in exec_result.message
+                else "materialized"
+            )
             final_exit_code = 0
             break
 

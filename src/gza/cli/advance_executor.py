@@ -54,10 +54,13 @@ from ..runner import (
     _worktree_execution_dir,
 )
 from ._common import (
+    PlanReviewMaterializationRepairBlocked,
+    PlanReviewMaterializationRepairResult,
     PlanReviewMaterializationResult,
     _create_improve_task,
     _create_retry_task,
     _prepare_task_for_reserved_launch,
+    _repair_plan_review_slice_materialization,
     format_duplicate_active_child_message,
     format_duplicate_rebase_message,
     release_held_plan_source,
@@ -113,6 +116,10 @@ class AdvanceActionExecutionContext:
     create_plan_improve_task: Callable[[DbTask, DbTask], DbTask] | None = None
     create_review_adjudication_task: Callable[[DbTask, DbTask, Any, dict[str, Any]], DbTask] | None = None
     materialize_plan_slices: Callable[[DbTask, DbTask, PlanReviewManifest], PlanReviewMaterializationResult] | None = None
+    repair_plan_slice_materialization: Callable[
+        [DbTask, DbTask, PlanReviewManifest, tuple[str, ...], str],
+        PlanReviewMaterializationRepairResult,
+    ] | None = None
     create_targeted_rebase_task: Callable[[DbTask, str], DbTask] | None = None
     reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
     config: Any | None = None
@@ -193,7 +200,7 @@ _WORKER_ACTIONS = frozenset(
     }
 )
 
-_DIRECT_ACTIONS = frozenset({"release_approved_plan_review"})
+_DIRECT_ACTIONS = frozenset({"release_approved_plan_review", "repair_plan_slice_materialization"})
 
 
 def _should_continue_branch_publication_after_reconcile(
@@ -306,6 +313,30 @@ def _prepare_spec_coherence_review_action(
         review_task=review_task,
         message=f"Created behavior-spec coherence review task {review_task.id}",
     )
+
+
+def _build_default_plan_slice_materialization_repair(
+    context: AdvanceActionExecutionContext,
+) -> Callable[
+    [DbTask, DbTask, PlanReviewManifest, tuple[str, ...], str],
+    PlanReviewMaterializationRepairResult,
+]:
+    config = context.config
+    assert config is not None
+    return lambda source_task, plan_review_task, repair_manifest, repair_task_ids, repair_trigger_source: (
+        _repair_plan_review_slice_materialization(
+            config,
+            context.store,
+            source_task,
+            plan_review_task,
+            repair_manifest,
+            partial_task_ids=repair_task_ids,
+            trigger_source=repair_trigger_source,
+            require_review_before_merge=getattr(config, "require_review_before_merge", True),
+        )
+    )
+
+
 def build_improve_needs_attention_result(
     *,
     store: SqliteTaskStore,
@@ -1422,6 +1453,89 @@ def execute_advance_action(
             success_message=message,
             work_done=changed,
             handled_task_id=plan_source_task.id,
+        )
+
+    if action_type == "repair_plan_slice_materialization":
+        review_task = action.get("plan_review_task")
+        plan_source_task = action.get("plan_source_task")
+        manifest = action.get("manifest")
+        partial_task_ids = action.get("partial_task_ids")
+        repair_trigger_source = action.get("repair_trigger_source")
+        if (
+            not isinstance(review_task, DbTask)
+            or review_task.id is None
+            or not isinstance(plan_source_task, DbTask)
+            or plan_source_task.id is None
+            or not isinstance(manifest, PlanReviewManifest)
+            or not isinstance(partial_task_ids, tuple)
+            or any(not isinstance(task_id, str) for task_id in partial_task_ids)
+            or not isinstance(repair_trigger_source, str)
+            or not repair_trigger_source
+        ):
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message="missing plan materialization repair inputs",
+            )
+        if context.dry_run:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="dry_run",
+                message=action.get("description", "Repair plan slice materialization"),
+                work_done=True,
+                handled_task_id=review_task.id,
+            )
+
+        repair = context.repair_plan_slice_materialization
+        if repair is None:
+            if context.config is None:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message="plan slice materialization repair is unavailable",
+                )
+            repair = _build_default_plan_slice_materialization_repair(context)
+        try:
+            repair_result = repair(
+                plan_source_task,
+                review_task,
+                manifest,
+                partial_task_ids,
+                repair_trigger_source,
+            )
+        except PlanReviewMaterializationRepairBlocked as exc:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=f"SKIP: {exc}",
+                attention_type="needs_discussion",
+                attention_reason=exc.reason,
+                handled_task_id=review_task.id,
+            )
+        except ValueError as exc:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=f"SKIP: {exc}",
+                attention_type="needs_discussion",
+                attention_reason="plan-review-materialization-repair-needed",
+                handled_task_id=review_task.id,
+            )
+        dropped_ids = ", ".join(task.id or "unknown" for task in repair_result.dropped_tasks)
+        created_ids = ", ".join(task.id or "unknown" for task in repair_result.materialization.tasks)
+        verb = "Rematerialized" if repair_result.materialization.created else "Reused"
+        message = (
+            f"Dropped partial plan-review slices: {dropped_ids}. "
+            f"{verb} implementation slices: {created_ids}"
+        )
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            message=message,
+            success_message=message,
+            work_done=True,
+            handled_task_id=review_task.id,
+            created_task=repair_result.materialization.tasks[0] if repair_result.materialization.tasks else None,
         )
 
     if action_type == "create_review":

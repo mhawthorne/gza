@@ -130,6 +130,7 @@ from ._common import (
     _materialize_plan_review_slices,
     _precondition_blocking_dependency_id,
     _prepare_task_for_immediate_execution,
+    _repair_plan_review_slice_materialization,
     _spawn_background_resume_worker,
     _spawn_background_worker,
     clear_task_queue_position_scoped,
@@ -4396,6 +4397,18 @@ def _run_cycle(
             manifest,
             trigger_source="plan-review",
             require_review_before_merge=config.require_review_before_merge,
+        ),
+        repair_plan_slice_materialization=lambda plan_task, review_task, manifest, partial_task_ids, repair_trigger_source: (
+            _repair_plan_review_slice_materialization(
+                config,
+                store,
+                plan_task,
+                review_task,
+                manifest,
+                partial_task_ids=partial_task_ids,
+                trigger_source=repair_trigger_source,
+                require_review_before_merge=config.require_review_before_merge,
+            )
         ),
         create_targeted_rebase_task=_create_targeted_rebase_from_task,
         spawn_worker=_watch_spawn_worker,

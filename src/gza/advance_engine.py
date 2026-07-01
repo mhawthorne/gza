@@ -38,7 +38,9 @@ from gza.off_topic_verify import (
 from gza.operator_state import terminal_no_work_lifecycle_detail
 from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
+    inspect_plan_review_materialization_for_repair,
     load_materialized_plan_slice_set,
+    plan_review_manifest_digest,
 )
 from gza.plan_review_verdict import (
     PlanReviewManifest,
@@ -268,6 +270,16 @@ class PlanMaterializationState:
     materialized: bool
     task_ids: tuple[str, ...] = ()
     partial_slice_descendants_detected: bool = False
+    partial_repair_candidate: PlanMaterializationRepairCandidate | None = None
+
+
+@dataclass(frozen=True)
+class PlanMaterializationRepairCandidate:
+    """Validated pending slice subset that can be deterministically rematerialized."""
+
+    partial_task_ids: tuple[str, ...]
+    manifest_digest: str
+    trigger_source: str
 
 
 @dataclass(frozen=True)
@@ -3670,6 +3682,33 @@ def _failed_plan_review_retry_limit_action(ctx: AdvanceContext) -> dict[str, Any
     )
 
 
+def _repair_plan_slice_materialization_action(ctx: AdvanceContext) -> dict[str, Any]:
+    state = ctx.plan_materialization_state
+    candidate = (
+        state.partial_repair_candidate
+        if state is not None and state.partial_repair_candidate is not None
+        else PlanMaterializationRepairCandidate(
+            partial_task_ids=(),
+            manifest_digest="",
+            trigger_source="plan-review",
+        )
+    )
+
+    return {
+        "type": "repair_plan_slice_materialization",
+        "description": (
+            "Repair partial plan-review slice materialization from approved review "
+            f"{_task_id(ctx.latest_completed_plan_review)}"
+        ),
+        "plan_review_task": ctx.latest_completed_plan_review,
+        "plan_source_task": ctx.latest_plan_source or ctx.task,
+        "manifest": ctx.validated_plan_review_manifest,
+        "manifest_digest": candidate.manifest_digest,
+        "partial_task_ids": candidate.partial_task_ids,
+        "repair_trigger_source": candidate.trigger_source,
+    }
+
+
 def _resolve_plan_materialization_state(
     *,
     config: Any,
@@ -3680,6 +3719,11 @@ def _resolve_plan_materialization_state(
 ) -> PlanMaterializationState:
     if latest_completed_plan_review is None or manifest is None:
         return PlanMaterializationState(materialized=False)
+    descendants = (
+        _list_non_dropped_implement_descendants_for_plan_source(store, latest_plan_source.id)
+        if latest_plan_source.id is not None
+        else []
+    )
     materialized_tasks = load_materialized_plan_slice_set(
         store,
         review_task=latest_completed_plan_review,
@@ -3687,56 +3731,290 @@ def _resolve_plan_materialization_state(
         manifest=manifest,
     )
     if materialized_tasks is None:
-        return PlanMaterializationState(
-            materialized=False,
-            partial_slice_descendants_detected=_has_unrecorded_plan_review_slice_descendants(
+        partial_descendants_detected, partial_repair_candidate = (
+            _classify_plan_review_slice_descendants_for_materialization_state(
                 config=config,
                 store=store,
                 latest_plan_source=latest_plan_source,
                 latest_completed_plan_review=latest_completed_plan_review,
                 manifest=manifest,
-            ),
+                descendants=descendants,
+            )
         )
+        return PlanMaterializationState(
+            materialized=False,
+            partial_slice_descendants_detected=partial_descendants_detected,
+            partial_repair_candidate=partial_repair_candidate,
+        )
+    materialized_task_ids = tuple(task.id for task in materialized_tasks if task.id is not None)
+    materialized_task_id_set = set(materialized_task_ids)
+    live_descendant_ids = {task.id for task in descendants if task.id is not None}
+    if (
+        len(descendants) == len(materialized_tasks)
+        and live_descendant_ids == materialized_task_id_set
+    ):
+        return PlanMaterializationState(
+            materialized=True,
+            task_ids=materialized_task_ids,
+        )
+
+    extra_descendants = [
+        task for task in descendants if task.id is None or task.id not in materialized_task_id_set
+    ]
+    partial_descendants_detected, partial_repair_candidate = (
+        _classify_plan_review_slice_descendants_for_materialization_state(
+            config=config,
+            store=store,
+            latest_plan_source=latest_plan_source,
+            latest_completed_plan_review=latest_completed_plan_review,
+            manifest=manifest,
+            descendants=extra_descendants,
+        )
+    )
     return PlanMaterializationState(
-        materialized=True,
-        task_ids=tuple(task.id for task in materialized_tasks if task.id is not None),
+        materialized=False,
+        task_ids=materialized_task_ids,
+        partial_slice_descendants_detected=partial_descendants_detected,
+        partial_repair_candidate=partial_repair_candidate,
     )
 
 
-def _has_unrecorded_plan_review_slice_descendants(
+def _classify_plan_review_slice_descendants_for_materialization_state(
     *,
     config: Any,
     store: SqliteTaskStore,
     latest_plan_source: DbTask,
     latest_completed_plan_review: DbTask,
     manifest: PlanReviewManifest,
-) -> bool:
-    """Return whether approved slice tasks exist without a durable materialization record."""
+    descendants: list[DbTask],
+) -> tuple[bool, PlanMaterializationRepairCandidate | None]:
+    """Classify live slice descendants as repairable partial state or ambiguous extras."""
     if latest_plan_source.id is None or latest_completed_plan_review.id is None:
-        return False
+        return False, None
 
-    expected_prompts = {
-        spec.prompt
-        for spec in build_plan_review_slice_task_specs(
+    if not descendants:
+        return False, None
+
+    inspection = inspect_plan_review_materialization_for_repair(
+        store,
+        review_task=latest_completed_plan_review,
+        plan_source_task=latest_plan_source,
+        manifest=manifest,
+    )
+    if inspection.blocked_reason is not None:
+        return True, None
+
+    require_review_before_merge = getattr(config, "require_review_before_merge", True)
+    trigger_sources = ("manual", "plan-review")
+    matched_any_descendant = False
+
+    for trigger_source in trigger_sources:
+        expected_specs = build_plan_review_slice_task_specs(
             plan_source_task=latest_plan_source,
             review_task=latest_completed_plan_review,
             manifest=manifest,
-            trigger_source="manual",
-            require_review_before_merge=getattr(config, "require_review_before_merge", True),
+            trigger_source=trigger_source,
+            require_review_before_merge=require_review_before_merge,
         )
-    }
-    if not expected_prompts:
-        return False
+        candidate = _build_plan_materialization_repair_candidate(
+            descendants=descendants,
+            plan_source_task=latest_plan_source,
+            review_task=latest_completed_plan_review,
+            manifest=manifest,
+            trigger_source=trigger_source,
+            require_review_before_merge=require_review_before_merge,
+        )
+        if candidate is not None:
+            return True, candidate
+        expected_prompts = {spec.prompt for spec in expected_specs}
+        if any(task.prompt in expected_prompts for task in descendants) or any(
+            _task_has_slice_like_plan_review_provenance(
+                task=task,
+                expected_specs=expected_specs,
+                plan_source_task=latest_plan_source,
+                descendants=descendants,
+            )
+            for task in descendants
+        ):
+            matched_any_descendant = True
 
+    return matched_any_descendant, None
+
+
+def _build_plan_materialization_repair_candidate(
+    *,
+    descendants: list[DbTask],
+    plan_source_task: DbTask,
+    review_task: DbTask,
+    manifest: PlanReviewManifest,
+    trigger_source: str,
+    require_review_before_merge: bool,
+) -> PlanMaterializationRepairCandidate | None:
+    expected_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan_source_task,
+        review_task=review_task,
+        manifest=manifest,
+        trigger_source=trigger_source,
+        require_review_before_merge=require_review_before_merge,
+    )
+    if not expected_specs:
+        return None
+
+    prompt_to_index: dict[str, int] = {}
+    for index, spec in enumerate(expected_specs):
+        if spec.prompt in prompt_to_index:
+            return None
+        prompt_to_index[spec.prompt] = index
+
+    matched_tasks: dict[int, DbTask] = {}
+    for task in descendants:
+        spec_index = prompt_to_index.get(task.prompt)
+        if spec_index is None:
+            return None
+        if task.status != "pending" or task.branch:
+            return None
+        if spec_index in matched_tasks:
+            return None
+        matched_tasks[spec_index] = task
+
+    if not matched_tasks:
+        return None
+
+    for spec_index, task in matched_tasks.items():
+        expected_spec = expected_specs[spec_index]
+        if task.task_type != expected_spec.task_type:
+            return None
+        if task.trigger_source != expected_spec.trigger_source:
+            return None
+        if task.same_branch != expected_spec.same_branch:
+            return None
+        if task.review_scope != expected_spec.review_scope:
+            return None
+        if task.tags != expected_spec.tags:
+            return None
+        if task.create_review != expected_spec.create_review:
+            return None
+        if task.based_on != _resolve_partial_materialized_candidate_ref(expected_spec.based_on, matched_tasks):
+            return None
+        if task.depends_on != _resolve_partial_materialized_candidate_ref(expected_spec.depends_on, matched_tasks):
+            return None
+
+    ordered_partial_task_ids = tuple(
+        task.id
+        for spec_index, task in sorted(matched_tasks.items())
+        if task.id is not None
+    )
+    if not ordered_partial_task_ids:
+        return None
+
+    return PlanMaterializationRepairCandidate(
+        partial_task_ids=ordered_partial_task_ids,
+        manifest_digest=plan_review_manifest_digest(manifest),
+        trigger_source=trigger_source,
+    )
+
+
+def _resolve_partial_materialized_candidate_ref(
+    value: str | None,
+    indexed_tasks: Mapping[int, DbTask],
+) -> str | None:
+    if value is None:
+        return None
+    if not value.startswith("__new_task_idx__:"):
+        return value
+    index = int(value.split(":", 1)[1])
+    resolved = indexed_tasks.get(index)
+    if resolved is None:
+        return None
+    return resolved.id
+
+
+def _task_has_slice_like_plan_review_provenance(
+    *,
+    task: DbTask,
+    expected_specs: list[Any],
+    plan_source_task: DbTask,
+    descendants: list[DbTask],
+) -> bool:
+    """Return whether a descendant still matches the durable shape of a slice task."""
+    return any(
+        _task_matches_slice_like_expected_spec(
+            task=task,
+            expected_spec=expected_spec,
+            plan_source_task=plan_source_task,
+            descendants=descendants,
+        )
+        for expected_spec in expected_specs
+    )
+
+
+def _task_matches_slice_like_expected_spec(
+    *,
+    task: DbTask,
+    expected_spec: Any,
+    plan_source_task: DbTask,
+    descendants: list[DbTask],
+) -> bool:
+    if plan_source_task.id is None:
+        return False
+    if task.task_type != expected_spec.task_type:
+        return False
+    if task.trigger_source != expected_spec.trigger_source:
+        return False
+    if task.same_branch != expected_spec.same_branch:
+        return False
+    if task.review_scope != expected_spec.review_scope:
+        return False
+    if task.tags != expected_spec.tags:
+        return False
+    if task.create_review != expected_spec.create_review:
+        return False
+    if not _partial_descendant_ref_matches_expected_shape(
+        actual_ref=task.based_on,
+        expected_ref=expected_spec.based_on,
+        plan_source_task_id=plan_source_task.id,
+        descendants=descendants,
+    ):
+        return False
+    if not _partial_descendant_ref_matches_expected_shape(
+        actual_ref=task.depends_on,
+        expected_ref=expected_spec.depends_on,
+        plan_source_task_id=plan_source_task.id,
+        descendants=descendants,
+    ):
+        return False
+    return True
+
+
+def _partial_descendant_ref_matches_expected_shape(
+    *,
+    actual_ref: str | None,
+    expected_ref: str | None,
+    plan_source_task_id: str,
+    descendants: list[DbTask],
+) -> bool:
+    if expected_ref is None:
+        return actual_ref is None
+    if not expected_ref.startswith("__new_task_idx__:"):
+        return actual_ref == expected_ref
+    if actual_ref is None or actual_ref == plan_source_task_id:
+        return False
+    return any(descendant.id == actual_ref for descendant in descendants if descendant.id is not None)
+
+
+def _list_non_dropped_implement_descendants_for_plan_source(
+    store: SqliteTaskStore,
+    source_task_id: str,
+) -> list[DbTask]:
+    descendants: list[DbTask] = []
     for task in store.get_all():
         if (
             task.task_type == "implement"
             and task.status != "dropped"
-            and task.prompt in expected_prompts
-            and _is_based_on_descendant_of_source(store, task, latest_plan_source.id)
+            and _is_based_on_descendant_of_source(store, task, source_task_id)
         ):
-            return True
-    return False
+            descendants.append(task)
+    return descendants
 
 
 def _is_based_on_descendant_of_source(store: SqliteTaskStore, task: DbTask, source_task_id: str) -> bool:
@@ -5422,6 +5700,23 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 else "SKIP: implement task already exists for this plan"
             ),
         },
+    ),
+    AdvanceRule(
+        name="plan_partial_materialization_auto_repair",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.plan_review_verdict == "APPROVED"
+            and ctx.validated_plan_review_manifest is not None
+            and ctx.latest_completed_plan_review is not None
+            and ctx.plan_materialization_state is not None
+            and ctx.plan_materialization_state.partial_repair_candidate is not None
+            and not ctx.plan_materialization_state.materialized
+        ),
+        action=_repair_plan_slice_materialization_action,
     ),
     AdvanceRule(
         name="plan_partial_materialization_requires_repair",

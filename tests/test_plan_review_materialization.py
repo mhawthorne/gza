@@ -14,6 +14,7 @@ from gza.plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
     build_plan_review_slice_task_specs,
+    inspect_plan_review_materialization_for_repair,
     load_materialized_plan_slice_set,
     plan_review_manifest_digest,
 )
@@ -116,6 +117,49 @@ def _persist_materialization_artifact(
             "task_ids": [task.id for task in created_tasks if task.id is not None],
         },
     )
+
+
+def _create_materialization_record(
+    store: SqliteTaskStore,
+    *,
+    plan_id: str,
+    review_id: str,
+    manifest,
+    trigger_source: str = "plan-review",
+    require_review_before_merge: bool = True,
+):
+    plan = store.get(plan_id)
+    review = store.get(review_id)
+    assert plan is not None
+    assert review is not None
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=manifest,
+        trigger_source=trigger_source,
+        require_review_before_merge=require_review_before_merge,
+    )
+    created_tasks = store.add_tasks_with_artifact_atomic(
+        tasks=task_specs,
+        artifact_task_id=review_id,
+        artifact_kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+        artifact_label="plan_review_materialization",
+        artifact_path=".gza/artifacts/materialized.txt",
+        artifact_byte_size=0,
+        artifact_sha256="",
+        artifact_metadata_builder=lambda tasks: {
+            "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+            "review_task_id": review_id,
+            "source_task_id": plan_id,
+            "source_task_type": "plan",
+            "manifest_digest": plan_review_manifest_digest(manifest),
+            "trigger_source": trigger_source,
+            "create_review": require_review_before_merge,
+            "task_ids": [task.id for task in tasks if task.id is not None],
+        },
+    )
+    artifact = store.list_artifacts(review_id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND)[0]
+    return created_tasks, artifact
 
 
 @pytest.mark.parametrize(
@@ -314,6 +358,138 @@ def test_load_materialized_plan_slice_set_reuses_legacy_manual_materialization_w
 
     assert loaded is not None
     assert [task.id for task in loaded] == [task.id for task in created_tasks]
+
+
+def test_inspect_plan_review_materialization_for_repair_reuses_existing_valid_complete_artifact(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+    manifest = _validated_manifest(plan.id)
+    assert manifest is not None
+
+    created_tasks, _artifact = _create_materialization_record(
+        store,
+        plan_id=plan.id,
+        review_id=review.id,
+        manifest=manifest,
+    )
+
+    inspection = inspect_plan_review_materialization_for_repair(
+        store,
+        review_task=review,
+        plan_source_task=plan,
+        manifest=manifest,
+    )
+
+    assert inspection.blocked_reason is None
+    assert [task.id for task in inspection.reusable_tasks or []] == [task.id for task in created_tasks]
+
+
+@pytest.mark.parametrize(
+    ("artifact_metadata", "expected_reason"),
+    [
+        pytest.param(
+            lambda plan_id, review_id, manifest, task_ids: None,
+            "invalid metadata",
+            id="missing-metadata",
+        ),
+        pytest.param(
+            lambda plan_id, review_id, manifest, task_ids: {
+                "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+                "review_task_id": review_id,
+                "source_task_id": plan_id,
+                "source_task_type": "plan",
+                "manifest_digest": "different-digest",
+                "task_ids": task_ids,
+            },
+            "different manifest digest",
+            id="different-manifest-digest",
+        ),
+        pytest.param(
+            lambda plan_id, review_id, manifest, task_ids: {
+                "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+                "review_task_id": review_id,
+                "source_task_id": plan_id,
+                "source_task_type": "plan",
+                "manifest_digest": plan_review_manifest_digest(manifest),
+                "task_ids": [task_ids[0], task_ids[0]],
+            },
+            "duplicate task ids",
+            id="duplicate-task-ids",
+        ),
+        pytest.param(
+            lambda plan_id, review_id, manifest, task_ids: {
+                "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+                "review_task_id": review_id,
+                "source_task_id": plan_id,
+                "source_task_type": "plan",
+                "manifest_digest": plan_review_manifest_digest(manifest),
+                "task_ids": [task_ids[0], 7],
+            },
+            "malformed task ids",
+            id="malformed-task-ids",
+        ),
+        pytest.param(
+            lambda plan_id, review_id, manifest, task_ids: {
+                "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+                "review_task_id": review_id,
+                "source_task_id": f"{plan_id}-other",
+                "source_task_type": "plan",
+                "manifest_digest": plan_review_manifest_digest(manifest),
+                "task_ids": task_ids,
+            },
+            "invalid source provenance",
+            id="conflicting-source-task-id",
+        ),
+    ],
+)
+def test_inspect_plan_review_materialization_for_repair_blocks_on_ambiguous_same_pair_artifacts(
+    tmp_path: Path,
+    artifact_metadata,
+    expected_reason: str,
+) -> None:
+    store = _make_store(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+    manifest = _validated_manifest(plan.id)
+    assert manifest is not None
+
+    created_tasks, artifact = _create_materialization_record(
+        store,
+        plan_id=plan.id,
+        review_id=review.id,
+        manifest=manifest,
+    )
+    task_ids = [task.id for task in created_tasks if task.id is not None]
+    store.add_artifact(
+        review.id,
+        kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+        label="plan_review_materialization",
+        path=".gza/artifacts/materialized.txt",
+        byte_size=0,
+        sha256="",
+        metadata=artifact_metadata(plan.id, review.id, manifest, task_ids),
+        artifact_id=artifact.id,
+    )
+
+    inspection = inspect_plan_review_materialization_for_repair(
+        store,
+        review_task=review,
+        plan_source_task=plan,
+        manifest=manifest,
+    )
+
+    assert inspection.reusable_tasks is None
+    assert inspection.blocked_reason is not None
+    assert expected_reason in inspection.blocked_reason
 
 
 def test_build_plan_review_slice_task_specs_maps_linear_dependencies_and_branch_continuation(

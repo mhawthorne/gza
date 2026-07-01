@@ -66,6 +66,7 @@ from ..plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
     build_plan_review_slice_task_specs,
+    inspect_plan_review_materialization_for_repair,
     load_materialized_plan_slice_set,
     plan_review_manifest_digest,
 )
@@ -104,6 +105,7 @@ from ..runner import (
     run,
     write_ops_entry,
 )
+from ..status_ops import apply_manual_task_status
 from ..task_types import CLI_FILTER_TASK_TYPES
 from ..tmux_proxy import get_tmux_session_pid
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -113,6 +115,7 @@ _REUSE_WORKER_OWNER_OUTER = "outer"
 _REUSE_WORKER_REENTRY_ENV = "GZA_REUSE_WORKER_REENTRY"
 _REUSE_WORKER_SESSION_ENV = "GZA_REUSE_WORKER_SESSION"
 _PLAN_REVIEW_OVERRIDE_ARTIFACT_KIND = "plan_review_manifest_override"
+PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON = "plan-review-materialization-auto-repair"
 
 
 def _prepare_startup_phase(
@@ -3462,6 +3465,324 @@ def _materialize_plan_review_slices(
         },
     )
     return PlanReviewMaterializationResult(tasks=created_tasks, created=True)
+
+
+@dataclass(frozen=True)
+class PlanReviewMaterializationRepairResult:
+    """Outcome of dropping stale partial slice rows and recreating the full manifest."""
+
+    dropped_tasks: tuple[DbTask, ...]
+    materialization: PlanReviewMaterializationResult
+
+
+@dataclass(frozen=True)
+class PlanReviewMaterializationRepairBlocked(ValueError):
+    """Non-mutating stale/ambiguous repair failure that should surface as attention."""
+
+    message: str
+    reason: str = "plan-review-materialization-repair-needed"
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def _repair_plan_review_slice_materialization(
+    config: Config,
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+    review_task: DbTask,
+    manifest: PlanReviewManifest,
+    *,
+    partial_task_ids: tuple[str, ...],
+    trigger_source: str,
+    require_review_before_merge: bool,
+) -> PlanReviewMaterializationRepairResult:
+    """Drop safe pending partial slices, then recreate the full validated manifest."""
+    assert plan_source_task.id is not None
+    assert review_task.id is not None
+
+    expected_manifest_digest = plan_review_manifest_digest(manifest)
+    current_plan_source, current_review, current_manifest = _revalidate_plan_review_slice_repair_rows(
+        config=config,
+        store=store,
+        plan_source_task=plan_source_task,
+        review_task=review_task,
+        expected_manifest_digest=expected_manifest_digest,
+    )
+    inspection = inspect_plan_review_materialization_for_repair(
+        store,
+        review_task=current_review,
+        plan_source_task=current_plan_source,
+        manifest=current_manifest,
+    )
+    if inspection.blocked_reason is not None:
+        raise PlanReviewMaterializationRepairBlocked(inspection.blocked_reason)
+    partial_tasks = _resolve_pending_partial_plan_review_slice_tasks_for_repair(
+        store=store,
+        plan_source_task=current_plan_source,
+        review_task=current_review,
+        manifest=current_manifest,
+        partial_task_ids=partial_task_ids,
+        reusable_tasks=inspection.reusable_tasks,
+        trigger_source=trigger_source,
+        require_review_before_merge=require_review_before_merge,
+    )
+
+    for partial_task in partial_tasks:
+        apply_manual_task_status(
+            config=config,
+            store=store,
+            task=partial_task,
+            status="dropped",
+            reason=PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON,
+        )
+
+    if inspection.reusable_tasks is not None:
+        return PlanReviewMaterializationRepairResult(
+            dropped_tasks=tuple(store.get(task.id) or task for task in partial_tasks if task.id is not None),
+            materialization=PlanReviewMaterializationResult(tasks=inspection.reusable_tasks, created=False),
+        )
+
+    materialization = _materialize_plan_review_slices(
+        config,
+        store,
+        current_plan_source,
+        current_review,
+        current_manifest,
+        trigger_source=trigger_source,
+        require_review_before_merge=require_review_before_merge,
+    )
+    return PlanReviewMaterializationRepairResult(
+        dropped_tasks=tuple(store.get(task.id) or task for task in partial_tasks if task.id is not None),
+        materialization=materialization,
+    )
+
+
+def _revalidate_plan_review_slice_repair_rows(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+    review_task: DbTask,
+    expected_manifest_digest: str,
+) -> tuple[DbTask, DbTask, PlanReviewManifest]:
+    assert plan_source_task.id is not None
+    assert review_task.id is not None
+
+    current_plan_source = store.get(plan_source_task.id)
+    if current_plan_source is None:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan source {plan_source_task.id} no longer exists; repair candidate is stale"
+        )
+    if current_plan_source.task_type != plan_source_task.task_type:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan source {plan_source_task.id} changed task_type; repair candidate is stale"
+        )
+    if current_plan_source.status != plan_source_task.status:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan source {plan_source_task.id} changed status to {current_plan_source.status}; repair candidate is stale"
+        )
+
+    current_review = store.get(review_task.id)
+    if current_review is None:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan review {review_task.id} no longer exists; repair candidate is stale"
+        )
+    if current_review.task_type != review_task.task_type:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan review {review_task.id} changed task_type; repair candidate is stale"
+        )
+    if current_review.status != review_task.status:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan review {review_task.id} changed status to {current_review.status}; repair candidate is stale"
+        )
+    if current_review.depends_on != current_plan_source.id:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan review {review_task.id} no longer depends on {current_plan_source.id}; repair candidate is stale"
+        )
+
+    assert current_plan_source.id is not None
+    outcome = get_plan_review_outcome(
+        config.project_dir,
+        current_review,
+        source_task_id=current_plan_source.id,
+        source_task_type=current_plan_source.task_type,
+        max_slice_timeout_minutes=_plan_review_timeout_budget_minutes(config),
+        max_plan_slices=getattr(config, "max_plan_slices", None),
+    )
+    if outcome.verdict != "APPROVED" or outcome.manifest is None:
+        detail = outcome.validation_error or outcome.verdict or "review is no longer approved"
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan review {review_task.id} no longer validates for auto-repair ({detail})"
+        )
+    current_manifest = outcome.manifest
+    if plan_review_manifest_digest(current_manifest) != expected_manifest_digest:
+        raise PlanReviewMaterializationRepairBlocked(
+            f"plan review {review_task.id} manifest changed; repair candidate is stale"
+        )
+
+    return current_plan_source, current_review, current_manifest
+
+
+def _resolve_pending_partial_plan_review_slice_tasks_for_repair(
+    *,
+    store: SqliteTaskStore,
+    plan_source_task: DbTask,
+    review_task: DbTask,
+    manifest: PlanReviewManifest,
+    partial_task_ids: tuple[str, ...],
+    reusable_tasks: list[DbTask] | None,
+    trigger_source: str,
+    require_review_before_merge: bool,
+) -> list[DbTask]:
+    if plan_source_task.id is None or review_task.id is None:
+        raise ValueError("missing plan-review repair inputs")
+    if not partial_task_ids:
+        raise ValueError("missing partial slice task ids")
+    if len(set(partial_task_ids)) != len(partial_task_ids):
+        raise ValueError("duplicate partial slice task ids")
+
+    expected_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan_source_task,
+        review_task=review_task,
+        manifest=manifest,
+        trigger_source=trigger_source,
+        require_review_before_merge=require_review_before_merge,
+    )
+    prompt_to_index: dict[str, int] = {}
+    for index, spec in enumerate(expected_specs):
+        if spec.prompt in prompt_to_index:
+            raise ValueError("repair requires unique slice prompts")
+        prompt_to_index[spec.prompt] = index
+
+    partial_indexed_tasks: dict[int, DbTask] = {}
+    partial_tasks: list[DbTask] = []
+    for task_id in partial_task_ids:
+        partial_task = store.get(task_id)
+        if partial_task is None:
+            raise ValueError(f"partial slice task {task_id} no longer exists")
+        if partial_task.status != "pending":
+            raise ValueError(f"partial slice task {task_id} is no longer pending")
+        if partial_task.branch:
+            raise ValueError(f"partial slice task {task_id} already has branch state")
+        if partial_task.prompt not in prompt_to_index:
+            raise ValueError(f"partial slice task {task_id} does not match the validated manifest")
+        spec_index = prompt_to_index[partial_task.prompt]
+        if spec_index in partial_indexed_tasks:
+            raise ValueError(f"multiple partial slice tasks map to manifest slice {partial_task.prompt!r}")
+        partial_indexed_tasks[spec_index] = partial_task
+        partial_tasks.append(partial_task)
+
+    current_descendants = _list_non_dropped_implement_descendants_for_plan_source(store, plan_source_task.id)
+    current_descendant_ids = {task.id for task in current_descendants if task.id is not None}
+    if any(task.id not in current_descendant_ids for task in partial_tasks if task.id is not None):
+        raise PlanReviewMaterializationRepairBlocked(
+            "current partial slice set no longer matches the repair candidate; re-evaluate lifecycle state"
+        )
+
+    reusable_task_ids = {
+        task.id for task in reusable_tasks or [] if task.id is not None
+    }
+    overlapping_reusable_partial_ids = tuple(
+        task_id for task_id in partial_task_ids if task_id in reusable_task_ids
+    )
+    if overlapping_reusable_partial_ids:
+        overlap_list = ", ".join(overlapping_reusable_partial_ids)
+        raise PlanReviewMaterializationRepairBlocked(
+            "repair candidate is stale because reusable materialization already references "
+            f"partial slice task id(s): {overlap_list}"
+        )
+    allowed_descendant_ids = set(partial_task_ids) | reusable_task_ids
+    for task in current_descendants:
+        if task.id is None or task.id not in allowed_descendant_ids:
+            raise PlanReviewMaterializationRepairBlocked(
+                f"implement descendant {task.id or 'unknown'} no longer matches the validated manifest"
+            )
+        if task.prompt not in prompt_to_index:
+            raise PlanReviewMaterializationRepairBlocked(
+                f"implement descendant {task.id or 'unknown'} no longer matches the validated manifest"
+            )
+
+    current_partial_ids = tuple(
+        task_id for task_id in partial_task_ids if task_id in current_descendant_ids
+    )
+    if current_partial_ids != partial_task_ids:
+        raise PlanReviewMaterializationRepairBlocked(
+            "current partial slice set no longer matches the repair candidate; re-evaluate lifecycle state"
+        )
+
+    for spec_index, task in partial_indexed_tasks.items():
+        expected_spec = expected_specs[spec_index]
+        if task.task_type != expected_spec.task_type:
+            raise ValueError(f"partial slice task {task.id} has unexpected task type")
+        if task.trigger_source != expected_spec.trigger_source:
+            raise ValueError(f"partial slice task {task.id} has unexpected trigger source")
+        if task.same_branch != expected_spec.same_branch:
+            raise ValueError(f"partial slice task {task.id} has unexpected same_branch wiring")
+        if task.review_scope != expected_spec.review_scope:
+            raise ValueError(f"partial slice task {task.id} has unexpected review scope")
+        if task.tags != expected_spec.tags:
+            raise ValueError(f"partial slice task {task.id} has unexpected tags")
+        if task.create_review != expected_spec.create_review:
+            raise ValueError(f"partial slice task {task.id} has unexpected review creation flag")
+        if task.based_on != _resolve_partial_materialized_task_ref(expected_spec.based_on, partial_indexed_tasks):
+            raise ValueError(f"partial slice task {task.id} has unexpected based_on wiring")
+        if task.depends_on != _resolve_partial_materialized_task_ref(expected_spec.depends_on, partial_indexed_tasks):
+            raise ValueError(f"partial slice task {task.id} has unexpected depends_on wiring")
+
+    return partial_tasks
+
+
+def _list_non_dropped_implement_descendants_for_plan_source(
+    store: SqliteTaskStore,
+    source_task_id: str,
+) -> list[DbTask]:
+    descendants: list[DbTask] = []
+    for task in store.get_all():
+        if (
+            task.task_type == "implement"
+            and task.status != "dropped"
+            and _is_based_on_descendant_of_source(store, task, source_task_id)
+        ):
+            descendants.append(task)
+    return descendants
+
+
+def _is_based_on_descendant_of_source(
+    store: SqliteTaskStore,
+    task: DbTask,
+    source_task_id: str,
+) -> bool:
+    current: DbTask | None = task
+    seen: set[str] = set()
+
+    while current is not None and current.based_on is not None:
+        parent_id = current.based_on
+        if parent_id == source_task_id:
+            return True
+        if parent_id in seen:
+            return False
+        seen.add(parent_id)
+        current = store.get(parent_id)
+
+    return False
+
+
+def _resolve_partial_materialized_task_ref(
+    value: str | None,
+    indexed_tasks: Mapping[int, DbTask],
+) -> str | None:
+    if value is None:
+        return None
+    if not value.startswith("__new_task_idx__:"):
+        return value
+    index = int(value.split(":", 1)[1])
+    resolved = indexed_tasks.get(index)
+    if resolved is None or resolved.id is None:
+        raise ValueError(
+            f"partial slice repair cannot validate unresolved slice dependency at manifest index {index}"
+        )
+    return resolved.id
 
 
 def _plan_review_timeout_budget_minutes(config: Config) -> int:
