@@ -2233,8 +2233,10 @@ def _enrich_unmerged_result(
     needs_lineage_stats = bool(
         effective_fields
         & {
-            "lineage_parent_id",
-            "lineage_child_count",
+            "lineage_origin_id",
+            "lineage_origin_type",
+            "lineage_root_impl_id",
+            "lineage_parent_impl_id",
             "lineage_task_count",
             "lineage_merge_unit_count",
         }

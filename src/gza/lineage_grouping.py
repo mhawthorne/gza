@@ -168,24 +168,29 @@ def group_subtree_counts(group: MergeUnitGroup) -> tuple[int, int]:
 def format_lineage_summary(stats: Mapping[str, object]) -> str:
     """Render the one-line lineage-orientation summary from structured stats.
 
-    Pure: reads the ``lineage_child_count`` / ``lineage_task_count`` /
-    ``lineage_merge_unit_count`` values a query projects onto a row, so both the
-    CLI feed renderers and the query presenters can share it. The immediate parent
-    is intentionally omitted — feed rows already print it on their ``← <id>`` line.
+    Pure: reads the ``lineage_origin_*`` / ``lineage_root_impl_id`` /
+    ``lineage_parent_impl_id`` values a query projects onto a row, so both the CLI
+    feed renderers and the query presenters share it. Orients the task by the
+    meaningful nodes above it (plan/explore origin, root implement, parent
+    implement) rather than a raw task count.
     """
-    def _count(key: str) -> int:
+    def _id(key: str) -> str | None:
         value = stats.get(key)
-        return value if isinstance(value, int) else 0
+        return value if isinstance(value, str) and value else None
 
     parts: list[str] = []
-    child_count = _count("lineage_child_count")
-    if child_count:
-        parts.append(f"{child_count} {'child' if child_count == 1 else 'children'}")
-    task_count = _count("lineage_task_count")
-    unit_count = _count("lineage_merge_unit_count")
-    tasks_word = "task" if task_count == 1 else "tasks"
-    units_word = "unit" if unit_count == 1 else "units"
-    parts.append(f"{task_count} {tasks_word} / {unit_count} {units_word} in tree")
+    origin_id = _id("lineage_origin_id")
+    if origin_id is not None:
+        origin_type = _id("lineage_origin_type") or "plan"
+        parts.append(f"{origin_type} {origin_id}")
+    root_impl_id = _id("lineage_root_impl_id")
+    if root_impl_id is not None:
+        parts.append(f"root impl {root_impl_id}")
+    parent_impl_id = _id("lineage_parent_impl_id")
+    if parent_impl_id is not None:
+        parts.append(f"parent impl {parent_impl_id}")
+    if not parts:
+        return "root"
     return " · ".join(parts)
 
 

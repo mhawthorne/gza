@@ -341,15 +341,19 @@ def lineage_summary_stats(
 ) -> dict[str, object]:
     """Return structured lineage-orientation stats for a feed row.
 
-    Keys: ``lineage_root_id``, ``lineage_parent_id`` (raw immediate parent, for
-    walking the chain), ``lineage_child_count`` (downstream merge units on owner
-    rows), ``lineage_task_count`` / ``lineage_merge_unit_count`` (whole-lineage
-    totals). ``cache`` is keyed by lineage-root id so a feed builds each root once.
+    Orients a task by the meaningful nodes above it rather than raw counts:
+    ``lineage_origin_id``/``lineage_origin_type`` (the plan or explore the work
+    derives from), ``lineage_root_impl_id`` (the first implement in the chain),
+    and ``lineage_parent_impl_id`` (the implement this one builds on). Also keeps
+    ``lineage_root_id`` and whole-lineage totals for scripting. ``cache`` is keyed
+    by lineage-root id so a feed builds each root's tree once.
     """
     empty: dict[str, object] = {
         "lineage_root_id": None,
-        "lineage_parent_id": None,
-        "lineage_child_count": 0,
+        "lineage_origin_id": None,
+        "lineage_origin_type": None,
+        "lineage_root_impl_id": None,
+        "lineage_parent_impl_id": None,
         "lineage_task_count": 0,
         "lineage_merge_unit_count": 0,
     }
@@ -370,14 +374,38 @@ def lineage_summary_stats(
         cache[root.id] = cached
     groups, total_tasks, total_units = cached
 
+    origin_id: str | None = None
+    origin_type: str | None = None
+    root_impl_id: str | None = None
+    parent_impl_id: str | None = None
     path = find_group_path(groups, task.id)
-    child_count = 0
-    if path is not None and path[-1].header.id == task.id:
-        child_count = len(path[-1].children)
+    if path is not None:
+        for group in path:  # root → task's group
+            header = group.header
+            if origin_id is None and header.task_type in {"plan", "plan_improve", "explore"}:
+                origin_id, origin_type = header.id, header.task_type
+            if root_impl_id is None and header.task_type == "implement":
+                root_impl_id = header.id
+        owning = path[-1]
+        if owning.header.id == task.id:
+            # The row heads a merge unit: its parent implement is the prior slice.
+            if len(path) >= 2 and path[-2].header.task_type == "implement":
+                parent_impl_id = path[-2].header.id
+        elif owning.header.task_type == "implement":
+            # The row is a supporting task; its implement is the owning unit head.
+            parent_impl_id = owning.header.id
+        # Drop redundant references so the display shows each node once.
+        if root_impl_id == task.id:
+            root_impl_id = None
+        if parent_impl_id is not None and parent_impl_id == root_impl_id:
+            parent_impl_id = None
+
     return {
         "lineage_root_id": root.id,
-        "lineage_parent_id": task.based_on or task.depends_on,
-        "lineage_child_count": child_count,
+        "lineage_origin_id": origin_id,
+        "lineage_origin_type": origin_type,
+        "lineage_root_impl_id": root_impl_id,
+        "lineage_parent_impl_id": parent_impl_id,
         "lineage_task_count": total_tasks,
         "lineage_merge_unit_count": total_units,
     }

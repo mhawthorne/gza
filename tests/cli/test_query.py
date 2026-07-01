@@ -13651,7 +13651,8 @@ class TestUnmergedUnifiedQueryOutput:
         assert result == 0
         assert summary_stats.call_count > 0
         assert "lineage:" in captured.out
-        assert "in tree" in captured.out
+        # A standalone implement heads its own lineage (no plan/root/parent above).
+        assert "lineage: root" in captured.out
         assert "Rich output task" in captured.out
 
     def test_unmerged_default_text_attaches_review_verdict_color_via_theme(self, tmp_path: Path) -> None:
@@ -13980,11 +13981,14 @@ class TestUnmergedUnifiedQueryOutput:
         assert result == 0
         assert "Unmerged branch B task" in captured.out
         assert branch_b.id in captured.out
+        # The lineage summary orients the row by its ancestor implement (root), but
+        # never by a sibling branch or anyone's prompt/descendants.
+        assert root.id in captured.out
         assert "Merged branch A root" not in captured.out
-        assert root.id not in captured.out
         assert "Merged branch A sibling" not in captured.out
         assert merged_sibling.id not in captured.out
         assert "Merged branch A child" not in captured.out
+        assert merged_sibling_child.id not in captured.out
 
 
 class TestFailureReasonField:
