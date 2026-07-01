@@ -106,7 +106,6 @@ def _write_fake_python(path: Path, log_path: Path) -> None:
         f"printf 'python %s\\n' \"$*\" >> {str(log_path)!r}\n",
     )
 
-
 def _current_env_tool(name: str) -> str:
     sibling_tool = Path(sys.executable).resolve().parent / name
     if sibling_tool.is_file():
@@ -122,6 +121,13 @@ def _watch_module_ruff_command(repo_root: Path) -> list[str]:
     if ruff_bin.is_file() and os.access(ruff_bin, os.X_OK):
         return [str(ruff_bin), "check", "src/gza/cli/watch.py"]
     return ["uv", "run", "ruff", "check", "src/gza/cli/watch.py"]
+
+
+def _repo_ruff_command(repo_root: Path) -> list[str]:
+    venv_bin = repo_root / ".venv" / "bin"
+    if venv_bin.is_dir():
+        return [str(venv_bin / "ruff")]
+    return ["uv", "run", "ruff"]
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -377,6 +383,52 @@ def test_verify_phase_ruff_passes_for_watch_cli_module_on_real_repo() -> None:
         result.stdout,
     )
     assert match is not None, result.stdout
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_quick_verify_falls_back_to_uv_run_ruff_without_project_venv(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    uv_log = fixture_root / "uv.log"
+
+    fake_bin = fixture_root / "fake-bin"
+    fake_bin.mkdir()
+    _write_fake_uv(fake_bin / "uv", uv_log)
+    uv_log.write_text("", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    result = subprocess.run(
+        ["bash", "bin/tests", "--quick"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert not (fixture_root / ".venv" / "bin" / "ruff").exists()
+    assert result.returncode == 0, result.stderr
+    assert "gza-verify phase=start name=ruff" in result.stdout
+    assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
+    uv_invocations = uv_log.read_text(encoding="utf-8")
+    assert "uv run python -m gza.tools.verify_phase ruff -- uv run ruff check src/gza/" in uv_invocations
+
+
+@pytest.mark.functional
+@pytest.mark.timeout(30, method="signal")
+def test_ruff_check_passes_for_watch_cli_module() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [*_repo_ruff_command(repo_root), "check", "src/gza/cli/watch.py"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_watch_module_ruff_command_matches_bin_tests_modes(tmp_path: Path) -> None:
