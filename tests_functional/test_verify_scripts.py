@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -103,6 +105,16 @@ def _write_fake_python(path: Path, log_path: Path) -> None:
         "set -euo pipefail\n"
         f"printf 'python %s\\n' \"$*\" >> {str(log_path)!r}\n",
     )
+
+
+def _current_env_tool(name: str) -> str:
+    sibling_tool = Path(sys.executable).resolve().parent / name
+    if sibling_tool.is_file():
+        return str(sibling_tool)
+
+    resolved = shutil.which(name)
+    assert resolved is not None, f"{name} not found in current test environment"
+    return resolved
 
 
 @pytest.mark.timeout(30, method="signal")
@@ -326,3 +338,36 @@ def test_quick_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
     tool_invocations = tool_log.read_text(encoding="utf-8")
     assert "ruff check src/gza/" in tool_invocations
     assert "python -m checks" not in tool_invocations
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_verify_phase_ruff_passes_for_watch_cli_module_on_real_repo() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "gza.tools.verify_phase",
+            "ruff",
+            "--",
+            _current_env_tool("ruff"),
+            "check",
+            "src/gza/cli/watch.py",
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "gza-verify phase=start name=ruff" in result.stdout
+    match = re.search(
+        r"gza-verify phase=passed name=ruff duration_seconds=[0-9.]+(?: tree_fingerprint=[0-9a-f]{64})?",
+        result.stdout,
+    )
+    assert match is not None, result.stdout
