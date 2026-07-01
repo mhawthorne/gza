@@ -29,6 +29,9 @@ class _FakeGit:
         ahead_count: int | None = None,
         merged: bool = False,
         net_diff: bool | None = None,
+        net_diff_by_ref: dict[str, bool | None] | None = None,
+        patch_present_by_commit: dict[tuple[str, str], bool | None] | None = None,
+        ancestors: dict[tuple[str, str], bool] | None = None,
         on_first_parent: bool = True,
         first_parent_error: Exception | None = None,
     ) -> None:
@@ -39,6 +42,9 @@ class _FakeGit:
         self._ahead_count = ahead_count
         self._merged = merged
         self._net_diff = net_diff
+        self._net_diff_by_ref = net_diff_by_ref or {}
+        self._patch_present_by_commit = patch_present_by_commit or {}
+        self._ancestors = ancestors or {}
         self._on_first_parent = on_first_parent
         self._first_parent_error = first_parent_error
 
@@ -67,7 +73,15 @@ class _FakeGit:
         return self._merged
 
     def has_non_empty_source_diff_against_target(self, _source_ref: str, _target: str) -> bool | None:
+        if _source_ref in self._net_diff_by_ref:
+            return self._net_diff_by_ref[_source_ref]
         return self._net_diff
+
+    def is_patch_equivalent_commit_present_on_target(self, commit: str, target: str) -> bool | None:
+        return self._patch_present_by_commit.get((commit, target))
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return self._ancestors.get((ancestor, descendant), False)
 
     def is_on_first_parent_history(self, _commit: str, _target: str) -> bool:
         if self._first_parent_error is not None:
@@ -350,6 +364,102 @@ def test_classify_zero_unique_commits_with_live_net_diff_stays_unmerged() -> Non
     assert result.reason == "net-diff-despite-zero-unique-commits"
 
 
+def test_classify_stale_source_missing_recorded_head_stays_unmerged() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="origin/feature/false-redundant",
+            ref_shas={"origin/feature/false-redundant": "base-sha", "main": "target-sha"},
+            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            net_diff_by_ref={
+                "origin/feature/false-redundant": False,
+            },
+            patch_present_by_commit={("recorded-head-sha", "main"): False},
+            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            on_first_parent=True,
+        ),
+        source_branch="feature/false-redundant",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == "unmerged"
+    assert result.reason == "recorded-head-has-net-diff"
+
+
+def test_classify_stale_source_missing_recorded_head_can_still_be_redundant_when_head_has_no_diff() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="origin/feature/redundant",
+            ref_shas={"origin/feature/redundant": "base-sha", "main": "target-sha"},
+            tree_shas={"origin/feature/redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            net_diff_by_ref={
+                "origin/feature/redundant": False,
+            },
+            patch_present_by_commit={("recorded-head-sha", "main"): True},
+            ancestors={("recorded-head-sha", "origin/feature/redundant"): False},
+            on_first_parent=True,
+        ),
+        source_branch="feature/redundant",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == "redundant"
+    assert result.reason == "no-unique-commits-with-task-commits"
+
+
+def test_classify_proved_merged_unresolved_source_sha_missing_recorded_head_stays_unmerged() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="origin/feature/false-redundant",
+            ref_shas={"origin/feature/false-redundant": None, "main": "target-sha"},
+            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            net_diff_by_ref={"origin/feature/false-redundant": False},
+            patch_present_by_commit={("recorded-head-sha", "main"): False},
+            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            on_first_parent=True,
+        ),
+        source_branch="feature/false-redundant",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == "unmerged"
+    assert result.reason == "net-diff-unresolved-source-sha"
+
+
+def test_classify_proved_merged_unresolved_target_sha_missing_recorded_head_stays_unmerged() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="origin/feature/false-redundant",
+            ref_shas={"origin/feature/false-redundant": "base-sha", "main": None},
+            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            net_diff_by_ref={"origin/feature/false-redundant": False},
+            patch_present_by_commit={("recorded-head-sha", "main"): False},
+            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            on_first_parent=True,
+        ),
+        source_branch="feature/false-redundant",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == "unmerged"
+    assert result.reason == "net-diff-unresolved-target-sha"
+
+
 def test_classify_proven_merged_state_preserves_no_ff_side_branch_as_merged() -> None:
     result = classify_proven_merged_state(
         git=_FakeGit(
@@ -381,6 +491,63 @@ def test_classify_proven_merged_state_stays_merged_when_target_advanced_after_la
     )
 
     assert result == "merged"
+
+
+def test_classify_proven_merged_side_branch_missing_recorded_head_stays_unmerged() -> None:
+    result = classify_proven_merged_state(
+        git=_FakeGit(
+            ref_shas={"feature/merged": "branch-tip-sha", "main": "target-tip-sha"},
+            tree_shas={"feature/merged": "branch-tree-sha", "main": "target-tree-sha"},
+            ahead_count=0,
+            net_diff=False,
+            patch_present_by_commit={("recorded-head-sha", "main"): False},
+            ancestors={("recorded-head-sha", "feature/merged"): False},
+            on_first_parent=False,
+        ),
+        source_ref="feature/merged",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result == "unmerged"
+
+
+def test_classify_proven_merged_side_branch_allows_recorded_head_patch_equivalence() -> None:
+    result = classify_proven_merged_state(
+        git=_FakeGit(
+            ref_shas={"feature/merged": "branch-tip-sha", "main": "target-tip-sha"},
+            tree_shas={"feature/merged": "branch-tree-sha", "main": "target-tree-sha"},
+            ahead_count=0,
+            net_diff=False,
+            patch_present_by_commit={("recorded-head-sha", "main"): True},
+            ancestors={("recorded-head-sha", "feature/merged"): False},
+            on_first_parent=False,
+        ),
+        source_ref="feature/merged",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result == "merged"
+
+
+def test_classify_proven_merged_missing_recorded_head_without_patch_proof_is_unknown() -> None:
+    result = classify_proven_merged_state(
+        git=_FakeGit(
+            ref_shas={"feature/merged": "branch-tip-sha", "main": "target-tip-sha"},
+            ahead_count=0,
+            net_diff=None,
+            ancestors={("recorded-head-sha", "feature/merged"): False},
+        ),
+        source_ref="feature/merged",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -531,6 +698,91 @@ def test_classify_proven_merged_state_returns_redundant_for_task_commits_when_pr
 
     assert result == "redundant"
     assert "Could not probe first-parent membership" in caplog.text
+
+
+def test_classify_zero_unique_side_branch_missing_recorded_head_stays_unmerged() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="feature/merged",
+            ref_shas={"feature/merged": "branch-tip-sha", "main": "merge-commit-sha"},
+            tree_shas={"feature/merged": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            patch_present_by_commit={("recorded-head-sha", "main"): False},
+            ancestors={("recorded-head-sha", "feature/merged"): False},
+            on_first_parent=False,
+        ),
+        source_branch="feature/merged",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == "unmerged"
+    assert result.reason == "recorded-head-has-net-diff"
+
+
+def test_classify_zero_unique_side_branch_allows_recorded_head_patch_equivalence() -> None:
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="feature/merged",
+            ref_shas={"feature/merged": "branch-tip-sha", "main": "merge-commit-sha"},
+            tree_shas={"feature/merged": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            patch_present_by_commit={("recorded-head-sha", "main"): True},
+            ancestors={("recorded-head-sha", "feature/merged"): False},
+            on_first_parent=False,
+        ),
+        source_branch="feature/merged",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == "merged"
+    assert result.reason == "merged-side-branch-no-unique-commits"
+
+
+@pytest.mark.parametrize(
+    ("ahead_count", "merged", "patch_present", "expected_state", "expected_reason"),
+    [
+        (2, True, False, "unmerged", "recorded-head-has-net-diff"),
+        (2, True, True, "merged", "content-equivalent-with-commits"),
+        (None, True, False, "unmerged", "recorded-head-has-net-diff"),
+        (None, True, True, "merged", "content-equivalent-with-commits-unverified"),
+        (None, True, None, "unknown", "recorded-head-diff-unavailable"),
+    ],
+)
+def test_classify_content_equivalent_terminal_states_respect_recorded_head_guard(
+    ahead_count: int | None,
+    merged: bool,
+    patch_present: bool | None,
+    expected_state: str,
+    expected_reason: str,
+) -> None:
+    patch_present_by_commit = {}
+    if patch_present is not None:
+        patch_present_by_commit[("recorded-head-sha", "main")] = patch_present
+
+    result = classify_branch_merge_state_for_target(
+        git=_FakeGit(
+            source_ref="feature/content-equivalent",
+            ref_shas={"feature/content-equivalent": "branch-tip-sha", "main": "target-tip-sha"},
+            tree_shas={"feature/content-equivalent": "branch-tree-sha", "main": "target-tree-sha"},
+            ahead_count=ahead_count,
+            merged=merged,
+            patch_present_by_commit=patch_present_by_commit,
+            ancestors={("recorded-head-sha", "feature/content-equivalent"): False},
+        ),
+        source_branch="feature/content-equivalent",
+        target_branch="main",
+        source_has_commits=True,
+        recorded_head_sha="recorded-head-sha",
+    )
+
+    assert result.state == expected_state
+    assert result.reason == expected_reason
 
 
 def test_classify_zero_unique_commits_returns_redundant_when_side_branch_probe_fails(
@@ -775,6 +1027,47 @@ def test_resolve_task_merge_state_reclassifies_persisted_no_work_with_live_net_d
             ahead_count=1,
             merged=False,
             net_diff=True,
+        ),
+        target_branch="main",
+    )
+
+    assert state == "unmerged"
+
+
+def test_resolve_task_merge_state_uses_recorded_head_when_source_ref_is_stale_ancestor(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Recorded head diff must win", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.has_commits = True
+    task.branch = "feature/false-redundant"
+    store.update(task)
+    assert task.id is not None
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="recorded-head-sha")
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    state = resolve_task_merge_state_for_target(
+        store=store,
+        task=refreshed,
+        git=_FakeGit(
+            source_ref="origin/feature/false-redundant",
+            ref_shas={"origin/feature/false-redundant": "base-sha", "main": "target-sha"},
+            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            ahead_count=0,
+            merged=True,
+            net_diff_by_ref={
+                "origin/feature/false-redundant": False,
+            },
+            patch_present_by_commit={("recorded-head-sha", "main"): False},
+            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            on_first_parent=True,
         ),
         target_branch="main",
     )

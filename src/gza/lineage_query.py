@@ -891,6 +891,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             persisted_state=None,
             merged_proof=None,
             source_has_commits=failed_task.has_commits,
+            recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
             on_warning=_LOG.warning,
         )
     except Exception as exc:

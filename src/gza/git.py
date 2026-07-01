@@ -1203,6 +1203,40 @@ class Git:
             return False
         return commit_sha in result.stdout.split()
 
+    def is_patch_equivalent_commit_present_on_target(self, commit: str, target: str) -> bool | None:
+        """Return whether every patch reachable from ``commit`` is already on ``target``.
+
+        Uses ``git cherry`` over the full ``target..commit`` range so callers can
+        distinguish a stale source ref from a recorded head whose entire patch set
+        was already landed by squash/cherry-pick semantics.
+        """
+        commit_sha = self.rev_parse_if_exists(commit)
+        if commit_sha is None:
+            return None
+
+        result = self._run_readonly_cached(
+            "cherry",
+            target,
+            commit_sha,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            return True
+
+        saw_present_patch = False
+        for line in lines:
+            status, *_rest = line.split(maxsplit=2)
+            if status == "+":
+                return False
+            if status != "-":
+                return None
+            saw_present_patch = True
+        return saw_present_patch
+
     def get_commit_subject(self, commit_ref: str) -> str:
         """Get the subject line for a single committed revision."""
         result = self._run("show", "-s", "--format=%s", commit_ref, check=False)

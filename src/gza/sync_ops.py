@@ -45,6 +45,7 @@ class BranchCohort:
     tasks: tuple[Task, ...]
     merge_unit_id: str | None = None
     merge_unit_state: str | None = None
+    merge_unit_head_sha: str | None = None
 
     @property
     def code_tasks(self) -> tuple[Task, ...]:
@@ -227,6 +228,7 @@ def build_branch_cohorts_for_task_ids(
                     tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
                     merge_unit_id=unit.id,
                     merge_unit_state=unit.state,
+                    merge_unit_head_sha=unit.head_sha,
                 )
             )
             continue
@@ -265,6 +267,7 @@ def build_branch_cohorts_for_tasks(
                     tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
                     merge_unit_id=unit.id,
                     merge_unit_state=unit.state,
+                    merge_unit_head_sha=unit.head_sha,
                 )
             )
             continue
@@ -408,6 +411,7 @@ def reconcile_branch_merge_truth(
                 source_ref=reconcile_ref,
                 target_branch=proof_target_ref,
                 source_has_commits=source_has_commits,
+                recorded_head_sha=cohort.merge_unit_head_sha,
                 on_warning=result.warnings.append,
             )
             if desired_merge_status == "merged":
@@ -439,6 +443,7 @@ def reconcile_branch_merge_truth(
                     persisted_state=cohort.merge_unit_state,
                     merged_proof=False,
                     source_has_commits=source_has_commits,
+                    recorded_head_sha=cohort.merge_unit_head_sha,
                     on_warning=result.warnings.append,
                 )
                 classify_state = classification.state

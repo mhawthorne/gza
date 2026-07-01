@@ -89,6 +89,21 @@ def test_build_task_branch_cohort_returns_cohort_for_task_scoped_callers(tmp_pat
     assert {row.id for row in cohort.tasks} == {task.id}
 
 
+def test_build_task_branch_cohort_carries_merge_unit_head_sha(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/scoped-head")
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="recorded-head-sha")
+
+    cohort, preliminary = build_task_branch_cohort(store, task.id)
+
+    assert preliminary is None
+    assert cohort is not None
+    assert cohort.merge_unit_id == unit.id
+    assert cohort.merge_unit_head_sha == "recorded-head-sha"
+
+
 def test_reconcile_branch_merge_truth_marks_merged_without_persisting(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task", "feature/merged")
@@ -136,6 +151,100 @@ def test_reconcile_branch_merge_truth_marks_proven_merged_zero_ahead_task_branch
         [cohort],
         target_branch="main",
         include_diff_stats=True,
+    )
+
+    assert results[0].merge_status == "redundant"
+    assert "marked merged" not in results[0].actions
+
+
+def test_reconcile_branch_merge_truth_stale_source_missing_multicommit_recorded_head_stays_unmerged(
+    tmp_path,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/false-redundant")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id="gza-mu-563",
+        merge_unit_state="redundant",
+        merge_unit_head_sha="recorded-head-tip-sha",
+    )
+
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = True
+    git.is_merged.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.is_on_first_parent_history.return_value = True
+    git.is_ancestor.return_value = False
+    git.has_non_empty_source_diff_against_target.return_value = False
+    # The recorded head covers multiple commits; target only has the tip patch,
+    # so the shared helper reports the range as not fully represented.
+    git.is_patch_equivalent_commit_present_on_target.return_value = False
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "origin/feature/false-redundant": "shared-tree-sha" if peel == "tree" else "base-sha",
+        "main": "shared-tree-sha" if peel == "tree" else "target-sha",
+        "origin/main": "shared-tree-sha" if peel == "tree" else "target-sha",
+    }
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/false-redundant": "base-sha",
+        "main": "target-sha",
+        "origin/main": "target-sha",
+    }.get(ref)
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+        remote_target_ref="origin/main",
+    )
+
+    assert results[0].merge_status == "unmerged"
+    assert "marked merged" not in results[0].actions
+
+
+def test_reconcile_branch_merge_truth_stale_source_missing_multicommit_recorded_head_stays_redundant_when_all_patches_are_already_on_target(
+    tmp_path,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/redundant")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id="gza-mu-564",
+        merge_unit_state="redundant",
+        merge_unit_head_sha="recorded-head-tip-sha",
+    )
+
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.return_value = True
+    git.is_merged.return_value = True
+    git.count_commits_ahead_checked.return_value = 0
+    git.is_on_first_parent_history.return_value = True
+    git.is_ancestor.return_value = False
+    git.has_non_empty_source_diff_against_target.return_value = False
+    # The stale source ref points at an ancestor, but every recorded-head patch
+    # is already present on target via patch equivalence.
+    git.is_patch_equivalent_commit_present_on_target.return_value = True
+    git.resolve_refs.side_effect = lambda refs, peel="commit": {
+        "origin/feature/redundant": "shared-tree-sha" if peel == "tree" else "base-sha",
+        "main": "shared-tree-sha" if peel == "tree" else "target-sha",
+        "origin/main": "shared-tree-sha" if peel == "tree" else "target-sha",
+    }
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/redundant": "base-sha",
+        "main": "target-sha",
+        "origin/main": "target-sha",
+    }.get(ref)
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+        remote_target_ref="origin/main",
     )
 
     assert results[0].merge_status == "redundant"

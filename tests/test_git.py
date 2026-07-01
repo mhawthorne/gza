@@ -2250,6 +2250,65 @@ class TestGitCached:
             call("rev-list", "--first-parent", "main", check=False),
         ]
 
+    def test_cached_scope_reuses_patch_equivalence_probe(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="recorded-head-sha\n", stderr=""),
+                MagicMock(returncode=0, stdout="- recorded-head-sha subject\n", stderr=""),
+            ]
+
+            with git.cached():
+                assert git.is_patch_equivalent_commit_present_on_target("recorded-head", "main") is True
+                assert git.is_patch_equivalent_commit_present_on_target("recorded-head", "main") is True
+
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list == [
+            call("rev-parse", "--verify", "--quiet", "recorded-head^{commit}", check=False),
+            call("cherry", "main", "recorded-head-sha", check=False),
+        ]
+
+    def test_patch_equivalence_probe_returns_false_when_any_recorded_head_patch_is_missing(
+        self, tmp_path: Path
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="recorded-head-sha\n", stderr=""),
+                MagicMock(
+                    returncode=0,
+                    stdout="+ missing-earlier-patch subject\n- landed-tip-patch subject\n",
+                    stderr="",
+                ),
+            ]
+
+            assert git.is_patch_equivalent_commit_present_on_target("recorded-head", "main") is False
+
+    def test_patch_equivalence_probe_returns_true_when_all_recorded_head_patches_are_present(
+        self, tmp_path: Path
+    ) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="recorded-head-sha\n", stderr=""),
+                MagicMock(
+                    returncode=0,
+                    stdout="- earlier-patch subject\n- tip-patch subject\n",
+                    stderr="",
+                ),
+            ]
+
+            assert git.is_patch_equivalent_commit_present_on_target("recorded-head", "main") is True
+
     def test_cached_scope_does_not_leak_between_calls(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
