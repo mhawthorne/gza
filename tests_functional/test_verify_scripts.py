@@ -51,6 +51,16 @@ def _write_fake_passthrough_tool(path: Path, log_path: Path, name: str) -> None:
     )
 
 
+def _write_fake_ruff_failure(path: Path, log_path: Path, *, exit_code: int = 1) -> None:
+    _make_executable(
+        path,
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf 'ruff %s\\n' \"$*\" >> {str(log_path)!r}\n"
+        f"exit {exit_code}\n",
+    )
+
+
 def _write_fake_getconf(path: Path, *, cpu_count: int) -> None:
     _make_executable(
         path,
@@ -285,3 +295,34 @@ def test_quick_verify_omits_tree_fingerprint_when_gitdir_is_unavailable(tmp_path
     assert "tree_fingerprint=" not in result.stdout
     assert "failed to compute exact tree fingerprint for timeout resume checkpoints" in result.stderr
     assert "not a git repository" in result.stderr
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_quick_verify_stops_after_ruff_failure(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    tool_log = fixture_root / "tool.log"
+
+    venv_bin = fixture_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    _write_fake_venv_python(venv_bin / "python", tool_log)
+    _write_fake_ruff_failure(venv_bin / "ruff", tool_log)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    result = subprocess.run(
+        ["bash", "bin/tests", "--quick"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert result.returncode == 1
+    assert "gza-verify phase=start name=ruff" in result.stdout
+    assert "gza-verify phase=failed name=ruff duration_seconds=" in result.stdout
+    assert "gza-verify phase=start name=checks" not in result.stdout
+    tool_invocations = tool_log.read_text(encoding="utf-8")
+    assert "ruff check src/gza/" in tool_invocations
+    assert "python -m checks" not in tool_invocations

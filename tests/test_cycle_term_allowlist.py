@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SEARCH_DIRS = ("src", "tests", "docs")
 WHOLE_WORD_CYCLE = re.compile(r"\bcycle\b")
