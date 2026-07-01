@@ -1834,7 +1834,7 @@ def _config_to_effective_dict(config: Config) -> dict:
             "transient_recovery_backoff_max": config.watch.transient_recovery_backoff_max,
             "failure_halt_after": config.watch.failure_halt_after,
             "no_progress_cycles": config.watch.no_progress_cycles,
-            "dispatch_start_timeout": config.watch.dispatch_start_timeout,
+            "slot_settle_seconds": config.watch.slot_settle_seconds,
             "main_verify_remediation_max_attempts": (
                 config.watch.main_verify_remediation_max_attempts
             ),

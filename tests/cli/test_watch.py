@@ -4968,16 +4968,17 @@ def test_watch_dispatch_start_state_treats_pending_task_with_live_registered_wor
         patch("gza.concurrency.WorkerRegistry", return_value=registry),
         patch("gza.cli.watch.WorkerRegistry", return_value=registry),
     ):
-        started, reason, refreshed = watch_module._watch_dispatch_start_state(
+        probe = watch_module._watch_dispatch_start_state(
             config=config,
             store=store,
             task_id=pending_task.id,
         )
 
-    assert started is True
-    assert reason == f"task {pending_task.id} is pending with a live registered worker in preloop"
-    assert refreshed is not None
-    assert refreshed.status == "pending"
+    assert probe.status is watch_module._DispatchSettleProbeStatus.LIVE
+    assert probe.slot_consuming is True
+    assert probe.reason == f"task {pending_task.id} is pending with a live registered worker in preloop"
+    assert probe.task is not None
+    assert probe.task.status == "pending"
 
 
 def test_watch_dispatch_start_state_treats_in_progress_task_with_live_running_pid_as_started(
@@ -5000,21 +5001,22 @@ def test_watch_dispatch_start_state_treats_in_progress_task_with_live_running_pi
         patch("gza.concurrency.WorkerRegistry", return_value=registry),
         patch("gza.concurrency._pid_alive", side_effect=lambda pid: pid == 5252),
     ):
-        started, reason, refreshed = watch_module._watch_dispatch_start_state(
+        probe = watch_module._watch_dispatch_start_state(
             config=config,
             store=store,
             task_id=task.id,
         )
 
-    assert started is True
-    assert reason == f"task {task.id} reached running state"
-    assert refreshed is not None
-    assert refreshed.status == "in_progress"
-    assert refreshed.running_pid == 5252
+    assert probe.status is watch_module._DispatchSettleProbeStatus.LIVE
+    assert probe.slot_consuming is True
+    assert probe.reason == f"task {task.id} reached running state"
+    assert probe.task is not None
+    assert probe.task.status == "in_progress"
+    assert probe.task.running_pid == 5252
 
 
 @pytest.mark.parametrize("initial_status", ["pending", "in_progress"])
-def test_watch_dispatch_start_state_treats_quick_terminal_outcome_as_started(
+def test_watch_dispatch_start_state_reports_terminal_before_running_without_slot_consumption(
     tmp_path: Path,
     initial_status: str,
 ) -> None:
@@ -5050,17 +5052,18 @@ def test_watch_dispatch_start_state_treats_quick_terminal_outcome_as_started(
         patch("gza.concurrency.WorkerRegistry", return_value=registry),
         patch("gza.concurrency._pid_alive", return_value=False),
     ):
-        started, reason, terminal = watch_module._watch_dispatch_start_state(
+        probe = watch_module._watch_dispatch_start_state(
             config=config,
             store=store,
             task_id=task.id,
             task_before=task_before,
         )
 
-    assert started is True
-    assert reason == f"task {task.id} reached an observable terminal outcome after dispatch"
-    assert terminal is not None
-    assert terminal.status == "failed"
+    assert probe.status is watch_module._DispatchSettleProbeStatus.TERMINAL_BEFORE_RUNNING
+    assert probe.slot_consuming is False
+    assert probe.reason == f"task {task.id} reached an observable terminal outcome after dispatch"
+    assert probe.task is not None
+    assert probe.task.status == "failed"
 
 
 def test_watch_dispatch_start_state_leaves_unchanged_completed_task_not_started(tmp_path: Path) -> None:
@@ -5081,17 +5084,97 @@ def test_watch_dispatch_start_state_leaves_unchanged_completed_task_not_started(
     registry.list_all.return_value = []
 
     with patch("gza.concurrency.WorkerRegistry", return_value=registry):
-        started, reason, refreshed = watch_module._watch_dispatch_start_state(
+        probe = watch_module._watch_dispatch_start_state(
             config=config,
             store=store,
             task_id=task.id,
             task_before=task_before,
         )
 
-    assert started is False
-    assert reason == f"task {task.id} remains completed with no live worker"
-    assert refreshed is not None
-    assert refreshed.status == "completed"
+    assert probe.status is watch_module._DispatchSettleProbeStatus.WAITING
+    assert probe.slot_consuming is False
+    assert probe.reason == f"task {task.id} remains completed with no live worker"
+    assert probe.task is not None
+    assert probe.task.status == "completed"
+
+
+def test_settle_watch_dispatch_starts_returns_no_live_proof_without_real_sleep(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.local.yaml").write_text("watch:\n  slot_settle_seconds: 2\n")
+    store = make_store(tmp_path)
+
+    task = store.add("Never proves live", task_type="implement")
+    assert task.id is not None
+    task_before = watch_module._snapshot_watch_dispatch_task(store.get(task.id))
+    assert task_before is not None
+
+    config = Config.load(tmp_path)
+    registry = MagicMock()
+    registry.list_all.return_value = []
+    monotonic_values = iter([100.0, 100.0, 101.0, 102.0])
+    sleep_calls: list[float] = []
+
+    with (
+        patch("gza.concurrency.WorkerRegistry", return_value=registry),
+        patch("gza.cli.watch.WorkerRegistry", return_value=registry),
+        patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(monotonic_values)),
+        patch("gza.cli.watch.time.sleep", side_effect=lambda seconds: sleep_calls.append(seconds)),
+    ):
+        result = watch_module._settle_watch_dispatch_starts(
+            config=config,
+            store=store,
+            pending_starts=[
+                watch_module._PendingWatchDispatchSettle(
+                    task_id=task.id,
+                    task_before=task_before,
+                    start_label=f"START {task.id}",
+                    dedupe_key=f"start:{task.id}",
+                )
+            ],
+        )[0]
+
+    assert result.status is watch_module._DispatchSettleStatus.NO_LIVE_PROOF
+    assert result.slot_consuming is False
+    assert result.reason == f"task {task.id} remains pending with no live worker"
+    assert result.task is not None
+    assert result.task.status == "pending"
+    assert sleep_calls == [1.0, 1.0]
+
+
+def test_confirm_watch_dispatch_start_preserves_terminal_before_running_compatibility_bool(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    settled_task = store.add("Dispatch target", task_type="implement")
+    assert settled_task.id is not None
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with patch.object(
+        watch_module,
+        "_wait_for_watch_dispatch_start",
+        return_value=(
+            True,
+            f"task {settled_task.id} reached an observable terminal outcome after dispatch",
+            settled_task,
+        ),
+    ):
+        started, returned_task = watch_module._confirm_watch_dispatch_start(
+            config=config,
+            store=store,
+            log=log,
+            task_id=settled_task.id,
+            task_before=None,
+            start_label=f"{settled_task.id} queued",
+            dedupe_key=f"start:{settled_task.id}",
+        )
+
+    assert started is True
+    assert returned_task is not None
+    assert returned_task.id == settled_task.id
+    assert not log_path.exists()
 
 
 def test_watch_cycle_allows_slots_when_terminal_task_worker_is_still_alive(

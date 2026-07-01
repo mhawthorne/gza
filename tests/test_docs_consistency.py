@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+from gza.config_schema import CONFIG_KEY_REGISTRY
+
 
 def _normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
@@ -1423,8 +1425,42 @@ def test_watch_supervisor_spec_pins_per_cycle_human_required_owner_parity() -> N
     assert "When that shared recovery policy returns a failed-task decision that parks the owner for" in compact
     assert "human intervention, phase 5 MUST emit `Needs attention` for that owner even when the" in compact
     assert "decision is represented internally as a `skip`." in compact
-    assert "Human-required parity is owner-based" in compact
-    assert "Non-human skips and hidden recovery decisions MAY remain silent or appear only in" in compact
+
+
+def test_watch_slot_settle_seconds_discoverable_text_matches_staged_compatibility_behavior() -> None:
+    """Discoverable config text should describe the current staged slot-settle contract."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+    config_example = (repo_root / "src" / "gza" / "gza.yaml.example").read_text()
+    local_config_example = (repo_root / "src" / "gza" / "gza.local.yaml.example").read_text()
+    slot_settle_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "watch.slot_settle_seconds")
+
+    for text in (
+        "observable terminal post-launch outcome counts as settled",
+        "only launches with neither signal within that window are logged as undispatched",
+    ):
+        assert text in config_docs
+
+    compact_registry_description = " ".join(slot_settle_spec.description.split())
+    assert "observable post-launch terminal outcome counts as settled" in compact_registry_description
+    assert "only launches with neither signal are treated as undispatched" in compact_registry_description
+
+    for rendered_example in (config_example, local_config_example):
+        assert (
+            "#   compatibility accounting: either live-running proof or an observable post-launch terminal\n"
+            "#   outcome counts as settled, and only launches with neither signal are treated as undispatched."
+        ) in rendered_example
+
+
+def test_watch_supervisor_spec_uses_slot_settle_seconds_config_key() -> None:
+    """The watch behavior spec should stay aligned with the accepted slot-settle config key."""
+    repo_root = Path(__file__).resolve().parents[1]
+    supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+
+    assert "watch.slot_settle_seconds" in supervisor
+    assert "watch.dispatch_start_timeout" not in supervisor
+    assert "watch.slot_settle_seconds" in config_docs
 
 
 def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy() -> None:

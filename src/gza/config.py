@@ -97,7 +97,7 @@ DEFAULT_WATCH_FAILURE_BACKOFF_MAX = 3600
 DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX = 1800
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
-DEFAULT_WATCH_DISPATCH_START_TIMEOUT = 2
+DEFAULT_WATCH_SLOT_SETTLE_SECONDS = 5
 DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS = 2
 DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED = False
 DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET = 2
@@ -252,7 +252,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
         "no_progress_cycles": None,
-        "dispatch_start_timeout": None,
+        "slot_settle_seconds": None,
         "main_verify_remediation_max_attempts": None,
         "parked_auto_rearm": {
             "enabled": None,
@@ -377,6 +377,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "failure_backoff_max": None,
         "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
+        "slot_settle_seconds": None,
         "main_verify_remediation_max_attempts": None,
     },
     "iterate_max_iterations": None,
@@ -630,6 +631,38 @@ def _validate_non_negative_int_field(
     validated_value = cast(int, value)
     if validated_value < 0:
         _record_error(f"'{field_name}' must be non-negative")
+        return None
+    return validated_value
+
+
+def _validate_bounded_int_field(
+    value: object,
+    field_name: str,
+    *,
+    greater_than: int,
+    less_than: int,
+    errors: list[str] | None = None,
+) -> int | None:
+    """Validate an integer field constrained to an exclusive range."""
+
+    def _record_error(message: str) -> None:
+        if errors is None:
+            raise ConfigError(message)
+        errors.append(message)
+
+    if value is None:
+        _record_error(
+            f"{field_name} must be greater than {greater_than} and less than {less_than} seconds"
+        )
+        return None
+    if not _is_strict_int(value):
+        _record_error(f"{field_name} must be an integer")
+        return None
+    validated_value = cast(int, value)
+    if validated_value <= greater_than or validated_value >= less_than:
+        _record_error(
+            f"{field_name} must be greater than {greater_than} and less than {less_than} seconds"
+        )
         return None
     return validated_value
 
@@ -1024,7 +1057,7 @@ class WatchConfig:
     transient_recovery_backoff_max: int = DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
     no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
-    dispatch_start_timeout: int = DEFAULT_WATCH_DISPATCH_START_TIMEOUT
+    slot_settle_seconds: int = DEFAULT_WATCH_SLOT_SETTLE_SECONDS
     main_verify_remediation_max_attempts: int = DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS
     parked_auto_rearm: ParkedAutoRearmConfig = field(default_factory=ParkedAutoRearmConfig)
 
@@ -2115,6 +2148,8 @@ class Config:
         watch_data = data.get("watch") or {}
         if not isinstance(watch_data, dict):
             raise ConfigError("'watch' must be a dictionary")
+        if "dispatch_start_timeout" in watch_data:
+            raise ConfigError("Unknown configuration field: 'watch.dispatch_start_timeout'")
         try:
             watch_batch = int(watch_data.get("batch", DEFAULT_WATCH_BATCH))
         except (TypeError, ValueError):
@@ -2224,12 +2259,14 @@ class Config:
             raise ConfigError("watch.no_progress_cycles must be a positive integer")
         if watch_no_progress_cycles < 1:
             raise ConfigError("watch.no_progress_cycles must be a positive integer")
-        watch_dispatch_start_timeout = _validate_positive_int_field(
-            watch_data.get("dispatch_start_timeout", DEFAULT_WATCH_DISPATCH_START_TIMEOUT),
-            "watch.dispatch_start_timeout",
+        watch_slot_settle_seconds = _validate_bounded_int_field(
+            watch_data.get("slot_settle_seconds", DEFAULT_WATCH_SLOT_SETTLE_SECONDS),
+            "watch.slot_settle_seconds",
+            greater_than=1,
+            less_than=15,
         )
-        if watch_dispatch_start_timeout is None:
-            raise ConfigError("watch.dispatch_start_timeout must be a positive integer")
+        if watch_slot_settle_seconds is None:
+            raise ConfigError("watch.slot_settle_seconds must be greater than 1 and less than 15 seconds")
         watch_main_verify_remediation_max_attempts = _validate_positive_int_field(
             watch_data.get(
                 "main_verify_remediation_max_attempts",
@@ -2283,7 +2320,7 @@ class Config:
             transient_recovery_backoff_max=watch_transient_recovery_backoff_max,
             failure_halt_after=watch_failure_halt_after,
             no_progress_cycles=watch_no_progress_cycles,
-            dispatch_start_timeout=watch_dispatch_start_timeout,
+            slot_settle_seconds=watch_slot_settle_seconds,
             main_verify_remediation_max_attempts=watch_main_verify_remediation_max_attempts,
             parked_auto_rearm=ParkedAutoRearmConfig(
                 enabled=parked_auto_rearm_enabled,
@@ -2876,6 +2913,8 @@ class Config:
             if not isinstance(watch_data, dict):
                 errors.append("'watch' must be a dictionary")
             else:
+                if "dispatch_start_timeout" in watch_data:
+                    errors.append("Unknown configuration field: 'watch.dispatch_start_timeout'")
                 if "batch" in watch_data:
                     if not isinstance(watch_data["batch"], int) or watch_data["batch"] < 1:
                         errors.append("watch.batch must be a positive integer")
@@ -2963,10 +3002,12 @@ class Config:
                         or watch_data["no_progress_cycles"] < 1
                     ):
                         errors.append("watch.no_progress_cycles must be a positive integer")
-                if "dispatch_start_timeout" in watch_data:
-                    _validate_positive_int_field(
-                        watch_data["dispatch_start_timeout"],
-                        "watch.dispatch_start_timeout",
+                if "slot_settle_seconds" in watch_data:
+                    _validate_bounded_int_field(
+                        watch_data["slot_settle_seconds"],
+                        "watch.slot_settle_seconds",
+                        greater_than=1,
+                        less_than=15,
                         errors=errors,
                     )
                 if "main_verify_remediation_max_attempts" in watch_data:

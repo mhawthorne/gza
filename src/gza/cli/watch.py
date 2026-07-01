@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
@@ -2669,6 +2670,57 @@ class _WatchDispatchTaskSnapshot:
     completion_reason: str | None
 
 
+class _DispatchSettleProbeStatus(Enum):
+    LIVE = "live"
+    TERMINAL_BEFORE_RUNNING = "terminal_before_running"
+    WAITING = "waiting"
+
+
+class _DispatchSettleStatus(Enum):
+    LIVE = "live"
+    TERMINAL_BEFORE_RUNNING = "terminal_before_running"
+    NO_LIVE_PROOF = "no_live_proof"
+
+
+@dataclass(frozen=True)
+class _WatchDispatchSettleProbe:
+    status: _DispatchSettleProbeStatus
+    reason: str
+    task: DbTask | None
+
+    @property
+    def slot_consuming(self) -> bool:
+        return self.status is _DispatchSettleProbeStatus.LIVE
+
+
+@dataclass(frozen=True)
+class _PendingWatchDispatchSettle:
+    task_id: str
+    task_before: _WatchDispatchTaskSnapshot | None
+    start_label: str
+    dedupe_key: str
+
+
+@dataclass(frozen=True)
+class _WatchDispatchSettleResult:
+    entry: _PendingWatchDispatchSettle
+    status: _DispatchSettleStatus
+    reason: str
+    task: DbTask | None
+
+    @property
+    def slot_consuming(self) -> bool:
+        return self.status is _DispatchSettleStatus.LIVE
+
+    @property
+    def compatibility_started(self) -> bool:
+        """Preserve the legacy started/not-started wrapper contract for existing callers."""
+        return self.status in {
+            _DispatchSettleStatus.LIVE,
+            _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING,
+        }
+
+
 def _snapshot_watch_dispatch_task(task: object | None) -> _WatchDispatchTaskSnapshot | None:
     if task is None:
         return None
@@ -2721,29 +2773,133 @@ def _watch_dispatch_start_state(
     store: SqliteTaskStore,
     task_id: str,
     task_before: _WatchDispatchTaskSnapshot | None = None,
-) -> tuple[bool, str, DbTask | None]:
+) -> _WatchDispatchSettleProbe:
     task = store.get(task_id)
     live_pids, running_task_ids, _, _ = _collect_live_running_state(config, store)
     live_registered_worker = _watch_task_has_live_registered_worker(config, task_id)
     if task_id in set(running_task_ids):
         if task is not None and task.status == "pending":
-            return True, f"task {task_id} is pending with a live registered worker in preloop", task
-        return True, f"task {task_id} reached running state", task
+            return _WatchDispatchSettleProbe(
+                status=_DispatchSettleProbeStatus.LIVE,
+                reason=f"task {task_id} is pending with a live registered worker in preloop",
+                task=task,
+            )
+        return _WatchDispatchSettleProbe(
+            status=_DispatchSettleProbeStatus.LIVE,
+            reason=f"task {task_id} reached running state",
+            task=task,
+        )
     if live_registered_worker:
         if task is not None and task.status == "pending":
-            return True, f"task {task_id} is pending with a live registered worker in preloop", task
-        return True, f"task {task_id} has a live registered worker", task
+            return _WatchDispatchSettleProbe(
+                status=_DispatchSettleProbeStatus.LIVE,
+                reason=f"task {task_id} is pending with a live registered worker in preloop",
+                task=task,
+            )
+        return _WatchDispatchSettleProbe(
+            status=_DispatchSettleProbeStatus.LIVE,
+            reason=f"task {task_id} has a live registered worker",
+            task=task,
+        )
     if _watch_dispatch_has_observed_terminal_outcome(task_before=task_before, task_after=task):
-        return True, f"task {task_id} reached an observable terminal outcome after dispatch", task
+        return _WatchDispatchSettleProbe(
+            status=_DispatchSettleProbeStatus.TERMINAL_BEFORE_RUNNING,
+            reason=f"task {task_id} reached an observable terminal outcome after dispatch",
+            task=task,
+        )
     if task is None:
-        return False, f"task {task_id} no longer exists after dispatch", None
+        return _WatchDispatchSettleProbe(
+            status=_DispatchSettleProbeStatus.WAITING,
+            reason=f"task {task_id} no longer exists after dispatch",
+            task=None,
+        )
     if task.status == "in_progress":
         pid = task.running_pid
         if pid is None:
-            return False, f"task {task_id} is in_progress but has no running_pid or live worker", task
+            return _WatchDispatchSettleProbe(
+                status=_DispatchSettleProbeStatus.WAITING,
+                reason=f"task {task_id} is in_progress but has no running_pid or live worker",
+                task=task,
+            )
         if pid not in live_pids:
-            return False, f"task {task_id} is in_progress but running_pid {pid} is not live", task
-    return False, f"task {task_id} remains {task.status} with no live worker", task
+            return _WatchDispatchSettleProbe(
+                status=_DispatchSettleProbeStatus.WAITING,
+                reason=f"task {task_id} is in_progress but running_pid {pid} is not live",
+                task=task,
+            )
+    return _WatchDispatchSettleProbe(
+        status=_DispatchSettleProbeStatus.WAITING,
+        reason=f"task {task_id} remains {task.status} with no live worker",
+        task=task,
+    )
+
+
+def _settle_watch_dispatch_starts(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    pending_starts: Sequence[_PendingWatchDispatchSettle],
+) -> list[_WatchDispatchSettleResult]:
+    if not pending_starts:
+        return []
+
+    deadline = time.monotonic() + config.watch.slot_settle_seconds
+    pending_by_task_id = {entry.task_id: entry for entry in pending_starts}
+    unresolved_task_ids = set(pending_by_task_id)
+    last_probe_by_task_id: dict[str, _WatchDispatchSettleProbe] = {}
+    settled_by_task_id: dict[str, _WatchDispatchSettleResult] = {}
+
+    while unresolved_task_ids:
+        for task_id in tuple(unresolved_task_ids):
+            entry = pending_by_task_id[task_id]
+            probe = _watch_dispatch_start_state(
+                config=config,
+                store=store,
+                task_id=task_id,
+                task_before=entry.task_before,
+            )
+            last_probe_by_task_id[task_id] = probe
+            if probe.status is _DispatchSettleProbeStatus.WAITING:
+                continue
+            settled_by_task_id[task_id] = _WatchDispatchSettleResult(
+                entry=entry,
+                status=(
+                    _DispatchSettleStatus.LIVE
+                    if probe.status is _DispatchSettleProbeStatus.LIVE
+                    else _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING
+                ),
+                reason=probe.reason,
+                task=probe.task,
+            )
+            unresolved_task_ids.remove(task_id)
+        if not unresolved_task_ids:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        time.sleep(min(1.0, max(0.0, deadline - now)))
+
+    for task_id in unresolved_task_ids:
+        entry = pending_by_task_id[task_id]
+        cached_probe = last_probe_by_task_id.get(task_id)
+        final_probe: _WatchDispatchSettleProbe
+        if cached_probe is None:
+            final_probe = _watch_dispatch_start_state(
+                config=config,
+                store=store,
+                task_id=task_id,
+                task_before=entry.task_before,
+            )
+        else:
+            final_probe = cached_probe
+        settled_by_task_id[task_id] = _WatchDispatchSettleResult(
+            entry=entry,
+            status=_DispatchSettleStatus.NO_LIVE_PROOF,
+            reason=final_probe.reason,
+            task=final_probe.task,
+        )
+
+    return [settled_by_task_id[entry.task_id] for entry in pending_starts]
 
 
 def _wait_for_watch_dispatch_start(
@@ -2753,20 +2909,19 @@ def _wait_for_watch_dispatch_start(
     task_id: str,
     task_before: _WatchDispatchTaskSnapshot | None = None,
 ) -> tuple[bool, str, DbTask | None]:
-    deadline = time.monotonic() + config.watch.dispatch_start_timeout
-    poll_seconds = 0.1
-    while True:
-        started, reason, task = _watch_dispatch_start_state(
-            config=config,
-            store=store,
-            task_id=task_id,
-            task_before=task_before,
-        )
-        if started:
-            return True, reason, task
-        if time.monotonic() >= deadline:
-            return False, reason, task
-        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+    result = _settle_watch_dispatch_starts(
+        config=config,
+        store=store,
+        pending_starts=[
+            _PendingWatchDispatchSettle(
+                task_id=task_id,
+                task_before=task_before,
+                start_label=task_id,
+                dedupe_key=f"wait:{task_id}",
+            )
+        ],
+    )[0]
+    return result.compatibility_started, result.reason, result.task
 
 
 def _watch_execution_requires_dispatch_confirmation(result: AdvanceActionExecutionResult) -> bool:
@@ -2796,7 +2951,7 @@ def _confirm_watch_dispatch_start(
             "START_UNDISPATCHED",
             (
                 f"{start_label}: dispatch did not reach running within "
-                f"{config.watch.dispatch_start_timeout}s ({dispatch_reason})"
+                f"{config.watch.slot_settle_seconds}s ({dispatch_reason})"
             ),
             dedupe_key=dedupe_key,
         )

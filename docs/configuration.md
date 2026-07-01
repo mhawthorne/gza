@@ -74,7 +74,7 @@ Gza reads configuration from three YAML layers:
 | `max_concurrent` | Integer | explicit `watch.batch` or `5` | Hard global ceiling on concurrently running task-executing processes across `work`, `watch`, `advance`, iterate/recovery helpers, and internal task runners. Explicit `max_concurrent` wins; otherwise an explicitly configured `watch.batch` becomes the cap; if `watch.batch` is omitted, the fallback remains `5` |
 | `iterate_max_iterations` | Integer | `3` | Default iterate iteration budget when `gza iterate` omits `--max-iterations` (1 iteration = code-change task [implement/improve] + review) |
 | `main_checkout_isolate` | Boolean | `false` | When true, `gza watch` stages merges in a dedicated detached checkout, then fast-forwards the real default branch only after the isolated merge lands cleanly |
-| `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, dispatch_start_timeout: 2, main_verify_remediation_max_attempts: 2}` | Defaults for `gza watch` loop behavior |
+| `watch` | Dict | `{batch: 2, poll: 300, no_activity_timeout: 60, max_idle: null, max_iterations: 10, recovery_slots: 1, slot_settle_seconds: 5, main_verify_remediation_max_attempts: 2}` | Defaults for `gza watch` loop behavior |
 | `behavior_monitor` | Dict | `{enabled: true, interval_seconds: 14400, tag: behavior-conformance, max_new_tasks_per_cycle: 5, check_timeout_seconds: 3600, file_undetermined: false}` | Defaults for the host-side behavior conformance monitor cadence, filing tag, and per-pass safety cap |
 | `spec_coherence` | Dict | `{enabled: true, paths: [specs/behavior/**]}` | Branch-scoped behavior-spec coherence gate settings for diffs that touch behavior-spec files |
 | `quiet_period_seconds` | Integer | `300` | Seconds a newly created task stays in the Quiet lane of `gza queue` / `gza next` before rejoining normal pending display order; current releases still do not change worker pickup eligibility, and `0` disables the quiet lane |
@@ -1024,7 +1024,7 @@ watch.failure_halt_after
 watch.max_idle
 watch.no_activity_timeout
 watch.no_progress_cycles
-watch.dispatch_start_timeout
+watch.slot_settle_seconds
 watch.main_verify_remediation_max_attempts
 watch.parked_auto_rearm.enabled
 watch.parked_auto_rearm.budget
@@ -2005,7 +2005,7 @@ watch:
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
 
-`watch.dispatch_start_timeout` bounds how long `gza watch` waits after selecting work for it to reach a live running state. If the worker never becomes live within that window, watch logs the undispatched action, does not advance no-progress accounting for it, and keeps scanning the current watch pass for another runnable candidate instead of leaving the slot idle.
+`watch.slot_settle_seconds` bounds how long `gza watch` gives a selected worker launch to settle during the current pass. In the current staged compatibility path, either live-running proof or an observable terminal post-launch outcome counts as settled for existing callers; only launches with neither signal within that window are logged as undispatched. Those undispatched launches do not advance no-progress accounting, and watch keeps scanning the current pass for another runnable candidate instead of leaving the slot idle.
 
 `watch.main_verify_remediation_max_attempts` caps how many merged-and-proven-ineffective automatic remediation attempts watch may consume for one main-verify failure identity before it stops filing more remediation work and leaves the red verify condition as human-required attention.
 
