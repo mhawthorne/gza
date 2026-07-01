@@ -36,8 +36,9 @@ def test_ruff_check_passes() -> None:
     assert result.returncode == 0, f"ruff check failed:\n{result.stdout}\n{result.stderr}"
 
 
-def test_ruff_check_watch_cli_module_passes() -> None:
-    result = _run(["uv", "run", "ruff", "check", "src/gza/cli/watch.py"])
+@pytest.mark.timeout(30, method="signal")
+def test_ruff_check_watch_cli_passes() -> None:
+    result = _run([_venv_tool("ruff"), "check", "src/gza/cli/watch.py"])
     assert result.returncode == 0, f"ruff check failed for watch CLI module:\n{result.stdout}\n{result.stderr}"
 
 
