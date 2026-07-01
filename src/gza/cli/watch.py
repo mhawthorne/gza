@@ -74,6 +74,7 @@ from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_TAG,
     MainIntegrationVerifyCheck,
     MainIntegrationVerifyRemediation,
+    MainIntegrationVerifyState,
     check_main_integration_verify,
     persist_main_integration_verify_alert_message,
 )
@@ -708,10 +709,10 @@ def _maybe_file_main_verify_remediation(
     any_tag: bool,
     log: "_WatchLog",
     check: MainIntegrationVerifyCheck,
-) -> None:
+) -> MainIntegrationVerifyState | None:
     remediation = getattr(check, "remediation", None)
     if remediation is None or dry_run:
-        return
+        return None
     result = _ensure_main_verify_remediation_task(
         config=config,
         store=store,
@@ -734,22 +735,19 @@ def _maybe_file_main_verify_remediation(
             state=check.state,
             alert_message=message,
         )
-        if persisted_state.task.id is not None:
-            log.emit_attention(
-                attention_key=f"main-integration-verify:{persisted_state.task.id}:{MAIN_INTEGRATION_VERIFY_REASON}",
-                message=message,
-            )
+        _emit_main_verify_attention(log=log, state=persisted_state, now=datetime.now(UTC))
         log.emit(
             "REMEDY",
             f"automatic remediation exhausted after {attempts}/{attempts} attempts for "
             f"{phase} on {fingerprint_label}",
         )
-        return
+        return persisted_state
     assert result.task is not None
     log.emit(
         "REMEDY",
         f"{result.task.id}: {result.outcome} {remediation.kind} remediation for {phase}; moved to queue position 1",
     )
+    return None
 
 
 def _resolve_merged_main_verify_remediation_task(
@@ -2248,6 +2246,37 @@ def _format_elapsed(started_at: str | None, completed_at: str | None) -> str | N
     if mins > 0:
         return f"{mins}m{secs:02d}s"
     return f"{secs}s"
+
+
+def format_red_duration(red_since: datetime, now: datetime) -> str:
+    elapsed = max(0, int((now - red_since).total_seconds()))
+    total_minutes = elapsed // 60
+    total_hours = elapsed // 3600
+    total_days = elapsed // 86400
+    if total_days > 0:
+        return f"{total_days}d{(total_hours % 24)}h"
+    if total_hours > 0:
+        return f"{total_hours}h{(total_minutes % 60)}m"
+    return f"{total_minutes}m"
+
+
+def _format_main_verify_attention_message(state: Any, *, now: datetime) -> str:
+    message = state.alert_message or "main verify is red; merges halted"
+    red_since = getattr(state, "red_since", None)
+    if red_since is None:
+        return message
+    return f"{message} (red for {format_red_duration(red_since, now)})"
+
+
+def _emit_main_verify_attention(*, log: "_WatchLog", state: Any, now: datetime) -> None:
+    task = getattr(state, "task", None)
+    task_id = getattr(task, "id", None)
+    if task_id is None:
+        return
+    log.emit_attention(
+        attention_key=f"main-integration-verify:{task_id}:{MAIN_INTEGRATION_VERIFY_REASON}",
+        message=_format_main_verify_attention_message(state, now=now),
+    )
 
 
 def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, quantum: float = 1.0) -> None:
@@ -4864,7 +4893,7 @@ def _run_cycle(
                 red_reruns=2,
             ),
         )
-        _maybe_file_main_verify_remediation(
+        refreshed_main_verify_state = _maybe_file_main_verify_remediation(
             dry_run=dry_run,
             config=config,
             store=store,
@@ -4873,13 +4902,10 @@ def _run_cycle(
             log=log,
             check=main_verify,
         )
-        if main_verify.merges_halted:
+        main_verify_state = refreshed_main_verify_state or getattr(main_verify, "state", None)
+        if main_verify.merges_halted and main_verify_state is not None:
             merge_halted_for_cycle = True
-            if main_verify.state.task.id is not None:
-                log.emit_attention(
-                    attention_key=f"main-integration-verify:{main_verify.state.task.id}:{MAIN_INTEGRATION_VERIFY_REASON}",
-                    message=main_verify.state.alert_message or "main verify is red; merges halted",
-                )
+            _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
@@ -5084,7 +5110,7 @@ def _run_cycle(
                         display_task=display_task,
                         check=main_verify,
                     )
-                    _maybe_file_main_verify_remediation(
+                    refreshed_main_verify_state = _maybe_file_main_verify_remediation(
                         dry_run=dry_run,
                         config=config,
                         store=store,
@@ -5093,13 +5119,10 @@ def _run_cycle(
                         log=log,
                         check=main_verify,
                     )
-                    if main_verify.merges_halted:
+                    main_verify_state = refreshed_main_verify_state or getattr(main_verify, "state", None)
+                    if main_verify.merges_halted and main_verify_state is not None:
                         merge_halted_for_cycle = True
-                        if main_verify.state.task.id is not None:
-                            log.emit_attention(
-                                attention_key=f"main-integration-verify:{main_verify.state.task.id}:{MAIN_INTEGRATION_VERIFY_REASON}",
-                                message=main_verify.state.alert_message or "main verify is red; merges halted",
-                            )
+                        _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
                 for followup_task in merge_result.created_followups:
                     log.emit(
                         "FOLLOW",

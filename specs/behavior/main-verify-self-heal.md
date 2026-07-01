@@ -86,7 +86,8 @@ When rerun verify confirms a real deterministic failure on the current canonical
 local-target tree, automation MUST halt further merges onto that target and MUST trigger
 both:
 
-- one visible durable alert naming the red-main condition; and
+- one visible durable alert naming the red-main condition and conveying how long the
+  gate has been continuously red; and
 - one bounded automatic repair path aimed at restoring a green local target or reaching a
   clear human-required stop.
 

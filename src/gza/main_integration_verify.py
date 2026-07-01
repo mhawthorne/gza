@@ -50,6 +50,7 @@ class MainIntegrationVerifyState:
     failure: str | None
     failing_phase: str | None
     alert_message: str | None
+    red_since: datetime | None
     captured_at: datetime | None
 
 
@@ -143,6 +144,13 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
             captured_at = datetime.fromisoformat(captured_at_raw)
         except ValueError:
             captured_at = None
+    red_since_raw = payload.get("red_since")
+    red_since = None
+    if isinstance(red_since_raw, str):
+        try:
+            red_since = datetime.fromisoformat(red_since_raw)
+        except ValueError:
+            red_since = None
     return MainIntegrationVerifyState(
         task=task,
         gate_enabled=_payload_gate_enabled(task, payload),
@@ -156,6 +164,7 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         failure=task.review_verify_failure,
         failing_phase=payload.get("failing_phase") if isinstance(payload.get("failing_phase"), str) else None,
         alert_message=payload.get("alert_message") if isinstance(payload.get("alert_message"), str) else None,
+        red_since=red_since,
         captured_at=captured_at or task.review_verify_captured_at,
     )
 
@@ -411,6 +420,7 @@ def _persist_main_integration_verify_payload(
     head_sha: str | None,
     failing_phase: str | None,
     alert_message: str | None,
+    red_since: datetime | None,
     captured_at: datetime,
 ) -> None:
     task.output_content = json.dumps(
@@ -423,6 +433,7 @@ def _persist_main_integration_verify_payload(
             "head_sha": head_sha,
             "failing_phase": failing_phase,
             "alert_message": alert_message,
+            "red_since": red_since.isoformat() if red_since is not None else None,
             "captured_at": captured_at.isoformat(),
         },
         sort_keys=True,
@@ -452,6 +463,7 @@ def persist_main_integration_verify_alert_message(
         head_sha=state.head_sha,
         failing_phase=state.failing_phase,
         alert_message=alert_message,
+        red_since=getattr(state, "red_since", None),
         captured_at=captured_at,
     )
     refreshed = load_main_integration_verify_state(store)
@@ -510,6 +522,7 @@ def run_main_integration_verify(
 ) -> MainIntegrationVerifyState:
     """Run the configured verify gate against the current local target checkout."""
     task = ensure_main_integration_verify_task(store)
+    prior_state = load_main_integration_verify_state(store)
     captured_at = datetime.now(UTC)
     head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
     gate = _current_gate_identity(config)
@@ -568,6 +581,16 @@ def run_main_integration_verify(
         if _verify_result_is_red(status=result.status, gate_enabled=gate_enabled)
         else None
     )
+    if _verify_result_is_red(status=result.status, gate_enabled=gate_enabled):
+        if prior_state is not None and _verify_result_is_red(
+            status=prior_state.verify_status,
+            gate_enabled=prior_state.gate_enabled,
+        ):
+            red_since = prior_state.red_since or result.captured_at
+        else:
+            red_since = result.captured_at
+    else:
+        red_since = None
     _persist_main_integration_verify_payload(
         store,
         task,
@@ -579,6 +602,7 @@ def run_main_integration_verify(
         head_sha=head_sha,
         failing_phase=failing_phase,
         alert_message=alert_message,
+        red_since=red_since,
         captured_at=result.captured_at,
     )
     state = load_main_integration_verify_state(store)

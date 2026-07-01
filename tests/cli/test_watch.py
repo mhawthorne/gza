@@ -66,6 +66,7 @@ from gza.cli.watch import (
     _format_elapsed,
     _format_sleep_message,
     _format_wake_message,
+    format_red_duration,
     _active_failure_backoff_owner_ids,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
@@ -94,6 +95,7 @@ from gza.cli.watch import (
     _WatchLog,
     allocate_watch_slots,
     cmd_watch,
+    format_red_duration,
 )
 from gza.concurrency import MaxConcurrentTasksError, launch_permit
 from gza.config import Config
@@ -8330,9 +8332,22 @@ def test_watch_cycle_dirty_checkout_blocks_merge_pass_and_stops_later_merges(tmp
     )
 
 
-def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_attention(tmp_path: Path) -> None:
+def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_attention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
 
     first = store.add("First completed task", task_type="implement")
     second = store.add("Second completed task", task_type="implement")
@@ -8375,6 +8390,7 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
         state=SimpleNamespace(
             task=main_verify_task,
             alert_message="main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
         ),
     )
 
@@ -8399,7 +8415,7 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
     assert len(merge_calls) == 1
     skipped_task_id = second.id if merge_calls[0] == first.id else first.id
     log_text = log_path.read_text()
-    assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing" in log_text
+    assert "main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing (red for 2h13m)" in log_text
     assert "Needs attention (1 task):" in log_text
     assert f"SKIP      {skipped_task_id}: merges halted while local main verify is red" in log_text
 
@@ -8770,6 +8786,7 @@ def test_watch_cycle_deterministic_main_verify_halts_and_files_fix_task(tmp_path
             head_sha="feedfacecafe",
             failing_phase="functional",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
             captured_at=datetime(2026, 6, 29, tzinfo=UTC),
         ),
     )
@@ -8988,6 +9005,7 @@ def test_watch_cycle_main_verify_remediation_reuses_stale_fingerprint_task_and_r
             head_sha="feedfacecafe",
             failing_phase="functional",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
             captured_at=datetime(2026, 6, 29, tzinfo=UTC),
         ),
     )
@@ -9436,6 +9454,7 @@ def test_watch_cycle_main_verify_remediation_reuses_existing_concrete_task_when_
             head_sha="feedfacecafe",
             failing_phase="functional",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
             captured_at=datetime(2026, 6, 29, tzinfo=UTC),
         ),
     )
@@ -9487,13 +9506,26 @@ def test_watch_cycle_main_verify_remediation_reuses_existing_concrete_task_when_
     ]
 
 
-def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation(tmp_path: Path) -> None:
+def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 29, 10, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
 
     main_verify_task = store.add(
         "System alert: local main integration verify", task_type="internal", skip_learnings=True
@@ -9560,6 +9592,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
             head_sha="feedfacecafe",
             failing_phase="functional",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
             captured_at=datetime(2026, 6, 29, tzinfo=UTC),
         ),
     )
@@ -9602,8 +9635,20 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     assert attempt_state.active_task_id is None
     assert attempt_state.exhausted_at is not None
     log_text = log_path.read_text()
-    assert "automatic remediation exhausted after 2/2 attempts for functional on fp-new" in log_text
+    expected_attention = (
+        "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing; "
+        "automatic remediation exhausted after 2/2 attempts for functional on fp-new; "
+        "human intervention required (red for 5d0h)"
+    )
+    assert log_text.count("ATTENTION") == 1
+    assert log_text.count("Needs attention (1 task):") == 1
+    assert log_text.count(expected_attention) == 2
+    assert expected_attention in log_text
     assert "human intervention required" in log_text
+    assert (
+        "Needs attention (1 task):\n"
+        "  main verify RED at `feedfacecafe` - merges halted; phase `functional` failing\n"
+    ) not in log_text
     alert_git = MagicMock(spec=Git)
     alert_git.default_branch.return_value = "main"
     alert_git.current_branch.return_value = "topic"
@@ -10748,9 +10793,22 @@ def test_watch_cycle_configured_unavailable_main_verify_halts_later_merges(tmp_p
     assert f"SKIP      {skipped_task_id}: merges halted while local main verify is red" in log_text
 
 
-def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_merge(tmp_path: Path) -> None:
+def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
 
     task = store.add("Completed task", task_type="implement")
     assert task.id is not None
@@ -10780,6 +10838,7 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
         state=SimpleNamespace(
             task=main_verify_task,
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
         ),
     )
 
@@ -10804,7 +10863,15 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
     execute_merge.assert_not_called()
     check_main_verify.assert_called_once()
     assert f"SKIP      {task.id}: merges halted while local main verify is red" in log_path.read_text()
-    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing" in log_path.read_text()
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in log_path.read_text()
+
+
+def test_format_red_duration_formats_minute_hour_and_day_boundaries() -> None:
+    start = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
+
+    assert format_red_duration(start, start + timedelta(minutes=8)) == "8m"
+    assert format_red_duration(start, start + timedelta(hours=2, minutes=13)) == "2h13m"
+    assert format_red_duration(start, start + timedelta(days=1, hours=3, minutes=59)) == "1d3h"
 
 
 def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row(tmp_path: Path) -> None:

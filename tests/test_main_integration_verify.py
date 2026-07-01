@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from gza.artifacts import store_command_output_artifact
@@ -14,6 +14,7 @@ from gza.main_integration_verify import (
     current_main_integration_verify_alert,
     load_main_integration_verify_state,
     persist_main_integration_verify_alert_message,
+    run_main_integration_verify,
 )
 from gza.runner import _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
@@ -1011,3 +1012,183 @@ def test_check_main_integration_verify_deterministic_red_uses_confirmed_current_
     assert check.remediation.tree_fingerprint == "fp-verified"
     assert check.remediation.failing_phase == "functional"
     assert check.remediation.failure == "fresh verify_command failed again"
+
+
+def test_run_main_integration_verify_sets_red_since_on_first_red(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    red_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output="gza-verify phase=failed name=unit duration_seconds=3.25",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=red_result),
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        state = run_main_integration_verify(config, store, git, reason="unit-test-first-red")
+
+    assert state.red_since == red_result.captured_at
+    persisted = load_main_integration_verify_state(store)
+    assert persisted is not None
+    assert persisted.red_since == red_result.captured_at
+
+
+def test_run_main_integration_verify_preserves_red_since_across_consecutive_red_reruns(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    first_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output="gza-verify phase=failed name=unit duration_seconds=3.25",
+    )
+    second_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 12, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed again",
+        output="gza-verify phase=failed name=unit duration_seconds=3.10",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=[first_red, second_red]),
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        first_state = run_main_integration_verify(config, store, git, reason="unit-test-first-red")
+        second_state = run_main_integration_verify(config, store, git, reason="unit-test-second-red")
+
+    assert first_state.red_since == first_red.captured_at
+    assert second_state.red_since == first_red.captured_at
+    assert second_state.captured_at == second_red.captured_at
+
+
+def test_run_main_integration_verify_resets_red_since_on_green_and_rearms_on_next_red(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    first_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed",
+        output="gza-verify phase=failed name=unit duration_seconds=3.25",
+    )
+    green = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 0, 10, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+    second_red = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, 0, 20, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify_command failed again",
+        output="gza-verify phase=failed name=unit duration_seconds=3.10",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=[first_red, green, second_red]),
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        first_state = run_main_integration_verify(config, store, git, reason="unit-test-first-red")
+        green_state = run_main_integration_verify(config, store, git, reason="unit-test-green")
+        second_state = run_main_integration_verify(config, store, git, reason="unit-test-second-red")
+
+    assert first_state.red_since == first_red.captured_at
+    assert green_state.red_since is None
+    assert second_state.red_since == second_red.captured_at
