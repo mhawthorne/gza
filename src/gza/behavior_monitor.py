@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from .config import Config, TaskTypeConfig
 from .db import (
@@ -164,6 +165,7 @@ def parse_behavior_check_report(report_text: str) -> list[BehaviorMonitorFinding
     for index, raw_finding in enumerate(payload):
         if not isinstance(raw_finding, dict):
             raise ValueError(f"finding {index + 1} is not a JSON object")
+        raw_finding = cast("dict[str, object]", raw_finding)
         evidence_rows = raw_finding.get("evidence")
         evidence: list[BehaviorMonitorEvidence] = []
         if not isinstance(evidence_rows, list):
@@ -171,6 +173,7 @@ def parse_behavior_check_report(report_text: str) -> list[BehaviorMonitorFinding
         for raw_evidence in evidence_rows:
             if not isinstance(raw_evidence, dict):
                 raise ValueError(f"finding {index + 1} has malformed evidence")
+            raw_evidence = cast("dict[str, object]", raw_evidence)
             line = raw_evidence.get("line")
             evidence.append(
                 BehaviorMonitorEvidence(

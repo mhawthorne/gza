@@ -218,7 +218,7 @@ def get_unmerged_field_value_color(field_name: str, value: object) -> str | None
 
 @dataclass(frozen=True)
 class LineageColors:
-    """Colors for lineage tree rendering (``_format_lineage`` and ``gza lineage``)."""
+    """Colors for lineage rendering (``gza.cli.lineage_view`` and ``gza lineage``)."""
 
     task_id: str = default_color
     task_type: str = default_color

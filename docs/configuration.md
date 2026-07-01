@@ -1322,7 +1322,6 @@ gza history [options]
 | `--tag TAG` | Filter by tag (repeatable; matches any requested tag by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
 | `--all-tags` | With repeated `--tag` and/or `--tag-not` values, require all requested tags instead of the default any-tag matching |
-| `--lineage-depth N` | Render root-deduplicated lineage trees up to N levels |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
@@ -1348,7 +1347,6 @@ gza incomplete [options]
 | `--date-field FIELD` | Date field for `--days`: `created`, `completed`, or `effective` (default: `effective`) |
 | `--tag TAG` | Only show unresolved lineage owners matching tag filters (repeatable) |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
-| `--tree` | Render unresolved lineages as trees instead of one-line summaries |
 | `--verbose` | In one-line mode, show owner task details beneath each unresolved lineage |
 | `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |

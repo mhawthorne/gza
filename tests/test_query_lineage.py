@@ -739,3 +739,101 @@ class TestLineageChildSortKey:
         # id=None maps to numeric key 0; decimal suffix parses directly.
         assert key_no_id[-1] == 0
         assert key_with_id[-1] == 141
+
+
+# ---------------------------------------------------------------------------
+# _build_merge_unit_group_tree
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMergeUnitGroupTree:
+    """Grouping a per-task lineage tree into merge-unit blocks."""
+
+    def _store(self, units_by_task: dict, owners_by_unit: dict):
+        from gza.db import MergeUnit
+
+        units: dict[str, MergeUnit] = {}
+        for task_id, unit_id in units_by_task.items():
+            if unit_id is None:
+                continue
+            units.setdefault(
+                unit_id,
+                MergeUnit(
+                    id=unit_id,
+                    source_branch=f"branch-{unit_id}",
+                    target_branch="main",
+                    state="merged",
+                    owner_task_id=owners_by_unit.get(unit_id),
+                ),
+            )
+
+        store = MagicMock()
+        store.resolve_merge_unit_for_task.side_effect = lambda tid: units.get(units_by_task.get(tid))
+        store.get_merge_unit.side_effect = lambda uid: units.get(uid)
+        # owner task is resolved lazily by the caller from the tree, so a stub is fine.
+        store.resolve_merge_unit_owner_task.side_effect = lambda unit: _make_task(
+            id=unit.owner_task_id, task_type="implement"
+        )
+        return store
+
+    def _tree(self):
+        from gza.query import TaskLineageNode
+
+        plan = TaskLineageNode(task=_make_task(id="gza-1", task_type="plan"))
+        impl_a = TaskLineageNode(
+            task=_make_task(id="gza-2", task_type="implement", based_on="gza-1")
+        )
+        review_a = TaskLineageNode(
+            task=_make_task(id="gza-3", task_type="review", based_on="gza-2")
+        )
+        impl_b = TaskLineageNode(
+            task=_make_task(id="gza-4", task_type="implement", depends_on="gza-2")
+        )
+        review_b = TaskLineageNode(
+            task=_make_task(id="gza-5", task_type="review", based_on="gza-4")
+        )
+        retry_b = TaskLineageNode(
+            task=_make_task(id="gza-6", task_type="implement", depends_on="gza-2")
+        )
+        impl_b.children = [review_b]
+        impl_a.children = [review_a, impl_b, retry_b]
+        plan.children = [impl_a]
+        return plan
+
+    def test_groups_reviews_under_owner_and_nests_dependent_implements(self):
+        from gza.lineage_grouping import build_merge_unit_group_tree as _build_merge_unit_group_tree
+
+        units = {
+            "gza-1": None,  # plan: no merge unit
+            "gza-2": "mu-A",
+            "gza-3": "mu-A",  # review of A
+            "gza-4": "mu-B",
+            "gza-5": "mu-B",  # review of B
+            "gza-6": "mu-B",  # retry/re-attempt of B's owner
+        }
+        owners = {"mu-A": "gza-2", "mu-B": "gza-4"}
+        store = self._store(units, owners)
+
+        roots = _build_merge_unit_group_tree(store, self._tree())
+
+        assert len(roots) == 1
+        plan_group = roots[0]
+        assert plan_group.key == "solo:gza-1"
+        assert plan_group.header.id == "gza-1"
+
+        # The implement merge unit is the plan's child block.
+        assert len(plan_group.children) == 1
+        group_a = plan_group.children[0]
+        assert group_a.key == "mu-A"
+        assert group_a.header.id == "gza-2"
+        # The review is an inline member, not a child block.
+        assert [m.id for m in group_a.members] == ["gza-3"]
+
+        # The dependent implement is its own nested block (distinct from a review).
+        assert len(group_a.children) == 1
+        group_b = group_a.children[0]
+        assert group_b.key == "mu-B"
+        assert group_b.header.id == "gza-4"
+        # Review and the retry sibling both collapse into B's unit as members.
+        assert sorted(m.id for m in group_b.members) == ["gza-5", "gza-6"]
+        assert group_b.children == []

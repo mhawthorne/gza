@@ -105,11 +105,11 @@ from ..task_query import (
     task_matches_tag_filters,
 )
 from ..workers import WorkerMetadata, WorkerRegistry
+from . import lineage_view as _lv
 from ._common import (
     TASK_COLORS,
     _build_failure_diagnostics,
     _failure_next_steps,
-    _format_lineage,
     _lineage_tree_prefix,
     _parse_iso,
     _render_failure_diagnostics,
@@ -624,8 +624,6 @@ def _collect_incomplete_legacy_args(args: argparse.Namespace) -> tuple[str, ...]
         legacy_args.append("--blocked-by-dropped")
     if getattr(args, "last", None) is not None:
         legacy_args.extend(["--last", str(args.last)])
-    if getattr(args, "tree", False):
-        legacy_args.append("--tree")
     if getattr(args, "type", None):
         legacy_args.extend(["--type", str(args.type)])
     if getattr(args, "days", None) is not None:
@@ -944,7 +942,7 @@ def cmd_next(args: argparse.Namespace) -> int:
 
 def cmd_history(args: argparse.Namespace) -> int:
     """List recent completed/failed tasks."""
-    from gza.query import HistoryFilter, TaskLineageNode, query_history, query_history_with_lineage
+    from gza.query import HistoryFilter, query_history
 
     if getattr(args, "list_fields", False):
         return _print_projection_fields("history")
@@ -959,7 +957,6 @@ def cmd_history(args: argparse.Namespace) -> int:
     start_date = getattr(args, 'start_date', None)
     end_date = getattr(args, 'end_date', None)
     date_field = cast(_QueryDateField, getattr(args, 'date_field', "effective"))
-    lineage_depth = getattr(args, 'lineage_depth', 0)
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
         command_name="history",
@@ -991,7 +988,6 @@ def cmd_history(args: argparse.Namespace) -> int:
         start_date=start_date,
         end_date=end_date,
         date_field=date_field,
-        lineage_depth=lineage_depth,
         tags=tags or None,
         tags_not=tags_not or None,
         any_tag=any_tag,
@@ -1223,73 +1219,27 @@ def cmd_history(args: argparse.Namespace) -> int:
             if comment_count > 0:
                 console.print(f"{detail_prefix}    comments: [{c['stats']}]{comment_count}[/{c['stats']}]")
 
-    def _render_lineage_node(node: TaskLineageNode) -> None:
-        """Render a lineage tree using branch connectors."""
-
-        def _render_subtree(
-            current: TaskLineageNode,
-            *,
-            parent_task: DbTask | None = None,
-            prefix: str = "",
-            is_last: bool = True,
-        ) -> None:
-            if parent_task is not None:
-                connector = "└── " if is_last else "├── "
-                child_prefix_raw = f"{prefix}{'    ' if is_last else '│   '}"
-                first_prefix = f"[{c['lineage']}]{prefix}{connector}[/{c['lineage']}]"
-                detail_prefix = f"[{c['lineage']}]{child_prefix_raw}[/{c['lineage']}]"
-            else:
-                child_prefix_raw = ""
-                first_prefix = ""
-                detail_prefix = ""
-            _render_task_line(
-                current.task,
-                first_prefix=first_prefix,
-                detail_prefix=detail_prefix,
-                parent_task=parent_task,
-                compact_child=parent_task is not None,
-            )
-
-            for index, child in enumerate(current.children):
-                _render_subtree(
-                    child,
-                    parent_task=current.task,
-                    prefix=child_prefix_raw,
-                    is_last=index == (len(current.children) - 1),
-                )
-
-        _render_subtree(node)
-        print()
-
     # Check for orphaned tasks (only when no status filter is active)
     orphaned: list[DbTask] = []
     if not status:
         registry = WorkerRegistry(config.workers_path)
         orphaned = _get_orphaned_tasks(registry, store)
 
-    if lineage_depth > 0:
-        nodes = query_history_with_lineage(store, f)
-        if not nodes and not orphaned:
-            _print_history_empty_message(status, task_type, days)
-            return 0
-        # Show orphaned tasks at the top
-        for task in orphaned:
-            _render_orphaned_task(task, c)
-        for node in nodes:
-            _render_lineage_node(node)
-    else:
-        recent = query_history(store, f)
-        if not recent and not orphaned:
-            _print_history_empty_message(status, task_type, days)
-            return 0
+    recent = query_history(store, f)
+    if not recent and not orphaned:
+        _print_history_empty_message(status, task_type, days)
+        return 0
 
-        # Show orphaned tasks at the top so they're immediately visible
-        for task in orphaned:
-            _render_orphaned_task(task, c)
+    # Show orphaned tasks at the top so they're immediately visible
+    for task in orphaned:
+        _render_orphaned_task(task, c)
 
-        for task in recent:
-            _render_task_line(task, first_prefix="", detail_prefix="")
-            print()
+    # One lineage tree per distinct root is enough for the whole feed.
+    lineage_cache: dict = {}
+    for task in recent:
+        _render_task_line(task, first_prefix="", detail_prefix="")
+        console.print(_lv.lineage_summary_line(store, task, lineage_cache))
+        print()
 
     return 0
 
@@ -1513,7 +1463,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
     limit = None if args.last == 0 else args.last
-    mode = cast(_PresentationMode, "tree" if getattr(args, "tree", False) else "one_line")
+    mode = cast(_PresentationMode, "one_line")
     task_type_filter: str | None = getattr(args, "type", None)
     projection_fields = _validate_projection_fields(
         _parse_csv(getattr(args, "fields", None)),
@@ -1645,7 +1595,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             assert task.id is not None
             console.print(_blocked_dependent_detail(store, task, readiness))
 
-    if getattr(args, "verbose", False) and mode != "tree":
+    if getattr(args, "verbose", False):
         c = TASK_COLORS
         for row in result.rows:
             if not isinstance(row, _LineageRow):
@@ -2280,7 +2230,18 @@ def _enrich_unmerged_result(
     live_branch_states: dict[str, str | None] | None = None,
 ) -> _TaskQueryResult:
     effective_fields = _unmerged_effective_fields(result.query)
-    needs_lineage_text = "lineage_text" in effective_fields
+    needs_lineage_stats = bool(
+        effective_fields
+        & {
+            "lineage_origin_id",
+            "lineage_origin_type",
+            "lineage_root_impl_id",
+            "lineage_parent_impl_id",
+            "lineage_task_count",
+            "lineage_merge_unit_count",
+        }
+    )
+    lineage_stats_cache: dict = {}
     needs_branch_metadata = bool(
         effective_fields
         & {
@@ -2367,7 +2328,7 @@ def _enrich_unmerged_result(
         review_detail = None
         review_verdict = None
         review_score: int | None = None
-        if needs_review_metadata or needs_lineage_text:
+        if needs_review_metadata:
             code_changing_tasks = _get_code_changing_descendants_for_root_task(store, lineage_root)
             review_source_task_ids: set[str] = set()
             same_branch_code_changing_tasks: list[DbTask] = []
@@ -2536,19 +2497,12 @@ def _enrich_unmerged_result(
             if merge_unit is None or merge_unit.target_branch != target_branch:
                 merge_unit_id = None
                 source_branch = representative_branch
+        if needs_lineage_stats:
+            unmerged_values.update(_lv.lineage_summary_stats(store, owner_task, lineage_stats_cache))
         unmerged_values.update(
             {
                 "member_ids": [member.id for member in members if member.id is not None],
                 "unresolved_ids": [task.id for task in row.unresolved_tasks if task.id is not None],
-                "lineage_text": (
-                    _format_lineage(
-                        pruned_tree,
-                        annotate=True,
-                        review_verdict_resolver=lambda review_task: get_review_verdict(config, review_task),
-                    )
-                    if needs_lineage_text and pruned_tree is not None
-                    else None
-                ),
                 "branch": representative_branch,
                 "source_branch": source_branch,
                 "target_branch": target_branch,
@@ -4021,20 +3975,8 @@ def cmd_lineage(args: argparse.Namespace) -> int:
         ts = value.astimezone(UTC) if value.tzinfo is not None else value
         return f"{ts.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
-    def _strip_slug_date_prefix(slug: str) -> str:
-        if len(slug) > 9 and slug[8] == "-" and slug[:8].isdigit():
-            return slug[9:]
-        return slug
-
     def _prompt_text(t: DbTask) -> str:
-        type_str = t.task_type or "implement"
-        if type_str not in {"plan", "plan_improve", "plan_review", "implement"}:
-            return ""
-        if t.slug:
-            value = _strip_slug_date_prefix(t.slug)
-        else:
-            value = t.prompt.split("\n")[0].strip()
-        return value[:60] + "…" if len(value) > 60 else value
+        return _lv.prompt_text(t)
 
     def _collect_rows(
         node: TaskLineageNode,
@@ -4164,7 +4106,23 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     show_full = bool(getattr(args, "full", False))
     show_parents_only = bool(getattr(args, "parents_only", False))
     show_children_only = bool(getattr(args, "children_only", False))
+    show_flat = bool(getattr(args, "flat", False))
+    show_json = bool(getattr(args, "json", False))
+
+    def _render_grouped_lineage(tree: TaskLineageNode) -> None:
+        _lv.render_merge_grouped(store=store, config=config, task_id=task_id, full_tree=tree)
+
+    render_tree = _render_lineage_tree if show_flat else _render_grouped_lineage
     parent_entries = _immediate_parent_entries(task)
+
+    # The default/full/json views need the whole tree rooted at the canonical
+    # lineage root so ancestors and counts are available.
+    root_task = _resolve_lineage_root_task(store, task)
+    full_tree = _build_lineage_tree_for_root(store, root_task, max_depth=None)
+
+    if show_json:
+        print(_lv.lineage_json_text(store, task_id, full_tree))
+        return 0
 
     if show_parents_only:
         for index, tree in enumerate(_build_ancestor_forest_for_task(store, task)):
@@ -4173,27 +4131,49 @@ def cmd_lineage(args: argparse.Namespace) -> int:
             _render_lineage_tree(tree)
         return 0
 
-    if show_full:
-        console.print("Parents:")
-        for index, tree in enumerate(_build_ancestor_forest_for_task(store, task)):
-            if index > 0:
-                console.print()
-            _render_lineage_tree(tree)
-        console.print()
-        console.print("Children:")
-        _render_lineage_tree(lineage_tree)
+    if show_children_only:
+        render_tree(lineage_tree)
         return 0
 
-    _render_lineage_tree(lineage_tree)
+    if show_full:
+        render_tree(full_tree)
+        return 0
 
-    if not show_children_only and parent_entries:
+    if show_flat:
+        _render_lineage_tree(lineage_tree)
+        if parent_entries:
+            parent_summary = ", ".join(
+                f"{parent.id} [{label}]"
+                for parent, label in parent_entries
+                if parent.id is not None
+            )
+            console.print(
+                rich_escape(f"Parents: {parent_summary}. Use --full or --parents-only to inspect ancestors.")
+            )
+        return 0
+
+    if not _lv.render_local(
+        store=store,
+        config=config,
+        task_id=task_id,
+        full_tree=full_tree,
+        heading=f"Lineage for [{_colors.LINEAGE_COLORS.task_id}]{rich_escape(task_id)}[/{_colors.LINEAGE_COLORS.task_id}]",
+    ):
+        _render_grouped_lineage(full_tree)
+    if parent_entries:
         parent_summary = ", ".join(
             f"{parent.id} [{label}]"
             for parent, label in parent_entries
             if parent.id is not None
         )
-        console.print(rich_escape(f"Parents: {parent_summary}. Use --full or --parents-only to inspect ancestors."))
-
+        console.print(
+            rich_escape(f"\nParents: {parent_summary}. Use --full or --parents-only to inspect ancestors.")
+        )
+    else:
+        console.print(
+            f"\n[{_colors.LINEAGE_COLORS.annotation}]Use --full for the whole tree, "
+            f"--flat for the raw per-task tree, or --json to script.[/{_colors.LINEAGE_COLORS.annotation}]"
+        )
     return 0
 
 
@@ -4545,16 +4525,18 @@ def _cmd_show_output(
         console.print(f"[{c['label']}]Session ID:[/{c['label']}] [{c['value']}]{task.session_id}[/{c['value']}]")
 
     root_task = _resolve_lineage_root_task(store, task)
-    lineage_tree = _build_lineage_tree_for_root(store, root_task)
-    lineage_str = _format_lineage(
-        lineage_tree,
-        c["task_id"],
-        show_status=True,
-        status_color_resolver=lambda lineage_task: _show_status_color(lineage_task, c),
-    )
-    if _lineage_has_descendants(lineage_tree) and lineage_str:
-        console.print(f"[{c['label']}]Lineage:[/{c['label']}]")
-        console.print(lineage_str)
+    lineage_tree = _build_lineage_tree_for_root(store, root_task, max_depth=None)
+    # Show a focused local window (ancestors, peers, immediate children with
+    # counts) rather than dumping the whole — possibly huge — lineage tree.
+    if _lineage_has_descendants(lineage_tree) and task.id is not None:
+        _lv.render_local(
+            store=store,
+            config=config,
+            task_id=task.id,
+            full_tree=lineage_tree,
+            heading=f"[{c['label']}]Lineage:[/{c['label']}]",
+            status_color=lambda lineage_task: _show_status_color(lineage_task, c),
+        )
 
     if not metadata_only:
         console.print()

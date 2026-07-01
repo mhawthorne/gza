@@ -92,7 +92,6 @@ from ..review_verdict import (
     get_review_outcome as _get_review_outcome,
     get_review_score as _get_review_score,
     get_review_verdict as _get_review_verdict,
-    parse_review_verdict,
 )
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
@@ -3223,121 +3222,6 @@ def _create_plan_improve_task(
     )
 
 
-from ..query import _LINEAGE_REL_LABELS, TaskLineageNode as _TaskLineageNode  # noqa: E402
-
-
-def _format_lineage(
-    lineage_tree: _TaskLineageNode,
-    task_id_color: str | None = None,
-    *,
-    annotate: bool = False,
-    show_status: bool = False,
-    status_color_resolver: Callable[[DbTask], str] | None = None,
-    review_verdict_resolver: Callable[[DbTask], str | None] | None = None,
-) -> str:
-    """Format a lineage tree as a multi-line branch rendering."""
-    lc = _colors.LINEAGE_COLORS
-    # Allow callers to override task_id color (e.g. unmerged passes its own)
-    _task_id_color = task_id_color if task_id_color is not None else lc.task_id
-
-    def _normalize_time(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value
-        return value.astimezone(UTC).replace(tzinfo=None)
-
-    def _lineage_time(task: DbTask) -> datetime:
-        return task.completed_at or task.created_at or datetime.min
-
-    latest_review_task_id: str | None = None
-    if annotate:
-        review_tasks: list[DbTask] = []
-
-        def _collect_reviews(node: _TaskLineageNode) -> None:
-            if node.task.task_type == "review":
-                review_tasks.append(node.task)
-            for child_node in node.children:
-                _collect_reviews(child_node)
-
-        _collect_reviews(lineage_tree)
-        if review_tasks:
-            latest_review = max(
-                review_tasks,
-                key=lambda task: (
-                    _normalize_time(_lineage_time(task)),
-                    task_id_numeric_key(task.id),
-                ),
-            )
-            latest_review_task_id = latest_review.id
-
-    def _annotation(task: DbTask) -> str:
-        if not annotate:
-            return ""
-
-        completed_label = (
-            task.completed_at.strftime("%Y-%m-%d %H:%M")
-            if task.completed_at
-            else "n/a"
-        )
-        status_label = task.status or "unknown"
-        verdict_label = "-"
-
-        if task.task_type == "review":
-            verdict = (
-                review_verdict_resolver(task)
-                if review_verdict_resolver is not None
-                else parse_review_verdict(task.output_content)
-            )
-            verdict_map = {
-                "APPROVED": "approved",
-                "APPROVED_WITH_FOLLOWUPS": "approved_with_followups",
-                "CHANGES_REQUESTED": "changes_requested",
-                "NEEDS_DISCUSSION": "needs_discussion",
-            }
-            verdict_label = verdict_map.get(verdict, "unknown") if verdict else "unknown"
-            if latest_review_task_id is not None and task.id == latest_review_task_id:
-                verdict_label = f"{verdict_label} \u2190 latest"
-
-        return f" [{lc.annotation}]({completed_label} | {status_label} | {verdict_label})[/{lc.annotation}]"
-
-    def _node_label(task: DbTask, relationship: str = "root") -> str:
-        rel_suffix = ""
-        rel_label = _LINEAGE_REL_LABELS.get(relationship, "")
-        if rel_label and rel_label != task.task_type:
-            rel_suffix = f" [{lc.task_type}]\\[{rel_label}][/{lc.task_type}]"
-        status_suffix = ""
-        if show_status:
-            status_text = format_task_status_text(task)
-            status_color = (
-                status_color_resolver(task)
-                if status_color_resolver is not None
-                else get_task_status_color(task)
-            )
-            status_suffix = f" [{status_color}]{rich_escape(status_text)}[/{status_color}]"
-            merge_label = format_task_merge_label(task)
-            if merge_label:
-                merge_color = _colors.STATUS_COLORS.completed if merge_label == "merged" else _colors.STATUS_COLORS.unmerged
-                status_suffix += f" ([{merge_color}]{merge_label}[/{merge_color}])"
-        if task.id is None:
-            return f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]{rel_suffix}{status_suffix}{_annotation(task)}"
-        return (
-            f"[{_task_id_color}]{task.id}[/{_task_id_color}]"
-            f"[{lc.task_type}]\\[{task.task_type}][/{lc.task_type}]"
-            f"{rel_suffix}"
-            f"{status_suffix}"
-            f"{_annotation(task)}"
-        )
-
-    lines: list[str] = [_node_label(lineage_tree.task)]
-
-    def _walk(node: _TaskLineageNode, ancestors_last: tuple[bool, ...] = ()) -> None:
-        for index, child in enumerate(node.children):
-            is_last = index == (len(node.children) - 1)
-            prefix = _lineage_tree_prefix((*ancestors_last, is_last))
-            lines.append(f"{prefix}{_node_label(child.task, child.relationship)}")
-            _walk(child, (*ancestors_last, is_last))
-
-    _walk(lineage_tree)
-    return "\n".join(lines)
 
 
 def _lineage_tree_prefix(ancestors_last: tuple[bool, ...]) -> str:
