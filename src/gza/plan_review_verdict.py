@@ -36,7 +36,6 @@ _SLICE_COMPLEXITY_SYNONYMS = {
 class PlanReviewValidationError(ValueError):
     """Raised when a plan-review report or manifest violates the contract."""
 
-
 @dataclass(frozen=True)
 class PlanReviewSliceQuality:
     """Top-level slice-budget assertion emitted by the reviewer."""
@@ -94,6 +93,7 @@ class PlanReviewOutcome:
     verdict: PlanReviewVerdict | None
     manifest: PlanReviewManifest | None
     validation_error: str | None = None
+    recoverable_schema_version_format_error: bool = False
 
 
 def _normalize_h2(name: str) -> str:
@@ -341,6 +341,11 @@ def get_plan_review_outcome(
             manifest=None,
             validation_error=str(exc),
         )
+    recoverable_schema_version_format_error = False
+    if report.raw_manifest is not None:
+        recoverable_schema_version_format_error = _has_recoverable_schema_version_format_error(
+            report.raw_manifest.get("schema_version")
+        )
     try:
         manifest = validate_plan_review_report(
             content,
@@ -354,6 +359,7 @@ def get_plan_review_outcome(
             verdict=report.verdict,
             manifest=None,
             validation_error=str(exc),
+            recoverable_schema_version_format_error=recoverable_schema_version_format_error,
         )
     return PlanReviewOutcome(
         verdict=report.verdict,
@@ -368,7 +374,7 @@ def _validate_manifest_common(
     source_task_id: str,
     source_task_type: str,
 ) -> PlanReviewManifest:
-    schema_version = _require_positive_int(raw_manifest.get("schema_version"), "schema_version")
+    schema_version = _normalize_schema_version(raw_manifest.get("schema_version"))
     if schema_version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise PlanReviewValidationError(f"unsupported plan review manifest schema_version: {schema_version}")
 
@@ -425,6 +431,24 @@ def _validate_manifest_common(
         slices=slices,
         manual_override=manual_override,
     )
+
+
+def _normalize_schema_version(value: object) -> int:
+    return _coerce_positive_int_like(
+        value,
+        "schema_version",
+    )
+
+
+def _has_recoverable_schema_version_format_error(value: object) -> bool:
+    try:
+        _coerce_positive_int_like(
+            value,
+            "schema_version",
+        )
+    except PlanReviewValidationError:
+        return True
+    return False
 
 
 def _parse_slice_quality(value: object) -> PlanReviewSliceQuality:
@@ -516,11 +540,38 @@ def _parse_slice(value: object) -> PlanReviewSlice:
 
 
 def _require_positive_int(value: object, field_name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
+    return _coerce_positive_int_like(value, field_name, allow_string=False, allow_float=False)
+
+
+def _coerce_positive_int_like(
+    value: object,
+    field_name: str,
+    *,
+    allow_string: bool = True,
+    allow_float: bool = True,
+) -> int:
+    normalized: int
+    if isinstance(value, bool):
         raise PlanReviewValidationError(f"{field_name} must be an integer")
-    if value <= 0:
+    if isinstance(value, int):
+        normalized = value
+    elif allow_float and isinstance(value, float):
+        if not value.is_integer():
+            raise PlanReviewValidationError(f"{field_name} must be an integer")
+        normalized = int(value)
+    elif allow_string and isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise PlanReviewValidationError(f"{field_name} must be an integer")
+        try:
+            normalized = int(stripped)
+        except ValueError as exc:
+            raise PlanReviewValidationError(f"{field_name} must be an integer") from exc
+    else:
+        raise PlanReviewValidationError(f"{field_name} must be an integer")
+    if normalized <= 0:
         raise PlanReviewValidationError(f"{field_name} must be positive")
-    return value
+    return normalized
 
 
 def _coerce_slice_complexity(value: str) -> str:

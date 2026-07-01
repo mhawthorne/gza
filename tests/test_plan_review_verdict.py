@@ -165,6 +165,69 @@ class TestValidatePlanReviewReport:
         assert manifest.verdict == "APPROVED"
         assert [slice_manifest.slice_id for slice_manifest in manifest.slices] == ["S1", "S2"]
 
+    @pytest.mark.parametrize("schema_version", ["1", 1.0])
+    def test_accepts_integer_like_supported_schema_version_representations(
+        self,
+        schema_version: object,
+    ) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        manifest["schema_version"] = schema_version
+
+        validated = validate_plan_review_report(
+            _report_for_manifest(manifest),
+            source_task_id="gza-123",
+            source_task_type="plan",
+            max_slice_timeout_minutes=45,
+        )
+
+        assert validated is not None
+        assert validated.schema_version == 1
+
+    @pytest.mark.parametrize(
+        ("schema_version", "remove_field", "expected_error"),
+        [
+            pytest.param("not-an-int", False, "schema_version must be an integer", id="nondigit-string"),
+            pytest.param("1.5", False, "schema_version must be an integer", id="decimal-string"),
+            pytest.param(1.5, False, "schema_version must be an integer", id="non-integral-float"),
+            pytest.param(True, False, "schema_version must be an integer", id="bool"),
+            pytest.param(None, True, "schema_version must be an integer", id="missing"),
+        ],
+    )
+    def test_rejects_ambiguous_or_missing_schema_version_representations(
+        self,
+        schema_version: object,
+        remove_field: bool,
+        expected_error: str,
+    ) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        if remove_field:
+            manifest.pop("schema_version")
+        else:
+            manifest["schema_version"] = schema_version
+
+        with pytest.raises(PlanReviewValidationError, match=expected_error):
+            validate_plan_review_report(
+                _report_for_manifest(manifest),
+                source_task_id="gza-123",
+                source_task_type="plan",
+                max_slice_timeout_minutes=45,
+            )
+
+    def test_rejects_explicit_unsupported_schema_version(self) -> None:
+        manifest = copy.deepcopy(_base_manifest())
+        manifest["schema_version"] = 2
+
+        with pytest.raises(
+            PlanReviewValidationError,
+            match="unsupported plan review manifest schema_version: 2",
+        ):
+            validate_plan_review_report(
+                _report_for_manifest(manifest),
+                source_task_id="gza-123",
+                source_task_type="plan",
+                max_slice_timeout_minutes=45,
+            )
+
     def test_coerces_string_scope_fields_in_approved_manifest(self) -> None:
         manifest = copy.deepcopy(_base_manifest())
         manifest["slices"][0]["scope"] = "Add task types"

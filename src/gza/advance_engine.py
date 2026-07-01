@@ -438,6 +438,7 @@ class AdvanceContext:
     parsed_plan_review_manifest: PlanReviewManifest | None = None
     validated_plan_review_manifest: PlanReviewManifest | None = None
     plan_review_validation_error: str | None = None
+    recoverable_plan_review_schema_version_format_error: bool = False
     current_plan_improve: DbTask | None = None
     active_plan_improve_pending: DbTask | None = None
     active_plan_improve_running: DbTask | None = None
@@ -3558,6 +3559,7 @@ def _resolve_plan_review_state(
     plan_review_verdict: str | None = None
     validated_manifest: PlanReviewManifest | None = None
     validation_error: str | None = None
+    recoverable_schema_version_format_error = False
     if latest_completed_plan_review is not None and latest_plan_source.id is not None:
         outcome = get_plan_review_outcome(
             Path(config.project_dir),
@@ -3570,6 +3572,7 @@ def _resolve_plan_review_state(
         plan_review_verdict = outcome.verdict
         validated_manifest = outcome.manifest
         validation_error = outcome.validation_error
+        recoverable_schema_version_format_error = outcome.recoverable_schema_version_format_error
 
     completed_plan_review_cycles = _count_consecutive_plan_review_cycles(
         config=config,
@@ -3596,6 +3599,7 @@ def _resolve_plan_review_state(
         "parsed_plan_review_manifest": validated_manifest,
         "validated_plan_review_manifest": validated_manifest,
         "plan_review_validation_error": validation_error,
+        "recoverable_plan_review_schema_version_format_error": recoverable_schema_version_format_error,
         "current_plan_improve": current_plan_improve,
         "active_plan_improve_pending": active_plan_improve_pending,
         "active_plan_improve_running": active_plan_improve_running,
@@ -5788,6 +5792,33 @@ ADVANCE_RULES: list[AdvanceRule] = [
             "type": "wait_plan_review",
             "description": f"Wait for plan review {_task_id(ctx.active_plan_review_running)}",
             "plan_review_task": ctx.active_plan_review_running,
+        },
+    ),
+    AdvanceRule(
+        name="plan_rederive_approved_review_schema_version_manifest",
+        matches=lambda ctx: (
+            ctx.task_type in {"plan", "plan_improve"}
+            and ctx.task.status == "completed"
+            and not ctx.has_non_dropped_implement_descendant
+            and ctx.auto_implement_enabled
+            and ctx.require_plan_review_before_implement
+            and ctx.plan_review_verdict == "APPROVED"
+            and ctx.validated_plan_review_manifest is None
+            and ctx.plan_review_validation_error is not None
+            and ctx.recoverable_plan_review_schema_version_format_error
+            and ctx.active_plan_review_pending is None
+            and ctx.active_plan_review_running is None
+            and not (
+                ctx.plan_materialization_state is not None
+                and ctx.plan_materialization_state.materialized
+            )
+        ),
+        action=lambda ctx: {
+            "type": "create_plan_review",
+            "description": (
+                "Re-run plan review to re-derive approved slice manifest after "
+                f"schema_version format mismatch in {_task_id(ctx.latest_completed_plan_review)}"
+            ),
         },
     ),
     AdvanceRule(

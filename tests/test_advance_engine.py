@@ -1750,6 +1750,111 @@ def test_completed_plan_improve_with_existing_implement_child_skips_without_mate
     assert action["reason"] == "already_has_implement"
 
 
+@pytest.mark.parametrize("schema_version", ["1", 1.0])
+def test_completed_plan_improve_with_integer_like_schema_version_manifest_materializes_slices(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    initial_review = store.add("Initial review", task_type="plan_review", depends_on=plan.id)
+    assert initial_review.id is not None
+    initial_review.status = "completed"
+    initial_review.completed_at = datetime.now(UTC)
+    initial_review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+    store.update(initial_review)
+
+    revised_plan = store.add("Revise plan", task_type="plan_improve", depends_on=initial_review.id, based_on=plan.id)
+    assert revised_plan.id is not None
+    revised_plan.status = "completed"
+    revised_plan.completed_at = datetime.now(UTC)
+    store.update(revised_plan)
+
+    manifest = {
+        **_approved_plan_review_manifest(revised_plan.id),
+        "schema_version": schema_version,
+        "source_task_type": "plan_improve",
+    }
+    revised_review = store.add("Revised review", task_type="plan_review", depends_on=revised_plan.id)
+    assert revised_review.id is not None
+    revised_review.status = "completed"
+    revised_review.completed_at = datetime.now(UTC)
+    revised_review.output_content = _approved_plan_review_report(manifest)
+    store.update(revised_review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), revised_plan, "main")
+
+    assert action["type"] == "materialize_plan_slices"
+    assert "needs_attention_reason" not in action
+    assert action["manifest"].schema_version == 1
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "remove_field"),
+    [
+        pytest.param("not-an-int", False, id="nondigit-string"),
+        pytest.param("1.5", False, id="decimal-string"),
+        pytest.param(1.5, False, id="non-integral-float"),
+        pytest.param(True, False, id="bool"),
+        pytest.param(None, True, id="missing"),
+    ],
+)
+def test_completed_plan_improve_with_malformed_schema_version_manifest_reruns_plan_review(
+    tmp_path: Path,
+    schema_version: object,
+    remove_field: bool,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime.now(UTC)
+    store.update(plan)
+
+    initial_review = store.add("Initial review", task_type="plan_review", depends_on=plan.id)
+    assert initial_review.id is not None
+    initial_review.status = "completed"
+    initial_review.completed_at = datetime.now(UTC)
+    initial_review.output_content = "## Verdict\nVerdict: CHANGES_REQUESTED\n"
+    store.update(initial_review)
+
+    revised_plan = store.add("Revise plan", task_type="plan_improve", depends_on=initial_review.id, based_on=plan.id)
+    assert revised_plan.id is not None
+    revised_plan.status = "completed"
+    revised_plan.completed_at = datetime.now(UTC)
+    store.update(revised_plan)
+
+    manifest = {
+        **_approved_plan_review_manifest(revised_plan.id),
+        "source_task_type": "plan_improve",
+    }
+    if remove_field:
+        manifest.pop("schema_version")
+    else:
+        manifest["schema_version"] = schema_version
+    revised_review = store.add("Revised review", task_type="plan_review", depends_on=revised_plan.id)
+    assert revised_review.id is not None
+    revised_review.status = "completed"
+    revised_review.completed_at = datetime.now(UTC)
+    revised_review.output_content = _approved_plan_review_report(manifest)
+    store.update(revised_review)
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), revised_plan, "main")
+
+    assert action["type"] == "create_plan_review"
+    assert "manifest" not in action
+    assert action.get("needs_attention_reason") != "plan-review-invalid-slices"
+
+
 def test_completed_plan_improve_with_partial_unrecorded_materialization_needs_repair(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

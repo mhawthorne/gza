@@ -312,6 +312,39 @@ def test_stale_completed_rebase_spec_only_parks_when_current_target_tip_is_alrea
         "including stale completed rebases whose branch no longer contains the current target tip"
     ) in workflow
 
+
+def test_plan_review_schema_version_contract_stays_aligned_across_spec_and_workflow_docs() -> None:
+    """Spec and internal workflow docs should preserve integer-like schema-version normalization."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+
+    assert (
+        'Unambiguous integer-like persisted `schema_version` representations such as string `"1"` '
+        "and float `1.0` MUST be normalized through the shared manifest validator and MAY proceed "
+        "through approved-manifest materialization."
+    ) in lifecycle_flat
+    assert (
+        "If an approved manifest instead fails validation because `schema_version` is missing "
+        "or not an unambiguous integer representation, the engine MUST re-run `plan_review` "
+        "to re-derive the manifest; it MUST NOT park that format-only failure as "
+        "`plan-review-invalid-slices`."
+    ) in lifecycle_flat
+    assert "it MUST NOT silently coerce that metadata into a supported version" not in lifecycle_flat
+
+    assert (
+        '| Completed non-held plan whose latest approved plan-review manifest has an unambiguous '
+        'integer-like `schema_version` such as string `"1"` or float `1.0` | '
+        "`materialize_plan_slices`"
+    ) in workflow
+    assert (
+        "| Completed non-held plan whose latest approved plan-review manifest only fails because "
+        "`schema_version` is missing or not an unambiguous integer representation | "
+        "`create_plan_review`"
+    ) in workflow
+    assert "instead of silently coercing or parking `plan-review-invalid-slices`" not in workflow
+
 def test_off_topic_verify_lifecycle_wording_stays_reconciled_with_focused_contract() -> None:
     """Lifecycle wording should not contradict the focused off-topic verify contract."""
     repo_root = Path(__file__).resolve().parents[1]

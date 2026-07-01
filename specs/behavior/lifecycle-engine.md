@@ -89,6 +89,12 @@ and default to **off**.
   with no implementation follow-up MUST enter automated `plan_review` first when
   `require_plan_review_before_implement` is on. The engine MUST create/run a `plan_review`,
   then materialize bounded implementation slices only after an approved valid manifest.
+  Unambiguous integer-like persisted `schema_version` representations such as string `"1"`
+  and float `1.0` MUST be normalized through the shared manifest validator and MAY proceed
+  through approved-manifest materialization. If an approved manifest instead fails
+  validation because `schema_version` is missing or not an unambiguous integer
+  representation, the engine MUST re-run `plan_review` to re-derive the manifest; it MUST
+  NOT park that format-only failure as `plan-review-invalid-slices`.
   If the same plan source is explicitly held (`auto_implement` off), an approved valid
   latest completed `plan_review` MUST first release that hold through the shared
   `auto_implement=true` transition, without materializing slices in the same action; the
