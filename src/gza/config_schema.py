@@ -238,7 +238,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("watch.failure_halt_after", "int | null", 10, "Exit `gza watch` after this many consecutive non-auto-resumable failures."),
     ConfigKeySpec("watch.no_progress_cycles", "int", 3, "Repeated unchanged watch-action cycles before the subject is parked for manual attention."),
-    ConfigKeySpec("watch.slot_settle_seconds", "int", 5, "Bounded seconds `gza watch` gives a selected worker launch to settle for current-pass compatibility accounting: either live-running proof or an observable post-launch terminal outcome counts as settled, and only launches with neither signal are treated as undispatched."),
+    ConfigKeySpec("watch.slot_settle_seconds", "int", 5, "Bounded seconds `gza watch` gives a selected worker launch to settle for current-pass slot accounting: only live-running proof consumes a slot; terminal-before-running and no-live-proof launches release provisional budget and stay non-slot-consuming."),
     ConfigKeySpec("watch.main_verify_remediation_max_attempts", "int", 2, "Maximum consumed automatic remediation attempts for one main-verify failure identity before watch stops filing more and requires human intervention."),
     ConfigKeySpec("watch.parked_auto_rearm.enabled", "bool", False, "Enable the watch-owned blind parked auto-rearm phase for eligible parked owner/reason pairs."),
     ConfigKeySpec("watch.parked_auto_rearm.budget", "int", 2, "Maximum blind auto-rearm attempts `gza watch` may spend per parked subject/reason pair before leaving it parked."),

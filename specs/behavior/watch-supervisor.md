@@ -387,13 +387,15 @@ When the installed `gza` package fingerprint changes while watch is running:
 - After selecting a worker-consuming action, watch MUST wait only a small bounded
   `watch.slot_settle_seconds` window for the chosen task to prove execution. A live
   running state counts, and a live registered worker counts, including the legitimate
-  preloop case where the task row is still `pending`. A task that already reaches an
-  observable terminal outcome inside that same bounded window also counts as executed
-  work rather than an undispatched launch no-show. Only when neither live-running proof
-  nor an observable post-launch terminal outcome appears in the window may watch log the
-  action as undispatched, skip no-progress accounting for that attempted launch, and
-  continue scanning the same cycle for another runnable candidate instead of leaving the
-  slot idle.
+  preloop case where the task row is still `pending`. A task that reaches an observable
+  terminal outcome inside that same bounded window is a settled launch outcome, but it
+  does NOT occupy a worker slot or count as a confirmed running start. Watch MUST emit a
+  visible diagnostic for that terminal-before-running outcome, release the provisional
+  launch budget for the same cycle, skip no-progress accounting for that attempted
+  launch, and continue scanning the same cycle for another runnable candidate instead of
+  leaving the slot idle. Only when neither live-running proof nor an observable
+  post-launch terminal outcome appears in the window may watch log the action as
+  undispatched and move on without consuming a slot.
 - When the latest relevant failed recovery or improve attempt for that selected
   subject/action is a **transient terminal** (for example provider-capacity,
   infrastructure/setup failure before durable work such as `WORKSPACE_NOT_POPULATED`,
@@ -535,7 +537,7 @@ The existence of these knobs is contract; their values are operator policy.
 | `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
 | `watch.transient_recovery_backoff_max` | Maximum persisted cooldown for transient failed recovery/improve retries |
 | `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
-| `watch.slot_settle_seconds` | Bounded wait for selected work to prove live execution, either by a running worker or by an observable post-launch terminal outcome, before watch treats the dispatch as undispatched and moves on |
+| `watch.slot_settle_seconds` | Bounded wait for selected work to prove live execution; only live proof occupies a slot, while terminal-before-running outcomes release provisional budget and no-live-proof outcomes remain undispatched |
 | `watch.no_activity_timeout` | Reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
 | `--tag` / `--all-tags` | Supervisor execution scope (`--tag` matches any requested tag by default; `--all-tags` requires all of them) |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
