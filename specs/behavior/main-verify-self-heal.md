@@ -71,7 +71,8 @@ current canonical local-target tree.
 
 The durable checkpoint for a red local-target verify result MUST auto-expire after a
 bounded TTL, even when the local-target tree fingerprint and verify-gate identity are
-unchanged.
+unchanged. Verify-gate identity includes the environment identity that produced the
+checkpoint whenever the gate is configured.
 
 - The bound itself is policy; the existence of the bound and its enforcement are
   contract.
@@ -79,6 +80,10 @@ unchanged.
   MUST rerun the local-target verify gate and replace the checkpoint with fresh evidence.
 - Automation MUST NOT treat "same tree, same gate, same old red checkpoint" as sufficient
   reason to freeze merges forever.
+- Automation MUST also fail closed on legacy or mismatched configured-gate checkpoints:
+  if the current gate requires an environment identity and the stored checkpoint either
+  lacks that identity or records a different one, the checkpoint is stale and MUST be
+  refreshed before it can justify a merge freeze.
 
 ### MV4 — Confirmed deterministic red MUST trigger bounded repair plus alert
 

@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import signal
 import sys
@@ -115,7 +116,11 @@ from gza.git_health import (
     load_git_health_state,
 )
 from gza.lineage_query import LineageOwnerRow
-from gza.main_integration_verify import MAIN_INTEGRATION_VERIFY_TAG, current_main_integration_verify_alert
+from gza.main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_TAG,
+    MainIntegrationVerifyEnvironmentIdentity,
+    current_main_integration_verify_alert,
+)
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
@@ -138,6 +143,16 @@ def _task_count(store) -> int:
         row = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()
     assert row is not None
     return int(row["c"])
+
+
+def _main_verify_environment_identity_payload() -> dict[str, str]:
+    return {
+        "runner_class": "host",
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "python_executable": sys.executable,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
 
 
 def _empty_scoped_watch_plan(
@@ -9542,6 +9557,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
         {
             "alert_message": "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
             "captured_at": "2026-06-29T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
             "failing_phase": "functional",
             "gate_enabled": True,
             "head_sha": "feedfacecafe",
@@ -9588,6 +9604,9 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
             verify_command="./bin/tests",
             verify_timeout_seconds=120,
             verify_timeout_grace_seconds=5.0,
+            environment_identity=MainIntegrationVerifyEnvironmentIdentity.from_payload(
+                _main_verify_environment_identity_payload()
+            ),
             tree_fingerprint="fp-new",
             head_sha="feedfacecafe",
             failing_phase="functional",
@@ -10892,6 +10911,7 @@ def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row
         {
             "alert_message": None,
             "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
             "failing_phase": None,
             "gate_enabled": True,
             "head_sha": "deadbeefcafe",
@@ -10932,6 +10952,7 @@ def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row
             {
                 "alert_message": red.state.alert_message,
                 "captured_at": "2026-06-23T00:05:00+00:00",
+                "environment_identity": _main_verify_environment_identity_payload(),
                 "failing_phase": "unit",
                 "gate_enabled": True,
                 "head_sha": "feedfacecafe",

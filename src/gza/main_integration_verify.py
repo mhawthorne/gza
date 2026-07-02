@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import platform
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any, Literal
+from pathlib import Path, PurePath
+from typing import Any, Literal, cast
 
 from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .config import Config
@@ -43,6 +46,7 @@ class MainIntegrationVerifyState:
     verify_command: str | None
     verify_timeout_seconds: int | None
     verify_timeout_grace_seconds: float | None
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
     tree_fingerprint: str | None
     head_sha: str | None
     verify_status: str | None
@@ -89,6 +93,112 @@ class MainIntegrationVerifyGateIdentity:
     verify_command: str | None
     verify_timeout_seconds: int | None
     verify_timeout_grace_seconds: float | None
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
+
+
+@dataclass(frozen=True)
+class MainIntegrationVerifyEnvironmentIdentity:
+    """Compact runtime identity for a persisted main integration verify checkpoint."""
+
+    runner_class: Literal["host", "container"]
+    platform_system: str
+    platform_machine: str
+    python_implementation: str | None
+    python_version: str
+    python_executable_family: str | None = None
+
+    def to_payload(self) -> dict[str, str]:
+        payload = {
+            "runner_class": self.runner_class,
+            "platform_system": self.platform_system,
+            "platform_machine": self.platform_machine,
+            "python_version": self.python_version,
+        }
+        if self.python_implementation is not None:
+            payload["python_implementation"] = self.python_implementation
+        if self.python_executable_family is not None:
+            payload["python_executable_family"] = self.python_executable_family
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: object) -> MainIntegrationVerifyEnvironmentIdentity | None:
+        if not isinstance(payload, dict):
+            return None
+        runner_class = payload.get("runner_class")
+        platform_system = payload.get("platform_system")
+        platform_machine = payload.get("platform_machine")
+        python_implementation = payload.get("python_implementation")
+        python_executable_family = payload.get("python_executable_family")
+        python_version = payload.get("python_version")
+        if runner_class not in {"host", "container"}:
+            return None
+        if not all(isinstance(value, str) and value for value in (
+            platform_system,
+            platform_machine,
+            python_version,
+        )):
+            return None
+        if python_implementation is not None and not isinstance(python_implementation, str):
+            return None
+        if python_executable_family is not None and not isinstance(python_executable_family, str):
+            return None
+        if python_implementation == "":
+            python_implementation = None
+        if python_executable_family == "":
+            python_executable_family = None
+        if python_executable_family is None:
+            legacy_python_executable = payload.get("python_executable")
+            if isinstance(legacy_python_executable, str) and legacy_python_executable:
+                python_executable_family = _normalize_python_executable_family(
+                    legacy_python_executable
+                )
+        typed_runner_class = cast(Literal["host", "container"], runner_class)
+        typed_platform_system = cast(str, platform_system)
+        typed_platform_machine = cast(str, platform_machine)
+        typed_python_implementation = cast(str | None, python_implementation)
+        typed_python_version = cast(str, python_version)
+        return cls(
+            runner_class=typed_runner_class,
+            platform_system=typed_platform_system,
+            platform_machine=typed_platform_machine,
+            python_implementation=typed_python_implementation,
+            python_version=typed_python_version,
+            python_executable_family=python_executable_family,
+        )
+
+
+@dataclass(frozen=True)
+class CandidateIntegrationVerifyEvidence:
+    """Structured verification evidence for one exact candidate checkout."""
+
+    gate_enabled: bool
+    verify_command: str | None
+    verify_timeout_seconds: int | None
+    verify_timeout_grace_seconds: float | None
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
+    tree_fingerprint: str | None
+    head_sha: str | None
+    verify_status: str | None
+    verify_exit_status: str | None
+    failure: str | None
+    failing_phase: str | None
+    reviewed_branch: str | None
+    working_directory: str | None
+    captured_at: datetime | None
+
+
+@dataclass(frozen=True)
+class CandidateIntegrationVerifyCheck:
+    """Outcome of verifying one exact candidate checkout without mutating main state."""
+
+    evidence: CandidateIntegrationVerifyEvidence
+    classification: Literal["pass", "red", "deterministic_red", "flake", "unavailable"]
+    merges_halted: bool
+    remediation: MainIntegrationVerifyRemediation | None = None
+    verify_runs: int = 0
+
+
+IntegrationVerifyEvidence = MainIntegrationVerifyState | CandidateIntegrationVerifyEvidence
 
 
 def _find_main_integration_verify_task(store: SqliteTaskStore) -> Task | None:
@@ -157,6 +267,9 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         verify_command=_payload_verify_command(task, payload),
         verify_timeout_seconds=_coerce_optional_int(payload.get("verify_timeout_seconds")),
         verify_timeout_grace_seconds=_coerce_optional_float(payload.get("verify_timeout_grace_seconds")),
+        environment_identity=MainIntegrationVerifyEnvironmentIdentity.from_payload(
+            payload.get("environment_identity")
+        ),
         tree_fingerprint=payload.get("tree_fingerprint") if isinstance(payload.get("tree_fingerprint"), str) else None,
         head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else task.review_verify_head_sha,
         verify_status=task.review_verify_status,
@@ -200,18 +313,13 @@ def _verify_failure_signature(
     return f"status:{status}:exit:{exit_status}"
 
 
-def _build_main_integration_verify_remediation(
+def _build_integration_verify_remediation(
     *,
     kind: Literal["deflake", "fix"],
-    config: Config,
-    store: SqliteTaskStore,
-    state: MainIntegrationVerifyState,
+    state: IntegrationVerifyEvidence,
 ) -> MainIntegrationVerifyRemediation:
-    artifact_path, artifact_output = _load_main_verify_artifact_evidence(
-        config=config,
-        store=store,
-        task=state.task,
-    )
+    artifact_path: str | None = None
+    artifact_output: str | None = None
     return MainIntegrationVerifyRemediation(
         kind=kind,
         signature=_verify_failure_signature(
@@ -222,6 +330,27 @@ def _build_main_integration_verify_remediation(
         tree_fingerprint=state.tree_fingerprint,
         failing_phase=state.failing_phase,
         failure=state.failure,
+        artifact_path=artifact_path,
+        failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
+        verify_excerpt=_build_main_verify_excerpt(artifact_output),
+    )
+
+
+def _build_main_integration_verify_remediation(
+    *,
+    kind: Literal["deflake", "fix"],
+    config: Config,
+    store: SqliteTaskStore,
+    state: MainIntegrationVerifyState,
+) -> MainIntegrationVerifyRemediation:
+    remediation = _build_integration_verify_remediation(kind=kind, state=state)
+    artifact_path, artifact_output = _load_main_verify_artifact_evidence(
+        config=config,
+        store=store,
+        task=state.task,
+    )
+    return replace(
+        remediation,
         artifact_path=artifact_path,
         failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
         verify_excerpt=_build_main_verify_excerpt(artifact_output),
@@ -356,7 +485,29 @@ def _normalized_verify_command(config: Config) -> str:
     return config.verify_command.strip() if isinstance(config.verify_command, str) else ""
 
 
-def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
+def _normalize_python_executable_family(executable: str) -> str | None:
+    normalized = PurePath(executable.strip()).name.lower()
+    return normalized or None
+
+
+def _current_verify_environment_identity(
+    *,
+    runner_class: Literal["host", "container"],
+) -> MainIntegrationVerifyEnvironmentIdentity:
+    return MainIntegrationVerifyEnvironmentIdentity(
+        runner_class=runner_class,
+        platform_system=platform.system(),
+        platform_machine=platform.machine(),
+        python_implementation=platform.python_implementation(),
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+    )
+
+
+def _current_gate_identity(
+    config: Config,
+    *,
+    runner_class: Literal["host", "container"],
+) -> MainIntegrationVerifyGateIdentity:
     verify_command = _normalized_verify_command(config)
     gate_enabled = bool(verify_command)
     if not gate_enabled:
@@ -365,6 +516,7 @@ def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
             verify_command=None,
             verify_timeout_seconds=None,
             verify_timeout_grace_seconds=None,
+            environment_identity=None,
         )
 
     timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
@@ -373,6 +525,7 @@ def _current_gate_identity(config: Config) -> MainIntegrationVerifyGateIdentity:
         verify_command=verify_command,
         verify_timeout_seconds=timeout_seconds,
         verify_timeout_grace_seconds=timeout_grace_seconds,
+        environment_identity=_current_verify_environment_identity(runner_class=runner_class),
     )
 
 
@@ -405,7 +558,42 @@ def _gate_identity_matches(
         and state.verify_command == current_gate.verify_command
         and state.verify_timeout_seconds == current_gate.verify_timeout_seconds
         and state.verify_timeout_grace_seconds == current_gate.verify_timeout_grace_seconds
+        and (
+            current_gate.environment_identity is None
+            or _environment_identity_matches(
+                state.environment_identity,
+                current_gate.environment_identity,
+            )
+        )
     )
+
+
+def _environment_identity_matches(
+    persisted: MainIntegrationVerifyEnvironmentIdentity | None,
+    current: MainIntegrationVerifyEnvironmentIdentity,
+) -> bool:
+    if persisted is None:
+        return False
+    if (
+        persisted.runner_class != current.runner_class
+        or persisted.platform_system != current.platform_system
+        or persisted.platform_machine != current.platform_machine
+        or persisted.python_version != current.python_version
+    ):
+        return False
+    if (
+        persisted.python_implementation is not None
+        and current.python_implementation is not None
+        and persisted.python_implementation != current.python_implementation
+    ):
+        return False
+    if (
+        persisted.python_executable_family is not None
+        and current.python_executable_family is not None
+        and persisted.python_executable_family != current.python_executable_family
+    ):
+        return False
+    return True
 
 
 def _persist_main_integration_verify_payload(
@@ -416,6 +604,7 @@ def _persist_main_integration_verify_payload(
     verify_command: str | None,
     verify_timeout_seconds: int | None,
     verify_timeout_grace_seconds: float | None,
+    environment_identity: MainIntegrationVerifyEnvironmentIdentity | None,
     tree_fingerprint: str | None,
     head_sha: str | None,
     failing_phase: str | None,
@@ -429,6 +618,7 @@ def _persist_main_integration_verify_payload(
             "verify_command": verify_command,
             "verify_timeout_seconds": verify_timeout_seconds,
             "verify_timeout_grace_seconds": verify_timeout_grace_seconds,
+            "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
             "tree_fingerprint": tree_fingerprint,
             "head_sha": head_sha,
             "failing_phase": failing_phase,
@@ -459,6 +649,7 @@ def persist_main_integration_verify_alert_message(
         verify_command=state.verify_command,
         verify_timeout_seconds=state.verify_timeout_seconds,
         verify_timeout_grace_seconds=state.verify_timeout_grace_seconds,
+        environment_identity=getattr(state, "environment_identity", None),
         tree_fingerprint=state.tree_fingerprint,
         head_sha=state.head_sha,
         failing_phase=state.failing_phase,
@@ -519,13 +710,14 @@ def run_main_integration_verify(
     git: Git,
     *,
     reason: str,
+    runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyState:
     """Run the configured verify gate against the current local target checkout."""
     task = ensure_main_integration_verify_task(store)
     prior_state = load_main_integration_verify_state(store)
     captured_at = datetime.now(UTC)
     head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
-    gate = _current_gate_identity(config)
+    gate = _current_gate_identity(config, runner_class=runner_class)
     verify_command = gate.verify_command or ""
     gate_enabled = gate.gate_enabled
 
@@ -598,6 +790,7 @@ def run_main_integration_verify(
         verify_command=gate.verify_command,
         verify_timeout_seconds=gate.verify_timeout_seconds,
         verify_timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+        environment_identity=gate.environment_identity,
         tree_fingerprint=tree_fingerprint,
         head_sha=head_sha,
         failing_phase=failing_phase,
@@ -610,20 +803,23 @@ def run_main_integration_verify(
     return state
 
 
-def _run_main_integration_verify_with_red_reruns(
-    config: Config,
-    store: SqliteTaskStore,
-    git: Git,
+def _run_integration_verify_with_red_reruns(
+    run_once: Callable[[str], IntegrationVerifyEvidence],
     *,
     reason: str,
     red_reruns: int,
-    prior_red_state: MainIntegrationVerifyState | None = None,
-) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
+    prior_red_state: IntegrationVerifyEvidence | None = None,
+) -> tuple[
+    IntegrationVerifyEvidence,
+    MainIntegrationVerifyRemediation | None,
+    IntegrationVerifyEvidence | None,
+    int,
+]:
     """Run verify, optionally rerunning red verdicts to classify flakes vs deterministic reds."""
-    state = run_main_integration_verify(config, store, git, reason=reason)
+    state = run_once(reason)
     verify_runs = 1
     if red_reruns <= 0:
-        return state, None, verify_runs
+        return state, None, None, verify_runs
 
     reference_state = (
         prior_red_state
@@ -632,38 +828,25 @@ def _run_main_integration_verify_with_red_reruns(
         else state
     )
     if not _verify_result_is_red(status=reference_state.verify_status, gate_enabled=reference_state.gate_enabled):
-        return state, None, verify_runs
+        return state, None, None, verify_runs
 
     if not _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
         return (
             state,
-            _build_main_integration_verify_remediation(
-                kind="deflake",
-                config=config,
-                store=store,
-                state=reference_state,
-            ),
+            _build_integration_verify_remediation(kind="deflake", state=reference_state),
+            reference_state,
             verify_runs,
         )
 
     confirmed_red_state = state
     for attempt in range(1, red_reruns + 1):
-        rerun_state = run_main_integration_verify(
-            config,
-            store,
-            git,
-            reason=f"{reason}-rerun-{attempt}",
-        )
+        rerun_state = run_once(f"{reason}-rerun-{attempt}")
         verify_runs += 1
         if not _verify_result_is_red(status=rerun_state.verify_status, gate_enabled=rerun_state.gate_enabled):
             return (
                 rerun_state,
-                _build_main_integration_verify_remediation(
-                    kind="deflake",
-                    config=config,
-                    store=store,
-                    state=confirmed_red_state,
-                ),
+                _build_integration_verify_remediation(kind="deflake", state=confirmed_red_state),
+                confirmed_red_state,
                 verify_runs,
             )
         confirmed_red_state = rerun_state
@@ -671,14 +854,52 @@ def _run_main_integration_verify_with_red_reruns(
 
     return (
         state,
-        _build_main_integration_verify_remediation(
-            kind="fix",
-            config=config,
-            store=store,
-            state=confirmed_red_state,
-        ),
+        _build_integration_verify_remediation(kind="fix", state=confirmed_red_state),
+        confirmed_red_state,
         verify_runs,
     )
+
+
+def _run_main_integration_verify_with_red_reruns(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    reason: str,
+    red_reruns: int,
+    runner_class: Literal["host", "container"] = "host",
+    prior_red_state: MainIntegrationVerifyState | None = None,
+) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
+    state, remediation, remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
+        lambda run_reason: run_main_integration_verify(
+            config,
+            store,
+            git,
+            reason=run_reason,
+            runner_class=runner_class,
+        ),
+        reason=reason,
+        red_reruns=red_reruns,
+        prior_red_state=prior_red_state,
+    )
+    main_state = cast(MainIntegrationVerifyState, state)
+    if remediation is not None:
+        remediation_source = cast(
+            MainIntegrationVerifyState,
+            remediation_source_state if remediation_source_state is not None else main_state,
+        )
+        artifact_path, artifact_output = _load_main_verify_artifact_evidence(
+            config=config,
+            store=store,
+            task=remediation_source.task,
+        )
+        remediation = replace(
+            remediation,
+            artifact_path=artifact_path,
+            failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
+            verify_excerpt=_build_main_verify_excerpt(artifact_output),
+        )
+    return main_state, remediation, verify_runs
 
 
 def check_main_integration_verify(
@@ -689,11 +910,12 @@ def check_main_integration_verify(
     reason: str,
     force: bool = False,
     red_reruns: int = 0,
+    runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyCheck:
     """Reuse or refresh local-main verify state for the current tree and gate identity."""
     current_tree_fingerprint = _compute_tree_fingerprint(git)
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
-    current_gate = _current_gate_identity(config)
+    current_gate = _current_gate_identity(config, runner_class=runner_class)
     state = load_main_integration_verify_state(store)
     checkpoint_is_current = state is not None and _checkpoint_is_current(
         state,
@@ -725,6 +947,7 @@ def check_main_integration_verify(
         git,
         reason=reason,
         red_reruns=red_reruns,
+        runner_class=runner_class,
         prior_red_state=state if checkpoint_is_current else None,
     )
     return MainIntegrationVerifyCheck(
@@ -741,10 +964,120 @@ def check_main_integration_verify(
     )
 
 
+def run_candidate_integration_verify(
+    config: Config,
+    git: Git,
+    *,
+    reason: str,
+    runner_class: Literal["host", "container"] = "host",
+) -> CandidateIntegrationVerifyEvidence:
+    """Run the configured verify gate against an exact candidate checkout."""
+    del reason
+    captured_at = datetime.now(UTC)
+    head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
+    gate = _current_gate_identity(config, runner_class=runner_class)
+    verify_command = gate.verify_command or ""
+    gate_enabled = gate.gate_enabled
+    current_branch = git.current_branch()
+    working_directory = str(git.repo_dir)
+
+    if not gate_enabled:
+        result = _make_review_verify_result(
+            "(verify_command unavailable)",
+            status="unavailable",
+            exit_status="not configured",
+            captured_at=captured_at,
+            reviewed_branch=current_branch,
+            reviewed_head_sha=head_sha,
+            working_directory=working_directory,
+            failure="verify_command is not configured",
+        )
+    else:
+        assert gate.verify_timeout_seconds is not None
+        assert gate.verify_timeout_grace_seconds is not None
+        result = _run_review_verify_command(
+            verify_command,
+            cwd=git.repo_dir,
+            reviewed_branch=current_branch,
+            reviewed_head_sha=head_sha,
+            timeout_seconds=gate.verify_timeout_seconds,
+            timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+        )
+
+    failing_phase = _verify_failure_phase_name(result.output)
+    tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
+    if gate_enabled and result.status == "passed" and tree_fingerprint is None:
+        result = _coerce_result_to_freshness_unavailable(result)
+
+    return CandidateIntegrationVerifyEvidence(
+        gate_enabled=gate_enabled,
+        verify_command=gate.verify_command,
+        verify_timeout_seconds=gate.verify_timeout_seconds,
+        verify_timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+        environment_identity=gate.environment_identity,
+        tree_fingerprint=tree_fingerprint,
+        head_sha=head_sha,
+        verify_status=result.status,
+        verify_exit_status=result.exit_status,
+        failure=result.failure,
+        failing_phase=failing_phase,
+        reviewed_branch=result.reviewed_branch,
+        working_directory=result.working_directory,
+        captured_at=result.captured_at,
+    )
+
+
+def _classify_candidate_integration_verify(
+    evidence: CandidateIntegrationVerifyEvidence,
+    remediation: MainIntegrationVerifyRemediation | None,
+) -> Literal["pass", "red", "deterministic_red", "flake", "unavailable"]:
+    if evidence.verify_status == "unavailable":
+        return "unavailable"
+    if remediation is not None and remediation.kind == "deflake":
+        return "flake"
+    if _verify_result_is_red(status=evidence.verify_status, gate_enabled=evidence.gate_enabled):
+        if remediation is not None and remediation.kind == "fix":
+            return "deterministic_red"
+        return "red"
+    return "pass"
+
+
+def check_candidate_integration_verify(
+    config: Config,
+    git: Git,
+    *,
+    reason: str,
+    red_reruns: int = 0,
+    runner_class: Literal["host", "container"] = "host",
+) -> CandidateIntegrationVerifyCheck:
+    """Run candidate integration verify for an exact checkout without touching main state."""
+    evidence, remediation, _remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
+        lambda run_reason: run_candidate_integration_verify(
+            config,
+            git,
+            reason=run_reason,
+            runner_class=runner_class,
+        ),
+        reason=reason,
+        red_reruns=red_reruns,
+    )
+    evidence = cast(CandidateIntegrationVerifyEvidence, evidence)
+    classification = _classify_candidate_integration_verify(evidence, remediation)
+    return CandidateIntegrationVerifyCheck(
+        evidence=evidence,
+        classification=classification,
+        merges_halted=evidence.gate_enabled and classification in {"red", "deterministic_red", "unavailable"},
+        remediation=remediation,
+        verify_runs=verify_runs,
+    )
+
+
 def current_main_integration_verify_alert(
     store: SqliteTaskStore,
     git: Git,
     config: Config,
+    *,
+    runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyState | None:
     """Return the current red-main alert when it still matches the live local tree."""
     state = load_main_integration_verify_state(store)
@@ -753,7 +1086,7 @@ def current_main_integration_verify_alert(
         gate_enabled=state.gate_enabled,
     ):
         return None
-    if not _gate_identity_matches(state, _current_gate_identity(config)):
+    if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
         return None
     default_branch = git.default_branch()
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists(default_branch))
