@@ -19,6 +19,7 @@ Run it with uv (deps are declared inline above)::
 
     uv run scripts/watch_log_graph.py
     uv run scripts/watch_log_graph.py --log /path/to/.gza/watch.log --out q.png
+    uv run scripts/watch_log_graph.py --start 2026-06-28   # only cycles on/after a date
     uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
@@ -323,6 +324,14 @@ def parse_date(s):
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
+def filter_start(points, start):
+    """Keep only cycles on/after ``start`` (a date), or all if ``start`` is None."""
+    if start is None:
+        return points
+    cutoff = datetime.combine(start, datetime.min.time())
+    return [p for p in points if p.when >= cutoff]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--log", type=Path, default=None,
@@ -331,6 +340,8 @@ def main(argv=None):
                     help="output PNG path (default: watch_status.png)")
     ap.add_argument("--date", type=parse_date, default=None,
                     help="base date to assume for the newest line (default: today)")
+    ap.add_argument("--start", type=parse_date, default=None, metavar="YYYY-MM-DD",
+                    help="only show cycles on/after this date (clips table + PNG)")
     ap.add_argument("--table-rows", type=int, default=40,
                     help="max rows in the printed table, evenly sampled (0 = all)")
     ap.add_argument("--no-png", action="store_true", help="skip PNG, table only")
@@ -350,6 +361,10 @@ def main(argv=None):
     points = parse_log(log_path, base_date)
     if not points:
         print(f"no WAKE cycles parsed from {log_path}", file=sys.stderr)
+        return 1
+    points = filter_start(points, args.start)
+    if not points:
+        print(f"no cycles on/after {args.start}", file=sys.stderr)
         return 1
 
     print_table(points, args.table_rows)
@@ -374,10 +389,12 @@ def _watch_loop(args, log_path):
                 print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
                 time.sleep(interval)
                 continue
+            points = filter_start(points, args.start)
 
             print(_CLEAR, end="")
             if not points:
-                print(f"no WAKE cycles yet in {log_path}")
+                since = f" on/after {args.start}" if args.start else ""
+                print(f"no WAKE cycles yet in {log_path}{since}")
             else:
                 print_current(points)
                 print()
