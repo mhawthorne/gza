@@ -229,7 +229,7 @@ def _draw_merges(ax, merges):
     ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
                zorder=6, label=f"merge ({len(merges)})")
     for when, tid in merges:
-        ax.annotate(tid, (when, 0), rotation=90, fontsize=6, color="tab:purple",
+        ax.annotate(tid, (when, 0), rotation=90, fontsize=12, color="tab:purple",
                     ha="center", va="bottom", xytext=(0, 4),
                     textcoords="offset points")
 
