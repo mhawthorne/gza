@@ -7352,6 +7352,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     lifecycle_entries: list[LifecycleActionEntry] = []
     scope_gaps: list[ScopedTagScopeGap] = []
     runnable_pending_total: list[DbTask] = []
+    _runnable_rows: list[TaskRow] = []
     blocked_pending: list[TaskRow] = []
     preview_git: Git | None = None
     queue_target_branch: str | None = None
@@ -7463,6 +7464,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
     )
     visible_recovery_entries = [entry for entry in visible_runnable_entries if entry.lane == "recovery"]
     visible_pending_entries = [entry for entry in visible_runnable_entries if entry.lane == "pending"]
+    visible_pending_task_ids = {
+        entry.task.id
+        for entry in visible_pending_entries
+        if entry.task.id is not None
+    }
     visible_runnable_recovery = [
         adapted
         for adapted in (
@@ -7475,6 +7481,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
             for entry in visible_recovery_entries
         )
         if adapted is not None
+    ]
+    visible_runnable_pending_rows = [
+        row for row in _runnable_rows if row.task.id in visible_pending_task_ids
+    ]
+    visible_quiet_rows = [
+        row for row in quiet_rows if row.task.id in visible_pending_task_ids
     ]
 
     if not show_pending:
@@ -7521,8 +7533,8 @@ def cmd_queue(args: argparse.Namespace) -> int:
         return 0
 
     rendered_rows = [
-        QueueRenderRow(task=entry.task, position_text=str(index))
-        for index, entry in enumerate(visible_pending_entries, 1)
+        QueueRenderRow(task=row.task, position_text=str(index))
+        for index, row in enumerate(visible_runnable_pending_rows, 1)
     ]
 
     def _blocked_by_text(row: TaskRow) -> str:
@@ -7558,7 +7570,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             blocked_by_text=_blocked_by_text(row) if bool(row.values.get("blocked")) else None,
             quiet_available_text=format_quiet_available_at(row.values.get("quiet_available_at")),
         )
-        for row in quiet_rows
+        for row in visible_quiet_rows
     ]
 
     rendered_rows.extend(
@@ -7597,7 +7609,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     console.print(
         _queue_section_summary(
             "Pending lane (watch will run after recovery policy allows slots)",
-            shown=len(visible_pending_entries),
+            shown=len(visible_runnable_pending_rows),
             total=len(runnable_pending_total),
         )
     )

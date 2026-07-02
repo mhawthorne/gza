@@ -3713,11 +3713,18 @@ class TestQueueCommand:
         result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Pending lane:" in result.stdout
+        assert (
+            "Pending lane (watch will run after recovery policy allows slots): "
+            "1 shown / 1 more"
+        ) in result.stdout
         assert "Quiet lane:" in result.stdout
         assert f"1  {runnable.id}" in result.stdout
         assert "Fresh quiet task" in result.stdout
-        quiet_line = next(line for line in result.stdout.splitlines() if "Fresh quiet task" in line)
+        quiet_line = next(
+            line
+            for line in result.stdout.splitlines()
+            if "Fresh quiet task" in line and line.lstrip().startswith("-")
+        )
         assert quiet_line.lstrip().startswith("-")
         assert "held until" in result.stdout
 
@@ -16422,11 +16429,17 @@ class TestIncompleteCommand:
             config: Config,
             git: object,
             target_branch: str | None,
+            max_recovery_attempts: int,
+            recovery_preview_entries_by_task_id: dict[str, object],
+            recovery_preview_read_context: object,
         ) -> query_cli._TaskQueryResult:  # noqa: SLF001
-            del service, store, config
+            del service, store
             assert cache_state["active"] is True
             assert git is not None
             assert target_branch == "main"
+            assert max_recovery_attempts == config.max_resume_attempts
+            assert recovery_preview_entries_by_task_id == {}
+            assert recovery_preview_read_context is not None
             phases.append("normalize")
             return result
 

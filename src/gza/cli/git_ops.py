@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -177,6 +177,26 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_advance_recovery_merge_context(git: Git, target_branch: str | None) -> _MergeContext:
+    local_branch_names = getattr(git, "local_branch_names", None)
+    if local_branch_names is None or not callable(local_branch_names):
+        console.print(
+            "[yellow]Warning: advance recovery preview is using a degraded git context; "
+            "the active git object does not expose local_branch_names()[/yellow]"
+        )
+        return _MergeContext(git=git, default_branch=target_branch)
+
+    preview_branch_names = local_branch_names()
+    if not isinstance(preview_branch_names, Iterable):
+        console.print(
+            "[yellow]Warning: advance recovery preview is using a degraded git context; "
+            "local_branch_names() did not return an iterable branch list[/yellow]"
+        )
+        return _MergeContext(git=git, default_branch=target_branch)
+
+    return build_merge_context_from_git(git, target_branch)
 
 
 def _classify_rebase_git_failure(error: BaseException) -> str:
@@ -3500,10 +3520,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if owner_rows:
             recovery_read_context = RecoveryReadContext()
             if git is not None:
-                try:
-                    recovery_read_context.merge_context = build_merge_context_from_git(git, target_branch)
-                except (AttributeError, TypeError):
-                    recovery_read_context.merge_context = _MergeContext(git=git, default_branch=target_branch)
+                recovery_read_context.merge_context = _build_advance_recovery_merge_context(
+                    git,
+                    target_branch,
+                )
             recovery_preview = build_dispatch_preview(
                 store,
                 config=config,
