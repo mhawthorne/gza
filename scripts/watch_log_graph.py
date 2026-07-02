@@ -20,6 +20,8 @@ Run it with uv (deps are declared inline above)::
     uv run scripts/watch_log_graph.py
     uv run scripts/watch_log_graph.py --log /path/to/.gza/watch.log --out q.png
     uv run scripts/watch_log_graph.py --start 2026-06-28   # only cycles on/after a date
+    uv run scripts/watch_log_graph.py --resolution day --aggregate p90   # daily p90 rollup
+    uv run scripts/watch_log_graph.py --resolution hour --agg max        # hourly peaks
     uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
@@ -189,6 +191,9 @@ _SERIES = [
     ("attention", "need attention"),
 ]
 
+# Row-unit word per resolution, for table/plot/summary captions.
+_UNIT = {"raw": "cycles", "hour": "hours", "day": "days"}
+
 
 def make_figure():
     """Create a reusable (fig, ax) with the Agg backend. Import matplotlib once."""
@@ -200,11 +205,12 @@ def make_figure():
     return plt.subplots(figsize=(14, 7))
 
 
-def render_png(points, out_path, log_path, fig_ax=None):
+def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label=""):
     """Render the 4-series plot to ``out_path``.
 
     Pass ``fig_ax`` (from :func:`make_figure`) to reuse a single figure across
     ticks in ``--watch`` mode; otherwise a throwaway figure is created and closed.
+    ``resolution``/``agg_label`` only affect the axis formatter and title text.
     """
     import matplotlib.dates as mdates
 
@@ -221,12 +227,16 @@ def render_png(points, out_path, log_path, fig_ax=None):
         ys = [float("nan") if getattr(p, attr) is None else getattr(p, attr) for p in points]
         ax.plot(xs, ys, label=label, linewidth=1.2)
 
+    unit = _UNIT.get(resolution, "cycles")
     ax.set_ylabel("task count")
     ax.set_xlabel("time")
-    ax.set_title(f"gza watch queue depth — {log_path}  ({len(points)} cycles)")
+    ax.set_title(
+        f"gza watch queue depth — {log_path}  ({len(points)} {unit}{agg_label})"
+    )
     ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    date_fmt = "%m-%d" if resolution == "day" else "%m-%d %H:%M"
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
     fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
@@ -240,26 +250,27 @@ def _fmt(v):
     return "" if v is None else str(v)
 
 
-def print_table(points, max_rows, tail=False):
+def print_table(points, max_rows, tail=False, unit="cycles"):
     """Print an aligned text table.
 
     Default: evenly sample at most ``max_rows`` rows across the full range.
-    ``tail=True`` (watch mode): show the most recent ``max_rows`` cycles instead.
+    ``tail=True`` (watch mode): show the most recent ``max_rows`` rows instead.
+    ``unit`` is the row-noun (cycles / hours / days) shown in the footer.
     """
     if tail:
         sampled = points[-max_rows:] if max_rows and max_rows > 0 else points
-        note = f"(latest {len(sampled)} of {len(points)} cycles)"
+        note = f"(latest {len(sampled)} of {len(points)} {unit})"
     elif max_rows and max_rows > 0 and len(points) > max_rows:
         step = len(points) / max_rows
         idxs = sorted({int(i * step) for i in range(max_rows)})
         idxs = [i for i in idxs if i < len(points)]
         if idxs[-1] != len(points) - 1:
-            idxs.append(len(points) - 1)  # always include the newest cycle
+            idxs.append(len(points) - 1)  # always include the newest row
         sampled = [points[i] for i in idxs]
-        note = f"(sampled {len(sampled)} of {len(points)} cycles; --table-rows 0 for all)"
+        note = f"(sampled {len(sampled)} of {len(points)} {unit}; --table-rows 0 for all)"
     else:
         sampled = points
-        note = f"({len(points)} cycles)"
+        note = f"({len(points)} {unit})"
 
     header = ("datetime", "running", "pending", "blocked", "attention")
     rows = [
@@ -292,11 +303,11 @@ def _series_range(points, attr):
     return f"{min(vals)}–{max(vals)}"
 
 
-def print_summary(points, out_path):
+def print_summary(points, out_path, unit="cycles", agg_label=""):
     first, last = points[0].when, points[-1].when
     print()
     print(f"range     : {first:%Y-%m-%d %H:%M:%S} → {last:%Y-%m-%d %H:%M:%S}")
-    print(f"cycles    : {len(points)}")
+    print(f"{unit:<10}: {len(points)}{agg_label}")
     for attr, label in _SERIES:
         print(f"{label:<14}: {_series_range(points, attr)}")
     print(f"png       : {out_path}")
@@ -332,6 +343,98 @@ def filter_start(points, start):
     return [p for p in points if p.when >= cutoff]
 
 
+# --- rollup / aggregation --------------------------------------------------
+
+_AGG_ALIASES = {"min": 0.0, "max": 100.0, "median": 50.0, "med": 50.0}
+
+
+def parse_aggregate(s):
+    """Normalise an aggregate spec to ('mean', None) or ('pct', q) with 0<=q<=100.
+
+    Accepts: mean/avg, min (=p0), max (=p100), median (=p50), or any ``pN``
+    percentile such as ``p50``, ``p90``, ``p99``, ``p99.9``.
+    """
+    s = s.strip().lower()
+    if s in ("mean", "avg", "average"):
+        return ("mean", None)
+    if s in _AGG_ALIASES:
+        return ("pct", _AGG_ALIASES[s])
+    if s.startswith("p"):
+        try:
+            q = float(s[1:])
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"bad percentile: {s!r}")
+        if not 0.0 <= q <= 100.0:
+            raise argparse.ArgumentTypeError(f"percentile out of range 0..100: {s!r}")
+        return ("pct", q)
+    raise argparse.ArgumentTypeError(
+        f"unknown aggregate {s!r} (use mean, min, max, median, or pN e.g. p90)"
+    )
+
+
+def _aggregate(vals, agg):
+    """Collapse a bucket's values (Nones dropped) via ``agg`` = parse_aggregate()."""
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    kind, q = agg
+    if kind == "mean":
+        m = sum(vals) / len(vals)
+        return int(m) if m == int(m) else round(m, 1)
+    s = sorted(vals)  # nearest-rank percentile keeps integer task counts
+    idx = int(round(q / 100.0 * (len(s) - 1)))
+    return s[idx]
+
+
+def _bucket_key(dt, resolution):
+    if resolution == "hour":
+        return dt.replace(minute=0, second=0, microsecond=0)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)  # day
+
+
+def rollup(points, resolution, agg):
+    """Bucket ``points`` to hour/day and aggregate each series within a bucket."""
+    if resolution == "raw":
+        return points
+    buckets = {}
+    order = []
+    for p in points:
+        key = _bucket_key(p.when, resolution)
+        if key not in buckets:
+            buckets[key] = {attr: [] for attr, _ in _SERIES}
+            order.append(key)
+        for attr, _ in _SERIES:
+            buckets[key][attr].append(getattr(p, attr))
+    out = []
+    for key in order:
+        col = buckets[key]
+        out.append(Point(
+            key,
+            _aggregate(col["running"], agg),
+            _aggregate(col["pending"], agg),
+            _aggregate(col["blocked"], agg),
+            _aggregate(col["attention"], agg),
+        ))
+    return out
+
+
+def agg_display(agg):
+    """Human name for a parsed aggregate: min/max/median/mean/pN."""
+    kind, q = agg
+    if kind == "mean":
+        return "mean"
+    return {0.0: "min", 100.0: "max", 50.0: "median"}.get(q, f"p{q:g}")
+
+
+def rollup_config(args):
+    """Resolve (agg, unit, agg_label) from args; default aggregate is max."""
+    agg = args.aggregate or ("pct", 100.0)  # default: max (peak per bucket)
+    unit = _UNIT[args.resolution]
+    if args.resolution == "raw":
+        return agg, unit, ""
+    return agg, unit, f", {agg_display(agg)}/{args.resolution}"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--log", type=Path, default=None,
@@ -342,6 +445,11 @@ def main(argv=None):
                     help="base date to assume for the newest line (default: today)")
     ap.add_argument("--start", type=parse_date, default=None, metavar="YYYY-MM-DD",
                     help="only show cycles on/after this date (clips table + PNG)")
+    ap.add_argument("--resolution", "--rollup", choices=("raw", "hour", "day"), default="raw",
+                    help="bucket cycles by hour or day before plotting (default: raw)")
+    ap.add_argument("--aggregate", "--agg", type=parse_aggregate, default=None, metavar="AGG",
+                    help="how to collapse each bucket: mean, min, max, median, or pN "
+                         "(e.g. p90, p99); default max when --resolution is set")
     ap.add_argument("--table-rows", type=int, default=40,
                     help="max rows in the printed table, evenly sampled (0 = all)")
     ap.add_argument("--no-png", action="store_true", help="skip PNG, table only")
@@ -353,10 +461,13 @@ def main(argv=None):
     log_path = args.log or default_log()
     if not log_path or not Path(log_path).is_file():
         ap.error(f"watch.log not found (looked for {log_path or '.gza/watch.log'}); pass --log")
+    if args.aggregate is not None and args.resolution == "raw":
+        ap.error("--aggregate requires --resolution hour|day")
 
     if args.watch is not None:
         return _watch_loop(args, log_path)
 
+    agg, unit, agg_label = rollup_config(args)
     base_date = args.date or date_cls.today()
     points = parse_log(log_path, base_date)
     if not points:
@@ -366,11 +477,13 @@ def main(argv=None):
     if not points:
         print(f"no cycles on/after {args.start}", file=sys.stderr)
         return 1
+    points = rollup(points, args.resolution, agg)
 
-    print_table(points, args.table_rows)
+    print_table(points, args.table_rows, unit=unit)
     if not args.no_png:
-        render_png(points, args.out, log_path)
-    print_summary(points, "(skipped)" if args.no_png else args.out)
+        render_png(points, args.out, log_path, resolution=args.resolution, agg_label=agg_label)
+    print_summary(points, "(skipped)" if args.no_png else args.out,
+                  unit=unit, agg_label=agg_label)
     return 0
 
 
@@ -380,6 +493,7 @@ _CLEAR = "\033[2J\033[3J\033[H"  # clear screen + scrollback, cursor home
 def _watch_loop(args, log_path):
     """Refresh the table (and PNG) every ``args.watch`` seconds until Ctrl-C."""
     interval = args.watch
+    agg, unit, agg_label = rollup_config(args)
     fig_ax = None if args.no_png else make_figure()
     try:
         while True:
@@ -390,6 +504,7 @@ def _watch_loop(args, log_path):
                 time.sleep(interval)
                 continue
             points = filter_start(points, args.start)
+            points = rollup(points, args.resolution, agg)
 
             print(_CLEAR, end="")
             if not points:
@@ -398,9 +513,10 @@ def _watch_loop(args, log_path):
             else:
                 print_current(points)
                 print()
-                print_table(points, args.table_rows, tail=True)
+                print_table(points, args.table_rows, tail=True, unit=unit)
                 if not args.no_png:
-                    render_png(points, args.out, log_path, fig_ax=fig_ax)
+                    render_png(points, args.out, log_path, fig_ax=fig_ax,
+                               resolution=args.resolution, agg_label=agg_label)
                     print(f"\npng refreshed: {args.out}")
             print(f"\nrefreshing every {interval}s — Ctrl-C to stop", flush=True)
             time.sleep(interval)
