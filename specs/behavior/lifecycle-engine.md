@@ -119,10 +119,10 @@ and default to **off**.
   to prove that candidate MUST be carried into the repair action and revalidated before
   any mutation.
   The repair MUST either recreate one complete durable materialization record for that
-  manifest or leave the prior state unchanged and fall through to parking. The engine MUST park with
-  `plan-review-materialization-repair-needed` only when the partial materialization
-  state is ambiguous or unsafe; it MUST NOT silently treat a partial prefix as a
-  complete materialization.
+  manifest or leave the prior state unchanged and fall through to fail-closed parking.
+  The engine MUST park with `plan-review-materialization-repair-needed` only when the
+  partial materialization state is ambiguous or unsafe; it MUST NOT silently treat a
+  partial prefix as a complete materialization.
   If a completed plan already has a non-dropped implement descendant but no recorded
   approved-slice materialization, `iterate` MAY still exit 0, but it MUST report a
   neutral skip such as `already_has_implement`; it MUST NOT claim the plan is already

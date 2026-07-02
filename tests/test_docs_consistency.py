@@ -1511,6 +1511,7 @@ def test_plan_materialization_repair_docs_distinguish_repairable_from_ambiguous_
     """Workflow/spec docs should route repairable partial slice materialization through the direct repair action."""
     repo_root = Path(__file__).resolve().parents[1]
     workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    configuration = (repo_root / "docs" / "configuration.md").read_text()
     lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
     workflow_plan_section = workflow.split("### 1. Plan tasks", 1)[1].split("### 2. Explore source follow-up", 1)[0]
 
@@ -1549,6 +1550,16 @@ def test_plan_materialization_repair_docs_distinguish_repairable_from_ambiguous_
         "MUST park with `plan-review-materialization-repair-needed` only when the partial "
         "materialization state is ambiguous or unsafe"
     ) in lifecycle_flat
+    assert (
+        "lifecycle now first attempts deterministic repair when the current partial slice set is a proven "
+        "safe pending subset of the validated manifest, and only parks with "
+        "`reason=plan-review-materialization-repair-needed` when that state is ambiguous or unsafe"
+    ) in _normalize_whitespace(configuration)
+    assert (
+        "partial implement descendants and the durable materialization record is missing, incomplete, or "
+        "already complete while stale extra pending duplicate slice descendants remain outside the recorded "
+        "set"
+    ) in _normalize_whitespace(configuration)
 
 
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:

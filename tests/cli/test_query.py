@@ -61,6 +61,28 @@ def _projection_list_stdout(command_name: str, *, blocked_by_dropped: bool = Fal
     )
 
 
+def test_format_cycle_lifecycle_action_summary_includes_plan_slice_repair_action(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    plan = store.add("Repair partial slice materialization", task_type="plan")
+    assert plan.id is not None
+
+    summary = lifecycle_actions_cli.format_cycle_lifecycle_action_summary(
+        [
+            (
+                plan,
+                {
+                    "type": "repair_plan_slice_materialization",
+                    "description": "Repair partial plan-review slice materialization",
+                },
+            )
+        ]
+    )
+
+    assert summary == f"Lifecycle actions (1): {plan.id}→repair_plan_slice_materialization"
+
+
 def _mock_unmerged_git() -> Git:
     class _MockUnmergedGit(Git):
         def __init__(self) -> None:

@@ -5,7 +5,6 @@ requires-python = ">=3.11"
 [options]
 exclude-newer = "2026-06-24T20:39:37.424506Z"
 exclude-newer-span = "P7D"
-
 [[package]]
 name = "backports-tarfile"
 version = "1.2.0"
