@@ -1,4 +1,4 @@
-"""Guarded serial rerun bridge for the unit pytest lane."""
+"""Guarded serial rerun bridge for the project's pytest lanes."""
 
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ from gza.test_latency import build_report, render_summary, run_pytest
 _DEFAULT_RERUN_CAP = 10
 
 
-def _warn(message: str) -> None:
-    print(f"test_serial_rerun: {message}", file=sys.stderr, flush=True)
+def _warn(message: str, *, warn_prefix: str) -> None:
+    print(f"{warn_prefix}: {message}", file=sys.stderr, flush=True)
 
 
-def _log(message: str) -> None:
-    print(f"unit-rerun: {message}", file=sys.stderr, flush=True)
+def _log(message: str, *, log_prefix: str) -> None:
+    print(f"{log_prefix}: {message}", file=sys.stderr, flush=True)
 
 
 def _current_timestamp() -> str:
@@ -139,7 +139,14 @@ def _classify_parallel_failure(parallel: _PytestPassResult, cap: int) -> str | N
     return None
 
 
-def run_unit_phase(pytest_args: list[str], *, cap: int, rerun_enabled: bool, emit_summary: bool) -> int:
+def run_pytest_phase(
+    pytest_args: list[str],
+    *,
+    cap: int,
+    rerun_enabled: bool,
+    emit_summary: bool,
+    log_prefix: str,
+) -> int:
     parallel_args = [*pytest_args, f"--maxfail={cap + 1}"]
     parallel, parallel_summary = _run_pytest_pass(parallel_args, emit_sigterm_summary=emit_summary)
     if parallel_summary is not None:
@@ -152,31 +159,55 @@ def run_unit_phase(pytest_args: list[str], *, cap: int, rerun_enabled: bool, emi
 
     no_mask_reason = _classify_parallel_failure(parallel, cap)
     if no_mask_reason is not None:
-        _log(f"NOT masking - {no_mask_reason}")
+        _log(f"NOT masking - {no_mask_reason}", log_prefix=log_prefix)
         return parallel.exit_code
 
     failed_nodeids = parallel.failed_nodeids
     _log(
         f"parallel pass failed; {len(failed_nodeids)} test(s) failed and are within cap {cap}; "
-        f"re-running serially: {' '.join(failed_nodeids)}"
+        f"re-running serially: {' '.join(failed_nodeids)}",
+        log_prefix=log_prefix,
     )
     serial_args = [*failed_nodeids, "-n0", "-v", "--maxfail=0", *_override_options(pytest_args)]
     serial, _ = _run_pytest_pass(serial_args, emit_sigterm_summary=False)
     serial_failed = set(serial.failed_nodeids)
     for nodeid in failed_nodeids:
         if nodeid in serial_failed:
-            _log(f"CONFIRMED FAILURE (failed serially too): {nodeid}")
+            _log(f"CONFIRMED FAILURE (failed serially too): {nodeid}", log_prefix=log_prefix)
         else:
-            _log(f"PARALLEL-ONLY FAILURE (passed serially): {nodeid}")
+            _log(f"PARALLEL-ONLY FAILURE (passed serially): {nodeid}", log_prefix=log_prefix)
     if serial.collection_errors:
-        _log(f"serial rerun produced collection errors: {', '.join(serial.collection_errors)}")
+        _log(
+            f"serial rerun produced collection errors: {', '.join(serial.collection_errors)}",
+            log_prefix=log_prefix,
+        )
     if serial.internal_errors:
-        _log("serial rerun produced internal pytest errors")
+        _log("serial rerun produced internal pytest errors", log_prefix=log_prefix)
     return serial.exit_code
 
 
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the unit pytest lane with a guarded serial rerun bridge.")
+def run_unit_phase(pytest_args: list[str], *, cap: int, rerun_enabled: bool, emit_summary: bool) -> int:
+    return run_pytest_phase(
+        pytest_args,
+        cap=cap,
+        rerun_enabled=rerun_enabled,
+        emit_summary=emit_summary,
+        log_prefix="unit-rerun",
+    )
+
+
+def run_functional_phase(pytest_args: list[str], *, cap: int, rerun_enabled: bool, emit_summary: bool) -> int:
+    return run_pytest_phase(
+        pytest_args,
+        cap=cap,
+        rerun_enabled=rerun_enabled,
+        emit_summary=emit_summary,
+        log_prefix="functional-rerun",
+    )
+
+
+def _parse_cli_args(argv: list[str], *, lane_name: str, default_target: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=f"Run the {lane_name} pytest lane with a guarded serial rerun bridge.")
     parser.add_argument(
         "--summary",
         action="store_true",
@@ -185,15 +216,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "pytest_args",
         nargs=argparse.REMAINDER,
-        help="Additional pytest args after '--'. Defaults to 'tests/ -q'.",
+        help=f"Additional pytest args after '--'. Defaults to '{default_target} -q'.",
     )
     return parser.parse_args(argv)
 
 
-def _default_pytest_args(extra_args: list[str]) -> list[str]:
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    return _parse_cli_args(argv, lane_name="unit", default_target="tests/")
+
+
+def _default_lane_pytest_args(extra_args: list[str], *, default_target: str) -> list[str]:
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
-    return extra_args or ["tests/", "-q"]
+    return extra_args or [default_target, "-q"]
+
+
+def _default_pytest_args(extra_args: list[str]) -> list[str]:
+    return _default_lane_pytest_args(extra_args, default_target="tests/")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -202,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         cap = _parse_positive_int_env("GZA_UNIT_RERUN_CAP", _DEFAULT_RERUN_CAP)
         rerun_enabled = _parse_bool_env("GZA_UNIT_SERIAL_RERUN", True)
     except ValueError as exc:
-        _warn(str(exc))
+        _warn(str(exc), warn_prefix="test_serial_rerun")
         return 2
     return run_unit_phase(
         _default_pytest_args(args.pytest_args),

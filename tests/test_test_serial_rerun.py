@@ -156,6 +156,35 @@ def test_run_unit_phase_reports_confirmed_failures_from_serial_rerun(
     assert "CONFIRMED FAILURE (failed serially too): tests/test_sample.py::test_broken" in capsys.readouterr().err
 
 
+def test_run_functional_phase_uses_functional_log_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    results = iter(
+        [
+            (_pass_result(exit_code=1, failed_nodeids=["tests_functional/test_sample.py::test_flake"]), None),
+            (_pass_result(exit_code=0), None),
+        ]
+    )
+    monkeypatch.setattr(
+        test_serial_rerun,
+        "_run_pytest_pass",
+        lambda pytest_args, *, emit_sigterm_summary: next(results),
+    )
+
+    exit_code = test_serial_rerun.run_functional_phase(
+        ["tests_functional/", "-n", "2"],
+        cap=2,
+        rerun_enabled=True,
+        emit_summary=False,
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "functional-rerun: parallel pass failed;" in captured.err
+    assert "functional-rerun: PARALLEL-ONLY FAILURE (passed serially): tests_functional/test_sample.py::test_flake" in captured.err
+
+
 def test_main_rejects_invalid_env_values(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setenv("GZA_UNIT_RERUN_CAP", "0")
 
