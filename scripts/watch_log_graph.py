@@ -22,6 +22,7 @@ Run it with uv (deps are declared inline above)::
     uv run scripts/watch_log_graph.py --start 2026-06-28   # only cycles on/after a date
     uv run scripts/watch_log_graph.py --resolution day --aggregate p90   # daily p90 rollup
     uv run scripts/watch_log_graph.py --resolution hour --agg max        # hourly peaks
+    uv run scripts/watch_log_graph.py --start 2026-07-01 --merges         # mark each merge
     uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
@@ -60,6 +61,8 @@ _WAKE_MID_RE = re.compile(r"WAKE\s+checking\.\.\. \((\d+) running, (\d+) pending
 _WAKE_OLD_RE = re.compile(r"WAKE\s+checking\.\.\. \((\d+) running, (\d+) slots\)")
 _ATTN_UNCHANGED_RE = re.compile(r"(\d+) tasks? still need attention")
 _ATTN_HEADER_RE = re.compile(r"Needs attention \((\d+) tasks?\)")
+# Real merge events: "MERGE     gza-7957 -> main" (dry-run variants excluded below).
+_MERGE_RE = re.compile(r"MERGE\s+(gza-\d+)\s*->")
 
 
 class Point:
@@ -88,8 +91,10 @@ def _parse_clock(line):
 
 
 def parse_log(path, base_date):
-    """Parse ``path`` into a chronological list of Point.
+    """Parse ``path`` into ``(points, merges)``.
 
+    ``points`` is a chronological list of Point; ``merges`` is a list of
+    ``(datetime, task_id)`` for each real ``MERGE gza-NNNN -> main`` event.
     ``base_date`` anchors the newest line (HMS-only logs). Attention is carried
     forward across cycles because the log only re-emits it when it changes.
     """
@@ -123,9 +128,13 @@ def parse_log(path, base_date):
                 attention = int(m.group(1))
                 # attach to a marker so ordering with WAKE lines is preserved
                 raw.append((full_dt, hms, "attn", attention))
+                continue
+            m = _MERGE_RE.search(line)
+            if m and "[dry-run]" not in line:
+                raw.append((full_dt, hms, "merge", m.group(1)))
 
     if not raw:
-        return []
+        return [], []
 
     # Assign real datetimes. If any line carried a full timestamp we trust those and
     # forward-fill HMS-only lines from the last known date; otherwise infer via wraps.
@@ -134,15 +143,19 @@ def parse_log(path, base_date):
 
     # Second pass: build Points from WAKE rows, carrying attention forward.
     points = []
+    merges = []  # (datetime, task_id)
     attention = None
     for (row, when) in zip(raw, times):
         kind = row[2]
         if kind == "attn":
             attention = row[3]
             continue
+        if kind == "merge":
+            merges.append((when, row[3]))
+            continue
         _, _, _, running, pending, blocked = row
         points.append(Point(when, running, pending, blocked, attention))
-    return points
+    return points, merges
 
 
 def _assign_datetimes(raw, base_date, have_full):
@@ -205,12 +218,29 @@ def make_figure():
     return plt.subplots(figsize=(14, 7))
 
 
-def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label=""):
+def _draw_merges(ax, merges):
+    """Draw each merge as a dot on the baseline + a vertical guide, labeled by task id."""
+    if not merges:
+        return
+    xs = [when for when, _ in merges]
+    for when in xs:
+        ax.axvline(when, color="0.75", linewidth=0.5, alpha=0.5, zorder=0)
+    ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
+               zorder=6, label=f"merge ({len(merges)})")
+    for when, tid in merges:
+        ax.annotate(tid, (when, 0), rotation=90, fontsize=6, color="tab:purple",
+                    ha="center", va="bottom", xytext=(0, 4),
+                    textcoords="offset points")
+
+
+def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label="",
+               merges=None):
     """Render the 4-series plot to ``out_path``.
 
     Pass ``fig_ax`` (from :func:`make_figure`) to reuse a single figure across
     ticks in ``--watch`` mode; otherwise a throwaway figure is created and closed.
     ``resolution``/``agg_label`` only affect the axis formatter and title text.
+    ``merges`` (list of ``(datetime, task_id)``) is drawn as labeled dots.
     """
     import matplotlib.dates as mdates
 
@@ -226,6 +256,8 @@ def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_la
     for attr, label in _SERIES:
         ys = [float("nan") if getattr(p, attr) is None else getattr(p, attr) for p in points]
         ax.plot(xs, ys, label=label, linewidth=1.2)
+
+    _draw_merges(ax, merges)
 
     unit = _UNIT.get(resolution, "cycles")
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -346,6 +378,14 @@ def filter_start(points, start):
     return [p for p in points if p.when >= cutoff]
 
 
+def filter_start_events(events, start):
+    """Keep only ``(datetime, id)`` events on/after ``start`` (a date)."""
+    if start is None:
+        return events
+    cutoff = datetime.combine(start, datetime.min.time())
+    return [(when, tid) for when, tid in events if when >= cutoff]
+
+
 # --- rollup / aggregation --------------------------------------------------
 
 _AGG_ALIASES = {"min": 0.0, "max": 100.0, "median": 50.0, "med": 50.0}
@@ -456,6 +496,9 @@ def main(argv=None):
     ap.add_argument("--table-rows", type=int, default=40,
                     help="max rows in the printed table, evenly sampled (0 = all)")
     ap.add_argument("--no-png", action="store_true", help="skip PNG, table only")
+    ap.add_argument("--merges", action="store_true",
+                    help="mark each merge on the graph as a task-id-labeled dot "
+                         "(best combined with --start to stay legible)")
     ap.add_argument("--watch", nargs="?", type=int, const=60, default=None, metavar="N",
                     help="live mode: refresh table + PNG every N seconds (default 60). "
                          "Table shows the most recent --table-rows cycles.")
@@ -472,7 +515,7 @@ def main(argv=None):
 
     agg, unit, agg_label = rollup_config(args)
     base_date = args.date or date_cls.today()
-    points = parse_log(log_path, base_date)
+    points, merges = parse_log(log_path, base_date)
     if not points:
         print(f"no WAKE cycles parsed from {log_path}", file=sys.stderr)
         return 1
@@ -481,10 +524,15 @@ def main(argv=None):
         print(f"no cycles on/after {args.start}", file=sys.stderr)
         return 1
     points = rollup(points, args.resolution, agg)
+    merges = filter_start_events(merges, args.start) if args.merges else None
 
     print_table(points, args.table_rows, unit=unit)
+    if merges is not None:
+        print(f"merges shown: {len(merges)}"
+              + ("  (tip: --start to declutter)" if len(merges) > 60 else ""))
     if not args.no_png:
-        render_png(points, args.out, log_path, resolution=args.resolution, agg_label=agg_label)
+        render_png(points, args.out, log_path, resolution=args.resolution,
+                   agg_label=agg_label, merges=merges)
     print_summary(points, "(skipped)" if args.no_png else args.out,
                   unit=unit, agg_label=agg_label)
     return 0
@@ -501,13 +549,14 @@ def _watch_loop(args, log_path):
     try:
         while True:
             try:
-                points = parse_log(log_path, args.date or date_cls.today())
+                points, merges = parse_log(log_path, args.date or date_cls.today())
             except OSError as exc:  # log momentarily unreadable — keep looping
                 print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
                 time.sleep(interval)
                 continue
             points = filter_start(points, args.start)
             points = rollup(points, args.resolution, agg)
+            merges = filter_start_events(merges, args.start) if args.merges else None
 
             print(_CLEAR, end="")
             if not points:
@@ -519,7 +568,8 @@ def _watch_loop(args, log_path):
                 print_table(points, args.table_rows, tail=True, unit=unit)
                 if not args.no_png:
                     render_png(points, args.out, log_path, fig_ax=fig_ax,
-                               resolution=args.resolution, agg_label=agg_label)
+                               resolution=args.resolution, agg_label=agg_label,
+                               merges=merges)
                     print(f"\npng refreshed: {args.out}")
             print(f"\nrefreshing every {interval}s — Ctrl-C to stop", flush=True)
             time.sleep(interval)
