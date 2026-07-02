@@ -339,6 +339,19 @@ def _series_range(points, attr):
     return f"{min(vals)}–{max(vals)}"
 
 
+def print_merges(merges, cap=50):
+    """List merge events (timestamp + task id) in the window; tail to ``cap``."""
+    print()
+    if not merges:
+        print("merges    : none in window")
+        return
+    shown = merges[-cap:] if cap and len(merges) > cap else merges
+    extra = f" (showing last {len(shown)})" if len(shown) < len(merges) else ""
+    print(f"merges ({len(merges)}){extra}:")
+    for when, tid in shown:
+        print(f"  {when:%Y-%m-%d %H:%M:%S}  {tid}")
+
+
 def print_summary(points, out_path, unit="cycles", agg_label=""):
     first, last = points[0].when, points[-1].when
     print()
@@ -548,8 +561,7 @@ def main(argv=None):
 
     print_table(points, args.table_rows, unit=unit)
     if merges is not None:
-        print(f"merges shown: {len(merges)}"
-              + ("  (tip: --start to declutter)" if len(merges) > 60 else ""))
+        print_merges(merges)
     if not args.no_png:
         render_png(points, args.out, log_path, resolution=args.resolution,
                    agg_label=agg_label, merges=merges)
@@ -586,6 +598,8 @@ def _watch_loop(args, log_path):
                 print_current(points)
                 print()
                 print_table(points, args.table_rows, tail=True, unit=unit)
+                if merges is not None:
+                    print_merges(merges)
                 if not args.no_png:
                     render_png(points, args.out, log_path, fig_ax=fig_ax,
                                resolution=args.resolution, agg_label=agg_label,
