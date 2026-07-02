@@ -384,13 +384,20 @@ def test_main_verify_remediation_identity_docs_match_signature_only_runtime_cont
     supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
     supervisor_flat = " ".join(supervisor.split())
     config_docs = (repo_root / "docs" / "configuration.md").read_text()
+    contract_flat = _normalize_whitespace(contract)
+    supervisor_flat = _normalize_whitespace(supervisor)
 
     assert "the normalized failure signature only" in contract
     assert "different, newly available, stale, or unavailable fingerprint MUST reuse" in contract_flat
+    assert "allow the merge of the one completed remediation implement task" in contract_flat
+    assert "Only a green rerun clears the freeze." in contract_flat
 
     assert "dedup is by failure identity: normalized" in supervisor
     assert "failure signature only" in supervisor
     assert "fingerprint changes, becomes available later, or is unavailable" in supervisor_flat
+    assert "MUST allow one narrow exemption" in supervisor_flat
+    assert "Only a green rerun clears the" in supervisor_flat
+    assert "freeze; if the rerun stays red" in supervisor_flat
 
     assert "deduplicated by failure signature only" in config_docs
     assert "fingerprint churn does not create a second open remediation row" in config_docs

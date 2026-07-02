@@ -582,6 +582,32 @@ def _main_verify_remediation_tree_fingerprint_from_prompt(prompt: str) -> str | 
     return None
 
 
+def _main_verify_remediation_prompt_records_unavailable_tree_fingerprint(prompt: str) -> bool:
+    return any(line == "Tree fingerprint: unavailable" for line in prompt.splitlines())
+
+
+def _is_active_main_verify_fix_remediation_merge(
+    task: DbTask,
+    active_remediation: MainIntegrationVerifyRemediation | None,
+) -> bool:
+    if active_remediation is None or active_remediation.kind != "fix":
+        return False
+    if task.task_type != "implement":
+        return False
+    if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
+        return False
+    if _main_verify_remediation_kind_from_prompt(task.prompt) != "fix":
+        return False
+    if _main_verify_remediation_signature_from_prompt(task.prompt) != active_remediation.signature:
+        return False
+    task_tree_fingerprint = _main_verify_remediation_tree_fingerprint_from_prompt(task.prompt)
+    if active_remediation.tree_fingerprint is None:
+        return task_tree_fingerprint is None and _main_verify_remediation_prompt_records_unavailable_tree_fingerprint(
+            task.prompt
+        )
+    return task_tree_fingerprint == active_remediation.tree_fingerprint
+
+
 def _queue_main_verify_remediation_task(
     *,
     store: SqliteTaskStore,
@@ -4877,6 +4903,7 @@ def _run_cycle(
             _rebuild_isolated_checkout()
 
     merge_halted_for_cycle = False
+    active_main_verify_remediation: MainIntegrationVerifyRemediation | None = None
     merge_verify_git: Git | None = None
     if isolation_enabled:
         merge_verify_git = merge_git
@@ -4906,6 +4933,9 @@ def _run_cycle(
         if main_verify.merges_halted and main_verify_state is not None:
             merge_halted_for_cycle = True
             _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
+            remediation = getattr(main_verify, "remediation", None)
+            if remediation is not None and remediation.kind == "fix":
+                active_main_verify_remediation = remediation
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
@@ -5009,13 +5039,22 @@ def _run_cycle(
                 continue
 
             if action_type in {"merge", "merge_with_followups"}:
-                if merge_halted_for_cycle:
+                freeze_exempt = merge_halted_for_cycle and _is_active_main_verify_fix_remediation_merge(
+                    task,
+                    active_main_verify_remediation,
+                )
+                if merge_halted_for_cycle and not freeze_exempt:
                     log.emit(
                         "SKIP",
                         f"{display_task.id}: merges halted while local main verify is red",
                         dedupe_key=f"main-integration-verify-skip:{display_task.id}",
                     )
                     continue
+                if freeze_exempt:
+                    log.emit(
+                        "INFO",
+                        f"{display_task.id}: merging active local main verify remediation despite red-main freeze",
+                    )
                 if not can_merge:
                     if isolation_enabled and merge_skip_reason == "merge-isolated-checkout-unavailable":
                         log.emit(
@@ -5123,6 +5162,14 @@ def _run_cycle(
                     if main_verify.merges_halted and main_verify_state is not None:
                         merge_halted_for_cycle = True
                         _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
+                        remediation = getattr(main_verify, "remediation", None)
+                        if remediation is not None and remediation.kind == "fix":
+                            active_main_verify_remediation = remediation
+                        else:
+                            active_main_verify_remediation = None
+                    else:
+                        merge_halted_for_cycle = False
+                        active_main_verify_remediation = None
                 for followup_task in merge_result.created_followups:
                     log.emit(
                         "FOLLOW",

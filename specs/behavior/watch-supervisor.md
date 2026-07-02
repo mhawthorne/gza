@@ -126,6 +126,22 @@ Each watch cycle MUST execute these phases in order:
    task so its prompt and purpose match the current classification before queue-bumping
    it. Reused or newly created remediation tasks in this lane MUST also carry the distinctive tag
    `system-main-verify` in addition to `system` and inherited watch scope tags.
+   While that deterministic-red freeze is active, watch MUST skip unrelated merge
+   actions for the cycle but MUST allow one narrow exemption: the merge subject that is
+   the active deterministic `system-main-verify` fix remediation for the currently red
+   failure identity. That exemption MUST be watch-owned, MUST match the actual merge
+   subject rather than a display owner row, and MUST require the remediation trigger
+   source, prompt kind `fix`, exact failure signature, and exact tree fingerprint when
+   one is available from the active evidence. If the active evidence has no tree
+   fingerprint, the exemption MUST stay conservative and only match a remediation prompt
+   whose parsed fingerprint is likewise unavailable. Deflake remediations and mismatched
+   signatures or fingerprints MUST NOT bypass the freeze. After an exempt remediation
+   merge succeeds, watch MUST immediately rerun the same local-target verify gate
+   against the post-merge tree before allowing any later merge in that cycle. Only a
+   green rerun clears the cycle-local freeze; if the rerun stays red, watch MUST keep
+   merges halted, emit the durable `main-integration-verify-red` attention, and create
+   or reuse the remediation task for the new active failure identity through the same
+   dedup path.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
 4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has

@@ -132,6 +132,20 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   node IDs, and excerpt instead of surfacing stale prompt evidence.
   The prompt MUST keep that evidence bounded and deterministic; it MUST NOT embed an
   unbounded verify log.
+- While that deterministic red freeze is active, watch MUST continue skipping unrelated
+  merge actions for the cycle, but it MUST allow the merge of the one completed
+  remediation implement task that is the active `system-main-verify` **fix** for the
+  current failure identity. That exemption is owned by the watch supervisor and MUST be
+  authorized only when the merge subject matches the active remediation by trigger
+  source, remediation kind, failure signature, and exact tree fingerprint when one is
+  available from the bounded rerun evidence. If the active evidence has no tree
+  fingerprint, the exemption MUST stay conservative and only match a remediation prompt
+  that likewise records fingerprint unavailability.
+- After that exempt remediation merge, watch MUST immediately rerun local-target verify
+  against the post-merge local target tree before allowing any later merge in the same
+  cycle. Only a green rerun clears the freeze. If the rerun is still red, automation
+  MUST keep the freeze in place, MUST surface the durable red-main attention, and MUST
+  create or reuse the next remediation task through the same failure-identity dedup path.
 
 That repair path MUST itself be bounded. It MUST NOT silently freeze the merge lane
 without either making bounded repair attempts or surfacing a human-required condition.
