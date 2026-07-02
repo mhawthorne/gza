@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import tempfile
 import time
 from datetime import date as date_cls
 from datetime import datetime, timedelta
@@ -240,6 +239,7 @@ def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_la
     ax.xaxis.set_major_formatter(mdates.DateFormatter(date_fmt))
     fig.autofmt_xdate()
     fig.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120)
     if own:
         import matplotlib.pyplot as plt
@@ -440,8 +440,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--log", type=Path, default=None,
                     help="path to a .gza/watch.log (default: auto-discover)")
-    ap.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "watch_status.png",
-                    help="output PNG path (default: <tmpdir>/watch_status.png)")
+    ap.add_argument("--out", type=Path, default=Path("tmp/watch_status.png"),
+                    help="output PNG path (default: tmp/watch_status.png under the cwd)")
     ap.add_argument("--date", type=parse_date, default=None,
                     help="base date to assume for the newest line (default: today)")
     ap.add_argument("--start", type=parse_date, default=None, metavar="YYYY-MM-DD",
