@@ -19,6 +19,7 @@ Run it with uv (deps are declared inline above)::
 
     uv run scripts/watch_log_graph.py
     uv run scripts/watch_log_graph.py --log /path/to/.gza/watch.log --out q.png
+    uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
 
@@ -31,9 +32,9 @@ Log line shapes it understands::
 from __future__ import annotations
 
 import argparse
-import math
 import re
 import sys
+import time
 from datetime import date as date_cls
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -188,18 +189,35 @@ _SERIES = [
 ]
 
 
-def render_png(points, out_path, log_path):
+def make_figure():
+    """Create a reusable (fig, ax) with the Agg backend. Import matplotlib once."""
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
+    return plt.subplots(figsize=(14, 7))
+
+
+def render_png(points, out_path, log_path, fig_ax=None):
+    """Render the 4-series plot to ``out_path``.
+
+    Pass ``fig_ax`` (from :func:`make_figure`) to reuse a single figure across
+    ticks in ``--watch`` mode; otherwise a throwaway figure is created and closed.
+    """
+    import matplotlib.dates as mdates
+
+    if fig_ax is None:
+        fig, ax = make_figure()
+        own = True
+    else:
+        fig, ax = fig_ax
+        ax.clear()
+        own = False
+
     xs = [p.when for p in points]
-    fig, ax = plt.subplots(figsize=(14, 7))
     for attr, label in _SERIES:
-        ys = [getattr(p, attr) for p in points]
-        ys = [float("nan") if v is None else v for v in ys]
+        ys = [float("nan") if getattr(p, attr) is None else getattr(p, attr) for p in points]
         ax.plot(xs, ys, label=label, linewidth=1.2)
 
     ax.set_ylabel("task count")
@@ -211,16 +229,26 @@ def render_png(points, out_path, log_path):
     fig.autofmt_xdate()
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
-    plt.close(fig)
+    if own:
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
 
 
 def _fmt(v):
     return "" if v is None else str(v)
 
 
-def print_table(points, max_rows):
-    """Print an aligned text table, evenly sampled to at most ``max_rows`` rows."""
-    if max_rows and max_rows > 0 and len(points) > max_rows:
+def print_table(points, max_rows, tail=False):
+    """Print an aligned text table.
+
+    Default: evenly sample at most ``max_rows`` rows across the full range.
+    ``tail=True`` (watch mode): show the most recent ``max_rows`` cycles instead.
+    """
+    if tail:
+        sampled = points[-max_rows:] if max_rows and max_rows > 0 else points
+        note = f"(latest {len(sampled)} of {len(points)} cycles)"
+    elif max_rows and max_rows > 0 and len(points) > max_rows:
         step = len(points) / max_rows
         idxs = sorted({int(i * step) for i in range(max_rows)})
         idxs = [i for i in idxs if i < len(points)]
@@ -245,6 +273,15 @@ def print_table(points, max_rows):
     for r in rows:
         print("  ".join(r[c].ljust(widths[c]) for c in range(len(header))))
     print(note)
+
+
+def print_current(points):
+    """One-line live status: refresh wall-clock + the newest cycle's counts."""
+    p = points[-1]
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"[{now}]  latest cycle {p.when:%Y-%m-%d %H:%M:%S}  |  "
+          f"running={_fmt(p.running)}  pending={_fmt(p.pending)}  "
+          f"blocked={_fmt(p.blocked)}  attention={_fmt(p.attention)}")
 
 
 def _series_range(points, attr):
@@ -297,11 +334,17 @@ def main(argv=None):
     ap.add_argument("--table-rows", type=int, default=40,
                     help="max rows in the printed table, evenly sampled (0 = all)")
     ap.add_argument("--no-png", action="store_true", help="skip PNG, table only")
+    ap.add_argument("--watch", nargs="?", type=int, const=60, default=None, metavar="N",
+                    help="live mode: refresh table + PNG every N seconds (default 60). "
+                         "Table shows the most recent --table-rows cycles.")
     args = ap.parse_args(argv)
 
     log_path = args.log or default_log()
     if not log_path or not Path(log_path).is_file():
         ap.error(f"watch.log not found (looked for {log_path or '.gza/watch.log'}); pass --log")
+
+    if args.watch is not None:
+        return _watch_loop(args, log_path)
 
     base_date = args.date or date_cls.today()
     points = parse_log(log_path, base_date)
@@ -313,6 +356,44 @@ def main(argv=None):
     if not args.no_png:
         render_png(points, args.out, log_path)
     print_summary(points, "(skipped)" if args.no_png else args.out)
+    return 0
+
+
+_CLEAR = "\033[2J\033[3J\033[H"  # clear screen + scrollback, cursor home
+
+
+def _watch_loop(args, log_path):
+    """Refresh the table (and PNG) every ``args.watch`` seconds until Ctrl-C."""
+    interval = args.watch
+    fig_ax = None if args.no_png else make_figure()
+    try:
+        while True:
+            try:
+                points = parse_log(log_path, args.date or date_cls.today())
+            except OSError as exc:  # log momentarily unreadable — keep looping
+                print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
+                time.sleep(interval)
+                continue
+
+            print(_CLEAR, end="")
+            if not points:
+                print(f"no WAKE cycles yet in {log_path}")
+            else:
+                print_current(points)
+                print()
+                print_table(points, args.table_rows, tail=True)
+                if not args.no_png:
+                    render_png(points, args.out, log_path, fig_ax=fig_ax)
+                    print(f"\npng refreshed: {args.out}")
+            print(f"\nrefreshing every {interval}s — Ctrl-C to stop", flush=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nstopped.")
+    finally:
+        if fig_ax is not None:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig_ax[0])
     return 0
 
 
