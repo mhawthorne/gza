@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +29,8 @@ def _seed_main_verify_task(
     failure: str,
     alert_message: str,
     failing_phase: str = "unit",
+    failure_signature: str | None = None,
+    pending_retirement_signatures: tuple[str, ...] = (),
 ) -> str:
     task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
     assert task.id is not None
@@ -38,12 +41,21 @@ def _seed_main_verify_task(
     task.review_verify_exit_status = verify_exit_status
     task.review_verify_failure = failure
     task.review_verify_head_sha = "abc123"
-    task.output_content = (
-        '{"alert_message":"'
-        + alert_message
-        + f'","captured_at":"2026-06-23T00:00:00+00:00","failing_phase":"{failing_phase}","gate_enabled":true,'
-        '"head_sha":"abc123","tree_fingerprint":"fp-verified","verify_command":"./bin/tests",'
-        '"verify_timeout_grace_seconds":5.0,"verify_timeout_seconds":120}'
+    task.output_content = json.dumps(
+        {
+            "alert_message": alert_message,
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "failure_signature": failure_signature,
+            "failing_phase": failing_phase,
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "pending_retirement_signatures": list(pending_retirement_signatures),
+            "tree_fingerprint": "fp-verified",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
     )
     store.update(task)
     return task.id
@@ -451,6 +463,7 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
         verify_exit_status="1",
         failure="verify_command failed",
         alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        pending_retirement_signatures=("phase:functional",),
     )
     task = store.get(task_id)
     assert task is not None
@@ -462,7 +475,7 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
         state=state,
         alert_message=(
             "main verify RED at `abc123` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for unit on fp-verified; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
             "human intervention required"
         ),
     )
@@ -474,12 +487,16 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
     assert updated.tree_fingerprint == "fp-verified"
     assert updated.head_sha == "abc123"
     assert updated.failing_phase == "unit"
+    assert updated.failure_signature == "phase:unit"
+    assert updated.pending_retirement_signatures == ("phase:functional",)
     assert "automatic remediation exhausted after 2/2 attempts" in (updated.alert_message or "")
     reloaded = load_main_integration_verify_state(store)
     assert reloaded is not None
     assert reloaded.alert_message == updated.alert_message
     assert reloaded.tree_fingerprint == "fp-verified"
     assert reloaded.head_sha == "abc123"
+    assert reloaded.failure_signature == "phase:unit"
+    assert reloaded.pending_retirement_signatures == ("phase:functional",)
 
 
 def test_check_main_integration_verify_reuses_same_tree_green_checkpoint_without_rerun(tmp_path) -> None:

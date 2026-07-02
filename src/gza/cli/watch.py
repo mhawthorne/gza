@@ -78,6 +78,7 @@ from ..main_integration_verify import (
     MainIntegrationVerifyState,
     check_main_integration_verify,
     persist_main_integration_verify_alert_message,
+    persist_main_integration_verify_pending_retire_signatures,
 )
 from ..merge_state import (
     effective_no_work_merge_state,
@@ -326,11 +327,18 @@ class _MainVerifyRemediationSelection:
     duplicates: tuple[DbTask, ...] = ()
 
 
+@dataclass(frozen=True)
+class _MainVerifyMootRetireResult:
+    retired_ids: tuple[str, ...] = ()
+    deferred_live_ids: tuple[str, ...] = ()
+
+
 MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON = "superseded_same_signature_remediation"
 MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON = "MAIN_VERIFY_REMEDIATION_LIMIT_REACHED"
 _MAIN_VERIFY_REMEDIATION_ATTEMPTS_PREFIX = "Remediation attempts spent: "
 _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE = re.compile(
-    r"automatic remediation exhausted after (?P<attempts>\d+/\d+) attempts",
+    r"automatic remediation exhausted after (?P<attempts>\d+/\d+) attempts"
+    r"(?: for (?P<signature>.+?) on (?P<fingerprint>.+?))?(?:;|$)",
 )
 
 
@@ -831,16 +839,20 @@ def _retire_moot_main_verify_remediations(
     store: SqliteTaskStore,
     signature: str,
     reason: str,
-) -> tuple[str, ...]:
+) -> _MainVerifyMootRetireResult:
     retired: list[str] = []
+    deferred_live: list[str] = []
     for task in store.get_all():
         if task.id is None:
             continue
         if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
             continue
-        if task.status in {"completed", "failed", "dropped", "unmerged"}:
+        if task.status in {"completed", "dropped", "unmerged"}:
             continue
         if _main_verify_remediation_signature_from_prompt(task.prompt) != signature:
+            continue
+        if task.status == "in_progress":
+            deferred_live.append(task.id)
             continue
         task.status = "dropped"
         task.started_at = None
@@ -853,7 +865,38 @@ def _retire_moot_main_verify_remediations(
         task.queue_position = None
         store.update(task)
         retired.append(task.id)
-    return tuple(retired)
+    return _MainVerifyMootRetireResult(
+        retired_ids=tuple(retired),
+        deferred_live_ids=tuple(deferred_live),
+    )
+
+
+def _collect_main_verify_pending_retirement_signatures(state: Any) -> tuple[str, ...]:
+    raw = getattr(state, "pending_retirement_signatures", ())
+    if not isinstance(raw, tuple):
+        return ()
+    return tuple(signature for signature in raw if isinstance(signature, str) and signature)
+
+
+def _main_verify_state_failure_signature(state: Any) -> str | None:
+    signature = getattr(state, "failure_signature", None)
+    if isinstance(signature, str) and signature:
+        return signature
+    message = getattr(state, "alert_message", None) or ""
+    exhausted_match = _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message)
+    if exhausted_match is not None:
+        parsed_signature = exhausted_match.group("signature")
+        if parsed_signature:
+            return parsed_signature
+    failing_phase = getattr(state, "failing_phase", None)
+    if isinstance(failing_phase, str) and failing_phase:
+        return f"phase:{failing_phase}"
+    verify_status = getattr(state, "verify_status", None)
+    if not isinstance(verify_status, str) or not verify_status:
+        return None
+    verify_exit_status = getattr(state, "verify_exit_status", None)
+    exit_status = verify_exit_status if isinstance(verify_exit_status, str) and verify_exit_status else "unknown"
+    return f"status:{verify_status}:exit:{exit_status}"
 
 
 def _maybe_file_main_verify_remediation(
@@ -868,22 +911,45 @@ def _maybe_file_main_verify_remediation(
 ) -> MainIntegrationVerifyState | None:
     remediation = getattr(check, "remediation", None)
     resolved_signature = getattr(check, "resolved_red_signature", None)
-    if not dry_run and remediation is None and not check.merges_halted and resolved_signature:
-        store.clear_main_verify_remediation_active_task(
-            signature=resolved_signature,
-            tree_fingerprint=None,
-            last_observed_head_sha=getattr(check.state, "head_sha", None),
-            last_observed_failure=None,
-        )
-        retired_ids = _retire_moot_main_verify_remediations(
-            store=store,
-            signature=resolved_signature,
-            reason=f"main verify green for signature {resolved_signature}",
-        )
-        if retired_ids:
-            log.emit(
-                "REMEDY",
-                f"retired moot remediation rows for {resolved_signature}: {', '.join(retired_ids)}",
+    if not dry_run and remediation is None and not check.merges_halted:
+        state = getattr(check, "state", None)
+        if state is None:
+            return None
+        signatures_to_retire = {
+            *(_collect_main_verify_pending_retirement_signatures(state)),
+            *((resolved_signature,) if resolved_signature else ()),
+        }
+        remaining_pending_signatures: list[str] = []
+        for signature in sorted(signatures_to_retire):
+            store.clear_main_verify_remediation_active_task(
+                signature=signature,
+                tree_fingerprint=None,
+                last_observed_head_sha=getattr(state, "head_sha", None),
+                last_observed_failure=None,
+            )
+            retirement = _retire_moot_main_verify_remediations(
+                store=store,
+                signature=signature,
+                reason=f"main verify green for signature {signature}",
+            )
+            if retirement.retired_ids:
+                log.emit(
+                    "REMEDY",
+                    f"retired moot remediation rows for {signature}: {', '.join(retirement.retired_ids)}",
+                )
+            if retirement.deferred_live_ids:
+                remaining_pending_signatures.append(signature)
+                log.emit(
+                    "REMEDY",
+                    f"main verify green for {signature}; delaying retirement for live remediation rows: "
+                    f"{', '.join(retirement.deferred_live_ids)}",
+                )
+        desired_pending_signatures = tuple(dict.fromkeys(remaining_pending_signatures))
+        if desired_pending_signatures != _collect_main_verify_pending_retirement_signatures(state):
+            persist_main_integration_verify_pending_retire_signatures(
+                store,
+                state=state,
+                pending_retirement_signatures=desired_pending_signatures,
             )
     if remediation is None or dry_run:
         return None
@@ -896,13 +962,14 @@ def _maybe_file_main_verify_remediation(
         any_tag=any_tag,
     )
     phase = remediation.failing_phase or remediation.signature
+    signature_label = remediation.signature
     fingerprint_label = remediation.tree_fingerprint or "unavailable"
     if result.outcome == "exhausted":
         attempts = config.watch.main_verify_remediation_max_attempts
         base_message = check.state.alert_message or "main verify is red; merges halted"
         message = (
             f"{base_message}; automatic remediation exhausted after {attempts}/{attempts} "
-            f"attempts for {phase} on {fingerprint_label}; human intervention required"
+            f"attempts for {signature_label} on {fingerprint_label}; human intervention required"
         )
         persisted_state = persist_main_integration_verify_alert_message(
             store,
@@ -912,7 +979,7 @@ def _maybe_file_main_verify_remediation(
         log.emit(
             "REMEDY",
             f"{result.task.id if result.task is not None else 'main verify'}: automatic remediation exhausted "
-            f"after {attempts}/{attempts} attempts for {phase} on {fingerprint_label}",
+            f"after {attempts}/{attempts} attempts for {signature_label} on {fingerprint_label}",
         )
         return persisted_state
     assert result.task is not None
@@ -2437,9 +2504,9 @@ def _format_main_verify_attention_message(state: Any, *, now: datetime) -> str:
     message = state.alert_message or "main verify is red; merges halted"
     exhausted_match = _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message)
     if exhausted_match is not None:
-        phase = getattr(state, "failing_phase", None) or "unknown"
+        signature = _main_verify_state_failure_signature(state) or "unknown"
         message = (
-            f"main verify remediation exhausted for {phase} after "
+            f"main verify remediation exhausted for {signature} after "
             f"{exhausted_match.group('attempts')} attempts; human intervention required"
         )
     red_since = getattr(state, "red_since", None)
@@ -2454,9 +2521,10 @@ def _main_verify_attention_key(state: Any) -> str | None:
     if task_id is None:
         return None
     message = getattr(state, "alert_message", None) or ""
-    failing_phase = getattr(state, "failing_phase", None)
-    if "automatic remediation exhausted after" in message and failing_phase:
-        return f"main-verify-remediation-exhausted:phase:{failing_phase}"
+    if "automatic remediation exhausted after" in message:
+        signature = _main_verify_state_failure_signature(state)
+        if signature:
+            return f"main-verify-remediation-exhausted:{signature}"
     return f"main-integration-verify:{task_id}:{MAIN_INTEGRATION_VERIFY_REASON}"
 
 
