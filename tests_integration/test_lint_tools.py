@@ -32,7 +32,16 @@ def test_ty_installed() -> None:
 
 
 def test_ruff_check_passes() -> None:
-    result = _run([sys.executable, "-m", "ruff", "check", "src/gza/"])
+    result = _run(
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "src/gza/",
+            "tests/test_main_integration_verify.py",
+        ]
+    )
     assert result.returncode == 0, f"ruff check failed:\n{result.stdout}\n{result.stderr}"
 
 
