@@ -170,6 +170,10 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "readable and yields content-bearing output" in contract
     assert "first readable content-bearing one" in contract
     assert "content-bearing verify artifact exists, it MUST omit the artifact reference" in contract
+    assert "stop requeueing once the configured bound is spent" in contract_flat
+    assert "Legacy failed remediation rows that predate explicit attempt metadata MUST be treated conservatively" in contract_flat
+    assert "emit one signature-scoped human-attention condition" in contract_flat
+    assert "retire matching open remediation rows for that signature as moot" in contract_flat
     assert "There MUST be a first-class operator command that forces a fresh local-target verify run" in contract
     assert "Future behavior-check findings against this area MUST classify implementation drift" in contract_flat
 

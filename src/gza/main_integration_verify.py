@@ -64,6 +64,7 @@ class MainIntegrationVerifyCheck:
     is_current: bool
     merges_halted: bool
     remediation: MainIntegrationVerifyRemediation | None = None
+    resolved_red_signature: str | None = None
     verify_runs: int = 0
 
 
@@ -719,6 +720,14 @@ def check_main_integration_verify(
             ),
         )
 
+    prior_red_signature = None
+    if state is not None and _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
+        prior_red_signature = _verify_failure_signature(
+            failing_phase=state.failing_phase,
+            verify_status=state.verify_status,
+            verify_exit_status=state.verify_exit_status,
+        )
+
     refreshed, remediation, verify_runs = _run_main_integration_verify_with_red_reruns(
         config,
         store,
@@ -727,6 +736,11 @@ def check_main_integration_verify(
         red_reruns=red_reruns,
         prior_red_state=state if checkpoint_is_current else None,
     )
+    resolved_red_signature = None
+    if not _verify_result_is_red(status=refreshed.verify_status, gate_enabled=refreshed.gate_enabled):
+        resolved_red_signature = prior_red_signature
+        if resolved_red_signature is None and remediation is not None and remediation.kind == "deflake":
+            resolved_red_signature = remediation.signature
     return MainIntegrationVerifyCheck(
         state=refreshed,
         performed_verify=True,
@@ -737,6 +751,7 @@ def check_main_integration_verify(
             gate_enabled=refreshed.gate_enabled,
         ),
         remediation=remediation,
+        resolved_red_signature=resolved_red_signature,
         verify_runs=verify_runs,
     )
 

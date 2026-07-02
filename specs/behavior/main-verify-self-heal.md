@@ -127,6 +127,20 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   node IDs, and excerpt instead of surfacing stale prompt evidence.
   The prompt MUST keep that evidence bounded and deterministic; it MUST NOT embed an
   unbounded verify log.
+- Reusing the same remediation row after a failed automatic attempt MUST be bounded and
+  sequential. Watch MUST track the consumed automatic attempts on that single row,
+  increment that state before requeueing a failed remediation, and stop requeueing once
+  the configured bound is spent. Legacy failed remediation rows that predate explicit
+  attempt metadata MUST be treated conservatively as already having spent one automatic
+  attempt.
+- When the automatic remediation bound is exhausted for a failure signature, watch MUST
+  leave the single remediation row failed, persist an explicit exhausted reason on that
+  row, and emit one signature-scoped human-attention condition instead of creating or
+  queueing another remediation task for the same unresolved signature.
+- When main verify later turns green and automation can safely identify the cleared
+  failure signature, watch MUST retire matching open remediation rows for that signature
+  as moot so stale main-verify fixes do not remain runnable after the gate has already
+  recovered.
 
 That repair path MUST itself be bounded. It MUST NOT silently freeze the merge lane
 without either making bounded repair attempts or surfacing a human-required condition.
