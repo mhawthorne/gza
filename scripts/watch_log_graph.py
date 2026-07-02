@@ -220,18 +220,38 @@ def make_figure():
 
 
 def _draw_merges(ax, merges):
-    """Draw each merge as a dot on the baseline + a vertical guide, labeled by task id."""
+    """Mark merges: exact-time dots on the baseline + one per-hour box of task ids.
+
+    Grouping by hour collapses tight within-hour clusters (which overlap badly as
+    individual rotated labels) into a single readable box placed mid-plot, in the
+    empty band between the low ``running`` line and the higher queue-depth lines.
+    """
     if not merges:
         return
     xs = [when for when, _ in merges]
-    for when in xs:
-        ax.axvline(when, color="0.75", linewidth=0.5, alpha=0.5, zorder=0)
     ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
                zorder=6, label=f"merge ({len(merges)})")
+
+    groups = {}  # hour bucket -> [task_id, ...] in time order
     for when, tid in merges:
-        ax.annotate(tid, (when, 0), rotation=90, fontsize=12, color="tab:purple",
-                    ha="center", va="bottom", xytext=(0, 4),
-                    textcoords="offset points")
+        groups.setdefault(when.replace(minute=0, second=0, microsecond=0), []).append(tid)
+
+    ymin, ymax = ax.get_ylim()
+    span = ymax - ymin
+    mid = ymin + span * 0.5
+    # Zigzag consecutive boxes between two heights so adjacent-hour boxes don't
+    # collide horizontally (they land in the empty band between the lines).
+    levels = [mid - span * 0.12, mid + span * 0.12]
+    for i, hour in enumerate(sorted(groups)):
+        ids = groups[hour]
+        center = hour + timedelta(minutes=30)
+        y = levels[i % 2]
+        ax.plot([center, center], [0, y], color="0.8", linewidth=0.6, alpha=0.6, zorder=0)
+        ax.annotate(
+            "\n".join(ids), (center, y), ha="center", va="center",
+            fontsize=9, color="tab:purple", zorder=7,
+            bbox=dict(boxstyle="round", fc="white", ec="tab:purple", alpha=0.9),
+        )
 
 
 def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label="",
