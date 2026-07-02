@@ -17,13 +17,13 @@ that is used directly and the wrap inference is skipped.
 
 Run it with uv (deps are declared inline above)::
 
-    uv run scripts/watch_log_graph.py
-    uv run scripts/watch_log_graph.py --log /path/to/.gza/watch.log --out q.png
-    uv run scripts/watch_log_graph.py --start 2026-06-28   # only cycles on/after a date
-    uv run scripts/watch_log_graph.py --resolution day --aggregate p90   # daily p90 rollup
+    uv run scripts/watch_log_graph.py                      # last 24h (default)
+    uv run scripts/watch_log_graph.py --hours 72           # last 3 days
+    uv run scripts/watch_log_graph.py --all                # full log history
+    uv run scripts/watch_log_graph.py --start 2026-06-28   # from an absolute date
+    uv run scripts/watch_log_graph.py --all --resolution day --aggregate p90  # daily p90
     uv run scripts/watch_log_graph.py --resolution hour --agg max        # hourly peaks
-    uv run scripts/watch_log_graph.py --start 2026-07-01     # merges are marked by default
-    uv run scripts/watch_log_graph.py --no-merges            # hide merge dots
+    uv run scripts/watch_log_graph.py --no-merges          # hide merge dots (on by default)
     uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
@@ -371,19 +371,32 @@ def parse_date(s):
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def filter_start(points, start):
-    """Keep only cycles on/after ``start`` (a date), or all if ``start`` is None."""
-    if start is None:
+def compute_cutoff(points, args):
+    """Resolve the start-of-window datetime from args (precedence: all > start > hours).
+
+    Default is a rolling window of ``args.hours`` before the newest cycle, so the
+    graph shows recent activity rather than the whole log. Returns None for "no cut".
+    """
+    if getattr(args, "all", False):
+        return None
+    if args.start is not None:
+        return datetime.combine(args.start, datetime.min.time())
+    if points:
+        return points[-1].when - timedelta(hours=args.hours)
+    return None
+
+
+def filter_since(points, cutoff):
+    """Keep only cycles at/after ``cutoff`` (a datetime), or all if ``cutoff`` is None."""
+    if cutoff is None:
         return points
-    cutoff = datetime.combine(start, datetime.min.time())
     return [p for p in points if p.when >= cutoff]
 
 
-def filter_start_events(events, start):
-    """Keep only ``(datetime, id)`` events on/after ``start`` (a date)."""
-    if start is None:
+def filter_since_events(events, cutoff):
+    """Keep only ``(datetime, id)`` events at/after ``cutoff``."""
+    if cutoff is None:
         return events
-    cutoff = datetime.combine(start, datetime.min.time())
     return [(when, tid) for when, tid in events if when >= cutoff]
 
 
@@ -487,8 +500,13 @@ def main(argv=None):
                     help="output PNG path (default: tmp/watch_status.png under the cwd)")
     ap.add_argument("--date", type=parse_date, default=None,
                     help="base date to assume for the newest line (default: today)")
+    ap.add_argument("--hours", type=float, default=24.0, metavar="H",
+                    help="rolling window: show only the last H hours of activity "
+                         "before the newest cycle (default 24)")
     ap.add_argument("--start", type=parse_date, default=None, metavar="YYYY-MM-DD",
-                    help="only show cycles on/after this date (clips table + PNG)")
+                    help="absolute start date (overrides --hours)")
+    ap.add_argument("--all", action="store_true",
+                    help="show the full log history (disable the default 24h window)")
     ap.add_argument("--resolution", "--rollup", choices=("raw", "hour", "day"), default="raw",
                     help="bucket cycles by hour or day before plotting (default: raw)")
     ap.add_argument("--aggregate", "--agg", type=parse_aggregate, default=None, metavar="AGG",
@@ -520,12 +538,13 @@ def main(argv=None):
     if not points:
         print(f"no WAKE cycles parsed from {log_path}", file=sys.stderr)
         return 1
-    points = filter_start(points, args.start)
+    cutoff = compute_cutoff(points, args)
+    points = filter_since(points, cutoff)
     if not points:
-        print(f"no cycles on/after {args.start}", file=sys.stderr)
+        print("no cycles in the selected window", file=sys.stderr)
         return 1
     points = rollup(points, args.resolution, agg)
-    merges = filter_start_events(merges, args.start) if args.merges else None
+    merges = filter_since_events(merges, cutoff) if args.merges else None
 
     print_table(points, args.table_rows, unit=unit)
     if merges is not None:
@@ -555,14 +574,14 @@ def _watch_loop(args, log_path):
                 print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
                 time.sleep(interval)
                 continue
-            points = filter_start(points, args.start)
+            cutoff = compute_cutoff(points, args)
+            points = filter_since(points, cutoff)
             points = rollup(points, args.resolution, agg)
-            merges = filter_start_events(merges, args.start) if args.merges else None
+            merges = filter_since_events(merges, cutoff) if args.merges else None
 
             print(_CLEAR, end="")
             if not points:
-                since = f" on/after {args.start}" if args.start else ""
-                print(f"no WAKE cycles yet in {log_path}{since}")
+                print(f"no WAKE cycles yet in {log_path} for the selected window")
             else:
                 print_current(points)
                 print()
