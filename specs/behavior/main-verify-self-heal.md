@@ -105,6 +105,13 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
   exactly one open remediation task for that failure identity that aims to fix the
   failing phase or gate.
+- A verify phase or verify tool that cannot be launched because the environment is
+  misconfigured (for example: missing executable, not-on-PATH tool, non-executable
+  tool, or shell-level `command not found`/exit-127 launch failure) is **not** a
+  deterministic red. Automation MUST surface that as a visible operator attention
+  condition that names the missing or non-runnable tool and tells the operator to fix
+  the environment rather than the code. That condition MUST NOT mark main red, MUST NOT
+  halt merges, and MUST NOT create or reuse a code-remediation task.
 - Remediation task dedup is by failure identity, not by watch cycle. That identity is
   the normalized failure signature only. The exact local-target tree fingerprint from
   the bounded rerun evidence remains prompt context and freshness evidence, but it MUST

@@ -174,7 +174,8 @@ def test_full_verify_defaults_to_ci_parity_xdist_worker_count_on_high_core_machi
     tool_invocations = tool_log.read_text(encoding="utf-8")
     assert "test-unit --summary -- tests/ -n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
-        "python -m gza.test_functional_rerun --summary -- tests_functional/ -n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        f"{venv_bin / 'python'} -m gza.test_functional_rerun --summary -- tests_functional/ "
+        "-n 2 --dist loadscope --durations=25 -o faulthandler_timeout=60"
         in tool_invocations
     )
 
@@ -217,7 +218,9 @@ def test_full_verify_uses_project_venv_for_test_latency_when_available(tmp_path:
     assert "python -m gza.tools.verify_phase unit -- ./bin/test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert "test-unit --summary -- tests/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60" in tool_invocations
     assert (
-        "python -m gza.tools.verify_phase functional -- python -m gza.test_functional_rerun --summary -- tests_functional/ -n 7 --dist loadscope --durations=25 -o faulthandler_timeout=60"
+        f"python -m gza.tools.verify_phase functional -- {venv_bin / 'python'} -m gza.test_functional_rerun "
+        "--summary -- tests_functional/ -n 7 --dist loadscope --durations=25 "
+        "-o faulthandler_timeout=60"
         in tool_invocations
     )
     assert uv_log.read_text(encoding="utf-8") == ""
@@ -503,8 +506,46 @@ def test_quick_verify_runs_ruff_phase_against_src_gza_with_project_venv(tmp_path
     assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert "python -m gza.tools.verify_phase ruff -- ruff check src/gza/" in tool_invocations
+    assert f"python -m gza.tools.verify_phase ruff -- {venv_bin / 'ruff'} check src/gza/" in tool_invocations
     assert "uv run ruff check src/gza/" not in tool_invocations
+
+
+@pytest.mark.timeout(30, method="signal")
+def test_quick_verify_falls_back_to_uv_run_when_project_venv_lacks_ruff(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    fixture_root = _setup_verify_script_fixture(tmp_path)
+    tool_log = fixture_root / "venv-tools.log"
+    uv_log = fixture_root / "uv.log"
+
+    venv_bin = fixture_root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    _write_fake_venv_python(venv_bin / "python", tool_log)
+
+    fake_bin = fixture_root / "fake-bin"
+    fake_bin.mkdir()
+    _write_fake_uv(fake_bin / "uv", uv_log)
+    uv_log.write_text("", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
+    result = subprocess.run(
+        ["bash", "bin/tests", "--quick"],
+        cwd=fixture_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=4,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "use_venv=1" in result.stdout
+    tool_invocations = tool_log.read_text(encoding="utf-8")
+    assert (
+        "python -m gza.tools.verify_phase ruff -- uv run ruff check "
+        "src/gza/ tests/test_main_integration_verify.py"
+    ) in tool_invocations
+    assert "uv run ruff check src/gza/ tests/test_main_integration_verify.py" in uv_log.read_text(encoding="utf-8")
 
 
 @pytest.mark.functional

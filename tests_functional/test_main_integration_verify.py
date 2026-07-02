@@ -12,7 +12,7 @@ from tests.cli.conftest import make_store, setup_config
 from tests_functional.git_helpers import init_basic_repo
 
 
-def test_configured_main_integration_verify_unavailable_halts_and_persists_alert(tmp_path) -> None:
+def test_configured_main_integration_verify_launch_failure_keeps_main_green_and_persists_attention(tmp_path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -45,9 +45,11 @@ def test_configured_main_integration_verify_unavailable_halts_and_persists_alert
     assert check.state.gate_enabled is True
     assert check.state.verify_status == "unavailable"
     assert check.state.alert_message == (
-        f"main verify RED at `{head_sha[:12]}` - merges halted; verify status `unavailable`"
+        f"main verify misconfigured at `{head_sha[:12]}` - could not launch verify tooling "
+        "(launcher missing); fix the environment, not the code"
     )
-    assert check.merges_halted is True
+    assert check.merges_halted is False
+    assert check.needs_attention is True
 
     persisted = load_main_integration_verify_state(store)
     assert persisted is not None

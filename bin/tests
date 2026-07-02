@@ -12,6 +12,7 @@ TARGET_ARGS=()
 USE_VENV=0
 VERIFY_PHASE_CMD=()
 RUFF_TARGETS=(src/gza/ tests/test_main_integration_verify.py)
+VENV_BIN=""
 
 usage() {
     echo "Usage: $0 [--quick [-- <pytest-target> ...]] [-i|--integration]" >&2
@@ -39,12 +40,46 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 if [[ -d ".venv/bin" ]]; then
-    export PATH="$(pwd)/.venv/bin:$PATH"
+    VENV_BIN="$(pwd)/.venv/bin"
+    export PATH="${VENV_BIN}:$PATH"
+fi
+
+if [[ -x "${VENV_BIN}/python" ]]; then
     USE_VENV=1
-    VERIFY_PHASE_CMD=(python -m gza.tools.verify_phase)
+    VERIFY_PHASE_CMD=("${VENV_BIN}/python" -m gza.tools.verify_phase)
 else
     VERIFY_PHASE_CMD=(uv run python -m gza.tools.verify_phase)
 fi
+
+resolve_tool_cmd() {
+    local tool_name="$1"
+    shift
+    if [[ -n "$VENV_BIN" && -x "${VENV_BIN}/${tool_name}" ]]; then
+        printf '%s\0' "${VENV_BIN}/${tool_name}" "$@"
+        return
+    fi
+    printf '%s\0' uv run "$tool_name" "$@"
+}
+
+resolve_python_module_cmd() {
+    local module_name="$1"
+    shift
+    if [[ -n "$VENV_BIN" && -x "${VENV_BIN}/python" ]]; then
+        printf '%s\0' "${VENV_BIN}/python" -m "$module_name" "$@"
+        return
+    fi
+    printf '%s\0' uv run python -m "$module_name" "$@"
+}
+
+run_resolved_phase() {
+    local phase_name="$1"
+    shift
+    local -a command=()
+    while IFS= read -r -d '' entry; do
+        command+=("$entry")
+    done < <("$@")
+    run_phase "$phase_name" "${command[@]}"
+}
 
 run_phase() {
     local phase_name="$1"
@@ -60,19 +95,10 @@ if [[ "$QUICK_MODE" -eq 1 ]]; then
         exit 2
     fi
 
-    if [[ "$USE_VENV" -eq 1 ]]; then
-        run_phase ruff ruff check "${RUFF_TARGETS[@]}"
-        run_phase checks python -m checks
-    else
-        run_phase ruff uv run ruff check "${RUFF_TARGETS[@]}"
-        run_phase checks uv run python -m checks
-    fi
+    run_resolved_phase ruff resolve_tool_cmd ruff check "${RUFF_TARGETS[@]}"
+    run_resolved_phase checks resolve_python_module_cmd checks
     if [[ "${#TARGET_ARGS[@]}" -gt 0 ]]; then
-        if [[ "$USE_VENV" -eq 1 ]]; then
-            run_phase targeted_pytest pytest "${TARGET_ARGS[@]}" -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-        else
-            run_phase targeted_pytest uv run pytest "${TARGET_ARGS[@]}" -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-        fi
+        run_resolved_phase targeted_pytest resolve_tool_cmd pytest "${TARGET_ARGS[@]}" -x -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
     else
         echo "quick verify: no targeted pytest args supplied; skipping pytest phase"
     fi
@@ -83,28 +109,13 @@ if [[ "${#TARGET_ARGS[@]}" -gt 0 ]]; then
     usage
 fi
 
-if [[ "$USE_VENV" -eq 1 ]]; then
-    run_phase ruff ruff check "${RUFF_TARGETS[@]}"
-    run_phase ty ty check src/gza/
-    run_phase mypy mypy src/gza/
-    run_phase checks python -m checks
-else
-    run_phase ruff uv run ruff check "${RUFF_TARGETS[@]}"
-    run_phase ty uv run ty check src/gza/
-    run_phase mypy uv run mypy src/gza/
-    run_phase checks uv run python -m checks
-fi
+run_resolved_phase ruff resolve_tool_cmd ruff check "${RUFF_TARGETS[@]}"
+run_resolved_phase ty resolve_tool_cmd ty check src/gza/
+run_resolved_phase mypy resolve_tool_cmd mypy src/gza/
+run_resolved_phase checks resolve_python_module_cmd checks
 run_phase unit ./bin/test-unit --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-if [[ "$USE_VENV" -eq 1 ]]; then
-    run_phase functional python -m gza.test_functional_rerun --summary -- tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-else
-    run_phase functional uv run python -m gza.test_functional_rerun --summary -- tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
-fi
+run_resolved_phase functional resolve_python_module_cmd gza.test_functional_rerun --summary -- tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 
 if [[ "$RUN_INTEGRATION" -eq 1 ]]; then
-    if [[ "$USE_VENV" -eq 1 ]]; then
-        run_phase integration pytest tests_integration -xv
-    else
-        run_phase integration uv run pytest tests_integration -xv
-    fi
+    run_resolved_phase integration resolve_tool_cmd pytest tests_integration -xv
 fi

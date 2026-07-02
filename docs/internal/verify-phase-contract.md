@@ -56,5 +56,11 @@ gza-verify phase=failed name=functional duration_seconds=12.500000
 ## Consumer behavior
 
 - `src/gza/runner.py` parses only `phase=passed` and `phase=failed` result lines.
+- When a phase wrapper cannot spawn its command, `verify_phase` keeps the stdout result
+  line parseable and emits a stderr diagnostic of the form
+  `verify_phase: failed to launch command [...]`.
+- Main-verify consumers must treat that spawn diagnostic, and shell-style tool-launch
+  failures such as exit `126`/`127` with `command not found` or non-executable output,
+  as environment/configuration errors rather than real phase failures.
 - Timeout-resume guidance may reuse recorded successful phases only when the saved
   `tree_fingerprint` matches the exact tree state being resumed.

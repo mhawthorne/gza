@@ -52,6 +52,7 @@ from gza.cli.watch import (
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
     SCOPED_WATCH_COMPLETE_MESSAGE,
     WatchSlotAllocation,
+    _active_failure_backoff_owner_ids,
     _collect_advance_completed_tasks,
     _collect_completed_transition_ids,
     _collect_live_running_state,
@@ -67,17 +68,15 @@ from gza.cli.watch import (
     _format_elapsed,
     _format_sleep_message,
     _format_wake_message,
-    format_red_duration,
-    _active_failure_backoff_owner_ids,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
-    _MainVerifyRemediationIdentity,
     _main_verify_remediation_prompt,
+    _MainVerifyRemediationIdentity,
     _maybe_finalize_watch_no_progress_for_background_action,
     _maybe_park_watch_no_progress,
     _maybe_repair_target_already_merged_skip,
-    _OwnerFailureBackoffState,
     _maybe_skip_watch_no_progress_for_transient_terminal,
+    _OwnerFailureBackoffState,
     _query_owner_rows_with_context,
     _record_failure_backoff_updates,
     _resolve_watch_attention_display_task,
@@ -9371,7 +9370,7 @@ def test_watch_cycle_dirty_checkout_block_still_wins_for_exempt_remediation_merg
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch.check_main_integration_verify", return_value=_main_verify_red_check(main_verify_task)),
     ):
-        result = _run_cycle_and_emit_transition_events(
+        _run_cycle_and_emit_transition_events(
             config=config,
             store=store,
             batch=2,
@@ -10614,6 +10613,83 @@ def test_watch_cycle_post_merge_red_final_attempt_exhausts_main_verify_remediati
     log_text = log_path.read_text()
     assert "dropped remediation attempt 2/2" in log_text
     assert "automatic remediation exhausted after 2/2 attempts for functional on fp-new" in log_text
+
+
+def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezing_merges(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merge_task = _make_completed_watch_merge_task(
+        store,
+        "Completed normal merge task",
+        branch="feature/normal-merge",
+        tags=("202606-recovery",),
+    )
+    main_verify_task = _make_main_verify_internal_task(store)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    launch_issue_check = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=True,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message=(
+                "main verify misconfigured at `feedfacecafe` - could not launch `ruff` "
+                "for phase `ruff` (not on PATH); fix the environment, not the code"
+            ),
+            red_since=None,
+            head_sha="feedfacecafe",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=launch_issue_check),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    assert merge_calls == [merge_task.id]
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert remediation_tasks == []
+    log_text = log_path.read_text()
+    assert "ATTENTION" in log_text
+    assert "could not launch `ruff`" in log_text
+    assert "fix the environment, not the code" in log_text
 
 
 def test_watch_cycle_post_merge_green_clears_main_verify_remediation_active_state_without_consuming(

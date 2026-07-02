@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -30,11 +31,27 @@ MAIN_INTEGRATION_VERIFY_PROMPT = "System alert: local main integration verify"
 MAIN_INTEGRATION_VERIFY_REASON = "main-integration-verify-red"
 MAIN_INTEGRATION_VERIFY_TAG = "system-main-verify"
 MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS = "tree fingerprint unavailable"
+MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS = "launch failed"
 MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE = "watch-main-integration-verify-remediation"
 VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND = "verify_command_output"
 MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES = 32 * 1024
 MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES = 24
 MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS = 2000
+_VERIFY_PHASE_LAUNCH_FAILURE_RE = re.compile(
+    r"verify_phase: failed to launch command (?P<command>\[.+?\]): (?P<detail>.+)"
+)
+_COMMAND_NOT_FOUND_RE = re.compile(
+    r"(?m)^(?:(?:ba|z|da|k)?sh:\s*(?:(?:line )?\d+:\s*)?)?(?P<tool>[^:\s`]+): "
+    r"(?P<detail>command not found|No such file or directory|not found)$"
+)
+_COMMAND_NOT_EXECUTABLE_RE = re.compile(
+    r"(?m)^(?:(?:ba|z|da|k)?sh:\s*(?:(?:line )?\d+:\s*)?)?(?P<tool>[^:\s`]+): "
+    r"(?P<detail>Permission denied|cannot execute|Exec format error|not executable)$"
+)
+_FAILED_TO_SPAWN_RE = re.compile(r"Failed to spawn:\s*`(?P<tool>[^`]+)`(?::\s*(?P<detail>.+))?")
+_OSERROR_TOOL_RE = re.compile(
+    r"(?P<detail>No such file or directory|Permission denied|Exec format error):\s*['\"](?P<tool>[^'\"]+)['\"]"
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +84,7 @@ class MainIntegrationVerifyCheck:
     current_tree_fingerprint: str | None
     is_current: bool
     merges_halted: bool
+    needs_attention: bool = False
     remediation: MainIntegrationVerifyRemediation | None = None
     verify_runs: int = 0
 
@@ -196,6 +214,15 @@ class CandidateIntegrationVerifyCheck:
     merges_halted: bool
     remediation: MainIntegrationVerifyRemediation | None = None
     verify_runs: int = 0
+
+
+@dataclass(frozen=True)
+class VerifyLaunchIssue:
+    """Environment/config issue that blocked the verify tool from launching."""
+
+    phase_name: str | None
+    tool_name: str | None
+    detail: str
 
 
 IntegrationVerifyEvidence = MainIntegrationVerifyState | CandidateIntegrationVerifyEvidence
@@ -452,6 +479,135 @@ def _build_red_alert_message(
     return f"main verify RED at `{short_sha}` - merges halted"
 
 
+def _normalize_verify_tool_name(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    stripped = raw.strip().strip("'").strip('"')
+    if not stripped:
+        return None
+    return PurePath(stripped).name or stripped
+
+
+def _summarize_launch_issue_detail(detail: str) -> str:
+    lowered = detail.lower()
+    if (
+        "command not found" in lowered
+        or "no such file or directory" in lowered
+        or lowered.endswith("not found")
+    ):
+        return "not on PATH"
+    if (
+        "permission denied" in lowered
+        or "cannot execute" in lowered
+        or "exec format error" in lowered
+        or "not executable" in lowered
+    ):
+        return "not executable"
+    return detail.strip()
+
+
+def _extract_launch_issue_tool_from_command_repr(command_repr: str) -> str | None:
+    match = re.search(r"'([^']+)'", command_repr)
+    if match is None:
+        return None
+    return _normalize_verify_tool_name(match.group(1))
+
+
+def _extract_launch_issue_from_text(text: str) -> VerifyLaunchIssue | None:
+    for pattern in (_COMMAND_NOT_FOUND_RE, _COMMAND_NOT_EXECUTABLE_RE):
+        match = pattern.search(text)
+        if match is not None:
+            return VerifyLaunchIssue(
+                phase_name=None,
+                tool_name=_normalize_verify_tool_name(match.group("tool")),
+                detail=_summarize_launch_issue_detail(match.group("detail")),
+            )
+
+    spawn_match = _FAILED_TO_SPAWN_RE.search(text)
+    if spawn_match is not None:
+        detail = spawn_match.group("detail") or spawn_match.group(0)
+        return VerifyLaunchIssue(
+            phase_name=None,
+            tool_name=_normalize_verify_tool_name(spawn_match.group("tool")),
+            detail=_summarize_launch_issue_detail(detail),
+        )
+
+    oserror_match = _OSERROR_TOOL_RE.search(text)
+    if oserror_match is not None:
+        return VerifyLaunchIssue(
+            phase_name=None,
+            tool_name=_normalize_verify_tool_name(oserror_match.group("tool")),
+            detail=_summarize_launch_issue_detail(oserror_match.group("detail")),
+        )
+
+    return None
+
+
+def _detect_verify_launch_issue(
+    *,
+    verify_output: str | None,
+    verify_exit_status: str | None,
+    verify_failure: str | None,
+    failing_phase: str | None,
+) -> VerifyLaunchIssue | None:
+    output = verify_output or ""
+    for line in output.splitlines():
+        match = _VERIFY_PHASE_LAUNCH_FAILURE_RE.search(line)
+        if match is None:
+            continue
+        return VerifyLaunchIssue(
+            phase_name=failing_phase,
+            tool_name=_extract_launch_issue_tool_from_command_repr(match.group("command")),
+            detail=_summarize_launch_issue_detail(match.group("detail")),
+        )
+
+    if verify_exit_status in {"126", "127"}:
+        issue = _extract_launch_issue_from_text(output)
+        if issue is not None:
+            return replace(issue, phase_name=failing_phase)
+
+    if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS and verify_failure:
+        failure_detail = verify_failure.removeprefix("failed to launch verify_command: ").strip()
+        issue = _extract_launch_issue_from_text(failure_detail)
+        if issue is not None:
+            return replace(issue, phase_name=failing_phase)
+        return VerifyLaunchIssue(
+            phase_name=failing_phase,
+            tool_name=None,
+            detail=_summarize_launch_issue_detail(failure_detail),
+        )
+    return None
+
+
+def _build_launch_issue_failure(issue: VerifyLaunchIssue) -> str:
+    if issue.tool_name and issue.phase_name:
+        return (
+            f"verify_command environment error: could not launch `{issue.tool_name}` "
+            f"for phase `{issue.phase_name}` ({issue.detail})"
+        )
+    if issue.tool_name:
+        return f"verify_command environment error: could not launch `{issue.tool_name}` ({issue.detail})"
+    return f"verify_command environment error: could not launch verify tooling ({issue.detail})"
+
+
+def _build_launch_issue_alert_message(*, head_sha: str | None, issue: VerifyLaunchIssue) -> str:
+    short_sha = (head_sha or "unknown")[:12]
+    if issue.tool_name and issue.phase_name:
+        return (
+            f"main verify misconfigured at `{short_sha}` - could not launch `{issue.tool_name}` "
+            f"for phase `{issue.phase_name}` ({issue.detail}); fix the environment, not the code"
+        )
+    if issue.tool_name:
+        return (
+            f"main verify misconfigured at `{short_sha}` - could not launch `{issue.tool_name}` "
+            f"({issue.detail}); fix the environment, not the code"
+        )
+    return (
+        f"main verify misconfigured at `{short_sha}` - could not launch verify tooling "
+        f"({issue.detail}); fix the environment, not the code"
+    )
+
+
 def _build_freshness_unavailable_failure() -> str:
     return "could not prove exact local target tree freshness because the tree fingerprint is unavailable"
 
@@ -461,8 +617,33 @@ def _build_freshness_unavailable_alert_message(*, head_sha: str | None) -> str:
     return f"main verify freshness unproven at `{short_sha}` - merges halted; exact tree fingerprint unavailable"
 
 
-def _verify_result_is_red(*, status: str | None, gate_enabled: bool) -> bool:
-    return gate_enabled and status != "passed"
+def _verify_result_halts_merges(
+    *,
+    status: str | None,
+    gate_enabled: bool,
+    exit_status: str | None,
+) -> bool:
+    if not gate_enabled or status == "passed":
+        return False
+    if exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        return False
+    return True
+
+
+def _verify_result_needs_attention(
+    *,
+    status: str | None,
+    gate_enabled: bool,
+    exit_status: str | None,
+    alert_message: str | None,
+) -> bool:
+    if not gate_enabled or not alert_message:
+        return False
+    return _verify_result_halts_merges(
+        status=status,
+        gate_enabled=gate_enabled,
+        exit_status=exit_status,
+    ) or exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
 
 
 def _coerce_optional_str(value: object) -> str | None:
@@ -689,8 +870,14 @@ def _checkpoint_is_current(
 ) -> bool:
     if not _gate_identity_matches(state, current_gate):
         return False
+    if state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        return False
     if state.gate_enabled:
-        if _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
+        if _verify_result_halts_merges(
+            status=state.verify_status,
+            gate_enabled=state.gate_enabled,
+            exit_status=state.verify_exit_status,
+        ):
             captured_at = state.captured_at
             if captured_at is None:
                 return False
@@ -745,6 +932,25 @@ def run_main_integration_verify(
         )
 
     failing_phase = _verify_failure_phase_name(result.output)
+    launch_issue = _detect_verify_launch_issue(
+        verify_output=result.output,
+        verify_exit_status=result.exit_status,
+        verify_failure=result.failure,
+        failing_phase=failing_phase,
+    )
+    if launch_issue is not None:
+        result = _make_review_verify_result(
+            result.command,
+            status="unavailable",
+            exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            captured_at=result.captured_at,
+            reviewed_branch=result.reviewed_branch,
+            reviewed_head_sha=result.reviewed_head_sha,
+            reviewed_base_sha=result.reviewed_base_sha,
+            working_directory=result.working_directory,
+            failure=_build_launch_issue_failure(launch_issue),
+            output=result.output,
+        )
     tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
     capture_metadata: dict[str, str] = {"reason": reason}
     if gate_enabled and result.status == "passed" and tree_fingerprint is None:
@@ -761,6 +967,9 @@ def run_main_integration_verify(
         metadata=capture_metadata,
     )
     alert_message = (
+        _build_launch_issue_alert_message(head_sha=head_sha, issue=launch_issue)
+        if gate_enabled and launch_issue is not None
+        else
         _build_freshness_unavailable_alert_message(head_sha=head_sha)
         if gate_enabled
         and result.status == "unavailable"
@@ -770,13 +979,22 @@ def run_main_integration_verify(
             verify_status=result.status,
             failing_phase=failing_phase,
         )
-        if _verify_result_is_red(status=result.status, gate_enabled=gate_enabled)
+        if _verify_result_halts_merges(
+            status=result.status,
+            gate_enabled=gate_enabled,
+            exit_status=result.exit_status,
+        )
         else None
     )
-    if _verify_result_is_red(status=result.status, gate_enabled=gate_enabled):
-        if prior_state is not None and _verify_result_is_red(
+    if _verify_result_halts_merges(
+        status=result.status,
+        gate_enabled=gate_enabled,
+        exit_status=result.exit_status,
+    ):
+        if prior_state is not None and _verify_result_halts_merges(
             status=prior_state.verify_status,
             gate_enabled=prior_state.gate_enabled,
+            exit_status=prior_state.verify_exit_status,
         ):
             red_since = prior_state.red_since or result.captured_at
         else:
@@ -824,13 +1042,25 @@ def _run_integration_verify_with_red_reruns(
     reference_state = (
         prior_red_state
         if prior_red_state is not None
-        and _verify_result_is_red(status=prior_red_state.verify_status, gate_enabled=prior_red_state.gate_enabled)
+        and _verify_result_halts_merges(
+            status=prior_red_state.verify_status,
+            gate_enabled=prior_red_state.gate_enabled,
+            exit_status=prior_red_state.verify_exit_status,
+        )
         else state
     )
-    if not _verify_result_is_red(status=reference_state.verify_status, gate_enabled=reference_state.gate_enabled):
+    if not _verify_result_halts_merges(
+        status=reference_state.verify_status,
+        gate_enabled=reference_state.gate_enabled,
+        exit_status=reference_state.verify_exit_status,
+    ):
         return state, None, None, verify_runs
 
-    if not _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled):
+    if not _verify_result_halts_merges(
+        status=state.verify_status,
+        gate_enabled=state.gate_enabled,
+        exit_status=state.verify_exit_status,
+    ):
         return (
             state,
             _build_integration_verify_remediation(kind="deflake", state=reference_state),
@@ -842,7 +1072,11 @@ def _run_integration_verify_with_red_reruns(
     for attempt in range(1, red_reruns + 1):
         rerun_state = run_once(f"{reason}-rerun-{attempt}")
         verify_runs += 1
-        if not _verify_result_is_red(status=rerun_state.verify_status, gate_enabled=rerun_state.gate_enabled):
+        if not _verify_result_halts_merges(
+            status=rerun_state.verify_status,
+            gate_enabled=rerun_state.gate_enabled,
+            exit_status=rerun_state.verify_exit_status,
+        ):
             return (
                 rerun_state,
                 _build_integration_verify_remediation(kind="deflake", state=confirmed_red_state),
@@ -927,7 +1161,11 @@ def check_main_integration_verify(
     if checkpoint_is_current and not force and not (
         state is not None
         and red_reruns > 0
-        and _verify_result_is_red(status=state.verify_status, gate_enabled=state.gate_enabled)
+        and _verify_result_halts_merges(
+            status=state.verify_status,
+            gate_enabled=state.gate_enabled,
+            exit_status=state.verify_exit_status,
+        )
     ):
         assert state is not None
         return MainIntegrationVerifyCheck(
@@ -935,9 +1173,16 @@ def check_main_integration_verify(
             performed_verify=False,
             current_tree_fingerprint=current_tree_fingerprint,
             is_current=True,
-            merges_halted=_verify_result_is_red(
+            merges_halted=_verify_result_halts_merges(
                 status=state.verify_status,
                 gate_enabled=state.gate_enabled,
+                exit_status=state.verify_exit_status,
+            ),
+            needs_attention=_verify_result_needs_attention(
+                status=state.verify_status,
+                gate_enabled=state.gate_enabled,
+                exit_status=state.verify_exit_status,
+                alert_message=state.alert_message,
             ),
         )
 
@@ -955,9 +1200,16 @@ def check_main_integration_verify(
         performed_verify=True,
         current_tree_fingerprint=current_tree_fingerprint,
         is_current=True,
-        merges_halted=_verify_result_is_red(
+        merges_halted=_verify_result_halts_merges(
             status=refreshed.verify_status,
             gate_enabled=refreshed.gate_enabled,
+            exit_status=refreshed.verify_exit_status,
+        ),
+        needs_attention=_verify_result_needs_attention(
+            status=refreshed.verify_status,
+            gate_enabled=refreshed.gate_enabled,
+            exit_status=refreshed.verify_exit_status,
+            alert_message=refreshed.alert_message,
         ),
         remediation=remediation,
         verify_runs=verify_runs,
@@ -1005,6 +1257,25 @@ def run_candidate_integration_verify(
         )
 
     failing_phase = _verify_failure_phase_name(result.output)
+    launch_issue = _detect_verify_launch_issue(
+        verify_output=result.output,
+        verify_exit_status=result.exit_status,
+        verify_failure=result.failure,
+        failing_phase=failing_phase,
+    )
+    if launch_issue is not None:
+        result = _make_review_verify_result(
+            result.command,
+            status="unavailable",
+            exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            captured_at=result.captured_at,
+            reviewed_branch=result.reviewed_branch,
+            reviewed_head_sha=result.reviewed_head_sha,
+            reviewed_base_sha=result.reviewed_base_sha,
+            working_directory=result.working_directory,
+            failure=_build_launch_issue_failure(launch_issue),
+            output=result.output,
+        )
     tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
     if gate_enabled and result.status == "passed" and tree_fingerprint is None:
         result = _coerce_result_to_freshness_unavailable(result)
@@ -1035,7 +1306,11 @@ def _classify_candidate_integration_verify(
         return "unavailable"
     if remediation is not None and remediation.kind == "deflake":
         return "flake"
-    if _verify_result_is_red(status=evidence.verify_status, gate_enabled=evidence.gate_enabled):
+    if _verify_result_halts_merges(
+        status=evidence.verify_status,
+        gate_enabled=evidence.gate_enabled,
+        exit_status=evidence.verify_exit_status,
+    ):
         if remediation is not None and remediation.kind == "fix":
             return "deterministic_red"
         return "red"
@@ -1066,7 +1341,11 @@ def check_candidate_integration_verify(
     return CandidateIntegrationVerifyCheck(
         evidence=evidence,
         classification=classification,
-        merges_halted=evidence.gate_enabled and classification in {"red", "deterministic_red", "unavailable"},
+        merges_halted=_verify_result_halts_merges(
+            status=evidence.verify_status,
+            gate_enabled=evidence.gate_enabled,
+            exit_status=evidence.verify_exit_status,
+        ),
         remediation=remediation,
         verify_runs=verify_runs,
     )
@@ -1081,9 +1360,10 @@ def current_main_integration_verify_alert(
 ) -> MainIntegrationVerifyState | None:
     """Return the current red-main alert when it still matches the live local tree."""
     state = load_main_integration_verify_state(store)
-    if state is None or not _verify_result_is_red(
+    if state is None or not _verify_result_halts_merges(
         status=state.verify_status,
         gate_enabled=state.gate_enabled,
+        exit_status=state.verify_exit_status,
     ):
         return None
     if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):

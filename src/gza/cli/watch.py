@@ -4936,6 +4936,8 @@ def _run_cycle(
             remediation = getattr(main_verify, "remediation", None)
             if remediation is not None and remediation.kind == "fix":
                 active_main_verify_remediation = remediation
+        elif getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+            _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
@@ -5170,6 +5172,8 @@ def _run_cycle(
                     else:
                         merge_halted_for_cycle = False
                         active_main_verify_remediation = None
+                        if getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+                            _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
                 for followup_task in merge_result.created_followups:
                     log.emit(
                         "FOLLOW",
@@ -7234,6 +7238,9 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
     if check.merges_halted:
         print(check.state.alert_message or f"main verify {status}{phase}; merges halted")
         return 1
+    if check.state.alert_message:
+        print(check.state.alert_message)
+        return 0
     print(
         f"main verify {status}{phase}; merges allowed"
         if check.performed_verify

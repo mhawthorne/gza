@@ -13,6 +13,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
     MainIntegrationVerifyEnvironmentIdentity,
     _build_main_integration_verify_remediation,
     check_candidate_integration_verify,
@@ -996,6 +997,212 @@ def test_check_candidate_integration_verify_treats_missing_fingerprint_as_unavai
     assert check.evidence.failure == (
         "could not prove exact local target tree freshness because the tree fingerprint is unavailable"
     )
+
+
+def test_check_main_integration_verify_classifies_tool_launch_failure_as_attention_without_red_or_remediation(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    launch_failure = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="127",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output=(
+            "gza-verify phase=start name=ruff\n"
+            "verify_phase: failed to launch command ['ruff', 'check', 'src/gza/']: "
+            "[Errno 2] No such file or directory: 'ruff'\n"
+            "gza-verify phase=failed name=ruff duration_seconds=0.25"
+        ),
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=launch_failure) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.verify_runs == 1
+    assert check.merges_halted is False
+    assert check.needs_attention is True
+    assert check.remediation is None
+    assert check.state.verify_status == "unavailable"
+    assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    assert check.state.failing_phase == "ruff"
+    assert check.state.alert_message is not None
+    assert "could not launch `ruff`" in check.state.alert_message
+    assert "fix the environment, not the code" in check.state.alert_message
+
+    alert_git = MagicMock()
+    alert_git.default_branch.return_value = "main"
+    alert_git.current_branch.return_value = "topic"
+    alert_git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+    assert current_main_integration_verify_alert(store, alert_git, config) is None
+
+
+def test_check_main_integration_verify_extracts_tool_name_from_top_level_launch_failed_oserror(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    launch_failure = _make_review_verify_result(
+        "./bin/tests",
+        status="unavailable",
+        exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        captured_at=datetime(2026, 7, 2, 12, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="failed to launch verify_command: [Errno 2] No such file or directory: 'ruff'",
+        output="failed to launch verify_command: [Errno 2] No such file or directory: 'ruff'",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=launch_failure) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    run_verify.assert_called_once()
+    assert check.merges_halted is False
+    assert check.needs_attention is True
+    assert check.remediation is None
+    assert check.state.verify_status == "unavailable"
+    assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    assert check.state.alert_message is not None
+    assert "could not launch `ruff`" in check.state.alert_message
+    assert "fix the environment, not the code" in check.state.alert_message
+
+
+def test_check_main_integration_verify_classifies_shell_not_found_phase_failure_as_attention(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    launch_failure = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="127",
+        captured_at=datetime(2026, 7, 2, 12, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output=(
+            "gza-verify phase=start name=ruff\n"
+            "sh: 1: ruff: not found\n"
+            "gza-verify phase=failed name=ruff duration_seconds=0.25"
+        ),
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=launch_failure) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    run_verify.assert_called_once()
+    assert check.merges_halted is False
+    assert check.needs_attention is True
+    assert check.remediation is None
+    assert check.state.verify_status == "unavailable"
+    assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    assert check.state.failing_phase == "ruff"
+    assert check.state.alert_message is not None
+    assert "could not launch `ruff`" in check.state.alert_message
+    assert "fix the environment, not the code" in check.state.alert_message
 
 
 def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint_is_unavailable(tmp_path) -> None:
