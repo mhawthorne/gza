@@ -22,7 +22,8 @@ Run it with uv (deps are declared inline above)::
     uv run scripts/watch_log_graph.py --start 2026-06-28   # only cycles on/after a date
     uv run scripts/watch_log_graph.py --resolution day --aggregate p90   # daily p90 rollup
     uv run scripts/watch_log_graph.py --resolution hour --agg max        # hourly peaks
-    uv run scripts/watch_log_graph.py --start 2026-07-01 --merges         # mark each merge
+    uv run scripts/watch_log_graph.py --start 2026-07-01     # merges are marked by default
+    uv run scripts/watch_log_graph.py --no-merges            # hide merge dots
     uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
@@ -496,9 +497,9 @@ def main(argv=None):
     ap.add_argument("--table-rows", type=int, default=40,
                     help="max rows in the printed table, evenly sampled (0 = all)")
     ap.add_argument("--no-png", action="store_true", help="skip PNG, table only")
-    ap.add_argument("--merges", action="store_true",
+    ap.add_argument("--merges", action=argparse.BooleanOptionalAction, default=True,
                     help="mark each merge on the graph as a task-id-labeled dot "
-                         "(best combined with --start to stay legible)")
+                         "(default: on; use --no-merges to hide, --start to declutter)")
     ap.add_argument("--watch", nargs="?", type=int, const=60, default=None, metavar="N",
                     help="live mode: refresh table + PNG every N seconds (default 60). "
                          "Table shows the most recent --table-rows cycles.")
