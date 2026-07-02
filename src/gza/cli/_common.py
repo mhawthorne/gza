@@ -3882,7 +3882,7 @@ def _create_retry_task(
         retry_same_branch = False
         retry_base_branch = original_task.branch
     elif original_task.task_type == "rebase":
-        retry_base_branch = resolve_rebase_base_branch(original_task)
+        retry_base_branch = resolve_rebase_base_branch(store, original_task)
 
     retry_task = store.add(
         prompt=original_task.prompt,

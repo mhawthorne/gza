@@ -8679,7 +8679,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
     task.failure_reason = None
     task.completion_reason = None
     if task.task_type == "rebase" and task.branch and task.has_commits:
-        target_branch: str | None = resolve_rebase_base_branch(task)
+        target_branch: str | None = resolve_rebase_base_branch(store, task)
         if target_branch is None:
             print(
                 f"Error: Rebase task {task.id} is missing its persisted local target branch; "
@@ -8857,7 +8857,7 @@ def _run_inner(
 
     rebase_execution_target: str | None = None
     if task.task_type == "rebase":
-        rebase_execution_target = resolve_rebase_base_branch(task)
+        rebase_execution_target = resolve_rebase_base_branch(store, task)
         if rebase_execution_target is None:
             message = (
                 f"Rebase task {task.id} is missing its persisted local target branch. "

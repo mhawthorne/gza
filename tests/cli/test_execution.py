@@ -1721,6 +1721,80 @@ class TestRetryCommand:
         assert retry_task.branch == impl.branch
         assert retry_task.recovery_origin == "retry"
 
+    def test_create_retry_task_manual_rebase_retry_derives_missing_base_branch_from_merge_unit(self, tmp_path: Path):
+        """Legacy rebase retries should re-derive and persist the canonical local target."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "trunk"
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=True, branch="feature/impl")
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+        assert impl_unit.target_branch == "trunk"
+
+        failed_rebase = store.add(
+            "Legacy rebase impl branch",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.branch = "feature/impl"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        retry_task = _create_retry_task(store, failed_rebase, trigger_source="manual")
+        assert retry_task.base_branch == "trunk"
+        assert retry_task.branch == "feature/impl"
+        assert retry_task.same_branch is True
+
+        refreshed_failed_rebase = store.get(failed_rebase.id)
+        assert refreshed_failed_rebase is not None
+        assert refreshed_failed_rebase.base_branch == "trunk"
+
+    def test_create_retry_task_manual_rebase_retry_keeps_missing_base_branch_without_merge_unit(
+        self,
+        tmp_path: Path,
+    ):
+        """Legacy rebase retries fail closed when no durable merge target exists."""
+        from gza.cli._common import _create_retry_task
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "trunk"
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/impl"
+        store.update(impl)
+        assert store.resolve_merge_unit_for_task(impl.id) is None
+
+        failed_rebase = store.add(
+            "Legacy rebase impl branch",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.branch = "feature/impl"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        retry_task = _create_retry_task(store, failed_rebase, trigger_source="manual")
+        assert retry_task.base_branch is None
+        assert retry_task.branch == "feature/impl"
+        assert retry_task.same_branch is True
+
+        refreshed_failed_rebase = store.get(failed_rebase.id)
+        assert refreshed_failed_rebase is not None
+        assert refreshed_failed_rebase.base_branch is None
+
     def test_create_retry_task_manual_rebase_retry_chain_prefers_impl_merge_unit(self, tmp_path: Path):
         """Manual rebase retry chains should attach to the implementation merge unit."""
         from gza.cli._common import _create_retry_task

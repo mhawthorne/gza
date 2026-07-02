@@ -16796,10 +16796,9 @@ class TestExtractedRunInnerHelpers:
             recovered=True,
         )
 
-    def test_run_inner_parks_legacy_rebase_without_persisted_target(
+    def test_run_inner_backfills_legacy_rebase_target_from_merge_unit(
         self,
         tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
@@ -16809,6 +16808,7 @@ class TestExtractedRunInnerHelpers:
         )
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
+        store._default_merge_target_cache = "trunk"
 
         parent = store.add(prompt="Implement parent", task_type="implement")
         assert parent.id is not None
@@ -16816,6 +16816,9 @@ class TestExtractedRunInnerHelpers:
         parent.branch = "feature/rebase-parent"
         store.mark_in_progress(parent)
         store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+        parent_unit = store.resolve_merge_unit_for_task(parent.id)
+        assert parent_unit is not None
+        assert parent_unit.target_branch == "trunk"
 
         task = store.add(
             prompt="Legacy rebase parent branch",
@@ -16829,11 +16832,81 @@ class TestExtractedRunInnerHelpers:
 
         mock_provider = Mock()
         mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.repo_dir = config.worktree_path / task.slug
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.status_porcelain.return_value = set()
+
+        def capture_baseline(_git: Git, *, branch: str, target: str, recovered: bool = False) -> RebaseDiffBaseline:
+            assert branch == parent.branch
+            assert target == "trunk"
+            assert recovered is False
+            return RebaseDiffBaseline(
+                old_tip="old-tip",
+                target_at_start="start-target",
+                merge_base_at_start="merge-base",
+            )
+
+        with (
+            patch("gza.runner.Git", return_value=mock_worktree_git),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", return_value=True),
+            patch("gza.runner._restore_wip_changes"),
+            patch("gza.skills_utils.ensure_all_skills", return_value=0),
+            patch("gza.runner._snapshot_task_db_to_worktree"),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner.capture_rebase_diff_baseline", side_effect=capture_baseline),
+            patch("gza.runner._complete_code_task", return_value=0) as mock_complete,
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.base_branch == "trunk"
+        assert refreshed.branch == parent.branch
+        assert mock_complete.call_args.kwargs["target_branch"] == "trunk"
+
+    def test_run_inner_parks_legacy_rebase_without_any_durable_target(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: false\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        task = store.add(
+            prompt="Legacy orphan rebase parent branch",
+            task_type="rebase",
+            same_branch=True,
+        )
+        assert task.id is not None
+        task.slug = "20260512-legacy-orphan-rebase"
+        task.branch = "feature/rebase-parent"
+        store.update(task)
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
         mock_main_git = Mock(spec=Git)
         mock_main_git.default_branch.return_value = "main"
 
         with (
-            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._resolve_code_task_branch_name", return_value=task.branch),
             patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("worktree setup should not run")),
             patch("gza.runner.isolated_rebase_checkout", side_effect=AssertionError("isolated checkout should not run")),
         ):
@@ -16848,7 +16921,7 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "GIT_ERROR"
-        assert refreshed.branch == parent.branch
+        assert refreshed.branch == task.branch
 
     def test_run_inner_uses_private_checkout_for_docker_rebase_and_completes_on_canonical_git(
         self,

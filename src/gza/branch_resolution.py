@@ -47,14 +47,66 @@ def resolve_rebase_target_branch(store: SqliteTaskStore, task: DbTask) -> str | 
     return target_task.branch if target_task is not None else None
 
 
-def resolve_rebase_base_branch(task: DbTask) -> str | None:
-    """Return the persisted local target branch for a rebase task.
+def _persist_rebase_base_branch(store: SqliteTaskStore, task: DbTask, target: str) -> str:
+    normalized_target = target.strip()
+    if not normalized_target:
+        return normalized_target
+    if task.base_branch == normalized_target or task.id is None:
+        return normalized_target
+    task.base_branch = normalized_target
+    store.update(task)
+    return normalized_target
 
-    Rebase execution must use the target chosen when the task was created. A
-    missing value means the row predates durable target persistence, so callers
-    should fail closed instead of substituting the repository default branch.
+
+def _resolve_rebase_merge_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    current: DbTask | None = task
+    visited_ids: set[str] = set()
+
+    while current is not None:
+        if current.id is not None:
+            if current.id in visited_ids:
+                return None
+            visited_ids.add(current.id)
+        if current.task_type != "rebase":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+
+    return None
+
+
+def resolve_rebase_base_branch(store: SqliteTaskStore, task: DbTask) -> str | None:
+    """Return the local target branch for a rebase task.
+
+    Newer rebase rows persist the chosen local target branch at creation time.
+    Legacy rows can lack that value; for those, re-derive the canonical local
+    target from durable merge-unit metadata for the owning work unit and persist
+    the result so future reads stay on the normal fast path.
     """
     if task.task_type != "rebase":
         return None
-    target = (task.base_branch or "").strip()
-    return target or None
+
+    persisted_target = (task.base_branch or "").strip()
+    if persisted_target:
+        return persisted_target
+
+    merge_target_task = _resolve_rebase_merge_target_task(store, task)
+    candidate_tasks: tuple[DbTask, ...] = tuple(
+        candidate
+        for candidate in (
+            merge_target_task,
+            resolve_rebase_target_task(store, task),
+        )
+        if candidate is not None
+    )
+    for candidate in candidate_tasks:
+        if candidate.id is None:
+            continue
+        merge_unit = store.resolve_merge_unit_for_task(candidate.id)
+        if merge_unit is None:
+            continue
+        target = (merge_unit.target_branch or "").strip()
+        if target:
+            return _persist_rebase_base_branch(store, task, target)
+    return None
