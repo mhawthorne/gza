@@ -228,10 +228,12 @@ def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_la
         ax.plot(xs, ys, label=label, linewidth=1.2)
 
     unit = _UNIT.get(resolution, "cycles")
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ax.set_ylabel("task count")
     ax.set_xlabel("time")
     ax.set_title(
-        f"gza watch queue depth — {log_path}  ({len(points)} {unit}{agg_label})"
+        f"gza watch queue depth — {log_path}\n"
+        f"{len(points)} {unit}{agg_label} · generated {generated}"
     )
     ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
