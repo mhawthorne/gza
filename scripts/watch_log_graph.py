@@ -222,12 +222,15 @@ def make_figure():
 def _draw_merges(ax, merges):
     """Mark merges: exact-time dots on the baseline + one per-hour box of task ids.
 
-    Grouping by hour collapses tight within-hour clusters (which overlap badly as
-    individual rotated labels) into a single readable box placed mid-plot, in the
-    empty band between the low ``running`` line and the higher queue-depth lines.
+    Grouping by hour collapses tight within-hour clusters into a single box. Boxes
+    are then lane-packed: each is assigned the lowest vertical lane whose previous
+    box ends (in pixels) before this one starts, so no two boxes overlap either
+    horizontally (same lane) or vertically (lanes are spaced by a box height).
     """
     if not merges:
         return
+    import matplotlib.dates as mdates
+
     xs = [when for when, _ in merges]
     ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
                zorder=6, label=f"merge ({len(merges)})")
@@ -235,21 +238,46 @@ def _draw_merges(ax, merges):
     groups = {}  # hour bucket -> [task_id, ...] in time order
     for when, tid in merges:
         groups.setdefault(when.replace(minute=0, second=0, microsecond=0), []).append(tid)
+    ordered = sorted(groups.items())
 
+    # Pixel geometry for width/height estimates (approximate; conservative is fine).
+    fig = ax.figure
+    fontsize = 9
+    x0, x1 = ax.get_xlim()
     ymin, ymax = ax.get_ylim()
-    span = ymax - ymin
-    mid = ymin + span * 0.5
-    # Zigzag consecutive boxes between two heights so adjacent-hour boxes don't
-    # collide horizontally (they land in the empty band between the lines).
-    levels = [mid - span * 0.12, mid + span * 0.12]
-    for i, hour in enumerate(sorted(groups)):
-        ids = groups[hour]
+    pos = ax.get_position()
+    px_per_datex = (pos.width * fig.get_figwidth() * fig.dpi) / (x1 - x0)
+    datey_per_px = (ymax - ymin) / (pos.height * fig.get_figheight() * fig.dpi)
+    char_px = fontsize * 0.62 * fig.dpi / 72.0
+    line_px = fontsize * 1.5 * fig.dpi / 72.0
+
+    # Lane-pack in display-x: first lane whose last box ends before this one starts.
+    lane_right = []          # last right-edge (px) per lane
+    placed = []              # (center_dt, ids, lane)
+    for hour, ids in ordered:
         center = hour + timedelta(minutes=30)
-        y = levels[i % 2]
+        cx = (mdates.date2num(center) - x0) * px_per_datex
+        half = (max(len(t) for t in ids) * char_px + 12) / 2
+        left, right = cx - half, cx + half
+        lane = next((i for i, r in enumerate(lane_right) if left >= r + 6), None)
+        if lane is None:
+            lane = len(lane_right)
+            lane_right.append(right)
+        else:
+            lane_right[lane] = right
+        placed.append((center, ids, lane))
+
+    # Vertical: stack lanes around mid, spaced by the tallest box's height.
+    max_lines = max(len(ids) for _, ids in ordered)
+    step_y = (max_lines * line_px + 10) * datey_per_px * 1.15
+    mid = (ymin + ymax) / 2
+    n = len(lane_right)
+    for center, ids, lane in placed:
+        y = mid + (lane - (n - 1) / 2) * step_y
         ax.plot([center, center], [0, y], color="0.8", linewidth=0.6, alpha=0.6, zorder=0)
         ax.annotate(
             "\n".join(ids), (center, y), ha="center", va="center",
-            fontsize=9, color="tab:purple", zorder=7,
+            fontsize=fontsize, color="tab:purple", zorder=7,
             bbox=dict(boxstyle="round", fc="white", ec="tab:purple", alpha=0.9),
         )
 
