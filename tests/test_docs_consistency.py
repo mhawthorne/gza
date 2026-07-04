@@ -163,7 +163,7 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "### MV5 — Red merge freezes MUST NOT hard-park downstream work" in contract
     assert "### MV6 — Operators MUST have a force-refresh escape hatch" in contract
     assert "A merge stall MUST NOT convert into a launch stall." in contract
-    assert "The shared no-progress backstop MUST count only actually executed unchanged actions." in contract
+    assert "both executed no-op repeats and undispatched selected repeats count" in contract
     assert "Remediation task dedup is by failure identity" in contract
     assert "the normalized failure signature only" in contract
     assert "different, newly available, stale, or unavailable fingerprint MUST reuse" in contract_flat

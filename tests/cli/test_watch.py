@@ -2765,6 +2765,55 @@ def test_watch_cycle_dry_run_recovery_mode_reports_actions_without_mutation(tmp_
     assert len(store.get_based_on_children(failed.id)) == 0
 
 
+def test_watch_cycle_dry_run_capacity_blocked_lifecycle_does_not_persist_no_progress(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/dry-run-capacity-preview"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+    ):
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=0,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id)) == []
+    log_text = log_path.read_text()
+    assert f"{impl.id}: no watch worker slots available for create_review" in log_text
+    assert "watch-no-progress-backstop" not in log_text
+
+
 def test_watch_cycle_recovery_startup_failure_rolls_back_child_and_skips_success_log(tmp_path: Path) -> None:
     """Restart-failed startup failures should not leave recovery children or RECOVR success output behind."""
     setup_config(tmp_path)
@@ -13956,6 +14005,53 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
         assert any(f"(new) implement for {root.id} [dry-run]" in line for line in log_lines)
 
 
+def test_watch_cycle_dry_run_capacity_blocked_recovery_does_not_persist_no_progress(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-dry-run-capacity"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+    ):
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=store,
+            batch=0,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=Config.load(tmp_path).max_resume_attempts,
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=0,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            restart_failed=True,
+            max_recovery_attempts=Config.load(tmp_path).max_resume_attempts,
+        )
+
+    assert store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(failed.id)) == []
+    assert store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON) == []
+    assert "watch-no-progress-backstop" not in log_path.read_text()
+
+
 def test_watch_dry_run_command_does_not_reconcile_or_prune_dead_in_progress_task(tmp_path: Path) -> None:
     """watch --dry-run must not mutate dead in-progress tasks or worker registry rows."""
     setup_config(tmp_path)
@@ -15208,7 +15304,7 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
     )
 
 
-def test_watch_cycle_undispatched_create_review_falls_through_without_no_progress_tick(tmp_path: Path) -> None:
+def test_watch_cycle_undispatched_create_review_counts_toward_no_progress_backstop(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -15221,22 +15317,15 @@ def test_watch_cycle_undispatched_create_review_falls_through_without_no_progres
     store.update(impl)
     store.set_merge_status(impl.id, "unmerged")
 
-    pending = store.add("Pending work", task_type="implement")
-    assert pending.id is not None
-
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
 
     def wait_for_start(*, task_id: str, **_kwargs: object) -> tuple[bool, str, object | None]:
-        if task_id == impl.id:
-            return False, f"task {task_id} remains completed with no live worker", store.get(task_id)
-        if task_id == pending.id:
-            return True, f"task {task_id} reached running state", store.get(task_id)
-        raise AssertionError(f"unexpected task id {task_id}")
+        assert task_id == impl.id
+        return False, f"task {task_id} remains completed with no live worker", store.get(task_id)
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -15248,23 +15337,123 @@ def test_watch_cycle_undispatched_create_review_falls_through_without_no_progres
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=wait_for_start),
     ):
-        result = _run_cycle(
+        _run_cycle(
             config=config,
             store=store,
-            batch=2,
+            batch=1,
             max_iterations=10,
             dry_run=False,
-            log=log,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
         )
 
-    assert result.work_done is True
     assert spawn_iterate.call_count == 2
-    observations = store.list_watch_progress_observations(subject_kind="lineage", subject_id=str(impl.id))
-    assert observations == []
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=store.get(impl.id) or impl,
+        action={"type": "create_review"},
+        action_task=store.get(impl.id) or impl,
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+    assert len(observations) == 1
+    assert observations[0].streak == 2
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
     text = log_path.read_text()
     assert f"{impl.id} create_review: dispatch did not reach running" in text
-    assert any("START" in line and f"{pending.id} implement" in line for line in text.splitlines())
-    assert "watch-no-progress-backstop" not in text
+    assert "manual intervention required" in text
+
+
+def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progress_streak(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-selected-skip"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+
+    routing_skip = AdvanceActionExecutionResult(
+        action_type="create_review",
+        status="skip",
+        message="iterate routing requires implementation status completed or pending (found failed)",
+        worker_consuming=True,
+        attempted_spawn=False,
+        worker_started=False,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._shared_lifecycle_actions.should_execute_lifecycle_action", return_value=False),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch("gza.cli.watch._shared_lifecycle_actions.should_execute_lifecycle_action", return_value=True),
+        patch("gza.cli.watch.execute_advance_action", return_value=routing_skip),
+    ):
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=store.get(impl.id) or impl,
+        action={"type": "create_review"},
+        action_task=store.get(impl.id) or impl,
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+    assert len(observations) == 1
+    assert observations[0].streak == 2
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    text = log_path.read_text()
+    assert f"{impl.id}: no watch worker slots available for create_review" in text
+    assert "iterate routing requires implementation status completed or pending (found failed)" not in text
+    assert "watch selected the same create review action without durable progress for 2 cycles" in text
 
 
 def test_watch_cycle_create_review_quick_terminal_iterate_counts_as_executed_work(tmp_path: Path) -> None:

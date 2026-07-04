@@ -437,6 +437,20 @@ def observe_watch_progress_and_maybe_park(
     )
 
 
+def observe_selected_watch_action_without_dispatch(
+    store: SqliteTaskStore,
+    *,
+    candidate: WatchProgressCandidate,
+    no_progress_cycles: int,
+) -> dict[str, Any] | None:
+    """Count a re-selected watch action that stayed undispatched and left evidence unchanged."""
+    return observe_watch_progress_and_maybe_park(
+        store,
+        candidate=candidate,
+        no_progress_cycles=no_progress_cycles,
+    )
+
+
 def finalize_watch_progress_after_execution(
     store: SqliteTaskStore,
     *,

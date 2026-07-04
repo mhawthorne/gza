@@ -397,12 +397,12 @@ When the installed `gza` package fingerprint changes while watch is running:
 - The persisted observation MUST include enough evidence to distinguish durable progress
   from a true no-op repeat: merge-unit identity/state/head, selected action type/reason,
   action task ID, relevant failed/recovery task ID, and current task status.
-- Watch MUST increment the no-progress streak only after it actually **executes** the
-  selected action and the resulting post-execution evidence is unchanged for the same
-  subject/action. Merely evaluating a candidate, failing to reserve capacity, being denied
-  launch, skipping the action, or finding an already-running/in-flight child MUST NOT
-  increment the streak. Restarting watch MUST NOT reset a streak created by actual executed
-  no-progress outcomes.
+- Watch MUST increment the no-progress streak when watch re-selects the same
+  subject/action and the subject evidence remains unchanged across cycles, including both:
+  actually **executed** no-op repeats and selected actions that never dispatch in that
+  cycle. Merely evaluating a candidate before selection, remaining on a blocked merge lane,
+  or switching to a different selected action/reason MUST NOT increment the streak.
+  Restarting watch MUST NOT reset a streak created by those unchanged repeats.
 - After selecting a worker-consuming action, watch MUST wait only a small bounded
   `watch.slot_settle_seconds` window for the chosen task to prove execution. A live
   running state counts, and a live registered worker counts, including the legitimate
@@ -410,9 +410,9 @@ When the installed `gza` package fingerprint changes while watch is running:
   observable terminal outcome inside that same bounded window also counts as executed
   work rather than an undispatched launch no-show. Only when neither live-running proof
   nor an observable post-launch terminal outcome appears in the window may watch log the
-  action as undispatched, skip no-progress accounting for that attempted launch, and
-  continue scanning the same cycle for another runnable candidate instead of leaving the
-  slot idle.
+  action as undispatched, count that unchanged selected action toward the same
+  subject/action no-progress streak, and continue scanning the same cycle for another
+  runnable candidate instead of leaving the slot idle.
 - When the latest relevant failed recovery or improve attempt for that selected
   subject/action is a **transient terminal** (for example provider-capacity,
   infrastructure/setup failure before durable work such as `WORKSPACE_NOT_POPULATED`,
@@ -441,6 +441,8 @@ When the installed `gza` package fingerprint changes while watch is running:
   completion, a branch-head change, a merge-unit state change, or a different selected
   action/reason. Merely launching a worker for the same task in the same state MUST NOT reset
   it.
+- Alternating skip reasons for the same selected subject/action (for example capacity-block
+  one cycle and routing-skip the next) MUST NOT reset the streak by themselves.
 - Re-invoking the **same command on the same task is permitted when the task's state has
   changed** since the prior cycle — e.g. a prior `iterate` worker was killed, leaving the
   task reclaimable, so the next cycle legitimately re-invokes `iterate` (possibly with resume

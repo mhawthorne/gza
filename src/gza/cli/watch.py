@@ -127,6 +127,7 @@ from ..watch_progress import (
     finalize_background_watch_execution,
     finalize_watch_progress_after_execution,
     get_active_watch_no_progress_attention,
+    observe_selected_watch_action_without_dispatch,
     reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
 )
@@ -1507,6 +1508,35 @@ def _finalize_watch_no_progress_after_execution(
         store,
         before=previous_candidate,
         after=refreshed_candidate,
+        no_progress_cycles=no_progress_cycles,
+    )
+
+
+def _observe_selected_watch_no_progress_without_dispatch(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task: DbTask | None,
+    failed_task: DbTask | None,
+    no_progress_cycles: int,
+    persist: bool = True,
+) -> dict[str, Any] | None:
+    """Count a re-selected watch action that did not dispatch and made no durable progress."""
+    if not persist:
+        return None
+    if subject_task.id is None:
+        return None
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+        failed_task=failed_task,
+    )
+    return observe_selected_watch_action_without_dispatch(
+        store,
+        candidate=candidate,
         no_progress_cycles=no_progress_cycles,
     )
 
@@ -5033,6 +5063,21 @@ def _run_cycle(
                 free_worker_slots=_free_worker_start_slots(),
             ):
                 _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
+                no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                    store=store,
+                    subject_task=display_task,
+                    action=action,
+                    action_task=task,
+                    failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                    persist=not dry_run,
+                )
+                if no_progress_attention is not None:
+                    log.emit_attention(
+                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(display_task, no_progress_attention),
+                    )
+                    continue
                 log.emit(
                     "SKIP",
                     f"{display_task.id}: no watch worker slots available for {action_type}",
@@ -5431,6 +5476,20 @@ def _run_cycle(
                         message=_watch_needs_attention_message(display_task, attention.action),
                     )
                     continue
+                no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                    store=store,
+                    subject_task=display_task,
+                    action=action,
+                    action_task=task,
+                    failed_task=None,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                )
+                if no_progress_attention is not None and display_task.id is not None:
+                    log.emit_attention(
+                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(display_task, no_progress_attention),
+                    )
+                    continue
                 log.emit(
                     "SKIP",
                     message,
@@ -5540,6 +5599,19 @@ def _run_cycle(
                     dedupe_key=f"advance-undispatched:{action_type}:{display_task.id}:{child_id}",
                 )
                 if not started:
+                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                        store=store,
+                        subject_task=display_task,
+                        action=action,
+                        action_task=task,
+                        failed_task=None,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(display_task, no_progress_attention),
+                        )
                     continue
                 if exec_result.worker_label == "iterate":
                     log.emit("START", f"{child_id} iterate")
@@ -5807,6 +5879,22 @@ def _run_cycle(
                 continue
         if worker_consuming_recovery and (_free_worker_start_slots() <= 0 or reserved_recovery_slots <= 0):
             _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+            no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                store=store,
+                subject_task=failed,
+                action=recovery_action,
+                action_task=action_task,
+                failed_task=failed,
+                no_progress_cycles=config.watch.no_progress_cycles,
+                persist=not dry_run,
+            )
+            if no_progress_attention is not None:
+                parked_recovery_subject_ids.add(str(failed.id))
+                nonparked_recovery_subject_ids.discard(str(failed.id))
+                log.emit_attention(
+                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                    message=_watch_needs_attention_message(failed, no_progress_attention),
+                )
             continue
         if not dry_run:
             no_progress_attention = _maybe_park_watch_no_progress(
@@ -5859,6 +5947,20 @@ def _run_cycle(
                         message=_watch_needs_attention_message(attention.task, attention.action),
                     )
                 else:
+                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                        store=store,
+                        subject_task=failed,
+                        action=recovery_action,
+                        action_task=action_task,
+                        failed_task=failed,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(failed, no_progress_attention),
+                        )
+                        continue
                     log.emit(
                         "SKIP",
                         f"{failed.id}: {exec_result.message}",
@@ -5940,6 +6042,20 @@ def _run_cycle(
                         message=_watch_needs_attention_message(attention.task, attention.action),
                     )
                 else:
+                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                        store=store,
+                        subject_task=failed,
+                        action=recovery_action,
+                        action_task=action_task,
+                        failed_task=failed,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(failed, no_progress_attention),
+                        )
+                        continue
                     log.emit(
                         "SKIP",
                         f"{failed.id}: {exec_result.message}",

@@ -166,9 +166,10 @@ because merges are currently halted.
 - Work whose next meaningful action is blocked by the freeze MAY remain waiting, but it
   MUST stay visible and re-evaluable rather than being converted into a permanent parked
   state solely because the target is red.
-- The shared no-progress backstop MUST count only actually executed unchanged actions. It
-  MUST NOT count repeated evaluation of a blocked merge lane, skipped launches, or
-  capacity-denied actions as "no progress."
+- The shared no-progress backstop MUST ignore repeated evaluation of a blocked merge lane
+  by itself. But once watch has already selected the same downstream subject/action on an
+  unchanged subject, both executed no-op repeats and undispatched selected repeats count
+  toward the shared backstop.
 
 This is what prevents a merge stall from cascading into a launch stall.
 
