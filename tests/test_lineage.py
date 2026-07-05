@@ -1,9 +1,12 @@
 """Tests for gza.lineage helpers."""
 
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gza.db import SqliteTaskStore
 from gza.lineage import get_plan_for_task, get_root_impl, resolve_impl_task, walk_lineage_descendants
+from gza.lineage_view import LineageView
 
 
 def test_get_plan_for_task_finds_plan_through_retry_chain(tmp_path: Path) -> None:
@@ -135,3 +138,92 @@ def test_resolve_impl_task_improve_error_paths(tmp_path: Path) -> None:
         f"Improve task {improve_wrong_parent.id} points to task {plan.id}, "
         "which is not an implementation task"
     )
+
+
+def test_lineage_view_owner_prefers_completed_reattempt_over_failed_original(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    original.branch = "feature/lineage-owner"
+    original.status = "failed"
+    original.completed_at = datetime(2026, 7, 5, 10, 0, tzinfo=UTC)
+    store.update(original)
+
+    reattempt = store.add("Completed reattempt", task_type="implement", based_on=original.id)
+    assert reattempt.id is not None
+    reattempt.branch = original.branch
+    reattempt.status = "completed"
+    reattempt.completed_at = datetime(2026, 7, 5, 11, 0, tzinfo=UTC)
+    store.update(reattempt)
+
+    owner = LineageView(store, original).owner()
+
+    assert owner is not None
+    assert owner.id == reattempt.id
+
+
+def test_lineage_view_owner_warns_when_multiple_successful_implements_exist(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    first = store.add("First implementation", task_type="implement")
+    assert first.id is not None
+    first.branch = "feature/lineage-warning"
+    first.status = "completed"
+    first.completed_at = datetime(2026, 7, 5, 10, 0, tzinfo=UTC)
+    store.update(first)
+
+    second = store.add("Second implementation", task_type="implement", based_on=first.id)
+    assert second.id is not None
+    second.branch = first.branch
+    second.status = "completed"
+    second.completed_at = datetime(2026, 7, 5, 11, 0, tzinfo=UTC)
+    store.update(second)
+
+    with caplog.at_level(logging.WARNING):
+        owner = LineageView(store, first).owner()
+
+    assert owner is not None
+    assert owner.id == second.id
+    assert "multiple successful implement tasks" in caplog.text
+
+
+def test_lineage_view_original_latest_and_all_sort_by_event_time(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    original.branch = "feature/lineage-order"
+    original.status = "failed"
+    original.completed_at = datetime(2026, 7, 5, 10, 0, tzinfo=UTC)
+    store.update(original)
+
+    review = store.add("First review", task_type="review", based_on=original.id, depends_on=original.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 7, 5, 10, 30, tzinfo=UTC)
+    store.update(review)
+
+    reattempt = store.add("Completed reattempt", task_type="implement", based_on=original.id)
+    assert reattempt.id is not None
+    reattempt.branch = original.branch
+    reattempt.status = "completed"
+    reattempt.completed_at = datetime(2026, 7, 5, 11, 0, tzinfo=UTC)
+    store.update(reattempt)
+
+    followup_review = store.add("Follow-up review", task_type="review", based_on=reattempt.id, depends_on=reattempt.id)
+    assert followup_review.id is not None
+    followup_review.status = "completed"
+    followup_review.completed_at = datetime(2026, 7, 5, 11, 30, tzinfo=UTC)
+    store.update(followup_review)
+
+    view = LineageView(store, reattempt)
+
+    assert view.original() is not None
+    assert view.original().id == original.id
+    assert view.latest() is not None
+    assert view.latest().id == followup_review.id
+    assert [task.id for task in view.all("review")] == [review.id, followup_review.id]

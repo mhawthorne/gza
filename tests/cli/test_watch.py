@@ -85,6 +85,7 @@ from gza.cli.watch import (
     _query_owner_rows_with_context,
     _record_failure_backoff_updates,
     _resolve_watch_attention_display_task,
+    _resolve_watch_iterate_impl_for_task,
     _retire_duplicate_main_verify_remediation_tasks,
     _run_cycle,
     _should_reexec_watch,
@@ -30878,6 +30879,43 @@ def test_watch_iterate_helper_skips_duplicate_impl_worker_for_pending_child(tmp_
     assert result.message == f"{impl.id}: iterate already running for implementation chain"
     assert result.worker_label == "iterate"
     assert result.guarded_pending_task_id == improve.id
+
+
+def test_watch_iterate_impl_resolver_uses_completed_reattempt_owner_for_failed_original_lineage(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    original.branch = "feature/watch-lineage-owner"
+    original.status = "failed"
+    original.completed_at = datetime.now(UTC) - timedelta(hours=2)
+    store.update(original)
+
+    reattempt = store.add("Completed reattempt", task_type="implement", based_on=original.id)
+    assert reattempt.id is not None
+    reattempt.branch = original.branch
+    reattempt.status = "completed"
+    reattempt.completed_at = datetime.now(UTC) - timedelta(hours=1)
+    store.update(reattempt)
+
+    lifecycle_member = store.add("Completed rebase", task_type="rebase", based_on=original.id)
+    assert lifecycle_member.id is not None
+    lifecycle_member.branch = original.branch
+    lifecycle_member.status = "completed"
+    lifecycle_member.completed_at = datetime.now(UTC)
+    store.update(lifecycle_member)
+
+    merge_unit = store.get_or_create_merge_unit_for_task(reattempt)
+    assert merge_unit is not None
+    store.attach_task_to_merge_unit(lifecycle_member.id, merge_unit.id, "rebase")
+
+    resolved = _resolve_watch_iterate_impl_for_task(store, lifecycle_member)
+
+    assert resolved is not None
+    assert resolved.id == reattempt.id
 
 
 def _make_preseeded_watch_git(tmp_path: Path) -> "Git":

@@ -71,6 +71,7 @@ from ..lineage_query import (
     query_lineage_owner_rows_in_read_session,
     resolve_lineage_owner_task_id,
 )
+from ..lineage_view import LineageView
 from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
@@ -244,20 +245,11 @@ def _render_watch_stdout(line: str) -> Text:
 
 def _resolve_watch_iterate_impl_for_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
     """Resolve the implementation iterate target for a same-branch lifecycle member."""
-    if task.task_type == "implement":
-        return task if task.id is not None else None
-
-    current: DbTask | None = task
-    visited: set[str] = set()
-    while current is not None and current.id is not None:
-        if current.id in visited:
-            return None
-        visited.add(current.id)
-        if current.task_type == "implement":
-            return current
-        if current.based_on is None:
-            return None
-        current = store.get(current.based_on)
+    owner = LineageView(store, task).owner()
+    if owner is not None:
+        return owner
+    if task.task_type == "implement" and task.id is not None:
+        return task
     return None
 
 
