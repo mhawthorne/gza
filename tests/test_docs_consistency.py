@@ -1450,7 +1450,7 @@ def test_watch_supervisor_spec_pins_per_cycle_human_required_owner_parity() -> N
 
 
 def test_watch_slot_settle_seconds_discoverable_text_matches_staged_compatibility_behavior() -> None:
-    """Discoverable config text should describe the current staged slot-settle contract."""
+    """Discoverable config text should describe the live-slot settle contract."""
     repo_root = Path(__file__).resolve().parents[1]
     config_docs = (repo_root / "docs" / "configuration.md").read_text()
     config_example = (repo_root / "src" / "gza" / "gza.yaml.example").read_text()
@@ -1458,19 +1458,21 @@ def test_watch_slot_settle_seconds_discoverable_text_matches_staged_compatibilit
     slot_settle_spec = next(spec for spec in CONFIG_KEY_REGISTRY if spec.key == "watch.slot_settle_seconds")
 
     for text in (
-        "observable terminal post-launch outcome counts as settled",
-        "only launches with neither signal within that window are logged as undispatched",
+        "Only live-running proof or a live registered worker consumes a slot in that window",
+        "If the launch reaches a terminal outcome before any live proof, watch logs that no-slot outcome",
+        "skips no-progress accounting for that attempted launch",
+        "Launches with neither live proof nor terminal evidence in the window are logged as undispatched, still count toward selected-action no-progress accounting",
     ):
         assert text in config_docs
 
     compact_registry_description = " ".join(slot_settle_spec.description.split())
-    assert "observable post-launch terminal outcome counts as settled" in compact_registry_description
-    assert "only launches with neither signal are treated as undispatched" in compact_registry_description
+    assert "only live-running proof consumes a slot" in compact_registry_description
+    assert "terminal-before-running and no-live-proof launches release provisional budget" in compact_registry_description
 
     for rendered_example in (config_example, local_config_example):
         assert (
-            "#   compatibility accounting: either live-running proof or an observable post-launch terminal\n"
-            "#   outcome counts as settled, and only launches with neither signal are treated as undispatched."
+            "#   accounting: only live-running proof consumes a slot; terminal-before-running and no-live-proof\n"
+            "#   launches release provisional budget and stay non-slot-consuming."
         ) in rendered_example
 
 

@@ -381,9 +381,9 @@
 #   Deprecated alias for `watch.recovery_slots`.
 #   Default: 1
 #   restart_failed_batch: 1
-#   Bounded seconds `gza watch` gives a selected worker launch to settle for current-pass
-#   compatibility accounting: either live-running proof or an observable post-launch terminal
-#   outcome counts as settled, and only launches with neither signal are treated as undispatched.
+#   Bounded seconds `gza watch` gives a selected worker launch to settle for current-pass slot
+#   accounting: only live-running proof consumes a slot; terminal-before-running and no-live-proof
+#   launches release provisional budget and stay non-slot-consuming.
 #   Default: 5
 #   slot_settle_seconds: 5
 #   Maximum cooldown for transient watch recovery retries after the bounded schedule ramps up.

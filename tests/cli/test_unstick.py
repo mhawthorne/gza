@@ -7,6 +7,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+import gza.cli.watch as watch_module
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.concurrency import ConcurrencySnapshot
 from gza.config import Config
@@ -520,7 +523,19 @@ def test_dispatch_rearmed_owners_caps_lifecycle_worker_starts_after_stale_capaci
             patch("gza.cli.watch.execute_advance_action", side_effect=fake_execute_advance_action)
         )
         stack.enter_context(patch("gza.cli.watch._snapshot_watch_dispatch_task", return_value=None))
-        stack.enter_context(patch("gza.cli.watch._confirm_watch_dispatch_start", return_value=(True, first_review)))
+        stack.enter_context(
+            patch(
+                "gza.cli.watch._settle_watch_dispatch_starts",
+                side_effect=lambda *, pending_starts, **_kwargs: [
+                    watch_module._WatchDispatchSettleResult(
+                        entry=pending_starts[0],
+                        status=watch_module._DispatchSettleStatus.LIVE,
+                        reason=f"task {first_review.id} reached running state",
+                        task=first_review,
+                    )
+                ],
+            )
+        )
         stack.enter_context(patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False))
         stack.enter_context(patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None))
         stack.enter_context(

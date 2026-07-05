@@ -3166,6 +3166,21 @@ class _PendingWatchDispatchSettle:
 
 
 @dataclass(frozen=True)
+class _DeferredWatchDispatchStart:
+    settle: _PendingWatchDispatchSettle
+    subject_task: DbTask
+    action: dict[str, Any]
+    action_task_before: DbTask | None
+    failed_task: DbTask | None
+    owner_task_id: str | None
+    action_type: str
+    start_message: str
+    worker_consuming: bool = True
+    reserve_recovery_slot: bool = False
+    emit_merge_conflict_skip_on_unsettled: bool = False
+
+
+@dataclass(frozen=True)
 class _WatchDispatchSettleResult:
     entry: _PendingWatchDispatchSettle
     status: _DispatchSettleStatus
@@ -3421,6 +3436,79 @@ def _confirm_watch_dispatch_start(
         )
         return False, refreshed_task
     return True, refreshed_task
+
+
+def _settle_single_watch_dispatch_start(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task_id: str,
+    task_before: _WatchDispatchTaskSnapshot | None,
+    start_label: str,
+    dedupe_key: str,
+) -> _WatchDispatchSettleResult:
+    return _settle_watch_dispatch_starts(
+        config=config,
+        store=store,
+        pending_starts=[
+            _PendingWatchDispatchSettle(
+                task_id=task_id,
+                task_before=task_before,
+                start_label=start_label,
+                dedupe_key=dedupe_key,
+            )
+        ],
+    )[0]
+
+
+def _emit_deferred_watch_dispatch_outcome(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    deferred: _DeferredWatchDispatchStart,
+    settle_result: _WatchDispatchSettleResult,
+) -> tuple[bool, dict[str, Any] | None]:
+    if settle_result.status is _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING:
+        log.emit(
+            "START_NOSLOT",
+            (
+                f"{deferred.settle.start_label}: dispatch exited before occupying a live slot "
+                f"({settle_result.reason})"
+            ),
+            dedupe_key=deferred.settle.dedupe_key,
+        )
+        return False, None
+    if settle_result.status is _DispatchSettleStatus.NO_LIVE_PROOF:
+        log.emit(
+            "START_UNDISPATCHED",
+            (
+                f"{deferred.settle.start_label}: dispatch did not reach live slot occupancy within "
+                f"{config.watch.slot_settle_seconds}s ({settle_result.reason})"
+            ),
+            dedupe_key=deferred.settle.dedupe_key,
+        )
+        no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+            store=store,
+            subject_task=deferred.subject_task,
+            action=deferred.action,
+            action_task=deferred.action_task_before,
+            failed_task=deferred.failed_task,
+            no_progress_cycles=config.watch.no_progress_cycles,
+        )
+        return False, no_progress_attention
+    log.emit("START", deferred.start_message)
+    no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        config=config,
+        store=store,
+        subject_task=deferred.subject_task,
+        action=deferred.action,
+        action_task_before=deferred.action_task_before,
+        action_task_after=settle_result.task,
+        failed_task=deferred.failed_task,
+        no_progress_cycles=config.watch.no_progress_cycles,
+    )
+    return True, no_progress_attention
 
 
 def _format_expected_start_annotation(expected_start: "_ExpectedStart") -> str:
@@ -4922,8 +5010,11 @@ def _run_cycle(
     slots = plan.slots
     work_done = False
     confirmed_start_count = 0
+    recovery_started_this_cycle = False
     started_task_ids: set[str] = set()
     expected_starts: dict[str, _ExpectedStart] = {}
+    deferred_lifecycle_starts: list[_DeferredWatchDispatchStart] = []
+    deferred_recovery_starts: list[_DeferredWatchDispatchStart] = []
     step1_handled_child_task_ids: set[str] = set()
     reserved_recovery_slots = 0
     remaining_new_worker_starts = (
@@ -5027,9 +5118,13 @@ def _run_cycle(
             remaining_new_worker_starts = max(0, remaining_new_worker_starts - 1)
 
     def _free_worker_start_slots() -> int:
+        provisional_starts = len(deferred_lifecycle_starts) + len(deferred_recovery_starts)
         if remaining_new_worker_starts is None:
-            return slots
-        return min(slots, remaining_new_worker_starts)
+            return max(0, slots - provisional_starts)
+        return max(0, min(slots, remaining_new_worker_starts) - provisional_starts)
+
+    def _free_reserved_recovery_slots() -> int:
+        return max(0, reserved_recovery_slots - len(deferred_recovery_starts))
 
     def _observe_dispatch(
         owner_task_id: str | None,
@@ -5039,6 +5134,74 @@ def _run_cycle(
         if dispatch_observer is None or owner_task_id is None:
             return
         dispatch_observer(str(owner_task_id), outcome, action_type)
+
+    def _emit_settle_no_progress_attention(
+        *,
+        deferred: _DeferredWatchDispatchStart,
+        no_progress_attention: dict[str, Any] | None,
+        attention_key_prefix: str,
+    ) -> None:
+        if no_progress_attention is None or deferred.subject_task.id is None:
+            return
+        log.emit_attention(
+            attention_key=(
+                f"{attention_key_prefix}:{deferred.subject_task.id}:{deferred.action_type}:watch-no-progress"
+            ),
+            message=_watch_needs_attention_message(deferred.subject_task, no_progress_attention),
+        )
+
+    def _settle_deferred_dispatch_starts(
+        deferred_starts: list[_DeferredWatchDispatchStart],
+        *,
+        count_confirmed_start: bool,
+        count_recovery_start: bool,
+    ) -> None:
+        nonlocal confirmed_start_count, recovery_started_this_cycle, work_done
+        if not deferred_starts:
+            return
+        settled_starts = _settle_watch_dispatch_starts(
+            config=config,
+            store=store,
+            pending_starts=[deferred.settle for deferred in deferred_starts],
+        )
+        for deferred, settle_result in zip(deferred_starts, settled_starts, strict=True):
+            started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+                config=config,
+                store=store,
+                log=log,
+                deferred=deferred,
+                settle_result=settle_result,
+            )
+            if not started:
+                _emit_settle_no_progress_attention(
+                    deferred=deferred,
+                    no_progress_attention=no_progress_attention,
+                    attention_key_prefix=(
+                        "recovery-attention" if deferred.failed_task is not None else "advance-attention"
+                    ),
+                )
+                if deferred.emit_merge_conflict_skip_on_unsettled:
+                    log.emit(
+                        "SKIP",
+                        f"{deferred.subject_task.id}: merge conflict routed to rebase",
+                        dedupe_key=f"merge-conflict:{deferred.subject_task.id}",
+                    )
+                continue
+            started_task_ids.add(deferred.settle.task_id)
+            _observe_dispatch(deferred.owner_task_id, "started", deferred.action_type)
+            if deferred.worker_consuming:
+                _consume_new_worker_start(reserve_recovery_slot=deferred.reserve_recovery_slot)
+            if count_confirmed_start:
+                confirmed_start_count += 1
+            if count_recovery_start:
+                recovery_started_this_cycle = True
+            work_done = True
+            _emit_settle_no_progress_attention(
+                deferred=deferred,
+                no_progress_attention=no_progress_attention,
+                attention_key_prefix="recovery-attention" if deferred.failed_task is not None else "advance-attention",
+            )
+        deferred_starts.clear()
 
     # 1) Execute advance actions for completed tasks (includes completed plans
     # with no implement child, aligned with gza advance).
@@ -5692,28 +5855,30 @@ def _run_cycle(
                                 rebase_rc = _watch_spawn_worker(prepared_rebase_task, "rebase")
                                 _release_watch_reserved_task(str(prepared_rebase_task.id))
                                 if rebase_rc == 0:
-                                    started, _refreshed_rebase_task = _confirm_watch_dispatch_start(
-                                        config=config,
-                                        store=store,
-                                        log=log,
-                                        task_id=str(prepared_rebase_task.id),
-                                        task_before=rebase_task_before,
-                                        start_label=f"{display_task.id} -> {prepared_rebase_task.id}",
-                                        dedupe_key=(
-                                            f"merge-conflict-rebase-undispatched:{display_task.id}:"
-                                            f"{prepared_rebase_task.id}"
-                                        ),
-                                    )
-                                    if not started:
-                                        log.emit(
-                                            "SKIP",
-                                            f"{display_task.id}: merge conflict routed to rebase",
-                                            dedupe_key=f"merge-conflict:{display_task.id}",
+                                    deferred_lifecycle_starts.append(
+                                        _DeferredWatchDispatchStart(
+                                            settle=_PendingWatchDispatchSettle(
+                                                task_id=str(prepared_rebase_task.id),
+                                                task_before=rebase_task_before,
+                                                start_label=f"{display_task.id} -> {prepared_rebase_task.id}",
+                                                dedupe_key=(
+                                                    f"merge-conflict-rebase-undispatched:{display_task.id}:"
+                                                    f"{prepared_rebase_task.id}"
+                                                ),
+                                            ),
+                                            subject_task=display_task,
+                                            action={
+                                                "type": "needs_rebase",
+                                                "description": "Merge conflict routed to rebase",
+                                            },
+                                            action_task_before=task,
+                                            failed_task=None,
+                                            owner_task_id=display_task.id,
+                                            action_type="needs_rebase",
+                                            start_message=f"{prepared_rebase_task.id} rebase",
+                                            emit_merge_conflict_skip_on_unsettled=True,
                                         )
-                                        continue
-                                    log.emit("START", f"{prepared_rebase_task.id} rebase")
-                                    started_task_ids.add(str(prepared_rebase_task.id))
-                                    _consume_new_worker_start()
+                                    )
                                     work_done = True
                                 else:
                                     log.emit(
@@ -5956,59 +6121,38 @@ def _run_cycle(
                 work_done = True
             elif exec_result.status == "success" and _watch_execution_requires_dispatch_confirmation(exec_result):
                 assert child_id is not None
-                started, refreshed_action_task = _confirm_watch_dispatch_start(
-                    config=config,
-                    store=store,
-                    log=log,
-                    task_id=str(child_id),
-                    task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
-                    start_label=f"{display_task.id} {action_type}",
-                    dedupe_key=f"advance-undispatched:{action_type}:{display_task.id}:{child_id}",
-                )
-                if not started:
-                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
-                        store=store,
+                step1_handled_child_task_ids.add(str(child_id))
+                work_done = True
+                if exec_result.worker_label == "iterate":
+                    start_message = f"{child_id} iterate"
+                elif action_type in {"create_review", "run_review"}:
+                    start_message = f"{child_id} review"
+                elif action_type in {"improve", "run_improve"}:
+                    start_message = f"{child_id} improve"
+                elif action_type == "create_implement":
+                    start_message = f"{child_id} implement"
+                elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
+                    start_message = f"{child_id} rebase"
+                else:
+                    start_message = f"{child_id} {exec_result.worker_label or 'worker'}"
+                deferred_lifecycle_starts.append(
+                    _DeferredWatchDispatchStart(
+                        settle=_PendingWatchDispatchSettle(
+                            task_id=str(child_id),
+                            task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
+                            start_label=f"{display_task.id} {action_type}",
+                            dedupe_key=f"advance-undispatched:{action_type}:{display_task.id}:{child_id}",
+                        ),
                         subject_task=display_task,
                         action=action,
-                        action_task=task,
+                        action_task_before=task,
                         failed_task=None,
-                        no_progress_cycles=config.watch.no_progress_cycles,
+                        owner_task_id=display_task.id,
+                        action_type=str(action_type),
+                        start_message=start_message,
+                        worker_consuming=exec_result.worker_consuming,
                     )
-                    if no_progress_attention is not None:
-                        log.emit_attention(
-                            attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
-                            message=_watch_needs_attention_message(display_task, no_progress_attention),
-                        )
-                    continue
-                if exec_result.worker_label == "iterate":
-                    log.emit("START", f"{child_id} iterate")
-                elif action_type in {"create_review", "run_review"}:
-                    log.emit("START", f"{child_id} review")
-                elif action_type in {"improve", "run_improve"}:
-                    log.emit("START", f"{child_id} improve")
-                elif action_type == "create_implement":
-                    log.emit("START", f"{child_id} implement")
-                elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
-                    log.emit("START", f"{child_id} rebase")
-                no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
-                    config=config,
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task_before=task,
-                    action_task_after=refreshed_action_task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
                 )
-                started_task_ids.add(str(child_id))
-                _observe_dispatch(display_task.id, "started", str(action_type))
-                _consume_worker_slot_if_needed(exec_result)
-                work_done = True
-                if no_progress_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(display_task, no_progress_attention),
-                    )
             elif exec_result.status == "success" and action_type == "reconcile_branch_divergence":
                 refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
                 no_progress_attention = _finalize_watch_no_progress_after_execution(
@@ -6054,6 +6198,12 @@ def _run_cycle(
                         attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
                         message=_watch_needs_attention_message(display_task, no_progress_attention),
                     )
+
+    _settle_deferred_dispatch_starts(
+        deferred_lifecycle_starts,
+        count_confirmed_start=False,
+        count_recovery_start=False,
+    )
 
     if not dry_run:
         target_sha = resolve_ref_if_possible(git, target_branch).sha
@@ -6213,7 +6363,6 @@ def _run_cycle(
         reserved_recovery_slots = min(reserved_recovery_slots, remaining_new_worker_starts)
     pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
     nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids) | set(analysis.active_recovery_subject_ids)
-    recovery_started_this_cycle = False
     for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
         if failed.id is None:
             continue
@@ -6244,7 +6393,7 @@ def _run_cycle(
                 action=recovery_action,
             ):
                 continue
-        if worker_consuming_recovery and (_free_worker_start_slots() <= 0 or reserved_recovery_slots <= 0):
+        if worker_consuming_recovery and (_free_worker_start_slots() <= 0 or _free_reserved_recovery_slots() <= 0):
             _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
             no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
                 store=store,
@@ -6378,8 +6527,12 @@ def _run_cycle(
             continue
         if recovery_action_type == "needs_rebase":
             if dry_run:
-                deferred = recovery_action.get("deferred_action_type")
-                deferred_text = f" deferred={deferred}" if isinstance(deferred, str) and deferred else ""
+                deferred_action_type = recovery_action.get("deferred_action_type")
+                deferred_text = (
+                    f" deferred={deferred_action_type}"
+                    if isinstance(deferred_action_type, str) and deferred_action_type
+                    else ""
+                )
                 log.emit(
                     "RECOVR",
                     (
@@ -6439,32 +6592,36 @@ def _run_cycle(
             if exec_result.status != "success" or exec_result.created_task is None or exec_result.created_task.id is None:
                 continue
             recovered_task_id = str(exec_result.created_task.id)
-            refreshed_recovered_task = store.get(recovered_task_id)
-            no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
-                config=config,
-                store=store,
-                subject_task=failed,
-                action=recovery_action,
-                action_task_before=action_task,
-                action_task_after=refreshed_recovered_task,
-                failed_task=failed,
-                no_progress_cycles=config.watch.no_progress_cycles,
-            )
-            recovery_started_this_cycle = True
-            started_task_ids.add(recovered_task_id)
-            _observe_dispatch(row.owner_task.id, "started", recovery_action_type)
-            expected_starts[recovered_task_id] = _ExpectedStart(
-                recovery_action="needs_rebase",
-                parent_failed_id=str(failed.id),
-                launch_mode="worker",
-            )
-            _consume_worker_slot_if_needed(exec_result, reserve_recovery_slot=True)
-            work_done = True
-            if no_progress_attention is not None:
-                log.emit_attention(
-                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                    message=_watch_needs_attention_message(failed, no_progress_attention),
+            recovered_start_task = exec_result.created_task
+            recovery_annotation = _format_expected_start_annotation(
+                _ExpectedStart(
+                    recovery_action="needs_rebase",
+                    parent_failed_id=str(failed.id),
+                    launch_mode="worker",
                 )
+            )
+            deferred_recovery_starts.append(
+                _DeferredWatchDispatchStart(
+                    settle=_PendingWatchDispatchSettle(
+                        task_id=recovered_task_id,
+                        task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
+                        start_label=f"{failed.id} -> {recovered_task_id}",
+                        dedupe_key=f"recovery-undispatched:needs_rebase:{failed.id}:{recovered_task_id}",
+                    ),
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task_before=action_task,
+                    failed_task=failed,
+                    owner_task_id=row.owner_task.id,
+                    action_type=recovery_action_type,
+                    start_message=_format_start_line(
+                        recovered_start_task,
+                        recovery_annotation=recovery_annotation,
+                    ),
+                    worker_consuming=exec_result.worker_consuming,
+                    reserve_recovery_slot=True,
+                )
+            )
             continue
         if recovery_action_type == "resume":
             if dry_run:
@@ -6516,6 +6673,8 @@ def _run_cycle(
                 )
                 if prepared_recovered_task is None:
                     continue
+                recovered_start_task = prepared_recovered_task
+                recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
@@ -6566,6 +6725,8 @@ def _run_cycle(
                 if prepared_recovered_task is None:
                     continue
                 resume_recovered_task = prepared_recovered_task
+                recovered_start_task = resume_recovered_task
+                recovered_task_before = _snapshot_watch_dispatch_task(resume_recovered_task)
                 recovered_task_id = str(prepared_recovered_task.id)
                 pending_recovery_task_ids.add(recovered_task_id)
                 rc = _spawn_worker_with_failure_log(
@@ -6649,6 +6810,8 @@ def _run_cycle(
             if prepared_recovered_task is None:
                 continue
             retry_recovered_task = prepared_recovered_task
+            recovered_start_task = retry_recovered_task
+            recovered_task_before = _snapshot_watch_dispatch_task(retry_recovered_task)
             recovered_task_id = str(prepared_recovered_task.id)
             pending_recovery_task_ids.add(recovered_task_id)
             rc = (
@@ -6695,32 +6858,80 @@ def _run_cycle(
 
         if rc != 0:
             continue
-        refreshed_recovered_task = store.get(recovered_task_id)
-        no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
-            config=config,
-            store=store,
-            subject_task=failed,
-            action=recovery_action,
-            action_task_before=action_task,
-            action_task_after=refreshed_recovered_task,
-            failed_task=failed,
-            no_progress_cycles=config.watch.no_progress_cycles,
-        )
-        recovery_started_this_cycle = True
-        started_task_ids.add(recovered_task_id)
-        _observe_dispatch(row.owner_task.id, "started", recovery_action_type)
-        expected_starts[recovered_task_id] = _ExpectedStart(
-            recovery_action=recovery_action_type,
-            parent_failed_id=str(failed.id),
-            launch_mode=decision.launch_mode,
-        )
-        _consume_new_worker_start(reserve_recovery_slot=True)
-        work_done = True
-        if no_progress_attention is not None:
-            log.emit_attention(
-                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                message=_watch_needs_attention_message(failed, no_progress_attention),
+        recovery_annotation = _format_expected_start_annotation(
+            _ExpectedStart(
+                recovery_action=recovery_action_type,
+                parent_failed_id=str(failed.id),
+                launch_mode=decision.launch_mode,
             )
+        )
+        deferred_recovery_starts.append(
+            _DeferredWatchDispatchStart(
+                settle=_PendingWatchDispatchSettle(
+                    task_id=recovered_task_id,
+                    task_before=recovered_task_before,
+                    start_label=f"{failed.id} -> {recovered_task_id}",
+                    dedupe_key=f"recovery-undispatched:{recovery_action_type}:{failed.id}:{recovered_task_id}",
+                ),
+                subject_task=failed,
+                action=recovery_action,
+                action_task_before=action_task,
+                failed_task=failed,
+                owner_task_id=row.owner_task.id,
+                action_type=recovery_action_type,
+                start_message=_format_start_line(
+                    recovered_start_task,
+                    recovery_annotation=recovery_annotation,
+                ),
+                reserve_recovery_slot=True,
+            )
+        )
+
+    _settle_deferred_dispatch_starts(
+        deferred_recovery_starts,
+        count_confirmed_start=True,
+        count_recovery_start=True,
+    )
+
+    def _recompute_pending_dispatch() -> tuple[list[DbTask], int]:
+        if scoped_owner_ids is not None:
+            return [], 0
+        pending_preview = build_dispatch_preview(
+            store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+            selection_mode="pending_only",
+            include_recovery=False,
+        )
+        pending_entries = _filter_watch_dispatch_preview_entries(
+            pending_preview.runnable_entries,
+            store=store,
+            started_task_ids=started_task_ids,
+            pending_recovery_task_ids=pending_recovery_task_ids,
+            step1_handled_child_task_ids=step1_handled_child_task_ids,
+            excluded_owner_ids=excluded_owner_ids,
+        )
+        effective_pending_slots = slots
+        if remaining_new_worker_starts is not None:
+            effective_pending_slots = min(effective_pending_slots, remaining_new_worker_starts)
+        pending_plan = plan_watch_dispatch_entries(
+            pending_entries,
+            slots=effective_pending_slots,
+            recovery_slot_cap=0,
+            selection_mode="pending_only",
+            include_pending=True,
+        )
+        return (
+            [entry.task for entry in pending_entries if entry.lane == "pending" and entry.task.id is not None],
+            pending_plan.pending_slots,
+        )
+
+    if scoped_owner_ids is None and recovery_mode != "recovery_only":
+        pending_tasks, pending_slots = _recompute_pending_dispatch()
 
     if (
         scoped_owner_ids is None
@@ -6729,36 +6940,49 @@ def _run_cycle(
         and not recovery_started_this_cycle
     ):
         if not nonparked_recovery_subject_ids:
-            pending_fallback_preview = build_dispatch_preview(
-                store,
-                config=config,
-                git=git,
-                target_branch=target_branch,
-                tags=tags,
-                any_tag=any_tag,
-                max_recovery_attempts=max_recovery_attempts,
-                selection_mode="pending_only",
-                include_recovery=False,
-            )
-            pending_tasks = [
-                entry.task
-                for entry in _filter_watch_dispatch_preview_entries(
-                    pending_fallback_preview.runnable_entries,
-                    store=store,
-                    started_task_ids=started_task_ids,
-                    pending_recovery_task_ids=pending_recovery_task_ids,
-                    step1_handled_child_task_ids=step1_handled_child_task_ids,
-                    excluded_owner_ids=excluded_owner_ids,
-                )
-                if entry.lane == "pending" and entry.task.id is not None
-            ]
-            pending_slots = slots
+            pending_tasks, pending_slots = _recompute_pending_dispatch()
 
     # 3) Start new queued tasks (consumes slots)
     def consume_pending_slot() -> None:
         nonlocal pending_slots, slots
         pending_slots -= 1
         slots = max(0, slots - 1)
+
+    def _settle_pending_dispatch_wave(
+        deferred_pending_starts: list[_DeferredWatchDispatchStart],
+    ) -> None:
+        nonlocal confirmed_start_count, work_done
+        if not deferred_pending_starts:
+            return
+        settled_starts = _settle_watch_dispatch_starts(
+            config=config,
+            store=store,
+            pending_starts=[deferred.settle for deferred in deferred_pending_starts],
+        )
+        for deferred, settle_result in zip(deferred_pending_starts, settled_starts, strict=True):
+            started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+                config=config,
+                store=store,
+                log=log,
+                deferred=deferred,
+                settle_result=settle_result,
+            )
+            if not started:
+                _emit_settle_no_progress_attention(
+                    deferred=deferred,
+                    no_progress_attention=no_progress_attention,
+                    attention_key_prefix="pending-attention",
+                )
+                continue
+            consume_pending_slot()
+            work_done = True
+            started_task_ids.add(deferred.settle.task_id)
+            confirmed_start_count += 1
+            _emit_settle_no_progress_attention(
+                deferred=deferred,
+                no_progress_attention=no_progress_attention,
+                attention_key_prefix="pending-attention",
+            )
 
     quiet_skip = None
     if not scoped_mode:
@@ -6782,19 +7006,128 @@ def _run_cycle(
     if pending_slots > 0:
         log.emit("QUEUE", "pending queue active")
     if pending_slots > 0:
-        for task in pending_tasks:
-            if pending_slots <= 0:
-                break
-            assert task.id is not None
-            if str(task.id) in started_task_ids:
-                continue
-            if str(task.id) in pending_recovery_task_ids:
-                continue
-            if str(task.id) in step1_handled_child_task_ids:
-                continue
-            task_type = task.task_type or "implement"
-            pending_action = _pending_queue_dispatch_action(task)
-            if task_type == "implement":
+        pending_task_index = 0
+        while pending_slots > 0 and pending_task_index < len(pending_tasks):
+            wave_budget = pending_slots
+            wave_fill_count = 0
+            deferred_pending_starts: list[_DeferredWatchDispatchStart] = []
+            while pending_task_index < len(pending_tasks) and wave_fill_count < wave_budget:
+                task = pending_tasks[pending_task_index]
+                pending_task_index += 1
+                assert task.id is not None
+                if str(task.id) in started_task_ids:
+                    continue
+                if str(task.id) in pending_recovery_task_ids:
+                    continue
+                if str(task.id) in step1_handled_child_task_ids:
+                    continue
+                task_type = task.task_type or "implement"
+                pending_action = _pending_queue_dispatch_action(task)
+                if task_type == "implement":
+                    if dry_run:
+                        dry_run_prompt = _format_prompt_for_width(
+                            task.prompt,
+                            prefix=16 + len(f'{task.id} {task_type} "'),
+                            suffix=len('" [dry-run]'),
+                        )
+                        log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
+                        started_task_ids.add(str(task.id))
+                        consume_pending_slot()
+                        wave_fill_count += 1
+                        work_done = True
+                        continue
+                    if _maybe_emit_active_watch_recovery_backoff(
+                        store=store,
+                        log=log,
+                        subject_task=task,
+                        action=pending_action,
+                    ):
+                        continue
+                    no_progress_attention = _maybe_park_watch_no_progress(
+                        config=config,
+                        store=store,
+                        subject_task=task,
+                        action=pending_action,
+                        action_task=task,
+                        failed_task=None,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                        _maybe_emit_active_watch_recovery_backoff(
+                            store=store,
+                            log=log,
+                            subject_task=task,
+                            action=pending_action,
+                        )
+                        continue
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                            message=_watch_needs_attention_message(task, no_progress_attention),
+                        )
+                        continue
+                    iterate_args = argparse.Namespace(
+                        max_iterations=max_iterations,
+                        no_docker=False,
+                        resume=False,
+                        retry=False,
+                        auto_iterate=True,
+                    )
+                    pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+                    reserved_launch = _reserve_watch_launch("iterate", str(task.id))
+                    if reserved_launch is None:
+                        continue
+                    prepared_pending_task = _prepare_watch_reserved_task(
+                        task,
+                        permit=reserved_launch,
+                        rollback_on_failure=False,
+                    )
+                    if prepared_pending_task is None:
+                        log.emit(
+                            "START_FAILED",
+                            f"{task.id} {task_type}: iterate startup preparation failed",
+                            dedupe_key=f"prepare-iterate-failed:{task.id}",
+                        )
+                        continue
+                    pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
+                    rc = _spawn_worker_with_failure_log(
+                        quiet=quiet,
+                        log=log,
+                        failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
+                        dedupe_key=f"spawn-iterate-failed:{task.id}",
+                        spawn_fn=lambda: _spawn_background_iterate(
+                            iterate_args,
+                            config,
+                            task,
+                            prepared_task_id=str(prepared_pending_task.id),
+                            prepared_resume=pending_recovery_mode == "resume",
+                            prepared_phase="preloop",
+                            startup_quiet=True,
+                        ),
+                    )
+                    _release_watch_reserved_task(str(prepared_pending_task.id))
+                    if rc != 0:
+                        continue
+                    deferred_pending_starts.append(
+                        _DeferredWatchDispatchStart(
+                            settle=_PendingWatchDispatchSettle(
+                                task_id=str(task.id),
+                                task_before=pending_task_before,
+                                start_label=f"{task.id} {task_type}",
+                                dedupe_key=f"pending-undispatched:{task.id}:iterate",
+                            ),
+                            subject_task=task,
+                            action=pending_action,
+                            action_task_before=task,
+                            failed_task=None,
+                            owner_task_id=task.id,
+                            action_type=str(task_type),
+                            start_message=_format_start_line(task),
+                        )
+                    )
+                    wave_fill_count += 1
+                    continue
+
                 if dry_run:
                     dry_run_prompt = _format_prompt_for_width(
                         task.prompt,
@@ -6804,6 +7137,7 @@ def _run_cycle(
                     log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
                     started_task_ids.add(str(task.id))
                     consume_pending_slot()
+                    wave_fill_count += 1
                     work_done = True
                     continue
                 if _maybe_emit_active_watch_recovery_backoff(
@@ -6836,180 +7170,42 @@ def _run_cycle(
                         message=_watch_needs_attention_message(task, no_progress_attention),
                     )
                     continue
-                iterate_args = argparse.Namespace(
-                    max_iterations=max_iterations,
-                    no_docker=False,
-                    resume=False,
-                    retry=False,
-                    auto_iterate=True,
-                )
-                pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
-                reserved_launch = _reserve_watch_launch("iterate", str(task.id))
-                if reserved_launch is None:
-                    continue
-                prepared_pending_task = _prepare_watch_reserved_task(
-                    task,
-                    permit=reserved_launch,
-                    rollback_on_failure=False,
-                )
-                if prepared_pending_task is None:
-                    log.emit(
-                        "START_FAILED",
-                        f"{task.id} {task_type}: iterate startup preparation failed",
-                        dedupe_key=f"prepare-iterate-failed:{task.id}",
-                    )
-                    continue
-                pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                pending_task_before = _snapshot_watch_dispatch_task(task)
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,
-                    failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
-                    dedupe_key=f"spawn-iterate-failed:{task.id}",
-                    spawn_fn=lambda: _spawn_background_iterate(
-                        iterate_args,
+                    failure_message=f"{task.id} {task_type}: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{task.id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args,
                         config,
-                        task,
-                        prepared_task_id=str(prepared_pending_task.id),
-                        prepared_resume=pending_recovery_mode == "resume",
-                        prepared_phase="preloop",
+                        task_id=task.id,
+                        quiet=quiet,
                         startup_quiet=True,
                     ),
                 )
-                _release_watch_reserved_task(str(prepared_pending_task.id))
                 if rc != 0:
                     continue
-                started, refreshed_pending_task = _confirm_watch_dispatch_start(
-                    config=config,
-                    store=store,
-                    log=log,
-                    task_id=str(task.id),
-                    task_before=pending_task_before,
-                    start_label=f"{task.id} {task_type}",
-                    dedupe_key=f"pending-undispatched:{task.id}:iterate",
-                )
-                if not started:
-                    continue
-                no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
-                    config=config,
-                    store=store,
-                    subject_task=task,
-                    action=pending_action,
-                    action_task_before=task,
-                    action_task_after=refreshed_pending_task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                consume_pending_slot()
-                work_done = True
-                started_task_ids.add(str(task.id))
-                confirmed_start_count += 1
-                started_prompt = _format_prompt_for_width(
-                    task.prompt,
-                    prefix=16 + len(f'{task.id} {task_type} "'),
-                    suffix=len('"'),
-                )
-                log.emit("START", f'{task.id} {task_type} "{started_prompt}"')
-                if no_progress_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
-                        message=_watch_needs_attention_message(task, no_progress_attention),
+                deferred_pending_starts.append(
+                    _DeferredWatchDispatchStart(
+                        settle=_PendingWatchDispatchSettle(
+                            task_id=str(task.id),
+                            task_before=pending_task_before,
+                            start_label=f"{task.id} {task_type}",
+                            dedupe_key=f"pending-undispatched:{task.id}:worker",
+                        ),
+                        subject_task=task,
+                        action=pending_action,
+                        action_task_before=task,
+                        failed_task=None,
+                        owner_task_id=task.id,
+                        action_type=str(task_type),
+                        start_message=_format_start_line(task),
                     )
-                continue
-
-            if dry_run:
-                dry_run_prompt = _format_prompt_for_width(
-                    task.prompt,
-                    prefix=16 + len(f'{task.id} {task_type} "'),
-                    suffix=len('" [dry-run]'),
                 )
-                log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
-                started_task_ids.add(str(task.id))
-                consume_pending_slot()
-                work_done = True
-                continue
-            if _maybe_emit_active_watch_recovery_backoff(
-                store=store,
-                log=log,
-                subject_task=task,
-                action=pending_action,
-            ):
-                continue
-            no_progress_attention = _maybe_park_watch_no_progress(
-                config=config,
-                store=store,
-                subject_task=task,
-                action=pending_action,
-                action_task=task,
-                failed_task=None,
-                no_progress_cycles=config.watch.no_progress_cycles,
-            )
-            if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
-                _maybe_emit_active_watch_recovery_backoff(
-                    store=store,
-                    log=log,
-                    subject_task=task,
-                    action=pending_action,
-                )
-                continue
-            if no_progress_attention is not None:
-                log.emit_attention(
-                    attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
-                    message=_watch_needs_attention_message(task, no_progress_attention),
-                )
-                continue
-            worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-            pending_task_before = _snapshot_watch_dispatch_task(task)
-            rc = _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=log,
-                failure_message=f"{task.id} {task_type}: worker spawn failed",
-                dedupe_key=f"spawn-worker-failed:{task.id}",
-                spawn_fn=lambda: _spawn_background_worker(
-                    worker_args,
-                    config,
-                    task_id=task.id,
-                    quiet=quiet,
-                    startup_quiet=True,
-                ),
-            )
-            if rc != 0:
-                continue
-            started, refreshed_pending_task = _confirm_watch_dispatch_start(
-                config=config,
-                store=store,
-                log=log,
-                task_id=str(task.id),
-                task_before=pending_task_before,
-                start_label=f"{task.id} {task_type}",
-                dedupe_key=f"pending-undispatched:{task.id}:worker",
-            )
-            if not started:
-                continue
-            no_progress_attention = _maybe_finalize_watch_no_progress_for_background_action(
-                config=config,
-                store=store,
-                subject_task=task,
-                action=pending_action,
-                action_task_before=task,
-                action_task_after=refreshed_pending_task,
-                failed_task=None,
-                no_progress_cycles=config.watch.no_progress_cycles,
-            )
-            consume_pending_slot()
-            work_done = True
-            started_task_ids.add(str(task.id))
-            confirmed_start_count += 1
-            started_prompt = _format_prompt_for_width(
-                task.prompt,
-                prefix=16 + len(f'{task.id} {task_type} "'),
-                suffix=len('"'),
-            )
-            log.emit("START", f'{task.id} {task_type} "{started_prompt}"')
-            if no_progress_attention is not None:
-                log.emit_attention(
-                    attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
-                    message=_watch_needs_attention_message(task, no_progress_attention),
-                )
+                wave_fill_count += 1
+            _settle_pending_dispatch_wave(deferred_pending_starts)
 
     pending_count = (
         0
