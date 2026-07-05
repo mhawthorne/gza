@@ -71,7 +71,11 @@ from ..lineage_query import (
 from ..log_paths import resolve_ops_log_path
 from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
+    CandidateIntegrationVerifyCheck,
+    check_candidate_integration_verify,
     check_main_integration_verify,
+    promote_candidate_integration_verify_evidence,
+    verify_gate_enabled,
 )
 from ..merge_state import resolve_task_merge_state_for_target
 from ..pickup import (
@@ -100,6 +104,7 @@ from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
     _complete_failed_code_task_after_pr_publication,
+    _compute_tree_fingerprint,
     ensure_task_log_path,
     get_effective_config_for_task,
     load_dotenv,
@@ -2873,6 +2878,7 @@ class _MergeActionResult:
     status: str = "merged"
     block_reason: str | None = None
     promotion_warnings: tuple[str, ...] = ()
+    candidate_verify: CandidateIntegrationVerifyCheck | None = None
 
 
 @dataclass
@@ -2909,6 +2915,50 @@ def _prepare_create_review_action(
         status="created",
         review_task=review_task,
         message=f"Created review task {review_task.id}",
+    )
+
+
+def _blocked_candidate_verify_attention_key(task_id: str, check: CandidateIntegrationVerifyCheck | None) -> str:
+    if check is None:
+        return f"merge-candidate-verify:{task_id}:unavailable"
+    remediation = getattr(check, "remediation", None)
+    if remediation is not None:
+        fingerprint = remediation.tree_fingerprint or "unavailable"
+        return f"merge-candidate-verify:{task_id}:{remediation.signature}:{fingerprint}"
+    evidence = check.evidence
+    phase = evidence.failing_phase or evidence.verify_exit_status or evidence.verify_status or "unknown"
+    fingerprint = evidence.tree_fingerprint or "unavailable"
+    return f"merge-candidate-verify:{task_id}:{phase}:{fingerprint}"
+
+
+def format_blocked_candidate_verify_message(task_id: str, merge_result: Any) -> str:
+    block_reason = getattr(merge_result, "block_reason", None) or "candidate verify blocked promotion"
+    check = getattr(merge_result, "candidate_verify", None)
+    if not isinstance(check, CandidateIntegrationVerifyCheck):
+        return f"{task_id}: {block_reason}"
+    evidence = check.evidence
+    fingerprint = evidence.tree_fingerprint or "unavailable"
+    if check.classification == "unavailable":
+        return f"{task_id}: candidate verify unavailable on {fingerprint}; local main was left unchanged"
+    if evidence.failing_phase:
+        return (
+            f"{task_id}: candidate verify blocked promotion on {fingerprint}; "
+            f"phase `{evidence.failing_phase}` failed before main changed"
+        )
+    if evidence.failure:
+        return f"{task_id}: candidate verify blocked promotion on {fingerprint}; {evidence.failure}"
+    return f"{task_id}: {block_reason}"
+
+
+def _isolated_merge_checkout_unavailable_result() -> _MergeActionResult:
+    return _MergeActionResult(
+        rc=1,
+        created_followups=[],
+        reused_followups=[],
+        created_investigation_task_ids=[],
+        reused_investigation_task_ids=[],
+        status="blocked_candidate_verify_unavailable",
+        block_reason="isolated host merge checkout unavailable; local main was left unchanged",
     )
 
 
@@ -3024,6 +3074,22 @@ def _execute_merge_action(
         resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
         target_branch,
     )
+    candidate_verify_required = bool(config.main_checkout_isolate and verify_gate_enabled(config))
+    isolated_promotion = merge_git is not None and merge_git.repo_dir != git.repo_dir
+    if candidate_verify_required and not isolated_promotion:
+        print(
+            "Error: pre-promotion candidate verify requires the isolated host merge checkout; "
+            "refusing to promote without it."
+        )
+        return _MergeActionResult(
+            rc=1,
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
+            status="blocked_candidate_verify_unavailable",
+            block_reason="isolated host merge checkout unavailable for pre-promotion candidate verify",
+        )
     real_pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
     if (
         getattr(merge_args, "squash", False)
@@ -3035,7 +3101,7 @@ def _execute_merge_action(
         real_pending_squash_reconcile = _capture_pre_squash_reconcile_state(
             git,
             branch=resolved_subject.merge_branch,
-        )
+    )
     merge_result = _coerce_merge_single_task_result(
         _merge_single_task(
             task.id,
@@ -3050,6 +3116,57 @@ def _execute_merge_action(
     )
     rc = merge_result.rc
     promotion_warnings: tuple[str, ...] = ()
+    candidate_verify = None
+    verified_head_sha: str | None = None
+    verified_tree_fingerprint: str | None = None
+    if rc == 0 and candidate_verify_required:
+        candidate_verify = check_candidate_integration_verify(
+            config,
+            execution_git,
+            reason="merge-executor-pre-promotion",
+            red_reruns=2,
+        )
+        verified_head_sha = _rev_parse_if_exists_if_supported(execution_git, "HEAD") or _rev_parse_if_supported(
+            execution_git,
+            "HEAD",
+        )
+        verified_tree_fingerprint = candidate_verify.evidence.tree_fingerprint
+        live_tree_fingerprint = (
+            _compute_tree_fingerprint(execution_git)
+            if verified_tree_fingerprint is not None
+            else None
+        )
+        if (
+            candidate_verify.evidence.verify_status != "passed"
+            or not candidate_verify.evidence.head_sha
+            or verified_head_sha != candidate_verify.evidence.head_sha
+            or not verified_tree_fingerprint
+            or live_tree_fingerprint != verified_tree_fingerprint
+        ):
+            message = "candidate verify blocked isolated promotion"
+            if candidate_verify.classification == "unavailable":
+                message = "candidate verify unavailable; refusing to promote without exact host proof"
+            elif candidate_verify.evidence.failing_phase:
+                message = (
+                    "candidate verify red; refusing to promote "
+                    f"while phase `{candidate_verify.evidence.failing_phase}` is failing"
+                )
+            elif candidate_verify.evidence.failure:
+                message = f"candidate verify blocked isolated promotion: {candidate_verify.evidence.failure}"
+            print(f"Error: {message}")
+            blocked_status = "blocked_candidate_verify"
+            if candidate_verify.classification == "unavailable":
+                blocked_status = "blocked_candidate_verify_unavailable"
+            return _MergeActionResult(
+                rc=1,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                status=blocked_status,
+                block_reason=message,
+                candidate_verify=candidate_verify,
+            )
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         try:
             promotion_warnings = _promote_isolated_merge_to_target_branch(
@@ -3057,6 +3174,22 @@ def _execute_merge_action(
                 execution_git,
                 target_branch,
             )
+            if candidate_verify is not None:
+                if not verified_head_sha or not verified_tree_fingerprint:
+                    raise GitError(
+                        "promoted target could not prove exact candidate identity for canonical checkpoint update"
+                    )
+                persisted_checkpoint = promote_candidate_integration_verify_evidence(
+                    store,
+                    evidence=candidate_verify.evidence,
+                    promoted_head_sha=verified_head_sha,
+                    promoted_tree_fingerprint=verified_tree_fingerprint,
+                )
+                if persisted_checkpoint is None:
+                    raise GitError(
+                        "promoted target did not exactly match the verified candidate tree; "
+                        "canonical checkpoint was not updated"
+                    )
             pending = real_pending_squash_reconcile or merge_result.pending_squash_reconcile
             if pending is not None:
                 _print_squash_reconcile_result(
@@ -3091,6 +3224,7 @@ def _execute_merge_action(
         status=merge_result.status,
         block_reason=merge_result.block_reason,
         promotion_warnings=promotion_warnings,
+        candidate_verify=candidate_verify,
     )
 
 
@@ -3851,6 +3985,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
     attention_tasks: list[tuple[DbTask, dict]] = []
     action_context = _build_action_context(dry_run_mode=False)
     merge_halt_attention = main_verify_attention[1] if main_verify_attention is not None else None
+    isolated_merge_enabled = bool(config.main_checkout_isolate)
+    advance_merge_git: Git | None = None
+
+    def _prepare_advance_isolated_merge_checkout() -> Git | None:
+        nonlocal advance_merge_git
+        try:
+            advance_merge_git = ensure_watch_main_checkout(config, git, target_branch)
+            return advance_merge_git
+        except GitError:
+            try:
+                advance_merge_git = ensure_watch_main_checkout(config, git, target_branch, rebuild=True)
+                return advance_merge_git
+            except GitError:
+                advance_merge_git = None
+                return None
 
     if main_verify_attention is not None:
         _append_attention_once(attention_tasks, *main_verify_attention)
@@ -3931,16 +4080,26 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 skip_count += 1
                 print()
                 continue
-            merge_result = _execute_merge_action(
-                config,
-                store,
-                git,
-                task,
-                action,
-                target_branch=target_branch,
-                current_branch=actual_current_branch,
-                merge_source=MERGE_SOURCE_ADVANCE,
-            )
+            prepared_merge_git = None
+            prepared_merge_branch = None
+            if isolated_merge_enabled:
+                prepared_merge_git = _prepare_advance_isolated_merge_checkout()
+                prepared_merge_branch = target_branch if prepared_merge_git is not None else None
+            if isolated_merge_enabled and prepared_merge_git is None:
+                merge_result = _isolated_merge_checkout_unavailable_result()
+            else:
+                merge_result = _execute_merge_action(
+                    config,
+                    store,
+                    git,
+                    task,
+                    action,
+                    target_branch=target_branch,
+                    current_branch=actual_current_branch,
+                    merge_git=prepared_merge_git,
+                    merge_current_branch=prepared_merge_branch,
+                    merge_source=MERGE_SOURCE_ADVANCE,
+                )
             if merge_result.created_followups:
                 created_ids = ", ".join(str(t.id) for t in merge_result.created_followups if t.id is not None)
                 console.print(f"      [{_c_ok}]✓ Created follow-up task(s): {created_ids}[/{_c_ok}]")
@@ -3976,6 +4135,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     }
                     _append_attention_once(attention_tasks, main_verify.state.task, merge_halt_attention)
             else:
+                if getattr(merge_result, "status", None) in {
+                    "blocked_candidate_verify",
+                    "blocked_candidate_verify_unavailable",
+                }:
+                    candidate_message = format_blocked_candidate_verify_message(str(display_task.id), merge_result)
+                    console.print(f"      [{_c_warn}]! {candidate_message}[/{_c_warn}]")
+                    _append_attention_once(
+                        attention_tasks,
+                        display_task,
+                        {
+                            "type": "needs_discussion",
+                            "description": f"SKIP: {candidate_message}",
+                            "needs_attention_reason": "blocked-candidate-verify",
+                            "subject_task_id": display_task.id,
+                        },
+                    )
+                    skip_count += 1
+                    print()
+                    continue
                 resolved_subject = (
                     _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
                     if task.id is not None

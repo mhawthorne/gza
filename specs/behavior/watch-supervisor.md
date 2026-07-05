@@ -144,6 +144,17 @@ Each watch cycle MUST execute these phases in order:
    dedup path.
    `advance` MAY surface the red-main condition from the shared state, but it MUST NOT
    create these remediation tasks itself.
+   When watch stages merges in the isolated host merge checkout, it MUST rely on the
+   shared merge executor's pre-promotion candidate gate: the candidate tree must verify
+   green in that isolated checkout before the canonical default-branch ref is updated.
+   If the isolated checkout is unavailable, or candidate verify is red or freshness is
+   unproven, watch MUST leave the canonical target untouched and let the shared executor
+   fail closed. That blocked pre-promotion result MUST surface as one sticky
+   operator-visible watch attention for the merge subject rather than falling through to
+   a generic merge-failed line, so the host-only blocked candidate remains visible across
+   watch cycles until the candidate changes or the failure clears. Before watch considers
+   any later merge candidate in that same cycle, it MUST refresh or rebuild the isolated
+   checkout back to the canonical target, or stop the merge lane for the cycle.
 4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
    reconciled the freshest target state for this cycle, watch MAY run one conservative
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay

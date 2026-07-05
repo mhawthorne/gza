@@ -2,6 +2,7 @@
 
 import argparse
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,12 @@ from gza.config import Config
 from gza.db import DuplicateActiveChildError
 from gza.git import Git, GitError, ResolvedGitRef, ResolvedMergeSourceRef
 from gza.lineage_query import LineageOwnerRow
+from gza.main_integration_verify import (
+    CandidateIntegrationVerifyCheck,
+    CandidateIntegrationVerifyEvidence,
+    MainIntegrationVerifyEnvironmentIdentity,
+    load_main_integration_verify_state,
+)
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
 from gza.review_verdict import ReviewFinding
 from gza.worktree_roots import managed_worktree_root_paths
@@ -53,6 +60,36 @@ def _stub_main_integration_verify() -> object:
             state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
         ),
     ) as mocked:
+        yield mocked
+
+
+@pytest.fixture(autouse=True)
+def _stub_candidate_integration_verify() -> object:
+    with (
+        patch(
+            "gza.cli.git_ops.check_candidate_integration_verify",
+            return_value=SimpleNamespace(
+                classification="pass",
+                evidence=SimpleNamespace(
+                    verify_status="passed",
+                    head_sha="isolated-merge-oid",
+                    tree_fingerprint="fp-candidate",
+                    gate_enabled=True,
+                    verify_command="./bin/tests",
+                    verify_timeout_seconds=300,
+                    verify_timeout_grace_seconds=5.0,
+                    environment_identity=None,
+                    verify_exit_status="0",
+                    failure=None,
+                    failing_phase=None,
+                    reviewed_branch="main",
+                    working_directory="/tmp/main-integration",
+                    captured_at=datetime.now(UTC),
+                ),
+            ),
+        ) as mocked,
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+    ):
         yield mocked
 
 
@@ -1502,6 +1539,294 @@ def test_execute_merge_action_propagates_blocked_dirty_checkout_status(tmp_path:
     assert result.rc == 1
     assert result.status == "blocked_dirty_checkout"
     assert result.block_reason == "main checkout has uncommitted changes"
+
+
+def test_execute_merge_action_fail_closed_when_isolated_candidate_gate_checkout_is_unavailable(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/missing-isolated-checkout"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(repo_dir=tmp_path)
+
+    with patch("gza.cli.git_ops._merge_single_task") as merge_single:
+        result = _execute_merge_action(
+            config,
+            store,
+            git,
+            task,
+            {"type": "merge", "description": "Merge"},
+            target_branch="main",
+            current_branch="main",
+        )
+
+    merge_single.assert_not_called()
+    assert result.rc == 1
+    assert result.status == "blocked_candidate_verify_unavailable"
+    assert result.block_reason == "isolated host merge checkout unavailable for pre-promotion candidate verify"
+    assert "pre-promotion candidate verify requires the isolated host merge checkout" in capsys.readouterr().out
+
+
+def test_execute_merge_action_isolated_candidate_verify_red_blocks_promotion(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/candidate-red"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    red_check = SimpleNamespace(
+        classification="deterministic_red",
+        evidence=SimpleNamespace(
+            verify_status="failed",
+            head_sha="isolated-merge-oid",
+            tree_fingerprint="fp-candidate",
+            failure="verify_command failed",
+            failing_phase="unit",
+        ),
+    )
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=red_check),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge", "description": "Merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 1
+    assert result.status == "blocked_candidate_verify"
+    assert result.block_reason == "candidate verify red; refusing to promote while phase `unit` is failing"
+    promote.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    assert "candidate verify red; refusing to promote while phase `unit` is failing" in capsys.readouterr().out
+
+
+def test_execute_merge_action_isolated_candidate_verify_unavailable_uses_distinct_status(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/candidate-unavailable"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    unavailable_check = SimpleNamespace(
+        classification="unavailable",
+        evidence=SimpleNamespace(
+            verify_status="unavailable",
+            head_sha="isolated-merge-oid",
+            tree_fingerprint="fp-candidate-unavailable",
+            failure="verify command unavailable",
+            failing_phase=None,
+        ),
+    )
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=unavailable_check),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate-unavailable"),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge", "description": "Merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 1
+    assert result.status == "blocked_candidate_verify_unavailable"
+    assert result.block_reason == "candidate verify unavailable; refusing to promote without exact host proof"
+    promote.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    assert "candidate verify unavailable; refusing to promote without exact host proof" in capsys.readouterr().out
+
+
+def test_execute_merge_action_isolated_candidate_verify_pass_promotes_and_persists_main_checkpoint(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/candidate-green"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+    merge_git.rev_parse_if_exists.return_value = "isolated-merge-oid"
+    merge_git.current_branch.return_value = "main"
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch", return_value=()) as promote,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge", "description": "Merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    promote.assert_called_once_with(repo_git, merge_git, "main")
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+    main_state = load_main_integration_verify_state(store)
+    assert main_state is not None
+    assert main_state.verify_status == "passed"
+    assert main_state.head_sha == "isolated-merge-oid"
+    assert main_state.tree_fingerprint == "fp-candidate"
+    assert main_state.environment_identity is None
+
+
+def test_execute_merge_action_isolated_whitespace_only_verify_command_keeps_no_gate_path(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text() + 'main_checkout_isolate: true\nverify_command: "   "\n'
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/whitespace-no-gate"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.current_branch.return_value = "main"
+
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch", return_value=()) as promote,
+        patch(
+            "gza.cli.git_ops.check_candidate_integration_verify",
+            side_effect=AssertionError("candidate verify should stay disabled for whitespace-only verify_command"),
+        ),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {"type": "merge", "description": "Merge"},
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 0
+    assert result.status == "merged"
+    assert result.candidate_verify is None
+    promote.assert_called_once_with(repo_git, merge_git, "main")
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "merged"
+
+    main_state = load_main_integration_verify_state(store)
+    assert main_state is None
 
 
 def test_run_task_backed_rebase_surfaces_resolution_warnings_and_preserves_existing_merge_unit_provenance(
@@ -5131,6 +5456,330 @@ def test_advance_post_merge_red_main_skips_later_merges_and_surfaces_attention(
     assert f"{second.id}" in output
     assert "1 advanced" in output
     assert "1 skipped" in output
+
+
+def test_cmd_advance_merge_uses_isolated_checkout_for_candidate_verify_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text() + "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task, _review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-isolated-candidate-green",
+        when=datetime.now(UTC),
+    )
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    isolated_git = MagicMock(spec=Git)
+    isolated_git.repo_dir = tmp_path / ".gza" / "main-integration"
+
+    green = SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=task, alert_message=None))
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=[green, green]),
+        patch("gza.cli.git_ops.ensure_watch_main_checkout", return_value=isolated_git) as ensure_checkout,
+        patch(
+            "gza.cli.git_ops._execute_merge_action",
+            return_value=SimpleNamespace(
+                rc=0,
+                created_followups=[],
+                reused_followups=[],
+                created_investigation_task_ids=[],
+                reused_investigation_task_ids=[],
+                promotion_warnings=(),
+            ),
+        ) as execute_merge,
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    ensure_checkout.assert_called_once()
+    assert execute_merge.call_args.kwargs["merge_git"] is isolated_git
+    assert execute_merge.call_args.kwargs["merge_current_branch"] == "main"
+    assert "✓ Merged" in output
+
+
+def test_cmd_advance_merge_uses_isolated_checkout_without_candidate_verify_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    store = make_store(tmp_path)
+    task, _review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-isolated-without-verify-command",
+        when=datetime.now(UTC),
+    )
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    isolated_git = MagicMock(spec=Git)
+    isolated_git.repo_dir = tmp_path / ".gza" / "main-integration"
+
+    green = SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=task, alert_message=None))
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=[green, green]),
+        patch("gza.cli.git_ops.ensure_watch_main_checkout", return_value=isolated_git) as ensure_checkout,
+        patch(
+            "gza.cli.git_ops._execute_merge_action",
+            return_value=SimpleNamespace(
+                rc=0,
+                created_followups=[],
+                reused_followups=[],
+                created_investigation_task_ids=[],
+                reused_investigation_task_ids=[],
+                promotion_warnings=(),
+            ),
+        ) as execute_merge,
+        patch(
+            "gza.cli.git_ops.check_candidate_integration_verify",
+            side_effect=AssertionError("candidate verify should stay disabled without verify_command"),
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    ensure_checkout.assert_called_once()
+    assert execute_merge.call_args.kwargs["merge_git"] is isolated_git
+    assert execute_merge.call_args.kwargs["merge_current_branch"] == "main"
+    assert "✓ Merged" in output
+
+
+@pytest.mark.parametrize(
+    ("verify_command_yaml", "case_label"),
+    [
+        ("", "unset"),
+        ('verify_command: "   "\n', "whitespace-only"),
+    ],
+)
+def test_cmd_advance_isolated_checkout_unavailable_blocks_no_gate_merge(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verify_command_yaml: str,
+    case_label: str,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text() + "main_checkout_isolate: true\n" + verify_command_yaml
+    )
+    store = make_store(tmp_path)
+    task, _review = _add_completed_impl_with_approved_review(
+        store,
+        f"feature/advance-isolated-unavailable-{case_label}",
+        when=datetime.now(UTC),
+    )
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    green = SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=task, alert_message=None))
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+        patch("gza.cli.git_ops.check_main_integration_verify", return_value=green),
+        patch(
+            "gza.cli.git_ops.ensure_watch_main_checkout",
+            side_effect=[GitError("refresh failed"), GitError("rebuild failed")],
+        ) as ensure_checkout,
+        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert ensure_checkout.call_count == 2
+    execute_merge.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    assert "isolated host merge checkout unavailable; local main was left unchanged" in output
+    assert "✓ Merged" not in output
+    assert "reason=blocked-candidate-verify" in output
+
+
+def test_cmd_advance_blocked_candidate_verify_surfaces_attention_not_generic_merge_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text() + "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task, _review = _add_completed_impl_with_approved_review(
+        store,
+        "feature/advance-isolated-candidate-red",
+        when=datetime.now(UTC),
+    )
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="Merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=task,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    isolated_git = MagicMock(spec=Git)
+    isolated_git.repo_dir = tmp_path / ".gza" / "main-integration"
+
+    green = SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=task, alert_message=None))
+    blocked_result = SimpleNamespace(
+        rc=1,
+        status="blocked_candidate_verify",
+        block_reason="candidate verify red; refusing to promote while phase `unit` is failing",
+        candidate_verify=CandidateIntegrationVerifyCheck(
+            evidence=CandidateIntegrationVerifyEvidence(
+                gate_enabled=True,
+                verify_command="./bin/tests",
+                verify_timeout_seconds=300,
+                verify_timeout_grace_seconds=5.0,
+                environment_identity=MainIntegrationVerifyEnvironmentIdentity(
+                    runner_class="host",
+                    platform_system="Darwin",
+                    platform_machine="arm64",
+                    python_implementation="CPython",
+                    python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+                ),
+                tree_fingerprint="fp-advance-candidate-red",
+                head_sha="isolated-merge-oid",
+                verify_status="failed",
+                verify_exit_status="1",
+                failure="worker died in host-only unit path",
+                failing_phase="unit",
+                reviewed_branch="main",
+                working_directory=str(tmp_path),
+                captured_at=datetime.now(UTC),
+            ),
+            classification="deterministic_red",
+            merges_halted=True,
+            remediation=None,
+            verify_runs=2,
+        ),
+        created_followups=[],
+        reused_followups=[],
+        created_investigation_task_ids=[],
+        reused_investigation_task_ids=[],
+        promotion_warnings=(),
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge", "description": "Merge"}),
+        patch("gza.cli.git_ops.check_main_integration_verify", return_value=green),
+        patch("gza.cli.git_ops.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.git_ops._execute_merge_action", return_value=blocked_result),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "candidate verify blocked promotion on fp-advance-candidate-red; phase `unit` failed before main changed" in output
+    assert "✗ Merge failed" not in output
+    assert "reason=blocked-candidate-verify" in output
 
 
 def test_advance_refreshes_red_main_before_preview_and_skips_confirmation_prompt(

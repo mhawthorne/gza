@@ -22,8 +22,9 @@ It does **not** own general watch-cycle ordering or merge eligibility. Those bel
 
 When `main_checkout_isolate` is enabled:
 
-1. `gza watch` MUST stage each merge attempt in a dedicated detached integration checkout
-   that is separate from any operator-attached default-branch checkout.
+1. Automated default-branch merge flows that enable `main_checkout_isolate` MUST stage
+   each merge attempt in a dedicated detached integration checkout that is separate from
+   any operator-attached default-branch checkout.
 2. A staged merge MUST count as landed only after the real default-branch ref is advanced
    to the detached merge result.
 3. If some attached checkout currently has the default branch checked out, watch MUST
@@ -45,6 +46,9 @@ When `main_checkout_isolate` is enabled:
    NOT re-apply or drop some older shifted stash entry by reusing the saved `stash@{n}`
    ordinal. Any cleanup failure that leaves the operator stash parked or unrestored MUST
    be surfaced in the promotion failure.
+10. If candidate verify blocks promotion after the detached checkout was mutated, the next
+    automated merge attempt in the same command cycle MUST first refresh or rebuild that
+    checkout back to the canonical target, or the merge lane MUST stop for the cycle.
 
 ## Rationale
 

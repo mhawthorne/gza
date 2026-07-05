@@ -694,8 +694,12 @@ def _coerce_optional_float(value: object) -> float | None:
     return None
 
 
-def _normalized_verify_command(config: Config) -> str:
+def normalized_verify_command(config: Config) -> str:
     return config.verify_command.strip() if isinstance(config.verify_command, str) else ""
+
+
+def verify_gate_enabled(config: Config) -> bool:
+    return bool(normalized_verify_command(config))
 
 
 def _normalize_python_executable_family(executable: str) -> str | None:
@@ -721,8 +725,8 @@ def _current_gate_identity(
     *,
     runner_class: Literal["host", "container"],
 ) -> MainIntegrationVerifyGateIdentity:
-    verify_command = _normalized_verify_command(config)
-    gate_enabled = bool(verify_command)
+    verify_command = normalized_verify_command(config)
+    gate_enabled = verify_gate_enabled(config)
     if not gate_enabled:
         return MainIntegrationVerifyGateIdentity(
             gate_enabled=False,
@@ -938,6 +942,62 @@ def persist_main_integration_verify_pending_retire_signatures(
         alert_message=state.alert_message,
         pending_retirement_signatures=pending_retirement_signatures,
         red_since=getattr(state, "red_since", None),
+        captured_at=captured_at,
+    )
+    refreshed = load_main_integration_verify_state(store)
+    assert refreshed is not None
+    return refreshed
+
+
+def promote_candidate_integration_verify_evidence(
+    store: SqliteTaskStore,
+    *,
+    evidence: CandidateIntegrationVerifyEvidence,
+    promoted_head_sha: str,
+    promoted_tree_fingerprint: str,
+) -> MainIntegrationVerifyState | None:
+    """Persist verified candidate evidence as the canonical main checkpoint.
+
+    The caller must only invoke this after promoting the exact verified candidate tree.
+    If the promoted head/tree do not exactly match the verified evidence, the helper
+    fails closed and does not mutate the canonical checkpoint.
+    """
+    if evidence.verify_status != "passed":
+        return None
+    if not evidence.head_sha or evidence.head_sha != promoted_head_sha:
+        return None
+    if not evidence.tree_fingerprint or evidence.tree_fingerprint != promoted_tree_fingerprint:
+        return None
+
+    task = ensure_main_integration_verify_task(store)
+    prior_state = load_main_integration_verify_state(store)
+    captured_at = evidence.captured_at or datetime.now(UTC)
+    pending_retirement_signatures = _pending_retirement_signatures_from_state(prior_state)
+
+    task.review_verify_command = evidence.verify_command or "(verify_command unavailable)"
+    task.review_verify_status = evidence.verify_status
+    task.review_verify_exit_status = evidence.verify_exit_status
+    task.review_verify_failure = evidence.failure
+    task.review_verify_head_sha = evidence.head_sha
+    task.review_verify_branch = evidence.reviewed_branch
+    task.review_verify_captured_at = captured_at
+    task.review_verify_artifact_file = None
+
+    _persist_main_integration_verify_payload(
+        store,
+        task,
+        gate_enabled=evidence.gate_enabled,
+        verify_command=evidence.verify_command,
+        verify_timeout_seconds=evidence.verify_timeout_seconds,
+        verify_timeout_grace_seconds=evidence.verify_timeout_grace_seconds,
+        environment_identity=evidence.environment_identity,
+        tree_fingerprint=evidence.tree_fingerprint,
+        head_sha=evidence.head_sha,
+        failure_signature=None,
+        failing_phase=evidence.failing_phase,
+        alert_message=None,
+        pending_retirement_signatures=pending_retirement_signatures,
+        red_since=None,
         captured_at=captured_at,
     )
     refreshed = load_main_integration_verify_state(store)

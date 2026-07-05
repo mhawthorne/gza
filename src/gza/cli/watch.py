@@ -204,6 +204,7 @@ from .advance_executor import (
 )
 from .execution import _spawn_background_iterate
 from .git_ops import (
+    _blocked_candidate_verify_attention_key,
     _collect_advance_completed_tasks as _git_ops_collect_advance_completed_tasks,
     _execute_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
@@ -213,6 +214,7 @@ from .git_ops import (
     _unimplemented_implement_prompt,
     cleanup_failed_merge_checkout,
     ensure_watch_main_checkout,
+    format_blocked_candidate_verify_message,
 )
 from .query import _resolve_incomplete_owner_task
 
@@ -2699,6 +2701,27 @@ def _emit_main_verify_attention(*, log: "_WatchLog", state: Any, now: datetime) 
     log.emit_attention(
         attention_key=attention_key,
         message=_format_main_verify_attention_message(state, now=now),
+    )
+
+
+def _emit_blocked_candidate_verify_attention(
+    *,
+    log: "_WatchLog",
+    display_task: DbTask,
+    merge_result: Any,
+) -> None:
+    task_id = getattr(display_task, "id", None)
+    if task_id is None:
+        return
+    log.emit_attention(
+        attention_key=_blocked_candidate_verify_attention_key(
+            str(task_id),
+            getattr(merge_result, "candidate_verify", None),
+        ),
+        message=format_blocked_candidate_verify_message(
+            str(display_task.id),
+            merge_result,
+        ),
     )
 
 
@@ -5661,6 +5684,19 @@ def _run_cycle(
                         )
                     work_done = True
                     continue
+                if isolation_enabled:
+                    try:
+                        merge_git = _run_with_optional_stdout_suppressed(
+                            quiet,
+                            lambda: ensure_watch_main_checkout(config, git, target_branch),
+                        )
+                    except GitError as exc:
+                        log.emit(
+                            "WARN",
+                            f"isolated merge checkout refresh failed; rebuilding: {exc}",
+                        )
+                        if not _rebuild_isolated_checkout():
+                            continue
                 merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
                 merge_execution_branch = target_branch if isolation_enabled else current_branch
                 merge_event = None
@@ -5793,6 +5829,16 @@ def _run_cycle(
                         message="merges blocked: main checkout has uncommitted changes - commit or stash them first",
                     )
                     break
+                if getattr(merge_result, "status", None) in {
+                    "blocked_candidate_verify",
+                    "blocked_candidate_verify_unavailable",
+                }:
+                    _emit_blocked_candidate_verify_attention(
+                        log=log,
+                        display_task=display_task,
+                        merge_result=merge_result,
+                    )
+                    continue
                 if rc == 0:
                     work_done = True
                 else:

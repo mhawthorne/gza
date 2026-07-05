@@ -582,6 +582,20 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `verify_command` are an explicit no-gate exception: they MAY persist an `unavailable`
   checkpoint with `exit_status="not configured"` for visibility, but that checkpoint MUST
   NOT halt merges or emit the red-main attention signal.
+- When automation uses an isolated host merge checkout to stage a merge before updating
+  the canonical local target, that isolated checkout becomes the authoritative
+  pre-promotion verify subject. With a configured verify gate, the shared merge executor
+  MUST run candidate verify on the exact staged candidate tree before updating the
+  canonical target ref, MUST fail closed when the required isolated checkout is
+  unavailable, and MUST block promotion when the candidate result is red or exact-tree
+  freshness cannot be proven. The canonical checkpoint MAY be copied forward from that
+  candidate evidence only when the exact verified candidate tree is the one promoted onto
+  the canonical target. Before any later merge attempt in the same command cycle, the
+  caller MUST refresh or rebuild that isolated checkout back to the canonical target, or
+  stop the merge lane for the cycle; later candidates MUST NOT run on top of a blocked
+  candidate tree. Watch's caller surface MUST preserve that blocked-candidate outcome
+  distinctly, surfacing it as candidate-verify attention for the merge subject rather
+  than collapsing it into a generic merge failure.
 
 Note: the "implementation unit with no review" rule above applies only when the
 implementation still has reviewable commits or diff against the target. Terminal
