@@ -2158,6 +2158,109 @@ def test_execute_repair_plan_slice_materialization_drops_partial_tasks_and_recre
     assert next_action["reason"] == "already_materialized"
 
 
+def test_execute_repair_plan_slice_materialization_drops_extra_pending_partial_and_reuses_complete_artifact(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    _mark_completed(plan)
+    store.update(plan)
+
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    _mark_completed(review)
+    manifest_payload = _build_plan_review_manifest_payload(plan.id)
+    review.output_content = (
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+        + json.dumps(manifest_payload)
+        + "\n```\n"
+    )
+    store.update(review)
+
+    manifest = validate_plan_review_manifest(
+        manifest_payload,
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=manifest,
+        trigger_source="plan-review",
+        require_review_before_merge=True,
+    )
+
+    created_tasks = store.add_tasks_with_artifact_atomic(
+        tasks=task_specs,
+        artifact_task_id=review.id,
+        artifact_kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
+        artifact_label="plan_review_materialization",
+        artifact_path=".gza/artifacts/materialized.txt",
+        artifact_byte_size=0,
+        artifact_sha256="",
+        artifact_metadata_builder=lambda tasks: {
+            "schema_version": PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
+            "review_task_id": review.id,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "manifest_digest": plan_review_manifest_digest(manifest),
+            "trigger_source": "plan-review",
+            "create_review": True,
+            "task_ids": [task.id for task in tasks if task.id is not None],
+        },
+    )
+    created_task_ids = {task.id for task in created_tasks if task.id is not None}
+
+    extra_partial = store.add(
+        task_specs[0].prompt,
+        task_type="implement",
+        based_on=plan.id,
+        trigger_source="plan-review",
+        tags=task_specs[0].tags,
+        review_scope=task_specs[0].review_scope,
+        create_review=task_specs[0].create_review,
+    )
+    assert extra_partial.id is not None
+
+    repair_action = evaluate_advance_rules(config, store, _PlanRepairFakeGit(), plan, "main")
+    assert repair_action["type"] == "repair_plan_slice_materialization"
+    assert repair_action["partial_task_ids"] == (extra_partial.id,)
+    assert repair_action["repair_trigger_source"] == "plan-review"
+
+    result = execute_advance_action(
+        task=plan,
+        action=repair_action,
+        context=_build_plan_review_repair_context(config=config, store=store),
+    )
+
+    repaired_partial = store.get(extra_partial.id)
+    assert repaired_partial is not None
+    assert result.status == "success"
+    assert repaired_partial.status == "dropped"
+    assert repaired_partial.drop_reason == PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON
+    assert "Dropped partial plan-review slices" in result.message
+    assert extra_partial.id in result.message
+    assert "Reused implementation slices" in result.message
+
+    active_implement_tasks = [task for task in store.get_all() if task.task_type == "implement" and task.status != "dropped"]
+    active_implement_ids = {task.id for task in active_implement_tasks if task.id is not None}
+    assert active_implement_ids == created_task_ids
+
+    artifacts = store.list_artifacts(review.id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND)
+    assert len(artifacts) == 1
+    assert set(artifacts[0].metadata["task_ids"]) == created_task_ids
+
+    next_action = evaluate_advance_rules(config, store, _PlanRepairFakeGit(), plan, "main")
+    assert next_action["type"] == "skip"
+    assert next_action["reason"] == "already_materialized"
+
+
 def test_execute_repair_plan_slice_materialization_skips_stale_overlap_when_full_artifact_now_reuses_partial(
     tmp_path: Path,
 ) -> None:
