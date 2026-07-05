@@ -2160,6 +2160,37 @@ def test_revalidate_terminal_no_work_merge_units_restores_recorded_head_diff_to_
     assert refreshed_task.merge_status == "unmerged"
 
 
+def test_revalidate_terminal_no_work_merge_units_is_no_op_after_false_redundant_recovery(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/false-redundant-idempotent")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.refresh_merge_unit_head(unit.id, head_sha="recorded-head-sha")
+    store.set_merge_unit_state(unit.id, "redundant")
+
+    git = Mock()
+    git.cached.return_value = nullcontext()
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "recorded-head-sha": "recorded-head-sha",
+    }.get(ref)
+    git.is_patch_equivalent_commit_present_on_target.return_value = False
+
+    first_results = revalidate_terminal_no_work_merge_units(store, git)
+    second_results = revalidate_terminal_no_work_merge_units(store, git)
+
+    assert len(first_results) == 1
+    assert first_results[0].merge_status == "unmerged"
+    assert second_results == ()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    refreshed_task = store.get(task.id)
+    assert refreshed_task is not None
+    assert refreshed_task.merge_status == "unmerged"
+    assert git.is_patch_equivalent_commit_present_on_target.call_count == 1
+
+
 def test_revalidate_terminal_no_work_merge_units_leaves_unresolvable_recorded_head_unchanged(
     tmp_path,
     caplog,
