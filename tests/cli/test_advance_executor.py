@@ -2136,6 +2136,8 @@ def test_execute_repair_plan_slice_materialization_drops_partial_tasks_and_recre
     assert repaired_partial.drop_reason == PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON
     assert "Dropped partial plan-review slices" in result.message
     assert partial.id in result.message
+    assert result.plan_review_materialization is not None
+    assert result.plan_review_materialization.created is True
 
     active_implement_tasks = [task for task in store.get_all() if task.task_type == "implement" and task.status != "dropped"]
     assert len(active_implement_tasks) == 2
@@ -2247,6 +2249,9 @@ def test_execute_repair_plan_slice_materialization_drops_extra_pending_partial_a
     assert "Dropped partial plan-review slices" in result.message
     assert extra_partial.id in result.message
     assert "Reused implementation slices" in result.message
+    assert result.plan_review_materialization is not None
+    assert result.plan_review_materialization.created is False
+    assert {task.id for task in result.plan_review_materialization.tasks if task.id is not None} == created_task_ids
 
     active_implement_tasks = [task for task in store.get_all() if task.task_type == "implement" and task.status != "dropped"]
     active_implement_ids = {task.id for task in active_implement_tasks if task.id is not None}

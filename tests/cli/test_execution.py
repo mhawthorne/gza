@@ -11318,6 +11318,101 @@ class TestIterateCommand:
         assert "unsupported_action:repair_plan_slice_materialization" not in output
         assert store.list_artifacts(review.id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND)
 
+    def test_plan_iterate_repair_plan_slice_materialization_uses_structured_result_not_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+        from unittest.mock import patch
+
+        from gza.cli._common import _materialize_plan_review_slices
+        from gza.cli.advance_executor import AdvanceActionExecutionResult
+        from gza.cli.execution import cmd_iterate
+        from gza.cli._common import PlanReviewMaterializationResult
+        from gza.config import Config
+        from gza.plan_review_verdict import validate_plan_review_manifest
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+
+        plan_task = store.add("Already materialized plan", task_type="plan")
+        assert plan_task.id is not None
+        plan_task.status = "completed"
+        plan_task.completed_at = datetime.now(UTC)
+        store.update(plan_task)
+
+        review = store.add("Plan review", task_type="plan_review", depends_on=plan_task.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = self._approved_plan_review_output(plan_task.id)
+        store.update(review)
+
+        manifest = validate_plan_review_manifest(
+            json.loads(self._approved_plan_review_output(plan_task.id).split("```json\n", 1)[1].rsplit("\n```", 1)[0]),
+            markdown_verdict="APPROVED",
+            source_task_id=plan_task.id,
+            source_task_type="plan",
+            max_slice_timeout_minutes=30,
+        )
+        materialization = _materialize_plan_review_slices(
+            config,
+            store,
+            plan_task,
+            review,
+            manifest,
+            trigger_source="manual",
+            require_review_before_merge=True,
+        )
+        assert materialization.created is True
+
+        args = argparse.Namespace(
+            impl_task_id=plan_task.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        repair_action = {
+            "type": "repair_plan_slice_materialization",
+            "description": "Repair partial plan-review slice materialization",
+            "plan_review_task": review,
+            "plan_source_task": plan_task,
+            "manifest": manifest,
+            "partial_task_ids": ("gza-9999",),
+            "repair_trigger_source": "manual",
+        }
+        exec_result = AdvanceActionExecutionResult(
+            action_type="repair_plan_slice_materialization",
+            status="success",
+            message="Adjusted slice reconciliation wording without legacy markers.",
+            success_message="Adjusted slice reconciliation wording without legacy markers.",
+            work_done=True,
+            handled_task_id=review.id,
+            created_task=materialization.tasks[0],
+            plan_review_materialization=PlanReviewMaterializationResult(
+                tasks=materialization.tasks,
+                created=False,
+            ),
+        )
+
+        with (
+            patch("gza.cli.execution.determine_next_action", return_value=repair_action),
+            patch("gza.cli.execution.execute_advance_action", return_value=exec_result),
+        ):
+            assert cmd_iterate(args) == 0
+
+        output = capsys.readouterr().out
+        assert "Iterate complete: MATERIALIZED (already_materialized)" in output
+        assert "Adjusted slice reconciliation wording without legacy markers." in output
+        assert "Reused implement task" in output
+        assert "Created implement task" not in output
+
     def test_plan_improve_iterate_existing_implement_skips_without_duplicates(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

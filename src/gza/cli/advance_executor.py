@@ -155,6 +155,7 @@ class AdvanceActionExecutionResult:
     reused_investigations: tuple[DbTask, ...] = ()
     improve_mode: str | None = None
     failed_improve: DbTask | None = None
+    plan_review_materialization: PlanReviewMaterializationResult | None = None
     attention_type: str | None = None
     attention_reason: str | None = None
     worker_label: str | None = None
@@ -1417,6 +1418,7 @@ def execute_advance_action(
             work_done=bool(created_tasks),
             handled_task_id=review_task.id,
             created_task=created_tasks[0] if created_tasks else None,
+            plan_review_materialization=materialization,
         )
 
     if action_type == "release_approved_plan_review":
@@ -1536,6 +1538,7 @@ def execute_advance_action(
             work_done=True,
             handled_task_id=review_task.id,
             created_task=repair_result.materialization.tasks[0] if repair_result.materialization.tasks else None,
+            plan_review_materialization=repair_result.materialization,
         )
 
     if action_type == "create_review":

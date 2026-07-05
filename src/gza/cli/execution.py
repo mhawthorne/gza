@@ -70,7 +70,6 @@ from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
 from ..merge_state import resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_error_message
-from ..plan_review_materialization import load_materialized_plan_slice_set
 from ..plan_review_verdict import PlanReviewManifest, get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
 from ..query import (
@@ -6972,21 +6971,19 @@ def _cmd_iterate_plan(
                 final_message = manifest_error or "approved plan review is missing materialization inputs"
                 final_exit_code = 3
                 break
-            materialized_tasks = load_materialized_plan_slice_set(
-                store,
-                review_task=review_task,
-                plan_source_task=action_source,
-                manifest=manifest,
-            ) or []
+            repair_materialization = exec_result.plan_review_materialization
+            if repair_materialization is None:
+                final_status = "blocked"
+                final_stop_reason = "invalid_materialization_result"
+                final_message = "plan materialization repair succeeded without structured materialization data"
+                final_exit_code = 3
+                break
             _emit_plan_slice_materialization(
-                PlanReviewMaterializationResult(
-                    tasks=materialized_tasks,
-                    created="Rematerialized implementation slices:" in exec_result.message,
-                ),
+                repair_materialization,
                 plan_source_id=action_source.id or "unknown",
                 plan_review_id=review_task.id or "unknown",
             )
-            for task in materialized_tasks:
+            for task in repair_materialization.tasks:
                 _append_iterate_summary_row(
                     store,
                     summary_rows,
@@ -6995,11 +6992,7 @@ def _cmd_iterate_plan(
                     task=task,
                 )
             final_status = "materialized"
-            final_stop_reason = (
-                "already_materialized"
-                if "Reused implementation slices:" in exec_result.message
-                else "materialized"
-            )
+            final_stop_reason = "materialized" if repair_materialization.created else "already_materialized"
             final_exit_code = 0
             break
 
