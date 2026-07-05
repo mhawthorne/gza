@@ -5765,6 +5765,10 @@ ADVANCE_RULES: list[AdvanceRule] = [
                     and ctx.plan_materialization_state is not None
                     and not ctx.plan_materialization_state.partial_slice_descendants_detected
                 )
+                or (
+                    ctx.plan_review_verdict == "CHANGES_REQUESTED"
+                    and ctx.completed_plan_review_cycles >= ctx.max_plan_review_cycles
+                )
             )
         ),
         action=lambda ctx: {
@@ -6001,14 +6005,14 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 and ctx.plan_materialization_state.materialized
             )
         ),
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": "SKIP: plan review reached max_plan_review_cycles without approval",
-            },
-            reason="plan-review-max-cycles-reached",
-            subject_task_id=ctx.task.id,
-        ),
+        action=lambda ctx: {
+            "type": "create_implement",
+            "description": (
+                "Create and start implement task "
+                "(accept latest plan revision after capped plan-review churn)"
+            ),
+            "plan_review_cycle_limit_reached": True,
+        },
     ),
     AdvanceRule(
         name="plan_create_improve",

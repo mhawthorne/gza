@@ -3964,6 +3964,23 @@ def _classify_plan_iterate_skip(action: dict[str, Any]) -> tuple[str, str]:
     return "skipped", "skip"
 
 
+def _continue_plan_iterate_through_direct_implement(
+    *,
+    args: argparse.Namespace,
+    config: Config,
+    implement_task: DbTask,
+) -> int:
+    """Hand off capped plan iterate direct-implement fallback to shared implement iterate."""
+    assert implement_task.id is not None
+    iterate_args = argparse.Namespace(**vars(args))
+    iterate_args.impl_task_id = implement_task.id
+    iterate_args.resume = False
+    iterate_args.retry = False
+    iterate_args.background = False
+    iterate_args.dry_run = False
+    return _cmd_iterate_impl(iterate_args, config, implement_task)
+
+
 def _cmd_iterate_impl(
     args: argparse.Namespace,
     config: Config,
@@ -6465,7 +6482,7 @@ def _cmd_iterate_plan(
     config: Config,
     plan_task: DbTask | None = None,
 ) -> int:
-    """Run an automated plan lifecycle loop without entering implementation iteration."""
+    """Run an automated plan lifecycle loop, handing direct-implement fallback to implement iterate."""
     store = get_store(config)
     max_iterations_arg = getattr(args, "max_iterations", None)
     max_iterations = max_iterations_arg if max_iterations_arg is not None else config.iterate_max_iterations
@@ -7029,11 +7046,31 @@ def _cmd_iterate_plan(
             break
 
         if action_type == "create_implement":
-            final_status = "blocked"
-            final_stop_reason = "create_implement"
-            final_message = f"No plan-review loop is configured; use uv run gza implement {source_task.id}."
-            final_exit_code = 1
-            break
+            if not bool(action.get("plan_review_cycle_limit_reached")):
+                final_status = "blocked"
+                final_stop_reason = "create_implement"
+                final_message = f"No plan-review loop is configured; use uv run gza implement {source_task.id}."
+                final_exit_code = 1
+                break
+            slug = _get_base_task_slug(source_task)
+            if slug:
+                prompt = f"Implement plan from task {source_task.id}: {slug}"
+            else:
+                prompt = f"Implement plan from task {source_task.id}"
+            implement_task = _create_implementation_task_from_source(
+                store,
+                source_task,
+                prompt=prompt,
+                trigger_source="manual",
+                create_review=getattr(config, "require_review_before_merge", True),
+            )
+            print(f"  Created implement task {implement_task.id}")
+            print(f"  Continuing iterate through implement lifecycle for {implement_task.id}...")
+            return _continue_plan_iterate_through_direct_implement(
+                args=args,
+                config=config,
+                implement_task=implement_task,
+            )
 
         if action_type == "skip":
             final_status, final_stop_reason = _classify_plan_iterate_skip(action)

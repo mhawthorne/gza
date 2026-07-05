@@ -1362,7 +1362,7 @@ def test_completed_plan_improve_supersedes_source_only_after_completion(tmp_path
     assert revised_action["plan_review_task"].id == revised_review.id
 
 
-def test_plan_review_cycle_limit_counts_across_plan_improve_chain(tmp_path: Path) -> None:
+def test_plan_review_cycle_limit_accepts_latest_revision_and_creates_implement(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.max_plan_review_cycles = 2
@@ -1394,8 +1394,48 @@ def test_plan_review_cycle_limit_counts_across_plan_improve_chain(tmp_path: Path
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "plan-review-max-cycles-reached"
+    assert action["type"] == "create_implement"
+    assert "capped plan-review churn" in action["description"]
+
+
+def test_plan_review_cycle_limit_with_existing_implement_skips_duplicate_materialization(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.max_plan_review_cycles = 2
+
+    plan = store.add("Plan ingestion options", task_type="plan")
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    first_review = store.add("Review the plan", task_type="plan_review", depends_on=plan.id)
+    assert first_review.id is not None
+    first_review.status = "completed"
+    first_review.completed_at = datetime(2026, 6, 1, 13, 0, tzinfo=UTC)
+    first_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(first_review)
+
+    improve = store.add("Revise the plan", task_type="plan_improve", based_on=plan.id, depends_on=first_review.id)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
+    store.update(improve)
+
+    second_review = store.add("Review revised plan", task_type="plan_review", depends_on=improve.id)
+    assert second_review.id is not None
+    second_review.status = "completed"
+    second_review.completed_at = datetime(2026, 6, 1, 15, 0, tzinfo=UTC)
+    second_review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(second_review)
+
+    existing_implement = store.add("Existing implement child", task_type="implement", based_on=improve.id)
+    assert existing_implement.id is not None
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), improve, "main")
+
+    assert action["type"] == "skip"
+    assert action["reason"] == "already_has_implement"
 
 
 def test_plan_review_first_rejection_below_limit_creates_one_plan_improve(tmp_path: Path) -> None:
@@ -14995,7 +15035,6 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "failed_task_skip",
         "awaiting_human_plan_review",
         "plan_invalid_approved_review",
-        "plan_max_cycles_reached",
         "plan_review_failed_retry_limit",
         "plan_partial_materialization_requires_repair",
         "plan_review_manual_creation_required",

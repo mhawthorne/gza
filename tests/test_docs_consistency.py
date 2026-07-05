@@ -1622,6 +1622,16 @@ def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() ->
         assert snippet in docker_content
 
 
+def test_max_plan_review_cycles_docs_describe_direct_implement_exit() -> None:
+    """Config docs should describe capped CHANGES_REQUESTED churn as a direct-implement exit, not a human park."""
+    docs_root = Path(__file__).resolve().parents[1] / "docs"
+    config_content = (docs_root / "configuration.md").read_text()
+
+    assert "Cap for repeated `CHANGES_REQUESTED` `plan_review` / `plan_improve` churn" in config_content
+    assert "accepts the latest plan revision and continues through the direct-implement path" in config_content
+    assert "before lifecycle automation parks for discussion" not in config_content
+
+
 def test_improve_related_skills_describe_comments_as_feedback_source() -> None:
     """Bundled improve-related skills should mention unresolved task comments as a first-class
     feedback source and describe the comments-only fallback when no review exists.

@@ -64,7 +64,7 @@ Gza reads configuration from three YAML layers:
 | `advance_create_plan_reviews` | Boolean | `true` | Auto-create `plan_review` tasks for completed non-held plans; when disabled, lifecycle parks for manual plan-review creation instead |
 | `advance_off_topic_verify_unblock` | Boolean | `false` | Permit the audited off-topic verify-only unblock lane after trusted same-head/tree green evidence already exists; lifecycle still fails closed unless full failing-node enumeration, exact fingerprint binding, and durable investigation-task persistence all succeed |
 | `require_plan_review_before_implement` | Boolean | `true` | Require an approved `plan_review` before lifecycle automation materializes implementation work from a plan |
-| `max_plan_review_cycles` | Integer | `2` | Cap for `plan_review` / `plan_improve` loops before lifecycle automation parks for discussion |
+| `max_plan_review_cycles` | Integer | `2` | Cap for repeated `CHANGES_REQUESTED` `plan_review` / `plan_improve` churn before lifecycle automation accepts the latest plan revision and continues through the direct-implement path |
 | `max_failed_plan_review_retries` | Integer | `3` | Max failed `plan_review` attempts for one plan source before lifecycle parks it as `needs_attention` instead of auto-spawning another review; set `0` to escalate after the first failure |
 | `max_plan_slices` | Integer or null | `null` | Optional cap on how many implementation slices one approved plan review may materialize automatically |
 | `plan_slice_target_timeout_minutes` | Integer or null | `code_task_diff_timeout_cap_minutes` | Optional reviewer sizing budget for one implementation slice; when unset it derives from code-task timeout sizing |

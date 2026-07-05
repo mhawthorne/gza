@@ -91,7 +91,7 @@ Manual `implement` follow-up for a held plan is intentionally explicit. `uv run 
 | Completed non-held plan with `CHANGES_REQUESTED` plan review | `create_plan_improve` / `run_plan_improve` / `wait_plan_improve` — revise the plan until approval or the configured iteration bound |
 | Completed non-held plan with `NEEDS_DISCUSSION` or unknown plan-review verdict | `needs_discussion` — stop for a human (`reason=plan-review-needs-discussion` or `plan-review-unknown-verdict`) |
 | Completed non-held plan with auto plan-review creation disabled | `needs_discussion` — require manual plan-review creation (`reason=plan-review-needs-manual-creation`) |
-| Completed non-held plan whose plan-review loop hit `max_plan_review_cycles` | `needs_discussion` — stop repeated plan churn (`reason=plan-review-max-cycles-reached`) |
+| Completed non-held plan whose plan-review loop hit `max_plan_review_cycles` | `create_implement` — accept the latest plan revision for lifecycle purposes and continue on the shared direct-implement path |
 | Completed non-held plan with approved plan review slices partially present, the current partial slice set is a proven safe pending subset of the validated manifest, and the durable materialization record is either missing/incomplete or already complete while stale extra pending duplicate slice descendants remain outside the recorded set | `repair_plan_slice_materialization` — revalidate the partial slice set, drop the safe pending partial rows, and rematerialize the full validated slice set through the shared guarded executor path using the same matched slice `trigger_source` that proved the repair candidate |
 | Completed non-held plan with approved plan review slices partially present, but the materialization state is ambiguous or unsafe | `needs_discussion` — stop for manual repair or drop of the partial slice set (`reason=plan-review-materialization-repair-needed`) |
 | Completed non-held plan with `require_plan_review_before_implement=false` | `create_implement` — legacy compatibility path |
@@ -99,9 +99,10 @@ Manual `implement` follow-up for a held plan is intentionally explicit. `uv run 
 
 Foreground `gza iterate <plan>` now drives this same action table directly for `plan`
 and `plan_improve` sources. In that mode, iterate may run/recover the plan source
-itself, then create/run `plan_review` or `plan_improve`, and finally materialize the
-approved slice set. It stops at materialization; it does not continue into the new
-implement children.
+itself, then create/run `plan_review` or `plan_improve`, and finally either materialize
+the approved slice set or continue through the shared direct-implement path when capped
+plan-review churn is accepted for lifecycle purposes. It stops at slice materialization;
+only the direct-implement fallback continues into the created implement child.
 
 ### 2. Explore source follow-up
 

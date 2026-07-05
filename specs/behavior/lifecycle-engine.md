@@ -111,6 +111,10 @@ and default to **off**.
   Repeated failed automated `plan_review` attempts for the same plan source MUST be bounded by
   a circuit breaker; once the failed-attempt cap is reached, the engine MUST park with
   `plan-review-repeatedly-failed` instead of spawning another review.
+  `max_plan_review_cycles` bounds only repeated `CHANGES_REQUESTED` plan-review churn on the
+  current plan revision chain. When that bound is reached, lifecycle MUST accept the latest
+  completed plan revision for lifecycle purposes and continue through the shared
+  direct-implement path; it MUST NOT park waiting for a human to re-enable automation.
   If implement descendants exist for an approved manifest but the durable materialization
   record is missing, incomplete, or already complete while stale extra pending duplicate
   slice descendants remain outside the recorded set, the engine MUST first attempt
@@ -657,7 +661,6 @@ is a spec change. The accompanying human message is free text.
 | `plan-review-needs-discussion` | needs_discussion | §1 completed plan review returned `NEEDS_DISCUSSION` |
 | `plan-review-unknown-verdict` | needs_discussion | §1 completed plan review verdict missing or unparseable |
 | `plan-review-repeatedly-failed` | needs_discussion | §1 failed automated plan-review attempts reached the configured cap |
-| `plan-review-max-cycles-reached` | needs_discussion | §1 `plan_review` / `plan_improve` loop hit `max_plan_review_cycles` |
 | `plan-review-materialization-repair-needed` | needs_discussion | §1 approved manifest has an ambiguous or unsafe partial materialization state that cannot be auto-repaired safely |
 | `explore-needs-follow-up-decision` | needs_discussion | §1 completed explore, no plan/implement follow-up |
 | `project-scope-violation` | ScopeParked | §3 diff touches paths outside scope, not tagged `cross-project` |
