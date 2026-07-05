@@ -73,10 +73,11 @@ The unit and functional verify lanes keep their wall-clock behavior unchanged
 on the all-green path, but they now have bounded bridges for contention-style
 parallel failures:
 
-- the parallel xdist pass runs first with the relevant rerun cap plus one
-  failure (`--maxfail=GZA_UNIT_RERUN_CAP+1` for unit, or
-  `--maxfail=GZA_FUNCTIONAL_RERUN_CAP+1` for functional), so the harness can
-  see the whole bounded failure set instead of stopping at the first failure;
+- the parallel xdist pass runs first with the relevant lane cap plus one
+  failure (`--maxfail=GZA_UNIT_RERUN_CAP+1` for the unit lane, or
+  `--maxfail=GZA_FUNCTIONAL_RERUN_CAP+1` for the functional lane), so the
+  harness can see the whole bounded failure set instead of stopping at the
+  first failure;
 - if that pass fails only because a bounded set of per-test node IDs failed,
   the harness reruns just those node IDs serially with the normal per-test
   timeout and logs each `PARALLEL-ONLY FAILURE (passed serially)` line;
