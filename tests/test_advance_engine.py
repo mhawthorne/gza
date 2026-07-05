@@ -46,6 +46,7 @@ from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
     plan_review_manifest_digest,
 )
+from gza.query import get_reviews_for_root
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_scope import (
@@ -15287,6 +15288,85 @@ def test_repeated_failed_closing_reviews_escalate_to_needs_attention(
     action = resolve_closing_review_action(
         task=impl,
         reviews=store.get_reviews_for_task(impl.id),
+        latest_completed_review=stale_review,
+        latest_completed_code_change=improve,
+        max_failed_closing_review_retries=max_retries,
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "closing-review-failed-max-retries"
+    assert action["subject_task_id"] == impl.id
+    assert str(max_retries) in action["description"]
+
+
+def test_failed_closing_review_recovery_chain_counts_toward_retry_cap(
+    tmp_path: Path,
+) -> None:
+    """Failed automatic review retries must exhaust the same closing-review retry budget."""
+    store = _make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feat/closing-review-retry-chain"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    impl.review_cleared_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(impl)
+
+    first_failed = store.add(
+        "Closing review attempt 1",
+        task_type="review",
+        based_on=impl.id,
+        depends_on=impl.id,
+    )
+    assert first_failed.id is not None
+    first_failed.status = "failed"
+    first_failed.failure_reason = "UNKNOWN"
+    first_failed.created_at = datetime(2026, 1, 4, tzinfo=UTC)
+    first_failed.completed_at = datetime(2026, 1, 4, 1, tzinfo=UTC)
+    store.update(first_failed)
+
+    retry_failed = store.add(
+        first_failed.prompt,
+        task_type="review",
+        based_on=first_failed.id,
+        depends_on=first_failed.depends_on,
+        recovery_origin="retry",
+    )
+    assert retry_failed.id is not None
+    retry_failed.status = "failed"
+    retry_failed.failure_reason = "NO_ACTIVITY"
+    retry_failed.created_at = datetime(2026, 1, 5, tzinfo=UTC)
+    retry_failed.completed_at = datetime(2026, 1, 5, 1, tzinfo=UTC)
+    store.update(retry_failed)
+
+    max_retries = 2
+    action = resolve_closing_review_action(
+        task=impl,
+        reviews=get_reviews_for_root(store, impl),
         latest_completed_review=stale_review,
         latest_completed_code_change=improve,
         max_failed_closing_review_retries=max_retries,
