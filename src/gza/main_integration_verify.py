@@ -101,6 +101,7 @@ class MainIntegrationVerifyRemediation:
     tree_fingerprint: str | None
     failing_phase: str | None
     failure: str | None
+    observed_environment_identity: MainIntegrationVerifyEnvironmentIdentity | None
     artifact_path: str | None
     failing_test_ids: tuple[str, ...]
     verify_excerpt: str | None
@@ -387,6 +388,7 @@ def _build_integration_verify_remediation(
         tree_fingerprint=state.tree_fingerprint,
         failing_phase=state.failing_phase,
         failure=state.failure,
+        observed_environment_identity=getattr(state, "environment_identity", None),
         artifact_path=artifact_path,
         failing_test_ids=extract_pytest_failing_nodeids(artifact_output) if artifact_output else (),
         verify_excerpt=_build_main_verify_excerpt(artifact_output),

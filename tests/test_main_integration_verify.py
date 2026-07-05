@@ -505,6 +505,40 @@ def test_build_main_integration_verify_remediation_preserves_ruff_failure_excerp
     assert "gza-verify phase=failed name=ruff duration_seconds=0.42" in remediation.verify_excerpt
 
 
+def test_build_main_integration_verify_remediation_carries_observed_environment_identity(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    identity = MainIntegrationVerifyEnvironmentIdentity(
+        runner_class="host",
+        platform_system="Darwin",
+        platform_machine="arm64",
+        python_implementation="CPython",
+        python_version="3.12",
+    )
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        environment_identity=identity,
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.observed_environment_identity == identity
+
+
 def test_load_main_integration_verify_state_round_trips_environment_identity(tmp_path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

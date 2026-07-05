@@ -14,6 +14,7 @@ from rich.console import Console
 
 from gza.colors import TaskStreamColors, build_rich_theme
 from gza.config import DEFAULT_DOCKER_STARTUP_TIMEOUT, ClaudeConfig, Config, ConfigError
+from gza.main_integration_verify import MainIntegrationVerifyEnvironmentIdentity
 from gza.providers import (
     ClaudeProvider,
     CodexProvider,
@@ -36,6 +37,7 @@ from gza.providers.base import (
     classify_provider_api_error,
     ensure_docker_image,
     is_docker_running,
+    resolve_docker_worker_environment_identity,
     verify_docker_credentials,
     wait_for_docker_ready,
 )
@@ -104,6 +106,116 @@ class TestGetProvider:
         )
         with pytest.raises(ValueError, match="Unknown provider: unknown"):
             get_provider(config)
+
+
+class TestResolveDockerWorkerEnvironmentIdentity:
+    """Tests for probing the configured Docker worker runtime."""
+
+    def test_probes_task_provider_image_and_parses_runtime_identity(self, tmp_path):
+        """Docker runtime probing should use the implement-task provider image and parsed container fields."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="claude",
+            task_providers={"implement": "codex"},
+            use_docker=True,
+            docker_image="test-project-gza",
+            docker_setup_command="uv sync",
+            docker_volumes=["/host/cache:/cache:ro"],
+        )
+
+        probe_identity = {
+            "runner_class": "container",
+            "platform_system": "Linux",
+            "platform_machine": "x86_64",
+            "python_implementation": "CPython",
+            "python_version": "3.11",
+        }
+        call_order: list[str] = []
+
+        with (
+            patch(
+                "gza.providers.base.ensure_docker_image",
+                side_effect=lambda *_args, **_kwargs: call_order.append("ensure") or True,
+            ) as mock_ensure,
+            patch(
+                "gza.providers.base.build_docker_cmd",
+                return_value=["docker", "run", "--rm", "test-project-gza-codex"],
+            ) as mock_build,
+            patch(
+                "gza.providers.base.subprocess.run",
+                side_effect=lambda *_args, **_kwargs: (
+                    call_order.append("probe"),
+                    MagicMock(
+                        returncode=0,
+                        stdout=(
+                            "setup output\n"
+                            "__GZA_WORKER_ENVIRONMENT_IDENTITY__="
+                            f"{json.dumps(probe_identity, sort_keys=True)}\n"
+                        ),
+                        stderr="",
+                    ),
+                )[1],
+            ) as mock_run,
+        ):
+            identity = resolve_docker_worker_environment_identity(config, task_type="implement")
+
+        assert identity == MainIntegrationVerifyEnvironmentIdentity.from_payload(probe_identity)
+        assert call_order == ["ensure", "probe"]
+        mock_ensure.assert_called_once()
+        build_args = mock_build.call_args.args
+        build_kwargs = mock_build.call_args.kwargs
+        assert build_args[0].image_name == "test-project-gza-codex"
+        assert build_kwargs["docker_setup_command"] == "uv sync"
+        assert build_kwargs["docker_volumes"] == ["/host/cache:/cache:ro"]
+        assert mock_run.call_args[0][0][-3:-1] == ["python3", "-c"]
+
+    def test_returns_none_when_ensuring_probe_image_fails(self, tmp_path):
+        """Docker runtime probing should fail closed when the task image cannot be ensured."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="claude",
+            use_docker=True,
+            docker_image="test-project-gza",
+        )
+
+        with (
+            patch("gza.providers.base.ensure_docker_image", return_value=False) as mock_ensure,
+            patch("gza.providers.base.build_docker_cmd") as mock_build,
+            patch("gza.providers.base.subprocess.run") as mock_run,
+        ):
+            identity = resolve_docker_worker_environment_identity(config, task_type="implement")
+
+        assert identity is None
+        mock_ensure.assert_called_once()
+        mock_build.assert_not_called()
+        mock_run.assert_not_called()
+
+    def test_returns_none_when_probe_cannot_prove_runtime_identity(self, tmp_path):
+        """Docker runtime probing should fail closed when the probe output is unavailable."""
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            provider="claude",
+            use_docker=True,
+            docker_image="test-project-gza",
+        )
+
+        with (
+            patch("gza.providers.base.ensure_docker_image", return_value=True),
+            patch(
+                "gza.providers.base.build_docker_cmd",
+                return_value=["docker", "run", "--rm", "test-project-gza-claude"],
+            ),
+            patch(
+                "gza.providers.base.subprocess.run",
+                return_value=MagicMock(returncode=1, stdout="", stderr="docker: image missing"),
+            ),
+        ):
+            identity = resolve_docker_worker_environment_identity(config, task_type="implement")
+
+        assert identity is None
 
 
 @pytest.mark.parametrize(

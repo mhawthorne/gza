@@ -105,6 +105,18 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
   exactly one open remediation task for that failure identity that aims to fix the
   failing phase or gate.
+- That automatic remediation path MUST also be representative of the observed failing
+  verify environment. The bounded rerun evidence MUST carry the observed environment
+  identity (at minimum runner class plus host/container-relevant runtime traits) into
+  remediation metadata and prompt text. Before watch launches or requeues remediation,
+  it MUST compare that observed environment with the execution environment the worker
+  would actually use. If the worker environment cannot represent the observed failure
+  (for example a host/Darwin red that would be retried only in a Linux container), or if
+  Docker probing cannot prove the actual worker runtime and it is therefore
+  unknown/unavailable, watch MUST NOT queue or requeue an ordinary code-remediation
+  task. Instead it MUST keep the merge freeze in place and surface exactly one durable
+  human-attention condition for that mismatch identity until fresh representative
+  evidence replaces it.
 - A verify phase or verify tool that cannot be launched because the environment is
   misconfigured (for example: missing executable, not-on-PATH tool, non-executable
   tool, or shell-level `command not found`/exit-127 launch failure) is **not** a
@@ -156,6 +168,11 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   leave the single remediation row failed, persist an explicit exhausted reason on that
   row, and emit one signature-scoped human-attention condition instead of creating or
   queueing another remediation task for the same unresolved signature.
+- When watch parks remediation because the available worker environment is not
+  representative of the observed failure, it MUST emit one durable mismatch attention
+  row for that observed failure identity instead of creating or queueing a normal
+  remediation task. Re-observing the same mismatch on the same failure identity MUST
+  reuse that existing durable attention rather than churning new rows or task IDs.
 - When main verify later turns green and automation can safely identify the cleared
   failure signature, watch MUST retire matching open remediation rows for that signature
   as moot so stale main-verify fixes do not remain runnable after the gate has already

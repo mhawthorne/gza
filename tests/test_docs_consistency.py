@@ -399,12 +399,15 @@ def test_main_verify_remediation_identity_docs_match_signature_only_runtime_cont
     assert "dedup is by failure identity: normalized" in supervisor
     assert "failure signature only" in supervisor
     assert "fingerprint changes, becomes available later, or is unavailable" in supervisor_flat
+    assert "unknown/unavailable" in contract_flat
+    assert "unknown/unavailable" in supervisor_flat
     assert "MUST allow one narrow exemption" in supervisor_flat
     assert "Only a green rerun clears the" in supervisor_flat
     assert "freeze; if the rerun stays red" in supervisor_flat
 
     assert "deduplicated by failure signature only" in config_docs
     assert "fingerprint churn does not create a second open remediation row" in config_docs
+    assert "unknown/unavailable" in config_docs
     assert "main-integration-verify-red" in supervisor
     assert "S7 — Watch owns bounded stateful work creation." in supervisor
     assert "advance` MAY surface the red-main condition from the shared state" in supervisor

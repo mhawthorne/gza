@@ -22,6 +22,7 @@ from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
 
 if TYPE_CHECKING:
     from ..config import Config
+    from ..main_integration_verify import MainIntegrationVerifyEnvironmentIdentity
 
 
 # Dockerfile template with all common dependencies
@@ -356,6 +357,27 @@ _DOCKER_DAEMON_ERROR_SNIPPETS = (
 )
 _DOCKER_CRASH_EXIT_CODES = frozenset({125, 126, 127, 137})
 DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT = DEFAULT_DOCKER_STARTUP_TIMEOUT
+_DOCKER_WORKER_ENVIRONMENT_MARKER = "__GZA_WORKER_ENVIRONMENT_IDENTITY__="
+_DOCKER_WORKER_ENVIRONMENT_PROBE = """\
+import json
+import platform
+import sys
+
+print(
+    "__GZA_WORKER_ENVIRONMENT_IDENTITY__="
+    + json.dumps(
+        {
+            "runner_class": "container",
+            "platform_system": platform.system(),
+            "platform_machine": platform.machine(),
+            "python_implementation": platform.python_implementation(),
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+"""
 
 
 @dataclass
@@ -1246,6 +1268,89 @@ def _extract_startup_log_line(line: str, max_len: int = 180) -> str | None:
     if len(line) > max_len:
         return f"{line[: max_len - 3]}..."
     return line
+
+
+def _provider_docker_config_for_task(config: Config, *, task_type: str) -> DockerConfig:
+    """Resolve the Docker image/config the given task type would actually run with."""
+    provider_name = config.get_provider_for_task(task_type)
+    image_name = f"{config.docker_image}-{provider_name}"
+
+    if provider_name == "claude":
+        from .claude import _get_docker_config
+    elif provider_name == "codex":
+        from .codex import _get_docker_config
+    elif provider_name == "gemini":
+        from .gemini import _get_docker_config
+    else:  # pragma: no cover - Config validation should prevent this.
+        raise ValueError(f"Unknown provider: {provider_name}")
+
+    return _get_docker_config(
+        image_name,
+        docker_startup_timeout=config.docker_startup_timeout,
+    )
+
+
+def _ensure_provider_docker_image_for_task(
+    config: Config,
+    *,
+    task_type: str,
+) -> DockerConfig | None:
+    """Return the provider Docker config after ensuring the task image is available."""
+    docker_config = _provider_docker_config_for_task(config, task_type=task_type)
+    if not ensure_docker_image(docker_config, config.project_dir):
+        return None
+    return docker_config
+
+
+def resolve_docker_worker_environment_identity(
+    config: Config,
+    *,
+    task_type: str,
+) -> MainIntegrationVerifyEnvironmentIdentity | None:
+    """Probe the configured Docker worker runtime identity for one task type.
+
+    Returns a ``MainIntegrationVerifyEnvironmentIdentity`` instance on success, or
+    ``None`` when the Docker worker environment cannot be proven.
+    """
+    from ..main_integration_verify import MainIntegrationVerifyEnvironmentIdentity
+
+    docker_config = _ensure_provider_docker_image_for_task(config, task_type=task_type)
+    if docker_config is None:
+        return None
+
+    probe_cmd = build_docker_cmd(
+        docker_config,
+        config.project_dir,
+        timeout_minutes=1,
+        docker_volumes=list(config.docker_volumes),
+        docker_setup_command=config.docker_setup_command,
+    )
+    probe_cmd.extend(["python3", "-c", _DOCKER_WORKER_ENVIRONMENT_PROBE])
+
+    try:
+        result = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    for line in reversed(combined_output.splitlines()):
+        if not line.startswith(_DOCKER_WORKER_ENVIRONMENT_MARKER):
+            continue
+        payload_raw = line.removeprefix(_DOCKER_WORKER_ENVIRONMENT_MARKER)
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            return None
+        return MainIntegrationVerifyEnvironmentIdentity.from_payload(payload)
+    return None
 
 
 def get_provider(config: Config) -> Provider:
