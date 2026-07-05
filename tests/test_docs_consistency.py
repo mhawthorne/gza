@@ -1538,6 +1538,26 @@ def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> 
     assert "`awaiting_human` — review the plan, then run `uv run gza implement <id>`" in internal_content
 
 
+def test_create_implement_action_docs_cover_both_plan_entry_points() -> None:
+    """The `create_implement` action reference should cover both documented plan lanes."""
+    repo_root = Path(__file__).resolve().parents[1]
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    worker_actions_section = workflow.split("### Worker-spawning actions", 1)[1].split("### Direct actions", 1)[0]
+
+    current_row = (
+        "| `create_implement` | Creates implement task for a plan, spawns worker "
+        "(used both for the legacy compatibility path when the plan-review gate is disabled "
+        "and for accepting the latest plan revision after capped plan-review churn) |"
+    )
+    stale_row = (
+        "| `create_implement` | Creates implement task for a plan, spawns worker "
+        "(legacy compatibility path when plan-review gate is disabled) |"
+    )
+
+    assert current_row in worker_actions_section
+    assert stale_row not in worker_actions_section
+
+
 def test_plan_materialization_repair_docs_distinguish_repairable_from_ambiguous_partial_state() -> None:
     """Workflow/spec docs should route repairable partial slice materialization through the direct repair action."""
     repo_root = Path(__file__).resolve().parents[1]

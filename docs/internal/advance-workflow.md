@@ -328,7 +328,7 @@ These actions create background workers and count toward the batch limit. The so
 | `create_plan_improve` | Creates `plan_improve` task after `CHANGES_REQUESTED` plan review, spawns worker |
 | `run_plan_improve` | Starts an existing pending `plan_improve` task |
 | `materialize_plan_slices` | Creates sliced implement tasks from an approved plan-review manifest; each slice becomes its own branch/merge unit and ordering stays on `depends_on` |
-| `create_implement` | Creates implement task for a plan, spawns worker (legacy compatibility path when plan-review gate is disabled) |
+| `create_implement` | Creates implement task for a plan, spawns worker (used both for the legacy compatibility path when the plan-review gate is disabled and for accepting the latest plan revision after capped plan-review churn) |
 | `resume` | Creates resume task, spawns worker |
 | `retry` | Creates retry task, spawns worker |
 
