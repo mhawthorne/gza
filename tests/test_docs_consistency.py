@@ -1462,6 +1462,7 @@ def test_watch_slot_settle_seconds_discoverable_text_matches_staged_compatibilit
         "If the launch reaches a terminal outcome before any live proof, watch logs that no-slot outcome",
         "skips no-progress accounting for that attempted launch",
         "Launches with neither live proof nor terminal evidence in the window are logged as undispatched, still count toward selected-action no-progress accounting",
+        "gza watch` keeps the same fixed `watch.poll` cadence between completed cycles",
     ):
         assert text in config_docs
 
@@ -1485,6 +1486,9 @@ def test_watch_supervisor_spec_uses_slot_settle_seconds_config_key() -> None:
     assert "watch.slot_settle_seconds" in supervisor
     assert "watch.dispatch_start_timeout" not in supervisor
     assert "watch.slot_settle_seconds" in config_docs
+    assert "the fixed sleep cadence" in supervisor
+    assert "`watch.poll` / `--poll` boundary before the next steady-state pass" in supervisor
+    assert "same fixed `watch.poll` cadence between completed cycles" in config_docs
 
 
 def test_internal_advance_workflow_task_collection_tracks_shared_recovery_policy() -> None:

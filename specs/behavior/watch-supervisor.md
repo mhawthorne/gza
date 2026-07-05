@@ -427,7 +427,9 @@ When the installed `gza` package fingerprint changes while watch is running:
   post-launch terminal outcome appears in the window may watch log the action as
   undispatched, count that unchanged selected action toward the same subject/action
   no-progress streak, and continue scanning the same cycle for another runnable
-  candidate instead of leaving the slot idle.
+  candidate instead of leaving the slot idle. This bounded settle window does NOT change
+  the fixed sleep cadence: after the cycle completes, watch still waits on the ordinary
+  `watch.poll` / `--poll` boundary before the next steady-state pass.
 - When the latest relevant failed recovery or improve attempt for that selected
   subject/action is a **transient terminal** (for example provider-capacity,
   infrastructure/setup failure before durable work such as `WORKSPACE_NOT_POPULATED`,
