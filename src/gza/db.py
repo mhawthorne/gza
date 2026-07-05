@@ -7503,25 +7503,42 @@ class SqliteTaskStore:
         signature: str,
         tree_fingerprint: str | None,
         task_id: str | None,
+        consumption_key: str | None = None,
+        consumed_attempt_floor: int = 0,
         last_observed_head_sha: str | None = None,
         last_observed_failure: str | None = None,
     ) -> MainVerifyRemediationAttemptState | None:
         """Increment the consumed-attempt counter for one failure identity.
 
-        Re-observing the same concrete consumed ``task_id`` is idempotent. A
-        ``None`` task_id is treated as unknown provenance and always consumes a
-        fresh attempt so distinct unknown-task consumes cannot collapse; that
-        branch also clears any active pointer explicitly because provenance is
-        unknown.
+        Re-observing the same concrete consumed provenance key is idempotent.
+        When ``consumption_key`` is omitted, ``task_id`` remains the dedupe
+        key. A ``None`` task_id is treated as unknown provenance and always
+        consumes a fresh attempt so distinct unknown-task consumes cannot
+        collapse; that branch also clears any active pointer explicitly because
+        provenance is unknown. ``consumed_attempt_floor`` lets callers carry
+        forward conservative legacy spend before recording the current spend.
         """
         if not self.supports_main_verify_remediation_attempts():
             return None
         normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
         updated_at = _format_db_timestamp(datetime.now(UTC))
         assert updated_at is not None
+        bounded_floor = max(consumed_attempt_floor, 0)
+        idempotency_key = consumption_key if consumption_key is not None else task_id
         increment = 1
         with self._connect() as conn:
-            if task_id is not None:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+            existing = self._row_to_main_verify_remediation_attempt_state(row)
+            if idempotency_key is not None:
                 inserted = conn.execute(
                     """
                     INSERT OR IGNORE INTO main_verify_remediation_consumed_task_ids(
@@ -7537,60 +7554,82 @@ class SqliteTaskStore:
                         self._project_id,
                         signature,
                         normalized_fingerprint,
-                        task_id,
+                        idempotency_key,
                         updated_at,
                     ),
                 )
                 increment = 1 if inserted.rowcount > 0 else 0
-            conn.execute(
-                """
-                INSERT INTO main_verify_remediation_attempts(
-                    project_id,
-                    signature,
-                    tree_fingerprint,
-                    consumed_attempt_count,
-                    active_task_id,
-                    exhausted_at,
-                    last_consumed_task_id,
-                    last_observed_head_sha,
-                    last_observed_failure,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
-                ON CONFLICT(project_id, signature, tree_fingerprint)
-                DO UPDATE SET
-                    consumed_attempt_count = (
-                        main_verify_remediation_attempts.consumed_attempt_count
-                        + excluded.consumed_attempt_count
-                    ),
-                    active_task_id = CASE
-                        WHEN excluded.last_consumed_task_id IS NULL
-                            AND excluded.consumed_attempt_count > 0
-                            THEN NULL
-                        WHEN main_verify_remediation_attempts.active_task_id = excluded.last_consumed_task_id
-                            THEN NULL
-                        ELSE main_verify_remediation_attempts.active_task_id
-                    END,
-                    last_consumed_task_id = CASE
-                        WHEN excluded.consumed_attempt_count > 0
-                            THEN excluded.last_consumed_task_id
-                        ELSE main_verify_remediation_attempts.last_consumed_task_id
-                    END,
-                    last_observed_head_sha = excluded.last_observed_head_sha,
-                    last_observed_failure = excluded.last_observed_failure,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    self._project_id,
-                    signature,
-                    normalized_fingerprint,
-                    increment,
-                    task_id,
-                    last_observed_head_sha,
-                    last_observed_failure,
-                    updated_at,
-                ),
+            current_count = existing.consumed_attempt_count if existing is not None else 0
+            next_count = max(current_count, bounded_floor) + increment if increment > 0 else max(
+                current_count,
+                bounded_floor,
             )
+            next_active_task_id = existing.active_task_id if existing is not None else None
+            if increment > 0 and (task_id is None or next_active_task_id == task_id):
+                next_active_task_id = None
+            next_last_consumed_task_id = (
+                task_id if increment > 0 else existing.last_consumed_task_id if existing is not None else None
+            )
+            next_exhausted_at = existing.exhausted_at if existing is not None else None
+            next_exhausted_at_value = _format_db_timestamp(next_exhausted_at)
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO main_verify_remediation_attempts(
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        consumed_attempt_count,
+                        active_task_id,
+                        exhausted_at,
+                        last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._project_id,
+                        signature,
+                        normalized_fingerprint,
+                        next_count,
+                        next_active_task_id,
+                        next_exhausted_at_value,
+                        next_last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        updated_at,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE main_verify_remediation_attempts
+                    SET consumed_attempt_count = ?,
+                        active_task_id = ?,
+                        exhausted_at = ?,
+                        last_consumed_task_id = ?,
+                        last_observed_head_sha = ?,
+                        last_observed_failure = ?,
+                        updated_at = ?
+                    WHERE project_id = ?
+                      AND signature = ?
+                      AND tree_fingerprint = ?
+                    """,
+                    (
+                        next_count,
+                        next_active_task_id,
+                        next_exhausted_at_value,
+                        next_last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        updated_at,
+                        self._project_id,
+                        signature,
+                        normalized_fingerprint,
+                    ),
+                )
             row = conn.execute(
                 """
                 SELECT *
@@ -7608,6 +7647,7 @@ class SqliteTaskStore:
         *,
         signature: str,
         tree_fingerprint: str | None,
+        consumed_attempt_count: int | None = None,
         last_observed_head_sha: str | None = None,
         last_observed_failure: str | None = None,
     ) -> MainVerifyRemediationAttemptState | None:
@@ -7617,40 +7657,79 @@ class SqliteTaskStore:
         normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
         exhausted_at = _format_db_timestamp(datetime.now(UTC))
         assert exhausted_at is not None
+        bounded_count = max(consumed_attempt_count, 0) if consumed_attempt_count is not None else None
         with self._connect() as conn:
-            conn.execute(
+            row = conn.execute(
                 """
-                INSERT INTO main_verify_remediation_attempts(
-                    project_id,
-                    signature,
-                    tree_fingerprint,
-                    consumed_attempt_count,
-                    active_task_id,
-                    exhausted_at,
-                    last_consumed_task_id,
-                    last_observed_head_sha,
-                    last_observed_failure,
-                    updated_at
-                )
-                VALUES (?, ?, ?, 0, NULL, ?, NULL, ?, ?, ?)
-                ON CONFLICT(project_id, signature, tree_fingerprint)
-                DO UPDATE SET
-                    active_task_id = NULL,
-                    exhausted_at = excluded.exhausted_at,
-                    last_observed_head_sha = excluded.last_observed_head_sha,
-                    last_observed_failure = excluded.last_observed_failure,
-                    updated_at = excluded.updated_at
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
                 """,
-                (
-                    self._project_id,
-                    signature,
-                    normalized_fingerprint,
-                    exhausted_at,
-                    last_observed_head_sha,
-                    last_observed_failure,
-                    exhausted_at,
-                ),
-            )
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+            existing = self._row_to_main_verify_remediation_attempt_state(row)
+            next_count = existing.consumed_attempt_count if existing is not None else 0
+            if bounded_count is not None:
+                next_count = max(next_count, bounded_count)
+            next_last_consumed_task_id = existing.last_consumed_task_id if existing is not None else None
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO main_verify_remediation_attempts(
+                        project_id,
+                        signature,
+                        tree_fingerprint,
+                        consumed_attempt_count,
+                        active_task_id,
+                        exhausted_at,
+                        last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._project_id,
+                        signature,
+                        normalized_fingerprint,
+                        next_count,
+                        exhausted_at,
+                        next_last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        exhausted_at,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE main_verify_remediation_attempts
+                    SET consumed_attempt_count = ?,
+                        active_task_id = NULL,
+                        exhausted_at = ?,
+                        last_consumed_task_id = ?,
+                        last_observed_head_sha = ?,
+                        last_observed_failure = ?,
+                        updated_at = ?
+                    WHERE project_id = ?
+                      AND signature = ?
+                      AND tree_fingerprint = ?
+                    """,
+                    (
+                        next_count,
+                        exhausted_at,
+                        next_last_consumed_task_id,
+                        last_observed_head_sha,
+                        last_observed_failure,
+                        exhausted_at,
+                        self._project_id,
+                        signature,
+                        normalized_fingerprint,
+                    ),
+                )
             row = conn.execute(
                 """
                 SELECT *

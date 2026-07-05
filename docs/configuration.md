@@ -2005,7 +2005,7 @@ watch:
 
 `watch.slot_settle_seconds` bounds how long `gza watch` gives a selected worker launch to settle during the current pass. In the current staged compatibility path, either live-running proof or an observable terminal post-launch outcome counts as settled for existing callers; only launches with neither signal within that window are logged as undispatched. Those undispatched launches do not advance no-progress accounting, and watch keeps scanning the current pass for another runnable candidate instead of leaving the slot idle.
 
-`watch.main_verify_remediation_max_attempts` caps how many merged-and-proven-ineffective automatic remediation attempts watch may consume for one main-verify failure identity before it stops filing more remediation work and leaves the red verify condition as human-required attention.
+`watch.main_verify_remediation_max_attempts` caps the consumed automatic remediation-attempt budget for one main-verify failure identity before watch stops filing more remediation work and leaves the red verify condition as human-required attention. Consumed attempts include failed remediation rows before watch requeues them and merged remediation attempts later proven ineffective, so the same signature spends one shared bounded budget across requeue and post-merge retry paths.
 
 `watch.parked_auto_rearm.enabled` turns on a conservative watch-owned blind parked auto-rearm phase. It runs after watch finishes the direct non-worker lifecycle phase for the current pass and before worker dispatch planning, so same-pass slot reuse still goes through the ordinary shared watch planner instead of a separate executor.
 

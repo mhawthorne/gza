@@ -10926,6 +10926,59 @@ class TestSharedDbIsolationAndImportGating:
         assert persisted.active_task_id is None
         assert persisted.exhausted_at is not None
 
+    def test_main_verify_remediation_exhausted_insert_can_persist_count_floor(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        exhausted = store.mark_main_verify_remediation_exhausted(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            consumed_attempt_count=2,
+            last_observed_head_sha="abc123",
+            last_observed_failure="budget exhausted before a reusable row remained",
+        )
+
+        assert exhausted is not None
+        assert exhausted.consumed_attempt_count == 2
+        assert exhausted.active_task_id is None
+        assert exhausted.exhausted_at is not None
+        assert exhausted.last_consumed_task_id is None
+        assert exhausted.last_observed_head_sha == "abc123"
+        assert exhausted.last_observed_failure == "budget exhausted before a reusable row remained"
+
+    def test_main_verify_remediation_consumed_attempt_allows_distinct_failed_requeues_for_same_task(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        first = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id="gza-100",
+            consumption_key="gza-100:failed-requeue:1",
+            last_observed_head_sha="abc123",
+            last_observed_failure="failed remediation requeued once",
+        )
+        second = store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id="gza-100",
+            consumption_key="gza-100:failed-requeue:2",
+            last_observed_head_sha="def456",
+            last_observed_failure="failed remediation exhausted",
+        )
+
+        assert first is not None
+        assert first.consumed_attempt_count == 1
+        assert second is not None
+        assert second.consumed_attempt_count == 2
+        assert second.last_consumed_task_id == "gza-100"
+        assert second.last_observed_head_sha == "def456"
+        assert second.last_observed_failure == "failed remediation exhausted"
+
     def test_main_verify_remediation_active_task_clears_exhausted_state(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")

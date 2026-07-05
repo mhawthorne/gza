@@ -50,6 +50,7 @@ from gza.cli.git_ops import (
 )
 from gza.cli.watch import (
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
+    MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON,
     SCOPED_WATCH_COMPLETE_MESSAGE,
     WatchSlotAllocation,
     _active_failure_backoff_owner_ids,
@@ -60,6 +61,7 @@ from gza.cli.watch import (
     _compute_failure_backoff_seconds,
     _count_live_workers,
     _CycleResult,
+    _emit_main_verify_attention,
     _emit_cycle_attention_summary,
     _emit_transition_events,
     _evaluate_blind_parked_auto_rearm,
@@ -70,8 +72,10 @@ from gza.cli.watch import (
     _format_wake_message,
     _installed_gza_package_fingerprint,
     _InstalledPackageDriftState,
-    _main_verify_remediation_prompt,
     _MainVerifyRemediationIdentity,
+    _main_verify_attention_key,
+    _main_verify_remediation_prompt,
+    _maybe_file_main_verify_remediation,
     _maybe_finalize_watch_no_progress_for_background_action,
     _maybe_park_watch_no_progress,
     _maybe_repair_target_already_merged_skip,
@@ -118,8 +122,11 @@ from gza.lineage_query import LineageOwnerRow
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_TAG,
     MainIntegrationVerifyEnvironmentIdentity,
+    check_main_integration_verify,
     current_main_integration_verify_alert,
+    load_main_integration_verify_state,
 )
+from gza.runner import _make_review_verify_result
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
@@ -8727,6 +8734,7 @@ def test_main_verify_remediation_prompt_includes_evidence_without_changing_metad
     assert "Failure signature: phase:functional" in prompt
     assert "Tree fingerprint: fp-functional-a" in prompt
     assert "Observed main HEAD: feedfacecafe" in prompt
+    assert "Remediation attempts spent: 0/2" in prompt
     assert "Verify artifact: .gza/artifacts/gza-1/verify.txt" in prompt
     assert "Failing test IDs: tests/test_alpha.py::test_one, tests/test_beta.py::test_two" in prompt
     assert "Verify excerpt:" in prompt
@@ -9852,7 +9860,7 @@ def test_find_open_main_verify_remediation_task_reuses_completed_unmerged_task_f
     assert reused.duplicates == ()
 
 
-def test_find_open_main_verify_remediation_task_backfills_legacy_task_into_ledger(
+def test_find_open_main_verify_remediation_task_selection_does_not_backfill_legacy_task_into_ledger(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -9889,11 +9897,10 @@ def test_find_open_main_verify_remediation_task_backfills_legacy_task_into_ledge
         signature="phase:functional",
         tree_fingerprint=None,
     )
-    assert state is not None
-    assert state.active_task_id == legacy_task.id
+    assert state is None
 
 
-def test_find_open_main_verify_remediation_tasks_prefers_in_progress_same_signature_task(
+def test_find_open_main_verify_remediation_tasks_prefers_non_live_same_signature_task(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -9947,8 +9954,8 @@ def test_find_open_main_verify_remediation_tasks_prefers_in_progress_same_signat
     )
 
     assert selection.canonical is not None
-    assert selection.canonical.id == live_task.id
-    assert [task.id for task in selection.duplicates] == [exact_task.id]
+    assert selection.canonical.id == exact_task.id
+    assert [task.id for task in selection.duplicates] == [live_task.id]
 
 
 def test_retire_duplicate_main_verify_remediation_tasks_drops_noncanonical_same_signature_rows(
@@ -10088,8 +10095,8 @@ def test_retire_duplicate_main_verify_remediation_tasks_preserves_live_in_progre
     )
 
     assert selection.canonical is not None
-    assert selection.canonical.id == live_duplicate.id
-    assert [task.id for task in selection.duplicates] == [exact_task.id]
+    assert selection.canonical.id == exact_task.id
+    assert [task.id for task in selection.duplicates] == [live_duplicate.id]
 
     merged_tags = _retire_duplicate_main_verify_remediation_tasks(
         store=store,
@@ -10114,10 +10121,8 @@ def test_retire_duplicate_main_verify_remediation_tasks_preserves_live_in_progre
     assert preserved_duplicate.drop_reason is None
     preserved_exact = store.get(exact_task.id)
     assert preserved_exact is not None
-    assert preserved_exact.status == "dropped"
-    assert preserved_exact.drop_reason == (
-        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{live_duplicate.id}"
-    )
+    assert preserved_exact.status != "dropped"
+    assert preserved_exact.drop_reason is None
 
 
 def test_watch_cycle_main_verify_remediation_reuses_existing_concrete_task_when_current_fingerprint_unavailable(
@@ -10367,8 +10372,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     assert attempt_state.exhausted_at is not None
     log_text = log_path.read_text()
     expected_attention = (
-        "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing; "
-        "automatic remediation exhausted after 2/2 attempts for functional on fp-new; "
+        "main verify remediation exhausted for phase:functional after 2/2 attempts; "
         "human intervention required (red for 5d0h)"
     )
     assert log_text.count("ATTENTION") == 1
@@ -10387,10 +10391,489 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     durable_alert = current_main_integration_verify_alert(store, alert_git, config)
     assert durable_alert is not None
     assert (
-        "automatic remediation exhausted after 2/2 attempts for functional on fp-new"
+        "automatic remediation exhausted after 2/2 attempts for phase:functional on fp-new"
         in durable_alert.alert_message
     )
     assert "human intervention required" in durable_alert.alert_message
+
+
+def test_watch_cycle_main_verify_remediation_exhaustion_disables_existing_pending_row(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    blocker = store.add("Scoped pending task", task_type="implement", tags=("202606-recovery",))
+    assert blocker.id is not None
+    assert set_task_queue_position_scoped(store, blocker.id, position=1, tags=("202606-recovery",))
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    pending_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-old",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 1/2",
+                "Verify failure: original failure",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert pending_task.id is not None
+    assert set_task_queue_position_scoped(store, pending_task.id, position=1, tags=("202606-recovery",))
+
+    store.mark_main_verify_remediation_exhausted(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        consumed_attempt_count=config.watch.main_verify_remediation_max_attempts,
+        last_observed_head_sha="deadbeefcafe",
+        last_observed_failure="still red after second merge",
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    deterministic_red = SimpleNamespace(
+        merges_halted=True,
+        remediation=SimpleNamespace(
+            kind="fix",
+            signature="phase:functional",
+            tree_fingerprint="fp-new",
+            failing_phase="functional",
+            failure="verify_command failed twice",
+        ),
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-new",
+            head_sha="feedfacecafe",
+            failing_phase="functional",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
+            captured_at=datetime(2026, 6, 29, tzinfo=UTC),
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert [task.id for task in remediation_tasks] == [pending_task.id]
+    exhausted_task = store.get(pending_task.id)
+    assert exhausted_task is not None
+    assert exhausted_task.status == "failed"
+    assert exhausted_task.failure_reason == MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON
+    assert exhausted_task.urgent is False
+    assert exhausted_task.queue_position is None
+    assert "Tree fingerprint: fp-new" in exhausted_task.prompt
+    assert "Remediation attempts spent: 2/2" in exhausted_task.prompt
+    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [blocker.id]
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == config.watch.main_verify_remediation_max_attempts
+    assert attempt_state.active_task_id is None
+    assert attempt_state.exhausted_at is not None
+    log_text = log_path.read_text()
+    assert log_text.count("ATTENTION") == 1
+    assert "main verify remediation exhausted for phase:functional after 2/2 attempts" in log_text
+
+
+def test_watch_cycle_failed_main_verify_remediation_tracks_attempts_across_fingerprint_churn(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def red_check(fingerprint: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            merges_halted=True,
+            remediation=SimpleNamespace(
+                kind="fix",
+                signature="phase:functional",
+                tree_fingerprint=fingerprint,
+                failing_phase="functional",
+                failure="verify_command failed twice",
+            ),
+            state=SimpleNamespace(
+                task=main_verify_task,
+                gate_enabled=True,
+                verify_command="./bin/tests",
+                verify_timeout_seconds=120,
+                verify_timeout_grace_seconds=5.0,
+                tree_fingerprint=fingerprint,
+                head_sha="feedfacecafe",
+                failing_phase="functional",
+                alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+                red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
+                captured_at=datetime(2026, 6, 29, tzinfo=UTC),
+            ),
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=[red_check("fp-a"), red_check("fp-b"), red_check("fp-c"), red_check("fp-d")],
+        ),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+        remediation_task = next(
+            candidate
+            for candidate in store.get_all()
+            if candidate.trigger_source == "watch-main-integration-verify-remediation"
+        )
+        assert "Tree fingerprint: fp-a" in remediation_task.prompt
+        assert "Remediation attempts spent: 0/2" in remediation_task.prompt
+        remediation_task.status = "failed"
+        remediation_task.completed_at = datetime.now(UTC)
+        remediation_task.failure_reason = "UNKNOWN"
+        store.update(remediation_task)
+
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+        remediation_task = store.get(str(remediation_task.id))
+        assert remediation_task is not None
+        assert remediation_task.status == "pending"
+        assert "Tree fingerprint: fp-b" in remediation_task.prompt
+        assert "Remediation attempts spent: 1/2" in remediation_task.prompt
+        attempt_state = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint=None,
+        )
+        assert attempt_state is not None
+        assert attempt_state.consumed_attempt_count == 1
+        assert attempt_state.active_task_id == remediation_task.id
+        remediation_task.status = "failed"
+        remediation_task.completed_at = datetime.now(UTC)
+        remediation_task.failure_reason = "UNKNOWN"
+        store.update(remediation_task)
+
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+        remediation_task = store.get(str(remediation_task.id))
+        assert remediation_task is not None
+        assert remediation_task.status == "failed"
+        assert remediation_task.failure_reason == MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON
+        assert remediation_task.urgent is False
+        assert remediation_task.queue_position is None
+        assert "Tree fingerprint: fp-c" in remediation_task.prompt
+        assert "Remediation attempts spent: 2/2" in remediation_task.prompt
+        attempt_state = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint=None,
+        )
+        assert attempt_state is not None
+        assert attempt_state.consumed_attempt_count == 2
+        assert attempt_state.active_task_id is None
+        assert attempt_state.exhausted_at is not None
+
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    log_text = log_path.read_text()
+    attention_lines = [
+        line
+        for line in log_text.splitlines()
+        if "ATTENTION" in line and "main verify remediation exhausted for phase:functional after 2/2 attempts" in line
+    ]
+    assert len(attention_lines) == 1
+
+
+def test_watch_cycle_main_verify_remediation_exhaustion_retires_non_live_duplicates(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    blocker = store.add("Scoped pending task", task_type="implement", tags=("202606-recovery",))
+    assert blocker.id is not None
+    assert set_task_queue_position_scoped(store, blocker.id, position=1, tags=("202606-recovery",))
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    pending_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-new",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 1/2",
+            ]
+        ),
+        task_type="implement",
+        tags=("exact-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert pending_task.id is not None
+    assert set_task_queue_position_scoped(store, pending_task.id, position=1, tags=("202606-recovery",))
+
+    legacy_duplicate = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: unavailable",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert legacy_duplicate.id is not None
+    assert set_task_queue_position_scoped(store, legacy_duplicate.id, position=2, tags=("202606-recovery",))
+
+    store.mark_main_verify_remediation_exhausted(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        consumed_attempt_count=config.watch.main_verify_remediation_max_attempts,
+        last_observed_head_sha="deadbeefcafe",
+        last_observed_failure="still red after second merge",
+    )
+
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+
+    deterministic_red = SimpleNamespace(
+        merges_halted=True,
+        remediation=SimpleNamespace(
+            kind="fix",
+            signature="phase:functional",
+            tree_fingerprint="fp-new",
+            failing_phase="functional",
+            failure="verify_command failed twice",
+        ),
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-new",
+            head_sha="feedfacecafe",
+            failing_phase="functional",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
+            captured_at=datetime(2026, 6, 29, tzinfo=UTC),
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    canonical = store.get(pending_task.id)
+    assert canonical is not None
+    assert canonical.status == "failed"
+    assert canonical.failure_reason == MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON
+    assert canonical.urgent is False
+    assert canonical.queue_position is None
+    assert set(canonical.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "202606-recovery",
+        "exact-recovery",
+        "legacy-recovery",
+    }
+
+    retired_duplicate = store.get(legacy_duplicate.id)
+    assert retired_duplicate is not None
+    assert retired_duplicate.status == "dropped"
+    assert retired_duplicate.urgent is False
+    assert retired_duplicate.queue_position is None
+    assert retired_duplicate.drop_reason == (
+        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{pending_task.id}"
+    )
+    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [blocker.id]
+
+
+def test_main_verify_exhausted_attention_uses_non_phase_signature_for_key_and_message(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    now = datetime(2026, 6, 29, tzinfo=UTC)
+
+    first = SimpleNamespace(
+        task=SimpleNamespace(id="gza-1"),
+        alert_message=(
+            "main verify RED at `feedfacecafe` - merges halted; "
+            "automatic remediation exhausted after 2/2 attempts for status:failed:exit:1 on fp-a; "
+            "human intervention required"
+        ),
+        failure_signature="status:failed:exit:1",
+        failing_phase=None,
+        verify_status="failed",
+        verify_exit_status="1",
+        red_since=None,
+    )
+    second = SimpleNamespace(
+        task=SimpleNamespace(id="gza-1"),
+        alert_message=(
+            "main verify RED at `feedfacecafe` - merges halted; "
+            "automatic remediation exhausted after 2/2 attempts for status:failed:exit:2 on fp-b; "
+            "human intervention required"
+        ),
+        failure_signature="status:failed:exit:2",
+        failing_phase=None,
+        verify_status="failed",
+        verify_exit_status="2",
+        red_since=None,
+    )
+
+    assert _main_verify_attention_key(first) == "main-verify-remediation-exhausted:status:failed:exit:1"
+    assert _main_verify_attention_key(second) == "main-verify-remediation-exhausted:status:failed:exit:2"
+
+    _emit_main_verify_attention(log=log, state=first, now=now)
+    _emit_main_verify_attention(log=log, state=second, now=now)
+
+    attention_lines = [line for line in log_path.read_text().splitlines() if " ATTENTION " in line]
+    assert len(attention_lines) == 2
+    assert "main verify remediation exhausted for status:failed:exit:1 after 2/2 attempts" in attention_lines[0]
+    assert "main verify remediation exhausted for status:failed:exit:2 after 2/2 attempts" in attention_lines[1]
 
 
 def test_watch_cycle_post_merge_red_consumes_merged_main_verify_remediation_and_creates_next_attempt(
@@ -10515,6 +10998,7 @@ def test_watch_cycle_post_merge_red_consumes_merged_main_verify_remediation_and_
     assert next_attempt.queue_position == 1
     assert "Failure signature: phase:functional" in next_attempt.prompt
     assert "Tree fingerprint: fp-new" in next_attempt.prompt
+    assert "Remediation attempts spent: 1/2" in next_attempt.prompt
 
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
@@ -10661,7 +11145,7 @@ def test_watch_cycle_post_merge_red_final_attempt_exhausts_main_verify_remediati
 
     log_text = log_path.read_text()
     assert "dropped remediation attempt 2/2" in log_text
-    assert "automatic remediation exhausted after 2/2 attempts for functional on fp-new" in log_text
+    assert "automatic remediation exhausted after 2/2 attempts for phase:functional on fp-new" in log_text
 
 
 def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezing_merges(
@@ -10739,6 +11223,226 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
     assert "ATTENTION" in log_text
     assert "could not launch `ruff`" in log_text
     assert "fix the environment, not the code" in log_text
+
+
+def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def red_check(fingerprint: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            merges_halted=True,
+            remediation=SimpleNamespace(
+                kind="fix",
+                signature="phase:functional",
+                tree_fingerprint=fingerprint,
+                failing_phase="functional",
+                failure="verify_command failed twice",
+            ),
+            state=SimpleNamespace(
+                task=main_verify_task,
+                gate_enabled=True,
+                verify_command="./bin/tests",
+                verify_timeout_seconds=120,
+                verify_timeout_grace_seconds=5.0,
+                tree_fingerprint=fingerprint,
+                head_sha="feedfacecafe",
+                failing_phase="functional",
+                alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+                captured_at=datetime(2026, 6, 29, tzinfo=UTC),
+            ),
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=red_check("fp-a")),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    remediation_task = next(
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    )
+    assert remediation_task.id is not None
+    assert "Remediation attempts spent: 0/2" in remediation_task.prompt
+
+    remediation_task.status = "failed"
+    remediation_task.completed_at = datetime.now(UTC)
+    remediation_task.failure_reason = "UNKNOWN"
+    store.update(remediation_task)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=red_check("fp-b")),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    remediation_task = store.get(remediation_task.id)
+    assert remediation_task is not None
+    assert remediation_task.status == "pending"
+    assert "Tree fingerprint: fp-b" in remediation_task.prompt
+    assert "Remediation attempts spent: 1/2" in remediation_task.prompt
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.active_task_id == remediation_task.id
+
+    remediation_task.status = "completed"
+    remediation_task.completed_at = datetime.now(UTC)
+    remediation_task.branch = "feature/main-verify-remediation-shared-budget"
+    remediation_task.has_commits = True
+    remediation_task.failure_reason = None
+    store.update(remediation_task)
+    store.set_merge_status(remediation_task.id, "unmerged")
+
+    pre_merge_clear = SimpleNamespace(
+        merges_halted=False,
+        remediation=None,
+        state=SimpleNamespace(task=main_verify_task, head_sha="feedfacecafe", alert_message=None),
+    )
+
+    def fake_execute_merge_action(*args, **kwargs):
+        merge_task = args[3]
+        store.set_merge_status(str(merge_task.id), "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=[pre_merge_clear, red_check("fp-c")]),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 1
+    remediation_task = store.get(remediation_task.id)
+    assert remediation_task is not None
+    assert remediation_task.status == "dropped"
+    assert remediation_task.drop_reason == "main verify remained red after merged remediation; attempt consumed"
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 2
+    assert attempt_state.active_task_id is None
+    assert attempt_state.last_consumed_task_id == remediation_task.id
+    assert attempt_state.exhausted_at is not None
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=red_check("fp-d")),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 1
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 2
+    assert attempt_state.active_task_id is None
+    assert attempt_state.exhausted_at is not None
+
+    log_text = log_path.read_text()
+    assert "automatic remediation exhausted after 2/2 attempts for phase:functional on fp-c" in log_text
+    assert "automatic remediation exhausted after 2/2 attempts for phase:functional on fp-d" in log_text
 
 
 def test_watch_cycle_post_merge_green_clears_main_verify_remediation_active_state_without_consuming(
@@ -10845,6 +11549,531 @@ def test_watch_cycle_post_merge_green_clears_main_verify_remediation_active_stat
     assert attempt_state.active_task_id is None
     assert attempt_state.exhausted_at is None
     assert "post-merge verify green; cleared active remediation state" in log_path.read_text()
+
+
+def test_watch_cycle_green_main_verify_retires_matching_failed_rows_and_defers_live_rows(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    matching_failed = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-old-a",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 1/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    matching_live = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-old-b",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 0/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    other_signature = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `unit`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:unit",
+                "Tree fingerprint: fp-unit",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 0/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert matching_failed.id is not None
+    assert matching_live.id is not None
+    assert other_signature.id is not None
+    matching_failed.status = "failed"
+    matching_failed.completed_at = datetime.now(UTC)
+    matching_failed.failure_reason = "UNKNOWN"
+    store.update(matching_failed)
+    matching_live.status = "in_progress"
+    matching_live.started_at = datetime.now(UTC)
+    matching_live.running_pid = 424242
+    store.update(matching_live)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    green_check = SimpleNamespace(
+        merges_halted=False,
+        remediation=None,
+        resolved_red_signature="phase:functional",
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-green",
+            head_sha="feedfacecafe",
+            verify_status="passed",
+            verify_exit_status="0",
+            failure_signature=None,
+            failing_phase=None,
+            alert_message=None,
+            pending_retirement_signatures=(),
+            red_since=None,
+            captured_at=datetime(2026, 6, 29, tzinfo=UTC),
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=green_check),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    refreshed_failed = store.get(str(matching_failed.id))
+    refreshed_live = store.get(str(matching_live.id))
+    refreshed_other = store.get(str(other_signature.id))
+    assert refreshed_failed is not None
+    assert refreshed_live is not None
+    assert refreshed_other is not None
+    assert refreshed_failed.status == "dropped"
+    assert refreshed_failed.drop_reason == "main verify green for signature phase:functional"
+    assert refreshed_live.status == "in_progress"
+    assert refreshed_live.running_pid == 424242
+    assert refreshed_live.drop_reason is None
+    assert refreshed_other.status == "pending"
+    open_runnable = [
+        task.id
+        for task in store.get_all()
+        if task.trigger_source == "watch-main-integration-verify-remediation"
+        and task.status in {"pending", "in_progress", "failed"}
+    ]
+    assert set(open_runnable) == {matching_live.id, other_signature.id}
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is not None
+    assert persisted_state.pending_retirement_signatures == ("phase:functional",)
+    log_text = log_path.read_text()
+    assert "retired moot remediation rows for phase:functional" in log_text
+    assert "delaying retirement for live remediation rows" in log_text
+
+
+def test_watch_green_deflake_persists_pending_retirement_for_live_same_signature_fix_row(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    live_fix = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-live-fix",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 1/2",
+                "Verify failure: deterministic failure",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert live_fix.id is not None
+    live_fix.status = "in_progress"
+    live_fix.started_at = datetime.now(UTC)
+    live_fix.running_pid = 424242
+    store.update(live_fix)
+    original_prompt = live_fix.prompt
+    original_tags = tuple(live_fix.tags or ())
+
+    deflake_check = SimpleNamespace(
+        merges_halted=False,
+        remediation=SimpleNamespace(
+            kind="deflake",
+            signature="phase:functional",
+            tree_fingerprint="fp-deflake",
+            failing_phase="functional",
+            failure="verify_command flaked once",
+        ),
+        resolved_red_signature="phase:functional",
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-deflake",
+            head_sha="feedfacecafe",
+            verify_status="passed",
+            verify_exit_status="0",
+            failure_signature=None,
+            failing_phase=None,
+            alert_message=None,
+            pending_retirement_signatures=(),
+            red_since=None,
+            captured_at=datetime(2026, 7, 5, tzinfo=UTC),
+        ),
+    )
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=log,
+        check=deflake_check,
+    )
+
+    assert refreshed_state is None
+    preserved_live = store.get(live_fix.id)
+    assert preserved_live is not None
+    assert preserved_live.status == "in_progress"
+    assert preserved_live.running_pid == 424242
+    assert preserved_live.prompt == original_prompt
+    assert tuple(preserved_live.tags or ()) == original_tags
+    assert preserved_live.urgent is False
+    assert preserved_live.queue_position is None
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 1
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is not None
+    assert persisted_state.pending_retirement_signatures == ("phase:functional",)
+    assert "delaying retirement for live remediation rows" in log_path.read_text()
+
+    preserved_live.status = "failed"
+    preserved_live.completed_at = datetime.now(UTC)
+    preserved_live.started_at = None
+    preserved_live.running_pid = None
+    preserved_live.failure_reason = "UNKNOWN"
+    store.update(preserved_live)
+
+    followup_green = SimpleNamespace(
+        merges_halted=False,
+        remediation=None,
+        resolved_red_signature=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-green",
+            head_sha="feedfacecafe",
+            verify_status="passed",
+            verify_exit_status="0",
+            failure_signature=None,
+            failing_phase=None,
+            alert_message=None,
+            pending_retirement_signatures=("phase:functional",),
+            red_since=None,
+            captured_at=datetime(2026, 7, 5, 0, 5, tzinfo=UTC),
+        ),
+    )
+
+    _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=log,
+        check=followup_green,
+    )
+
+    retired_live = store.get(live_fix.id)
+    assert retired_live is not None
+    assert retired_live.status == "dropped"
+    assert retired_live.drop_reason == "main verify green for signature phase:functional"
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is not None
+    assert persisted_state.pending_retirement_signatures == ()
+
+
+def test_watch_stale_green_main_verify_rerun_retries_pending_retirement_after_live_row_stops(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "passed"
+    main_verify_task.review_verify_exit_status = "0"
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    main_verify_task.review_verify_captured_at = datetime(2026, 6, 29, 0, 0, tzinfo=UTC)
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": None,
+            "captured_at": "2026-06-29T00:00:00+00:00",
+            "failure_signature": None,
+            "failing_phase": None,
+            "gate_enabled": True,
+            "head_sha": "feedfacecafe",
+            "pending_retirement_signatures": ["phase:functional"],
+            "tree_fingerprint": "fp-stale",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    stopped_row = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-old-b",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 1/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert stopped_row.id is not None
+    stopped_row.status = "failed"
+    stopped_row.completed_at = datetime.now(UTC)
+    stopped_row.failure_reason = "UNKNOWN"
+    store.update(stopped_row)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    green_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 1, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="feedfacecafe",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch(
+            "gza.main_integration_verify._compute_tree_fingerprint",
+            side_effect=["fp-current", "fp-current"],
+        ),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=green_result) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            reason="watch-main-verify",
+        )
+        refreshed_state = _maybe_file_main_verify_remediation(
+            dry_run=False,
+            config=config,
+            store=store,
+            tags=("202606-recovery",),
+            any_tag=False,
+            log=log,
+            check=check,
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.merges_halted is False
+    assert check.state.pending_retirement_signatures == ("phase:functional",)
+    assert refreshed_state is None
+    refreshed = store.get(stopped_row.id)
+    assert refreshed is not None
+    assert refreshed.status == "dropped"
+    assert refreshed.drop_reason == "main verify green for signature phase:functional"
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is not None
+    assert persisted_state.tree_fingerprint == "fp-current"
+    assert persisted_state.pending_retirement_signatures == ()
+    assert "retired moot remediation rows for phase:functional" in log_path.read_text()
+
+
+def test_watch_green_deflake_retires_stale_fix_row_and_files_one_runnable_deflake_row(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    stale_fix = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-stale-fix",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 1/2",
+            ]
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert stale_fix.id is not None
+    stale_fix.status = "failed"
+    stale_fix.completed_at = datetime.now(UTC)
+    stale_fix.failure_reason = "UNKNOWN"
+    store.update(stale_fix)
+
+    deflake_check = SimpleNamespace(
+        merges_halted=False,
+        remediation=SimpleNamespace(
+            kind="deflake",
+            signature="phase:functional",
+            tree_fingerprint="fp-deflake",
+            failing_phase="functional",
+            failure="verify_command flaked once",
+        ),
+        resolved_red_signature="phase:functional",
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-deflake",
+            head_sha="feedfacecafe",
+            verify_status="passed",
+            verify_exit_status="0",
+            failure_signature=None,
+            failing_phase=None,
+            alert_message=None,
+            pending_retirement_signatures=(),
+            red_since=None,
+            captured_at=datetime(2026, 7, 5, tzinfo=UTC),
+        ),
+    )
+
+    refreshed_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=log,
+        check=deflake_check,
+    )
+
+    assert refreshed_state is None
+    retired_fix = store.get(stale_fix.id)
+    assert retired_fix is not None
+    assert retired_fix.status == "dropped"
+    assert retired_fix.drop_reason == "main verify green for signature phase:functional"
+    remediation_tasks = [
+        candidate
+        for candidate in store.get_all()
+        if candidate.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    runnable_tasks = [candidate for candidate in remediation_tasks if candidate.status == "pending"]
+    assert len(remediation_tasks) == 2
+    assert len(runnable_tasks) == 1
+    deflake_task = runnable_tasks[0]
+    assert deflake_task.id != stale_fix.id
+    assert deflake_task.urgent is True
+    assert deflake_task.queue_position == 1
+    assert "De-flake local main integration verify phase `functional`" in deflake_task.prompt
+    assert "Remediation kind: deflake" in deflake_task.prompt
+    assert "Tree fingerprint: fp-deflake" in deflake_task.prompt
+    persisted_state = load_main_integration_verify_state(store)
+    assert persisted_state is not None
+    assert persisted_state.pending_retirement_signatures == ()
 
 
 def test_watch_cycle_main_verify_remediation_updates_unknown_task_in_place_when_fingerprint_arrives(
@@ -11195,25 +12424,30 @@ def test_watch_cycle_main_verify_remediation_preserves_live_in_progress_duplicat
     assert preserved_duplicate.status == "in_progress"
     assert preserved_duplicate.running_pid == 424242
     assert preserved_duplicate.drop_reason is None
-    assert preserved_duplicate.urgent is True
-    assert preserved_duplicate.queue_position == 1
-    assert set(preserved_duplicate.tags or ()) == {
+    assert preserved_duplicate.urgent is False
+    assert preserved_duplicate.queue_position is None
+    assert set(preserved_duplicate.tags or ()) == {"legacy-recovery", "system"}
+    assert "Tree fingerprint: unavailable" in preserved_duplicate.prompt
+    assert "Tree fingerprint: fp-new" not in preserved_duplicate.prompt
+    assert "Remediation attempts spent:" not in preserved_duplicate.prompt
+
+    updated_exact = store.get(exact_task.id)
+    assert updated_exact is not None
+    assert updated_exact.status == "pending"
+    assert updated_exact.running_pid is None
+    assert updated_exact.drop_reason is None
+    assert updated_exact.urgent is True
+    assert updated_exact.queue_position == 1
+    assert set(updated_exact.tags or ()) == {
         "system",
         MAIN_INTEGRATION_VERIFY_TAG,
         "202606-recovery",
         "exact-recovery",
         "legacy-recovery",
     }
-    assert "Tree fingerprint: fp-new" in preserved_duplicate.prompt
-
-    updated_exact = store.get(exact_task.id)
-    assert updated_exact is not None
-    assert updated_exact.status == "dropped"
-    assert updated_exact.running_pid is None
-    assert updated_exact.drop_reason == (
-        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{live_duplicate.id}"
-    )
+    assert "Tree fingerprint: fp-new" in updated_exact.prompt
     assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
+        updated_exact.id,
         blocker.id,
     ]
     refreshed_tasks = [
@@ -11224,7 +12458,112 @@ def test_watch_cycle_main_verify_remediation_preserves_live_in_progress_duplicat
         )
         if candidate is not None and candidate.status in {"pending", "in_progress", "failed"}
     ]
-    assert [task.id for task in refreshed_tasks] == [live_duplicate.id]
+    assert [task.id for task in refreshed_tasks] == [live_duplicate.id, updated_exact.id]
+
+
+def test_watch_cycle_main_verify_remediation_keeps_only_live_in_progress_row_untouched(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    blocker = store.add("Scoped pending task", task_type="implement", tags=("202606-recovery",))
+    assert blocker.id is not None
+    assert set_task_queue_position_scoped(store, blocker.id, position=1, tags=("202606-recovery",))
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_head_sha = "feedfacecafe"
+    store.update(main_verify_task)
+
+    live_remediation = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-old",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 0/2",
+                "Verify failure: original failure",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert live_remediation.id is not None
+    live_remediation.status = "in_progress"
+    live_remediation.started_at = datetime.now(UTC)
+    live_remediation.running_pid = 989898
+    store.update(live_remediation)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+
+    deterministic_red = SimpleNamespace(
+        merges_halted=True,
+        remediation=SimpleNamespace(
+            kind="fix",
+            signature="phase:functional",
+            tree_fingerprint="fp-new",
+            failing_phase="functional",
+            failure="verify_command failed twice",
+        ),
+        state=SimpleNamespace(
+            task=main_verify_task,
+            head_sha="feedfacecafe",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    preserved = store.get(live_remediation.id)
+    assert preserved is not None
+    assert preserved.status == "in_progress"
+    assert preserved.running_pid == 989898
+    assert preserved.urgent is False
+    assert preserved.queue_position is None
+    assert set(preserved.tags or ()) == {"legacy-recovery", "system"}
+    assert "Tree fingerprint: fp-old" in preserved.prompt
+    assert "Tree fingerprint: fp-new" not in preserved.prompt
+    assert "Verify failure: original failure" in preserved.prompt
+    assert "Verify failure: verify_command failed twice" not in preserved.prompt
+    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
+        blocker.id,
+    ]
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "reused live fix remediation for functional" in log_text
+    assert "left existing in_progress row untouched and deferred queue changes" in log_text
+    assert "moved to queue position 1" not in log_text
 
 
 def test_watch_cycle_reuses_same_signature_remediation_task_but_updates_kind(tmp_path: Path) -> None:
@@ -11348,6 +12687,7 @@ def test_watch_cycle_reuses_failed_deterministic_main_verify_remediation_as_pend
                 "Failure signature: phase:functional",
                 "Tree fingerprint: fp-functional-a",
                 "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 0/2",
             ]
         ),
         task_type="implement",
@@ -11377,6 +12717,13 @@ def test_watch_cycle_reuses_failed_deterministic_main_verify_remediation_as_pend
             task=main_verify_task,
             head_sha="feedfacecafe",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `functional` failing",
+            captured_at=datetime(2026, 6, 29, tzinfo=UTC),
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            tree_fingerprint="fp-functional-a",
+            failing_phase="functional",
         ),
     )
 
@@ -11414,6 +12761,7 @@ def test_watch_cycle_reuses_failed_deterministic_main_verify_remediation_as_pend
     assert updated.status == "pending"
     assert updated.urgent is True
     assert updated.queue_position == 1
+    assert "Remediation attempts spent: 1/2" in updated.prompt
     assert set(updated.tags or ()) == {
         "system",
         MAIN_INTEGRATION_VERIFY_TAG,

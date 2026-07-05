@@ -120,7 +120,14 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   fingerprint MUST reuse the existing open remediation task instead of filing another
   copy. If the current bounded rerun evidence changes the required remediation kind,
   fingerprint context, or other prompt evidence for that same signature, the reused
-  task MUST be updated in place so its prompt still matches the current classification.
+  task MUST be updated in place so its prompt still matches the current classification,
+  except that a row already `in_progress` MUST keep the prompt evidence, tags, urgency,
+  and queue state the running worker actually received. If a same-signature non-live row
+  also exists, watch MUST prefer that non-live row for refresh or requeue and leave the
+  live duplicate untouched until worker-aware reconciliation can retire it. If the live
+  row is the only same-signature match, watch MUST keep it as the signature-owned open
+  row but limit any updates to safe freshness bookkeeping that does not misrepresent the
+  running worker.
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
@@ -139,6 +146,20 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   node IDs, and excerpt instead of surfacing stale prompt evidence.
   The prompt MUST keep that evidence bounded and deterministic; it MUST NOT embed an
   unbounded verify log.
+- Reusing the same remediation row after a failed automatic attempt MUST be bounded and
+  sequential. Watch MUST track the consumed automatic attempts on that single row,
+  increment that state before requeueing a failed remediation, and stop requeueing once
+  the configured bound is spent. Legacy failed remediation rows that predate explicit
+  attempt metadata MUST be treated conservatively as already having spent one automatic
+  attempt.
+- When the automatic remediation bound is exhausted for a failure signature, watch MUST
+  leave the single remediation row failed, persist an explicit exhausted reason on that
+  row, and emit one signature-scoped human-attention condition instead of creating or
+  queueing another remediation task for the same unresolved signature.
+- When main verify later turns green and automation can safely identify the cleared
+  failure signature, watch MUST retire matching open remediation rows for that signature
+  as moot so stale main-verify fixes do not remain runnable after the gate has already
+  recovered.
 - While that deterministic red freeze is active, watch MUST continue skipping unrelated
   merge actions for the cycle, but it MUST allow the merge of the one completed
   remediation implement task that is the active `system-main-verify` **fix** for the

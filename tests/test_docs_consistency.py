@@ -170,6 +170,10 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
     assert "readable and yields content-bearing output" in contract
     assert "first readable content-bearing one" in contract
     assert "content-bearing verify artifact exists, it MUST omit the artifact reference" in contract
+    assert "stop requeueing once the configured bound is spent" in contract_flat
+    assert "Legacy failed remediation rows that predate explicit attempt metadata MUST be treated conservatively" in contract_flat
+    assert "emit one signature-scoped human-attention condition" in contract_flat
+    assert "retire matching open remediation rows for that signature as moot" in contract_flat
     assert "There MUST be a first-class operator command that forces a fresh local-target verify run" in contract
     assert "Future behavior-check findings against this area MUST classify implementation drift" in contract_flat
 
@@ -405,6 +409,17 @@ def test_main_verify_remediation_identity_docs_match_signature_only_runtime_cont
     assert "S7 — Watch owns bounded stateful work creation." in supervisor
     assert "advance` MAY surface the red-main condition from the shared state" in supervisor
     assert "create these remediation tasks itself." in supervisor
+
+
+def test_main_verify_remediation_attempt_budget_docs_match_consumed_attempt_runtime_contract() -> None:
+    """Operator docs should describe the shared consumed-attempt budget for main-verify remediation."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_docs = " ".join((repo_root / "docs" / "configuration.md").read_text().split())
+
+    assert "consumed automatic remediation-attempt budget for one main-verify failure identity" in config_docs
+    assert "failed remediation rows before watch requeues them" in config_docs
+    assert "merged remediation attempts later proven ineffective" in config_docs
+    assert "caps how many merged-and-proven-ineffective automatic remediation attempts" not in config_docs
 
 
 def test_worktree_isolation_contract_and_internal_docs_stay_aligned() -> None:

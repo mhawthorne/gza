@@ -65,6 +65,8 @@ def _seed_main_verify_task(
     alert_message: str,
     failing_phase: str = "unit",
     environment_identity: MainIntegrationVerifyEnvironmentIdentity | None = _current_host_identity(),
+    failure_signature: str | None = None,
+    pending_retirement_signatures: tuple[str, ...] = (),
 ) -> str:
     task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
     assert task.id is not None
@@ -75,19 +77,23 @@ def _seed_main_verify_task(
     task.review_verify_exit_status = verify_exit_status
     task.review_verify_failure = failure
     task.review_verify_head_sha = "abc123"
-    payload = {
-        "alert_message": alert_message,
-        "captured_at": "2026-06-23T00:00:00+00:00",
-        "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
-        "failing_phase": failing_phase,
-        "gate_enabled": True,
-        "head_sha": "abc123",
-        "tree_fingerprint": "fp-verified",
-        "verify_command": "./bin/tests",
-        "verify_timeout_grace_seconds": 5.0,
-        "verify_timeout_seconds": 120,
-    }
-    task.output_content = json.dumps(payload, sort_keys=True)
+    task.output_content = json.dumps(
+        {
+            "alert_message": alert_message,
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
+            "failure_signature": failure_signature,
+            "failing_phase": failing_phase,
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "pending_retirement_signatures": list(pending_retirement_signatures),
+            "tree_fingerprint": "fp-verified",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
     store.update(task)
     return task.id
 
@@ -273,6 +279,67 @@ def test_build_main_integration_verify_remediation_skips_unreadable_preferred_ar
     assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
 
 
+def test_build_main_integration_verify_remediation_skips_whitespace_only_preferred_artifact_for_newer_readable_evidence(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    preferred = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify preferred",
+        output="  \n\t  \n",
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    newer = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify newer",
+        output="\n".join(
+            [
+                "WORKER_DIED subprocess boundary failure",
+                "=========================== short test summary info ============================",
+                "FAILED tests/test_newer.py::test_latest - AssertionError: newer",
+                "============================== 1 failed in 0.20s ==============================",
+            ]
+        ),
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
+    task.review_verify_artifact_file = preferred.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path == newer.path
+    assert remediation.failing_test_ids == ("tests/test_newer.py::test_latest",)
+    assert remediation.verify_excerpt is not None
+    assert "WORKER_DIED subprocess boundary failure" in remediation.verify_excerpt
+
+
 def test_build_main_integration_verify_remediation_omits_missing_artifact_evidence_and_prompt_line(
     tmp_path,
 ) -> None:
@@ -311,6 +378,61 @@ def test_build_main_integration_verify_remediation_omits_missing_artifact_eviden
     )
     (tmp_path / older.path).unlink()
     (tmp_path / newer.path).unlink()
+    task.review_verify_artifact_file = older.path
+    store.update(task)
+
+    state = load_main_integration_verify_state(store)
+    assert state is not None
+    remediation = _build_main_integration_verify_remediation(
+        kind="fix",
+        config=config,
+        store=store,
+        state=state,
+    )
+
+    assert remediation.artifact_path is None
+    assert remediation.failing_test_ids == ()
+    assert remediation.verify_excerpt is None
+    prompt = _main_verify_remediation_prompt(remediation, head_sha=state.head_sha)
+    assert "Verify artifact:" not in prompt
+
+
+def test_build_main_integration_verify_remediation_omits_whitespace_only_artifact_evidence_and_prompt_line(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task_id = _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+    task = store.get(task_id)
+    assert task is not None
+    config = Config.load(tmp_path)
+
+    older = store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify older",
+        output="  \n",
+        created_at=datetime(2026, 6, 23, 0, 0, tzinfo=UTC),
+    )
+    store_command_output_artifact(
+        store,
+        task,
+        config,
+        kind="verify_command_output",
+        producer="main_verify_test",
+        label="verify newer",
+        output="",
+        created_at=datetime(2026, 6, 23, 0, 1, tzinfo=UTC),
+    )
     task.review_verify_artifact_file = older.path
     store.update(task)
 
@@ -1075,6 +1197,71 @@ def test_check_main_integration_verify_classifies_tool_launch_failure_as_attenti
     assert current_main_integration_verify_alert(store, alert_git, config) is None
 
 
+def test_check_main_integration_verify_green_does_not_resolve_launch_failure_signature(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="unavailable",
+        verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        failure="verify tool launch failed",
+        alert_message="main verify misconfigured at `abc123` - could not launch `ruff` (missing); fix the environment, not the code",
+        failing_phase="ruff",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    green_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 0, 35, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified"]),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=green_result) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify-after-launch-failure",
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.merges_halted is False
+    assert check.remediation is None
+    assert check.resolved_red_signature is None
+    assert check.state.verify_status == "passed"
+    assert check.state.failure_signature is None
+
+
 def test_check_main_integration_verify_extracts_tool_name_from_top_level_launch_failed_oserror(
     tmp_path,
 ) -> None:
@@ -1374,6 +1561,7 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
         verify_exit_status="1",
         failure="verify_command failed",
         alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+        pending_retirement_signatures=("phase:functional",),
     )
     task = store.get(task_id)
     assert task is not None
@@ -1385,7 +1573,7 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
         state=state,
         alert_message=(
             "main verify RED at `abc123` - merges halted; phase `unit` failing; "
-            "automatic remediation exhausted after 2/2 attempts for unit on fp-verified; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
             "human intervention required"
         ),
     )
@@ -1397,12 +1585,86 @@ def test_persist_main_integration_verify_alert_message_preserves_existing_identi
     assert updated.tree_fingerprint == "fp-verified"
     assert updated.head_sha == "abc123"
     assert updated.failing_phase == "unit"
+    assert updated.failure_signature == "phase:unit"
+    assert updated.pending_retirement_signatures == ("phase:functional",)
     assert "automatic remediation exhausted after 2/2 attempts" in (updated.alert_message or "")
     reloaded = load_main_integration_verify_state(store)
     assert reloaded is not None
     assert reloaded.alert_message == updated.alert_message
     assert reloaded.tree_fingerprint == "fp-verified"
     assert reloaded.head_sha == "abc123"
+    assert reloaded.failure_signature == "phase:unit"
+    assert reloaded.pending_retirement_signatures == ("phase:functional",)
+
+
+def test_check_main_integration_verify_preserves_pending_retirements_across_fresh_green_rerun(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="passed",
+        verify_exit_status="0",
+        failure="",
+        alert_message="",
+        pending_retirement_signatures=("phase:functional",),
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    green_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 1, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch(
+            "gza.main_integration_verify._compute_tree_fingerprint",
+            side_effect=["fp-refreshed", "fp-refreshed"],
+        ),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=green_result) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-test-green-refresh",
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.merges_halted is False
+    assert check.resolved_red_signature is None
+    assert check.state.verify_status == "passed"
+    assert check.state.pending_retirement_signatures == ("phase:functional",)
+    reloaded = load_main_integration_verify_state(store)
+    assert reloaded is not None
+    assert reloaded.pending_retirement_signatures == ("phase:functional",)
 
 
 def test_check_main_integration_verify_reuses_same_tree_green_checkpoint_without_rerun(tmp_path) -> None:
@@ -1623,6 +1885,7 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_flake_without_
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
     assert check.remediation.signature == "phase:unit"
+    assert check.resolved_red_signature == "phase:unit"
     assert check.remediation.tree_fingerprint == "fp-verified"
     assert check.remediation.failing_phase == "unit"
 
@@ -1695,6 +1958,7 @@ def test_check_main_integration_verify_watch_red_rerun_retries_fresh_red_and_cla
     assert check.remediation is not None
     assert check.remediation.kind == "deflake"
     assert check.remediation.signature == "phase:functional"
+    assert check.resolved_red_signature == "phase:functional"
     assert check.remediation.tree_fingerprint == "fp-live"
     assert check.remediation.failing_phase == "functional"
 
@@ -2221,3 +2485,54 @@ def test_run_main_integration_verify_resets_red_since_on_green_and_rearms_on_nex
     assert first_state.red_since == first_red.captured_at
     assert green_state.red_since is None
     assert second_state.red_since == second_red.captured_at
+
+
+def test_run_main_integration_verify_does_not_persist_failure_signature_for_launch_failure(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    launch_failure = _make_review_verify_result(
+        "./bin/tests",
+        status="unavailable",
+        exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        captured_at=datetime(2026, 6, 23, 0, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        failure="verify tool launch failed",
+        output="gza-verify phase=error name=ruff detail=missing executable",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=launch_failure),
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        state = run_main_integration_verify(config, store, git, reason="unit-test-launch-failure")
+
+    assert state.verify_status == "unavailable"
+    assert state.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    assert state.failure_signature is None
+    persisted = load_main_integration_verify_state(store)
+    assert persisted is not None
+    assert persisted.failure_signature is None

@@ -68,9 +68,11 @@ class MainIntegrationVerifyState:
     head_sha: str | None
     verify_status: str | None
     verify_exit_status: str | None
+    failure_signature: str | None
     failure: str | None
     failing_phase: str | None
     alert_message: str | None
+    pending_retirement_signatures: tuple[str, ...]
     red_since: datetime | None
     captured_at: datetime | None
 
@@ -86,6 +88,7 @@ class MainIntegrationVerifyCheck:
     merges_halted: bool
     needs_attention: bool = False
     remediation: MainIntegrationVerifyRemediation | None = None
+    resolved_red_signature: str | None = None
     verify_runs: int = 0
 
 
@@ -288,6 +291,31 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
             red_since = datetime.fromisoformat(red_since_raw)
         except ValueError:
             red_since = None
+    failing_phase = payload.get("failing_phase") if isinstance(payload.get("failing_phase"), str) else None
+    failure_signature = payload.get("failure_signature") if isinstance(payload.get("failure_signature"), str) else None
+    if (
+        failure_signature is None
+        and _verify_result_halts_merges(
+            status=task.review_verify_status,
+            gate_enabled=_payload_gate_enabled(task, payload),
+            exit_status=task.review_verify_exit_status,
+        )
+    ):
+        failure_signature = _verify_failure_signature(
+            failing_phase=failing_phase,
+            verify_status=task.review_verify_status,
+            verify_exit_status=task.review_verify_exit_status,
+        )
+    pending_retirement_signatures_raw = payload.get("pending_retirement_signatures")
+    pending_retirement_signatures = (
+        tuple(
+            signature
+            for signature in pending_retirement_signatures_raw
+            if isinstance(signature, str) and signature
+        )
+        if isinstance(pending_retirement_signatures_raw, list)
+        else ()
+    )
     return MainIntegrationVerifyState(
         task=task,
         gate_enabled=_payload_gate_enabled(task, payload),
@@ -301,9 +329,11 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else task.review_verify_head_sha,
         verify_status=task.review_verify_status,
         verify_exit_status=task.review_verify_exit_status,
+        failure_signature=failure_signature,
         failure=task.review_verify_failure,
-        failing_phase=payload.get("failing_phase") if isinstance(payload.get("failing_phase"), str) else None,
+        failing_phase=failing_phase,
         alert_message=payload.get("alert_message") if isinstance(payload.get("alert_message"), str) else None,
+        pending_retirement_signatures=pending_retirement_signatures,
         red_since=red_since,
         captured_at=captured_at or task.review_verify_captured_at,
     )
@@ -436,6 +466,8 @@ def _load_main_verify_artifact_evidence(
             continue
         artifact_output = _read_main_verify_artifact_tail(config=config, stored_path=stored_path)
         if artifact_output is None:
+            continue
+        if not artifact_output.strip():
             continue
         return stored_path, artifact_output
     return None, None
@@ -788,8 +820,10 @@ def _persist_main_integration_verify_payload(
     environment_identity: MainIntegrationVerifyEnvironmentIdentity | None,
     tree_fingerprint: str | None,
     head_sha: str | None,
+    failure_signature: str | None,
     failing_phase: str | None,
     alert_message: str | None,
+    pending_retirement_signatures: tuple[str, ...],
     red_since: datetime | None,
     captured_at: datetime,
 ) -> None:
@@ -802,8 +836,10 @@ def _persist_main_integration_verify_payload(
             "environment_identity": environment_identity.to_payload() if environment_identity is not None else None,
             "tree_fingerprint": tree_fingerprint,
             "head_sha": head_sha,
+            "failure_signature": failure_signature,
             "failing_phase": failing_phase,
             "alert_message": alert_message,
+            "pending_retirement_signatures": list(pending_retirement_signatures),
             "red_since": red_since.isoformat() if red_since is not None else None,
             "captured_at": captured_at.isoformat(),
         },
@@ -815,6 +851,13 @@ def _persist_main_integration_verify_payload(
     store.update(task)
 
 
+def _pending_retirement_signatures_from_state(state: Any) -> tuple[str, ...]:
+    raw = getattr(state, "pending_retirement_signatures", ())
+    if not isinstance(raw, tuple):
+        return ()
+    return tuple(signature for signature in raw if isinstance(signature, str) and signature)
+
+
 def persist_main_integration_verify_alert_message(
     store: SqliteTaskStore,
     *,
@@ -822,6 +865,63 @@ def persist_main_integration_verify_alert_message(
     alert_message: str,
 ) -> MainIntegrationVerifyState:
     """Persist a replacement durable alert message while preserving verify identity."""
+    captured_at = state.captured_at or state.task.completed_at or datetime.now(UTC)
+    failure_signature = getattr(state, "failure_signature", None)
+    if not isinstance(failure_signature, str) or not failure_signature:
+        failing_phase = getattr(state, "failing_phase", None)
+        verify_status = getattr(state, "verify_status", None)
+        verify_exit_status = getattr(state, "verify_exit_status", None)
+        if _verify_result_halts_merges(
+            status=verify_status if isinstance(verify_status, str) else None,
+            gate_enabled=state.gate_enabled,
+            exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+        ) and isinstance(failing_phase, str) and failing_phase:
+            failure_signature = _verify_failure_signature(
+                failing_phase=failing_phase,
+                verify_status=verify_status if isinstance(verify_status, str) else None,
+                verify_exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+            )
+        elif _verify_result_halts_merges(
+            status=verify_status if isinstance(verify_status, str) else None,
+            gate_enabled=state.gate_enabled,
+            exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+        ) and isinstance(verify_status, str) and verify_status:
+            failure_signature = _verify_failure_signature(
+                failing_phase=None,
+                verify_status=verify_status,
+                verify_exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+            )
+        else:
+            failure_signature = None
+    _persist_main_integration_verify_payload(
+        store,
+        state.task,
+        gate_enabled=state.gate_enabled,
+        verify_command=state.verify_command,
+        verify_timeout_seconds=state.verify_timeout_seconds,
+        verify_timeout_grace_seconds=state.verify_timeout_grace_seconds,
+        environment_identity=getattr(state, "environment_identity", None),
+        tree_fingerprint=state.tree_fingerprint,
+        head_sha=state.head_sha,
+        failure_signature=failure_signature,
+        failing_phase=state.failing_phase,
+        alert_message=alert_message,
+        pending_retirement_signatures=_pending_retirement_signatures_from_state(state),
+        red_since=getattr(state, "red_since", None),
+        captured_at=captured_at,
+    )
+    refreshed = load_main_integration_verify_state(store)
+    assert refreshed is not None
+    return refreshed
+
+
+def persist_main_integration_verify_pending_retire_signatures(
+    store: SqliteTaskStore,
+    *,
+    state: MainIntegrationVerifyState,
+    pending_retirement_signatures: tuple[str, ...],
+) -> MainIntegrationVerifyState:
+    """Persist the set of green-but-live remediation signatures awaiting safe retirement."""
     captured_at = state.captured_at or state.task.completed_at or datetime.now(UTC)
     _persist_main_integration_verify_payload(
         store,
@@ -833,8 +933,10 @@ def persist_main_integration_verify_alert_message(
         environment_identity=getattr(state, "environment_identity", None),
         tree_fingerprint=state.tree_fingerprint,
         head_sha=state.head_sha,
+        failure_signature=getattr(state, "failure_signature", None),
         failing_phase=state.failing_phase,
-        alert_message=alert_message,
+        alert_message=state.alert_message,
+        pending_retirement_signatures=pending_retirement_signatures,
         red_since=getattr(state, "red_since", None),
         captured_at=captured_at,
     )
@@ -1001,6 +1103,9 @@ def run_main_integration_verify(
             red_since = result.captured_at
     else:
         red_since = None
+    pending_retirement_signatures: tuple[str, ...] = ()
+    if gate_enabled and result.status == "passed":
+        pending_retirement_signatures = _pending_retirement_signatures_from_state(prior_state)
     _persist_main_integration_verify_payload(
         store,
         task,
@@ -1011,8 +1116,22 @@ def run_main_integration_verify(
         environment_identity=gate.environment_identity,
         tree_fingerprint=tree_fingerprint,
         head_sha=head_sha,
+        failure_signature=(
+            _verify_failure_signature(
+                failing_phase=failing_phase,
+                verify_status=result.status,
+                verify_exit_status=result.exit_status,
+            )
+            if _verify_result_halts_merges(
+                status=result.status,
+                gate_enabled=gate_enabled,
+                exit_status=result.exit_status,
+            )
+            else None
+        ),
         failing_phase=failing_phase,
         alert_message=alert_message,
+        pending_retirement_signatures=pending_retirement_signatures,
         red_since=red_since,
         captured_at=result.captured_at,
     )
@@ -1186,6 +1305,18 @@ def check_main_integration_verify(
             ),
         )
 
+    prior_red_signature = None
+    if state is not None and _verify_result_halts_merges(
+        status=state.verify_status,
+        gate_enabled=state.gate_enabled,
+        exit_status=state.verify_exit_status,
+    ):
+        prior_red_signature = _verify_failure_signature(
+            failing_phase=state.failing_phase,
+            verify_status=state.verify_status,
+            verify_exit_status=state.verify_exit_status,
+        )
+
     refreshed, remediation, verify_runs = _run_main_integration_verify_with_red_reruns(
         config,
         store,
@@ -1195,6 +1326,15 @@ def check_main_integration_verify(
         runner_class=runner_class,
         prior_red_state=state if checkpoint_is_current else None,
     )
+    resolved_red_signature = None
+    if not _verify_result_halts_merges(
+        status=refreshed.verify_status,
+        gate_enabled=refreshed.gate_enabled,
+        exit_status=refreshed.verify_exit_status,
+    ):
+        resolved_red_signature = prior_red_signature
+        if resolved_red_signature is None and remediation is not None and remediation.kind == "deflake":
+            resolved_red_signature = remediation.signature
     return MainIntegrationVerifyCheck(
         state=refreshed,
         performed_verify=True,
@@ -1212,6 +1352,7 @@ def check_main_integration_verify(
             alert_message=refreshed.alert_message,
         ),
         remediation=remediation,
+        resolved_red_signature=resolved_red_signature,
         verify_runs=verify_runs,
     )
 
